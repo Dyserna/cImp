@@ -16,9 +16,8 @@ use crate::error::{AppError, AppResult};
 
 use super::memory::{
     MemNote, ModelUsage, OriginSplit, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage,
-    UsageEvent, UsageOrigin, UsageTotals,
-    WorkingSetEntry, MAX_EVENTS_PER_SESSION, MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT,
-    MAX_USAGE_PER_SESSION,
+    UsageEvent, UsageOrigin, UsageTotals, WorkingSetEntry, MAX_EVENTS_PER_SESSION,
+    MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT, MAX_USAGE_PER_SESSION,
 };
 use super::model::{Confidence, EdgeKind, FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
@@ -294,9 +293,16 @@ impl GraphIndex {
         let dir = root.join(db_subdir);
         std::fs::create_dir_all(&dir).map_err(AppError::Io)?;
         let db_path = dir.join("graph.db");
-        let db = DbInstance::new("sqlite", db_path.to_string_lossy().as_ref(), Default::default())
-            .map_err(|e| AppError::Graph(format!("open {}: {e}", db_path.display())))?;
-        Ok(GraphIndex { db, schema_reset: AtomicBool::new(false) })
+        let db = DbInstance::new(
+            "sqlite",
+            db_path.to_string_lossy().as_ref(),
+            Default::default(),
+        )
+        .map_err(|e| AppError::Graph(format!("open {}: {e}", db_path.display())))?;
+        Ok(GraphIndex {
+            db,
+            schema_reset: AtomicBool::new(false),
+        })
     }
 
     /// Open (creating if needed) the graph store for `root`, ensuring the schema.
@@ -373,7 +379,12 @@ impl GraphIndex {
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
-        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(dv_i64)
+            .unwrap_or(0) as u64)
     }
 
     /// Drop every relation and recreate the schema empty. Used by a **full
@@ -443,11 +454,7 @@ impl GraphIndex {
     }
 
     fn existing_relations(&self) -> AppResult<HashSet<String>> {
-        let rows = self.run(
-            "::relations",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.run("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
         // Fail loudly rather than silently reading column 0 if a future CozoDB
         // changes the `::relations` shape — guessing the wrong column would make
         // every schema-existence check misfire (re-create conflicts on startup,
@@ -646,10 +653,7 @@ impl GraphIndex {
     /// `Err`. Lets a multi-step mutation (the per-file replace) be all-or-nothing
     /// rather than a sequence of independently-committed scripts that can leave a
     /// half-written file graph behind.
-    fn with_write_txn<T>(
-        &self,
-        f: impl FnOnce(&MultiTransaction) -> AppResult<T>,
-    ) -> AppResult<T> {
+    fn with_write_txn<T>(&self, f: impl FnOnce(&MultiTransaction) -> AppResult<T>) -> AppResult<T> {
         let tx = self.db.multi_transaction(true);
         match f(&tx) {
             Ok(v) => {
@@ -861,13 +865,18 @@ impl GraphIndex {
 
         // Resolve each to a file→file adjacency (indices into `files`).
         let files: Vec<String> = known.iter().cloned().collect();
-        let idx_of: std::collections::HashMap<&str, usize> =
-            files.iter().enumerate().map(|(i, f)| (f.as_str(), i)).collect();
+        let idx_of: std::collections::HashMap<&str, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.as_str(), i))
+            .collect();
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
         for r in &import_rows.rows {
             let src = cell_str(r, 0);
             let module = cell_str(r, 1);
-            let Some(&si) = idx_of.get(src.as_str()) else { continue };
+            let Some(&si) = idx_of.get(src.as_str()) else {
+                continue;
+            };
             let lang = Lang::from_tag(lang_of.get(&src).map(|s| s.as_str()).unwrap_or(""));
             if let Some(target) = resolve_import(lang, &src, &module, &known) {
                 if let Some(&ti) = idx_of.get(target.as_str()) {
@@ -881,7 +890,11 @@ impl GraphIndex {
         let mut cycles = tarjan_sccs(&adj)
             .into_iter()
             .filter(|scc| scc.len() >= 2)
-            .map(|scc| scc.into_iter().map(|i| files[i].clone()).collect::<Vec<_>>())
+            .map(|scc| {
+                scc.into_iter()
+                    .map(|i| files[i].clone())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         // Stable order (biggest cycles first, then lexicographic) and bound.
         for c in cycles.iter_mut() {
@@ -918,7 +931,12 @@ impl GraphIndex {
             p,
             ScriptMutability::Immutable,
         )?;
-        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(dv_i64)
+            .unwrap_or(0) as u64)
     }
 
     /// The set of symbol names defined by more than one definition — the names
@@ -971,7 +989,12 @@ impl GraphIndex {
             p,
             ScriptMutability::Immutable,
         )?;
-        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(dv_i64)
+            .unwrap_or(0) as u64)
     }
 
     /// The stored content hash for an indexed file, or `None` if not indexed.
@@ -1120,12 +1143,16 @@ reach[x] := reach[z], calls[x, z]"#
         // Per dependent: (min depth, weakest confidence along its discovery chain).
         let mut best: HashMap<String, (u32, Confidence)> = HashMap::new();
         // Roots seed the BFS at full certainty; each hop weakens by its edge.
-        let mut frontier: HashMap<String, Confidence> =
-            roots.iter().map(|n| (n.clone(), Confidence::Extracted)).collect();
+        let mut frontier: HashMap<String, Confidence> = roots
+            .iter()
+            .map(|n| (n.clone(), Confidence::Extracted))
+            .collect();
         for d in 1..=depth {
             let mut next_frontier: HashMap<String, Confidence> = HashMap::new();
             for (name, chain_conf) in &frontier {
-                let Some(callers) = rev.get(name) else { continue };
+                let Some(callers) = rev.get(name) else {
+                    continue;
+                };
                 for (caller, ec) in callers {
                     if root_set.contains(caller.as_str()) {
                         continue;
@@ -1199,7 +1226,12 @@ reach[x] := reach[z], calls[x, z]"#
         for (name, d, conf) in names {
             if let Some(syms) = by_name.remove(&name) {
                 for symbol in syms {
-                    hits.push(DependentHit { symbol, depth: d, approx: true, confidence: conf });
+                    hits.push(DependentHit {
+                        symbol,
+                        depth: d,
+                        approx: true,
+                        confidence: conf,
+                    });
                     if hits.len() >= max {
                         return Ok(hits);
                     }
@@ -1242,7 +1274,10 @@ reach[x] := reach[z], calls[x, z]"#
         for r in &sym_rows.rows {
             let id = cell_str(r, 0);
             let name = cell_str(r, 1);
-            name_to_ids.entry(name.clone()).or_default().push(id.clone());
+            name_to_ids
+                .entry(name.clone())
+                .or_default()
+                .push(id.clone());
             meta.insert(
                 id.clone(),
                 PathNode {
@@ -1272,7 +1307,15 @@ reach[x] := reach[z], calls[x, z]"#
             let node_id = format!("file:{path}");
             meta.insert(
                 node_id.clone(),
-                PathNode { id: node_id, label: path.clone(), file: path.clone(), line: 0, kind: "file".to_string(), edge_to_next: None, confidence: None },
+                PathNode {
+                    id: node_id,
+                    label: path.clone(),
+                    file: path.clone(),
+                    line: 0,
+                    kind: "file".to_string(),
+                    edge_to_next: None,
+                    confidence: None,
+                },
             );
             known_files.insert(path);
         }
@@ -1350,10 +1393,16 @@ reach[x] := reach[z], calls[x, z]"#
                 for r in &rows.rows {
                     let from_file = cell_str(r, 0);
                     let module = cell_str(r, 1);
-                    let lang = Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
+                    let lang =
+                        Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
                     if let Some(target) = resolve_import(lang, &from_file, &module, &known_files) {
                         let conf = Confidence::from_tag(&cell_str(r, 2));
-                        add(format!("file:{from_file}"), format!("file:{target}"), EdgeKind::Import, conf);
+                        add(
+                            format!("file:{from_file}"),
+                            format!("file:{target}"),
+                            EdgeKind::Import,
+                            conf,
+                        );
                     }
                 }
             }
@@ -1361,14 +1410,19 @@ reach[x] := reach[z], calls[x, z]"#
 
         // 4. Resolve endpoints (each may yield several candidate nodes).
         let from_nodes = self.resolve_path_endpoint(from, &name_to_ids, &known_files)?;
-        let to_set: HashSet<String> =
-            self.resolve_path_endpoint(to, &name_to_ids, &known_files)?.into_iter().collect();
+        let to_set: HashSet<String> = self
+            .resolve_path_endpoint(to, &name_to_ids, &known_files)?
+            .into_iter()
+            .collect();
         if from_nodes.is_empty() || to_set.is_empty() {
             return Ok(None);
         }
         // A source that is already a target → a zero-hop path.
-        let mut src_is_target: Vec<String> =
-            from_nodes.iter().filter(|n| to_set.contains(*n)).cloned().collect();
+        let mut src_is_target: Vec<String> = from_nodes
+            .iter()
+            .filter(|n| to_set.contains(*n))
+            .cloned()
+            .collect();
         src_is_target.sort();
         if let Some(t) = src_is_target.first() {
             if let Some(node) = meta.get(t).cloned() {
@@ -1399,7 +1453,9 @@ reach[x] := reach[z], calls[x, z]"#
             let mut next: Vec<String> = Vec::new();
             for u in &frontier {
                 let up = npaths.get(u).copied().unwrap_or(0);
-                let Some(neighbors) = adj.get(u) else { continue };
+                let Some(neighbors) = adj.get(u) else {
+                    continue;
+                };
                 let mut ns = neighbors.clone();
                 ns.sort();
                 ns.dedup();
@@ -1421,7 +1477,11 @@ reach[x] := reach[z], calls[x, z]"#
                     }
                 }
             }
-            let mut hits: Vec<String> = next.iter().filter(|n| to_set.contains(*n)).cloned().collect();
+            let mut hits: Vec<String> = next
+                .iter()
+                .filter(|n| to_set.contains(*n))
+                .cloned()
+                .collect();
             if !hits.is_empty() {
                 hits.sort();
                 let target = &hits[0];
@@ -1438,8 +1498,13 @@ reach[x] := reach[z], calls[x, z]"#
                 let mut nodes: Vec<PathNode> = Vec::with_capacity(chain.len());
                 for (i, id) in chain.iter().enumerate() {
                     let mut n = meta.get(id).cloned().unwrap_or_else(|| PathNode {
-                        id: id.clone(), label: id.clone(), file: String::new(), line: 0,
-                        kind: "?".to_string(), edge_to_next: None, confidence: None,
+                        id: id.clone(),
+                        label: id.clone(),
+                        file: String::new(),
+                        line: 0,
+                        kind: "?".to_string(),
+                        edge_to_next: None,
+                        confidence: None,
                     });
                     if let Some(nxt) = chain.get(i + 1) {
                         if let Some((k, c)) = edge_kind.get(&(id.clone(), nxt.clone())) {
@@ -1451,7 +1516,11 @@ reach[x] := reach[z], calls[x, z]"#
                 }
                 let hops = nodes.len() - 1;
                 let alt = npaths.get(target).copied().unwrap_or(1).saturating_sub(1);
-                return Ok(Some(PathHit { nodes, hops, equal_alternatives: alt }));
+                return Ok(Some(PathHit {
+                    nodes,
+                    hops,
+                    equal_alternatives: alt,
+                }));
             }
             if next.is_empty() {
                 break;
@@ -1513,10 +1582,10 @@ reach[x] := reach[z], calls[x, z]"#
         )?;
         let mut sym_file: HashMap<String, String> = HashMap::new(); // id → file
         let mut name_files: HashMap<String, Vec<String>> = HashMap::new(); // name → files
-        // name → (id, kind, file, start_line) of its FIRST definition, ordered
-        // like `find_symbol` (file, start_line, id) — the god-node loop below
-        // resolves representatives from this already-loaded table instead of
-        // issuing one `find_symbol` DB query per candidate name.
+                                                                           // name → (id, kind, file, start_line) of its FIRST definition, ordered
+                                                                           // like `find_symbol` (file, start_line, id) — the god-node loop below
+                                                                           // resolves representatives from this already-loaded table instead of
+                                                                           // issuing one `find_symbol` DB query per candidate name.
         let mut first_def: HashMap<String, (String, String, String, i64)> = HashMap::new();
         for r in &sym_rows.rows {
             let id = cell_str(r, 0);
@@ -1559,17 +1628,30 @@ reach[x] := reach[z], calls[x, z]"#
         // built from call edges (caller file ↔ callee file) and resolved imports.
         let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
         let mut pair_kind: HashMap<(String, String), &'static str> = HashMap::new();
-        let link = |a: &str, b: &str, kind: &'static str,
-                        adj: &mut HashMap<String, HashSet<String>>,
-                        pair_kind: &mut HashMap<(String, String), &'static str>| {
+        let link = |a: &str,
+                    b: &str,
+                    kind: &'static str,
+                    adj: &mut HashMap<String, HashSet<String>>,
+                    pair_kind: &mut HashMap<(String, String), &'static str>| {
             if a == b {
                 return;
             }
             adj.entry(a.to_string()).or_default().insert(b.to_string());
             adj.entry(b.to_string()).or_default().insert(a.to_string());
-            let key = if a < b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) };
+            let key = if a < b {
+                (a.to_string(), b.to_string())
+            } else {
+                (b.to_string(), a.to_string())
+            };
             // Prefer to remember an import link over a call link when both exist.
-            pair_kind.entry(key).and_modify(|k| { if kind == "import" { *k = "import"; } }).or_insert(kind);
+            pair_kind
+                .entry(key)
+                .and_modify(|k| {
+                    if kind == "import" {
+                        *k = "import";
+                    }
+                })
+                .or_insert(kind);
         };
 
         // Call edges → caller file ↔ each callee-name's file(s). Also inbound
@@ -1584,7 +1666,9 @@ reach[x] := reach[z], calls[x, z]"#
             let src = cell_str(r, 0);
             let dst = cell_str(r, 1);
             *inbound_calls.entry(dst.clone()).or_default() += 1;
-            let Some(caller_file) = sym_file.get(&src) else { continue };
+            let Some(caller_file) = sym_file.get(&src) else {
+                continue;
+            };
             if let Some(files) = name_files.get(&dst) {
                 for cf in files {
                     link(caller_file, cf, "call", &mut adj, &mut pair_kind);
@@ -1610,7 +1694,8 @@ reach[x] := reach[z], calls[x, z]"#
         // ── Label propagation (deterministic, id-sorted, bounded) ──
         let mut files: Vec<String> = adj.keys().cloned().collect();
         files.sort();
-        let mut label: HashMap<String, String> = files.iter().map(|f| (f.clone(), f.clone())).collect();
+        let mut label: HashMap<String, String> =
+            files.iter().map(|f| (f.clone(), f.clone())).collect();
         const MAX_ITERS: usize = 20;
         for _ in 0..MAX_ITERS {
             let mut changed = false;
@@ -1651,8 +1736,11 @@ reach[x] := reach[z], calls[x, z]"#
             }
         }
         // File centrality → hub selection + a score map.
-        let centrality: HashMap<String, u64> =
-            self.file_centrality(usize::MAX).unwrap_or_default().into_iter().collect();
+        let centrality: HashMap<String, u64> = self
+            .file_centrality(usize::MAX)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         let mut communities: Vec<Vec<String>> = groups
             .into_values()
@@ -1673,7 +1761,10 @@ reach[x] := reach[z], calls[x, z]"#
             let hub = members
                 .iter()
                 .max_by(|a, b| {
-                    centrality.get(*a).copied().unwrap_or(0)
+                    centrality
+                        .get(*a)
+                        .copied()
+                        .unwrap_or(0)
                         .cmp(&centrality.get(*b).copied().unwrap_or(0))
                         .then_with(|| b.cmp(a))
                 })
@@ -1696,21 +1787,35 @@ reach[x] := reach[z], calls[x, z]"#
         let mut cross_count: HashMap<(String, String), usize> = HashMap::new();
         let mut candidates: Vec<((String, String), &'static str, String, String)> = Vec::new();
         for ((a, b), kind) in &pair_kind {
-            let (Some(ca), Some(cb)) = (file_comm.get(a), file_comm.get(b)) else { continue };
+            let (Some(ca), Some(cb)) = (file_comm.get(a), file_comm.get(b)) else {
+                continue;
+            };
             if ca == cb {
                 continue;
             }
-            let cpair = if ca < cb { (ca.clone(), cb.clone()) } else { (cb.clone(), ca.clone()) };
+            let cpair = if ca < cb {
+                (ca.clone(), cb.clone())
+            } else {
+                (cb.clone(), ca.clone())
+            };
             *cross_count.entry(cpair).or_default() += 1;
             candidates.push(((a.clone(), b.clone()), kind, ca.clone(), cb.clone()));
         }
         candidates.sort_by(|x, y| {
             let cx = {
-                let k = if x.2 < x.3 { (x.2.clone(), x.3.clone()) } else { (x.3.clone(), x.2.clone()) };
+                let k = if x.2 < x.3 {
+                    (x.2.clone(), x.3.clone())
+                } else {
+                    (x.3.clone(), x.2.clone())
+                };
                 cross_count.get(&k).copied().unwrap_or(0)
             };
             let cy = {
-                let k = if y.2 < y.3 { (y.2.clone(), y.3.clone()) } else { (y.3.clone(), y.2.clone()) };
+                let k = if y.2 < y.3 {
+                    (y.2.clone(), y.3.clone())
+                } else {
+                    (y.3.clone(), y.2.clone())
+                };
                 cross_count.get(&k).copied().unwrap_or(0)
             };
             cx.cmp(&cy).then_with(|| x.0.cmp(&y.0))
@@ -1758,7 +1863,11 @@ reach[x] := reach[z], calls[x, z]"#
         god.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.label.cmp(&b.label)));
         god.truncate(max_rows);
 
-        Ok(ArchReport { god_nodes: god, subsystems, surprising })
+        Ok(ArchReport {
+            god_nodes: god,
+            subsystems,
+            surprising,
+        })
     }
 
     /// V15 Feature 4: a bounded subgraph for the Graph View tab — FILE-level
@@ -1827,7 +1936,9 @@ reach[x] := reach[z], calls[x, z]"#
         for (mut e, _) in weighted {
             let su = used.get(&e.src).copied().unwrap_or(0);
             let du = used.get(&e.dst).copied().unwrap_or(0);
-            if drawn_count < max_edges && (su < VIZ_NEIGHBORS_PER_NODE || du < VIZ_NEIGHBORS_PER_NODE) {
+            if drawn_count < max_edges
+                && (su < VIZ_NEIGHBORS_PER_NODE || du < VIZ_NEIGHBORS_PER_NODE)
+            {
                 e.drawn = true;
                 drawn_count += 1;
                 *used.entry(e.src.clone()).or_default() += 1;
@@ -1836,7 +1947,10 @@ reach[x] := reach[z], calls[x, z]"#
             final_edges.push(e);
         }
 
-        Ok(VizGraph { nodes, edges: final_edges })
+        Ok(VizGraph {
+            nodes,
+            edges: final_edges,
+        })
     }
 
     /// Workbench ⌖ support: per-file Graph View presence for a batch of
@@ -1849,8 +1963,16 @@ reach[x] := reach[z], calls[x, z]"#
         Ok(paths
             .iter()
             .map(|p| match meta.get(&format!("file:{p}")) {
-                Some(n) => VizFileStatus { path: p.clone(), indexed: true, degree: n.degree },
-                None => VizFileStatus { path: p.clone(), indexed: false, degree: 0 },
+                Some(n) => VizFileStatus {
+                    path: p.clone(),
+                    indexed: true,
+                    degree: n.degree,
+                },
+                None => VizFileStatus {
+                    path: p.clone(),
+                    indexed: false,
+                    degree: 0,
+                },
             })
             .collect())
     }
@@ -1961,7 +2083,14 @@ reach[x] := reach[z], calls[x, z]"#
             let id = format!("file:{path}");
             meta.insert(
                 id.clone(),
-                VizNode { id, label: path.clone(), file: path.clone(), kind: "file".to_string(), degree: 0, subsystem: String::new() },
+                VizNode {
+                    id,
+                    label: path.clone(),
+                    file: path.clone(),
+                    kind: "file".to_string(),
+                    degree: 0,
+                    subsystem: String::new(),
+                },
             );
             known_files.insert(path);
         }
@@ -1976,7 +2105,14 @@ reach[x] := reach[z], calls[x, z]"#
         // symbol pairs between the same two files) collapse into one edge
         // that keeps the best confidence seen.
         let mut edge_ix: HashMap<(String, String, &'static str), usize> = HashMap::new();
-        let push_edge = |edges: &mut Vec<VizEdge>, weights: &mut Vec<u64>, edge_ix: &mut HashMap<(String, String, &'static str), usize>, meta: &mut HashMap<String, VizNode>, a: &str, b: &str, kind: &'static str, conf: Confidence| {
+        let push_edge = |edges: &mut Vec<VizEdge>,
+                         weights: &mut Vec<u64>,
+                         edge_ix: &mut HashMap<(String, String, &'static str), usize>,
+                         meta: &mut HashMap<String, VizNode>,
+                         a: &str,
+                         b: &str,
+                         kind: &'static str,
+                         conf: Confidence| {
             if a == b || !meta.contains_key(a) || !meta.contains_key(b) {
                 return;
             }
@@ -1988,9 +2124,19 @@ reach[x] := reach[z], calls[x, z]"#
                 return;
             }
             edge_ix.insert((a.to_string(), b.to_string(), kind), edges.len());
-            if let Some(n) = meta.get_mut(a) { n.degree += 1; }
-            if let Some(n) = meta.get_mut(b) { n.degree += 1; }
-            edges.push(VizEdge { src: a.to_string(), dst: b.to_string(), kind: kind.to_string(), confidence: conf.tag().to_string(), drawn: false });
+            if let Some(n) = meta.get_mut(a) {
+                n.degree += 1;
+            }
+            if let Some(n) = meta.get_mut(b) {
+                n.degree += 1;
+            }
+            edges.push(VizEdge {
+                src: a.to_string(),
+                dst: b.to_string(),
+                kind: kind.to_string(),
+                confidence: conf.tag().to_string(),
+                drawn: false,
+            });
             weights.push(1);
         };
 
@@ -2003,15 +2149,30 @@ reach[x] := reach[z], calls[x, z]"#
         for r in &call_rows.rows {
             let src = cell_str(r, 0);
             let dst = cell_str(r, 1);
-            let Some(from_file) = sym_file.get(&src) else { continue };
-            let conf = if multi.contains(&dst) { Confidence::Ambiguous } else { Confidence::from_tag(&cell_str(r, 2)) };
+            let Some(from_file) = sym_file.get(&src) else {
+                continue;
+            };
+            let conf = if multi.contains(&dst) {
+                Confidence::Ambiguous
+            } else {
+                Confidence::from_tag(&cell_str(r, 2))
+            };
             if let Some(files) = name_to_files.get(&dst) {
                 let mut files: Vec<&String> = files.iter().collect();
                 files.sort(); // deterministic pick when the fan-out is capped
                 files.dedup();
                 let from_id = format!("file:{from_file}");
                 for callee_file in files.into_iter().take(VIZ_CALL_FANOUT_MAX) {
-                    push_edge(&mut edges, &mut weights, &mut edge_ix, &mut meta, &from_id, &format!("file:{callee_file}"), "call", conf);
+                    push_edge(
+                        &mut edges,
+                        &mut weights,
+                        &mut edge_ix,
+                        &mut meta,
+                        &from_id,
+                        &format!("file:{callee_file}"),
+                        "call",
+                        conf,
+                    );
                 }
             }
         }
@@ -2027,7 +2188,16 @@ reach[x] := reach[z], calls[x, z]"#
             let lang = Lang::from_tag(file_lang.get(&from_file).map(|s| s.as_str()).unwrap_or(""));
             if let Some(target) = resolve_import(lang, &from_file, &module, &known_files) {
                 let conf = Confidence::from_tag(&cell_str(r, 2));
-                push_edge(&mut edges, &mut weights, &mut edge_ix, &mut meta, &format!("file:{from_file}"), &format!("file:{target}"), "import", conf);
+                push_edge(
+                    &mut edges,
+                    &mut weights,
+                    &mut edge_ix,
+                    &mut meta,
+                    &format!("file:{from_file}"),
+                    &format!("file:{target}"),
+                    "import",
+                    conf,
+                );
             }
         }
 
@@ -2208,7 +2378,11 @@ reach[x] := reach[z], calls[x, z]"#
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         };
         if n > 0 {
             self.run_mut(
@@ -2235,7 +2409,13 @@ reach[x] := reach[z], calls[x, z]"#
     }
 
     /// Upsert a computed digest for `file`, keeping at most ONE row per file.
-    pub fn put_digest(&self, file: &str, content_hash: &str, text: &str, ts_ms: i64) -> AppResult<()> {
+    pub fn put_digest(
+        &self,
+        file: &str,
+        content_hash: &str,
+        text: &str,
+        ts_ms: i64,
+    ) -> AppResult<()> {
         let mut p = BTreeMap::new();
         p.insert("file".to_string(), DataValue::Str(file.into()));
         p.insert("hash".to_string(), DataValue::Str(content_hash.into()));
@@ -2270,7 +2450,12 @@ reach[x] := reach[z], calls[x, z]"#
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
-        Ok(rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64)
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(dv_i64)
+            .unwrap_or(0) as u64)
     }
 
     /// Drop cached digests whose file is no longer indexed (mirrors the doc_vec
@@ -2285,7 +2470,11 @@ reach[x] := reach[z], calls[x, z]"#
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         };
         if n > 0 {
             self.run_mut(
@@ -2465,7 +2654,11 @@ reach[x] := reach[z], calls[x, z]"#
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         };
         let embedded = if self.existing_relations()?.contains("doc_vec") {
             let mut p = BTreeMap::new();
@@ -2475,7 +2668,11 @@ reach[x] := reach[z], calls[x, z]"#
                 p,
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         } else {
             0
         };
@@ -2495,7 +2692,12 @@ reach[x] := reach[z], calls[x, z]"#
     /// stamp `model`/`dim`/`epoch` into the `code_embed_meta` singleton.
     /// Mirrors [`Self::ensure_vector_store`]. Returns `true` on a dim change
     /// (old code vectors dropped — a full code re-embed is due).
-    pub fn ensure_code_vector_store(&self, dim: usize, model: &str, epoch: &str) -> AppResult<bool> {
+    pub fn ensure_code_vector_store(
+        &self,
+        dim: usize,
+        model: &str,
+        epoch: &str,
+    ) -> AppResult<bool> {
         self.ensure_code_meta_relation()?;
         let existing_dim = self.stored_code_dim()?;
         let mut reset = false;
@@ -2561,7 +2763,11 @@ reach[x] := reach[z], calls[x, z]"#
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         };
         if n > 0 {
             self.run_mut(
@@ -2751,7 +2957,11 @@ reach[x] := reach[z], calls[x, z]"#
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         };
         let embedded = if self.existing_relations()?.contains("code_vec") {
             let mut p = BTreeMap::new();
@@ -2761,7 +2971,11 @@ reach[x] := reach[z], calls[x, z]"#
                 p,
                 ScriptMutability::Immutable,
             )?;
-            rows.rows.first().and_then(|r| r.first()).map(dv_i64).unwrap_or(0) as u64
+            rows.rows
+                .first()
+                .and_then(|r| r.first())
+                .map(dv_i64)
+                .unwrap_or(0) as u64
         } else {
             0
         };
@@ -2816,7 +3030,11 @@ reach[x] := reach[z], calls[x, z]"#
         Ok(())
     }
 
-    fn run_mut(&self, script: &str, params: BTreeMap<String, DataValue>) -> AppResult<cozo::NamedRows> {
+    fn run_mut(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> AppResult<cozo::NamedRows> {
         self.run(script, params, ScriptMutability::Mutable)
     }
 
@@ -3000,7 +3218,10 @@ impl GraphIndex {
         // empty source has no rows to lose, so create the stage empty in that
         // case (avoids feeding `<- $rows` an empty list).
         if migrated.is_empty() {
-            self.run_mut(&Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE), BTreeMap::new())?;
+            self.run_mut(
+                &Self::usage_stat_create_ddl(Self::USAGE_STAT_STAGE),
+                BTreeMap::new(),
+            )?;
         } else {
             let mut p = BTreeMap::new();
             p.insert("rows".to_string(), DataValue::List(migrated));
@@ -3017,7 +3238,10 @@ impl GraphIndex {
         // fail loudly rather than promote it over the still-intact live data.
         let staged = self.usage_stat_row_count(Self::USAGE_STAT_STAGE)?;
         if staged != expected {
-            self.run_mut(&format!("::remove {}", Self::USAGE_STAT_STAGE), BTreeMap::new())?;
+            self.run_mut(
+                &format!("::remove {}", Self::USAGE_STAT_STAGE),
+                BTreeMap::new(),
+            )?;
             return Err(AppError::Graph(format!(
                 "usage_stat migration stage captured {staged} of {expected} rows; aborting"
             )));
@@ -3060,13 +3284,22 @@ impl GraphIndex {
     /// column. Introspects via `::columns` (its column-name header is `column`),
     /// failing loudly if that shape ever changes rather than mis-migrating.
     fn usage_stat_has_origin(&self) -> AppResult<bool> {
-        let rows = self.run("::columns usage_stat", BTreeMap::new(), ScriptMutability::Immutable)?;
+        let rows = self.run(
+            "::columns usage_stat",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
         let col = rows
             .headers
             .iter()
             .position(|h| h == "column")
-            .ok_or_else(|| AppError::Graph("::columns result has no 'column' column".to_string()))?;
-        Ok(rows.rows.iter().any(|r| r.get(col).map(dv_string).as_deref() == Some("origin")))
+            .ok_or_else(|| {
+                AppError::Graph("::columns result has no 'column' column".to_string())
+            })?;
+        Ok(rows
+            .rows
+            .iter()
+            .any(|r| r.get(col).map(dv_string).as_deref() == Some("origin")))
     }
 
     /// Append one memory event for `session_id`, upserting the session's
@@ -3375,12 +3608,13 @@ impl GraphIndex {
         )?;
         let mut sums: HashMap<String, u64> = HashMap::new();
         for r in &rows.rows {
-            let Some(model) = cell_str_opt(r, 1) else { continue };
+            let Some(model) = cell_str_opt(r, 1) else {
+                continue;
+            };
             if model == "<synthetic>" {
                 continue;
             }
-            let toks: u64 =
-                (2..=5).map(|i| cell_i64(r, i).max(0) as u64).sum();
+            let toks: u64 = (2..=5).map(|i| cell_i64(r, i).max(0) as u64).sum();
             *sums.entry(model).or_insert(0) += toks;
         }
         let mut out: Vec<(String, u64)> = sums.into_iter().collect();
@@ -3413,7 +3647,9 @@ impl GraphIndex {
         }
         let mut map: HashMap<String, Agg> = HashMap::new();
         for r in &rows.rows {
-            let Some(model) = cell_str_opt(r, 1) else { continue };
+            let Some(model) = cell_str_opt(r, 1) else {
+                continue;
+            };
             if model == "<synthetic>" {
                 continue;
             }
@@ -3421,9 +3657,10 @@ impl GraphIndex {
             let out_tok = cell_i64(r, 3).max(0) as u64;
             let cache_read = cell_i64(r, 4).max(0) as u64;
             let cache_make = cell_i64(r, 5).max(0) as u64;
-            let e = map
-                .entry(model)
-                .or_insert_with(|| Agg { totals: UsageTotals::default(), origins: OriginSplit::default() });
+            let e = map.entry(model).or_insert_with(|| Agg {
+                totals: UsageTotals::default(),
+                origins: OriginSplit::default(),
+            });
             e.totals.in_tok += in_tok;
             e.totals.out_tok += out_tok;
             e.totals.cache_read += cache_read;
@@ -3436,7 +3673,11 @@ impl GraphIndex {
         }
         let mut out: Vec<ModelUsage> = map
             .into_iter()
-            .map(|(model, a)| ModelUsage { model, totals: a.totals, origins: a.origins })
+            .map(|(model, a)| ModelUsage {
+                model,
+                totals: a.totals,
+                origins: a.origins,
+            })
             .collect();
         out.sort_by(|a, b| {
             let ta = a.totals.in_tok + a.totals.out_tok + a.totals.cache_read + a.totals.cache_make;
@@ -3532,7 +3773,10 @@ impl GraphIndex {
     /// built for one id so the `graph_session_usage` command doesn't scan every
     /// session to render one.
     pub fn usage_session_row(&self, session_id: &str) -> AppResult<Option<SessionUsageRow>> {
-        let Some(info) = self.mem_sessions()?.into_iter().find(|s| s.session_id == session_id)
+        let Some(info) = self
+            .mem_sessions()?
+            .into_iter()
+            .find(|s| s.session_id == session_id)
         else {
             return Ok(None);
         };
@@ -3547,8 +3791,11 @@ impl GraphIndex {
         let models = self.usage_session_models(&s.session_id)?;
         let tool_chars: u64 = per_tool.iter().map(|(_, c)| *c).sum();
         let denom = totals.cache_read + totals.in_tok;
-        let cache_hit_ratio =
-            if denom > 0 { totals.cache_read as f64 / denom as f64 } else { 0.0 };
+        let cache_hit_ratio = if denom > 0 {
+            totals.cache_read as f64 / denom as f64
+        } else {
+            0.0
+        };
         // V24 Phase E: "est" means "no real token accounting", derived from
         // whether ANY turn was recorded — not from the summed token totals. A
         // recorded turn (Claude, or OpenCode once its plugin forwards usage in
@@ -3605,13 +3852,16 @@ impl GraphIndex {
 
     /// Recorded commit hashes for EVERY session in one scan (session_id →
     /// hashes) — the Sessions card's per-row counts want all of them at once.
-    pub fn session_commit_hashes_all(&self) -> AppResult<std::collections::HashMap<String, Vec<String>>> {
+    pub fn session_commit_hashes_all(
+        &self,
+    ) -> AppResult<std::collections::HashMap<String, Vec<String>>> {
         let rows = self.run(
             "?[session_id, hash] := *session_commit{session_id, hash}",
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
-        let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for r in &rows.rows {
             out.entry(cell_str(r, 0)).or_default().push(cell_str(r, 1));
         }
@@ -3718,7 +3968,10 @@ impl GraphIndex {
             total += 1;
             let key = (cell_str(r, 0), cell_str(r, 1));
             let remind_ts = cell_i64(r, 2);
-            if reads_by_key.get(&key).is_some_and(|ts| ts.iter().any(|&t| t > remind_ts)) {
+            if reads_by_key
+                .get(&key)
+                .is_some_and(|ts| ts.iter().any(|&t| t > remind_ts))
+            {
                 reread += 1;
             }
         }
@@ -3805,7 +4058,10 @@ impl GraphIndex {
             if !window.contains(&sid) {
                 continue;
             }
-            reads_by_key.entry((sid, cell_str(r, 1))).or_default().push(cell_i64(r, 2));
+            reads_by_key
+                .entry((sid, cell_str(r, 1)))
+                .or_default()
+                .push(cell_i64(r, 2));
         }
         let mut edits_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
         for r in &edits.rows {
@@ -3813,7 +4069,10 @@ impl GraphIndex {
             if !window.contains(&sid) {
                 continue;
             }
-            edits_by_key.entry((sid, cell_str(r, 1))).or_default().push(cell_i64(r, 2));
+            edits_by_key
+                .entry((sid, cell_str(r, 1)))
+                .or_default()
+                .push(cell_i64(r, 2));
         }
 
         let mut pairs = 0u64;
@@ -3907,7 +4166,9 @@ impl GraphIndex {
         }
         let mut read_counts: HashMap<(String, String), u64> = HashMap::new();
         for r in &reads.rows {
-            *read_counts.entry((cell_str(r, 0), cell_str(r, 1))).or_default() += 1;
+            *read_counts
+                .entry((cell_str(r, 0), cell_str(r, 1)))
+                .or_default() += 1;
         }
         let spans = self.run(
             "?[file, l] := *symbol{file, end_line: l}",
@@ -3926,9 +4187,7 @@ impl GraphIndex {
         let min = min_lines as i64;
         Ok(read_counts
             .into_iter()
-            .filter(|((_, path), n)| {
-                *n >= 2 && max_line.get(path).is_some_and(|&l| l >= min)
-            })
+            .filter(|((_, path), n)| *n >= 2 && max_line.get(path).is_some_and(|&l| l >= min))
             .count() as u64)
     }
 
@@ -3955,8 +4214,10 @@ impl GraphIndex {
             entry.0 += cell_i64(r, 2).max(0) as u64;
             entry.1 += 1;
         }
-        let mut out: Vec<(String, u64, u64)> =
-            sums.into_iter().map(|(tool, (chars, calls))| (tool, chars, calls)).collect();
+        let mut out: Vec<(String, u64, u64)> = sums
+            .into_iter()
+            .map(|(tool, (chars, calls))| (tool, chars, calls))
+            .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         Ok(out)
     }
@@ -4078,9 +4339,17 @@ impl GraphIndex {
             p.clone(),
             ScriptMutability::Immutable,
         )?;
-        let Some(r) = rows.rows.first() else { return Ok(()) };
-        p.insert("sid".to_string(), DataValue::Str(cell_str(r, 0).as_str().into()));
-        p.insert("text".to_string(), DataValue::Str(cell_str(r, 1).as_str().into()));
+        let Some(r) = rows.rows.first() else {
+            return Ok(());
+        };
+        p.insert(
+            "sid".to_string(),
+            DataValue::Str(cell_str(r, 0).as_str().into()),
+        );
+        p.insert(
+            "text".to_string(),
+            DataValue::Str(cell_str(r, 1).as_str().into()),
+        );
         p.insert("ts".to_string(), DataValue::Num(Num::Int(cell_i64(r, 2))));
         self.run_mut(
             "?[note_id, session_id, text, ts_ms, pinned] <- [[$nid, $sid, $text, $ts, $pin]]\n\
@@ -4235,7 +4504,11 @@ impl GraphIndex {
 
     /// Live (non-archived) project facts unless `include_archived`, pinned
     /// first then newest, bounded to `max`.
-    pub fn list_project_facts(&self, include_archived: bool, max: usize) -> AppResult<Vec<ProjectFact>> {
+    pub fn list_project_facts(
+        &self,
+        include_archived: bool,
+        max: usize,
+    ) -> AppResult<Vec<ProjectFact>> {
         let script = if include_archived {
             "?[fact_id, text, source_session, ts_ms, pinned, archived] := \
                 *project_fact{fact_id, text, source_session, ts_ms, pinned, archived}"
@@ -4284,7 +4557,9 @@ impl GraphIndex {
             p,
             ScriptMutability::Immutable,
         )?;
-        let Some(r) = rows.rows.first() else { return Ok(()) };
+        let Some(r) = rows.rows.first() else {
+            return Ok(());
+        };
         let mut fact = ProjectFact {
             fact_id: fact_id.to_string(),
             text: cell_str(r, 0),
@@ -4377,7 +4652,10 @@ impl GraphIndex {
             .filter(|r| cell_bool(r, 1))
             .map(|r| cell_str(r, 0))
             .collect();
-        Ok(idle.into_iter().filter(|s| !distilled.contains(s)).collect())
+        Ok(idle
+            .into_iter()
+            .filter(|s| !distilled.contains(s))
+            .collect())
     }
 
     // ── V12 Phase D: git churn (`commit_touch`) ──────────────────────────
@@ -4451,7 +4729,10 @@ impl GraphIndex {
             return Ok(Vec::new());
         }
         let mut p = BTreeMap::new();
-        p.insert("max".to_string(), int(max.max(1).min(u32::MAX as usize) as u32));
+        p.insert(
+            "max".to_string(),
+            int(max.max(1).min(u32::MAX as usize) as u32),
+        );
         let rows = self.run(
             "?[file, last_ts, last_subject, touches_90d] := \
                 *commit_touch{file, last_ts, last_subject, touches_90d}\n\
@@ -4565,7 +4846,11 @@ fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
         // session that was evicted would hit `is_session_distilled == true` and
         // the idle sweep would skip distilling all its NEW work.
         tx_run(tx, "?[session_id] := *session_distilled{session_id}, session_id == $sid\n:rm session_distilled {session_id}", p.clone())?;
-        tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
+        tx_run(
+            tx,
+            "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}",
+            p,
+        )?;
     }
     Ok(())
 }
@@ -4600,7 +4885,9 @@ fn archive_fact_in_tx(tx: &MultiTransaction, fact_id: &str) -> AppResult<()> {
             *project_fact{fact_id, text, source_session, ts_ms, pinned}, fact_id == $fid",
         p,
     )?;
-    let Some(r) = rows.rows.first() else { return Ok(()) };
+    let Some(r) = rows.rows.first() else {
+        return Ok(());
+    };
     let row = DataValue::List(vec![
         DataValue::Str(fact_id.into()),
         DataValue::Str(cell_str(r, 0).as_str().into()),
@@ -4655,7 +4942,11 @@ fn remove_file_in_tx(tx: &MultiTransaction, file: &str) -> AppResult<Vec<String>
     // report ghosts of a symbol that no longer exists. External/unresolved
     // call targets (stdlib names that never had a symbol) are NOT in this set,
     // so they're left untouched.
-    let defined = tx_run(tx, "?[name] := *symbol{file, name}, file == $file", p.clone())?;
+    let defined = tx_run(
+        tx,
+        "?[name] := *symbol{file, name}, file == $file",
+        p.clone(),
+    )?;
     let defined_names: Vec<String> = defined.rows.iter().map(|r| cell_str(r, 0)).collect();
 
     tx_run(
@@ -4796,7 +5087,12 @@ fn rows_to_symbols(rows: &cozo::NamedRows) -> Vec<SymbolHit> {
 /// Attach the effective confidence to an edge-bearing symbol hit: `Ambiguous`
 /// when `ambiguous` (the name was multi-candidate), otherwise the stored edge
 /// confidence read from column `conf_col`.
-fn with_row_confidence(mut hit: SymbolHit, r: &[DataValue], conf_col: usize, ambiguous: bool) -> SymbolHit {
+fn with_row_confidence(
+    mut hit: SymbolHit,
+    r: &[DataValue],
+    conf_col: usize,
+    ambiguous: bool,
+) -> SymbolHit {
     hit.confidence = Some(if ambiguous {
         Confidence::Ambiguous
     } else {
@@ -4818,8 +5114,16 @@ fn row_to_symbol(r: &[DataValue]) -> SymbolHit {
         file: cell_str(r, 3),
         start_line,
         signature: cell_str(r, 5),
-        visibility: if r.len() > 6 { cell_str(r, 6) } else { "unknown".to_string() },
-        end_line: if r.len() > 7 { cell_i64(r, 7) as u32 } else { start_line },
+        visibility: if r.len() > 6 {
+            cell_str(r, 6)
+        } else {
+            "unknown".to_string()
+        },
+        end_line: if r.len() > 7 {
+            cell_i64(r, 7) as u32
+        } else {
+            start_line
+        },
         is_test: cell_bool(r, 8),
         // A plain definition lookup involves no edge — callers/callees set this
         // explicitly from the surfacing edge's confidence.
@@ -4878,14 +5182,23 @@ fn community_name(files: &[String]) -> String {
     if !prefix.is_empty() {
         return format!("{}/", prefix.join("/"));
     }
-    files.iter().min_by_key(|f| f.len()).cloned().unwrap_or_default()
+    files
+        .iter()
+        .min_by_key(|f| f.len())
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Best-effort resolution of an import's raw module string to a concrete indexed
 /// file, per language. Returns `None` (dropped by the cycle detector) for
 /// external/unresolvable modules or languages without a resolver. Paths are
 /// project-relative with `/` separators (as stored on graph rows).
-fn resolve_import(lang: Lang, from_file: &str, module: &str, known: &HashSet<String>) -> Option<String> {
+fn resolve_import(
+    lang: Lang,
+    from_file: &str,
+    module: &str,
+    known: &HashSet<String>,
+) -> Option<String> {
     match lang {
         Lang::TypeScript | Lang::JavaScript => resolve_relative_js(from_file, module, known),
         Lang::Python => resolve_python(from_file, module, known),
@@ -5116,15 +5429,23 @@ pub struct Point { x: i32 }
         // V11 Phase A: end_line is projected and covers the body.
         assert!(hits[0].end_line >= hits[0].start_line);
         // symbol_at resolves the smallest enclosing definition for a body line.
-        let at = idx.symbol_at("src/geo.rs", hits[0].start_line).expect("symbol_at");
+        let at = idx
+            .symbol_at("src/geo.rs", hits[0].start_line)
+            .expect("symbol_at");
         assert_eq!(at.as_ref().map(|s| s.name.as_str()), Some("add"));
         // The blank first line encloses no definition.
-        assert!(idx.symbol_at("src/geo.rs", 1).expect("symbol_at blank").is_none());
+        assert!(idx
+            .symbol_at("src/geo.rs", 1)
+            .expect("symbol_at blank")
+            .is_none());
         // callers_count: add calls helper → helper has ≥1 caller; add has none.
         assert!(idx.callers_count("helper").expect("cc helper") >= 1);
         assert_eq!(idx.callers_count("add").expect("cc add"), 0);
         // stored_file_hash returns the indexed content hash.
-        assert_eq!(idx.stored_file_hash("src/geo.rs").expect("hash"), Some(fg.hash.clone()));
+        assert_eq!(
+            idx.stored_file_hash("src/geo.rs").expect("hash"),
+            Some(fg.hash.clone())
+        );
 
         let stats = idx.stats().expect("stats");
         assert_eq!(stats.files, 1);
@@ -5139,12 +5460,18 @@ pub struct Point { x: i32 }
     fn shortest_path_traces_cross_file_call_chain() {
         let dir = std::env::temp_dir().join(format!("ckg-path-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/a.rs", "pub fn a() { b(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/b.rs", "pub fn b() { c(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/c.rs", "pub fn c() {}\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/a.rs", "pub fn a() { b(); }\n", Lang::Rust))
+            .unwrap();
+        idx.index_file_graph(&parse_file("src/b.rs", "pub fn b() { c(); }\n", Lang::Rust))
+            .unwrap();
+        idx.index_file_graph(&parse_file("src/c.rs", "pub fn c() {}\n", Lang::Rust))
+            .unwrap();
 
         let kinds = [EdgeKind::Call, EdgeKind::Import, EdgeKind::Contains];
-        let hit = idx.shortest_path("a", "c", &kinds, 8, false).unwrap().expect("path a→c");
+        let hit = idx
+            .shortest_path("a", "c", &kinds, 8, false)
+            .unwrap()
+            .expect("path a→c");
         let labels: Vec<&str> = hit.nodes.iter().map(|n| n.label.as_str()).collect();
         assert_eq!(labels, vec!["a", "b", "c"]);
         assert_eq!(hit.hops, 2);
@@ -5154,12 +5481,24 @@ pub struct Point { x: i32 }
         assert_eq!(hit.equal_alternatives, 0);
 
         // Directed: no reverse path within bound; symmetric finds it.
-        assert!(idx.shortest_path("c", "a", &kinds, 8, false).unwrap().is_none());
-        assert!(idx.shortest_path("c", "a", &kinds, 8, true).unwrap().is_some());
+        assert!(idx
+            .shortest_path("c", "a", &kinds, 8, false)
+            .unwrap()
+            .is_none());
+        assert!(idx
+            .shortest_path("c", "a", &kinds, 8, true)
+            .unwrap()
+            .is_some());
         // Unresolvable endpoint → None.
-        assert!(idx.shortest_path("a", "nope", &kinds, 8, false).unwrap().is_none());
+        assert!(idx
+            .shortest_path("a", "nope", &kinds, 8, false)
+            .unwrap()
+            .is_none());
         // Bound too small → None.
-        assert!(idx.shortest_path("a", "c", &kinds, 1, false).unwrap().is_none());
+        assert!(idx
+            .shortest_path("a", "c", &kinds, 1, false)
+            .unwrap()
+            .is_none());
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5183,16 +5522,30 @@ pub struct Point { x: i32 }
             ))
             .unwrap();
         }
-        idx.index_file_graph(&parse_file("src/main.rs", "pub fn caller() { dup(); }\n", Lang::Rust))
-            .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/main.rs",
+            "pub fn caller() { dup(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
 
         let g = idx.viz_snapshot(100).expect("viz");
         // File-level graph: no symbol nodes, no contains edges, and the call
         // edges connect file:… ids.
-        assert!(g.nodes.iter().all(|n| n.kind == "file"), "nodes: {:?}", g.nodes);
-        assert!(g.edges.iter().all(|e| e.kind != "contains"), "edges: {:?}", g.edges);
+        assert!(
+            g.nodes.iter().all(|n| n.kind == "file"),
+            "nodes: {:?}",
+            g.nodes
+        );
+        assert!(
+            g.edges.iter().all(|e| e.kind != "contains"),
+            "edges: {:?}",
+            g.edges
+        );
         let calls: Vec<_> = g.edges.iter().filter(|e| e.kind == "call").collect();
-        assert!(calls.iter().all(|e| e.src.starts_with("file:") && e.dst.starts_with("file:")));
+        assert!(calls
+            .iter()
+            .all(|e| e.src.starts_with("file:") && e.dst.starts_with("file:")));
         assert_eq!(
             calls.len(),
             VIZ_CALL_FANOUT_MAX,
@@ -5221,11 +5574,28 @@ pub struct Point { x: i32 }
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // hub is called from three files (degree 3); leaf has exactly one
         // edge (its call to hub); lone is indexed but fully disconnected.
-        idx.index_file_graph(&parse_file("src/hub.rs", "pub fn hub() {}\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/s1.rs", "pub fn s1() { hub(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/s2.rs", "pub fn s2() { hub(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/leaf.rs", "pub fn leaf() { hub(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/lone.rs", "pub fn lone() {}\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file("src/hub.rs", "pub fn hub() {}\n", Lang::Rust))
+            .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/s1.rs",
+            "pub fn s1() { hub(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/s2.rs",
+            "pub fn s2() { hub(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/leaf.rs",
+            "pub fn leaf() { hub(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
+        idx.index_file_graph(&parse_file("src/lone.rs", "pub fn lone() {}\n", Lang::Rust))
+            .unwrap();
 
         // A max_nodes=1 snapshot keeps only the hub — leaf falls off the cut.
         let snap = idx.viz_snapshot(1).expect("snapshot");
@@ -5233,12 +5603,28 @@ pub struct Point { x: i32 }
         assert_eq!(snap.nodes[0].id, "file:src/hub.rs");
 
         let status = idx
-            .viz_file_status(&["src/leaf.rs".into(), "src/lone.rs".into(), "src/nope.rs".into()])
+            .viz_file_status(&[
+                "src/leaf.rs".into(),
+                "src/lone.rs".into(),
+                "src/nope.rs".into(),
+            ])
             .expect("status");
         assert_eq!(status.len(), 3);
-        assert!(status[0].indexed && status[0].degree >= 1, "leaf: {:?}", status[0]);
-        assert!(status[1].indexed && status[1].degree == 0, "lone: {:?}", status[1]);
-        assert!(!status[2].indexed && status[2].degree == 0, "nope: {:?}", status[2]);
+        assert!(
+            status[0].indexed && status[0].degree >= 1,
+            "leaf: {:?}",
+            status[0]
+        );
+        assert!(
+            status[1].indexed && status[1].degree == 0,
+            "lone: {:?}",
+            status[1]
+        );
+        assert!(
+            !status[2].indexed && status[2].degree == 0,
+            "nope: {:?}",
+            status[2]
+        );
 
         // Ego of the dropped file: itself first, its neighbor, one drawn edge.
         let ego = idx.viz_ego("src/leaf.rs").expect("ego");
@@ -5252,7 +5638,11 @@ pub struct Point { x: i32 }
         let lone = idx.viz_ego("src/lone.rs").expect("ego lone");
         assert_eq!(lone.nodes.len(), 1);
         assert!(lone.edges.is_empty());
-        assert!(idx.viz_ego("src/nope.rs").expect("ego nope").nodes.is_empty());
+        assert!(idx
+            .viz_ego("src/nope.rs")
+            .expect("ego nope")
+            .nodes
+            .is_empty());
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5263,16 +5653,42 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-arch-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // Two cohesive directories, each internally coupled, with no cross edges.
-        idx.index_file_graph(&parse_file("src/graph/a.rs", "pub fn ga() { gb(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/graph/b.rs", "pub fn gb() { ga(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/ui/x.rs", "pub fn ux() { uy(); }\n", Lang::Rust)).unwrap();
-        idx.index_file_graph(&parse_file("src/ui/y.rs", "pub fn uy() { ux(); }\n", Lang::Rust)).unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/graph/a.rs",
+            "pub fn ga() { gb(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/graph/b.rs",
+            "pub fn gb() { ga(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/ui/x.rs",
+            "pub fn ux() { uy(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
+        idx.index_file_graph(&parse_file(
+            "src/ui/y.rs",
+            "pub fn uy() { ux(); }\n",
+            Lang::Rust,
+        ))
+        .unwrap();
 
         let report = idx.architecture(12, 2, 50).expect("arch");
         assert!(!report.god_nodes.is_empty(), "expected hubs");
         let names: Vec<&str> = report.subsystems.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.iter().any(|n| n.contains("src/graph")), "communities: {names:?}");
-        assert!(names.iter().any(|n| n.contains("src/ui")), "communities: {names:?}");
+        assert!(
+            names.iter().any(|n| n.contains("src/graph")),
+            "communities: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("src/ui")),
+            "communities: {names:?}"
+        );
         // Determinism: a second run yields the identical report.
         assert_eq!(idx.architecture(12, 2, 50).expect("arch2"), report);
         drop(idx);
@@ -5288,18 +5704,33 @@ pub struct Point { x: i32 }
 
         // Miss, then hit; a different hash is a miss (stale content).
         assert!(idx.get_digest("src/a.rs", "h1").unwrap().is_none());
-        idx.put_digest("src/a.rs", "h1", "a three line digest", 100).unwrap();
-        assert_eq!(idx.get_digest("src/a.rs", "h1").unwrap().as_deref(), Some("a three line digest"));
+        idx.put_digest("src/a.rs", "h1", "a three line digest", 100)
+            .unwrap();
+        assert_eq!(
+            idx.get_digest("src/a.rs", "h1").unwrap().as_deref(),
+            Some("a three line digest")
+        );
         assert!(idx.get_digest("src/a.rs", "h2").unwrap().is_none());
         assert_eq!(idx.digest_count().unwrap(), 1);
 
         // F11: re-digesting the SAME file under a new hash supersedes the old
         // row rather than leaking it — the count stays 1 and the stale hash is
         // no longer a hit.
-        idx.put_digest("src/a.rs", "h2", "updated digest", 200).unwrap();
-        assert_eq!(idx.digest_count().unwrap(), 1, "one digest per file, not per edit");
-        assert!(idx.get_digest("src/a.rs", "h1").unwrap().is_none(), "old hash superseded");
-        assert_eq!(idx.get_digest("src/a.rs", "h2").unwrap().as_deref(), Some("updated digest"));
+        idx.put_digest("src/a.rs", "h2", "updated digest", 200)
+            .unwrap();
+        assert_eq!(
+            idx.digest_count().unwrap(),
+            1,
+            "one digest per file, not per edit"
+        );
+        assert!(
+            idx.get_digest("src/a.rs", "h1").unwrap().is_none(),
+            "old hash superseded"
+        );
+        assert_eq!(
+            idx.get_digest("src/a.rs", "h2").unwrap().as_deref(),
+            Some("updated digest")
+        );
 
         // A digest for a file no longer indexed is pruned; the live one stays.
         idx.put_digest("gone.rs", "hx", "orphan", 100).unwrap();
@@ -5319,14 +5750,29 @@ pub struct Point { x: i32 }
         // `run` is defined twice in one file; a single inbound call must count
         // ONCE for that file, not once per matching definition (the old
         // count-over-join bug double-counted files with recurring method names).
-        idx.index_file_graph(&parse_file("src/dup.rs", "pub fn run() {}\npub fn run() {}\n", Lang::Rust))
-            .expect("index dup");
-        idx.index_file_graph(&parse_file("src/caller.rs", "pub fn c() { run() }\n", Lang::Rust))
-            .expect("index caller");
+        idx.index_file_graph(&parse_file(
+            "src/dup.rs",
+            "pub fn run() {}\npub fn run() {}\n",
+            Lang::Rust,
+        ))
+        .expect("index dup");
+        idx.index_file_graph(&parse_file(
+            "src/caller.rs",
+            "pub fn c() { run() }\n",
+            Lang::Rust,
+        ))
+        .expect("index caller");
 
         let central = idx.file_centrality(10).expect("centrality");
-        let dup = central.iter().find(|(f, _)| f == "src/dup.rs").map(|(_, c)| *c).unwrap_or(0);
-        assert_eq!(dup, 1, "one call edge counts once despite two same-named defs");
+        let dup = central
+            .iter()
+            .find(|(f, _)| f == "src/dup.rs")
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        assert_eq!(
+            dup, 1,
+            "one call edge counts once despite two same-named defs"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5353,13 +5799,18 @@ pub struct Point { x: i32 }
         // outline lists the file's defs in line order.
         let outline = idx.outline("src/geo.rs").expect("outline");
         assert!(outline.iter().any(|s| s.name == "add"));
-        assert!(outline.windows(2).all(|w| w[0].start_line <= w[1].start_line));
+        assert!(outline
+            .windows(2)
+            .all(|w| w[0].start_line <= w[1].start_line));
 
         // transitive: add -> helper (forward), and helper <- add (backward).
         let reach = idx.transitive("add", true).expect("transitive");
         assert!(reach.contains(&"helper".to_string()));
         let back = idx.transitive("helper", false).expect("transitive back");
-        assert!(back.contains(&"add".to_string()), "add transitively calls helper");
+        assert!(
+            back.contains(&"add".to_string()),
+            "add transitively calls helper"
+        );
 
         // doc search finds the "Adds two numbers." chunk.
         let docs = idx.search_docs("numbers", 10, 200).expect("docs");
@@ -5382,13 +5833,24 @@ pub struct Point { x: i32 }
         ))
         .expect("index");
 
-        let hits = idx.dependents_transitive(&["a".to_string()], 3, 100, None).expect("dependents");
+        let hits = idx
+            .dependents_transitive(&["a".to_string()], 3, 100, None)
+            .expect("dependents");
         assert_eq!(hits.len(), 2, "{hits:?}");
-        let b = hits.iter().find(|h| h.symbol.name == "b").expect("b present");
-        let c = hits.iter().find(|h| h.symbol.name == "c").expect("c present");
+        let b = hits
+            .iter()
+            .find(|h| h.symbol.name == "b")
+            .expect("b present");
+        let c = hits
+            .iter()
+            .find(|h| h.symbol.name == "c")
+            .expect("c present");
         assert_eq!(b.depth, 1);
         assert_eq!(c.depth, 2);
-        assert!(b.approx && c.approx, "every hit is approximate by construction");
+        assert!(
+            b.approx && c.approx,
+            "every hit is approximate by construction"
+        );
         // Sorted by (depth, name): b (depth 1) before c (depth 2).
         assert_eq!(hits[0].symbol.name, "b");
         assert_eq!(hits[1].symbol.name, "c");
@@ -5409,29 +5871,40 @@ pub struct Point { x: i32 }
         .expect("index");
 
         // depth=1 only reaches b, not c.
-        let capped = idx.dependents_transitive(&["a".to_string()], 1, 100, None).expect("dependents");
+        let capped = idx
+            .dependents_transitive(&["a".to_string()], 1, 100, None)
+            .expect("dependents");
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].symbol.name, "b");
 
         // max=1 truncates even though depth would reach both.
-        let truncated = idx.dependents_transitive(&["a".to_string()], 6, 1, None).expect("dependents");
+        let truncated = idx
+            .dependents_transitive(&["a".to_string()], 6, 1, None)
+            .expect("dependents");
         assert_eq!(truncated.len(), 1);
 
         // A depth passed as 0 (or absurdly high) is clamped into 1..=6, not
         // rejected — 0 still finds the direct caller.
-        let clamped = idx.dependents_transitive(&["a".to_string()], 0, 100, None).expect("dependents");
+        let clamped = idx
+            .dependents_transitive(&["a".to_string()], 0, 100, None)
+            .expect("dependents");
         assert_eq!(clamped.len(), 1);
         assert_eq!(clamped[0].symbol.name, "b");
 
         // Empty roots is an empty result, not a query error.
-        assert!(idx.dependents_transitive(&[], 3, 100, None).expect("dependents").is_empty());
+        assert!(idx
+            .dependents_transitive(&[], 3, 100, None)
+            .expect("dependents")
+            .is_empty());
 
         // A root that's also a caller of another root doesn't get reported as
         // its own dependent.
         let both_roots = idx
             .dependents_transitive(&["a".to_string(), "b".to_string()], 3, 100, None)
             .expect("dependents");
-        assert!(!both_roots.iter().any(|h| h.symbol.name == "a" || h.symbol.name == "b"));
+        assert!(!both_roots
+            .iter()
+            .any(|h| h.symbol.name == "a" || h.symbol.name == "b"));
         assert!(both_roots.iter().any(|h| h.symbol.name == "c"));
 
         drop(idx);
@@ -5445,17 +5918,28 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-testsfor-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         let src = "pub fn one() {}\npub fn two() { one() }\n#[test]\nfn test_it() { two() }\npub fn plain_caller() { one() }\n";
-        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/chain.rs", src, Lang::Rust))
+            .expect("index");
 
-        let hits = idx.tests_for(&["one".to_string()], 3, 100).expect("tests_for");
+        let hits = idx
+            .tests_for(&["one".to_string()], 3, 100)
+            .expect("tests_for");
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].name, "test_it");
         assert!(hits[0].is_test);
-        assert!(!hits.iter().any(|s| s.name == "plain_caller"), "non-test caller excluded: {hits:?}");
-        assert!(!hits.iter().any(|s| s.name == "two"), "the intermediate non-test hop is excluded: {hits:?}");
+        assert!(
+            !hits.iter().any(|s| s.name == "plain_caller"),
+            "non-test caller excluded: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|s| s.name == "two"),
+            "the intermediate non-test hop is excluded: {hits:?}"
+        );
 
         // Depth 1 only reaches `two` (not a test), so no tests found yet.
-        let shallow = idx.tests_for(&["one".to_string()], 1, 100).expect("tests_for");
+        let shallow = idx
+            .tests_for(&["one".to_string()], 1, 100)
+            .expect("tests_for");
         assert!(shallow.is_empty(), "{shallow:?}");
 
         drop(idx);
@@ -5475,7 +5959,9 @@ pub struct Point { x: i32 }
             .expect("index md");
 
         let epoch = "test-epoch";
-        let reset = idx.ensure_vector_store(3, "fake-model", epoch).expect("ensure");
+        let reset = idx
+            .ensure_vector_store(3, "fake-model", epoch)
+            .expect("ensure");
         assert!(!reset, "fresh store isn't a reset");
 
         // Every chunk needs a vector initially.
@@ -5498,7 +5984,10 @@ pub struct Point { x: i32 }
 
         // Coverage is now full; nothing left to embed.
         assert_eq!(idx.embedding_coverage(epoch).expect("cov"), (2, 2));
-        assert!(idx.chunks_needing_vectors(epoch, 100).expect("need2").is_empty());
+        assert!(idx
+            .chunks_needing_vectors(epoch, 100)
+            .expect("need2")
+            .is_empty());
 
         // A query near [1,0,0] returns the "Cats" chunk first.
         let hits = idx
@@ -5519,8 +6008,12 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-clr-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
 
-        idx.index_file_graph(&parse_file("docs/a.md", "# Cats\n\nFelines purr.\n", Lang::Markdown))
-            .expect("index");
+        idx.index_file_graph(&parse_file(
+            "docs/a.md",
+            "# Cats\n\nFelines purr.\n",
+            Lang::Markdown,
+        ))
+        .expect("index");
 
         let epoch = "e1";
         idx.ensure_vector_store(3, "m", epoch).expect("ensure");
@@ -5532,7 +6025,8 @@ pub struct Point { x: i32 }
         idx.put_doc_vectors(epoch, &vecs).expect("put");
 
         // The HNSW index is attached now — clearing must not error.
-        idx.clear_vectors().expect("clear_vectors with index attached");
+        idx.clear_vectors()
+            .expect("clear_vectors with index attached");
         assert!(!idx.existing_relations().unwrap().contains("doc_vec"));
 
         // A dim change re-exercises the same drop path inside ensure_vector_store.
@@ -5551,8 +6045,12 @@ pub struct Point { x: i32 }
         // a.rs defines `baz`; b.rs's `bar` calls it.
         idx.index_file_graph(&parse_file("src/a.rs", "pub fn baz() {}\n", Lang::Rust))
             .expect("index a");
-        idx.index_file_graph(&parse_file("src/b.rs", "pub fn bar() { baz() }\n", Lang::Rust))
-            .expect("index b");
+        idx.index_file_graph(&parse_file(
+            "src/b.rs",
+            "pub fn bar() { baz() }\n",
+            Lang::Rust,
+        ))
+        .expect("index b");
         assert!(idx.callers("baz").unwrap().iter().any(|s| s.name == "bar"));
 
         // Delete a.rs: with `baz` gone, the inbound call edge from `bar` must
@@ -5578,8 +6076,12 @@ pub struct Point { x: i32 }
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         idx.index_file_graph(&parse_file("src/a.rs", "pub fn baz() {}\n", Lang::Rust))
             .expect("index a");
-        idx.index_file_graph(&parse_file("src/b.rs", "pub fn bar() { baz() }\n", Lang::Rust))
-            .expect("index b");
+        idx.index_file_graph(&parse_file(
+            "src/b.rs",
+            "pub fn bar() { baz() }\n",
+            Lang::Rust,
+        ))
+        .expect("index b");
         assert!(idx.callers("baz").unwrap().iter().any(|s| s.name == "bar"));
 
         // Re-index a.rs (an ordinary edit): `baz` is still defined, so bar's
@@ -5648,8 +6150,12 @@ pub struct Point { x: i32 }
         // Pruning must NOT force a re-embed of chunks that still exist.
         let dir = std::env::temp_dir().join(format!("ckg-keep-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("docs/a.md", "# Cats\n\nFelines.\n", Lang::Markdown))
-            .expect("index md");
+        idx.index_file_graph(&parse_file(
+            "docs/a.md",
+            "# Cats\n\nFelines.\n",
+            Lang::Markdown,
+        ))
+        .expect("index md");
         let epoch = "e";
         idx.ensure_vector_store(3, "m", epoch).expect("ensure");
         let need = idx.chunks_needing_vectors(epoch, 100).expect("need");
@@ -5675,15 +6181,25 @@ pub struct Point { x: i32 }
                    pub fn long_fn(a: i32, b: i32) -> i32 {\n    let c = a + b;\n    c * 2\n}\n";
         let fg = parse_file("src/a.rs", src, Lang::Rust);
         let ids: Vec<&str> = fg.code_chunks.iter().map(|c| c.id.as_str()).collect();
-        assert!(!ids.iter().any(|i| i.contains("N@")), "const not chunked: {ids:?}");
-        assert!(!ids.iter().any(|i| i.contains("short@")), "1-line fn not chunked: {ids:?}");
+        assert!(
+            !ids.iter().any(|i| i.contains("N@")),
+            "const not chunked: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i.contains("short@")),
+            "1-line fn not chunked: {ids:?}"
+        );
         let chunk = fg
             .code_chunks
             .iter()
             .find(|c| c.id.contains("long_fn@"))
             .expect("long_fn chunked");
         assert_eq!(chunk.file, "src/a.rs");
-        assert!(chunk.text.contains("let c = a + b"), "body present: {}", chunk.text);
+        assert!(
+            chunk.text.contains("let c = a + b"),
+            "body present: {}",
+            chunk.text
+        );
     }
 
     #[test]
@@ -5700,7 +6216,9 @@ pub struct Point { x: i32 }
             .expect("index");
 
         let epoch = "code-epoch";
-        let reset = idx.ensure_code_vector_store(3, "fake-model", epoch).expect("ensure");
+        let reset = idx
+            .ensure_code_vector_store(3, "fake-model", epoch)
+            .expect("ensure");
         assert!(!reset, "fresh store isn't a reset");
 
         let need = idx.pending_code_chunks(epoch, 100).expect("need");
@@ -5721,7 +6239,10 @@ pub struct Point { x: i32 }
         idx.put_code_vectors(epoch, &vecs).expect("put vecs");
 
         assert_eq!(idx.code_embedding_coverage(epoch).expect("cov"), (2, 2));
-        assert!(idx.pending_code_chunks(epoch, 100).expect("need2").is_empty());
+        assert!(idx
+            .pending_code_chunks(epoch, 100)
+            .expect("need2")
+            .is_empty());
 
         let hits = idx
             .semantic_code_search(&[0.9, 0.1, 0.0], epoch, 2)
@@ -5783,14 +6304,20 @@ pub struct Point { x: i32 }
         // The data is still intact (open_existing didn't reset it).
         {
             let peek = GraphIndex::open_db(&dir, ".ckg").expect("peek");
-            assert!(!peek.find_symbol("f").unwrap().is_empty(), "open_existing must not wipe");
+            assert!(
+                !peek.find_symbol("f").unwrap().is_empty(),
+                "open_existing must not wipe"
+            );
         }
 
         // The writable path migrates: resets (empties) + flags exactly once.
         let idx2 = GraphIndex::open(&dir, ".ckg").expect("reopen");
         assert!(idx2.take_schema_reset(), "migration flags a rebuild");
         assert!(!idx2.take_schema_reset(), "flag is one-shot");
-        assert!(idx2.find_symbol("f").unwrap().is_empty(), "stale rows were reset");
+        assert!(
+            idx2.find_symbol("f").unwrap().is_empty(),
+            "stale rows were reset"
+        );
 
         drop(idx2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5810,9 +6337,15 @@ pub struct Point { x: i32 }
 
         let dead = idx.dead_exports(100).expect("dead");
         let names: Vec<&str> = dead.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"unused_pub"), "unused public fn is a candidate");
+        assert!(
+            names.contains(&"unused_pub"),
+            "unused public fn is a candidate"
+        );
         assert!(!names.contains(&"used_pub"), "a called fn is not dead");
-        assert!(!names.contains(&"priv_fn"), "a private fn is never a dead export");
+        assert!(
+            !names.contains(&"priv_fn"),
+            "a private fn is never a dead export"
+        );
         // driver() is public + unused, but it *does* reference used_pub, so it's
         // not itself referenced — it should appear (honest candidate).
         assert!(names.contains(&"driver"));
@@ -5826,10 +6359,18 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-cyc-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // a.ts imports ./b, b.ts imports ./a → a 2-file cycle.
-        idx.index_file_graph(&parse_file("src/a.ts", "import { x } from './b';\nexport const y = 1;\n", Lang::TypeScript))
-            .expect("a");
-        idx.index_file_graph(&parse_file("src/b.ts", "import { y } from './a';\nexport const x = 1;\n", Lang::TypeScript))
-            .expect("b");
+        idx.index_file_graph(&parse_file(
+            "src/a.ts",
+            "import { x } from './b';\nexport const y = 1;\n",
+            Lang::TypeScript,
+        ))
+        .expect("a");
+        idx.index_file_graph(&parse_file(
+            "src/b.ts",
+            "import { y } from './a';\nexport const x = 1;\n",
+            Lang::TypeScript,
+        ))
+        .expect("b");
 
         let cycles = idx.import_cycles(50).expect("cycles");
         assert_eq!(cycles.len(), 1, "exactly one cycle");
@@ -5845,14 +6386,26 @@ pub struct Point { x: i32 }
     fn import_cycles_none_for_acyclic_graph() {
         let dir = std::env::temp_dir().join(format!("ckg-acyc-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/a.ts", "import { x } from './b';\n", Lang::TypeScript))
-            .expect("a");
-        idx.index_file_graph(&parse_file("src/b.ts", "export const x = 1;\n", Lang::TypeScript))
-            .expect("b");
+        idx.index_file_graph(&parse_file(
+            "src/a.ts",
+            "import { x } from './b';\n",
+            Lang::TypeScript,
+        ))
+        .expect("a");
+        idx.index_file_graph(&parse_file(
+            "src/b.ts",
+            "export const x = 1;\n",
+            Lang::TypeScript,
+        ))
+        .expect("b");
         assert!(idx.import_cycles(50).expect("cycles").is_empty());
         // An unresolvable/external import must not crash.
-        idx.index_file_graph(&parse_file("src/c.ts", "import fs from 'node:fs';\n", Lang::TypeScript))
-            .expect("c");
+        idx.index_file_graph(&parse_file(
+            "src/c.ts",
+            "import fs from 'node:fs';\n",
+            Lang::TypeScript,
+        ))
+        .expect("c");
         assert!(idx.import_cycles(50).expect("cycles2").is_empty());
 
         drop(idx);
@@ -5865,9 +6418,30 @@ pub struct Point { x: i32 }
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
 
         // Session s1: read a.rs (t=100), then edit b.rs twice (t=200,300).
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s1", "claude", "edit", "b.rs", Some("foo"), Some(3), 200, None).unwrap();
-        idx.record_mem_event("s1", "claude", "edit", "b.rs", Some("bar"), Some(9), 300, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event(
+            "s1",
+            "claude",
+            "edit",
+            "b.rs",
+            Some("foo"),
+            Some(3),
+            200,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s1",
+            "claude",
+            "edit",
+            "b.rs",
+            Some("bar"),
+            Some(9),
+            300,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(idx.mem_current_session().unwrap().as_deref(), Some("s1"));
 
@@ -5878,25 +6452,44 @@ pub struct Point { x: i32 }
         assert_eq!(ws[0].touches, 2);
         assert_eq!(ws[0].last_kind, "edit");
         // Most-recent symbol first, deduped.
-        assert_eq!(ws[0].top_symbols, vec!["bar".to_string(), "foo".to_string()]);
+        assert_eq!(
+            ws[0].top_symbols,
+            vec!["bar".to_string(), "foo".to_string()]
+        );
         assert_eq!(ws[1].path, "a.rs");
 
         // A later session s2 becomes current.
-        idx.record_mem_event("s2", "opencode", "read", "c.rs", None, None, 400, None).unwrap();
+        idx.record_mem_event("s2", "opencode", "read", "c.rs", None, None, 400, None)
+            .unwrap();
         assert_eq!(idx.mem_current_session().unwrap().as_deref(), Some("s2"));
 
         // Notes: a pinned note is visible from any session; unpinned only its own.
         let n1 = "note-1";
-        idx.mem_add_note(n1, "s1", "use FNV hashing", 250, true).unwrap();
-        idx.mem_add_note("note-2", "s1", "s1-only detail", 260, false).unwrap();
+        idx.mem_add_note(n1, "s1", "use FNV hashing", 250, true)
+            .unwrap();
+        idx.mem_add_note("note-2", "s1", "s1-only detail", 260, false)
+            .unwrap();
         let s2_notes = idx.mem_notes("s2").unwrap();
-        assert!(s2_notes.iter().any(|n| n.note_id == n1), "pinned note crosses sessions");
-        assert!(!s2_notes.iter().any(|n| n.note_id == "note-2"), "unpinned note stays in its session");
+        assert!(
+            s2_notes.iter().any(|n| n.note_id == n1),
+            "pinned note crosses sessions"
+        );
+        assert!(
+            !s2_notes.iter().any(|n| n.note_id == "note-2"),
+            "unpinned note stays in its session"
+        );
 
         let sessions = idx.mem_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "s2"); // newest first
-        assert!(sessions.iter().find(|s| s.session_id == "s1").unwrap().events >= 3);
+        assert!(
+            sessions
+                .iter()
+                .find(|s| s.session_id == "s1")
+                .unwrap()
+                .events
+                >= 3
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5908,15 +6501,27 @@ pub struct Point { x: i32 }
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // A Claude session (older) and an OpenCode session (more recent) on the
         // same project.
-        idx.record_mem_event("c1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("o1", "opencode", "read", "b.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("c1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("o1", "opencode", "read", "b.rs", None, None, 200, None)
+            .unwrap();
 
         // Unscoped picks the globally most recent (OpenCode's).
         assert_eq!(idx.mem_current_session().unwrap().as_deref(), Some("o1"));
         // Agent-scoped resolves each agent's own session — no cross-talk, even
         // though the OpenCode session is newer.
-        assert_eq!(idx.mem_current_session_for(Some("claude")).unwrap().as_deref(), Some("c1"));
-        assert_eq!(idx.mem_current_session_for(Some("opencode")).unwrap().as_deref(), Some("o1"));
+        assert_eq!(
+            idx.mem_current_session_for(Some("claude"))
+                .unwrap()
+                .as_deref(),
+            Some("c1")
+        );
+        assert_eq!(
+            idx.mem_current_session_for(Some("opencode"))
+                .unwrap()
+                .as_deref(),
+            Some("o1")
+        );
         // An agent with no sessions yet resolves to None.
         assert_eq!(idx.mem_current_session_for(Some("nobody")).unwrap(), None);
 
@@ -5967,17 +6572,28 @@ pub struct Point { x: i32 }
         .unwrap();
 
         let series = idx.usage_turn_series("s1").unwrap();
-        assert_eq!(series.len(), 1, "same msg_id must upsert in place, not duplicate");
+        assert_eq!(
+            series.len(),
+            1,
+            "same msg_id must upsert in place, not duplicate"
+        );
         assert_eq!(series[0].msg_id, "m1");
         assert_eq!(series[0].model.as_deref(), Some("claude-x"));
         assert_eq!(series[0].in_tok, 120);
         assert_eq!(series[0].out_tok, 30);
         assert_eq!(series[0].cache_read, 40);
         assert_eq!(series[0].cache_make, 5);
-        assert_eq!(series[0].origin, UsageOrigin::Agent, "upsert carries the updated origin");
+        assert_eq!(
+            series[0].origin,
+            UsageOrigin::Agent,
+            "upsert carries the updated origin"
+        );
 
         let totals = idx.usage_session_totals("s1").unwrap();
-        assert_eq!(totals.in_tok, 120, "totals reflect the upserted (last) value, not both writes summed");
+        assert_eq!(
+            totals.in_tok, 120,
+            "totals reflect the upserted (last) value, not both writes summed"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6033,7 +6649,11 @@ pub struct Point { x: i32 }
         assert_eq!(series.len(), 1, "the pre-V24 turn row survives migration");
         assert_eq!(series[0].msg_id, "m1");
         assert_eq!(series[0].in_tok, 100, "token counts are preserved");
-        assert_eq!(series[0].origin, UsageOrigin::Session, "old rows default to session");
+        assert_eq!(
+            series[0].origin,
+            UsageOrigin::Session,
+            "old rows default to session"
+        );
         // The relation now carries `origin`, so a re-open is a clean no-op.
         assert!(idx2.usage_stat_has_origin().unwrap());
 
@@ -6053,8 +6673,11 @@ pub struct Point { x: i32 }
             let idx = GraphIndex::open(&dir, ".ckg").expect("open");
             // Build the fully-populated stage (new shape, origin already set) —
             // exactly what the atomic create-and-populate would have durably left.
-            idx.run_mut(&GraphIndex::usage_stat_create_ddl(GraphIndex::USAGE_STAT_STAGE), BTreeMap::new())
-                .unwrap();
+            idx.run_mut(
+                &GraphIndex::usage_stat_create_ddl(GraphIndex::USAGE_STAT_STAGE),
+                BTreeMap::new(),
+            )
+            .unwrap();
             let staged_row = DataValue::List(vec![
                 DataValue::Str("s1".into()),
                 DataValue::Num(Num::Int(0)),
@@ -6082,7 +6705,11 @@ pub struct Point { x: i32 }
             // + the next `ensure_memory_relations` would have produced) and stamp
             // an older schema version so the reopen takes the migration path.
             idx.run_mut("::remove usage_stat", BTreeMap::new()).unwrap();
-            idx.run_mut(&GraphIndex::usage_stat_create_ddl("usage_stat"), BTreeMap::new()).unwrap();
+            idx.run_mut(
+                &GraphIndex::usage_stat_create_ddl("usage_stat"),
+                BTreeMap::new(),
+            )
+            .unwrap();
             idx.write_schema_version(1).unwrap();
         }
 
@@ -6091,11 +6718,17 @@ pub struct Point { x: i32 }
         let series = idx2.usage_turn_series("s1").unwrap();
         assert_eq!(series.len(), 1, "staged rows recovered without loss");
         assert_eq!(series[0].msg_id, "m1");
-        assert_eq!(series[0].in_tok, 100, "token counts preserved through recovery");
+        assert_eq!(
+            series[0].in_tok, 100,
+            "token counts preserved through recovery"
+        );
         assert_eq!(series[0].origin, UsageOrigin::Session);
         // The stage was consumed (renamed over `usage_stat`), leaving no leftover.
         assert!(
-            !idx2.existing_relations().unwrap().contains("usage_stat_v24"),
+            !idx2
+                .existing_relations()
+                .unwrap()
+                .contains("usage_stat_v24"),
             "the stage is gone after promotion"
         );
         assert!(idx2.usage_stat_has_origin().unwrap());
@@ -6129,14 +6762,20 @@ pub struct Point { x: i32 }
         idx.record_usage_event(
             "s1",
             "claude",
-            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 500 },
+            &UsageEvent::ToolResult {
+                tool: Some("Read".to_string()),
+                chars: 500,
+            },
             110,
         )
         .unwrap();
         idx.record_usage_event(
             "s1",
             "claude",
-            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 300 },
+            &UsageEvent::ToolResult {
+                tool: Some("Read".to_string()),
+                chars: 300,
+            },
             111,
         )
         .unwrap();
@@ -6163,9 +6802,15 @@ pub struct Point { x: i32 }
         let series = idx.usage_turn_series("s1").unwrap();
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].msg_id, "t1");
-        assert_eq!(series[0].tool_chars, 0, "no tool results before the first turn");
+        assert_eq!(
+            series[0].tool_chars, 0,
+            "no tool results before the first turn"
+        );
         assert_eq!(series[1].msg_id, "t2");
-        assert_eq!(series[1].tool_chars, 800, "both Read results attributed to the turn that followed them");
+        assert_eq!(
+            series[1].tool_chars, 800,
+            "both Read results attributed to the turn that followed them"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6175,9 +6820,20 @@ pub struct Point { x: i32 }
     fn usage_per_tool_buckets_unjoined_results_as_unknown() {
         let dir = std::env::temp_dir().join(format!("ckg-usage-unknown-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.record_usage_event("s1", "claude", &UsageEvent::ToolResult { tool: None, chars: 42 }, 100)
-            .unwrap();
-        assert_eq!(idx.usage_per_tool("s1").unwrap(), vec![("unknown".to_string(), 42)]);
+        idx.record_usage_event(
+            "s1",
+            "claude",
+            &UsageEvent::ToolResult {
+                tool: None,
+                chars: 42,
+            },
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            idx.usage_per_tool("s1").unwrap(),
+            vec![("unknown".to_string(), 42)]
+        );
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6252,7 +6908,10 @@ pub struct Point { x: i32 }
         idx.record_usage_event(
             "o1",
             "opencode",
-            &UsageEvent::ToolResult { tool: Some("edit".to_string()), chars: 20 },
+            &UsageEvent::ToolResult {
+                tool: Some("edit".to_string()),
+                chars: 20,
+            },
             200,
         )
         .unwrap();
@@ -6278,7 +6937,10 @@ pub struct Point { x: i32 }
         idx.record_usage_event(
             "c2",
             "claude",
-            &UsageEvent::ToolResult { tool: Some("read".to_string()), chars: 12 },
+            &UsageEvent::ToolResult {
+                tool: Some("read".to_string()),
+                chars: 12,
+            },
             220,
         )
         .unwrap();
@@ -6303,7 +6965,10 @@ pub struct Point { x: i32 }
         .unwrap();
 
         let rows = idx.usage_all_sessions().unwrap();
-        let claude = rows.iter().find(|r| r.session_id == "c1").expect("c1 present");
+        let claude = rows
+            .iter()
+            .find(|r| r.session_id == "c1")
+            .expect("c1 present");
         assert!(!claude.est_only, "claude sessions carry exact usage");
         assert_eq!(claude.totals.in_tok, 306);
         // cache_read / (cache_read + in_tok) = 50 / 356.
@@ -6314,25 +6979,58 @@ pub struct Point { x: i32 }
             "models rank by tokens desc; model-less and <synthetic> turns excluded"
         );
 
-        let opencode = rows.iter().find(|r| r.session_id == "o1").expect("o1 present");
-        assert!(opencode.est_only, "a tool_result-only session has zero token totals ⇒ est-only");
-        assert_eq!(opencode.totals.in_tok, 0, "a tool_result-only session has zero token totals");
+        let opencode = rows
+            .iter()
+            .find(|r| r.session_id == "o1")
+            .expect("o1 present");
+        assert!(
+            opencode.est_only,
+            "a tool_result-only session has zero token totals ⇒ est-only"
+        );
+        assert_eq!(
+            opencode.totals.in_tok, 0,
+            "a tool_result-only session has zero token totals"
+        );
         assert_eq!(opencode.tool_chars, 20);
-        assert_eq!(opencode.cache_hit_ratio, 0.0, "no denominator ⇒ 0.0, not NaN");
-        assert!(opencode.models.is_empty(), "tool_result-only session has no models");
+        assert_eq!(
+            opencode.cache_hit_ratio, 0.0,
+            "no denominator ⇒ 0.0, not NaN"
+        );
+        assert!(
+            opencode.models.is_empty(),
+            "tool_result-only session has no models"
+        );
 
         // OpenCode WITH real tokens → NOT est-only (agent name is irrelevant).
-        let oc_tokens = rows.iter().find(|r| r.session_id == "o2").expect("o2 present");
-        assert!(!oc_tokens.est_only, "an OpenCode session with real Turn tokens is exact");
+        let oc_tokens = rows
+            .iter()
+            .find(|r| r.session_id == "o2")
+            .expect("o2 present");
+        assert!(
+            !oc_tokens.est_only,
+            "an OpenCode session with real Turn tokens is exact"
+        );
         assert_eq!(oc_tokens.totals.in_tok, 42);
         // Claude with NO turn rows (tool-result chars only) → est-only (derived
         // from turn presence, not agent).
-        let claude_notoks = rows.iter().find(|r| r.session_id == "c2").expect("c2 present");
-        assert!(claude_notoks.est_only, "a Claude session with no turn rows is est-only");
+        let claude_notoks = rows
+            .iter()
+            .find(|r| r.session_id == "c2")
+            .expect("c2 present");
+        assert!(
+            claude_notoks.est_only,
+            "a Claude session with no turn rows is est-only"
+        );
         // Claude WITH a zero-token turn → NOT est-only: the recorded turn is
         // exact accounting even though every token count is zero.
-        let claude_ztok = rows.iter().find(|r| r.session_id == "c3").expect("c3 present");
-        assert!(!claude_ztok.est_only, "a recorded zero-token turn is exact, not est");
+        let claude_ztok = rows
+            .iter()
+            .find(|r| r.session_id == "c3")
+            .expect("c3 present");
+        assert!(
+            !claude_ztok.est_only,
+            "a recorded zero-token turn is exact, not est"
+        );
         assert_eq!(claude_ztok.totals.in_tok, 0, "the turn carries zero tokens");
 
         drop(idx);
@@ -6349,13 +7047,19 @@ pub struct Point { x: i32 }
             idx.record_usage_event(
                 "s1",
                 "claude",
-                &UsageEvent::ToolResult { tool: Some("Bash".to_string()), chars: 1 },
+                &UsageEvent::ToolResult {
+                    tool: Some("Bash".to_string()),
+                    chars: 1,
+                },
                 100 + i,
             )
             .unwrap();
         }
         let per_tool = idx.usage_per_tool("s1").unwrap();
-        let (_, chars) = per_tool.into_iter().find(|(t, _)| t == "Bash").expect("Bash present");
+        let (_, chars) = per_tool
+            .into_iter()
+            .find(|(t, _)| t == "Bash")
+            .expect("Bash present");
         assert_eq!(
             chars, MAX_USAGE_PER_SESSION as u64,
             "the ring keeps exactly the cap's worth of rows (1 char each), not `total`"
@@ -6375,7 +7079,10 @@ pub struct Point { x: i32 }
         idx.record_usage_event(
             "s0",
             "claude",
-            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 99 },
+            &UsageEvent::ToolResult {
+                tool: Some("Read".to_string()),
+                chars: 99,
+            },
             0,
         )
         .unwrap();
@@ -6384,15 +7091,24 @@ pub struct Point { x: i32 }
             idx.record_usage_event(
                 &sid,
                 "claude",
-                &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 1 },
+                &UsageEvent::ToolResult {
+                    tool: Some("Read".to_string()),
+                    chars: 1,
+                },
                 1000 + i as i64,
             )
             .unwrap();
         }
 
-        assert!(idx.usage_per_tool("s0").unwrap().is_empty(), "s0's usage rows were cascaded away");
         assert!(
-            !idx.mem_sessions().unwrap().iter().any(|s| s.session_id == "s0"),
+            idx.usage_per_tool("s0").unwrap().is_empty(),
+            "s0's usage rows were cascaded away"
+        );
+        assert!(
+            !idx.mem_sessions()
+                .unwrap()
+                .iter()
+                .any(|s| s.session_id == "s0"),
             "s0 itself was evicted"
         );
 
@@ -6407,7 +7123,10 @@ pub struct Point { x: i32 }
         idx.record_usage_event(
             "s1",
             "claude",
-            &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars: 10 },
+            &UsageEvent::ToolResult {
+                tool: Some("Read".to_string()),
+                chars: 10,
+            },
             100,
         )
         .unwrap();
@@ -6427,7 +7146,10 @@ pub struct Point { x: i32 }
             idx.record_usage_event(
                 "s1",
                 "claude",
-                &UsageEvent::ToolResult { tool: Some("Read".to_string()), chars },
+                &UsageEvent::ToolResult {
+                    tool: Some("Read".to_string()),
+                    chars,
+                },
                 100,
             )
             .unwrap();
@@ -6435,12 +7157,18 @@ pub struct Point { x: i32 }
         idx.record_usage_event(
             "s1",
             "claude",
-            &UsageEvent::ToolResult { tool: Some("Bash".to_string()), chars: 50 },
+            &UsageEvent::ToolResult {
+                tool: Some("Bash".to_string()),
+                chars: 50,
+            },
             100,
         )
         .unwrap();
         let ranking = idx.usage_tool_ranking("s1").unwrap();
-        assert_eq!(ranking, vec![("Read".to_string(), 300, 2), ("Bash".to_string(), 50, 1)]);
+        assert_eq!(
+            ranking,
+            vec![("Read".to_string(), 300, 2), ("Bash".to_string(), 50, 1)]
+        );
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6480,14 +7208,54 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-permodel-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // model-a: a Session turn (150 tok) + an Agent turn (10 tok) = 160.
-        seed_turn(&idx, "s1", "m1", Some("model-a"), (100, 20, 30, 0), UsageOrigin::Session, 100);
-        seed_turn(&idx, "s1", "m2", Some("model-a"), (10, 0, 0, 0), UsageOrigin::Agent, 110);
+        seed_turn(
+            &idx,
+            "s1",
+            "m1",
+            Some("model-a"),
+            (100, 20, 30, 0),
+            UsageOrigin::Session,
+            100,
+        );
+        seed_turn(
+            &idx,
+            "s1",
+            "m2",
+            Some("model-a"),
+            (10, 0, 0, 0),
+            UsageOrigin::Agent,
+            110,
+        );
         // model-b: one Session turn (5 tok) — fewer tokens, ranks after model-a.
-        seed_turn(&idx, "s1", "m3", Some("model-b"), (5, 0, 0, 0), UsageOrigin::Session, 120);
+        seed_turn(
+            &idx,
+            "s1",
+            "m3",
+            Some("model-b"),
+            (5, 0, 0, 0),
+            UsageOrigin::Session,
+            120,
+        );
         // `<synthetic>` and no-model rows are excluded (parity with
         // `usage_session_models`), even carrying large token counts.
-        seed_turn(&idx, "s1", "m4", Some("<synthetic>"), (999, 0, 0, 0), UsageOrigin::Session, 130);
-        seed_turn(&idx, "s1", "m5", None, (999, 0, 0, 0), UsageOrigin::Session, 140);
+        seed_turn(
+            &idx,
+            "s1",
+            "m4",
+            Some("<synthetic>"),
+            (999, 0, 0, 0),
+            UsageOrigin::Session,
+            130,
+        );
+        seed_turn(
+            &idx,
+            "s1",
+            "m5",
+            None,
+            (999, 0, 0, 0),
+            UsageOrigin::Session,
+            140,
+        );
 
         let per_model = idx.usage_session_model_totals("s1").unwrap();
         assert_eq!(per_model.len(), 2, "synthetic + no-model rows are excluded");
@@ -6495,10 +7263,21 @@ pub struct Point { x: i32 }
         assert_eq!(per_model[0].model, "model-a");
         assert_eq!(
             per_model[0].totals,
-            UsageTotals { in_tok: 110, out_tok: 20, cache_read: 30, cache_make: 0 }
+            UsageTotals {
+                in_tok: 110,
+                out_tok: 20,
+                cache_read: 30,
+                cache_make: 0
+            }
         );
-        assert_eq!(per_model[0].origins.session_tok, 150, "the Session turn's 150 tok");
-        assert_eq!(per_model[0].origins.agent_tok, 10, "the Agent turn's 10 tok");
+        assert_eq!(
+            per_model[0].origins.session_tok, 150,
+            "the Session turn's 150 tok"
+        );
+        assert_eq!(
+            per_model[0].origins.agent_tok, 10,
+            "the Agent turn's 10 tok"
+        );
         assert_eq!(per_model[1].model, "model-b");
         assert_eq!(per_model[1].origins.session_tok, 5);
         assert_eq!(per_model[1].origins.agent_tok, 0);
@@ -6513,8 +7292,24 @@ pub struct Point { x: i32 }
         // model, the per-model totals sum back to the whole-session totals.
         let dir = std::env::temp_dir().join(format!("ckg-permodel-sum-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        seed_turn(&idx, "s1", "m1", Some("model-a"), (100, 20, 30, 5), UsageOrigin::Session, 100);
-        seed_turn(&idx, "s1", "m2", Some("model-b"), (7, 3, 1, 0), UsageOrigin::Agent, 110);
+        seed_turn(
+            &idx,
+            "s1",
+            "m1",
+            Some("model-a"),
+            (100, 20, 30, 5),
+            UsageOrigin::Session,
+            100,
+        );
+        seed_turn(
+            &idx,
+            "s1",
+            "m2",
+            Some("model-b"),
+            (7, 3, 1, 0),
+            UsageOrigin::Agent,
+            110,
+        );
 
         let per_model = idx.usage_session_model_totals("s1").unwrap();
         let mut summed = UsageTotals::default();
@@ -6534,18 +7329,36 @@ pub struct Point { x: i32 }
     fn usage_session_row_is_none_for_unknown_but_present_for_a_seeded_session() {
         let dir = std::env::temp_dir().join(format!("ckg-sessrow-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        assert!(idx.usage_session_row("nope").unwrap().is_none(), "unknown session → None");
+        assert!(
+            idx.usage_session_row("nope").unwrap().is_none(),
+            "unknown session → None"
+        );
 
-        seed_turn(&idx, "s1", "m1", Some("model-a"), (100, 20, 30, 0), UsageOrigin::Session, 100);
-        let row = idx.usage_session_row("s1").unwrap().expect("seeded session has a row");
+        seed_turn(
+            &idx,
+            "s1",
+            "m1",
+            Some("model-a"),
+            (100, 20, 30, 0),
+            UsageOrigin::Session,
+            100,
+        );
+        let row = idx
+            .usage_session_row("s1")
+            .unwrap()
+            .expect("seeded session has a row");
         assert_eq!(row.session_id, "s1");
         assert_eq!(row.agent, "claude");
         assert!(!row.est_only, "a claude session is not est-only");
         assert_eq!(row.totals, idx.usage_session_totals("s1").unwrap());
         assert_eq!(row.models, vec!["model-a".to_string()]);
         // Same row the whole-project scan would produce for this id.
-        let from_all =
-            idx.usage_all_sessions().unwrap().into_iter().find(|r| r.session_id == "s1").unwrap();
+        let from_all = idx
+            .usage_all_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.session_id == "s1")
+            .unwrap();
         assert_eq!(row, from_all);
 
         drop(idx);
@@ -6557,8 +7370,12 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-sessagent-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         assert_eq!(idx.session_agent("s1").unwrap(), None, "unknown session");
-        idx.record_mem_event("s1", "opencode", "read", "a.rs", None, None, 100, None).unwrap();
-        assert_eq!(idx.session_agent("s1").unwrap(), Some("opencode".to_string()));
+        idx.record_mem_event("s1", "opencode", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        assert_eq!(
+            idx.session_agent("s1").unwrap(),
+            Some("opencode".to_string())
+        );
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6567,12 +7384,21 @@ pub struct Point { x: i32 }
     fn mem_touched_paths_covers_read_and_edit_only() {
         let dir = std::env::temp_dir().join(format!("ckg-touched-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s1", "claude", "edit", "b.rs", None, None, 200, None).unwrap();
-        idx.record_mem_event("s1", "claude", "query", "c.rs", None, None, 300, None).unwrap();
-        idx.record_mem_event("s1", "claude", "remind", "d.rs", None, None, 400, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("s1", "claude", "edit", "b.rs", None, None, 200, None)
+            .unwrap();
+        idx.record_mem_event("s1", "claude", "query", "c.rs", None, None, 300, None)
+            .unwrap();
+        idx.record_mem_event("s1", "claude", "remind", "d.rs", None, None, 400, None)
+            .unwrap();
         let touched = idx.mem_touched_paths("s1").unwrap();
-        assert_eq!(touched, ["a.rs".to_string(), "b.rs".to_string()].into_iter().collect());
+        assert_eq!(
+            touched,
+            ["a.rs".to_string(), "b.rs".to_string()]
+                .into_iter()
+                .collect()
+        );
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6591,13 +7417,18 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-reread-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // s1/a.rs: reminded, then genuinely re-read afterward -> counts.
-        idx.record_mem_event("s1", "claude", "remind", "a.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s1", "claude", "remind", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 200, None)
+            .unwrap();
         // s1/b.rs: reminded, only read BEFORE (stale/irrelevant) -> doesn't count.
-        idx.record_mem_event("s1", "claude", "read", "b.rs", None, None, 50, None).unwrap();
-        idx.record_mem_event("s1", "claude", "remind", "b.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "b.rs", None, None, 50, None)
+            .unwrap();
+        idx.record_mem_event("s1", "claude", "remind", "b.rs", None, None, 100, None)
+            .unwrap();
         // s2/c.rs: reminded, never read again -> doesn't count.
-        idx.record_mem_event("s2", "claude", "remind", "c.rs", None, None, 100, None).unwrap();
+        idx.record_mem_event("s2", "claude", "remind", "c.rs", None, None, 100, None)
+            .unwrap();
 
         let (rate, samples) = idx.advisor_reread_rate().unwrap().unwrap();
         assert_eq!(samples, 3);
@@ -6622,19 +7453,100 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-redun-pairs-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
         // SRC's max symbol end_line (~5) clears a min_lines of 3.
-        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust))
+            .expect("index");
 
         // s_two: two consecutive un-edited reads -> 1 pair.
-        idx.record_mem_event("s_two", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s_two", "claude", "read", "src/geo.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event(
+            "s_two",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            100,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_two",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            200,
+            None,
+        )
+        .unwrap();
         // s_edit: read, edit, read -> the intervening edit breaks the pair (0).
-        idx.record_mem_event("s_edit", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s_edit", "claude", "edit", "src/geo.rs", None, None, 200, None).unwrap();
-        idx.record_mem_event("s_edit", "claude", "read", "src/geo.rs", None, None, 300, None).unwrap();
+        idx.record_mem_event(
+            "s_edit",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            100,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_edit",
+            "claude",
+            "edit",
+            "src/geo.rs",
+            None,
+            None,
+            200,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_edit",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            300,
+            None,
+        )
+        .unwrap();
         // s_three: three consecutive un-edited reads -> 2 pairs.
-        idx.record_mem_event("s_three", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s_three", "claude", "read", "src/geo.rs", None, None, 200, None).unwrap();
-        idx.record_mem_event("s_three", "claude", "read", "src/geo.rs", None, None, 300, None).unwrap();
+        idx.record_mem_event(
+            "s_three",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            100,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_three",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            200,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_three",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            300,
+            None,
+        )
+        .unwrap();
 
         let (pairs, sessions) = idx.redundant_read_candidates(3, 10).unwrap().unwrap();
         assert_eq!(pairs, 3, "1 (s_two) + 0 (s_edit) + 2 (s_three)");
@@ -6647,14 +7559,75 @@ pub struct Point { x: i32 }
     fn redundant_read_candidates_windows_to_the_most_recent_sessions() {
         let dir = std::env::temp_dir().join(format!("ckg-redun-win-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust)).expect("index");
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust))
+            .expect("index");
         // s_old (oldest, max ts 101), s_new1 (501), s_new2 (601) — each a pair.
-        idx.record_mem_event("s_old", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s_old", "claude", "read", "src/geo.rs", None, None, 101, None).unwrap();
-        idx.record_mem_event("s_new1", "claude", "read", "src/geo.rs", None, None, 500, None).unwrap();
-        idx.record_mem_event("s_new1", "claude", "read", "src/geo.rs", None, None, 501, None).unwrap();
-        idx.record_mem_event("s_new2", "claude", "read", "src/geo.rs", None, None, 600, None).unwrap();
-        idx.record_mem_event("s_new2", "claude", "read", "src/geo.rs", None, None, 601, None).unwrap();
+        idx.record_mem_event(
+            "s_old",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            100,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_old",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            101,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_new1",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            500,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_new1",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            501,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_new2",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            600,
+            None,
+        )
+        .unwrap();
+        idx.record_mem_event(
+            "s_new2",
+            "claude",
+            "read",
+            "src/geo.rs",
+            None,
+            None,
+            601,
+            None,
+        )
+        .unwrap();
 
         // Only the 2 most recent sessions (s_new2, s_new1) are scanned.
         let (pairs, sessions) = idx.redundant_read_candidates(3, 2).unwrap().unwrap();
@@ -6668,9 +7641,12 @@ pub struct Point { x: i32 }
     fn redundant_read_candidates_filters_small_files_but_still_scans_the_session() {
         let dir = std::env::temp_dir().join(format!("ckg-redun-min-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust)).expect("index");
-        idx.record_mem_event("s1", "claude", "read", "src/geo.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s1", "claude", "read", "src/geo.rs", None, None, 200, None).unwrap();
+        idx.index_file_graph(&parse_file("src/geo.rs", SRC, Lang::Rust))
+            .expect("index");
+        idx.record_mem_event("s1", "claude", "read", "src/geo.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("s1", "claude", "read", "src/geo.rs", None, None, 200, None)
+            .unwrap();
 
         // min_lines 3: SRC clears it -> 1 pair.
         let (kept, _) = idx.redundant_read_candidates(3, 10).unwrap().unwrap();
@@ -6682,10 +7658,15 @@ pub struct Point { x: i32 }
         assert_eq!(sessions, 1);
 
         // A never-indexed file (no symbols) has no size proxy -> filtered out.
-        idx.record_mem_event("s2", "claude", "read", "src/nope.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s2", "claude", "read", "src/nope.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s2", "claude", "read", "src/nope.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("s2", "claude", "read", "src/nope.rs", None, None, 200, None)
+            .unwrap();
         let sessions_now = idx.redundant_read_candidates(3, 10).unwrap().unwrap().1;
-        assert_eq!(sessions_now, 2, "s2 is scanned even though its file has no size");
+        assert_eq!(
+            sessions_now, 2,
+            "s2 is scanned even though its file has no size"
+        );
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6796,7 +7777,10 @@ pub struct Point { x: i32 }
         let rows = idx.recent_changes(30, None, 10).expect("recent_changes");
         let files: Vec<&str> = rows.iter().map(|c| c.file.as_str()).collect();
         assert!(!files.contains(&"src/stale.rs"), "{files:?}");
-        assert_eq!(files[0], "docs/readme.md", "5 touches, more recent than hot.rs: {files:?}");
+        assert_eq!(
+            files[0], "docs/readme.md",
+            "5 touches, more recent than hot.rs: {files:?}"
+        );
         assert_eq!(files[1], "src/hot.rs", "5 touches: {files:?}");
         assert_eq!(files[2], "src/warm.rs", "2 touches ranks last: {files:?}");
 
@@ -6806,7 +7790,9 @@ pub struct Point { x: i32 }
         assert!(tight.is_empty(), "{tight:?}");
 
         // path_prefix filters to one subtree.
-        let docs_only = idx.recent_changes(30, Some("docs/"), 10).expect("recent_changes");
+        let docs_only = idx
+            .recent_changes(30, Some("docs/"), 10)
+            .expect("recent_changes");
         assert_eq!(docs_only.len(), 1);
         assert_eq!(docs_only[0].file, "docs/readme.md");
 
@@ -6833,7 +7819,10 @@ pub struct Point { x: i32 }
             ("oldest-unpinned".to_string(), 2, false),
             ("newer-unpinned".to_string(), 3, false),
         ];
-        assert_eq!(fact_to_archive_for_cap(&over, 2), Some("oldest-unpinned".to_string()));
+        assert_eq!(
+            fact_to_archive_for_cap(&over, 2),
+            Some("oldest-unpinned".to_string())
+        );
 
         // Every live fact pinned: nothing safe to archive, cap simply exceeded.
         let all_pinned = vec![("p1".to_string(), 1, true), ("p2".to_string(), 2, true)];
@@ -6882,12 +7871,21 @@ pub struct Point { x: i32 }
 
         let live = idx.list_project_facts(false, 1000).expect("list live");
         assert_eq!(live.len(), MAX_LIVE_PROJECT_FACTS);
-        assert!(live.iter().any(|f| f.fact_id == "pinned-1"), "pinned fact must survive the cap");
+        assert!(
+            live.iter().any(|f| f.fact_id == "pinned-1"),
+            "pinned fact must survive the cap"
+        );
         assert!(live.iter().any(|f| f.fact_id == "new-1"));
-        assert!(!live.iter().any(|f| f.fact_id == "f0"), "oldest unpinned fact should be archived");
+        assert!(
+            !live.iter().any(|f| f.fact_id == "f0"),
+            "oldest unpinned fact should be archived"
+        );
 
         let all = idx.list_project_facts(true, 1000).expect("list all");
-        let f0 = all.iter().find(|f| f.fact_id == "f0").expect("f0 still exists, archived");
+        let f0 = all
+            .iter()
+            .find(|f| f.fact_id == "f0")
+            .expect("f0 still exists, archived");
         assert!(f0.archived);
 
         drop(idx);
@@ -6899,9 +7897,12 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-factlist-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
 
-        idx.add_project_fact("old-unpinned", "old unpinned", "s1", 100, false).unwrap();
-        idx.add_project_fact("new-unpinned", "new unpinned", "s1", 300, false).unwrap();
-        idx.add_project_fact("old-pinned", "old pinned", "s1", 50, true).unwrap();
+        idx.add_project_fact("old-unpinned", "old unpinned", "s1", 100, false)
+            .unwrap();
+        idx.add_project_fact("new-unpinned", "new unpinned", "s1", 300, false)
+            .unwrap();
+        idx.add_project_fact("old-pinned", "old pinned", "s1", 50, true)
+            .unwrap();
 
         let facts = idx.list_project_facts(false, 10).unwrap();
         let ids: Vec<&str> = facts.iter().map(|f| f.fact_id.as_str()).collect();
@@ -6918,7 +7919,8 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-factcrud-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
 
-        idx.add_project_fact("f1", "some fact", "s1", 100, false).unwrap();
+        idx.add_project_fact("f1", "some fact", "s1", 100, false)
+            .unwrap();
         assert!(!idx.list_project_facts(false, 10).unwrap()[0].pinned);
 
         idx.set_fact_pinned("f1", true).unwrap();
@@ -6928,7 +7930,10 @@ pub struct Point { x: i32 }
         assert!(!idx.list_project_facts(false, 10).unwrap()[0].pinned);
 
         idx.set_fact_archived("f1", true).unwrap();
-        assert!(idx.list_project_facts(false, 10).unwrap().is_empty(), "archived facts are excluded by default");
+        assert!(
+            idx.list_project_facts(false, 10).unwrap().is_empty(),
+            "archived facts are excluded by default"
+        );
         let all = idx.list_project_facts(true, 10).unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].archived);
@@ -6949,8 +7954,10 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-distflag-{}", uuid::Uuid::new_v4()));
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
 
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s2", "claude", "read", "b.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("s2", "claude", "read", "b.rs", None, None, 200, None)
+            .unwrap();
 
         // Neither session has been distilled yet.
         assert!(!idx.is_session_distilled("s1").unwrap());
@@ -6988,8 +7995,10 @@ pub struct Point { x: i32 }
         let idx = GraphIndex::open(&dir, ".ckg").expect("open");
 
         // mem_clear(Some) drops only the target's flag.
-        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None).unwrap();
-        idx.record_mem_event("s2", "claude", "read", "b.rs", None, None, 200, None).unwrap();
+        idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("s2", "claude", "read", "b.rs", None, None, 200, None)
+            .unwrap();
         idx.mark_session_distilled("s1", 150).unwrap();
         idx.mark_session_distilled("s2", 250).unwrap();
         idx.mem_clear(Some("s1")).unwrap();
@@ -6998,16 +8007,29 @@ pub struct Point { x: i32 }
 
         // mem_clear(None) drops the rest.
         idx.mem_clear(None).unwrap();
-        assert!(!idx.is_session_distilled("s2").unwrap(), "whole-project clear drops s2 flag");
+        assert!(
+            !idx.is_session_distilled("s2").unwrap(),
+            "whole-project clear drops s2 flag"
+        );
 
         // Eviction cascades the flag too: mark s0 distilled, then push it past
         // the cap with newer sessions.
-        idx.record_mem_event("s0", "claude", "read", "a.rs", None, None, 0, None).unwrap();
+        idx.record_mem_event("s0", "claude", "read", "a.rs", None, None, 0, None)
+            .unwrap();
         idx.mark_session_distilled("s0", 1).unwrap();
         for i in 0..MAX_SESSIONS_PER_ROOT {
             let sid = format!("n{}", i + 1);
-            idx.record_mem_event(&sid, "claude", "read", "a.rs", None, None, 1000 + i as i64, None)
-                .unwrap();
+            idx.record_mem_event(
+                &sid,
+                "claude",
+                "read",
+                "a.rs",
+                None,
+                None,
+                1000 + i as i64,
+                None,
+            )
+            .unwrap();
         }
         assert!(
             !idx.is_session_distilled("s0").unwrap(),

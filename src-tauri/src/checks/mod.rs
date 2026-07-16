@@ -320,7 +320,13 @@ pub async fn test_check(root: &Path, def: &CheckDef) -> ChecksTestResult {
                     sites: g
                         .sites
                         .iter()
-                        .map(|(f, l)| if *l > 0 { format!("{f}:{l}") } else { f.clone() })
+                        .map(|(f, l)| {
+                            if *l > 0 {
+                                format!("{f}:{l}")
+                            } else {
+                                f.clone()
+                            }
+                        })
                         .collect(),
                 })
                 .collect();
@@ -391,7 +397,13 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     let mut report_error: Option<Diag> = None;
     let mut diags = match def.report_file.as_deref().filter(|s| !s.is_empty()) {
         Some(rel) => match read_report_file(root, &effective_cwd, rel).await {
-            Ok(content) => parsers::parse(def.parser, &content, "", &effective_cwd, def.pattern.as_deref()),
+            Ok(content) => parsers::parse(
+                def.parser,
+                &content,
+                "",
+                &effective_cwd,
+                def.pattern.as_deref(),
+            ),
             Err(msg) => {
                 report_error = Some(Diag {
                     severity: Severity::Error,
@@ -404,7 +416,13 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
                 Vec::new()
             }
         },
-        None => parsers::parse(def.parser, &stdout, &stderr, &effective_cwd, def.pattern.as_deref()),
+        None => parsers::parse(
+            def.parser,
+            &stdout,
+            &stderr,
+            &effective_cwd,
+            def.pattern.as_deref(),
+        ),
     };
     // Diagnostics parsed against the effective cwd are relative to it; re-root
     // them under the project root so the report — and the `changed_only` git
@@ -434,7 +452,11 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
     };
 
     if let Some(changed) = &changed {
-        groups.retain(|g| g.sites.iter().any(|(f, _)| changed.contains(&normalize_rel(root, f))));
+        groups.retain(|g| {
+            g.sites
+                .iter()
+                .any(|(f, _)| changed.contains(&normalize_rel(root, f)))
+        });
     }
     for g in &mut groups {
         cap_sites(&mut g.sites, root, changed.as_ref());
@@ -462,7 +484,12 @@ fn group(diags: Vec<Diag>) -> Vec<DiagGroup> {
     let mut map: HashMap<String, DiagGroup> = HashMap::new();
     for d in diags {
         let normalized = normalize_message(&d.message);
-        let key = format!("{}|{}|{}", d.severity.as_str(), d.code.as_deref().unwrap_or(""), normalized);
+        let key = format!(
+            "{}|{}|{}",
+            d.severity.as_str(),
+            d.code.as_deref().unwrap_or(""),
+            normalized
+        );
         if !map.contains_key(&key) {
             order.push(key.clone());
             let message = match &d.code {
@@ -471,7 +498,13 @@ fn group(diags: Vec<Diag>) -> Vec<DiagGroup> {
             };
             map.insert(
                 key.clone(),
-                DiagGroup { key: key.clone(), severity: d.severity, message, count: 0, sites: Vec::new() },
+                DiagGroup {
+                    key: key.clone(),
+                    severity: d.severity,
+                    message,
+                    count: 0,
+                    sites: Vec::new(),
+                },
             );
         }
         let entry = map.get_mut(&key).expect("just inserted");
@@ -493,7 +526,13 @@ fn cap_sites(sites: &mut Vec<(String, u32)>, root: &Path, changed: Option<&HashS
         return;
     }
     if let Some(changed) = changed {
-        sites.sort_by_key(|(f, _)| if changed.contains(&normalize_rel(root, f)) { 0 } else { 1 });
+        sites.sort_by_key(|(f, _)| {
+            if changed.contains(&normalize_rel(root, f)) {
+                0
+            } else {
+                1
+            }
+        });
     }
     sites.truncate(MAX_SITES);
 }
@@ -549,7 +588,10 @@ fn lexically_confined(field: &str, rel: &str) -> AppResult<()> {
             "check `{field}` must be relative to the project root, not an absolute path (`{rel}`)"
         )));
     }
-    if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if raw
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(AppError::Checks(format!(
             "check `{field}` `{rel}` escapes the project root (`..` is not allowed)"
         )));
@@ -580,9 +622,9 @@ fn confine_under_root(root: &Path, base: &Path, field: &str, rel: &str) -> AppRe
     // paths that `parsers` relativizes.
     match crate::fsutil::confine_creatable(root, &joined) {
         Ok(_) => Ok(joined),
-        Err(crate::fsutil::ConfineError::Boundary(e)) => {
-            Err(AppError::Checks(format!("cannot resolve project root: {e}")))
-        }
+        Err(crate::fsutil::ConfineError::Boundary(e)) => Err(AppError::Checks(format!(
+            "cannot resolve project root: {e}"
+        ))),
         Err(crate::fsutil::ConfineError::Escaped) => Err(AppError::Checks(format!(
             "check `{field}` `{rel}` resolves outside the project root"
         ))),
@@ -615,7 +657,8 @@ async fn read_report_file(root: &Path, cwd: &Path, rel: &str) -> Result<String, 
         // root-relative location only when it actually exists; otherwise keep
         // `primary` so the "could not be read" error points at the preferred
         // (cwd-relative) path the new semantics expect.
-        let fallback = confine_under_root(root, root, "report_file", rel).map_err(|e| e.to_string())?;
+        let fallback =
+            confine_under_root(root, root, "report_file", rel).map_err(|e| e.to_string())?;
         if tokio::fs::try_exists(&fallback).await.unwrap_or(false) {
             fallback
         } else {
@@ -638,7 +681,10 @@ async fn read_report_file(root: &Path, cwd: &Path, rel: &str) -> Result<String, 
 /// i.e. one outside the effective cwd) are left as-is.
 fn reroot_diags(diags: &mut [Diag], cwd_rel: &str) {
     let prefix = cwd_rel.replace('\\', "/");
-    let prefix = prefix.trim_matches('/').trim_start_matches("./").trim_end_matches('/');
+    let prefix = prefix
+        .trim_matches('/')
+        .trim_start_matches("./")
+        .trim_end_matches('/');
     if prefix.is_empty() {
         return;
     }
@@ -696,20 +742,27 @@ async fn spawn_capture(
     // on `child.wait()` below — killing the child for a timeout only closes
     // its pipes (which cleanly EOFs these readers), it doesn't discard what
     // was already captured.
-    let out_task = tokio::spawn(crate::procutil::read_capped(child.stdout.take(), MAX_OUTPUT_BYTES));
-    let err_task = tokio::spawn(crate::procutil::read_capped(child.stderr.take(), MAX_OUTPUT_BYTES));
+    let out_task = tokio::spawn(crate::procutil::read_capped(
+        child.stdout.take(),
+        MAX_OUTPUT_BYTES,
+    ));
+    let err_task = tokio::spawn(crate::procutil::read_capped(
+        child.stderr.take(),
+        MAX_OUTPUT_BYTES,
+    ));
 
-    let (exit_code, timed_out) = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(Ok(status)) => (status.code(), false),
-        Ok(Err(e)) => return Err(AppError::Checks(format!("check `{cmd}` failed: {e}"))),
-        Err(_) => {
-            // Timed out: kill the whole tree (kill_on_drop is a backstop, not a
-            // guarantee the process is gone by the time we read the buffers
-            // below — and a checker's own children must not survive it) and reap.
-            crate::procutil::kill_tree(&mut child).await;
-            (None, true)
-        }
-    };
+    let (exit_code, timed_out) =
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+            Ok(Ok(status)) => (status.code(), false),
+            Ok(Err(e)) => return Err(AppError::Checks(format!("check `{cmd}` failed: {e}"))),
+            Err(_) => {
+                // Timed out: kill the whole tree (kill_on_drop is a backstop, not a
+                // guarantee the process is gone by the time we read the buffers
+                // below — and a checker's own children must not survive it) and reap.
+                crate::procutil::kill_tree(&mut child).await;
+                (None, true)
+            }
+        };
 
     // Bounded: a checker grandchild still holding a pipe write end must not
     // hang the check run forever (truncation is irrelevant here — parsers
@@ -755,7 +808,14 @@ mod tests {
     use super::*;
 
     fn diag(severity: Severity, code: Option<&str>, message: &str, file: &str, line: u32) -> Diag {
-        Diag { severity, code: code.map(str::to_string), message: message.to_string(), file: file.to_string(), line, col: None }
+        Diag {
+            severity,
+            code: code.map(str::to_string),
+            message: message.to_string(),
+            file: file.to_string(),
+            line,
+            col: None,
+        }
     }
 
     #[test]
@@ -764,9 +824,15 @@ mod tests {
             normalize_message("cannot find value `x` in this scope"),
             "cannot find value ‹…› in this scope"
         );
-        assert_eq!(normalize_message("expected 'i32', found 'String'"), "expected ‹…›, found ‹…›");
+        assert_eq!(
+            normalize_message("expected 'i32', found 'String'"),
+            "expected ‹…›, found ‹…›"
+        );
         // No quotes: unchanged.
-        assert_eq!(normalize_message("aborting due to 2 previous errors"), "aborting due to 2 previous errors");
+        assert_eq!(
+            normalize_message("aborting due to 2 previous errors"),
+            "aborting due to 2 previous errors"
+        );
         // Unterminated quote: left as a literal character, not consumed.
         assert_eq!(normalize_message("odd ' quote"), "odd ' quote");
     }
@@ -775,35 +841,60 @@ mod tests {
     fn group_dedups_but_leaves_sites_uncapped() {
         let mut diags = Vec::new();
         for i in 0..8 {
-            diags.push(diag(Severity::Error, Some("E0425"), &format!("cannot find value `v{i}` in this scope"), &format!("src/f{i}.rs"), 1));
+            diags.push(diag(
+                Severity::Error,
+                Some("E0425"),
+                &format!("cannot find value `v{i}` in this scope"),
+                &format!("src/f{i}.rs"),
+                1,
+            ));
         }
         // A different code must NOT collapse into the same group.
-        diags.push(diag(Severity::Warning, Some("unused"), "unused variable `y`", "src/g.rs", 3));
+        diags.push(diag(
+            Severity::Warning,
+            Some("unused"),
+            "unused variable `y`",
+            "src/g.rs",
+            3,
+        ));
 
         let groups = group(diags);
-        assert_eq!(groups.len(), 2, "the 8 E0425s collapse to one group, the warning is separate: {groups:?}");
-        let e0425 = groups.iter().find(|g| g.message.starts_with("E0425")).expect("E0425 group");
+        assert_eq!(
+            groups.len(),
+            2,
+            "the 8 E0425s collapse to one group, the warning is separate: {groups:?}"
+        );
+        let e0425 = groups
+            .iter()
+            .find(|g| g.message.starts_with("E0425"))
+            .expect("E0425 group");
         assert_eq!(e0425.count, 8);
         // `group` no longer caps — that's `cap_sites`'s job now, run after
         // the `changed_only` filter (see `run`'s doc comment).
-        assert_eq!(e0425.sites.len(), 8, "group() itself leaves sites uncapped: {e0425:?}");
+        assert_eq!(
+            e0425.sites.len(),
+            8,
+            "group() itself leaves sites uncapped: {e0425:?}"
+        );
         assert_eq!(e0425.message, "E0425: cannot find value ‹…› in this scope");
     }
 
     #[test]
     fn cap_sites_plain_truncates_in_source_order() {
         let dir = std::env::temp_dir().join(format!("checks-capsites-{}", uuid::Uuid::new_v4()));
-        let mut sites: Vec<(String, u32)> =
-            (0..8).map(|i| (format!("src/f{i}.rs"), 1)).collect();
+        let mut sites: Vec<(String, u32)> = (0..8).map(|i| (format!("src/f{i}.rs"), 1)).collect();
         cap_sites(&mut sites, &dir, None);
         assert_eq!(sites.len(), MAX_SITES);
-        assert_eq!(sites, vec![
-            ("src/f0.rs".to_string(), 1),
-            ("src/f1.rs".to_string(), 1),
-            ("src/f2.rs".to_string(), 1),
-            ("src/f3.rs".to_string(), 1),
-            ("src/f4.rs".to_string(), 1),
-        ]);
+        assert_eq!(
+            sites,
+            vec![
+                ("src/f0.rs".to_string(), 1),
+                ("src/f1.rs".to_string(), 1),
+                ("src/f2.rs".to_string(), 1),
+                ("src/f3.rs".to_string(), 1),
+                ("src/f4.rs".to_string(), 1),
+            ]
+        );
     }
 
     #[test]
@@ -811,7 +902,8 @@ mod tests {
         // 6 sites, none of the first 5 (source order) is the changed file —
         // it's the 6th. A naive source-order truncation would drop it; the
         // changed-file site must still show up among the capped 5.
-        let dir = std::env::temp_dir().join(format!("checks-capsites-changed-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("checks-capsites-changed-{}", uuid::Uuid::new_v4()));
         let mut sites: Vec<(String, u32)> = (0..6).map(|i| (format!("src/f{i}.rs"), 1)).collect();
         let mut changed = HashSet::new();
         changed.insert("src/f5.rs".to_string());
@@ -842,10 +934,23 @@ mod tests {
         // spans, so `left: `1`` / `left: `3`` don't split the group. Pins that
         // the cargo-test parser's block-as-message plays nicely with `group`.
         const OUT: &str = "test tests::a ... FAILED\ntest tests::b ... FAILED\n\nfailures:\n\n---- tests::a stdout ----\nthread 'tests::a' panicked at 'assertion failed: `(left == right)`\n  left: `1`,\n right: `2`', src/helper.rs:5:5\n\n---- tests::b stdout ----\nthread 'tests::b' panicked at 'assertion failed: `(left == right)`\n  left: `3`,\n right: `4`', src/helper.rs:5:5\n\ntest result: FAILED. 0 passed; 2 failed;\n";
-        let diags = parsers::parse(ParserKind::CargoTest, OUT, "", std::path::Path::new("."), None);
+        let diags = parsers::parse(
+            ParserKind::CargoTest,
+            OUT,
+            "",
+            std::path::Path::new("."),
+            None,
+        );
         let groups = group(diags);
-        let errs: Vec<_> = groups.iter().filter(|g| g.severity == Severity::Error).collect();
-        assert_eq!(errs.len(), 1, "identical assertions should group: {groups:?}");
+        let errs: Vec<_> = groups
+            .iter()
+            .filter(|g| g.severity == Severity::Error)
+            .collect();
+        assert_eq!(
+            errs.len(),
+            1,
+            "identical assertions should group: {groups:?}"
+        );
         assert_eq!(errs[0].count, 2);
     }
 
@@ -884,7 +989,13 @@ mod tests {
     #[tokio::test]
     async fn run_executes_a_real_command() {
         let cmd = format!("{} --version", resolve_quoted("cargo"));
-        let def = CheckDef { name: "sanity".into(), cmd, parser: ParserKind::GenericGcc, timeout_secs: 30, ..Default::default() };
+        let def = CheckDef {
+            name: "sanity".into(),
+            cmd,
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 30,
+            ..Default::default()
+        };
         let report = run(&std::env::temp_dir(), &def, false).await.expect("run");
         assert_eq!(report.exit_code, Some(0));
         assert!(!report.timed_out);
@@ -1000,21 +1111,39 @@ mod tests {
         let cmd = format!("{} -n 40 127.0.0.1 >NUL", resolve_quoted("ping"));
         #[cfg(not(windows))]
         let cmd = format!("{} 40", resolve_quoted("sleep"));
-        let def = CheckDef { name: "slow".into(), cmd, parser: ParserKind::GenericGcc, timeout_secs: 1, ..Default::default() };
+        let def = CheckDef {
+            name: "slow".into(),
+            cmd,
+            parser: ParserKind::GenericGcc,
+            timeout_secs: 1,
+            ..Default::default()
+        };
         let started = Instant::now();
         let report = run(&std::env::temp_dir(), &def, false).await.expect("run");
         assert!(report.timed_out);
         assert_eq!(report.exit_code, None);
         // Floored at 10s, generous upper bound for slow CI.
-        assert!(started.elapsed() >= Duration::from_secs(9), "elapsed: {:?}", started.elapsed());
-        assert!(started.elapsed() < Duration::from_secs(60), "elapsed: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= Duration::from_secs(9),
+            "elapsed: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "elapsed: {:?}",
+            started.elapsed()
+        );
     }
 
     // ── V22 Phase B — cwd / env / report_file ────────────────────────────
 
     #[test]
     fn validate_rejects_absolute_and_escaping_cwd_and_report_file() {
-        let abs = if cfg!(windows) { "C:\\Windows\\Temp" } else { "/etc" };
+        let abs = if cfg!(windows) {
+            "C:\\Windows\\Temp"
+        } else {
+            "/etc"
+        };
 
         // cwd: escaping (`..`) and absolute are both rejected; a plain
         // relative subpath is fine.
@@ -1035,11 +1164,20 @@ mod tests {
             report_file: Some("../secrets.xml".into()),
             ..Default::default()
         };
-        assert!(def.validate().is_err(), "escaping report_file must be rejected");
+        assert!(
+            def.validate().is_err(),
+            "escaping report_file must be rejected"
+        );
         def.report_file = Some(abs.into());
-        assert!(def.validate().is_err(), "absolute report_file must be rejected");
+        assert!(
+            def.validate().is_err(),
+            "absolute report_file must be rejected"
+        );
         def.report_file = Some("target/surefire/TEST.xml".into());
-        assert!(def.validate().is_ok(), "a plain relative report_file is allowed");
+        assert!(
+            def.validate().is_ok(),
+            "a plain relative report_file is allowed"
+        );
     }
 
     #[tokio::test]
@@ -1055,7 +1193,10 @@ mod tests {
             ..Default::default()
         };
         let result = run(&std::env::temp_dir(), &def, false).await;
-        assert!(result.is_err(), "run must reject an escaping cwd: {result:?}");
+        assert!(
+            result.is_err(),
+            "run must reject an escaping cwd: {result:?}"
+        );
     }
 
     /// `env` entries are forced onto the spawned child — echo the sentinel back
@@ -1068,10 +1209,15 @@ mod tests {
         let cmd = "echo cimp_env=$CIMP_CHECK_ENV".to_string();
         let env = vec![("CIMP_CHECK_ENV".to_string(), "sentinel42".to_string())];
         let (code, stdout, _stderr, timed_out) =
-            spawn_capture(&std::env::temp_dir(), &cmd, &env, 30).await.expect("spawn");
+            spawn_capture(&std::env::temp_dir(), &cmd, &env, 30)
+                .await
+                .expect("spawn");
         assert_eq!(code, Some(0));
         assert!(!timed_out);
-        assert!(stdout.contains("cimp_env=sentinel42"), "env not forced onto child; stdout: {stdout:?}");
+        assert!(
+            stdout.contains("cimp_env=sentinel42"),
+            "env not forced onto child; stdout: {stdout:?}"
+        );
     }
 
     /// A check run in a nested `cwd` must still report project-root-relative
@@ -1090,7 +1236,11 @@ mod tests {
             ..Default::default()
         };
         let report = run(&root, &def, false).await.expect("run");
-        let sites: Vec<_> = report.groups.iter().flat_map(|g| g.sites.iter().cloned()).collect();
+        let sites: Vec<_> = report
+            .groups
+            .iter()
+            .flat_map(|g| g.sites.iter().cloned())
+            .collect();
         assert!(
             sites.iter().any(|(f, _)| f == "nested/foo.rs"),
             "diagnostic site should be re-rooted under the nested cwd: {sites:?}"
@@ -1103,7 +1253,8 @@ mod tests {
         // A config written before V22 (no cwd/env/report_file) deserializes
         // with those fields defaulted, and is stable across a re-serialize /
         // re-deserialize roundtrip.
-        let old = r#"{"name":"cargo","cmd":"cargo check","parser":"cargo-json","timeout_secs":120}"#;
+        let old =
+            r#"{"name":"cargo","cmd":"cargo check","parser":"cargo-json","timeout_secs":120}"#;
         let def: CheckDef = serde_json::from_str(old).expect("old JSON deserializes");
         assert_eq!(def.cwd, None);
         assert!(def.env.is_empty());
@@ -1115,7 +1266,10 @@ mod tests {
         assert!(!def.auto);
         let reserialized = serde_json::to_value(&def).expect("CheckDef serializes");
         let again: CheckDef = serde_json::from_value(reserialized).expect("re-deserializes");
-        assert_eq!(def, again, "CheckDef must survive a serialize/deserialize roundtrip unchanged");
+        assert_eq!(
+            def, again,
+            "CheckDef must survive a serialize/deserialize roundtrip unchanged"
+        );
     }
 
     /// `report_file` set ⇒ the parser reads the FILE's content after the run,
@@ -1136,8 +1290,14 @@ mod tests {
         };
         let report = run(&root, &def, false).await.expect("run");
         let msgs: Vec<_> = report.groups.iter().map(|g| g.message.clone()).collect();
-        assert!(msgs.iter().any(|m| m.contains("watch out")), "parser should read report_file: {msgs:?}");
-        assert!(!msgs.iter().any(|m| m.contains("from_stdout")), "stdout must not be parsed when report_file is set: {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("watch out")),
+            "parser should read report_file: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("from_stdout")),
+            "stdout must not be parsed when report_file is set: {msgs:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1146,20 +1306,38 @@ mod tests {
     #[test]
     fn validate_regex_custom_requires_a_valid_pattern() {
         // regex-custom with no pattern is inert — rejected at validate time.
-        let mut def = CheckDef { parser: ParserKind::RegexCustom, ..Default::default() };
-        assert!(def.validate().is_err(), "regex-custom without a pattern must be rejected");
+        let mut def = CheckDef {
+            parser: ParserKind::RegexCustom,
+            ..Default::default()
+        };
+        assert!(
+            def.validate().is_err(),
+            "regex-custom without a pattern must be rejected"
+        );
         // A pattern missing the mandatory `line`/`message` groups is rejected.
         def.pattern = Some(r"(?<file>\S+)".into());
-        assert!(def.validate().is_err(), "missing mandatory named groups must be rejected");
+        assert!(
+            def.validate().is_err(),
+            "missing mandatory named groups must be rejected"
+        );
         // An uncompilable regex is rejected.
         def.pattern = Some(r"(?<file>[".into());
         assert!(def.validate().is_err(), "a bad regex must be rejected");
         // All three mandatory groups present + compiles ⇒ ok.
         def.pattern = Some(r"^(?<file>\S+):(?<line>\d+): (?<message>.+)$".into());
-        assert!(def.validate().is_ok(), "a valid pattern with all groups is accepted");
+        assert!(
+            def.validate().is_ok(),
+            "a valid pattern with all groups is accepted"
+        );
         // The pattern is ignored (not required) for any other parser.
-        let other = CheckDef { parser: ParserKind::GenericGcc, ..Default::default() };
-        assert!(other.validate().is_ok(), "a non-regex-custom parser needs no pattern");
+        let other = CheckDef {
+            parser: ParserKind::GenericGcc,
+            ..Default::default()
+        };
+        assert!(
+            other.validate().is_ok(),
+            "a non-regex-custom parser needs no pattern"
+        );
     }
 
     #[test]
@@ -1174,8 +1352,14 @@ mod tests {
         };
         let value = serde_json::to_value(&def).expect("CheckDef serializes");
         let back: CheckDef = serde_json::from_value(value).expect("re-deserializes");
-        assert_eq!(def, back, "pattern must survive a serialize/deserialize roundtrip");
-        assert_eq!(back.pattern.as_deref(), Some(r"^(?<file>\S+):(?<line>\d+) (?<message>.+)$"));
+        assert_eq!(
+            def, back,
+            "pattern must survive a serialize/deserialize roundtrip"
+        );
+        assert_eq!(
+            back.pattern.as_deref(),
+            Some(r"^(?<file>\S+):(?<line>\d+) (?<message>.+)$")
+        );
     }
 
     #[test]
@@ -1184,9 +1368,17 @@ mod tests {
         // identical lines must collapse in `group` (count reflects both).
         const OUT: &str = "Program.cs(10,13): error CS0103: boom [C:\\proj\\App.csproj]\nProgram.cs(10,13): error CS0103: boom [C:\\proj\\App.csproj]\n";
         let diags = parsers::parse(ParserKind::Dotnet, OUT, "", std::path::Path::new("."), None);
-        assert_eq!(diags.len(), 2, "parser itself emits one diag per line: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            2,
+            "parser itself emits one diag per line: {diags:?}"
+        );
         let groups = group(diags);
-        assert_eq!(groups.len(), 1, "identical MSBuild lines dedup into one group: {groups:?}");
+        assert_eq!(
+            groups.len(),
+            1,
+            "identical MSBuild lines dedup into one group: {groups:?}"
+        );
         assert_eq!(groups[0].count, 2);
         assert_eq!(groups[0].severity, Severity::Error);
     }
@@ -1195,7 +1387,8 @@ mod tests {
     /// never an empty, falsely-green run.
     #[tokio::test]
     async fn missing_report_file_yields_explicit_error_diag() {
-        let root = std::env::temp_dir().join(format!("checks-report-missing-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("checks-report-missing-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let def = CheckDef {
             name: "rep".into(),
@@ -1228,12 +1421,21 @@ mod tests {
         std::fs::create_dir_all(root.join("backend").join("target")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         // The correct (cwd-relative) file, plus a root-relative decoy.
-        std::fs::write(root.join("backend").join("target").join("r.xml"), "CWD_WINS").unwrap();
+        std::fs::write(
+            root.join("backend").join("target").join("r.xml"),
+            "CWD_WINS",
+        )
+        .unwrap();
         std::fs::write(root.join("target").join("r.xml"), "ROOT_DECOY").unwrap();
 
         let cwd = root.join("backend");
-        let got = read_report_file(&root, &cwd, "target/r.xml").await.expect("read");
-        assert_eq!(got, "CWD_WINS", "cwd-relative report_file must win over the root-relative decoy");
+        let got = read_report_file(&root, &cwd, "target/r.xml")
+            .await
+            .expect("read");
+        assert_eq!(
+            got, "CWD_WINS",
+            "cwd-relative report_file must win over the root-relative decoy"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1242,15 +1444,21 @@ mod tests {
     /// root-relative one if THAT exists — so old configs keep working.
     #[tokio::test]
     async fn report_file_falls_back_to_root_relative_for_old_configs() {
-        let root = std::env::temp_dir().join(format!("checks-rf-fallback-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("checks-rf-fallback-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("backend")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         // Only the root-relative location exists (no backend/target/r.xml).
         std::fs::write(root.join("target").join("r.xml"), "ROOT_ONLY").unwrap();
 
         let cwd = root.join("backend");
-        let got = read_report_file(&root, &cwd, "target/r.xml").await.expect("read");
-        assert_eq!(got, "ROOT_ONLY", "must fall back to root-relative when only that exists");
+        let got = read_report_file(&root, &cwd, "target/r.xml")
+            .await
+            .expect("read");
+        assert_eq!(
+            got, "ROOT_ONLY",
+            "must fall back to root-relative when only that exists"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1261,8 +1469,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("checks-rf-escape-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("backend")).unwrap();
         let cwd = root.join("backend");
-        let err = read_report_file(&root, &cwd, "../../secrets.xml").await.unwrap_err();
-        assert!(err.contains("escapes the project root") || err.contains("not allowed"), "got: {err}");
+        let err = read_report_file(&root, &cwd, "../../secrets.xml")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("escapes the project root") || err.contains("not allowed"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1282,11 +1495,17 @@ mod tests {
             ..Default::default()
         };
         let result = test_check(&std::env::temp_dir(), &def).await;
-        assert!(result.error.is_none(), "a valid check must not carry an error: {result:?}");
+        assert!(
+            result.error.is_none(),
+            "a valid check must not carry an error: {result:?}"
+        );
         assert_eq!(result.exit_code, Some(0));
         assert!(!result.timed_out);
         assert_eq!(result.diag_count, 1, "one diagnostic parsed: {result:?}");
-        assert!(result.stdout_bytes > 0, "the echo produced captured stdout: {result:?}");
+        assert!(
+            result.stdout_bytes > 0,
+            "the echo produced captured stdout: {result:?}"
+        );
         let first = result.diagnostics.first().expect("one preview diagnostic");
         assert_eq!(first.severity, "error");
         assert!(first.message.contains("boom"), "{first:?}");
@@ -1309,8 +1528,14 @@ mod tests {
         };
         let result = test_check(&std::env::temp_dir(), &def).await;
         assert!(result.error.is_none(), "{result:?}");
-        assert_eq!(result.diag_count, 0, "cargo-json parses plain text to zero diags: {result:?}");
-        assert!(result.stdout_bytes > 0, "output was produced (wrong-parser signal): {result:?}");
+        assert_eq!(
+            result.diag_count, 0,
+            "cargo-json parses plain text to zero diags: {result:?}"
+        );
+        assert!(
+            result.stdout_bytes > 0,
+            "output was produced (wrong-parser signal): {result:?}"
+        );
     }
 
     /// A validation failure (escaping `cwd`) is captured into `error`, not
@@ -1326,7 +1551,10 @@ mod tests {
             ..Default::default()
         };
         let result = test_check(&std::env::temp_dir(), &def).await;
-        assert!(result.error.is_some(), "an escaping cwd must surface as an error: {result:?}");
+        assert!(
+            result.error.is_some(),
+            "an escaping cwd must surface as an error: {result:?}"
+        );
         assert_eq!(result.diag_count, 0);
     }
 }

@@ -76,7 +76,9 @@ pub struct SessionWindow {
 /// from git's own commit summary output — usually the short form — so match
 /// by prefix.
 fn matches_recorded(full_hash: &str, recorded: &[String]) -> bool {
-    recorded.iter().any(|h| !h.is_empty() && full_hash.starts_with(h.as_str()))
+    recorded
+        .iter()
+        .any(|h| !h.is_empty() && full_hash.starts_with(h.as_str()))
 }
 
 /// The `workbench_git_graph` payload: the current branch (or `None` when
@@ -165,7 +167,9 @@ pub async fn log_commit_times(root: &Path, max: usize) -> AppResult<(Vec<(String
             continue;
         }
         let mut f = record.splitn(2, FIELD_SEP);
-        let (Some(hash), Some(ts)) = (f.next(), f.next()) else { continue };
+        let (Some(hash), Some(ts)) = (f.next(), f.next()) else {
+            continue;
+        };
         out.push((
             hash.to_string(),
             ts.trim().parse::<i64>().unwrap_or(0).saturating_mul(1000),
@@ -186,9 +190,24 @@ fn parse_log(raw: &str) -> Vec<CommitInfo> {
             continue;
         }
         let mut f = record.splitn(8, FIELD_SEP);
-        let (Some(hash), Some(short), Some(parents), Some(ts), Some(author), Some(refs), Some(subject)) = (
-            f.next(), f.next(), f.next(), f.next(), f.next(), f.next(), f.next(),
-        ) else {
+        let (
+            Some(hash),
+            Some(short),
+            Some(parents),
+            Some(ts),
+            Some(author),
+            Some(refs),
+            Some(subject),
+        ) = (
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+        )
+        else {
             continue; // malformed record — skip, never panic on git output
         };
         let body = f.next().unwrap_or("");
@@ -264,11 +283,13 @@ pub fn commit_counts_from(
     windows: &[SessionWindow],
     recorded: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, u32> {
-    let mut out: HashMap<String, u32> =
-        windows.iter().map(|w| (w.session_id.clone(), 0)).collect();
+    let mut out: HashMap<String, u32> = windows.iter().map(|w| (w.session_id.clone(), 0)).collect();
     for (hash, ts_ms) in commits {
         for w in windows {
-            let hashes = recorded.get(&w.session_id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let hashes = recorded
+                .get(&w.session_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             if (*ts_ms >= w.from_ms && *ts_ms <= w.to_ms) || matches_recorded(hash, hashes) {
                 if let Some(n) = out.get_mut(&w.session_id) {
                     *n += 1;
@@ -282,7 +303,11 @@ pub fn commit_counts_from(
 /// One commit vs. its first parent (the whole commit for a root commit),
 /// parsed into the same [`super::diff::FileDiff`] shape every other diff
 /// surface renders. Read-only — no revert applies to a historical commit.
-pub async fn commit_diff(root: &Path, hash: &str, context: u32) -> AppResult<Vec<super::diff::FileDiff>> {
+pub async fn commit_diff(
+    root: &Path,
+    hash: &str,
+    context: u32,
+) -> AppResult<Vec<super::diff::FileDiff>> {
     validate_hash(hash)?;
     let ctx = GitCtx::discover(root);
     let unified = format!("--unified={}", context.min(super::diff::MAX_CONTEXT));
@@ -292,8 +317,14 @@ pub async fn commit_diff(root: &Path, hash: &str, context: u32) -> AppResult<Vec
     let out = git::run(
         &ctx,
         &[
-            "show", "--no-color", "--format=", &unified, "--first-parent", "-m",
-            "--no-renames", hash,
+            "show",
+            "--no-color",
+            "--format=",
+            &unified,
+            "--first-parent",
+            "-m",
+            "--no-renames",
+            hash,
         ],
         Some(LOG_TIMEOUT),
     )
@@ -323,7 +354,11 @@ pub async fn git_graph(root: &Path, limit: usize) -> AppResult<GitGraph> {
         }
         _ => None,
     };
-    Ok(GitGraph { head, commits, truncated })
+    Ok(GitGraph {
+        head,
+        commits,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -344,7 +379,11 @@ mod tests {
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .output()
             .expect("git spawns");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn setup_repo(tag: &str) -> std::path::PathBuf {
@@ -412,7 +451,9 @@ mod tests {
         // A recorded hash prefix pulls a commit in even OUTSIDE the window,
         // flagged tracked; window-only commits stay untracked.
         let first_short: String = all.commits[1].hash.chars().take(7).collect();
-        let by_hash = session_commits(&dir, 0, 1, &[first_short.clone()]).await.unwrap();
+        let by_hash = session_commits(&dir, 0, 1, &[first_short.clone()])
+            .await
+            .unwrap();
         assert_eq!(by_hash.commits.len(), 1);
         assert_eq!(by_hash.commits[0].subject, "first");
         assert!(by_hash.commits[0].tracked);
@@ -423,9 +464,21 @@ mod tests {
         let counts = commit_counts_from(
             &times,
             &[
-                SessionWindow { session_id: "s1".into(), from_ms: 0, to_ms: i64::MAX },
-                SessionWindow { session_id: "s2".into(), from_ms: 0, to_ms: 1 },
-                SessionWindow { session_id: "s3".into(), from_ms: 0, to_ms: 1 },
+                SessionWindow {
+                    session_id: "s1".into(),
+                    from_ms: 0,
+                    to_ms: i64::MAX,
+                },
+                SessionWindow {
+                    session_id: "s2".into(),
+                    from_ms: 0,
+                    to_ms: 1,
+                },
+                SessionWindow {
+                    session_id: "s3".into(),
+                    from_ms: 0,
+                    to_ms: 1,
+                },
             ],
             &HashMap::from([("s3".to_string(), vec![first_short])]),
         );
@@ -443,7 +496,10 @@ mod tests {
         let dir = setup_repo("diff");
         commit_file(&dir, "a.txt", "one\n", "first");
         commit_file(&dir, "a.txt", "two\n", "second");
-        let commits = session_commits(&dir, 0, i64::MAX, &[]).await.unwrap().commits;
+        let commits = session_commits(&dir, 0, i64::MAX, &[])
+            .await
+            .unwrap()
+            .commits;
         let files = commit_diff(&dir, &commits[0].hash, 3).await.unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.txt");
@@ -466,18 +522,30 @@ mod tests {
         commit_file(&dir, "b.txt", "1", "feat work");
         git(&dir, &["checkout", "main"]);
         commit_file(&dir, "a.txt", "2", "main work");
-        git(&dir, &["merge", "--no-ff", "-m", "merge feature", "feature"]);
+        git(
+            &dir,
+            &["merge", "--no-ff", "-m", "merge feature", "feature"],
+        );
 
         let g = git_graph(&dir, 100).await.unwrap();
         assert_eq!(g.head.as_deref(), Some("main"));
         assert!(!g.truncated);
         assert_eq!(g.commits.len(), 4);
         // Topo order: every commit appears before all of its parents.
-        let pos: HashMap<&str, usize> =
-            g.commits.iter().enumerate().map(|(i, c)| (c.hash.as_str(), i)).collect();
+        let pos: HashMap<&str, usize> = g
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.hash.as_str(), i))
+            .collect();
         for c in &g.commits {
             for p in &c.parents {
-                assert!(pos[c.hash.as_str()] < pos[p.as_str()], "{} before {}", c.short, p);
+                assert!(
+                    pos[c.hash.as_str()] < pos[p.as_str()],
+                    "{} before {}",
+                    c.short,
+                    p
+                );
             }
         }
         // The merge commit has two parents and carries the HEAD decoration.

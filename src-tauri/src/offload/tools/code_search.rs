@@ -64,7 +64,8 @@ pub fn def() -> ToolDef {
 }
 
 pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
-    let args: Args = serde_json::from_value(args).map_err(|e| format!("invalid code_search args: {e}"))?;
+    let args: Args =
+        serde_json::from_value(args).map_err(|e| format!("invalid code_search args: {e}"))?;
     if args.query.is_empty() {
         return Err("query must not be empty".into());
     }
@@ -73,7 +74,10 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         Some(p) => vec![ctx.confine(p)?],
         None => ctx.allowed_roots.clone(),
     };
-    let max_results = args.max_results.unwrap_or(DEFAULT_MAX_RESULTS).min(MAX_RESULTS_CAP);
+    let max_results = args
+        .max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .min(MAX_RESULTS_CAP);
     let needle = args.query.to_lowercase();
     // Lowercased so the suffix match is case-insensitive — otherwise a `.sql`
     // filter would miss `.SQL` (common on Windows / case-insensitive volumes).
@@ -152,7 +156,12 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                     for (lineno, line) in text.lines().enumerate() {
                         if line.to_lowercase().contains(&needle) {
                             let snippet: String = line.trim().chars().take(SNIPPET_MAX).collect();
-                            hits.push(format!("{}:{}: {}", display_path(&path, root), lineno + 1, snippet));
+                            hits.push(format!(
+                                "{}:{}: {}",
+                                display_path(&path, root),
+                                lineno + 1,
+                                snippet
+                            ));
                             if hits.len() >= max_results {
                                 truncated = true;
                                 break 'outer;
@@ -169,7 +178,10 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
 
     let (hits, truncated, scanned) = result;
     if hits.is_empty() {
-        return Ok(format!("(no matches for `{}` in {} file(s) scanned)", args.query, scanned));
+        return Ok(format!(
+            "(no matches for `{}` in {} file(s) scanned)",
+            args.query, scanned
+        ));
     }
     let mut out = hits.join("\n");
     if truncated {

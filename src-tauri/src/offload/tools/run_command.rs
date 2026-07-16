@@ -83,7 +83,9 @@ fn command_stem(command: &str) -> String {
 /// case-insensitively.
 fn policy_for<'a>(command: &str, policies: &'a [CommandPolicy]) -> Option<&'a CommandPolicy> {
     let stem = command_stem(command);
-    policies.iter().find(|p| p.program.eq_ignore_ascii_case(&stem))
+    policies
+        .iter()
+        .find(|p| p.program.eq_ignore_ascii_case(&stem))
 }
 
 /// True for a POSIX short flag (`-c`, `-C`) — a single dash followed by exactly
@@ -189,7 +191,8 @@ fn dangerous_args(command: &str, args: &[String], policies: &[CommandPolicy]) ->
 }
 
 pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
-    let args: Args = serde_json::from_value(args).map_err(|e| format!("invalid run_command args: {e}"))?;
+    let args: Args =
+        serde_json::from_value(args).map_err(|e| format!("invalid run_command args: {e}"))?;
     if ctx.command_allowlist.is_empty() {
         return Err("run_command is disabled — no commands are allowlisted".into());
     }
@@ -223,9 +226,11 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let program = crate::pty::resolve_command(&args.command)
         .map_err(|_| format!("`{}` was not found on PATH", args.command))?;
 
-    let cwd = ctx.allowed_roots.first().cloned().ok_or_else(|| {
-        "run_command has no allowed root to execute in".to_string()
-    })?;
+    let cwd = ctx
+        .allowed_roots
+        .first()
+        .cloned()
+        .ok_or_else(|| "run_command has no allowed root to execute in".to_string())?;
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args.args)
         .current_dir(&cwd)
@@ -275,7 +280,13 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let (out, err, status) = match tokio::time::timeout(TIMEOUT, run).await {
         Ok((out, err, status)) => (out, err, status),
         // `run` (and the `child` it borrows) is dropped here → kill_on_drop reaps it.
-        Err(_) => return Err(format!("`{}` timed out after {}s", args.command, TIMEOUT.as_secs())),
+        Err(_) => {
+            return Err(format!(
+                "`{}` timed out after {}s",
+                args.command,
+                TIMEOUT.as_secs()
+            ))
+        }
     };
     let status = status.map_err(|e| format!("`{}` failed: {e}", args.command))?;
 
@@ -296,7 +307,12 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .unwrap_or_else(|| "signal".into());
 
     if combined.len() > MAX_OUTPUT_BYTES {
-        let cut = combined.char_indices().take_while(|(i, _)| *i < MAX_OUTPUT_BYTES).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+        let cut = combined
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_OUTPUT_BYTES)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
         combined.truncate(cut);
         truncated = true;
     }
@@ -392,7 +408,9 @@ mod tests {
         // Denied flags (exact and `=`-form), via stem match incl. `git.exe`.
         assert!(dangerous_args("git", &argv(&["-c", "core.pager=!sh"]), &policies).is_some());
         assert!(dangerous_args("git.exe", &argv(&["-C", "/etc"]), &policies).is_some());
-        assert!(dangerous_args("git", &argv(&["--git-dir=/other/.git", "log"]), &policies).is_some());
+        assert!(
+            dangerous_args("git", &argv(&["--git-dir=/other/.git", "log"]), &policies).is_some()
+        );
         assert!(dangerous_args("git", &argv(&["--work-tree", "/"]), &policies).is_some());
         // Denied subcommand as the first non-flag token.
         assert!(dangerous_args("git", &argv(&["config", "core.pager", "x"]), &policies).is_some());
@@ -405,7 +423,9 @@ mod tests {
         // `-c core.hooksPath=/x` — the glued spelling previously bypassed the
         // `-c` guard entirely.
         let policies = crate::settings::default_command_policies();
-        assert!(dangerous_args("git", &argv(&["-ccore.hooksPath=/x", "status"]), &policies).is_some());
+        assert!(
+            dangerous_args("git", &argv(&["-ccore.hooksPath=/x", "status"]), &policies).is_some()
+        );
         assert!(dangerous_args("git", &argv(&["-C/etc"]), &policies).is_some());
         // A long flag that merely starts with a denied short flag's letters is
         // NOT a glued short flag and must not be over-matched.
@@ -419,9 +439,24 @@ mod tests {
         // value-taking git global is denied, so these are refused at the flag
         // loop before the (positional) subcommand check even runs.
         let policies = crate::settings::default_command_policies();
-        assert!(dangerous_args("git", &argv(&["--namespace", "x", "config", "--local", "alias.p", "!sh"]), &policies).is_some());
-        assert!(dangerous_args("git", &argv(&["--super-prefix", "p/", "config", "core.pager", "!sh"]), &policies).is_some());
-        assert!(dangerous_args("git", &argv(&["--attr-source", "HEAD", "config", "x", "y"]), &policies).is_some());
+        assert!(dangerous_args(
+            "git",
+            &argv(&["--namespace", "x", "config", "--local", "alias.p", "!sh"]),
+            &policies
+        )
+        .is_some());
+        assert!(dangerous_args(
+            "git",
+            &argv(&["--super-prefix", "p/", "config", "core.pager", "!sh"]),
+            &policies
+        )
+        .is_some());
+        assert!(dangerous_args(
+            "git",
+            &argv(&["--attr-source", "HEAD", "config", "x", "y"]),
+            &policies
+        )
+        .is_some());
         // A legitimate read probe whose ARGUMENT is "config" still runs.
         assert!(dangerous_args("git", &argv(&["grep", "config"]), &policies).is_none());
         assert!(dangerous_args("git", &argv(&["log", "--grep", "config"]), &policies).is_none());
@@ -430,7 +465,9 @@ mod tests {
     #[test]
     fn default_git_policy_allows_read_probes() {
         let policies = crate::settings::default_command_policies();
-        assert!(dangerous_args("git", &argv(&["log", "--oneline", "-n", "5"]), &policies).is_none());
+        assert!(
+            dangerous_args("git", &argv(&["log", "--oneline", "-n", "5"]), &policies).is_none()
+        );
         assert!(dangerous_args("git", &argv(&["diff", "--stat"]), &policies).is_none());
         assert!(dangerous_args("git", &argv(&["status"]), &policies).is_none());
         // `config` only as a later pathspec, not the subcommand, is fine.
@@ -457,7 +494,12 @@ mod tests {
         let policies = vec![crate::settings::readonly_cargo_policy()];
         // The two allowed subcommands (with their own flags) pass.
         assert!(dangerous_args("cargo", &argv(&["metadata"]), &policies).is_none());
-        assert!(dangerous_args("cargo", &argv(&["metadata", "--format-version", "1"]), &policies).is_none());
+        assert!(dangerous_args(
+            "cargo",
+            &argv(&["metadata", "--format-version", "1"]),
+            &policies
+        )
+        .is_none());
         assert!(dangerous_args("cargo", &argv(&["tree"]), &policies).is_none());
         assert!(dangerous_args("cargo", &argv(&["tree", "-e", "features"]), &policies).is_none());
         // Everything that builds/runs/executes project code is refused.
@@ -479,21 +521,36 @@ mod tests {
         // they can neither inject a runner nor shift the subcommand check.
         let policies = vec![crate::settings::readonly_cargo_policy()];
         // `--config` can install a runner/rustc-wrapper → arbitrary exec.
-        assert!(dangerous_args("cargo", &argv(&["--config", "target.x.runner='sh'", "metadata"]), &policies).is_some());
-        assert!(dangerous_args("cargo", &argv(&["--config=build.rustc-wrapper=/x", "tree"]), &policies).is_some());
+        assert!(dangerous_args(
+            "cargo",
+            &argv(&["--config", "target.x.runner='sh'", "metadata"]),
+            &policies
+        )
+        .is_some());
+        assert!(dangerous_args(
+            "cargo",
+            &argv(&["--config=build.rustc-wrapper=/x", "tree"]),
+            &policies
+        )
+        .is_some());
         // `-C dir` escapes the working root; glued form must also be blocked.
         assert!(dangerous_args("cargo", &argv(&["-C", "/etc", "tree"]), &policies).is_some());
         assert!(dangerous_args("cargo", &argv(&["-C/etc", "tree"]), &policies).is_some());
         // `-Z` unstable flags, glued too.
-        assert!(dangerous_args("cargo", &argv(&["-Z", "unstable-options", "metadata"]), &policies).is_some());
+        assert!(dangerous_args(
+            "cargo",
+            &argv(&["-Z", "unstable-options", "metadata"]),
+            &policies
+        )
+        .is_some());
         assert!(dangerous_args("cargo", &argv(&["-Zbuild-std", "tree"]), &policies).is_some());
     }
 
     #[test]
     fn program_without_policy_passes_through() {
         let policies = crate::settings::default_command_policies(); // only git
-        // No policy for `rg`/`cargo` → arg hardening is a no-op (allowlist +
-        // bare-name remain the guard).
+                                                                    // No policy for `rg`/`cargo` → arg hardening is a no-op (allowlist +
+                                                                    // bare-name remain the guard).
         assert!(dangerous_args("rg", &argv(&["-c", "pattern"]), &policies).is_none());
         assert!(dangerous_args("cargo", &argv(&["--config", "x"]), &policies).is_none());
     }

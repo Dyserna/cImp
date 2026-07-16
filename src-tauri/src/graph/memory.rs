@@ -143,7 +143,11 @@ fn strip_list_marker(line: &str) -> &str {
     if matches!(line, "-" | "*" | "•") {
         return ""; // marker-only line — nothing behind it.
     }
-    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
+    if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("• "))
+    {
         return rest.trim_start();
     }
     let digits = line.chars().take_while(char::is_ascii_digit).count();
@@ -616,8 +620,14 @@ mod tests {
         }
         // serde (the `Turn` payload / `TurnUsage` IPC) and `as_str` (the stored
         // column) must produce the same strings.
-        assert_eq!(serde_json::to_value(UsageOrigin::Session).unwrap(), serde_json::json!("session"));
-        assert_eq!(serde_json::to_value(UsageOrigin::Agent).unwrap(), serde_json::json!("agent"));
+        assert_eq!(
+            serde_json::to_value(UsageOrigin::Session).unwrap(),
+            serde_json::json!("session")
+        );
+        assert_eq!(
+            serde_json::to_value(UsageOrigin::Agent).unwrap(),
+            serde_json::json!("agent")
+        );
         assert_eq!(UsageOrigin::Session.as_str(), "session");
         assert_eq!(UsageOrigin::Agent.as_str(), "agent");
         // Column round-trip; anything unexpected (incl. a migrated legacy row)

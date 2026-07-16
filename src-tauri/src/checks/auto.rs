@@ -68,7 +68,12 @@ pub fn should_run(state: &mut AutoCheckState, now: Instant, debounce: Duration) 
 pub fn diff_groups<'a>(baseline: &Baseline, groups: &'a [DiagGroup]) -> Vec<&'a DiagGroup> {
     groups
         .iter()
-        .filter(|g| baseline.get(&g.key).map(|&prev| g.count > prev).unwrap_or(true))
+        .filter(|g| {
+            baseline
+                .get(&g.key)
+                .map(|&prev| g.count > prev)
+                .unwrap_or(true)
+        })
         .collect()
 }
 
@@ -204,10 +209,10 @@ impl RootRunner {
                 Err(e) => errors.push(spawn_failure_line(&def.name, &e.to_string())),
             }
         }
-        self.last
-            .lock()
-            .unwrap()
-            .insert(root.to_path_buf(), (Instant::now(), reports.clone(), errors.clone()));
+        self.last.lock().unwrap().insert(
+            root.to_path_buf(),
+            (Instant::now(), reports.clone(), errors.clone()),
+        );
         (reports, errors)
     }
 }
@@ -234,10 +239,21 @@ mod tests {
         let mut state = AutoCheckState::default();
         let debounce = Duration::from_secs(5);
         let t0 = Instant::now();
-        assert!(should_run(&mut state, t0, debounce), "first edit always runs");
+        assert!(
+            should_run(&mut state, t0, debounce),
+            "first edit always runs"
+        );
         // Two more edits arrive well inside the debounce window: coalesced.
-        assert!(!should_run(&mut state, t0 + Duration::from_millis(100), debounce));
-        assert!(!should_run(&mut state, t0 + Duration::from_millis(200), debounce));
+        assert!(!should_run(
+            &mut state,
+            t0 + Duration::from_millis(100),
+            debounce
+        ));
+        assert!(!should_run(
+            &mut state,
+            t0 + Duration::from_millis(200),
+            debounce
+        ));
     }
 
     #[test]
@@ -246,9 +262,17 @@ mod tests {
         let debounce = Duration::from_secs(5);
         let t0 = Instant::now();
         assert!(should_run(&mut state, t0, debounce));
-        assert!(!should_run(&mut state, t0 + Duration::from_secs(1), debounce));
+        assert!(!should_run(
+            &mut state,
+            t0 + Duration::from_secs(1),
+            debounce
+        ));
         // A quiet gap of >= debounce since the LAST RUN (t0) reopens the window.
-        assert!(should_run(&mut state, t0 + Duration::from_secs(6), debounce));
+        assert!(should_run(
+            &mut state,
+            t0 + Duration::from_secs(6),
+            debounce
+        ));
     }
 
     // ── diff / baseline (the pure core) ─────────────────────────────────
@@ -267,7 +291,10 @@ mod tests {
         let groups = vec![group("e1", 3), group("e2", 1)];
         let baseline = to_baseline(&groups);
         let diff = diff_groups(&baseline, &groups);
-        assert!(diff.is_empty(), "unchanged counts must not re-surface: {diff:?}");
+        assert!(
+            diff.is_empty(),
+            "unchanged counts must not re-surface: {diff:?}"
+        );
     }
 
     #[test]

@@ -461,7 +461,9 @@ fn parse_metrics(text: Option<&str>) -> ParsedMetrics {
         }
         // `llamacpp:metric{labels} value` — key is up to the first space or `{`.
         let mut parts = line.split_whitespace();
-        let Some(raw_key) = parts.next() else { continue };
+        let Some(raw_key) = parts.next() else {
+            continue;
+        };
         let key = raw_key.split('{').next().unwrap_or(raw_key);
         let Some(val) = parts.last().and_then(|v| v.parse::<f64>().ok()) else {
             continue;
@@ -538,7 +540,7 @@ mod tests {
         // Start a request: idle→busy at decoded 0, prompt 500.
         let tps0 = p.fold_slot(0, true, 0, 500, 7, 1_000, t0);
         assert!(tps0.is_none()); // no delta yet
-        // 1s later, 100 tokens decoded → ~100 tps.
+                                 // 1s later, 100 tokens decoded → ~100 tps.
         let tps1 = p.fold_slot(0, true, 100, 500, 7, 2_000, t0 + Duration::from_secs(1));
         assert!(tps1.unwrap() > 90.0 && tps1.unwrap() < 110.0);
         // Finish: busy→idle → one history record of 100 output tokens, prompt 500.

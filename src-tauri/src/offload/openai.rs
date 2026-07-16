@@ -95,7 +95,11 @@ pub struct FunctionDef {
 }
 
 impl ToolDef {
-    pub fn function(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
         Self {
             kind: "function",
             function: FunctionDef {
@@ -376,11 +380,11 @@ mod tests {
         assert_eq!(strip_think("before<think>x</think>after"), "beforeafter");
         assert_eq!(strip_think("plain"), "plain");
         // Nested blocks must balance — no stray </think> in the output.
-        assert_eq!(strip_think("<think>a<think>b</think>c</think>answer"), "answer");
         assert_eq!(
-            strip_think("x<think>a<think>b</think>c</think>y"),
-            "xy"
+            strip_think("<think>a<think>b</think>c</think>answer"),
+            "answer"
         );
+        assert_eq!(strip_think("x<think>a<think>b</think>c</think>y"), "xy");
     }
 
     #[test]
@@ -459,7 +463,10 @@ mod tests {
             response_format: None,
         };
         let v = serde_json::to_value(&base).unwrap();
-        assert!(v.get("response_format").is_none(), "None must be omitted from the request body");
+        assert!(
+            v.get("response_format").is_none(),
+            "None must be omitted from the request body"
+        );
 
         let mut with = base.clone();
         with.response_format = Some(serde_json::json!({
@@ -468,6 +475,9 @@ mod tests {
         }));
         let v = serde_json::to_value(&with).unwrap();
         assert_eq!(v["response_format"]["type"], "json_schema");
-        assert_eq!(v["response_format"]["json_schema"]["schema"]["type"], "object");
+        assert_eq!(
+            v["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
     }
 }

@@ -141,14 +141,26 @@ mod tests {
         assert_eq!(whole_file_read("get-content p").as_deref(), Some("p"));
         assert_eq!(whole_file_read("cat src/a.rs").as_deref(), Some("src/a.rs"));
         // Windows-style path with backslashes stays literal.
-        assert_eq!(whole_file_read("cat C:\\x\\y.txt").as_deref(), Some("C:\\x\\y.txt"));
+        assert_eq!(
+            whole_file_read("cat C:\\x\\y.txt").as_deref(),
+            Some("C:\\x\\y.txt")
+        );
     }
 
     #[test]
     fn accepts_quoted_paths_with_spaces() {
-        assert_eq!(whole_file_read("cat \"my file.txt\"").as_deref(), Some("my file.txt"));
-        assert_eq!(whole_file_read("Get-Content 'a b/c d.log'").as_deref(), Some("a b/c d.log"));
-        assert_eq!(whole_file_read("cat \"C:\\Program Files\\x.txt\"").as_deref(), Some("C:\\Program Files\\x.txt"));
+        assert_eq!(
+            whole_file_read("cat \"my file.txt\"").as_deref(),
+            Some("my file.txt")
+        );
+        assert_eq!(
+            whole_file_read("Get-Content 'a b/c d.log'").as_deref(),
+            Some("a b/c d.log")
+        );
+        assert_eq!(
+            whole_file_read("cat \"C:\\Program Files\\x.txt\"").as_deref(),
+            Some("C:\\Program Files\\x.txt")
+        );
     }
 
     #[test]

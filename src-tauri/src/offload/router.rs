@@ -150,7 +150,10 @@ impl std::fmt::Display for RouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RouteError::NoBackendReady => {
-                write!(f, "no offload backend is ready (enable/start one, or grant cloud consent)")
+                write!(
+                    f,
+                    "no offload backend is ready (enable/start one, or grant cloud consent)"
+                )
             }
             RouteError::NoToolMatch => write!(
                 f,
@@ -282,23 +285,61 @@ pub fn escalation_target(
 /// code, repo, commands) — its results must not leave the box, so the
 /// router requires a local-data tool (which excludes cloud backends).
 const LOCAL_SIGNALS: &[&str] = &[
-    "file", "read ", "open ", "path", "directory", "folder", "code",
-    "grep", "function", "class", "module", "repo", "repository", "log file",
-    "build", "compile", "unit test", "command", "run ", "git ", "diff", "blame",
-    "callsite", "call site", "implementation", "codebase",
+    "file",
+    "read ",
+    "open ",
+    "path",
+    "directory",
+    "folder",
+    "code",
+    "grep",
+    "function",
+    "class",
+    "module",
+    "repo",
+    "repository",
+    "log file",
+    "build",
+    "compile",
+    "unit test",
+    "command",
+    "run ",
+    "git ",
+    "diff",
+    "blame",
+    "callsite",
+    "call site",
+    "implementation",
+    "codebase",
     // Local-context phrases: a task scoped to the user's own project needs
     // local tools even when it also mentions web-ish words (e.g. "summarize the
     // documentation in this project"). Without these such a task matched only a
     // WEB_SIGNAL and was wrongly routed cloud-eligible.
-    "project", "in this", "this repo", "this file", "our ", "the source",
+    "project",
+    "in this",
+    "this repo",
+    "this file",
+    "our ",
+    "the source",
 ];
 
 /// Keyword signals that a task is purely web/docs research — safe for a
 /// cloud backend if no local signal is also present.
 const WEB_SIGNALS: &[&str] = &[
-    "web", "online", "internet", "url", "http", "fetch", "website",
-    "documentation", "docs for", "latest version", "release notes",
-    "stack overflow", "google", "duckduckgo",
+    "web",
+    "online",
+    "internet",
+    "url",
+    "http",
+    "fetch",
+    "website",
+    "documentation",
+    "docs for",
+    "latest version",
+    "release notes",
+    "stack overflow",
+    "google",
+    "duckduckgo",
 ];
 
 /// Heuristically build a [`RouteRequest`] from the task text. Estimation is
@@ -325,8 +366,11 @@ pub fn analyze_task(instructions: &str, context: Option<&str>, tier: TierHint) -
     let needs_local = local || !web;
     if needs_local {
         required.push("read_file".to_string());
-        let mentions_run = hay.contains("command") || hay.contains("build")
-            || hay.contains("unit test") || hay.contains("run ") || hay.contains("compile");
+        let mentions_run = hay.contains("command")
+            || hay.contains("build")
+            || hay.contains("unit test")
+            || hay.contains("run ")
+            || hay.contains("compile");
         // A git-related task needs the ability to run git. `git` is an MCP
         // *server* name that may not be configured at all; a backend with the
         // native `run_command` tool can shell out to git just fine. Require
@@ -334,14 +378,18 @@ pub fn analyze_task(instructions: &str, context: Option<&str>, tier: TierHint) -
         // MCP server, so a scoped local backend that lacks the server isn't
         // wrongly refused with NoToolMatch for any task that merely mentions
         // a diff or a commit.
-        let mentions_git = hay.contains("git ") || hay.contains("commit")
-            || hay.contains("blame") || hay.contains("diff");
+        let mentions_git = hay.contains("git ")
+            || hay.contains("commit")
+            || hay.contains("blame")
+            || hay.contains("diff");
         if mentions_run || mentions_git {
             required.push("run_command".to_string());
         }
     }
     debug_assert!(
-        required.iter().all(|t| LOCAL_DATA_TOOLS.contains(&t.as_str())),
+        required
+            .iter()
+            .all(|t| LOCAL_DATA_TOOLS.contains(&t.as_str())),
         "required tools should be local-data names"
     );
 
@@ -391,15 +439,39 @@ mod tests {
 
     #[test]
     fn single_backend_is_a_noop() {
-        let bs = vec![view("only", true, BackendTier::Quality, Some(100_000), 1, 0, ToolScope::All)];
+        let bs = vec![view(
+            "only",
+            true,
+            BackendTier::Quality,
+            Some(100_000),
+            1,
+            0,
+            ToolScope::All,
+        )];
         assert_eq!(select(&bs, &req(&[], 500, TierHint::Auto)).unwrap(), 0);
     }
 
     #[test]
     fn tiny_task_prefers_fast_backend() {
         let bs = vec![
-            view("big", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "big",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
         // Auto + tiny input → fast tier.
         assert_eq!(select(&bs, &req(&[], 500, TierHint::Auto)).unwrap(), 1);
@@ -408,8 +480,24 @@ mod tests {
     #[test]
     fn large_context_task_picks_the_big_backend() {
         let bs = vec![
-            view("big", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "big",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
         // 100k estimate: the fast 16k box is filtered out by the context
         // budget, leaving only the big backend.
@@ -420,11 +508,33 @@ mod tests {
     #[test]
     fn honors_explicit_tier_hints() {
         let bs = vec![
-            view("big", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "big",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
-        assert_eq!(bs[select(&bs, &req(&[], 500, TierHint::Quality)).unwrap()].name, "big");
-        assert_eq!(bs[select(&bs, &req(&[], 500, TierHint::Fast)).unwrap()].name, "fast");
+        assert_eq!(
+            bs[select(&bs, &req(&[], 500, TierHint::Quality)).unwrap()].name,
+            "big"
+        );
+        assert_eq!(
+            bs[select(&bs, &req(&[], 500, TierHint::Fast)).unwrap()].name,
+            "fast"
+        );
     }
 
     #[test]
@@ -432,8 +542,24 @@ mod tests {
         // Prefer quality, but the quality backend has no free slot → spill
         // to the fast one (which is eligible and free).
         let bs = vec![
-            view("big", true, BackendTier::Quality, Some(150_000), 1, 1, ToolScope::All),
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "big",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                1,
+                ToolScope::All,
+            ),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
         let idx = select(&bs, &req(&[], 500, TierHint::Quality)).unwrap();
         assert_eq!(bs[idx].name, "fast");
@@ -442,8 +568,24 @@ mod tests {
     #[test]
     fn fails_over_when_preferred_is_down() {
         let bs = vec![
-            view("big", false, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All), // down
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "big",
+                false,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ), // down
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
         // Quality requested but down → fail over to the ready fast backend.
         let idx = select(&bs, &req(&[], 500, TierHint::Quality)).unwrap();
@@ -452,8 +594,19 @@ mod tests {
 
     #[test]
     fn no_ready_backend_errors() {
-        let bs = vec![view("x", false, BackendTier::Quality, Some(100_000), 1, 0, ToolScope::All)];
-        assert_eq!(select(&bs, &req(&[], 500, TierHint::Auto)), Err(RouteError::NoBackendReady));
+        let bs = vec![view(
+            "x",
+            false,
+            BackendTier::Quality,
+            Some(100_000),
+            1,
+            0,
+            ToolScope::All,
+        )];
+        assert_eq!(
+            select(&bs, &req(&[], 500, TierHint::Auto)),
+            Err(RouteError::NoBackendReady)
+        );
     }
 
     #[test]
@@ -492,18 +645,45 @@ mod tests {
 
     #[test]
     fn cloud_without_consent_is_skipped() {
-        let mut cloud = view("cloud", true, BackendTier::Quality, Some(128_000), 4, 0, ToolScope::All);
+        let mut cloud = view(
+            "cloud",
+            true,
+            BackendTier::Quality,
+            Some(128_000),
+            4,
+            0,
+            ToolScope::All,
+        );
         cloud.cloud_blocked = true;
         let bs = vec![cloud];
-        assert_eq!(select(&bs, &req(&[], 500, TierHint::Auto)), Err(RouteError::NoBackendReady));
+        assert_eq!(
+            select(&bs, &req(&[], 500, TierHint::Auto)),
+            Err(RouteError::NoBackendReady)
+        );
     }
 
     #[test]
     fn degrades_to_largest_when_nothing_fits() {
         // Both backends are too small for the estimate; pick the larger.
         let bs = vec![
-            view("small", true, BackendTier::Fast, Some(8_000), 1, 0, ToolScope::All),
-            view("medium", true, BackendTier::Quality, Some(20_000), 1, 0, ToolScope::All),
+            view(
+                "small",
+                true,
+                BackendTier::Fast,
+                Some(8_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "medium",
+                true,
+                BackendTier::Quality,
+                Some(20_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
         let idx = select(&bs, &req(&[], 500_000, TierHint::Auto)).unwrap();
         assert_eq!(bs[idx].name, "medium");
@@ -511,13 +691,21 @@ mod tests {
 
     #[test]
     fn analyze_flags_local_task() {
-        let r = analyze_task("Find all call sites of foo in the codebase and summarize", None, TierHint::Auto);
+        let r = analyze_task(
+            "Find all call sites of foo in the codebase and summarize",
+            None,
+            TierHint::Auto,
+        );
         assert!(r.required_tools.contains(&"read_file".to_string()));
     }
 
     #[test]
     fn analyze_web_only_task_requires_no_local_tools() {
-        let r = analyze_task("Search the web for the latest release notes of tokio", None, TierHint::Auto);
+        let r = analyze_task(
+            "Search the web for the latest release notes of tokio",
+            None,
+            TierHint::Auto,
+        );
         assert!(r.required_tools.is_empty());
     }
 
@@ -525,7 +713,11 @@ mod tests {
     fn analyze_local_task_with_web_word_stays_local() {
         // Mentions "documentation" (a web signal) but is scoped to the local
         // project — must require local tools, not be cloud-eligible.
-        let r = analyze_task("Summarize the documentation in this project", None, TierHint::Auto);
+        let r = analyze_task(
+            "Summarize the documentation in this project",
+            None,
+            TierHint::Auto,
+        );
         assert!(r.required_tools.contains(&"read_file".to_string()));
     }
 
@@ -534,11 +726,30 @@ mod tests {
     #[test]
     fn escalation_picks_distinct_ready_quality_for_a_fast_run() {
         let bs = vec![
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
-            view("big", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "big",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
         // Ran on the fast backend (index 0) → escalate to the quality one.
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), Some(1));
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            Some(1)
+        );
     }
 
     #[test]
@@ -546,41 +757,117 @@ mod tests {
         // Never quality→quality: a run that resolved to a quality backend has no
         // escalation target even if another quality backend exists.
         let bs = vec![
-            view("q1", true, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All),
-            view("q2", true, BackendTier::Quality, Some(120_000), 1, 0, ToolScope::All),
+            view(
+                "q1",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "q2",
+                true,
+                BackendTier::Quality,
+                Some(120_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            None
+        );
     }
 
     #[test]
     fn no_escalation_without_a_quality_backend() {
         // Only fast backends configured → nothing to escalate to (inert).
         let bs = vec![
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
-            view("fast2", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "fast2",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
         ];
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            None
+        );
     }
 
     #[test]
     fn no_escalation_to_a_down_quality_backend() {
         let bs = vec![
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
-            view("big", false, BackendTier::Quality, Some(150_000), 1, 0, ToolScope::All), // down
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "big",
+                false,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                0,
+                ToolScope::All,
+            ), // down
         ];
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            None
+        );
     }
 
     #[test]
     fn no_escalation_to_the_same_instance() {
         // Two entries pointing at the SAME server (same base_url): escalation
         // would just re-run on the identical instance → refused.
-        let mut fast = view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All);
-        let mut big = view("big", true, BackendTier::Quality, Some(16_000), 1, 0, ToolScope::All);
+        let mut fast = view(
+            "fast",
+            true,
+            BackendTier::Fast,
+            Some(16_000),
+            1,
+            0,
+            ToolScope::All,
+        );
+        let mut big = view(
+            "big",
+            true,
+            BackendTier::Quality,
+            Some(16_000),
+            1,
+            0,
+            ToolScope::All,
+        );
         fast.base_url = "http://same:8080".into();
         big.base_url = "http://same:8080".into();
         let bs = vec![fast, big];
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), None);
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            None
+        );
     }
 
     #[test]
@@ -597,28 +884,73 @@ mod tests {
             ToolScope::default_for(true),
         );
         let bs = vec![
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
             cloud,
         ];
-        assert_eq!(escalation_target(&bs, &req(&["read_file"], 500, TierHint::Auto), 0), None);
+        assert_eq!(
+            escalation_target(&bs, &req(&["read_file"], 500, TierHint::Auto), 0),
+            None
+        );
         // But a web-only task (no required local tools) may escalate to it.
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), Some(1));
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            Some(1)
+        );
     }
 
     #[test]
     fn escalation_prefers_a_free_quality_slot() {
         let bs = vec![
-            view("fast", true, BackendTier::Fast, Some(16_000), 1, 0, ToolScope::All),
-            view("busy-q", true, BackendTier::Quality, Some(150_000), 1, 1, ToolScope::All), // full
-            view("free-q", true, BackendTier::Quality, Some(120_000), 1, 0, ToolScope::All), // free
+            view(
+                "fast",
+                true,
+                BackendTier::Fast,
+                Some(16_000),
+                1,
+                0,
+                ToolScope::All,
+            ),
+            view(
+                "busy-q",
+                true,
+                BackendTier::Quality,
+                Some(150_000),
+                1,
+                1,
+                ToolScope::All,
+            ), // full
+            view(
+                "free-q",
+                true,
+                BackendTier::Quality,
+                Some(120_000),
+                1,
+                0,
+                ToolScope::All,
+            ), // free
         ];
-        assert_eq!(escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0), Some(2));
+        assert_eq!(
+            escalation_target(&bs, &req(&[], 500, TierHint::Auto), 0),
+            Some(2)
+        );
     }
 
     #[test]
     fn analyze_ambiguous_defaults_to_local() {
         // No clear web signal → treated as needing local data (privacy).
-        let r = analyze_task("Summarize the following and list key points", None, TierHint::Auto);
+        let r = analyze_task(
+            "Summarize the following and list key points",
+            None,
+            TierHint::Auto,
+        );
         assert!(r.required_tools.contains(&"read_file".to_string()));
     }
 }

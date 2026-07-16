@@ -186,7 +186,13 @@ impl HostRouter {
             .chain(mcp_defs)
             .filter(|d| scope.allows_namespaced(&d.function.name))
             .collect();
-        Self { defs, ctx, host, scope, allow_graph }
+        Self {
+            defs,
+            ctx,
+            host,
+            scope,
+            allow_graph,
+        }
     }
 }
 
@@ -337,7 +343,8 @@ fn finalize_schema_answer(
     }
 }
 
-const SYSTEM_PROMPT: &str = "You are a local offload worker. You are given a self-contained subtask \
+const SYSTEM_PROMPT: &str =
+    "You are a local offload worker. You are given a self-contained subtask \
 by a more capable orchestrator. Use the available tools to gather what you need, then return a \
 single concise, complete answer — the orchestrator sees ONLY your final message, not your \
 intermediate tool calls or reasoning. Be specific and include concrete references (file paths, \
@@ -359,7 +366,8 @@ this run, or `verified: partially — <what you could not verify>` otherwise.";
 /// grammar — and the model is told its final message must be JSON only, citing
 /// nothing. (Kept in lockstep with `SYSTEM_PROMPT`'s grounding half; both are
 /// pinned by tripwire tests.)
-const SCHEMA_SYSTEM_PROMPT: &str = "You are a local offload worker. You are given a self-contained \
+const SCHEMA_SYSTEM_PROMPT: &str =
+    "You are a local offload worker. You are given a self-contained \
 subtask by a more capable orchestrator. Use the available tools to gather what you need, then \
 return a single complete answer — the orchestrator sees ONLY your final message, not your \
 intermediate tool calls or reasoning. Only state filesystem or code facts (paths, file lists, \
@@ -595,7 +603,9 @@ fn looks_like_path(tok: &str) -> bool {
 fn clean_token(raw: &str) -> String {
     let t = raw.trim();
     let t = t.trim_matches(|c: char| "`\"'*()[]{}<>".contains(c));
-    let mut t = t.trim_end_matches([',', ';', ':', '!', '?', '.']).to_string();
+    let mut t = t
+        .trim_end_matches([',', ';', ':', '!', '?', '.'])
+        .to_string();
     // Peel trailing `:123` (and `:123:45`) location suffixes.
     loop {
         if let Some(idx) = t.rfind(':') {
@@ -662,7 +672,11 @@ fn list_dir_entry_names(result: &str) -> Vec<String> {
             if line.is_empty() || line.starts_with('[') {
                 return None;
             }
-            let name = line.split('\t').next().unwrap_or(line).trim_end_matches('/');
+            let name = line
+                .split('\t')
+                .next()
+                .unwrap_or(line)
+                .trim_end_matches('/');
             (!name.is_empty()).then(|| name.to_string())
         })
         .collect()
@@ -809,7 +823,11 @@ fn split_marker(answer: &str) -> (String, VerifiedLevel, Option<String>) {
             return (body.trim_end().to_string(), level, note);
         }
     }
-    (answer.trim_end().to_string(), VerifiedLevel::Partially, None)
+    (
+        answer.trim_end().to_string(),
+        VerifiedLevel::Partially,
+        None,
+    )
 }
 
 /// Case-insensitive `verified:` prefix strip (the model may capitalize the
@@ -835,9 +853,15 @@ fn parse_marker_value(value: &str) -> (VerifiedLevel, Option<String>) {
         let rest = value["partially".len()..]
             .trim_start_matches(|c: char| c == '—' || c == '-' || c == ':' || c.is_whitespace())
             .trim();
-        (VerifiedLevel::Partially, (!rest.is_empty()).then(|| rest.to_string()))
+        (
+            VerifiedLevel::Partially,
+            (!rest.is_empty()).then(|| rest.to_string()),
+        )
     } else {
-        (VerifiedLevel::Partially, (!value.is_empty()).then(|| value.to_string()))
+        (
+            VerifiedLevel::Partially,
+            (!value.is_empty()).then(|| value.to_string()),
+        )
     }
 }
 
@@ -880,10 +904,17 @@ fn verify_and_mark(
     let (body, self_level, self_note) = split_marker(&strip_citations(answer));
     let unverified = unverified_mentions(&body, observed, ctx);
     if unverified.is_empty() {
-        (append_marker(&body, self_level, self_note.as_deref()), unverified)
+        (
+            append_marker(&body, self_level, self_note.as_deref()),
+            unverified,
+        )
     } else {
         let tainted = append_taint(&body, &unverified);
-        let marked = append_marker(&tainted, VerifiedLevel::Partially, Some(&unverified.join(", ")));
+        let marked = append_marker(
+            &tainted,
+            VerifiedLevel::Partially,
+            Some(&unverified.join(", ")),
+        );
         (marked, unverified)
     }
 }
@@ -1045,7 +1076,9 @@ impl CallCache {
     /// uniform and cheap.
     fn record(&mut self, name: &str, args: &serde_json::Value, result: String) {
         let key = (name.to_string(), canonical_json(args));
-        self.seen.entry(key).or_insert(CacheEntry { result, hits: 1 });
+        self.seen
+            .entry(key)
+            .or_insert(CacheEntry { result, hits: 1 });
     }
 }
 
@@ -1106,8 +1139,19 @@ pub async fn run(
                 convo.compact(budget);
             }
             return force_final(
-                client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, step,
-                &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
+                client,
+                &url,
+                cfg,
+                convo.flatten(),
+                task.thinking,
+                used_tools,
+                gen_tps,
+                step,
+                &observed,
+                obs_ctx,
+                task.schema.as_ref(),
+                trace.as_deref_mut(),
+                cancel,
             )
             .await;
         }
@@ -1126,8 +1170,17 @@ pub async fn run(
         // V21 F9: tool-call turns are always free-form (`None`) — grammar
         // enforcement is reserved for the final-synthesis turn in `force_final`.
         let resp = post_chat(
-            client, &url, cfg, &convo.flatten(), &tools, enable_thinking, true, None,
-            cfg.per_call_timeout, gen_tps, cancel,
+            client,
+            &url,
+            cfg,
+            &convo.flatten(),
+            &tools,
+            enable_thinking,
+            true,
+            None,
+            cfg.per_call_timeout,
+            gen_tps,
+            cancel,
         )
         .await?;
         let call_dur = call_started.elapsed();
@@ -1161,7 +1214,11 @@ pub async fn run(
         };
         // V21 F4: the turn immediately after a corrective nudge is the
         // "verify" turn in the run log (not derivable from `step`/`is_final`).
-        let this_kind: &str = if verify_turn { "verify" } else { call_kind(step, false) };
+        let this_kind: &str = if verify_turn {
+            "verify"
+        } else {
+            call_kind(step, false)
+        };
         verify_turn = false;
         if let Some(t) = trace.as_deref_mut() {
             t.calls.push(CallRecord {
@@ -1195,8 +1252,19 @@ pub async fn run(
                     convo.compact(budget);
                 }
                 return force_final(
-                    client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, step,
-                    &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
+                    client,
+                    &url,
+                    cfg,
+                    convo.flatten(),
+                    task.thinking,
+                    used_tools,
+                    gen_tps,
+                    step,
+                    &observed,
+                    obs_ctx,
+                    task.schema.as_ref(),
+                    trace.as_deref_mut(),
+                    cancel,
                 )
                 .await;
             }
@@ -1216,8 +1284,7 @@ pub async fn run(
                 // gets tools so the model can actually verify, and is labeled
                 // "verify" in the run log. Otherwise (or if already corrected)
                 // return the pre-marked taint answer.
-                let deadline_spent =
-                    deadline.saturating_duration_since(Instant::now()).is_zero();
+                let deadline_spent = deadline.saturating_duration_since(Instant::now()).is_zero();
                 if !correction_used && !deadline_spent && step + 1 < cfg.max_steps {
                     correction_used = true;
                     verify_turn = true;
@@ -1248,8 +1315,19 @@ pub async fn run(
                 convo.compact(budget);
             }
             return force_final(
-                client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, step,
-                &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
+                client,
+                &url,
+                cfg,
+                convo.flatten(),
+                task.thinking,
+                used_tools,
+                gen_tps,
+                step,
+                &observed,
+                obs_ctx,
+                task.schema.as_ref(),
+                trace.as_deref_mut(),
+                cancel,
             )
             .await;
         }
@@ -1308,7 +1386,10 @@ pub async fn run(
             // V21 F4: label each tool result with an observation id the model
             // can cite ([T1], [T2], …).
             obs_id += 1;
-            turn.push(ChatMessage::tool(&call.id, label_observation(obs_id, &result)));
+            turn.push(ChatMessage::tool(
+                &call.id,
+                label_observation(obs_id, &result),
+            ));
         }
         convo.push_turn(turn);
         // V21 F8: mark the run-log record for this step so repeats are visible.
@@ -1355,8 +1436,19 @@ pub async fn run(
         convo.compact(budget);
     }
     force_final(
-        client, &url, cfg, convo.flatten(), task.thinking, used_tools, gen_tps, cfg.max_steps,
-        &observed, obs_ctx, task.schema.as_ref(), trace.as_deref_mut(), cancel,
+        client,
+        &url,
+        cfg,
+        convo.flatten(),
+        task.thinking,
+        used_tools,
+        gen_tps,
+        cfg.max_steps,
+        &observed,
+        obs_ctx,
+        task.schema.as_ref(),
+        trace.as_deref_mut(),
+        cancel,
     )
     .await
 }
@@ -1378,8 +1470,16 @@ fn build_chat_request(
 ) -> ChatRequest {
     ChatRequest {
         messages: messages.to_vec(),
-        tools: if with_tools { tools.to_vec() } else { Vec::new() },
-        tool_choice: if with_tools { Some("auto".into()) } else { Some("none".into()) },
+        tools: if with_tools {
+            tools.to_vec()
+        } else {
+            Vec::new()
+        },
+        tool_choice: if with_tools {
+            Some("auto".into())
+        } else {
+            Some("none".into())
+        },
         model: cfg.model.clone(),
         temperature: Some(0.2),
         chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": enable_thinking })),
@@ -1417,7 +1517,14 @@ async fn post_chat(
     cancel: &CancellationToken,
 ) -> AppResult<ChatResponse> {
     let req = build_chat_request(
-        cfg, messages, tools, enable_thinking, with_tools, response_format, req_timeout, gen_tps,
+        cfg,
+        messages,
+        tools,
+        enable_thinking,
+        with_tools,
+        response_format,
+        req_timeout,
+        gen_tps,
     );
 
     // Send and consume with one retry on a transient transport failure —
@@ -1611,7 +1718,11 @@ async fn force_final(
             output_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
             duration_ms: call_dur.as_millis() as u64,
             tps: final_tps,
-            result: if empty { "empty".into() } else { "answer".into() },
+            result: if empty {
+                "empty".into()
+            } else {
+                "answer".into()
+            },
         });
     }
     if empty {
@@ -1689,7 +1800,10 @@ impl Convo {
     /// assistant — no orphan-tool repair needed.
     fn flatten(&self) -> Vec<ChatMessage> {
         let mut out: Vec<ChatMessage> = Vec::with_capacity(self.head.len() + self.turns.len() * 2);
-        let all = self.head.iter().chain(self.turns.iter().flat_map(|t| t.msgs.iter()));
+        let all = self
+            .head
+            .iter()
+            .chain(self.turns.iter().flat_map(|t| t.msgs.iter()));
         for m in all {
             // Coalesce adjacent `user` messages. Compaction prepends a synthetic
             // `user` eviction note right after the head's `user` task — sending
@@ -1722,7 +1836,11 @@ impl Convo {
 
     /// Append a model turn (assistant + its tool results) as one droppable unit.
     fn push_turn(&mut self, msgs: Vec<ChatMessage>) {
-        self.turns.push(Turn { msgs, cost: None, note: false });
+        self.turns.push(Turn {
+            msgs,
+            cost: None,
+            note: false,
+        });
     }
 
     /// Attribute a server `prompt_tokens` report. `prompt_tokens` is the real
@@ -1738,15 +1856,14 @@ impl Convo {
             return;
         }
         let n = self.sent_turns.min(self.turns.len());
-        let known: u32 =
-            self.head_cost.unwrap_or(0) + self.turns[..n].iter().filter_map(|t| t.cost).sum::<u32>();
+        let known: u32 = self.head_cost.unwrap_or(0)
+            + self.turns[..n].iter().filter_map(|t| t.cost).sum::<u32>();
         let delta = prompt_tokens.saturating_sub(known);
         // Attribute to the newest still-unmeasured *real* turn. Skip the synthetic
         // eviction note (`note`): it carries no meaningful token cost of its own,
         // and letting it absorb the delta would both mismeasure the real turn and
         // inflate `known_total`, triggering premature compaction.
-        if let Some(t) = self
-            .turns[..n]
+        if let Some(t) = self.turns[..n]
             .iter_mut()
             .rev()
             .find(|t| t.cost.is_none() && !t.note)
@@ -1795,7 +1912,11 @@ impl Convo {
                 if !self.turns.first().is_some_and(|t| t.note) {
                     self.turns.insert(
                         0,
-                        Turn { msgs: vec![ChatMessage::user(NOTE)], cost: None, note: true },
+                        Turn {
+                            msgs: vec![ChatMessage::user(NOTE)],
+                            cost: None,
+                            note: true,
+                        },
                     );
                 }
             }
@@ -1958,7 +2079,11 @@ mod tests {
     }
 
     fn turn(tag: &str, cost: Option<u32>) -> Turn {
-        Turn { msgs: vec![ChatMessage::user(tag)], cost, note: false }
+        Turn {
+            msgs: vec![ChatMessage::user(tag)],
+            cost,
+            note: false,
+        }
     }
 
     fn test_cfg(budget: Option<u32>, n_ctx: Option<u32>, cap: u32) -> AgentConfig {
@@ -1982,9 +2107,15 @@ mod tests {
         let reserve = gen_reserve(90112);
         assert_eq!(compaction_budget(&cfg), Some(90112 - reserve));
         // A budget already under the cap is left untouched.
-        assert_eq!(compaction_budget(&test_cfg(Some(30_000), Some(90112), 8000)), Some(30_000));
+        assert_eq!(
+            compaction_budget(&test_cfg(Some(30_000), Some(90112), 8000)),
+            Some(30_000)
+        );
         // No n_ctx → fall back to the raw budget (no headroom math possible).
-        assert_eq!(compaction_budget(&test_cfg(Some(50_000), None, 8000)), Some(50_000));
+        assert_eq!(
+            compaction_budget(&test_cfg(Some(50_000), None, 8000)),
+            Some(50_000)
+        );
     }
 
     #[test]
@@ -1992,13 +2123,23 @@ mod tests {
         let cfg = test_cfg(Some(72089), Some(90112), 8000);
         let ctx_cap = 90112 - compaction_budget(&cfg).unwrap() - 512;
         // Generous time budget at a high rate → the context bound dominates.
-        assert_eq!(output_token_cap(&cfg, Duration::from_secs(10_000), 1000.0), Some(ctx_cap));
+        assert_eq!(
+            output_token_cap(&cfg, Duration::from_secs(10_000), 1000.0),
+            Some(ctx_cap)
+        );
         // Tight time budget at a slow rate → the time bound dominates:
         // 30s * 50 tok/s * 0.6 = 900.
-        assert_eq!(output_token_cap(&cfg, Duration::from_secs(30), 50.0), Some(900));
+        assert_eq!(
+            output_token_cap(&cfg, Duration::from_secs(30), 50.0),
+            Some(900)
+        );
         // No n_ctx → still time-bounded (never unbounded now).
         assert_eq!(
-            output_token_cap(&test_cfg(Some(50_000), None, 8000), Duration::from_secs(30), 50.0),
+            output_token_cap(
+                &test_cfg(Some(50_000), None, 8000),
+                Duration::from_secs(30),
+                50.0
+            ),
             Some(900)
         );
     }
@@ -2030,11 +2171,19 @@ mod tests {
 
     #[test]
     fn detects_leaked_tool_call_markup() {
-        assert!(looks_like_leaked_tool_call("<tool_call>\n<function=read_file>"));
-        assert!(looks_like_leaked_tool_call("  <function=read_file>\n<parameter=path>"));
+        assert!(looks_like_leaked_tool_call(
+            "<tool_call>\n<function=read_file>"
+        ));
+        assert!(looks_like_leaked_tool_call(
+            "  <function=read_file>\n<parameter=path>"
+        ));
         // Prose that merely mentions the syntax is not flagged.
-        assert!(!looks_like_leaked_tool_call("The template uses <tool_call> tags for calls."));
-        assert!(!looks_like_leaked_tool_call("[{\"file\":\"x\",\"summary\":\"bug\"}]"));
+        assert!(!looks_like_leaked_tool_call(
+            "The template uses <tool_call> tags for calls."
+        ));
+        assert!(!looks_like_leaked_tool_call(
+            "[{\"file\":\"x\",\"summary\":\"bug\"}]"
+        ));
     }
 
     #[test]
@@ -2098,14 +2247,15 @@ mod tests {
         assert!(c.known_total() > 500);
         c.compact(500);
         assert_eq!(c.turns.len(), 3, "no turn is dropped below the keep-floor");
-        assert!(c.known_total() <= 500, "truncation fits the measured size to budget");
         assert!(
-            c.turns
-                .iter()
-                .any(|t| t.msgs.iter().any(|m| m
-                    .content
-                    .as_deref()
-                    .is_some_and(|s| s.contains("truncated")))),
+            c.known_total() <= 500,
+            "truncation fits the measured size to budget"
+        );
+        assert!(
+            c.turns.iter().any(|t| t.msgs.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|s| s.contains("truncated")))),
             "a truncation marker is left behind"
         );
     }
@@ -2148,7 +2298,10 @@ mod tests {
         assert_eq!(strip_citations("The file exists [T3]."), "The file exists.");
         assert_eq!(strip_citations("A [T1] and B [T22] done"), "A and B done");
         // Non-citations (no digits, or a different word) are preserved.
-        assert_eq!(strip_citations("see [Tool] and [T] here"), "see [Tool] and [T] here");
+        assert_eq!(
+            strip_citations("see [Tool] and [T] here"),
+            "see [Tool] and [T] here"
+        );
         assert_eq!(strip_citations("plain text"), "plain text");
     }
 
@@ -2176,18 +2329,20 @@ mod tests {
     fn looks_like_path_excludes_urls_but_keeps_drive_and_file_uris() {
         // A URL with a path + extension is NOT a filesystem path mention — no tool
         // ever touched it, so it must not taint the answer as "unverified".
-        assert!(!looks_like_path("https://ci.example.com/build/42/output.log"));
+        assert!(!looks_like_path(
+            "https://ci.example.com/build/42/output.log"
+        ));
         assert!(!looks_like_path("http://host/a/b.txt"));
         assert!(!looks_like_path("ftp://host/pub/file.zip"));
         assert!(!looks_like_path("ws://host/socket.io"));
         assert!(!looks_like_path("wss://host/live/stream.ts"));
         assert!(has_url_scheme("git+ssh://host/repo.git")); // general scheme grammar
-        // Real paths still count.
+                                                            // Real paths still count.
         assert!(looks_like_path("src/main.rs")); // relative
         assert!(looks_like_path("C:\\proj\\x.rs")); // windows absolute, backslash
         assert!(looks_like_path("C:/proj/x.rs")); // windows absolute, forward slash
         assert!(looks_like_path("\\\\host\\share\\x.rs")); // UNC
-        // `file://` URIs ARE path claims — kept in the verifier's scope.
+                                                           // `file://` URIs ARE path claims — kept in the verifier's scope.
         assert!(!has_url_scheme("file:///c:/proj/x.rs"));
         assert!(looks_like_path("file:///c:/proj/x.rs"));
     }
@@ -2197,7 +2352,10 @@ mod tests {
         let answer = "The bug is in `src/offload/agent.rs` and also docs/plan.md, not README.";
         let m = extract_path_mentions(answer, None);
         assert!(m.contains(&"src/offload/agent.rs".to_string()));
-        assert!(m.contains(&"docs/plan.md".to_string()), "trailing comma not cleaned: {m:?}");
+        assert!(
+            m.contains(&"docs/plan.md".to_string()),
+            "trailing comma not cleaned: {m:?}"
+        );
         assert!(!m.iter().any(|x| x == "README"));
         // A `path:line:` reference cleans down to the bare path.
         let m2 = extract_path_mentions("hit at src/foo.rs:42: bar", None);
@@ -2208,12 +2366,30 @@ mod tests {
     fn collect_observed_accumulates_across_tool_kinds() {
         let mut obs = HashSet::new();
         // read_file — the path argument.
-        collect_observed(&mut obs, None, "read_file", &json!({ "path": "src/main.rs" }), "fn main(){}");
+        collect_observed(
+            &mut obs,
+            None,
+            "read_file",
+            &json!({ "path": "src/main.rs" }),
+            "fn main(){}",
+        );
         // list_dir — the listed dir plus each entry (joined and bare).
         let listing = "/proj/docs (2 entries)\nguide.md\t100\nsub/";
-        collect_observed(&mut obs, None, "list_dir", &json!({ "path": "docs" }), listing);
+        collect_observed(
+            &mut obs,
+            None,
+            "list_dir",
+            &json!({ "path": "docs" }),
+            listing,
+        );
         // code_search — match paths from `path:line: snippet`.
-        collect_observed(&mut obs, None, "code_search", &json!({ "query": "x" }), "src/util.rs:5: let x = 1;");
+        collect_observed(
+            &mut obs,
+            None,
+            "code_search",
+            &json!({ "query": "x" }),
+            "src/util.rs:5: let x = 1;",
+        );
         // graph tool — path-like tokens in the report.
         collect_observed(
             &mut obs,
@@ -2281,8 +2457,14 @@ mod tests {
             verify_and_mark("Fixed [T2] `src/real.rs`.\n\nverified: fully", &obs, None);
         assert!(unverified.is_empty());
         assert!(!marked.contains("[T2]"), "citations stripped");
-        assert!(!marked.contains("worker note"), "clean answer has no taint footer");
-        assert!(marked.ends_with("verified: fully"), "model's own marker kept");
+        assert!(
+            !marked.contains("worker note"),
+            "clean answer has no taint footer"
+        );
+        assert!(
+            marked.ends_with("verified: fully"),
+            "model's own marker kept"
+        );
         // Dirty answer: an unobserved mention is flagged, a taint footer is
         // appended, and the self-report is downgraded to a forced `partially`
         // marker listing the offending mention.
@@ -2292,7 +2474,10 @@ mod tests {
         assert!(marked.contains(
             "[worker note: the following mentions were not verified by any tool call: src/ghost.rs]"
         ));
-        assert!(marked.ends_with("verified: partially — src/ghost.rs"), "verifier overrides self-report");
+        assert!(
+            marked.ends_with("verified: partially — src/ghost.rs"),
+            "verifier overrides self-report"
+        );
         assert_eq!(answer_verified_level(&marked), VerifiedLevel::Partially);
     }
 
@@ -2303,7 +2488,10 @@ mod tests {
         std::fs::write(root.join("docs/x.rs"), "").unwrap();
         let ctx = ToolCtx::new(vec![root.clone()], vec![], vec![], &root);
         // Two spellings of the same real file normalize to the same key.
-        assert_eq!(norm_path(Some(&ctx), "docs/x.rs"), norm_path(Some(&ctx), "./docs/x.rs"));
+        assert_eq!(
+            norm_path(Some(&ctx), "docs/x.rs"),
+            norm_path(Some(&ctx), "./docs/x.rs")
+        );
         let mut obs = HashSet::new();
         obs.insert(norm_path(Some(&ctx), "docs/x.rs"));
         // The observed real path matches a mention of it, even a spelling variant.
@@ -2357,7 +2545,10 @@ mod tests {
         let second = step(&mut cache);
         let third = step(&mut cache);
         assert_eq!(first, "RESULT");
-        assert!(second.starts_with(REPEAT_NUDGE) && second.contains("RESULT"), "second: {second}");
+        assert!(
+            second.starts_with(REPEAT_NUDGE) && second.contains("RESULT"),
+            "second: {second}"
+        );
         assert_eq!(third, REPEAT_EXHAUSTED);
         assert_eq!(executions, 1, "the executor ran only for the fresh call");
     }
@@ -2397,8 +2588,14 @@ mod tests {
         let third = step(&mut cache);
         assert_eq!(first, "v1");
         // Re-executed → fresh on-disk value, plus the repeat nudge.
-        assert!(second.starts_with(REPEAT_NUDGE) && second.contains("v2"), "second: {second}");
-        assert!(third.starts_with(REPEAT_NUDGE) && third.contains("v3"), "third: {third}");
+        assert!(
+            second.starts_with(REPEAT_NUDGE) && second.contains("v2"),
+            "second: {second}"
+        );
+        assert!(
+            third.starts_with(REPEAT_NUDGE) && third.contains("v3"),
+            "third: {third}"
+        );
         assert_eq!(executions, 3, "the stateful tool re-executed every time");
     }
 
@@ -2410,13 +2607,19 @@ mod tests {
         let rc = json!({ "name": "test" });
         assert!(matches!(cache.probe("run_check", &rc), CacheProbe::Fresh));
         cache.record("run_check", &rc, "report".into());
-        assert!(matches!(cache.probe("run_check", &rc), CacheProbe::RepeatStateful));
+        assert!(matches!(
+            cache.probe("run_check", &rc),
+            CacheProbe::RepeatStateful
+        ));
         // Distinct arguments miss; an identical stateful call re-executes.
         let a = json!({ "path": "a" });
         let b = json!({ "path": "b" });
         cache.record("read_file", &a, "one".into());
         assert!(matches!(cache.probe("read_file", &b), CacheProbe::Fresh));
-        assert!(matches!(cache.probe("read_file", &a), CacheProbe::RepeatStateful));
+        assert!(matches!(
+            cache.probe("read_file", &a),
+            CacheProbe::RepeatStateful
+        ));
     }
 
     // ── V21 F9 — grammar-enforced structured output ────────────────────────
@@ -2457,18 +2660,42 @@ mod tests {
         // Tool-call / planning turn: `with_tools == true`, response_format None.
         // Tool calling stays free-form; no grammar constraint on the wire.
         let tool_turn = build_chat_request(
-            &cfg, &msgs, &tools, false, true, None, Duration::from_secs(300), 50.0,
+            &cfg,
+            &msgs,
+            &tools,
+            false,
+            true,
+            None,
+            Duration::from_secs(300),
+            50.0,
         );
-        assert!(tool_turn.response_format.is_none(), "tool turns must not constrain output");
+        assert!(
+            tool_turn.response_format.is_none(),
+            "tool turns must not constrain output"
+        );
         assert_eq!(tool_turn.tool_choice.as_deref(), Some("auto"));
 
         // Final-synthesis / forced-final turn: `with_tools == false`, schema set.
         let final_turn = build_chat_request(
-            &cfg, &msgs, &tools, false, false, Some(rf.clone()), Duration::from_secs(300), 50.0,
+            &cfg,
+            &msgs,
+            &tools,
+            false,
+            false,
+            Some(rf.clone()),
+            Duration::from_secs(300),
+            50.0,
         );
-        assert_eq!(final_turn.response_format.as_ref(), Some(&rf), "final turn carries the schema");
+        assert_eq!(
+            final_turn.response_format.as_ref(),
+            Some(&rf),
+            "final turn carries the schema"
+        );
         assert_eq!(final_turn.tool_choice.as_deref(), Some("none"));
-        assert!(final_turn.tools.is_empty(), "the final turn suppresses tools");
+        assert!(
+            final_turn.tools.is_empty(),
+            "the final turn suppresses tools"
+        );
     }
 
     #[test]
@@ -2496,9 +2723,15 @@ mod tests {
         // footer AFTER the JSON, never inside it.
         let jsonish = r#"{"note": "see marker [T1] here", "count": 2}"#;
         let out = finalize_schema_answer(jsonish, &obs, None).unwrap();
-        assert!(out.starts_with(jsonish), "JSON must lead verbatim, citations intact: {out}");
+        assert!(
+            out.starts_with(jsonish),
+            "JSON must lead verbatim, citations intact: {out}"
+        );
         assert!(out.contains("[T1]"), "strip_citations must not have run");
-        assert!(out.trim_end().ends_with("verified: fully"), "clean schema run ⇒ fully footer: {out}");
+        assert!(
+            out.trim_end().ends_with("verified: fully"),
+            "clean schema run ⇒ fully footer: {out}"
+        );
         // The leading JSON portion (before the footer) still parses verbatim.
         let body = out.split("\n\nverified:").next().unwrap();
         assert_eq!(body, jsonish);
@@ -2508,7 +2741,8 @@ mod tests {
     #[test]
     fn finalize_schema_answer_rejects_non_json() {
         let obs = HashSet::new();
-        let err = finalize_schema_answer("Sure! Here you go: {\"count\": 2}", &obs, None).unwrap_err();
+        let err =
+            finalize_schema_answer("Sure! Here you go: {\"count\": 2}", &obs, None).unwrap_err();
         assert!(err.contains("did not return valid JSON"), "err: {err}");
     }
 
@@ -2521,9 +2755,18 @@ mod tests {
         let jsonish = r#"{"file": "src/ghost.rs"}"#;
         let out = finalize_schema_answer(jsonish, &obs, None).unwrap();
         assert!(out.starts_with(jsonish), "JSON body stays verbatim: {out}");
-        assert!(!out.contains("worker note"), "no F4 taint footer for schema runs");
-        assert!(out.contains("verified: partially"), "unobserved mention ⇒ partial marker");
-        assert!(out.contains("src/ghost.rs"), "partial note names the unverified mention");
+        assert!(
+            !out.contains("worker note"),
+            "no F4 taint footer for schema runs"
+        );
+        assert!(
+            out.contains("verified: partially"),
+            "unobserved mention ⇒ partial marker"
+        );
+        assert!(
+            out.contains("src/ghost.rs"),
+            "partial note names the unverified mention"
+        );
         // The JSON portion alone is still verbatim-parseable.
         let body = out.split("\n\nverified:").next().unwrap();
         assert_eq!(body, jsonish);
@@ -2540,8 +2783,14 @@ mod tests {
         let jsonish = r#"{"log": "https://ci.example.com/build/42/output.log"}"#;
         let out = finalize_schema_answer(jsonish, &obs, None).unwrap();
         assert!(out.starts_with(jsonish), "JSON body verbatim: {out}");
-        assert!(out.trim_end().ends_with("verified: fully"), "URL value ⇒ fully, not partial: {out}");
-        assert!(!out.contains("verified: partially"), "no false unverified taint: {out}");
+        assert!(
+            out.trim_end().ends_with("verified: fully"),
+            "URL value ⇒ fully, not partial: {out}"
+        );
+        assert!(
+            !out.contains("verified: partially"),
+            "no false unverified taint: {out}"
+        );
     }
 
     // ── V21 F5 — confidence marker parse/emit ──────────────────────────────
@@ -2565,7 +2814,8 @@ mod tests {
         assert_eq!(lvl, VerifiedLevel::Fully);
         assert!(note.is_none());
         // Partially with a note (em-dash separator).
-        let (body, lvl, note) = split_marker("Count is 3.\nverified: partially — could not open Q:\\x");
+        let (body, lvl, note) =
+            split_marker("Count is 3.\nverified: partially — could not open Q:\\x");
         assert_eq!(body, "Count is 3.");
         assert_eq!(lvl, VerifiedLevel::Partially);
         assert_eq!(note.as_deref(), Some("could not open Q:\\x"));
@@ -2597,7 +2847,10 @@ mod tests {
 
     #[test]
     fn answer_verified_level_reads_the_footer() {
-        assert_eq!(answer_verified_level("body\n\nverified: fully"), VerifiedLevel::Fully);
+        assert_eq!(
+            answer_verified_level("body\n\nverified: fully"),
+            VerifiedLevel::Fully
+        );
         assert_eq!(
             answer_verified_level("body\n\nverified: partially — x"),
             VerifiedLevel::Partially
@@ -2608,14 +2861,20 @@ mod tests {
             VerifiedLevel::Fully
         );
         // Missing marker ⇒ partially (fail-safe).
-        assert_eq!(answer_verified_level("no marker here"), VerifiedLevel::Partially);
+        assert_eq!(
+            answer_verified_level("no marker here"),
+            VerifiedLevel::Partially
+        );
     }
 
     #[test]
     fn append_marker_round_trips_through_split() {
         let full = append_marker("some body", VerifiedLevel::Fully, None);
         assert!(full.ends_with("verified: fully"));
-        assert_eq!(split_marker(&full), ("some body".to_string(), VerifiedLevel::Fully, None));
+        assert_eq!(
+            split_marker(&full),
+            ("some body".to_string(), VerifiedLevel::Fully, None)
+        );
         let part = append_marker("body", VerifiedLevel::Partially, Some("a.rs, b.rs"));
         assert!(part.ends_with("verified: partially — a.rs, b.rs"));
         let (b, l, n) = split_marker(&part);

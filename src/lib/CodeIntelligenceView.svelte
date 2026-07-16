@@ -443,6 +443,9 @@
       }
       selectedRow = s;
       selectedSession = detail;
+      // Seed the auto-refresh key with the CLICKED row's last_ms so the
+      // effect below doesn't immediately refetch the snapshot it just got.
+      selectedFetchKey = `${s.session_id}:${s.last_ms}`;
       seedCostCustom(detail.per_model); // Cost card rows for this session.
     } catch (e) {
       console.warn('graph_session_usage failed', e);
@@ -454,6 +457,39 @@
     selectedSession = null;
     selectedRow = null;
     selectedId = null;
+    selectedFetchKey = '';
+  }
+
+  // Keep a drilled-in session LIVE: the snapshot fetched at click time goes
+  // stale while its session keeps running (selecting the current session
+  // froze the chart until the row was clicked again). The 2s Overview poll
+  // refreshes `usage.sessions`; whenever the selected session's row advances
+  // (`last_ms` moves on every recorded turn) refetch its detail. Idle
+  // sessions never advance, so this costs nothing for historical drill-ins.
+  // Non-reactive key guard = one fetch per advance, and no effect loop when
+  // the fetch itself replaces `selectedSession`.
+  let selectedFetchKey = '';
+  $effect(() => {
+    const sid = selectedId;
+    if (!sid || !selectedSession) return;
+    const row = usage?.sessions.find((s) => s.session_id === sid);
+    if (!row) return;
+    const key = `${sid}:${row.last_ms}`;
+    if (selectedFetchKey === key) return;
+    selectedFetchKey = key;
+    void refetchSelected(sid);
+  });
+
+  async function refetchSelected(sid: string): Promise<void> {
+    try {
+      const detail = await graphSessionUsage(undefined, sid);
+      if (selectedId !== sid) return; // superseded / cleared mid-flight
+      if (isEmptyDetailRow(detail.row)) return; // vanished — keep the last snapshot
+      selectedSession = detail;
+      seedCostCustom(detail.per_model);
+    } catch (e) {
+      console.warn('graph_session_usage (selected refresh) failed', e);
+    }
   }
 
   // Return to the live current-session view. Lives on a button inside the
@@ -687,9 +723,6 @@
 
   // Stacked-bar chart derived state (This Session). Pure math lives in
   // `./usageMath` (unit-tested); this just wires it to the current turns.
-  // The chart shows the newest turns that FIT the card's width (each bar
-  // needs ~5px: 2px min column + 3px gap) — an unbounded session used to
-  // push the flex row right out of the card on narrow panes.
   // V24 Phase C: source the card from the selected session when one is
   // picked, else the live current session — so `shownTurns`, `currentModel`,
   // the cost toggle, and the top-tools list all follow the selection with no
@@ -698,15 +731,93 @@
   let cardTopTools = $derived(
     selectedSession ? selectedSession.top_tools : (usage?.current?.top_tools ?? []),
   );
-  let ubarsWidth = $state(0);
-  const BAR_MIN_PX = 5;
-  let shownTurns = $derived.by(() => {
-    const cap = ubarsWidth > 0 ? Math.max(10, Math.floor(ubarsWidth / BAR_MIN_PX)) : 60;
-    return usageTurns.length > cap ? usageTurns.slice(-cap) : usageTurns;
-  });
+  // The chart used to DROP the oldest turns once bars hit their minimum
+  // width; it now scrolls horizontally instead (wheel = zoom, shift+wheel =
+  // pan), so every turn stays reachable. Only a hard DOM cap remains — each
+  // column is ~7 nodes, so an absurdly long session can't bloat the card.
+  const TURN_RENDER_CAP = 1000;
+  let shownTurns = $derived(
+    usageTurns.length > TURN_RENDER_CAP ? usageTurns.slice(-TURN_RENDER_CAP) : usageTurns,
+  );
   let usageMax = $derived(maxTurnTotal(shownTurns));
   // V24 Phase C: merged same-origin runs for the S/A lane under the bars.
   let laneSegs = $derived(laneSegments(shownTurns));
+
+  // ── Chart zoom + horizontal scroll ───────────────────────────────────
+  // `zoomCol` is the wheel-chosen column width (px); null = auto, i.e. fill
+  // the viewport down to `BAR_MIN_COL` per bar, then overflow into a scroll.
+  let ubarsWidth = $state(0); // the scroll viewport's clientWidth
+  const BAR_GAP = 3; // must match the .ubars / .salane CSS gap
+  const BAR_MIN_COL = 2; // px — a bar column's minimum width before scrolling
+  const BAR_MAX_COL = 48; // zoom-in ceiling
+  let zoomCol = $state<number | null>(null);
+  let ubarsScroll = $state<HTMLDivElement | null>(null);
+  // Non-reactive: stick to the right edge (newest turns) as data lands,
+  // unless the user scrolled back into history.
+  let pinnedRight = true;
+  // Column width at which all shown turns exactly fill the viewport (may be
+  // sub-minimum when the session is long — that's the scroll trigger).
+  let fitCol = $derived(
+    shownTurns.length > 0 && ubarsWidth > 0
+      ? (ubarsWidth - BAR_GAP * (shownTurns.length - 1)) / shownTurns.length
+      : 0,
+  );
+  let colPx = $derived(zoomCol ?? Math.max(fitCol, BAR_MIN_COL));
+  // Fixed-width columns (scroll mode) whenever the user zoomed or the fit
+  // width dropped below the minimum; otherwise columns flex to fill.
+  let fixedCols = $derived(zoomCol !== null || (fitCol > 0 && fitCol < BAR_MIN_COL));
+  let chartWidthPx = $derived(
+    shownTurns.length > 0 ? colPx * shownTurns.length + BAR_GAP * (shownTurns.length - 1) : 0,
+  );
+  let laneWidthPx = $derived(fixedCols ? chartWidthPx : ubarsWidth);
+  let chartScrollable = $derived(fixedCols && chartWidthPx > ubarsWidth + 1);
+
+  function onChartScroll(): void {
+    const el = ubarsScroll;
+    if (!el) return;
+    pinnedRight = el.scrollLeft + el.clientWidth >= el.scrollWidth - 4;
+  }
+
+  function chartWheel(e: WheelEvent): void {
+    // Shift+wheel keeps the browser's native horizontal pan; plain wheel
+    // zooms the bar width around the cursor.
+    if (e.shiftKey || shownTurns.length === 0) return;
+    const el = ubarsScroll;
+    if (!el || ubarsWidth <= 0) return;
+    e.preventDefault();
+    const minCol = Math.max(fitCol, BAR_MIN_COL); // zoom-out floor: fill-the-card
+    const maxCol = Math.max(BAR_MAX_COL, minCol);
+    const factor = e.deltaY < 0 ? 1.25 : 0.8;
+    const next = Math.min(maxCol, Math.max(minCol, colPx * factor));
+    if (Math.abs(next - colPx) < 0.01) return;
+    // Anchor the turn under the cursor while the chart width changes.
+    const mouseX = e.clientX - el.getBoundingClientRect().left;
+    const frac = chartWidthPx > 0 ? (el.scrollLeft + mouseX) / chartWidthPx : 1;
+    pinnedRight = false; // don't fight the anchor below
+    zoomCol = next <= minCol + 0.01 ? null : next;
+    const newWidth = shownTurns.length * next + BAR_GAP * (shownTurns.length - 1);
+    requestAnimationFrame(() => {
+      el.scrollLeft = frac * newWidth - mouseX;
+      onChartScroll(); // re-derive pinnedRight from where we actually landed
+    });
+  }
+
+  // Svelte 5 attaches `onwheel` passively; zooming needs preventDefault, so
+  // the listener is attached by hand, non-passive.
+  function wheelZoom(node: HTMLElement): { destroy(): void } {
+    const h = (e: WheelEvent): void => chartWheel(e);
+    node.addEventListener('wheel', h, { passive: false });
+    return { destroy: () => node.removeEventListener('wheel', h) };
+  }
+
+  // Keep the newest turns in view as new data lands (only while pinned to
+  // the right edge — a user reading history isn't yanked forward).
+  $effect(() => {
+    void shownTurns.length;
+    void colPx;
+    const el = ubarsScroll;
+    if (el && pinnedRight && el.scrollWidth > el.clientWidth) el.scrollLeft = el.scrollWidth;
+  });
 
   // V24 Phase C: the current session's totals row (agent + start time for the
   // live card title) — matched out of the Sessions list by `current`'s id.
@@ -737,7 +848,14 @@
     { key: 'out', label: 'output', field: 'usage_color_out' },
     { key: 'tool', label: 'est. tool-result', field: 'usage_color_tool' },
   ] as const;
-  type ChartSegKey = (typeof CHART_SEGS)[number]['key'];
+  // The S/A lane's two origin colors — same picker/preview/commit machinery
+  // as the bar segments, separate list because these feed the lane (and the
+  // sub-agent bar outline), not the stacked segments.
+  const SA_SEGS = [
+    { key: 'session', label: 'S session', field: 'usage_color_session' },
+    { key: 'agent', label: 'A agent', field: 'usage_color_agent' },
+  ] as const;
+  type ChartSegKey = (typeof CHART_SEGS)[number]['key'] | (typeof SA_SEGS)[number]['key'];
   let chartPreview = $state<Partial<Record<ChartSegKey, string>>>({});
   let chartColors = $derived({
     in: chartPreview.in ?? $settings.graph.usage_color_in,
@@ -745,9 +863,11 @@
     write: chartPreview.write ?? $settings.graph.usage_color_write,
     out: chartPreview.out ?? $settings.graph.usage_color_out,
     tool: chartPreview.tool ?? $settings.graph.usage_color_tool,
+    session: chartPreview.session ?? $settings.graph.usage_color_session,
+    agent: chartPreview.agent ?? $settings.graph.usage_color_agent,
   });
   async function commitChartColor(
-    seg: (typeof CHART_SEGS)[number],
+    seg: (typeof CHART_SEGS)[number] | (typeof SA_SEGS)[number],
     value: string,
   ): Promise<void> {
     const next = structuredClone($settings);
@@ -1215,7 +1335,7 @@
     <details
       class="card"
       bind:open={sessionCardOpen}
-      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}"
+      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --ubar-tool: {chartColors.tool}; --sa-session: {chartColors.session}; --sa-agent: {chartColors.agent}"
     >
       <summary class="history-head">
         {#if selectedRow}
@@ -1305,64 +1425,92 @@
               {s.label}
             </span>
           {/each}
-          <!-- V24 Phase C: S/A lane key. Colors track the lane (muted track /
-               theme accent), not the per-segment settings pickers. -->
-          <span class="sa-key"><span class="sa-swatch session"></span>S session</span>
-          <span class="sa-key"><span class="sa-swatch agent"></span>A agent</span>
-        </div>
-        <div class="ubars" bind:clientWidth={ubarsWidth}>
-          {#each shownTurns as t, i (i)}
-            {@const est_tool = Math.round(t.tool_chars / 4)}
-            {@const cost = costActive && currentRates ? turnCost(t, currentRates) : null}
-            {@const total = cost ? cost.total : turnTotal(t)}
-            {@const max = cost ? usageCostMax : usageMax}
-            {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
-            <div class="ubar-col">
-              <div
-                class="ubar {agentBarClass(t.origin)}"
-                style="height: {barHeightPct(total, max)}%"
-                title={cost
-                  ? `turn ${turnNo} (est.): ${fmtUsd(cost.input)} in / ${fmtUsd(cost.cache_read)} cache-read / ${fmtUsd(cost.cache_write)} cache-write / ${fmtUsd(cost.output)} out / ${fmtUsd(cost.tool)} est. tool — ${fmtUsd(cost.total)}`
-                  : `turn ${turnNo}: ${t.in_tok} in / ${t.cache_read} cache-read / ${t.cache_make} cache-write / ${t.out_tok} out / ~${est_tool} est. tool`}
-              >
-                {#if total > 0}
-                  <!-- One segment list for both modes (order matches
-                       CHART_SEGS: in / cache-read / cache-write / out /
-                       tool) so a new segment can't be added to one mode and
-                       missed in the other. -->
-                  {@const segs = cost
-                    ? [cost.input, cost.cache_read, cost.cache_write, cost.output, cost.tool].map(
-                        (v) => v * 1e6,
-                      )
-                    : [t.in_tok, t.cache_read, t.cache_make, t.out_tok, est_tool]}
-                  {#each CHART_SEGS as s, si (s.key)}
-                    <span class="useg {s.key}" style="flex-grow: {segs[si]}"></span>
-                  {/each}
-                {/if}
-              </div>
-            </div>
+          <!-- V24 Phase C: S/A lane key — now color pickers too, persisted
+               like the segment colors (the agent color also tints the
+               sub-agent bars' outline). -->
+          {#each SA_SEGS as s (s.key)}
+            <span>
+              <input
+                type="color"
+                class="dot"
+                value={chartColors[s.key]}
+                title="{s.label} — click to pick a color"
+                oninput={(e) => (chartPreview[s.key] = e.currentTarget.value)}
+                onchange={(e) => commitChartColor(s, e.currentTarget.value)}
+              />
+              {s.label}
+            </span>
           {/each}
+          {#if shownTurns.length > 1}
+            <span class="zoom-hint">wheel: zoom · shift+wheel: pan</span>
+          {/if}
         </div>
-
-        <!-- V24 Phase C: S/A lane — one segment per contiguous same-origin
-             run, width proportional to the turns it spans (same per-bar width
-             logic as the chart). The letter shows only when the segment is
-             ≥~2 chars wide; otherwise the tooltip carries it. -->
-        {#if shownTurns.length > 0}
-          <div class="salane">
-            {#each laneSegs as seg, i (i)}
-              <span
-                class="saseg {seg.origin}"
-                style="flex-grow: {seg.count}"
-                title="{seg.origin === 'agent' ? 'sub-agent' : 'main session'} · {seg.count} turn{seg.count ===
-                1
-                  ? ''
-                  : 's'}"
-                >{#if laneLabelVisible(seg.count, shownTurns.length, ubarsWidth)}{seg.label}{/if}</span
-              >
+        <!-- Wheel = zoom (bar width), shift+wheel = pan; the wrapper scrolls
+             horizontally once bars hit their minimum width, so long sessions
+             keep every turn reachable instead of dropping the oldest. -->
+        <div
+          class="ubars-scroll"
+          class:scrollable={chartScrollable}
+          bind:this={ubarsScroll}
+          bind:clientWidth={ubarsWidth}
+          onscroll={onChartScroll}
+          use:wheelZoom
+        >
+          <div class="ubars" style={fixedCols ? `width: ${chartWidthPx}px` : undefined}>
+            {#each shownTurns as t, i (i)}
+              {@const est_tool = Math.round(t.tool_chars / 4)}
+              {@const cost = costActive && currentRates ? turnCost(t, currentRates) : null}
+              {@const total = cost ? cost.total : turnTotal(t)}
+              {@const max = cost ? usageCostMax : usageMax}
+              {@const turnNo = usageTurns.length - shownTurns.length + i + 1}
+              <div class="ubar-col" style={fixedCols ? `flex: 0 0 ${colPx}px` : undefined}>
+                <div
+                  class="ubar {agentBarClass(t.origin)}"
+                  style="height: {barHeightPct(total, max)}%"
+                  title={cost
+                    ? `turn ${turnNo} (est.): ${fmtUsd(cost.input)} in / ${fmtUsd(cost.cache_read)} cache-read / ${fmtUsd(cost.cache_write)} cache-write / ${fmtUsd(cost.output)} out / ${fmtUsd(cost.tool)} est. tool — ${fmtUsd(cost.total)}`
+                    : `turn ${turnNo}: ${t.in_tok} in / ${t.cache_read} cache-read / ${t.cache_make} cache-write / ${t.out_tok} out / ~${est_tool} est. tool`}
+                >
+                  {#if total > 0}
+                    <!-- One segment list for both modes (order matches
+                         CHART_SEGS: in / cache-read / cache-write / out /
+                         tool) so a new segment can't be added to one mode and
+                         missed in the other. -->
+                    {@const segs = cost
+                      ? [cost.input, cost.cache_read, cost.cache_write, cost.output, cost.tool].map(
+                          (v) => v * 1e6,
+                        )
+                      : [t.in_tok, t.cache_read, t.cache_make, t.out_tok, est_tool]}
+                    {#each CHART_SEGS as s, si (s.key)}
+                      <span class="useg {s.key}" style="flex-grow: {segs[si]}"></span>
+                    {/each}
+                  {/if}
+                </div>
+              </div>
             {/each}
           </div>
-        {/if}
+
+          <!-- V24 Phase C: S/A lane — one segment per contiguous same-origin
+               run, width proportional to the turns it spans (same per-bar width
+               logic as the chart). The letter shows only when the segment is
+               ≥~2 chars wide; otherwise the tooltip carries it. Lives inside
+               the scroll wrapper so it pans/zooms with the bars. -->
+          {#if shownTurns.length > 0}
+            <div class="salane" style={fixedCols ? `width: ${chartWidthPx}px` : undefined}>
+              {#each laneSegs as seg, i (i)}
+                <span
+                  class="saseg {seg.origin}"
+                  style="flex-grow: {seg.count}"
+                  title="{seg.origin === 'agent' ? 'sub-agent' : 'main session'} · {seg.count} turn{seg.count ===
+                  1
+                    ? ''
+                    : 's'}"
+                  >{#if laneLabelVisible(seg.count, shownTurns.length, laneWidthPx)}{seg.label}{/if}</span
+                >
+              {/each}
+            </div>
+          {/if}
+        </div>
 
         <div class="history-head">Top consumers</div>
         {#if cardTopTools.length === 0}
@@ -2863,14 +3011,29 @@
   .useg.tool {
     background: var(--ubar-tool, #f0c674);
   }
+  /* Horizontal scroll + zoom viewport around the bars and the S/A lane —
+     scrolls once bars hit their minimum width (or the user wheel-zooms in),
+     so long sessions keep every turn reachable. */
+  .ubars-scroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin-bottom: 12px;
+  }
+  .ubars-scroll.scrollable {
+    padding-bottom: 4px; /* keep the scrollbar off the S/A lane */
+  }
   .ubars {
     display: flex;
     align-items: flex-end;
     gap: 3px;
     height: 130px;
-    margin-bottom: 14px;
+    margin-bottom: 4px;
     border-bottom: 1px solid var(--border, #333);
     padding-bottom: 2px;
+  }
+  .ubars-legend .zoom-hint {
+    margin-left: auto;
+    opacity: 0.7;
   }
   .ubar-col {
     flex: 1 1 0;
@@ -2893,7 +3056,7 @@
      segment colors so sub-agent spend reads even when the lane is cramped.
      The stacked-segment structure is unchanged. */
   .ubar.agent {
-    outline: 1px solid var(--accent, #3b6ea5);
+    outline: 1px solid var(--sa-agent, var(--accent, #3b6ea5));
     outline-offset: -1px;
     filter: saturate(0.55);
   }
@@ -2904,7 +3067,7 @@
     display: flex;
     gap: 3px;
     height: 13px;
-    margin: -10px 0 12px;
+    margin: 0;
   }
   .saseg {
     flex-basis: 0;
@@ -2919,29 +3082,14 @@
     line-height: 1;
     letter-spacing: 0.5px;
   }
-  /* Session = muted track color; agent = theme accent (matches the legend). */
+  /* Colors flow from settings via the legend pickers (like the segments). */
   .saseg.session {
-    background: var(--surface-raised, rgba(255, 255, 255, 0.08));
+    background: var(--sa-session, #30363d);
     color: var(--text-subtle, #999);
   }
   .saseg.agent {
-    background: var(--accent, #3b6ea5);
+    background: var(--sa-agent, #3b6ea5);
     color: #fff;
-  }
-  .ubars-legend .sa-key {
-    gap: 4px;
-  }
-  .ubars-legend .sa-swatch {
-    width: 11px;
-    height: 11px;
-    border-radius: 2px;
-    border: 1px solid var(--border, #444);
-  }
-  .ubars-legend .sa-swatch.session {
-    background: var(--surface-raised, rgba(255, 255, 255, 0.08));
-  }
-  .ubars-legend .sa-swatch.agent {
-    background: var(--accent, #3b6ea5);
   }
 
   /* V24 Phase C: card title + selected-session controls. */

@@ -43,7 +43,10 @@ pub enum TtsRequest {
         /// speech (`tts_test`, `tts_speak`), which is never suppressed.
         suppressible: bool,
     },
-    SynthesizeNotification { tab: TabId, text: String },
+    SynthesizeNotification {
+        tab: TabId,
+        text: String,
+    },
     SpeakSelection {
         tab: TabId,
         session: u64,
@@ -74,8 +77,8 @@ pub type ActiveTab = Arc<RwLock<TabId>>;
 /// `kokoro-v1.0.onnx` and `voices/af_heart.bin` here so a fresh unzip works
 /// out of the box. This is the only location the runtime looks at.
 pub fn model_dir() -> AppResult<PathBuf> {
-    let exe = std::env::current_exe()
-        .map_err(|e| AppError::Tts(format!("current_exe failed: {e}")))?;
+    let exe =
+        std::env::current_exe().map_err(|e| AppError::Tts(format!("current_exe failed: {e}")))?;
     let dir = exe
         .parent()
         .and_then(|p| p.parent())

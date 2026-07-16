@@ -41,18 +41,16 @@ use serde_json::{Map, Value};
 
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
-use crate::settings::write_atomic;
 use crate::settings::schema::{
-    default_ai_tab, default_code_audit_tab, default_graph_monitor_tab, default_graph_view_tab,
-    default_offload_server_tab,
+    default_ai_tab, default_audit_tools, default_code_audit_tab, default_code_quality_tab,
+    default_graph_monitor_tab, default_graph_view_tab, default_offload_server_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
-    starter_prompt_templates,
-    AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings,
-    TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
-    SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
+    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
+    PromptTemplate, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID,
+    CODE_QUALITY_TAB_ID, GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID,
+    OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
+use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
 
 const GLOBAL_FILE_NAME: &str = "settings.json";
@@ -828,7 +826,11 @@ fn seed_prompt_templates_if_needed(s: &mut Settings) -> bool {
 fn portable_avatars_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.parent()?.join("avatars");
-    if dir.is_dir() { Some(dir) } else { None }
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 /// Point the bundled avatar defaults at the active theme's videos under
@@ -888,8 +890,7 @@ fn stamp_avatar_paths_from(s: &mut Settings, dir: &Path) {
     let is_bundled = |p: &Option<PathBuf>| match p {
         None => true,
         Some(path) => {
-            path.starts_with(dir)
-                || path.to_str().is_some_and(|s| s.starts_with("/avatar/"))
+            path.starts_with(dir) || path.to_str().is_some_and(|s| s.starts_with("/avatar/"))
         }
     };
 
@@ -951,11 +952,7 @@ fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
     // Iterate in canonical order (claude → claude-local → opencode) so
     // successive insertions land in the right relative
     // slot regardless of the user's `enabled_ai_tabs` ordering.
-    let order = [
-        AiTabId::Claude,
-        AiTabId::ClaudeLocal,
-        AiTabId::OpenCode,
-    ];
+    let order = [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
     let mut changed = false;
     for &id in &order {
         if !settings.enabled_ai_tabs.contains(&id) {
@@ -967,7 +964,10 @@ fn restore_enabled_ai_builtins(settings: &mut Settings) -> bool {
         let pos = canonical_insert_position(&settings.tabs, id);
         settings.tabs.insert(pos, default_ai_tab(id));
         changed = true;
-        tracing::warn!(id = id.as_str(), "integrity: restored missing AI builtin tab");
+        tracing::warn!(
+            id = id.as_str(),
+            "integrity: restored missing AI builtin tab"
+        );
     }
     changed
 }
@@ -1070,6 +1070,17 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         default_tab: default_code_audit_tab,
         sync_name: true,
     },
+    // V25: the Code Quality tab shares the `code_audit.enabled` flag with Code
+    // Audit — enabling the feature materializes both tabs, contiguous and in
+    // this order (Code Audit then Code Quality).
+    ReservedTabSpec {
+        id: CODE_QUALITY_TAB_ID,
+        log_name: "Code Quality",
+        flag: "code_audit",
+        enabled: |s| s.code_audit.enabled,
+        default_tab: default_code_quality_tab,
+        sync_name: true,
+    },
 ];
 
 /// Keep one reserved feature tab present iff its gating flag is on. Inserts
@@ -1154,15 +1165,41 @@ pub fn reconcile_reserved_tabs(settings: &mut Settings) -> bool {
     changed
 }
 
+/// V25: reconcile `code_audit.tools` with the built-in adapter set. A config
+/// persisted by v0.43/v0.44 (before the Quality tools existed) carries only the
+/// three Security entries; the lenient `tools` deserializer keeps a present
+/// array verbatim, so those installs would never gain the eleven Quality tools
+/// and the Code Quality tab / Settings section would stay empty. This appends a
+/// default entry (per [`default_audit_tools`]: enabled except `dotnet-analyzers`
+/// and `semgrep-quality`) for every [`AuditToolId`] missing from the array,
+/// **preserving every existing entry verbatim and in its current order** —
+/// the user's `enabled`/`path`/`extra_args`/`timeout_secs` and any customization
+/// survive untouched. Stale/unknown ids were already dropped by the lenient
+/// deserializer, and that stays: this only ever *adds* the missing built-ins.
+/// Idempotent (a second call finds every id present and is a no-op). Runs on
+/// both the load path ([`integrity_check`]) and the live settings-update
+/// round-trip (`apply_incoming_settings`), exactly like
+/// [`reconcile_reserved_tabs`]. Returns `true` if anything was appended.
+pub fn reconcile_audit_tools(settings: &mut Settings) -> bool {
+    let tools = &mut settings.code_audit.tools;
+    let mut changed = false;
+    for def in default_audit_tools() {
+        if !tools.iter().any(|t| t.id == def.id) {
+            tools.push(def);
+            changed = true;
+        }
+    }
+    if changed {
+        tracing::info!("integrity: appended missing built-in code_audit tools");
+    }
+    changed
+}
+
 /// All three reserved AI tab ids. Used by the integrity check's "is this
 /// id one of our reserved AI builtins?" loops; a single source of truth
 /// keeps the `ai_builtins` membership check, the `use_local_provider`
 /// expectation table, and the drop-disabled-tab pass in sync.
-const AI_BUILTIN_IDS: [&str; 3] = [
-    CLAUDE_TAB_ID,
-    CLAUDE_LOCAL_TAB_ID,
-    OPENCODE_TAB_ID,
-];
+const AI_BUILTIN_IDS: [&str; 3] = [CLAUDE_TAB_ID, CLAUDE_LOCAL_TAB_ID, OPENCODE_TAB_ID];
 
 /// Reconcile the `tabs` array with `enabled_ai_tabs`. Every enabled AI
 /// id is forced present and marked `builtin: true`; every reserved AI
@@ -1197,7 +1234,10 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         if AI_BUILTIN_IDS.contains(&tab.id()) && !tab.builtin() {
             tab.set_builtin(true);
             changed = true;
-            tracing::warn!(id = tab.id(), "integrity: forced builtin: true on AI builtin");
+            tracing::warn!(
+                id = tab.id(),
+                "integrity: forced builtin: true on AI builtin"
+            );
         }
     }
 
@@ -1285,6 +1325,14 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
+    // 4c. Reconcile `code_audit.tools` with the built-in adapter set so a
+    //     pre-V25 config (three Security tools only) gains the eleven Quality
+    //     tools on load. Existing entries are preserved verbatim; only missing
+    //     built-ins are appended. Idempotent.
+    if reconcile_audit_tools(settings) {
+        changed = true;
+    }
+
     // 5. Backend layout sanity. The frontend owns the deep integrity
     //    walk (orphan placement, empty-pane collapse) — it has the tree
     //    helpers. The backend's job here is just to keep the file
@@ -1293,8 +1341,7 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
     //    `focused_pane_id` so the frontend's leftmost-leaf fallback
     //    kicks in.
     if let Some(layout) = settings.layout.as_mut() {
-        let valid_ids: HashSet<&str> =
-            settings.tabs.iter().map(|t| t.id()).collect();
+        let valid_ids: HashSet<&str> = settings.tabs.iter().map(|t| t.id()).collect();
         let mut pane_ids: HashSet<String> = HashSet::new();
         if filter_layout_tab_ids(&mut layout.tree, &valid_ids, &mut pane_ids) {
             changed = true;
@@ -1435,9 +1482,7 @@ mod tests {
 
         // Simulate a file that upgraded before the `question` slot existed:
         // the slot deserialized to the pure default (disabled, empty text).
-        if let Some(TabConfig::AiTool(c)) =
-            s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID)
-        {
+        if let Some(TabConfig::AiTool(c)) = s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID) {
             c.notifications.question = NotificationSlot::default();
             assert!(!c.notifications.question.enabled);
             assert!(c.notifications.question.text.is_empty());
@@ -1461,9 +1506,7 @@ mod tests {
         integrity_check(&mut s);
 
         // User deliberately disabled the slot but kept (non-empty) text.
-        if let Some(TabConfig::AiTool(c)) =
-            s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID)
-        {
+        if let Some(TabConfig::AiTool(c)) = s.tabs.iter_mut().find(|t| t.id() == CLAUDE_TAB_ID) {
             c.notifications.question = NotificationSlot {
                 enabled: false,
                 text: "My custom question text".to_string(),
@@ -1483,11 +1526,7 @@ mod tests {
     #[test]
     fn integrity_seeds_opencode_at_canonical_position() {
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![
-            AiTabId::Claude,
-            AiTabId::ClaudeLocal,
-            AiTabId::OpenCode,
-        ];
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
         integrity_check(&mut s);
         assert_eq!(s.tabs.len(), 3);
         assert_eq!(s.tabs[0].id(), CLAUDE_TAB_ID);
@@ -1580,9 +1619,21 @@ mod tests {
         s.offload.enabled = true;
         s.graph.enabled = true;
         integrity_check(&mut s);
-        let offload_pos = s.tabs.iter().position(|t| t.id() == OFFLOAD_SERVER_TAB_ID).unwrap();
-        let graph_pos = s.tabs.iter().position(|t| t.id() == GRAPH_MONITOR_TAB_ID).unwrap();
-        let workbench_pos = s.tabs.iter().position(|t| t.id() == WORKBENCH_TAB_ID).unwrap();
+        let offload_pos = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == OFFLOAD_SERVER_TAB_ID)
+            .unwrap();
+        let graph_pos = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == GRAPH_MONITOR_TAB_ID)
+            .unwrap();
+        let workbench_pos = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == WORKBENCH_TAB_ID)
+            .unwrap();
         assert!(offload_pos < graph_pos);
         assert!(graph_pos < workbench_pos);
     }
@@ -1616,9 +1667,16 @@ mod tests {
         let mut s = Settings::default();
         integrity_check(&mut s);
         assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
-        let workbench_pos = s.tabs.iter().position(|t| t.id() == WORKBENCH_TAB_ID).unwrap();
-        let tool_activity_pos =
-            s.tabs.iter().position(|t| t.id() == TOOL_ACTIVITY_TAB_ID).unwrap();
+        let workbench_pos = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == WORKBENCH_TAB_ID)
+            .unwrap();
+        let tool_activity_pos = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == TOOL_ACTIVITY_TAB_ID)
+            .unwrap();
         assert!(workbench_pos < tool_activity_pos);
     }
 
@@ -1644,30 +1702,156 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_audit_tools_appends_missing_quality_tools() {
+        use crate::settings::schema::{AuditToolConfig, AuditToolId};
+        // A v0.43/v0.44 persisted config: only the three Security tools, one of
+        // them customized (disabled + custom path + extra args + timeout).
+        let mut s = base_test_settings();
+        s.code_audit.tools = vec![
+            AuditToolConfig {
+                id: AuditToolId::OsvScanner,
+                enabled: false,
+                path: r"C:\tools\osv.exe".to_string(),
+                extra_args: vec!["--offline".to_string()],
+                timeout_secs: Some(42),
+            },
+            AuditToolConfig {
+                id: AuditToolId::Gitleaks,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+            AuditToolConfig {
+                id: AuditToolId::Semgrep,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+        ];
+
+        let changed = reconcile_audit_tools(&mut s);
+        assert!(changed);
+        let tools = &s.code_audit.tools;
+        assert_eq!(tools.len(), 14);
+
+        // The three Security entries are preserved verbatim, in order — the
+        // customized osv-scanner survives untouched.
+        assert_eq!(tools[0].id, AuditToolId::OsvScanner);
+        assert!(!tools[0].enabled);
+        assert_eq!(tools[0].path, r"C:\tools\osv.exe");
+        assert_eq!(tools[0].extra_args, vec!["--offline".to_string()]);
+        assert_eq!(tools[0].timeout_secs, Some(42));
+        assert_eq!(tools[1].id, AuditToolId::Gitleaks);
+        assert_eq!(tools[2].id, AuditToolId::Semgrep);
+
+        // The eleven Quality ids are appended with correct enabled defaults:
+        // enabled except dotnet-analyzers and semgrep-quality.
+        let by_id = |id| tools.iter().find(|t| t.id == id).unwrap();
+        for id in [
+            AuditToolId::Oxlint,
+            AuditToolId::GolangciLint,
+            AuditToolId::Ruff,
+            AuditToolId::Cppcheck,
+            AuditToolId::Typos,
+            AuditToolId::Eslint,
+            AuditToolId::Pmd,
+            AuditToolId::Knip,
+            AuditToolId::CargoMachete,
+        ] {
+            assert!(by_id(id).enabled, "{id:?} enabled by default");
+            assert!(by_id(id).path.is_empty(), "{id:?} no path override");
+            assert!(by_id(id).timeout_secs.is_none(), "{id:?} global timeout");
+        }
+        assert!(!by_id(AuditToolId::DotnetAnalyzers).enabled);
+        assert!(!by_id(AuditToolId::SemgrepQuality).enabled);
+    }
+
+    #[test]
+    fn reconcile_audit_tools_leaves_full_config_untouched() {
+        // A fresh install already carries all fourteen tools — nothing to add.
+        let mut s = base_test_settings();
+        let before = s.code_audit.tools.clone();
+        assert_eq!(before.len(), 14);
+        assert!(!reconcile_audit_tools(&mut s));
+        assert_eq!(s.code_audit.tools, before);
+    }
+
+    #[test]
+    fn reconcile_audit_tools_is_idempotent() {
+        use crate::settings::schema::{AuditToolConfig, AuditToolId};
+        let mut s = base_test_settings();
+        s.code_audit.tools = vec![AuditToolConfig {
+            id: AuditToolId::Gitleaks,
+            enabled: true,
+            path: String::new(),
+            extra_args: vec![],
+            timeout_secs: None,
+        }];
+        assert!(reconcile_audit_tools(&mut s));
+        let after_first = s.code_audit.tools.clone();
+        assert_eq!(after_first.len(), 14);
+        // A second pass finds every id present and changes nothing.
+        assert!(!reconcile_audit_tools(&mut s));
+        assert_eq!(s.code_audit.tools, after_first);
+    }
+
+    #[test]
+    fn integrity_reconciles_pre_v25_audit_tools() {
+        use crate::settings::schema::{AuditToolConfig, AuditToolId};
+        // The load-path integrity pass performs the same reconcile, so an
+        // upgraded install gains the Quality tools on first load.
+        let mut s = base_test_settings();
+        s.code_audit.tools = vec![
+            AuditToolConfig {
+                id: AuditToolId::OsvScanner,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+            AuditToolConfig {
+                id: AuditToolId::Gitleaks,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+            AuditToolConfig {
+                id: AuditToolId::Semgrep,
+                enabled: true,
+                path: String::new(),
+                extra_args: vec![],
+                timeout_secs: None,
+            },
+        ];
+        integrity_check(&mut s);
+        assert_eq!(s.code_audit.tools.len(), 14);
+    }
+
+    #[test]
     fn integrity_inserts_opencode_between_claude_local_and_user_shell() {
         // User has [claude, claude-local, shell-foo] and now enables
         // opencode. The new tab should land at index 2 (after claude-local,
         // before the shell), not at the end.
         let mut s = base_test_settings();
-        s.enabled_ai_tabs = vec![
-            AiTabId::Claude,
-            AiTabId::ClaudeLocal,
-            AiTabId::OpenCode,
-        ];
+        s.enabled_ai_tabs = vec![AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode];
         integrity_check(&mut s);
         // Insert a user shell tab to simulate the existing layout.
-        s.tabs.push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
-            id: "shell-foo".to_string(),
-            builtin: false,
-            name: "Foo".to_string(),
-            command: "/bin/bash".to_string(),
-            args: vec!["-i".to_string()],
-            cwd: None,
-            env: Default::default(),
-            notifications: Default::default(),
-            theme_override: None,
-            background_override: None,
-        }));
+        s.tabs
+            .push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
+                id: "shell-foo".to_string(),
+                builtin: false,
+                name: "Foo".to_string(),
+                command: "/bin/bash".to_string(),
+                args: vec!["-i".to_string()],
+                cwd: None,
+                env: Default::default(),
+                notifications: Default::default(),
+                theme_override: None,
+                background_override: None,
+            }));
         // Drop opencode, then re-add via integrity.
         s.tabs.retain(|t| t.id() != OPENCODE_TAB_ID);
         let changed = integrity_check(&mut s);
@@ -1716,10 +1900,7 @@ mod tests {
         let mut s = base_test_settings();
         let _shell = fake_default_shell();
         integrity_check(&mut s);
-        assert!(s
-            .tabs
-            .iter()
-            .all(|t| t.id() != SHELL_DEFAULT_TAB_ID));
+        assert!(s.tabs.iter().all(|t| t.id() != SHELL_DEFAULT_TAB_ID));
     }
 
     #[test]
@@ -1731,8 +1912,8 @@ mod tests {
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a legacy-shaped shell-default-1 with builtin: true.
-        s.tabs.push(TabConfig::Shell(
-            crate::settings::schema::ShellTabConfig {
+        s.tabs
+            .push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
                 id: SHELL_DEFAULT_TAB_ID.to_string(),
                 builtin: true,
                 name: "Shell 1".to_string(),
@@ -1743,8 +1924,7 @@ mod tests {
                 notifications: Default::default(),
                 theme_override: None,
                 background_override: None,
-            },
-        ));
+            }));
         let changed = integrity_check(&mut s);
         assert!(changed);
         let entry = s
@@ -1775,18 +1955,19 @@ mod tests {
         let _shell = fake_default_shell();
         integrity_check(&mut s);
         // Insert a user shell tab.
-        s.tabs.push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
-            id: "shell-user-1".to_string(),
-            builtin: false,
-            name: "Build Watch".to_string(),
-            command: "/bin/bash".to_string(),
-            args: vec!["-i".to_string()],
-            cwd: None,
-            env: Default::default(),
-            notifications: Default::default(),
-            theme_override: None,
-            background_override: None,
-        }));
+        s.tabs
+            .push(TabConfig::Shell(crate::settings::schema::ShellTabConfig {
+                id: "shell-user-1".to_string(),
+                builtin: false,
+                name: "Build Watch".to_string(),
+                command: "/bin/bash".to_string(),
+                args: vec!["-i".to_string()],
+                cwd: None,
+                env: Default::default(),
+                notifications: Default::default(),
+                theme_override: None,
+                background_override: None,
+            }));
         let user_pos_before = s.tabs.len() - 1;
 
         // Delete claude — integrity should restore it without disturbing
@@ -1839,10 +2020,16 @@ mod tests {
         let changed = integrity_check(&mut s);
         assert!(changed);
         if let TabConfig::AiTool(c) = &s.tabs[0] {
-            assert!(!c.use_local_provider, "claude must have use_local_provider=false");
+            assert!(
+                !c.use_local_provider,
+                "claude must have use_local_provider=false"
+            );
         }
         if let TabConfig::AiTool(c) = &s.tabs[1] {
-            assert!(c.use_local_provider, "claude-local must have use_local_provider=true");
+            assert!(
+                c.use_local_provider,
+                "claude-local must have use_local_provider=true"
+            );
         }
     }
 
@@ -1852,13 +2039,21 @@ mod tests {
         s.enabled_ai_tabs = vec![AiTabId::OpenCode];
         integrity_check(&mut s);
         // Tamper: opencode → local (it has no local variant; canonical is false).
-        if let TabConfig::AiTool(c) = s.tabs.iter_mut().find(|t| t.id() == OPENCODE_TAB_ID).unwrap() {
+        if let TabConfig::AiTool(c) = s
+            .tabs
+            .iter_mut()
+            .find(|t| t.id() == OPENCODE_TAB_ID)
+            .unwrap()
+        {
             c.use_local_provider = true;
         }
         let changed = integrity_check(&mut s);
         assert!(changed);
         if let TabConfig::AiTool(c) = s.tabs.iter().find(|t| t.id() == OPENCODE_TAB_ID).unwrap() {
-            assert!(!c.use_local_provider, "opencode must have use_local_provider=false");
+            assert!(
+                !c.use_local_provider,
+                "opencode must have use_local_provider=false"
+            );
         }
     }
 
@@ -1971,7 +2166,10 @@ mod tests {
         let delta = diff(&c_value, &g_value).expect("non-empty diff");
 
         // The delta should be tiny — just the ui.theme branch.
-        assert_eq!(delta, serde_json::json!({ "ui": { "theme": "future-light" } }));
+        assert_eq!(
+            delta,
+            serde_json::json!({ "ui": { "theme": "future-light" } })
+        );
 
         // Reverse: apply delta to global, deserialize, confirm we get
         // `customized` back.
@@ -1983,8 +2181,7 @@ mod tests {
 
     #[test]
     fn stamp_avatar_paths_uses_files_present_in_dir() {
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp_avatars_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
         // Stage two of the five state videos plus the transition; the
@@ -1998,26 +2195,42 @@ mod tests {
         // at the embedded `/avatar/...` URL.
         assert!(s.avatar.images.idle.is_none());
         assert_eq!(
-            s.avatar.transition.path.as_deref().map(|p| p.to_string_lossy().to_string()),
+            s.avatar
+                .transition
+                .path
+                .as_deref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("/avatar/Transition.mp4".to_string())
         );
 
         stamp_avatar_paths_from(&mut s, &dir);
 
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(dir.join("Idle.mp4").as_path()));
-        assert_eq!(s.avatar.images.speaking.as_deref(), Some(dir.join("Speaking.mp4").as_path()));
-        assert!(s.avatar.images.listening.is_none(), "missing files should not be stamped");
+        assert_eq!(
+            s.avatar.images.idle.as_deref(),
+            Some(dir.join("Idle.mp4").as_path())
+        );
+        assert_eq!(
+            s.avatar.images.speaking.as_deref(),
+            Some(dir.join("Speaking.mp4").as_path())
+        );
+        assert!(
+            s.avatar.images.listening.is_none(),
+            "missing files should not be stamped"
+        );
         assert!(s.avatar.images.thinking.is_none());
         assert!(s.avatar.images.error.is_none());
-        assert_eq!(s.avatar.transition.path.as_deref(), Some(dir.join("Transition.mp4").as_path()));
+        assert_eq!(
+            s.avatar.transition.path.as_deref(),
+            Some(dir.join("Transition.mp4").as_path())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stamp_avatar_paths_prefers_theme_subfolder() {
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_themed_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("cimp_avatars_themed_{}", uuid::Uuid::new_v4()));
         let modern = dir.join("modern-dark");
         let tui_yellow = dir.join("tui-yellow");
         fs::create_dir_all(&modern).unwrap();
@@ -2034,7 +2247,10 @@ mod tests {
         s.ui.theme = "tui-yellow".to_string();
         stamp_avatar_paths_from(&mut s, &dir);
 
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(tui_yellow.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.images.idle.as_deref(),
+            Some(tui_yellow.join("Idle.mp4").as_path())
+        );
         assert_eq!(
             s.avatar.images.speaking.as_deref(),
             Some(tui_yellow.join("Speaking.mp4").as_path()),
@@ -2061,8 +2277,7 @@ mod tests {
         // Legacy zips (pre per-theme split) staged the videos at the top
         // of `avatars/`. Verify those still get picked up when the active
         // theme's subfolder is missing.
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_flat_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp_avatars_flat_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         for f in ["Idle.mp4", "Transition.mp4"] {
             fs::write(dir.join(f), b"").unwrap();
@@ -2072,7 +2287,10 @@ mod tests {
         s.ui.theme = "tui-yellow".to_string(); // tui-yellow/ subfolder does not exist
         stamp_avatar_paths_from(&mut s, &dir);
 
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(dir.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.images.idle.as_deref(),
+            Some(dir.join("Idle.mp4").as_path())
+        );
         assert_eq!(
             s.avatar.transition.path.as_deref(),
             Some(dir.join("Transition.mp4").as_path()),
@@ -2083,8 +2301,7 @@ mod tests {
 
     #[test]
     fn stamp_avatar_paths_noop_when_dir_empty() {
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_empty_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp_avatars_empty_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
         let mut s = Settings::default();
@@ -2103,15 +2320,13 @@ mod tests {
 
     #[test]
     fn stamp_avatar_paths_preserves_user_override_outside_dir() {
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_ovr_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp_avatars_ovr_{}", uuid::Uuid::new_v4()));
         let theme = dir.join("tui-yellow");
         fs::create_dir_all(&theme).unwrap();
         fs::write(theme.join("Idle.mp4"), b"").unwrap();
 
         // A genuine override the user picked from elsewhere on disk.
-        let custom = std::env::temp_dir()
-            .join(format!("cimp_custom_{}.mp4", uuid::Uuid::new_v4()));
+        let custom = std::env::temp_dir().join(format!("cimp_custom_{}.mp4", uuid::Uuid::new_v4()));
         fs::write(&custom, b"").unwrap();
 
         let mut s = Settings::default();
@@ -2128,8 +2343,8 @@ mod tests {
 
     #[test]
     fn stamp_avatar_paths_repoints_on_theme_switch() {
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_switch_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("cimp_avatars_switch_{}", uuid::Uuid::new_v4()));
         let yellow = dir.join("tui-yellow");
         let purple = dir.join("tui-purple");
         fs::create_dir_all(&yellow).unwrap();
@@ -2140,21 +2355,26 @@ mod tests {
         let mut s = Settings::default();
         s.ui.theme = "tui-yellow".to_string();
         stamp_avatar_paths_from(&mut s, &dir);
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(yellow.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.images.idle.as_deref(),
+            Some(yellow.join("Idle.mp4").as_path())
+        );
 
         // The previously-stamped path (inside `dir`) is re-pointed to the new
         // theme, NOT mistaken for a user override. This is the actual bug fix.
         s.ui.theme = "tui-purple".to_string();
         stamp_avatar_paths_from(&mut s, &dir);
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(purple.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.images.idle.as_deref(),
+            Some(purple.join("Idle.mp4").as_path())
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stamp_avatar_paths_resets_when_new_theme_has_no_files() {
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_avatars_reset_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp_avatars_reset_{}", uuid::Uuid::new_v4()));
         let yellow = dir.join("tui-yellow");
         fs::create_dir_all(&yellow).unwrap();
         fs::write(yellow.join("Idle.mp4"), b"").unwrap();
@@ -2163,7 +2383,10 @@ mod tests {
         let mut s = Settings::default();
         s.ui.theme = "tui-yellow".to_string();
         stamp_avatar_paths_from(&mut s, &dir);
-        assert_eq!(s.avatar.images.idle.as_deref(), Some(yellow.join("Idle.mp4").as_path()));
+        assert_eq!(
+            s.avatar.images.idle.as_deref(),
+            Some(yellow.join("Idle.mp4").as_path())
+        );
         assert_eq!(
             s.avatar.transition.path.as_deref(),
             Some(yellow.join("Transition.mp4").as_path()),
@@ -2177,7 +2400,11 @@ mod tests {
         stamp_avatar_paths_from(&mut s, &dir);
         assert!(s.avatar.images.idle.is_none());
         assert_eq!(
-            s.avatar.transition.path.as_deref().map(|p| p.to_string_lossy().to_string()),
+            s.avatar
+                .transition
+                .path
+                .as_deref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("/avatar/Transition.mp4".to_string())
         );
 
@@ -2192,8 +2419,7 @@ mod tests {
 
         // Use a unique subdir under the system temp root so parallel test
         // runs don't collide. Cleaned up at the end of the test.
-        let dir = std::env::temp_dir()
-            .join(format!("cimp_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cimp_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         // The overlay now lives inside the project's `.cimp/` dir.
         let overlay = custom_path(&dir);
@@ -2205,7 +2431,10 @@ mod tests {
         assert!(overlay.exists());
         let text = fs::read_to_string(&overlay).unwrap();
         let parsed: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed, serde_json::json!({ "ui": { "theme": "future-light" } }));
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "ui": { "theme": "future-light" } })
+        );
 
         // Reverted to identical: should remove the overlay.
         save(&global, &dir, &global).unwrap();
@@ -2224,7 +2453,8 @@ mod tests {
         let mut global = Settings::default();
         integrity_check(&mut global);
 
-        let dir = std::env::temp_dir().join(format!("cimp_checks_dismiss_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("cimp_checks_dismiss_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let overlay = custom_path(&dir);
 
@@ -2235,7 +2465,10 @@ mod tests {
 
         // The diff carries both fields (they differ from the default baseline).
         let text = fs::read_to_string(&overlay).unwrap();
-        assert!(text.contains("checks_suggestion_dismissed"), "overlay: {text}");
+        assert!(
+            text.contains("checks_suggestion_dismissed"),
+            "overlay: {text}"
+        );
         assert!(text.contains("checks_auto_configure"), "overlay: {text}");
 
         // Reconstitute: merge the overlay back onto the default baseline.
@@ -2243,7 +2476,10 @@ mod tests {
         let overlay_val: Value = serde_json::from_str(&text).unwrap();
         deep_merge(&mut merged, overlay_val);
         let loaded: Settings = serde_json::from_value(merged).unwrap();
-        assert!(loaded.checks_suggestion_dismissed, "dismissal survives a save→merge roundtrip");
+        assert!(
+            loaded.checks_suggestion_dismissed,
+            "dismissal survives a save→merge roundtrip"
+        );
         assert!(loaded.checks_auto_configure);
 
         // A config predating Phase D (neither key) defaults both to false.
@@ -2287,8 +2523,14 @@ mod tests {
         migrate_legacy_overlay(&dir);
 
         let canonical = dir.join(".cimp").join("config.json");
-        assert!(canonical.exists(), "legacy overlay should be moved into .cimp/");
-        assert!(!legacy.exists(), "legacy overlay should be gone after the move");
+        assert!(
+            canonical.exists(),
+            "legacy overlay should be moved into .cimp/"
+        );
+        assert!(
+            !legacy.exists(),
+            "legacy overlay should be gone after the move"
+        );
         assert_eq!(
             fs::read_to_string(&canonical).unwrap(),
             r#"{"ui":{"theme":"future-light"}}"#
@@ -2339,8 +2581,14 @@ mod tests {
         // though the list is now empty again.
         s.prompt_templates.clear();
         let seeded_second = seed_prompt_templates_if_needed(&mut s);
-        assert!(!seeded_second, "seeding must not re-fire once templates_seeded is true");
-        assert!(s.prompt_templates.is_empty(), "deleted starters must stay deleted");
+        assert!(
+            !seeded_second,
+            "seeding must not re-fire once templates_seeded is true"
+        );
+        assert!(
+            s.prompt_templates.is_empty(),
+            "deleted starters must stay deleted"
+        );
     }
 
     #[test]
@@ -2350,8 +2598,14 @@ mod tests {
         let path = dir.join("settings.json");
 
         let templates = vec![
-            PromptTemplate { name: "a".to_string(), body: "body-a".to_string() },
-            PromptTemplate { name: "b".to_string(), body: "body-b".to_string() },
+            PromptTemplate {
+                name: "a".to_string(),
+                body: "body-a".to_string(),
+            },
+            PromptTemplate {
+                name: "b".to_string(),
+                body: "body-b".to_string(),
+            },
         ];
         write_prompt_templates_to(&path, templates.clone()).unwrap();
 
@@ -2381,12 +2635,18 @@ mod tests {
 
         write_prompt_templates_to(
             &path,
-            vec![PromptTemplate { name: "a".to_string(), body: "x".to_string() }],
+            vec![PromptTemplate {
+                name: "a".to_string(),
+                body: "x".to_string(),
+            }],
         )
         .unwrap();
 
         let after: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after.ui.theme, "future-light", "unrelated field must survive the R-M-W");
+        assert_eq!(
+            after.ui.theme, "future-light",
+            "unrelated field must survive the R-M-W"
+        );
         assert_eq!(after.prompt_templates.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
@@ -2425,7 +2685,8 @@ mod tests {
 
     #[test]
     fn write_global_llm_pricing_preserves_other_fields() {
-        let dir = std::env::temp_dir().join(format!("cimp_price_preserve_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("cimp_price_preserve_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
 
@@ -2436,7 +2697,10 @@ mod tests {
         write_llm_pricing_to(&path, Vec::new()).unwrap();
 
         let after: Settings = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after.ui.theme, "future-light", "unrelated field must survive the R-M-W");
+        assert_eq!(
+            after.ui.theme, "future-light",
+            "unrelated field must survive the R-M-W"
+        );
         assert!(after.llm_pricing.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
@@ -2463,7 +2727,8 @@ mod tests {
 
     #[test]
     fn read_project_prompt_templates_empty_when_overlay_absent_or_key_missing() {
-        let dir = std::env::temp_dir().join(format!("cimp_tpl_project_absent_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("cimp_tpl_project_absent_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         // No overlay file at all.
         assert!(read_project_prompt_templates(&dir).is_empty());

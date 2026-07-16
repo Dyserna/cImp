@@ -29,7 +29,10 @@ use crate::state::TabId;
 /// a tokio worker. Per-tab ordering is preserved because the channel is FIFO and
 /// a single thread drains it.
 enum Msg {
-    Write { key: String, bytes: Vec<u8> },
+    Write {
+        key: String,
+        bytes: Vec<u8>,
+    },
     /// Drop every open appender and acknowledge — used before deleting files
     /// (Windows can't unlink a file with a live handle).
     DropAll(Sender<()>),
@@ -62,9 +65,9 @@ fn writer_loop(rx: Receiver<Msg>) {
                     // filename prefix on each rotation, e.g. `claude.log.2026-05-08`.
                     tracing_appender::rolling::daily(&dir, format!("{key}.log"))
                 });
-                let _ = writer
-                    .write_all(&bytes)
-                    .inspect_err(|e| tracing::warn!(tab = %key, error = %e, "content capture: write failed"));
+                let _ = writer.write_all(&bytes).inspect_err(
+                    |e| tracing::warn!(tab = %key, error = %e, "content capture: write failed"),
+                );
             }
             Msg::DropAll(ack) => {
                 writers.clear();
@@ -129,7 +132,10 @@ pub fn write(tab: &TabId, bytes: &[u8]) {
     // Hand the bytes to the dedicated writer thread. `send` on an unbounded
     // channel never blocks (and only errors if the thread died), so the PTY
     // hot path stays off the disk entirely.
-    let _ = cap.tx.send(Msg::Write { key, bytes: bytes.to_vec() });
+    let _ = cap.tx.send(Msg::Write {
+        key,
+        bytes: bytes.to_vec(),
+    });
 }
 
 /// Sanitize a tab id for use as a filename. Tab ids are already

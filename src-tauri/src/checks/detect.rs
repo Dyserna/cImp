@@ -300,7 +300,14 @@ pub fn detect_with(
     let markers = scan_markers(root);
     let mut out = Vec::new();
 
-    for eco in [Eco::Rust, Eco::TsJs, Eco::Go, Eco::Python, Eco::Dotnet, Eco::Jvm] {
+    for eco in [
+        Eco::Rust,
+        Eco::TsJs,
+        Eco::Go,
+        Eco::Python,
+        Eco::Dotnet,
+        Eco::Jvm,
+    ] {
         let graph_note = graph_note_for(eco, lang_stats);
         for cand in presets_for(eco, &markers) {
             let mut evidence = cand.evidence;
@@ -322,7 +329,14 @@ pub fn detect_with(
     // has no marker (a manifest deeper than the walk, or simply absent at the
     // top) can't be wired to a runnable command — surface it greyed so the user
     // knows it was seen and can configure it by hand, rather than dropping it.
-    for eco in [Eco::Rust, Eco::TsJs, Eco::Go, Eco::Python, Eco::Dotnet, Eco::Jvm] {
+    for eco in [
+        Eco::Rust,
+        Eco::TsJs,
+        Eco::Go,
+        Eco::Python,
+        Eco::Dotnet,
+        Eco::Jvm,
+    ] {
         if eco_has_anchor(eco, &markers) {
             continue; // already produced marker-driven proposals above
         }
@@ -438,7 +452,15 @@ fn presets_for(eco: Eco, m: &Markers) -> Vec<Candidate> {
         Eco::Go => {
             if m.go_anchor.is_some() {
                 let cwd = anchor_cwd(&m.go_anchor);
-                v.push(cand("go-vet", "go vet ./...", ParserKind::Go, 300, cwd.clone(), "go", "go.mod"));
+                v.push(cand(
+                    "go-vet",
+                    "go vet ./...",
+                    ParserKind::Go,
+                    300,
+                    cwd.clone(),
+                    "go",
+                    "go.mod",
+                ));
                 v.push(cand(
                     "go-test",
                     "go test -json ./...",
@@ -464,7 +486,15 @@ fn presets_for(eco: Eco, m: &Markers) -> Vec<Candidate> {
                 ));
             }
             if m.pytest {
-                v.push(cand("pytest", "pytest -q", ParserKind::Pytest, 600, cwd, "pytest", "pytest/tests"));
+                v.push(cand(
+                    "pytest",
+                    "pytest -q",
+                    ParserKind::Pytest,
+                    600,
+                    cwd,
+                    "pytest",
+                    "pytest/tests",
+                ));
             }
         }
         Eco::Dotnet => {
@@ -612,13 +642,78 @@ fn primary_lang(eco: Eco) -> &'static str {
 /// The single representative check used for a greyed graph-only proposal.
 fn eco_primary_check(eco: Eco) -> CheckDef {
     match eco {
-        Eco::Rust => cand("cargo-check", "cargo check --message-format=json", ParserKind::CargoJson, 300, None, "cargo", "").check,
-        Eco::TsJs => cand("tsc", "tsc --noEmit --pretty false", ParserKind::Tsc, 300, None, "tsc", "").check,
-        Eco::Go => cand("go-vet", "go vet ./...", ParserKind::Go, 300, None, "go", "").check,
-        Eco::Python => cand("pytest", "pytest -q", ParserKind::Pytest, 600, None, "pytest", "").check,
-        Eco::Dotnet => cand("dotnet-build", "dotnet build --nologo", ParserKind::Dotnet, 600, None, "dotnet", "").check,
+        Eco::Rust => {
+            cand(
+                "cargo-check",
+                "cargo check --message-format=json",
+                ParserKind::CargoJson,
+                300,
+                None,
+                "cargo",
+                "",
+            )
+            .check
+        }
+        Eco::TsJs => {
+            cand(
+                "tsc",
+                "tsc --noEmit --pretty false",
+                ParserKind::Tsc,
+                300,
+                None,
+                "tsc",
+                "",
+            )
+            .check
+        }
+        Eco::Go => {
+            cand(
+                "go-vet",
+                "go vet ./...",
+                ParserKind::Go,
+                300,
+                None,
+                "go",
+                "",
+            )
+            .check
+        }
+        Eco::Python => {
+            cand(
+                "pytest",
+                "pytest -q",
+                ParserKind::Pytest,
+                600,
+                None,
+                "pytest",
+                "",
+            )
+            .check
+        }
+        Eco::Dotnet => {
+            cand(
+                "dotnet-build",
+                "dotnet build --nologo",
+                ParserKind::Dotnet,
+                600,
+                None,
+                "dotnet",
+                "",
+            )
+            .check
+        }
         Eco::Jvm => {
-            cand_report("mvn-test", "mvn -q test", ParserKind::JunitXml, 900, None, "target/surefire-reports", "mvn", "").check
+            cand_report(
+                "mvn-test",
+                "mvn -q test",
+                ParserKind::JunitXml,
+                900,
+                None,
+                "target/surefire-reports",
+                "mvn",
+                "",
+            )
+            .check
         }
     }
 }
@@ -707,7 +802,11 @@ mod tests {
         let props = detect_with(&fx.root, &[], &all_present);
 
         let check = find(&props, "cargo-check").expect("cargo-check proposed");
-        assert_eq!(check.check.cwd.as_deref(), Some("src-tauri"), "nested cwd points at the manifest dir");
+        assert_eq!(
+            check.check.cwd.as_deref(),
+            Some("src-tauri"),
+            "nested cwd points at the manifest dir"
+        );
         assert_eq!(check.check.parser, ParserKind::CargoJson);
         assert!(check.valid);
         assert!(check.check.auto, "detected entries are marked auto");
@@ -730,8 +829,14 @@ mod tests {
         let fx = Fixture::new();
         fx.file("package.json", "{}").file("tsconfig.json", "{}");
         let props = detect_with(&fx.root, &[], &all_present);
-        assert!(find(&props, "tsc").is_some(), "tsc proposed when tsconfig present");
-        assert!(find(&props, "eslint").is_none(), "eslint NOT proposed without an eslint config");
+        assert!(
+            find(&props, "tsc").is_some(),
+            "tsc proposed when tsconfig present"
+        );
+        assert!(
+            find(&props, "eslint").is_none(),
+            "eslint NOT proposed without an eslint config"
+        );
         assert!(find(&props, "jest").is_none() && find(&props, "vitest").is_none());
     }
 
@@ -744,10 +849,16 @@ mod tests {
             .file("vitest.config.ts", "export default {}");
         let props = detect_with(&fx.root, &[], &all_present);
         assert!(find(&props, "tsc").is_some());
-        assert!(find(&props, "eslint").is_some(), "eslint proposed when config present");
+        assert!(
+            find(&props, "eslint").is_some(),
+            "eslint proposed when config present"
+        );
         let vitest = find(&props, "vitest").expect("vitest proposed on vitest.config");
         assert_eq!(vitest.check.parser, ParserKind::JestJson);
-        assert!(find(&props, "jest").is_none(), "vitest wins over jest when both/only-vitest present");
+        assert!(
+            find(&props, "jest").is_none(),
+            "vitest wins over jest when both/only-vitest present"
+        );
     }
 
     #[test]
@@ -771,7 +882,10 @@ mod tests {
         let props = detect_with(&fx.root, &[], &all_present);
         let ruff = find(&props, "ruff").expect("ruff proposed when [tool.ruff] present");
         assert_eq!(ruff.check.parser, ParserKind::Sarif);
-        assert!(find(&props, "pytest").is_some(), "pytest proposed from [tool.pytest]");
+        assert!(
+            find(&props, "pytest").is_some(),
+            "pytest proposed from [tool.pytest]"
+        );
     }
 
     #[test]
@@ -780,8 +894,14 @@ mod tests {
         fx.file("pyproject.toml", "[project]\nname = \"x\"\n");
         fx.file("tests/test_x.py", "def test_x():\n    assert True\n");
         let props = detect_with(&fx.root, &[], &all_present);
-        assert!(find(&props, "ruff").is_none(), "no ruff config ⇒ no ruff proposal");
-        assert!(find(&props, "pytest").is_some(), "a tests/ dir triggers pytest");
+        assert!(
+            find(&props, "ruff").is_none(),
+            "no ruff config ⇒ no ruff proposal"
+        );
+        assert!(
+            find(&props, "pytest").is_some(),
+            "a tests/ dir triggers pytest"
+        );
     }
 
     #[test]
@@ -791,7 +911,10 @@ mod tests {
         let props = detect_with(&fx.root, &[], &all_present);
         let mvn = find(&props, "mvn-test").expect("mvn test proposed");
         assert_eq!(mvn.check.parser, ParserKind::JunitXml);
-        assert_eq!(mvn.check.report_file.as_deref(), Some("target/surefire-reports"));
+        assert_eq!(
+            mvn.check.report_file.as_deref(),
+            Some("target/surefire-reports")
+        );
     }
 
     #[test]
@@ -806,14 +929,22 @@ mod tests {
         fx.file("backend/pom.xml", "<project></project>");
         let props = detect_with(&fx.root, &[], &all_present);
         let mvn = find(&props, "mvn-test").expect("mvn test proposed for nested module");
-        assert_eq!(mvn.check.cwd.as_deref(), Some("backend"), "cwd anchors to the nested module dir");
+        assert_eq!(
+            mvn.check.cwd.as_deref(),
+            Some("backend"),
+            "cwd anchors to the nested module dir"
+        );
         assert_eq!(
             mvn.check.report_file.as_deref(),
             Some("target/surefire-reports"),
             "report_file stays cwd-relative (unprefixed), not root-prefixed"
         );
         // Effective (cwd-joined) location is the module's own report dir.
-        let effective = format!("{}/{}", mvn.check.cwd.as_deref().unwrap(), mvn.check.report_file.as_deref().unwrap());
+        let effective = format!(
+            "{}/{}",
+            mvn.check.cwd.as_deref().unwrap(),
+            mvn.check.report_file.as_deref().unwrap()
+        );
         assert_eq!(effective, "backend/target/surefire-reports");
     }
 
@@ -844,20 +975,38 @@ mod tests {
         let fx = Fixture::new();
         fx.file("src-tauri/Cargo.toml", "[package]\nname=\"x\"\n");
         let stats = vec![
-            LangStat { lang: "rust".into(), files: 812 },
-            LangStat { lang: "go".into(), files: 3 },
+            LangStat {
+                lang: "rust".into(),
+                files: 812,
+            },
+            LangStat {
+                lang: "go".into(),
+                files: 3,
+            },
         ];
         let props = detect_with(&fx.root, &stats, &all_present);
 
         // Rust proposal (marker-driven) carries the graph corroboration.
         let cargo = find(&props, "cargo-check").expect("cargo-check");
-        assert!(cargo.evidence.contains("Cargo.toml"), "marker in evidence: {}", cargo.evidence);
-        assert!(cargo.evidence.contains("812 rust files"), "graph note in evidence: {}", cargo.evidence);
+        assert!(
+            cargo.evidence.contains("Cargo.toml"),
+            "marker in evidence: {}",
+            cargo.evidence
+        );
+        assert!(
+            cargo.evidence.contains("812 rust files"),
+            "graph note in evidence: {}",
+            cargo.evidence
+        );
 
         // Go is in the graph but has no go.mod ⇒ a greyed, graph-only proposal.
         let go = find(&props, "go-vet").expect("greyed go proposal from graph stats");
         assert!(!go.valid);
-        assert!(go.reason.as_deref().unwrap().contains("go.mod"), "reason: {:?}", go.reason);
+        assert!(
+            go.reason.as_deref().unwrap().contains("go.mod"),
+            "reason: {:?}",
+            go.reason
+        );
     }
 
     #[test]
@@ -867,7 +1016,10 @@ mod tests {
         let props = detect_with(&fx.root, &[], &all_present);
         // Same marker-driven proposals, and no greyed graph-only entries.
         assert!(find(&props, "cargo-check").is_some());
-        assert!(!props.iter().any(|p| p.evidence.contains("code graph")), "no graph annotation without stats");
+        assert!(
+            !props.iter().any(|p| p.evidence.contains("code graph")),
+            "no graph annotation without stats"
+        );
         // No proposal for an ecosystem with neither marker nor graph.
         assert!(find(&props, "go-vet").is_none());
     }
@@ -879,7 +1031,10 @@ mod tests {
         fx.file("node_modules/dep/Cargo.toml", "[package]\nname=\"dep\"\n");
         fx.file("target/foo/go.mod", "module junk\n");
         let props = detect_with(&fx.root, &[], &all_present);
-        assert!(find(&props, "cargo-check").is_none(), "node_modules manifest ignored");
+        assert!(
+            find(&props, "cargo-check").is_none(),
+            "node_modules manifest ignored"
+        );
         assert!(find(&props, "go-vet").is_none(), "target manifest ignored");
     }
 
@@ -887,8 +1042,16 @@ mod tests {
     fn merge_appends_new_and_is_idempotent() {
         let mut existing: Vec<CheckDef> = Vec::new();
         let incoming = vec![
-            CheckDef { name: "cargo-check".into(), auto: true, ..Default::default() },
-            CheckDef { name: "cargo-test".into(), auto: true, ..Default::default() },
+            CheckDef {
+                name: "cargo-check".into(),
+                auto: true,
+                ..Default::default()
+            },
+            CheckDef {
+                name: "cargo-test".into(),
+                auto: true,
+                ..Default::default()
+            },
         ];
         let applied = merge_auto(&mut existing, incoming.clone());
         assert_eq!(applied.len(), 2);
@@ -903,13 +1066,31 @@ mod tests {
     fn merge_never_overwrites_a_user_entry_but_updates_auto() {
         let mut existing = vec![
             // User-authored (or user-edited): auto == false, custom cmd.
-            CheckDef { name: "cargo-check".into(), cmd: "cargo clippy".into(), auto: false, ..Default::default() },
+            CheckDef {
+                name: "cargo-check".into(),
+                cmd: "cargo clippy".into(),
+                auto: false,
+                ..Default::default()
+            },
             // Machine-authored earlier: auto == true.
-            CheckDef { name: "cargo-test".into(), cmd: "cargo test --old".into(), auto: true, ..Default::default() },
+            CheckDef {
+                name: "cargo-test".into(),
+                cmd: "cargo test --old".into(),
+                auto: true,
+                ..Default::default()
+            },
         ];
         let incoming = vec![
-            CheckDef { name: "cargo-check".into(), cmd: "cargo check".into(), ..Default::default() },
-            CheckDef { name: "cargo-test".into(), cmd: "cargo test".into(), ..Default::default() },
+            CheckDef {
+                name: "cargo-check".into(),
+                cmd: "cargo check".into(),
+                ..Default::default()
+            },
+            CheckDef {
+                name: "cargo-test".into(),
+                cmd: "cargo test".into(),
+                ..Default::default()
+            },
         ];
         let applied = merge_auto(&mut existing, incoming);
         // The user entry was preserved; only the auto one updated.

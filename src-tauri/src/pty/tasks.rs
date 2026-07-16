@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use super::manager::ProcessorControl;
 use crate::processing::permission::{
     PatternKind, PatternTransition, PermissionDetector, PermissionPattern,
 };
 use crate::processing::{ProcessingEvent, ProcessingLayer};
-use super::manager::ProcessorControl;
 use crate::settings::SettingsHandle;
 use crate::state::{StateSignal, TabId, TabKind};
 
@@ -126,10 +126,12 @@ pub fn spawn_reader(
                     if tracing::enabled!(target: "pty_in", tracing::Level::DEBUG) {
                         let pretty: String = String::from_utf8_lossy(&buf[..n])
                             .chars()
-                            .map(|c| if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-                                format!("\\x{:02x}", c as u32)
-                            } else {
-                                c.to_string()
+                            .map(|c| {
+                                if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                                    format!("\\x{:02x}", c as u32)
+                                } else {
+                                    c.to_string()
+                                }
                             })
                             .collect();
                         debug!(target: "pty_in", len = n, bytes = %pretty);
@@ -471,22 +473,34 @@ fn run_permission_check(
     }
     for transition in detector.check(&rendered) {
         match transition {
-            PatternTransition::Detected { kind: PatternKind::Permission, pattern_name } => {
+            PatternTransition::Detected {
+                kind: PatternKind::Permission,
+                pattern_name,
+            } => {
                 debug!(?tab, pattern = pattern_name, "permission prompt detected");
                 let _ = state_signals
                     .try_send(StateSignal::PermissionPromptDetected { tab: tab.clone() });
             }
-            PatternTransition::Resolved { kind: PatternKind::Permission, pattern_name } => {
+            PatternTransition::Resolved {
+                kind: PatternKind::Permission,
+                pattern_name,
+            } => {
                 debug!(?tab, pattern = pattern_name, "permission prompt resolved");
                 let _ = state_signals
                     .try_send(StateSignal::PermissionPromptResolved { tab: tab.clone() });
             }
-            PatternTransition::Detected { kind: PatternKind::Question, pattern_name } => {
+            PatternTransition::Detected {
+                kind: PatternKind::Question,
+                pattern_name,
+            } => {
                 debug!(?tab, pattern = pattern_name, "question prompt detected");
                 let _ = state_signals
                     .try_send(StateSignal::QuestionPromptDetected { tab: tab.clone() });
             }
-            PatternTransition::Resolved { kind: PatternKind::Question, pattern_name } => {
+            PatternTransition::Resolved {
+                kind: PatternKind::Question,
+                pattern_name,
+            } => {
                 debug!(?tab, pattern = pattern_name, "question prompt resolved");
                 let _ = state_signals
                     .try_send(StateSignal::QuestionPromptResolved { tab: tab.clone() });
@@ -494,11 +508,17 @@ fn run_permission_check(
             // Working transitions don't emit directly — they update the
             // marker level the activity block reads to drive ClaudeOutput
             // Started/Stopped (content-first, byte timers as fallback).
-            PatternTransition::Detected { kind: PatternKind::Working, pattern_name } => {
+            PatternTransition::Detected {
+                kind: PatternKind::Working,
+                pattern_name,
+            } => {
                 debug!(?tab, pattern = pattern_name, "claude working detected");
                 *working_active = true;
             }
-            PatternTransition::Resolved { kind: PatternKind::Working, pattern_name } => {
+            PatternTransition::Resolved {
+                kind: PatternKind::Working,
+                pattern_name,
+            } => {
                 debug!(?tab, pattern = pattern_name, "claude working resolved");
                 *working_active = false;
             }
@@ -519,10 +539,12 @@ async fn dispatch_events(
                 if tracing::enabled!(target: "pty_emit", tracing::Level::DEBUG) {
                     let pretty: String = String::from_utf8_lossy(&bytes)
                         .chars()
-                        .map(|c| if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-                            format!("\\x{:02x}", c as u32)
-                        } else {
-                            c.to_string()
+                        .map(|c| {
+                            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                                format!("\\x{:02x}", c as u32)
+                            } else {
+                                c.to_string()
+                            }
                         })
                         .collect();
                     debug!(target: "pty_emit", len = bytes.len(), bytes = %pretty);
@@ -591,7 +613,10 @@ pub fn spawn_waiter(
         // frontend desynced about whether the tab's child is alive. We're on
         // the blocking pool here (can't await), so use blocking_send to apply
         // backpressure instead of try_send's silent drop on a full channel.
-        let _ = state_signals.blocking_send(StateSignal::SubprocessExited { tab: tab.clone(), code });
+        let _ = state_signals.blocking_send(StateSignal::SubprocessExited {
+            tab: tab.clone(),
+            code,
+        });
         if let Err(e) = app.emit(
             "pty-exit",
             PtyExitPayload {
@@ -637,12 +662,12 @@ mod tests {
     fn sustained_marker_absence_releases() {
         // Marker gone past the grace window and the stream is quiet — Claude is
         // genuinely done. Release to Idle.
-        let (release, stale) = should_release_idle(
-            Some(ms(600)),
-            Some(CLAUDE_MARKER_GRACE + ms(1)),
-            false,
+        let (release, stale) =
+            should_release_idle(Some(ms(600)), Some(CLAUDE_MARKER_GRACE + ms(1)), false);
+        assert!(
+            release,
+            "marker gone past grace + quiet must settle to Idle"
         );
-        assert!(release, "marker gone past grace + quiet must settle to Idle");
         assert!(!stale);
     }
 
@@ -650,12 +675,12 @@ mod tests {
     fn grace_gates_release_even_when_quiet() {
         // Quiet threshold is met but the marker vanished only just now. The
         // grace gate must still block the release.
-        let (release, _) = should_release_idle(
-            Some(CLAUDE_WORKING_STALE - ms(1)),
-            Some(ms(10)),
-            false,
+        let (release, _) =
+            should_release_idle(Some(CLAUDE_WORKING_STALE - ms(1)), Some(ms(10)), false);
+        assert!(
+            !release,
+            "grace must gate release until the marker is gone long enough"
         );
-        assert!(!release, "grace must gate release until the marker is gone long enough");
     }
 
     #[test]
@@ -681,12 +706,11 @@ mod tests {
         // The marker is somehow still matched (ghost footer) but bytes have
         // been silent past the stale window — the safety valve releases and
         // flags stale so the caller force-clears the latched Working state.
-        let (release, stale) = should_release_idle(
-            Some(CLAUDE_WORKING_STALE),
-            Some(ms(0)),
-            true,
+        let (release, stale) = should_release_idle(Some(CLAUDE_WORKING_STALE), Some(ms(0)), true);
+        assert!(
+            release,
+            "stale window must release even with the marker active"
         );
-        assert!(release, "stale window must release even with the marker active");
         assert!(stale, "stale flag must be set so the caller clears Working");
     }
 

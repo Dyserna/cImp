@@ -35,9 +35,18 @@ pub fn run() {
         Err(_) => return,
     };
     let tool_name = v.get("tool_name").and_then(|t| t.as_str());
-    let tool_input = v.get("tool_input").cloned().unwrap_or(serde_json::Value::Null);
-    let file_path = tool_input.get("file_path").and_then(|p| p.as_str()).unwrap_or("");
-    let command = tool_input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+    let tool_input = v
+        .get("tool_input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let file_path = tool_input
+        .get("file_path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let command = tool_input
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
     let session_id = v.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
     let cwd_raw = v.get("cwd").and_then(|s| s.as_str()).unwrap_or("");
     // V16 Feature 3 / V17 Phase B: payload-shape drift report, before every
@@ -46,7 +55,9 @@ pub fn run() {
     // tool is Read/unknown, `tool_input.command`'s when the tool is Bash) counts.
     report_contract_drift(
         "read_hook",
-        &missing_fields(&contract_checks(tool_name, session_id, cwd_raw, file_path, command)),
+        &missing_fields(&contract_checks(
+            tool_name, session_id, cwd_raw, file_path, command,
+        )),
         session_id,
     );
 
@@ -54,7 +65,9 @@ pub fn run() {
     // Map the payload to a verdict request, or let the tool proceed untouched
     // (non-target tool, empty path, or a Bash command that isn't a provable
     // whole-file read).
-    let Some(reqst) = plan_request(tool_name, &tool_input, &cwd) else { return };
+    let Some(reqst) = plan_request(tool_name, &tool_input, &cwd) else {
+        return;
+    };
 
     let body = serde_json::json!({
         "cwd": cwd,
@@ -68,7 +81,9 @@ pub fn run() {
     // `post_loopback` returns the response's `text` field, which the route only
     // sets for a `remind` verdict — so `Some(text)` means "deny with content",
     // and `None` (pass / error) means "let the read proceed".
-    let Some(text) = post_loopback("/context/should_read", &body) else { return };
+    let Some(text) = post_loopback("/context/should_read", &body) else {
+        return;
+    };
     if text.trim().is_empty() {
         return;
     }
@@ -117,8 +132,14 @@ fn contract_checks(
         ("session_id", !session_id.is_empty()),
         ("cwd", !cwd_raw.is_empty()),
         ("tool_name", tool_name.is_some()),
-        ("tool_input.file_path", tool_name.is_some_and(|t| t != "Read") || !file_path.is_empty()),
-        ("tool_input.command", !matches!(tool_name, Some("Bash")) || !command.is_empty()),
+        (
+            "tool_input.file_path",
+            tool_name.is_some_and(|t| t != "Read") || !file_path.is_empty(),
+        ),
+        (
+            "tool_input.command",
+            !matches!(tool_name, Some("Bash")) || !command.is_empty(),
+        ),
     ]
 }
 
@@ -127,10 +148,17 @@ fn contract_checks(
 /// cwd (used to absolutize a relative shell path). Same verdict body for both
 /// tools — the only difference is the deny prefix — so a `Read` and an
 /// equivalent `cat` get byte-identical advice modulo that prefix.
-fn plan_request(tool_name: Option<&str>, tool_input: &serde_json::Value, cwd: &str) -> Option<ReadRequest> {
+fn plan_request(
+    tool_name: Option<&str>,
+    tool_input: &serde_json::Value,
+    cwd: &str,
+) -> Option<ReadRequest> {
     match tool_name {
         Some("Read") => {
-            let file_path = tool_input.get("file_path").and_then(|p| p.as_str()).unwrap_or("");
+            let file_path = tool_input
+                .get("file_path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
             if file_path.trim().is_empty() {
                 return None;
             }
@@ -144,7 +172,10 @@ fn plan_request(tool_name: Option<&str>, tool_input: &serde_json::Value, cwd: &s
             })
         }
         Some("Bash") => {
-            let command = tool_input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            let command = tool_input
+                .get("command")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
             // Strict: `Some(path)` only for a provable pure whole-file read of
             // one file. Anything else ⇒ let the command run.
             let path = crate::graph::shellread::whole_file_read(command)?;
@@ -153,7 +184,10 @@ fn plan_request(tool_name: Option<&str>, tool_input: &serde_json::Value, cwd: &s
             let file_path = if std::path::Path::new(&path).is_absolute() {
                 path
             } else {
-                std::path::Path::new(cwd).join(&path).to_string_lossy().into_owned()
+                std::path::Path::new(cwd)
+                    .join(&path)
+                    .to_string_lossy()
+                    .into_owned()
             };
             Some(ReadRequest {
                 file_path,
@@ -190,12 +224,24 @@ mod tests {
 
     #[test]
     fn bash_whole_file_read_resolves_relative_path_against_cwd() {
-        let r = plan_request(Some("Bash"), &json!({ "command": "cat foo.txt" }), "C:/proj")
-            .expect("bash request");
+        let r = plan_request(
+            Some("Bash"),
+            &json!({ "command": "cat foo.txt" }),
+            "C:/proj",
+        )
+        .expect("bash request");
         // Absolutized against cwd (not left bare-relative), offset/limit cleared,
         // and carries the shell deny prefix.
-        assert!(std::path::Path::new(&r.file_path).is_absolute(), "got {}", r.file_path);
-        assert!(r.file_path.replace('\\', "/").ends_with("proj/foo.txt"), "got {}", r.file_path);
+        assert!(
+            std::path::Path::new(&r.file_path).is_absolute(),
+            "got {}",
+            r.file_path
+        );
+        assert!(
+            r.file_path.replace('\\', "/").ends_with("proj/foo.txt"),
+            "got {}",
+            r.file_path
+        );
         assert_eq!(r.offset, None);
         assert_eq!(r.limit, None);
         assert_eq!(r.deny_prefix, BASH_DENY_PREFIX);
@@ -203,15 +249,24 @@ mod tests {
 
     #[test]
     fn bash_absolute_path_is_left_as_is() {
-        let r = plan_request(Some("Bash"), &json!({ "command": "cat C:\\proj\\a.rs" }), "C:/other")
-            .expect("bash request");
+        let r = plan_request(
+            Some("Bash"),
+            &json!({ "command": "cat C:\\proj\\a.rs" }),
+            "C:/other",
+        )
+        .expect("bash request");
         assert_eq!(r.file_path, "C:\\proj\\a.rs");
     }
 
     #[test]
     fn bash_non_whole_file_read_is_skipped() {
         // Pipe, partial-read verb, and a bare non-read command all pass through.
-        assert!(plan_request(Some("Bash"), &json!({ "command": "cat a | grep x" }), "C:/p").is_none());
+        assert!(plan_request(
+            Some("Bash"),
+            &json!({ "command": "cat a | grep x" }),
+            "C:/p"
+        )
+        .is_none());
         assert!(plan_request(Some("Bash"), &json!({ "command": "head -50 f" }), "C:/p").is_none());
         assert!(plan_request(Some("Bash"), &json!({ "command": "npm test" }), "C:/p").is_none());
         assert!(plan_request(Some("Bash"), &json!({}), "C:/p").is_none());
@@ -227,10 +282,18 @@ mod tests {
     /// (same file_path/offset/limit) — the only difference is the deny prefix.
     #[test]
     fn read_and_cat_yield_identical_body_modulo_prefix() {
-        let bash = plan_request(Some("Bash"), &json!({ "command": "cat foo.txt" }), "C:/proj")
-            .expect("bash");
-        let read = plan_request(Some("Read"), &json!({ "file_path": bash.file_path.clone() }), "C:/proj")
-            .expect("read");
+        let bash = plan_request(
+            Some("Bash"),
+            &json!({ "command": "cat foo.txt" }),
+            "C:/proj",
+        )
+        .expect("bash");
+        let read = plan_request(
+            Some("Read"),
+            &json!({ "file_path": bash.file_path.clone() }),
+            "C:/proj",
+        )
+        .expect("read");
         assert_eq!(bash.file_path, read.file_path);
         assert_eq!((bash.offset, bash.limit), (None, None));
         assert_eq!((read.offset, read.limit), (None, None));
@@ -244,7 +307,10 @@ mod tests {
         // Bash with no command ⇒ reports the missing command field.
         let miss = missing_fields(&contract_checks(Some("Bash"), "s", "c", "", ""));
         assert!(miss.contains(&"tool_input.command"), "got {miss:?}");
-        assert!(!miss.contains(&"tool_input.file_path"), "file_path not required for Bash: {miss:?}");
+        assert!(
+            !miss.contains(&"tool_input.file_path"),
+            "file_path not required for Bash: {miss:?}"
+        );
         // Bash WITH a command ⇒ no drift.
         let ok = missing_fields(&contract_checks(Some("Bash"), "s", "c", "", "cat f"));
         assert!(ok.is_empty(), "got {ok:?}");
@@ -254,6 +320,8 @@ mod tests {
         assert!(!rmiss.contains(&"tool_input.command"), "got {rmiss:?}");
         // Base fields still checked regardless of tool.
         let base = missing_fields(&contract_checks(None, "", "", "", ""));
-        assert!(base.contains(&"session_id") && base.contains(&"cwd") && base.contains(&"tool_name"));
+        assert!(
+            base.contains(&"session_id") && base.contains(&"cwd") && base.contains(&"tool_name")
+        );
     }
 }

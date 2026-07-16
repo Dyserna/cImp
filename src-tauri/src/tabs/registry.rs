@@ -327,7 +327,11 @@ impl TabRegistry {
             // Backpressuring send (not try_send): a dropped ShellRestarted
             // leaves the tab pinned in the "closed" overlay even though the PTY
             // respawned. Safe to await — see the note in `activate`.
-            if let Err(e) = self.state_signals.send(StateSignal::ShellRestarted { tab }).await {
+            if let Err(e) = self
+                .state_signals
+                .send(StateSignal::ShellRestarted { tab })
+                .await
+            {
                 warn!(error = %e, "shell restart: state-signal channel closed");
             }
         }
@@ -384,7 +388,11 @@ impl TabRegistry {
             // Backpressuring send (not try_send): a dropped ShellRestarted
             // leaves the tab pinned in the "closed" overlay even though the PTY
             // respawned. Safe to await — see the note in `activate`.
-            if let Err(e) = self.state_signals.send(StateSignal::ShellRestarted { tab }).await {
+            if let Err(e) = self
+                .state_signals
+                .send(StateSignal::ShellRestarted { tab })
+                .await
+            {
                 warn!(error = %e, "shell restart: state-signal channel closed");
             }
         }
@@ -399,11 +407,7 @@ impl TabRegistry {
     /// if the child has exited and the processor task already cleaned up.
     /// In either case the caller (frontend `attemptSpawn(entry, 'rebind')`)
     /// falls back to a fresh `pty_start`.
-    pub async fn rebind_channel(
-        &self,
-        tab: TabId,
-        new_channel: Channel<String>,
-    ) -> AppResult<()> {
+    pub async fn rebind_channel(&self, tab: TabId, new_channel: Channel<String>) -> AppResult<()> {
         let manager = self
             .managers
             .get(&tab)
@@ -519,7 +523,11 @@ impl TabRegistry {
         // the registry, so it keeps draining): a dropped `TabActivated` under a
         // rapid tab-switch burst would leave the manager's active pointer and
         // `ActiveTabChanged` broadcast out of sync with the registry.
-        if let Err(e) = self.state_signals.send(StateSignal::TabActivated { tab }).await {
+        if let Err(e) = self
+            .state_signals
+            .send(StateSignal::TabActivated { tab })
+            .await
+        {
             warn!(error = %e, "activate: state-signal channel closed");
         }
 
@@ -545,9 +553,8 @@ impl TabRegistry {
 fn emit_launch_failure(state_signals: &mpsc::Sender<StateSignal>, tab: &TabId, err: &AppError) {
     if matches!(tab.kind(), TabKind::Shell) {
         if let AppError::CommandNotFound(name) = err {
-            let message = format!(
-                "Shell command not found: {name}. Reconfigure or close this tab."
-            );
+            let message =
+                format!("Shell command not found: {name}. Reconfigure or close this tab.");
             let _ = state_signals.try_send(StateSignal::ShellLaunchFailed {
                 tab: tab.clone(),
                 message,

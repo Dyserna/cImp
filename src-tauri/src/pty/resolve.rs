@@ -1,15 +1,15 @@
-//! Command resolution with a bundled-tool `ebin` directory.
+//! Command resolution with a drop-in `ebin` tool directory.
 //!
 //! Every external command the app launches — PTY tabs, `llama-server`, the
 //! MCP-host servers, and `run_command` — goes through [`resolve_command`].
 //! Historically that was a bare PATH lookup; now it first considers an `ebin/`
-//! directory shipped alongside the app, so the portable release can carry tools
-//! (broot, rustnet, …) without the user installing them, and so new tools can
-//! be added later by dropping a binary in.
+//! directory alongside the app, so users can make tools (broot, rustnet, …)
+//! available to cImp by dropping a binary in, without touching PATH. The
+//! release ships `ebin/` empty — nothing is bundled.
 //!
 //! Resolution is simply **`ebin` first, then PATH**: if a bare command name is
 //! found in `ebin` it's used; otherwise we fall back to a normal PATH lookup.
-//! No version comparison — the bundled copy is the curated one and wins when
+//! No version comparison — the `ebin` copy is the curated one and wins when
 //! present, which is deterministic and needs no per-tool probing.
 //!
 //! `ebin` is located relative to the executable, covering both the packaged

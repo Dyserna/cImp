@@ -193,7 +193,11 @@ fn credentials_path() -> Option<PathBuf> {
     } else {
         std::env::var_os("HOME")
     }?;
-    Some(PathBuf::from(home).join(".claude").join(".credentials.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join(".credentials.json"),
+    )
 }
 
 /// Read the OAuth access token from the credentials file. Returns `None` on

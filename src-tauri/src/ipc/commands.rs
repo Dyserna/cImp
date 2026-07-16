@@ -7,8 +7,8 @@ use crate::error::{AppError, AppResult};
 use crate::ipc::windows::{open_or_focus_settings, SETTINGS_LABEL};
 use crate::ipc::AppState;
 use crate::settings::{
-    default_claude_local_tab, default_claude_tab, default_opencode_tab,
-    AiToolTabConfig, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
+    default_claude_local_tab, default_claude_tab, default_opencode_tab, AiToolTabConfig, Settings,
+    TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, OPENCODE_TAB_ID,
 };
 use crate::state::{StateSignal, TabId};
 
@@ -157,20 +157,13 @@ pub async fn pty_rebind_channel(
 /// internal API (`pty_start` returning `Option<Vec<u8>>`) for
 /// efficiency. Returns `NotStarted` if the tab has no live PTY.
 #[tauri::command]
-pub async fn pty_get_scrollback(
-    state: State<'_, AppState>,
-    tab: TabId,
-) -> AppResult<Vec<u8>> {
+pub async fn pty_get_scrollback(state: State<'_, AppState>, tab: TabId) -> AppResult<Vec<u8>> {
     let registry = state.tabs.lock().await;
     registry.scrollback_snapshot(tab).await
 }
 
 #[tauri::command]
-pub async fn pty_write(
-    state: State<'_, AppState>,
-    tab: TabId,
-    input: String,
-) -> AppResult<()> {
+pub async fn pty_write(state: State<'_, AppState>, tab: TabId, input: String) -> AppResult<()> {
     // The reserved dashboard tabs are read-only — app-rendered with no PTY
     // of their own — so swallow any write. Defense-in-depth behind the
     // frontend's read-only guard; one shared predicate so a new reserved
@@ -253,7 +246,9 @@ pub async fn pty_write(
     if !is_automatic_terminal_response(&input) {
         if contains_enter(&input) {
             len_counter.store(0, Ordering::Relaxed);
-            let _ = state.state_signals.try_send(StateSignal::UserSubmit { tab: tab.clone() });
+            let _ = state
+                .state_signals
+                .try_send(StateSignal::UserSubmit { tab: tab.clone() });
         } else {
             apply_input_delta(&input, &len_counter);
             let _ = state
@@ -412,7 +407,11 @@ pub async fn tts_test(state: State<'_, AppState>, text: String) -> AppResult<()>
     let active = state.tabs.lock().await.active();
     state
         .tts_segments
-        .send(crate::tts::TtsRequest::Synthesize { tab: active, text, suppressible: false })
+        .send(crate::tts::TtsRequest::Synthesize {
+            tab: active,
+            text,
+            suppressible: false,
+        })
         .await
         .map_err(|e| AppError::Tts(format!("tts_test send: {e}")))?;
     Ok(())
@@ -432,7 +431,11 @@ pub async fn tts_speak(state: State<'_, AppState>, text: String) -> AppResult<()
     let active = state.tabs.lock().await.active();
     state
         .tts_segments
-        .send(crate::tts::TtsRequest::Synthesize { tab: active, text, suppressible: false })
+        .send(crate::tts::TtsRequest::Synthesize {
+            tab: active,
+            text,
+            suppressible: false,
+        })
         .await
         .map_err(|e| AppError::Tts(format!("tts_speak send: {e}")))?;
     Ok(())
@@ -469,7 +472,11 @@ pub async fn tts_speak_selection(
     state.speak_session.store(session, Ordering::SeqCst);
     state
         .tts_segments
-        .send(crate::tts::TtsRequest::SpeakSelection { tab: active, session, chunks })
+        .send(crate::tts::TtsRequest::SpeakSelection {
+            tab: active,
+            session,
+            chunks,
+        })
         .await
         .map_err(|e| AppError::Tts(format!("tts_speak_selection send: {e}")))?;
     Ok(())
@@ -595,10 +602,7 @@ pub async fn pty_resize(
 }
 
 #[tauri::command]
-pub async fn compose_content_changed(
-    state: State<'_, AppState>,
-    non_empty: bool,
-) -> AppResult<()> {
+pub async fn compose_content_changed(state: State<'_, AppState>, non_empty: bool) -> AppResult<()> {
     // Compose targets the currently active tab — its non-empty edge promotes
     // the active tab Idle→Listening and pins Listening while content remains.
     let active = state.tabs.lock().await.active();
@@ -621,7 +625,9 @@ pub async fn compose_content_changed(
 /// would silently replace the global list instead of shadowing it.
 /// `root` defaults to the launch directory, mirroring `graph_rebuild`.
 #[tauri::command]
-pub async fn compose_templates(root: Option<String>) -> AppResult<Vec<crate::settings::ResolvedTemplate>> {
+pub async fn compose_templates(
+    root: Option<String>,
+) -> AppResult<Vec<crate::settings::ResolvedTemplate>> {
     let root = resolve_graph_root(root)?;
     let global = crate::settings::read_global_prompt_templates();
     let project = crate::settings::read_project_prompt_templates(&root);
@@ -663,9 +669,7 @@ pub async fn llm_pricing_get() -> AppResult<Vec<crate::settings::LlmPricingModel
 /// `compose_templates_global_set`; see
 /// `settings::persistence::write_global_llm_pricing`'s doc comment.
 #[tauri::command]
-pub async fn llm_pricing_set(
-    pricing: Vec<crate::settings::LlmPricingModel>,
-) -> AppResult<()> {
+pub async fn llm_pricing_set(pricing: Vec<crate::settings::LlmPricingModel>) -> AppResult<()> {
     crate::settings::write_global_llm_pricing(pricing)
 }
 
@@ -704,8 +708,6 @@ pub async fn acknowledge_error(state: State<'_, AppState>, tab: TabId) -> AppRes
         .try_send(StateSignal::ErrorAcknowledged { tab });
     Ok(())
 }
-
-
 
 /// Activate a tab. Frontend calls this on click and on Ctrl+1/Ctrl+2; the
 /// state manager broadcasts an `ActiveTabChanged` event so all subscribers
@@ -746,9 +748,7 @@ pub async fn set_active_tab(state: State<'_, AppState>, tab: TabId) -> AppResult
 /// `avatar-state` channel. Avoids the race where setup-time TabCreated
 /// emissions could fire before the webview's listener attaches.
 #[tauri::command]
-pub async fn list_tabs(
-    state: State<'_, AppState>,
-) -> AppResult<Vec<crate::tabs::TabMetaWire>> {
+pub async fn list_tabs(state: State<'_, AppState>) -> AppResult<Vec<crate::tabs::TabMetaWire>> {
     let registry = state.tabs.lock().await;
     Ok(registry.list())
 }
@@ -838,6 +838,10 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // Keep the reserved feature tabs (Offload Server / Code Graph monitor /
     // Workbench) present-iff-enabled in the persisted list.
     crate::settings::reconcile_reserved_tabs(cur);
+    // V25: keep `code_audit.tools` complete — a pre-V25 snapshot (three Security
+    // tools) gains the eleven Quality tools here, mirroring the load-path
+    // reconcile in `integrity_check`. Existing entries are untouched; idempotent.
+    crate::settings::reconcile_audit_tools(cur);
     // V21: when OpenCode local-llama auto-sync is on and the local server is
     // enabled, re-derive the provider snapshot if the primary Local command
     // changed (no-op otherwise), so the OpenCode tab tracks command edits.
@@ -868,6 +872,7 @@ pub async fn settings_update(
         (TabId::GraphView, |s| s.graph.graph_viz),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
         (TabId::CodeAudit, |s| s.code_audit.enabled),
+        (TabId::CodeQuality, |s| s.code_audit.enabled),
     ];
 
     // Snapshot the pre-update flags (reserved tabs via the table, plus the
@@ -875,8 +880,16 @@ pub async fn settings_update(
     // list for the resync edge at the bottom.
     let (was_reserved, was_stt, was_stt_device, was_graph_ignore) = {
         let old = state.settings.current();
-        let was: Vec<bool> = RESERVED_TAB_FLAGS.iter().map(|(_, flag)| flag(&old)).collect();
-        (was, old.stt.enabled, old.stt.device, normalized_ignore(&old.graph.ignore))
+        let was: Vec<bool> = RESERVED_TAB_FLAGS
+            .iter()
+            .map(|(_, flag)| flag(&old))
+            .collect();
+        (
+            was,
+            old.stt.enabled,
+            old.stt.device,
+            normalized_ignore(&old.graph.ignore),
+        )
     };
 
     // The Settings window holds a full snapshot and replaces wholesale, but it
@@ -900,7 +913,9 @@ pub async fn settings_update(
     // template library having reverted or lost entries. Preserve both here,
     // exactly like `layout`/`session`, so the dedicated compose IPC stays
     // the only writer of the template library.
-    state.settings.mutate(move |cur| apply_incoming_settings(cur, settings));
+    state
+        .settings
+        .mutate(move |cur| apply_incoming_settings(cur, settings));
 
     // On an `stt.enabled` edge, load or unload the Whisper model so the toggle
     // actually frees/reclaims memory (not just hides the record button). When
@@ -922,7 +937,10 @@ pub async fn settings_update(
 
     // On an actual enable/disable edge, mirror the change into the runtime so
     // the reserved tab appears/disappears live (tab bar + pane placement).
-    let now_reserved: Vec<bool> = RESERVED_TAB_FLAGS.iter().map(|(_, flag)| flag(&now)).collect();
+    let now_reserved: Vec<bool> = RESERVED_TAB_FLAGS
+        .iter()
+        .map(|(_, flag)| flag(&now))
+        .collect();
     if now_reserved != was_reserved {
         // Serialize against create/close_tab while we touch the registry.
         let _serializer = state.lifecycle_serializer.lock().await;
@@ -994,7 +1012,10 @@ pub async fn offload_backend_start(
     name: String,
     command_override: Option<String>,
 ) -> AppResult<()> {
-    supervisor.inner().start_backend(&name, command_override).await
+    supervisor
+        .inner()
+        .start_backend(&name, command_override)
+        .await
 }
 
 /// V8-02: stop one named Local backend (idempotent).
@@ -1192,7 +1213,11 @@ pub async fn checks_suggestion(
     let auto_configure = snap.checks_auto_configure;
     // Only offer for a project with no checks configured yet.
     if !snap.checks.is_empty() {
-        return Ok(ChecksSuggestion { count: 0, dismissed, auto_configure });
+        return Ok(ChecksSuggestion {
+            count: 0,
+            dismissed,
+            auto_configure,
+        });
     }
     let root = resolve_graph_root(root)?;
     let stats = service.checks_lang_stats(&root);
@@ -1204,14 +1229,20 @@ pub async fn checks_suggestion(
     })
     .await
     .map_err(|e| AppError::Checks(format!("detection task failed: {e}")))?;
-    Ok(ChecksSuggestion { count, dismissed, auto_configure })
+    Ok(ChecksSuggestion {
+        count,
+        dismissed,
+        auto_configure,
+    })
 }
 
 /// V22 Phase D: remember that the user dismissed the suggestion nudge for this
 /// project (persists via the per-project overlay). Idempotent.
 #[tauri::command]
 pub async fn checks_dismiss_suggestion(state: State<'_, AppState>) -> AppResult<()> {
-    state.settings.mutate(|s| s.checks_suggestion_dismissed = true);
+    state
+        .settings
+        .mutate(|s| s.checks_suggestion_dismissed = true);
     Ok(())
 }
 
@@ -1273,8 +1304,7 @@ pub async fn graph_rebuild(
 ) -> AppResult<()> {
     let root = match root {
         Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
-        _ => std::env::current_dir()
-            .map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
+        _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
     };
     service.spawn_rebuild(root);
     Ok(())
@@ -1314,8 +1344,11 @@ pub async fn graph_ignore_pick(
     .map_err(|e| AppError::Settings(format!("picker task: {e}")))?;
     let Some(path) = picked else { return Ok(None) };
 
-    let mut roots: Vec<std::path::PathBuf> =
-        service.statuses().iter().map(|s| std::path::PathBuf::from(&s.root)).collect();
+    let mut roots: Vec<std::path::PathBuf> = service
+        .statuses()
+        .iter()
+        .map(|s| std::path::PathBuf::from(&s.root))
+        .collect();
     // The launch dir is the primary project even before its first build.
     if let Ok(cwd) = std::env::current_dir() {
         roots.push(cwd);
@@ -1544,7 +1577,12 @@ pub async fn graph_impact(
         changed: report
             .changed
             .into_iter()
-            .map(|s| ChangedSymbolRow { name: s.name, kind: s.kind, file: s.file, line: s.start_line })
+            .map(|s| ChangedSymbolRow {
+                name: s.name,
+                kind: s.kind,
+                file: s.file,
+                line: s.start_line,
+            })
             .collect(),
         dependents: report
             .dependents
@@ -1600,7 +1638,11 @@ fn parse_path_kinds(kinds: Option<Vec<String>>) -> Vec<crate::graph::EdgeKind> {
             _ => {}
         }
     }
-    if out.is_empty() { all() } else { out }
+    if out.is_empty() {
+        all()
+    } else {
+        out
+    }
 }
 
 /// V15 Feature 1 (Architecture): trace the shortest path between two entities
@@ -1617,7 +1659,13 @@ pub async fn graph_path(
 ) -> AppResult<PathResult> {
     let root = resolve_graph_root(root)?;
     let kinds = parse_path_kinds(kinds);
-    let hit = service.shortest_path(&root, from.trim(), to.trim(), &kinds, symmetric.unwrap_or(false))?;
+    let hit = service.shortest_path(
+        &root,
+        from.trim(),
+        to.trim(),
+        &kinds,
+        symmetric.unwrap_or(false),
+    )?;
     Ok(match hit {
         Some(h) => PathResult {
             found: true,
@@ -1637,7 +1685,12 @@ pub async fn graph_path(
             hops: h.hops,
             equal_alternatives: h.equal_alternatives,
         },
-        None => PathResult { found: false, nodes: Vec::new(), hops: 0, equal_alternatives: 0 },
+        None => PathResult {
+            found: false,
+            nodes: Vec::new(),
+            hops: 0,
+            equal_alternatives: 0,
+        },
     })
 }
 
@@ -1690,12 +1743,23 @@ pub async fn graph_architecture(
         god_nodes: r
             .god_nodes
             .into_iter()
-            .map(|g| GodNodeRow { id: g.id, label: g.label, file: g.file, kind: g.kind, degree: g.degree })
+            .map(|g| GodNodeRow {
+                id: g.id,
+                label: g.label,
+                file: g.file,
+                kind: g.kind,
+                degree: g.degree,
+            })
             .collect(),
         subsystems: r
             .subsystems
             .into_iter()
-            .map(|s| SubsystemRow { name: s.name, size: s.size, files: s.files, hub: s.hub })
+            .map(|s| SubsystemRow {
+                name: s.name,
+                size: s.size,
+                files: s.files,
+                hub: s.hub,
+            })
             .collect(),
         surprising: r
             .surprising
@@ -1753,12 +1817,25 @@ pub async fn graph_viz_snapshot(
         nodes: g
             .nodes
             .into_iter()
-            .map(|n| VizNodeRow { id: n.id, label: n.label, file: n.file, kind: n.kind, degree: n.degree, subsystem: n.subsystem })
+            .map(|n| VizNodeRow {
+                id: n.id,
+                label: n.label,
+                file: n.file,
+                kind: n.kind,
+                degree: n.degree,
+                subsystem: n.subsystem,
+            })
             .collect(),
         edges: g
             .edges
             .into_iter()
-            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence, drawn: e.drawn })
+            .map(|e| VizEdgeRow {
+                src: e.src,
+                dst: e.dst,
+                kind: e.kind,
+                confidence: e.confidence,
+                drawn: e.drawn,
+            })
             .collect(),
     })
 }
@@ -1786,7 +1863,11 @@ pub async fn graph_viz_file_status(
     Ok(service
         .viz_file_status(&root, &paths)?
         .into_iter()
-        .map(|s| VizFileStatusRow { path: s.path, indexed: s.indexed, degree: s.degree })
+        .map(|s| VizFileStatusRow {
+            path: s.path,
+            indexed: s.indexed,
+            degree: s.degree,
+        })
         .collect())
 }
 
@@ -1806,12 +1887,25 @@ pub async fn graph_viz_ego(
         nodes: g
             .nodes
             .into_iter()
-            .map(|n| VizNodeRow { id: n.id, label: n.label, file: n.file, kind: n.kind, degree: n.degree, subsystem: n.subsystem })
+            .map(|n| VizNodeRow {
+                id: n.id,
+                label: n.label,
+                file: n.file,
+                kind: n.kind,
+                degree: n.degree,
+                subsystem: n.subsystem,
+            })
             .collect(),
         edges: g
             .edges
             .into_iter()
-            .map(|e| VizEdgeRow { src: e.src, dst: e.dst, kind: e.kind, confidence: e.confidence, drawn: e.drawn })
+            .map(|e| VizEdgeRow {
+                src: e.src,
+                dst: e.dst,
+                kind: e.kind,
+                confidence: e.confidence,
+                drawn: e.drawn,
+            })
             .collect(),
     })
 }
@@ -2135,7 +2229,10 @@ pub async fn graph_usage_advice(
         && (session_count < crate::advisor::MIN_SESSIONS
             || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
                 && advisor_reread_samples < crate::advisor::MIN_REMINDS));
-    Ok(AdvisorSnapshot { proposals, collecting })
+    Ok(AdvisorSnapshot {
+        proposals,
+        collecting,
+    })
 }
 
 /// V16 Feature 1: the harness version + contract-verification state, read
@@ -2156,7 +2253,9 @@ pub async fn harness_mark_verified(state: State<'_, AppState>) -> AppResult<()> 
     let after = crate::settings::mutate_global_harness_versions(|hv| {
         hv.claude_last_verified = hv.claude_last_seen.clone();
     })?;
-    state.settings.mutate(move |cur| cur.harness_versions = after);
+    state
+        .settings
+        .mutate(move |cur| cur.harness_versions = after);
     Ok(())
 }
 
@@ -2177,7 +2276,8 @@ pub async fn advisor_dismiss(
             .iter()
             .any(|d| d.rule_id == rule_id && d.signature == signature);
         if !already {
-            cur.advisor_dismissed.push(crate::settings::DismissedRule { rule_id, signature });
+            cur.advisor_dismissed
+                .push(crate::settings::DismissedRule { rule_id, signature });
         }
     });
     Ok(())
@@ -2203,7 +2303,8 @@ pub async fn advisor_mark_applied(
     let session_count = graph.advisor_session_count(&root);
     let root_str = root.to_string_lossy().to_string();
     state.settings.mutate(move |cur| {
-        cur.advisor_applied.retain(|a| !(a.rule_id == rule_id && a.root == root_str));
+        cur.advisor_applied
+            .retain(|a| !(a.rule_id == rule_id && a.root == root_str));
         cur.advisor_applied.push(crate::settings::AppliedRule {
             rule_id,
             root: root_str,
@@ -2306,7 +2407,9 @@ pub async fn workbench_revert_hunk(
     hunk_hash: String,
 ) -> AppResult<crate::workbench::diff::FileDiff> {
     let root = resolve_workbench_root(root)?;
-    service.revert_hunk(&root, &path, hunk_index, &hunk_hash).await
+    service
+        .revert_hunk(&root, &path, hunk_index, &hunk_hash)
+        .await
 }
 
 /// V13 Phase B: format one hunk as a fenced code block + `path:line` header
@@ -2350,7 +2453,9 @@ pub async fn workbench_checkpoint_diff(
     context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
     let root = resolve_workbench_root(root)?;
-    service.checkpoint_diff(&root, &id, diff_context(context)).await
+    service
+        .checkpoint_diff(&root, &id, diff_context(context))
+        .await
 }
 
 /// V13 Phase C: the manual "Checkpoint now" action. `label` defaults to
@@ -2409,7 +2514,9 @@ pub async fn workbench_worktree_diff(
     context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
     let root = resolve_workbench_root(root)?;
-    service.worktree_diff(&root, &slug, diff_context(context)).await
+    service
+        .worktree_diff(&root, &slug, diff_context(context))
+        .await
 }
 
 /// Session-commits section: the union of commits caught live from the
@@ -2435,7 +2542,9 @@ pub async fn workbench_session_commits(
         Some((s, l)) => (from_ms.min(*s), to_ms.max(*l)),
         None => (from_ms, to_ms),
     };
-    service.session_commits(&root, from_ms, to_ms, &recorded).await
+    service
+        .session_commits(&root, from_ms, to_ms, &recorded)
+        .await
 }
 
 /// Per-session commit counts (session_id → count) for the Sessions card's
@@ -2465,7 +2574,9 @@ pub async fn workbench_session_commit_counts(
             w
         })
         .collect();
-    service.session_commit_counts(&root, &windows, &recorded).await
+    service
+        .session_commit_counts(&root, &windows, &recorded)
+        .await
 }
 
 /// One commit vs. its first parent, parsed the same way `workbench_diff_file`
@@ -2478,7 +2589,9 @@ pub async fn workbench_commit_diff(
     context: Option<u32>,
 ) -> AppResult<Vec<crate::workbench::diff::FileDiff>> {
     let root = resolve_workbench_root(root)?;
-    service.commit_diff(&root, &hash, diff_context(context)).await
+    service
+        .commit_diff(&root, &hash, diff_context(context))
+        .await
 }
 
 /// The Git-graph section: up to `limit` commits from every ref in
@@ -2613,12 +2726,20 @@ pub async fn graph_set_language_enabled(
 ) -> AppResult<()> {
     let tag = lang.trim().to_ascii_lowercase();
     if crate::graph::Lang::from_tag(&tag) == crate::graph::Lang::Other {
-        return Err(AppError::Settings(format!("unsupported graph language: {lang}")));
+        return Err(AppError::Settings(format!(
+            "unsupported graph language: {lang}"
+        )));
     }
     // Skip the mutate + full rebuild when the desired state already holds
     // (re-enabling an already-present language, or disabling an absent one).
     // A redundant rebuild re-indexes/re-embeds the whole project for nothing.
-    let already = state.settings.current().graph.languages.iter().any(|l| l == &tag);
+    let already = state
+        .settings
+        .current()
+        .graph
+        .languages
+        .iter()
+        .any(|l| l == &tag);
     if enabled == already {
         return Ok(());
     }
@@ -2861,8 +2982,8 @@ pub async fn restart_shell_tab(app: AppHandle, tab: TabId) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_automatic_terminal_response as auto_reply;
     use super::apply_incoming_settings;
+    use super::is_automatic_terminal_response as auto_reply;
     use crate::settings::{PromptTemplate, Settings};
 
     /// `graph_ignore_pick`'s glob shaping: root-relative + `/`-anchored with
@@ -2897,8 +3018,13 @@ mod tests {
     /// (the editor's just-added empty line) don't count, order does.
     #[test]
     fn normalized_ignore_drops_blanks_keeps_order() {
-        let norm = |v: &[&str]| super::normalized_ignore(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(norm(&["/gen/", "", "  ", " *.snap "]), vec!["/gen/", "*.snap"]);
+        let norm = |v: &[&str]| {
+            super::normalized_ignore(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            norm(&["/gen/", "", "  ", " *.snap "]),
+            vec!["/gen/", "*.snap"]
+        );
         assert_ne!(norm(&["/gen/", "!keep"]), norm(&["!keep", "/gen/"]));
     }
 
@@ -2915,8 +3041,14 @@ mod tests {
     fn settings_update_preserves_out_of_band_prompt_templates() {
         let mut cur = Settings::default();
         cur.prompt_templates = vec![
-            PromptTemplate { name: "review-this-diff".to_string(), body: "R".to_string() },
-            PromptTemplate { name: "my-new-template".to_string(), body: "N".to_string() },
+            PromptTemplate {
+                name: "review-this-diff".to_string(),
+                body: "R".to_string(),
+            },
+            PromptTemplate {
+                name: "my-new-template".to_string(),
+                body: "N".to_string(),
+            },
         ];
         cur.templates_seeded = true;
 

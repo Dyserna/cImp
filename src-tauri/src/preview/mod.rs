@@ -213,7 +213,10 @@ pub fn is_externally_openable(url: &str) -> bool {
 /// the OS — see that function's doc comment for why.
 fn open_external(app: &AppHandle, url: &str) {
     if !is_externally_openable(url) {
-        tracing::debug!(url, "preview: dropped non-http(s) URL instead of opening it externally");
+        tracing::debug!(
+            url,
+            "preview: dropped non-http(s) URL instead of opening it externally"
+        );
         return;
     }
     if let Err(e) = app.opener().open_url(url, None::<&str>) {
@@ -482,9 +485,7 @@ pub async fn preview_update_config(
     auto_reload: bool,
 ) -> AppResult<()> {
     state.settings.mutate(move |snap| {
-        if let Some(TabConfig::Preview(cfg)) =
-            snap.tabs.iter_mut().find(|t| t.id() == tab_id)
-        {
+        if let Some(TabConfig::Preview(cfg)) = snap.tabs.iter_mut().find(|t| t.id() == tab_id) {
             cfg.url = url.clone();
             cfg.device_width = device_width;
             cfg.auto_reload = auto_reload;
@@ -530,7 +531,10 @@ mod tests {
     #[test]
     fn localhost_name_allowed() {
         assert!(is_allowed_preview_host("http://localhost:3000", false));
-        assert!(is_allowed_preview_host("http://localhost:3000/path?x=1", false));
+        assert!(is_allowed_preview_host(
+            "http://localhost:3000/path?x=1",
+            false
+        ));
         assert!(is_allowed_preview_host("http://LOCALHOST:8080", false));
     }
 
@@ -633,7 +637,9 @@ mod tests {
         assert!(!is_externally_openable("ms-msdt:x-msdt-config?..."));
         assert!(!is_externally_openable("file:///etc/passwd"));
         assert!(!is_externally_openable("javascript:alert(1)"));
-        assert!(!is_externally_openable("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_externally_openable(
+            "data:text/html,<script>alert(1)</script>"
+        ));
         assert!(!is_externally_openable("mailto:someone@example.com"));
         assert!(!is_externally_openable("about:blank"));
         // A hypothetical custom app scheme.

@@ -1018,6 +1018,105 @@ own stderr (falling back to stdout) to the `exited with code N` message, surface
 as the failed chip's tooltip — a bare `exited with code N` with no tail means the
 tool printed nothing, not that the excerpt was dropped.
 
+## Code Quality — Language-Gated Linters (V25)
+
+**Builds directly on V23, no new schema and nothing bundled.** The eleven
+quality tools are additional `Adapter` rows + `AuditToolId` variants in the same
+registry (`src-tauri/src/audit/adapters.rs`), sharing V23's runner, ebin → PATH →
+override resolution, and SARIF-through-`checks::parsers` pipeline. `CodeAuditSettings`
+stays additive (`#[serde(default)]`); the four non-SARIF tools add four small
+audit-local parsers (`audit/parsers.rs`: `TyposJsonl`, `EslintJson`, `KnipJson`,
+`MacheteText`), fixture-tested from `src-tauri/testdata/audit/`. The one genuinely
+new mechanism is the **census** (`audit/census.rs`) — a bounded, ignore-respecting
+walk (20 000 entries / 2 s, cached ~60 s) that decides which tools apply.
+
+**Flags/exit-codes were web-verified at implementation and deviate from the spec
+in two places — trust the code, not the spec.** (1) **cppcheck** writes its report
+to **stderr**, not stdout, and exits **0 even with findings**; the adapter uses
+`--output-file=<tmp>` with `Transport::ReportFile` and an empty `findings_exit_codes`
+(a clean exit-0 run with a populated report is the normal findings path), needs
+**≥ 2.16** for SARIF, and runs with `--enable=warning,style`. (2) **cargo-machete**
+emits a header line + tab-indented crate names on stdout (the `MacheteText` parser
+matches that), exit 1 on unused deps. Other exit codes: **typos** = 2, **PMD** = 4
+(5 is a real error), everyone else 1. `Adapter::classify_exit` owns all of this.
+
+**Node tools resolve project-local first.** eslint and knip carry
+`Adapter::project_local_bin`; `resolve_audit_binary` (`audit/mod.rs`) tries a
+non-empty override verbatim → `<root>/node_modules/.bin/<tool>` (the `.cmd`/`.bat`
+shim on Windows) → ebin → PATH. `dotnet-analyzers` resolves `dotnet`,
+`semgrep-quality` reuses the `semgrep` binary.
+
+**Upgrade reconcile.** A pre-V25 `settings.json` persisted only the three Security
+tools; the lenient `tools` deserializer keeps a present array verbatim, so
+`persistence::reconcile_audit_tools` appends any missing built-in on load
+(`integrity_check`) and on the live settings-update round-trip, preserving every
+existing entry and its order. Unknown/stale ids are still dropped by the lenient
+enum.
+
+### Live-verify recipe (run by hand before release)
+
+With a build running and `code_audit.enabled` on. The **Code Quality** tab is
+separate from **Code Audit**; each tool's install hint, then Detect in
+**Settings → Code Audit → Quality tools**, then scan a small fixture project of
+that language and confirm the finding lands in the **Code Quality** tab:
+
+1. **oxlint** (`npm i -g oxlint`) → scan a JS/TS fixture with an obvious lint
+   error (`==` / unused var); SARIF findings appear.
+2. **ruff** (`pipx install ruff`) → scan a `.py` fixture (unused import); findings
+   appear.
+3. **golangci-lint** (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`)
+   → scan a `go.mod` module; confirm the **v2** `--output.sarif.path stdout`
+   invocation works (v1's `--out-format` would error).
+4. **cppcheck ≥ 2.16** (`winget install Cppcheck.Cppcheck`) → scan a `.cpp`
+   fixture with a null-deref/style issue; confirm findings land **even though the
+   process exits 0** (report-file transport, not stdout/stderr).
+5. **typos** (`cargo install typos-cli`) → **works on every project**: scan THIS
+   repo, expect the spell-check notes; confirm the JSONL `type: "typo"` records
+   render as note-severity rows.
+6. **eslint** (project-local `npm i -D eslint` + an `eslint.config.js`) → confirm
+   Detect and the scan resolve **`node_modules/.bin/eslint` first**, not a global
+   install; JSON reporter findings appear.
+7. **knip** (project-local `npm i -D knip`) → scan a `package.json` project with an
+   unused export/dep; project-local `.bin/knip` is preferred; JSON findings appear.
+8. **cargo-machete** (`cargo install cargo-machete`) → scan a crate with an unused
+   dependency in `Cargo.toml`; the `MacheteText` parser anchors the finding to the
+   `Cargo.toml`.
+9. **PMD** (`pmd.bat` on PATH/ebin, needs a JRE) → scan a `.java` fixture; SARIF
+   findings appear; exit 4 classifies as findings, not error.
+10. **Roslyn analyzers** (default-disabled; enable it, `.NET SDK` installed) → set
+    its **per-tool timeout to ~1200 s** first, scan a `*.csproj`; it runs a real
+    `dotnet build` (restores packages, writes obj/bin) and the `/p:ErrorLog` SARIF
+    report merges. Confirm it does **not** run when left disabled.
+11. **semgrep (quality)** (default-disabled; enable it, `pipx install semgrep`,
+    online) → scans with `--config p/best-practices`; findings show under the
+    **Code Quality** tab only — the Security semgrep entry stays pure SAST.
+
+**Gating checks (this repo has no Java/Go/Python):**
+
+12. Open the **Code Quality** tab in *this* repo and run a scan → the **PMD /
+    golangci-lint / ruff** chips are **absent** (census sees no `.java`/`.go`/`.py`),
+    and the muted "**n tools hidden — not applicable to this project**" line
+    accounts for them. oxlint/eslint/knip/cargo-machete/typos DO show (this repo
+    has `.ts`, `package.json`, `Cargo.toml`).
+13. In **Settings → Code Audit → Quality tools**, after that scan, the gated-off
+    tools (PMD/golangci-lint/ruff) show the "**not applicable to the current
+    project**" hint — Settings never hides them (global config). The hint appears
+    **only after at least one scan**; a fresh window (empty census) shows no hint.
+
+**Upgrade check:**
+
+14. Take a pre-V25 config (`code_audit.tools` with only the three security ids —
+    e.g. a v0.43/v0.44 `settings.json`), launch → the **Code Quality** tab and the
+    Settings Quality group are populated with all eleven tools on first load (the
+    reconcile), and any customized security entry (disabled / custom path / extra
+    args / timeout) is preserved verbatim.
+
+**Cross-tab lock:**
+
+15. Start a scan in the **Code Quality** tab; switch to **Code Audit** → its Scan
+    button is disabled and shows "**waiting — quality scan running**" (one scan at
+    a time globally). The reverse holds too.
+
 ## Workbench — Vibe-Coding Guardrails (V13)
 
 **No graph-schema change, no new MCP tool.** The whole feature is a reserved

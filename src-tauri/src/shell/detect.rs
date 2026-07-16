@@ -30,13 +30,13 @@
 //! trailing slash if the registry value contains one, so no explicit
 //! sanitization is required.
 
-use std::path::PathBuf;
 #[cfg(any(unix, windows))]
 use std::path::Path;
+use std::path::PathBuf;
 
-use tracing::info;
 #[cfg(unix)]
 use tracing::debug;
+use tracing::info;
 #[cfg(windows)]
 use tracing::warn;
 
@@ -91,9 +91,7 @@ pub fn default_shell() -> ShellSpec {
 pub fn is_git_bash_source(source: &ShellSource) -> bool {
     matches!(
         source,
-        ShellSource::GitBashProgramFiles
-            | ShellSource::GitBashRegistry
-            | ShellSource::GitBashPath
+        ShellSource::GitBashProgramFiles | ShellSource::GitBashRegistry | ShellSource::GitBashPath
     )
 }
 

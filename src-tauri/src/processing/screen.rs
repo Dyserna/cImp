@@ -99,7 +99,6 @@ impl Row {
         }
         s
     }
-
 }
 
 pub struct Screen {
@@ -283,7 +282,13 @@ impl Perform for Screen {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(
+        &mut self,
+        params: &Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
         let p = |i: usize, default: u16| -> u16 {
             params
                 .iter()
@@ -337,7 +342,11 @@ impl Perform for Screen {
                 self.move_cursor(row, self.cursor_col);
             }
             'K' => {
-                let mode = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                let mode = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
                 let row = self.cursor_row;
                 let col = self.cursor_col;
                 self.ensure_row(row);
@@ -349,7 +358,11 @@ impl Perform for Screen {
                 }
             }
             'J' => {
-                let mode = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
+                let mode = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
                 let row = self.cursor_row;
                 let col = self.cursor_col;
                 self.ensure_row(row);

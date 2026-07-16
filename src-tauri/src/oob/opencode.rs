@@ -245,7 +245,10 @@ impl Tracker {
                     props.get("delta").and_then(Value::as_str),
                 ) {
                     self.register_part(mid, pid);
-                    self.part_text.entry(pid.to_string()).or_default().push_str(delta);
+                    self.part_text
+                        .entry(pid.to_string())
+                        .or_default()
+                        .push_str(delta);
                 }
             }
             "session.idle" => {
@@ -299,12 +302,20 @@ impl Tracker {
                 continue;
             }
             let streamed = self.part_text.get(pid).map(String::as_str).unwrap_or("");
-            let snapshot = self.part_snapshot.get(pid).map(String::as_str).unwrap_or("");
+            let snapshot = self
+                .part_snapshot
+                .get(pid)
+                .map(String::as_str)
+                .unwrap_or("");
             // Prefer whichever view is fuller: deltas can be missing entirely
             // (short message ⇒ snapshot only) or partial (stream joined
             // mid-message ⇒ the accumulated deltas hold only the tail while
             // the `message.part.updated` snapshot carries the full text).
-            let text = if snapshot.len() > streamed.len() { snapshot } else { streamed };
+            let text = if snapshot.len() > streamed.len() {
+                snapshot
+            } else {
+                streamed
+            };
             if !text.trim().is_empty() {
                 if !out.is_empty() {
                     out.push('\n');
@@ -361,7 +372,13 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    fn ctx_with(tab: &str) -> (OobContext, mpsc::Receiver<TtsRequest>, mpsc::Receiver<StateSignal>) {
+    fn ctx_with(
+        tab: &str,
+    ) -> (
+        OobContext,
+        mpsc::Receiver<TtsRequest>,
+        mpsc::Receiver<StateSignal>,
+    ) {
         let (tts_tx, tts_rx) = mpsc::channel(64);
         let (sig_tx, sig_rx) = mpsc::channel(64);
         // Seed the opencode tab so the per-tab TTS gate (tts_injection.enabled,
@@ -451,7 +468,8 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
 
         match tts_rx.try_recv() {
             Ok(TtsRequest::Synthesize { text, .. }) => {
@@ -486,8 +504,12 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
-        assert!(tts_rx.try_recv().is_err(), "reasoning must not be spoken even if declared late");
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
+        assert!(
+            tts_rx.try_recv().is_err(),
+            "reasoning must not be spoken even if declared late"
+        );
     }
 
     #[tokio::test]
@@ -505,7 +527,8 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
         assert!(tts_rx.try_recv().is_err(), "user text must not be spoken");
     }
 
@@ -524,11 +547,21 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
-        assert!(matches!(tts_rx.try_recv(), Ok(TtsRequest::Synthesize { .. })));
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
+        assert!(matches!(
+            tts_rx.try_recv(),
+            Ok(TtsRequest::Synthesize { .. })
+        ));
         // Working state went up then down.
-        assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStarted { .. })));
-        assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStopped { .. })));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::ClaudeOutputStarted { .. })
+        ));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::ClaudeOutputStopped { .. })
+        ));
     }
 
     // ── Legacy sweep session 5 regressions ────────────────────────────────
@@ -544,7 +577,10 @@ mod tests {
         buf.extend_from_slice(&bytes[..split]);
         assert!(drain_lines(&mut buf).is_empty(), "no complete line yet");
         buf.extend_from_slice(&bytes[split..]);
-        assert_eq!(drain_lines(&mut buf), vec!["data: {\"delta\":\"café ready\"}".to_string()]);
+        assert_eq!(
+            drain_lines(&mut buf),
+            vec!["data: {\"delta\":\"café ready\"}".to_string()]
+        );
         assert!(buf.is_empty(), "fully drained");
         // A trailing partial line stays buffered.
         buf.extend_from_slice(b"data: {\"a\":1}\ndata: {\"b\"");
@@ -607,13 +643,15 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
         match tts_rx.try_recv() {
             Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Late but here."),
             other => panic!("expected idle to recover the message, got {other:?}"),
         }
         // And only once.
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
         assert!(tts_rx.try_recv().is_err(), "must not double-speak");
     }
 
@@ -639,7 +677,8 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
         match tts_rx.try_recv() {
             Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Hello world."),
             other => panic!("expected the snapshot text, got {other:?}"),
@@ -668,7 +707,8 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
         assert!(tts_rx.try_recv().is_err(), "tool part must not be spoken");
     }
 
@@ -694,8 +734,12 @@ mod tests {
             &ctx,
         )
         .await;
-        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx).await;
-        assert!(matches!(tts_rx.try_recv(), Ok(TtsRequest::Synthesize { .. })));
+        t.handle(&ev(r#"{"type":"session.idle","properties":{}}"#), &ctx)
+            .await;
+        assert!(matches!(
+            tts_rx.try_recv(),
+            Ok(TtsRequest::Synthesize { .. })
+        ));
         assert!(t.part_text.is_empty(), "part text pruned");
         assert!(t.part_snapshot.is_empty(), "snapshots pruned");
         assert!(t.part_type.is_empty(), "types pruned");
@@ -744,14 +788,24 @@ mod tests {
         .expect("consume must return when the stream closes")
         .expect("clean close is not an error");
         server.await.unwrap();
-        assert_eq!(end, StreamEnd::Closed, "close must ask for a reconnect, not read as cancel");
+        assert_eq!(
+            end,
+            StreamEnd::Closed,
+            "close must ask for a reconnect, not read as cancel"
+        );
         // Buffered text was flushed on close…
         match tts_rx.try_recv() {
             Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Mid-turn text."),
             other => panic!("expected the buffered message, got {other:?}"),
         }
         // …and Thinking was released (Started then Stopped).
-        assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStarted { .. })));
-        assert!(matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStopped { .. })));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::ClaudeOutputStarted { .. })
+        ));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::ClaudeOutputStopped { .. })
+        ));
     }
 }

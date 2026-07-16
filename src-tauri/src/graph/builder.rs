@@ -92,10 +92,12 @@ pub fn parse_file(path: &str, src: &str, lang: Lang) -> FileGraph {
 fn dedup_graph(fg: &mut FileGraph) {
     let mut seen_edges: std::collections::HashSet<(&'static str, String, String)> =
         std::collections::HashSet::new();
-    fg.edges.retain(|e| seen_edges.insert((e.kind.tag(), e.src.clone(), e.dst.clone())));
+    fg.edges
+        .retain(|e| seen_edges.insert((e.kind.tag(), e.src.clone(), e.dst.clone())));
     let mut seen_refs: std::collections::HashSet<(String, u32, u32)> =
         std::collections::HashSet::new();
-    fg.references.retain(|r| seen_refs.insert((r.name.clone(), r.line, r.col)));
+    fg.references
+        .retain(|r| seen_refs.insert((r.name.clone(), r.line, r.col)));
 }
 
 /// Chunk a Markdown file into `doc_chunk`s by heading section, so
@@ -115,7 +117,10 @@ fn parse_markdown(src: &str, file: &str, fg: &mut FileGraph) {
     // versa — tracking just a bool would let the other marker close it early.
     let mut fence: Option<&str> = None;
 
-    let flush = |anchor: &str, title: &str, body: &[String], fg: &mut FileGraph,
+    let flush = |anchor: &str,
+                 title: &str,
+                 body: &[String],
+                 fg: &mut FileGraph,
                  seen: &mut std::collections::HashMap<String, u32>| {
         let text = compose_chunk(title, body);
         if text.trim().is_empty() {
@@ -237,7 +242,10 @@ fn dedup_anchor(anchor: &str, seen: &mut std::collections::HashMap<String, u32>)
 /// The file stem (no directory, no extension) for the pre-heading chunk anchor.
 fn file_stem(file: &str) -> String {
     let name = file.rsplit('/').next().unwrap_or(file);
-    name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name).to_string()
+    name.rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// Deterministic FNV-1a content hash for staleness detection. Delegates to the
@@ -321,7 +329,9 @@ fn walk_items(
             let is_test = in_test_mod
                 || (matches!(skind, SymbolKind::Function | SymbolKind::Method)
                     && pending_attrs.iter().any(|a| is_test_attribute(a)));
-            let id = emit_symbol(src, file, child, &name, skind, parent, doc, vis, is_test, fg);
+            let id = emit_symbol(
+                src, file, child, &name, skind, parent, doc, vis, is_test, fg,
+            );
 
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls_in(src, file, child, depth + 1, &id, CallSyntax::Rust, fg);
@@ -331,7 +341,16 @@ fn walk_items(
             // the way down (a plain `fn` inside needs no `#[test]` of its own).
             let child_in_test_mod = in_test_mod
                 || (kind == "mod_item" && pending_attrs.iter().any(|a| is_cfg_test_attribute(a)));
-            walk_items(src, file, child, depth + 1, Some(&id), child_in_impl, child_in_test_mod, fg);
+            walk_items(
+                src,
+                file,
+                child,
+                depth + 1,
+                Some(&id),
+                child_in_impl,
+                child_in_test_mod,
+                fg,
+            );
             pending_doc.clear();
             pending_attrs.clear();
         } else if kind == "use_declaration" {
@@ -343,14 +362,24 @@ fn walk_items(
                 let mut paths = Vec::new();
                 collect_use_paths(src, arg, "", &mut paths);
                 for path in paths {
-                    fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), path));
+                    fg.edges
+                        .push(Edge::new(EdgeKind::Import, file.to_string(), path));
                 }
             }
             pending_doc.clear();
             pending_attrs.clear();
         } else {
             // Descend for nested items (module bodies, impl bodies, etc.).
-            walk_items(src, file, child, depth + 1, parent, in_impl, in_test_mod, fg);
+            walk_items(
+                src,
+                file,
+                child,
+                depth + 1,
+                parent,
+                in_impl,
+                in_test_mod,
+                fg,
+            );
             pending_doc.clear();
             pending_attrs.clear();
         }
@@ -437,7 +466,9 @@ fn is_cfg_test_attribute(attr_text: &str) -> bool {
         .trim_end_matches(']')
         .trim();
     let compact: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
-    let Some(rest) = compact.strip_prefix("cfg(") else { return false };
+    let Some(rest) = compact.strip_prefix("cfg(") else {
+        return false;
+    };
     rest.split(['(', ')', ',']).any(|tok| tok == "test")
 }
 
@@ -491,7 +522,9 @@ fn rust_visibility(node: Node) -> Visibility {
 /// Synthesize a readable name for an `impl` block: `impl Foo` or
 /// `impl Trait for Foo`.
 fn impl_name(src: &str, node: Node) -> Option<String> {
-    let ty = node.child_by_field_name("type").map(|n| node_text(src, n))?;
+    let ty = node
+        .child_by_field_name("type")
+        .map(|n| node_text(src, n))?;
     if let Some(tr) = node.child_by_field_name("trait").map(|n| node_text(src, n)) {
         Some(format!("impl {tr} for {ty}"))
     } else {
@@ -614,7 +647,11 @@ fn push_call(src: &str, file: &str, at: Node, callee: &str, from_id: &str, fg: &
         // Extracted if `callee` is defined in this same file.
         confidence: Confidence::Inferred,
     });
-    fg.edges.push(Edge::new(EdgeKind::Call, from_id.to_string(), callee.to_string()));
+    fg.edges.push(Edge::new(
+        EdgeKind::Call,
+        from_id.to_string(),
+        callee.to_string(),
+    ));
 }
 
 /// The 1-based **character** column of `node`'s start. F26: tree-sitter's
@@ -624,8 +661,15 @@ fn push_call(src: &str, file: &str, at: Node, callee: &str, from_id: &str, fg: &
 /// counting chars from the line start fixes it. `line` (the row) is unaffected.
 pub(crate) fn char_col(src: &str, node: Node) -> u32 {
     let start = node.start_byte();
-    let line_start = src.get(..start).and_then(|s| s.rfind('\n')).map(|i| i + 1).unwrap_or(0);
-    src.get(line_start..start).map(|s| s.chars().count() as u32).unwrap_or(0) + 1
+    let line_start = src
+        .get(..start)
+        .and_then(|s| s.rfind('\n'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    src.get(line_start..start)
+        .map(|s| s.chars().count() as u32)
+        .unwrap_or(0)
+        + 1
 }
 
 /// Rust macros (`println!`, `assert_eq!`, `vec!`, `tokio::select!`, …) wrap their
@@ -639,7 +683,14 @@ pub(crate) fn char_col(src: &str, node: Node) -> u32 {
 /// The zero-gap adjacency check excludes a nested macro invocation `inner!(…)`
 /// (a `!` sits between the name and its tree) and generic turbofish calls, both
 /// of which would otherwise be mis-attributed. Recurses into nested token trees.
-fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, depth: u32, from_id: &str, fg: &mut FileGraph) {
+fn collect_rust_macro_calls(
+    src: &str,
+    file: &str,
+    tree: Node,
+    depth: u32,
+    from_id: &str,
+    fg: &mut FileGraph,
+) {
     if depth > MAX_WALK_DEPTH {
         return;
     }
@@ -660,8 +711,10 @@ fn collect_rust_macro_calls(src: &str, file: &str, tree: Node, depth: u32, from_
                         // call. Rust functions are snake_case, so a PascalCase
                         // initial marks the common false positives — skip them
                         // (real snake_case calls like `foo()`/`bar()` are kept).
-                        let is_ctor_like =
-                            callee.chars().find(|c| c.is_alphabetic()).is_some_and(char::is_uppercase);
+                        let is_ctor_like = callee
+                            .chars()
+                            .find(|c| c.is_alphabetic())
+                            .is_some_and(char::is_uppercase);
                         if !callee.is_empty() && !is_ctor_like {
                             push_call(src, file, *child, &callee, from_id, fg);
                         }
@@ -878,7 +931,10 @@ pub fn struct_search(
     use tree_sitter::StreamingIterator;
 
     let language = language_for(lang).ok_or_else(|| {
-        format!("structural search isn't supported for language `{}`", lang.tag())
+        format!(
+            "structural search isn't supported for language `{}`",
+            lang.tag()
+        )
     })?;
     let query = tree_sitter::Query::new(&language, pattern)
         .map_err(|e| format!("invalid tree-sitter query: {e}"))?;
@@ -940,7 +996,16 @@ fn parse_js_ts(src: &str, file: &str, lang: Lang, fg: &mut FileGraph) {
         return;
     };
     let file_is_test = js_is_test_file(file);
-    walk_js(src, file, tree.root_node(), 0, None, false, file_is_test, fg);
+    walk_js(
+        src,
+        file,
+        tree.root_node(),
+        0,
+        None,
+        false,
+        file_is_test,
+        fg,
+    );
 }
 
 /// Whether `file`'s path marks every definition in it as a test, by the common
@@ -952,7 +1017,9 @@ fn parse_js_ts(src: &str, file: &str, lang: Lang, fg: &mut FileGraph) {
 fn js_is_test_file(file: &str) -> bool {
     let lower = file.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
-    name.contains(".test.") || name.contains(".spec.") || lower.split('/').any(|seg| seg == "__tests__")
+    name.contains(".test.")
+        || name.contains(".spec.")
+        || lower.split('/').any(|seg| seg == "__tests__")
 }
 
 /// Recursive JS/TS item walk: declarations (functions, classes, methods,
@@ -998,31 +1065,81 @@ fn walk_js(
         // a bare top-level declaration is module-private. Methods nested in a
         // class stay Private (reachable via their class, never a dead export).
         let exported = kind == "export_statement";
-        let vis = if exported { Visibility::Public } else { Visibility::Private };
+        let vis = if exported {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
 
         if let Some((name, skind)) = js_def_name_kind(src, def_node, in_class) {
             let doc = take_doc(&mut pending_doc);
-            let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, file_is_test, fg);
+            let id = emit_symbol(
+                src,
+                file,
+                def_node,
+                &name,
+                skind,
+                parent,
+                doc,
+                vis,
+                file_is_test,
+                fg,
+            );
             if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                 collect_calls_in(src, file, def_node, depth + 1, &id, CallSyntax::Js, fg);
             }
-            let child_in_class = matches!(def_node.kind(), "class_declaration" | "abstract_class_declaration");
-            walk_js(src, file, def_node, depth + 1, Some(&id), child_in_class, file_is_test, fg);
+            let child_in_class = matches!(
+                def_node.kind(),
+                "class_declaration" | "abstract_class_declaration"
+            );
+            walk_js(
+                src,
+                file,
+                def_node,
+                depth + 1,
+                Some(&id),
+                child_in_class,
+                file_is_test,
+                fg,
+            );
             pending_doc.clear();
-        } else if matches!(def_node.kind(), "lexical_declaration" | "variable_declaration") {
+        } else if matches!(
+            def_node.kind(),
+            "lexical_declaration" | "variable_declaration"
+        ) {
             // `const foo = () => {…}` / `const bar = function(){}` → a function.
             let doc = take_doc(&mut pending_doc);
-            emit_js_var_functions(src, file, def_node, depth + 1, parent, doc, vis, file_is_test, fg);
+            emit_js_var_functions(
+                src,
+                file,
+                def_node,
+                depth + 1,
+                parent,
+                doc,
+                vis,
+                file_is_test,
+                fg,
+            );
             pending_doc.clear();
         } else if kind == "import_statement" {
             if let Some(srcpath) = js_import_source(src, child) {
-                fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), srcpath));
+                fg.edges
+                    .push(Edge::new(EdgeKind::Import, file.to_string(), srcpath));
             }
             pending_doc.clear();
         } else {
             // Descend into wrappers (export of a name list, statement blocks,
             // class bodies, namespaces) keeping the enclosing symbol/parent.
-            walk_js(src, file, def_node, depth + 1, parent, in_class, file_is_test, fg);
+            walk_js(
+                src,
+                file,
+                def_node,
+                depth + 1,
+                parent,
+                in_class,
+                file_is_test,
+                fg,
+            );
             pending_doc.clear();
         }
     }
@@ -1058,7 +1175,8 @@ pub(crate) fn emit_symbol(
         is_test,
     });
     if let Some(p) = parent {
-        fg.edges.push(Edge::new(EdgeKind::Contains, p.to_string(), id.clone()));
+        fg.edges
+            .push(Edge::new(EdgeKind::Contains, p.to_string(), id.clone()));
     }
     // V11 Phase G: a semantic *code* chunk for this symbol (doc + body), keyed by
     // the symbol's own id. The node text already begins with the signature line,
@@ -1090,7 +1208,8 @@ pub(crate) fn emit_symbol(
             anchor: name.to_string(),
             text,
         });
-        fg.edges.push(Edge::new(EdgeKind::Documents, cid, id.clone()));
+        fg.edges
+            .push(Edge::new(EdgeKind::Documents, cid, id.clone()));
     }
     id
 }
@@ -1133,7 +1252,9 @@ fn take_doc(pending: &mut Vec<String>) -> Option<String> {
 fn js_def_name_kind(src: &str, node: Node, in_class: bool) -> Option<(String, SymbolKind)> {
     let named = |field: &str| node.child_by_field_name(field).map(|n| node_text(src, n));
     let pair = match node.kind() {
-        "function_declaration" | "generator_function_declaration" => (named("name")?, SymbolKind::Function),
+        "function_declaration" | "generator_function_declaration" => {
+            (named("name")?, SymbolKind::Function)
+        }
         "method_definition" => (named("name")?, SymbolKind::Method),
         "class_declaration" | "abstract_class_declaration" => (named("name")?, SymbolKind::Class),
         "interface_declaration" => (named("name")?, SymbolKind::Interface),
@@ -1166,14 +1287,32 @@ fn emit_js_var_functions(
         if d.kind() != "variable_declarator" {
             continue;
         }
-        let Some(value) = d.child_by_field_name("value") else { continue };
-        if !matches!(value.kind(), "arrow_function" | "function" | "function_expression" | "generator_function") {
+        let Some(value) = d.child_by_field_name("value") else {
+            continue;
+        };
+        if !matches!(
+            value.kind(),
+            "arrow_function" | "function" | "function_expression" | "generator_function"
+        ) {
             continue;
         }
-        let Some(name) = d.child_by_field_name("name").map(|n| node_text(src, n)) else { continue };
+        let Some(name) = d.child_by_field_name("name").map(|n| node_text(src, n)) else {
+            continue;
+        };
         // Only the first declarator gets the leading doc-comment.
         let this_doc = if first { doc.clone() } else { None };
-        let id = emit_symbol(src, file, d, &name, SymbolKind::Function, parent, this_doc, vis, file_is_test, fg);
+        let id = emit_symbol(
+            src,
+            file,
+            d,
+            &name,
+            SymbolKind::Function,
+            parent,
+            this_doc,
+            vis,
+            file_is_test,
+            fg,
+        );
         collect_calls_in(src, file, value, depth + 1, &id, CallSyntax::Js, fg);
         first = false;
     }
@@ -1205,7 +1344,9 @@ fn js_callee_name(src: &str, call: Node) -> Option<String> {
 
 /// The module specifier of an `import_statement` (the quoted source), unquoted.
 fn js_import_source(src: &str, node: Node) -> Option<String> {
-    let s = node.child_by_field_name("source").map(|n| node_text(src, n))?;
+    let s = node
+        .child_by_field_name("source")
+        .map(|n| node_text(src, n))?;
     Some(s.trim().trim_matches(['"', '\'', '`']).to_string())
 }
 
@@ -1240,14 +1381,26 @@ fn js_doc_text(src: &str, node: Node) -> Option<String> {
 
 fn parse_python(src: &str, file: &str, fg: &mut FileGraph) {
     let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_python::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
         return;
     }
     let Some(tree) = parser.parse(src, None) else {
         return;
     };
     let file_is_test_path = py_is_test_file(file);
-    walk_py(src, file, tree.root_node(), 0, None, false, file_is_test_path, fg);
+    walk_py(
+        src,
+        file,
+        tree.root_node(),
+        0,
+        None,
+        false,
+        file_is_test_path,
+        fg,
+    );
 }
 
 /// Whether `file`'s path matches the pytest test-file convention:
@@ -1291,7 +1444,10 @@ fn walk_py(
         };
         match def_node.kind() {
             "function_definition" | "class_definition" => {
-                let Some(name) = def_node.child_by_field_name("name").map(|n| node_text(src, n)) else {
+                let Some(name) = def_node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(src, n))
+                else {
                     continue;
                 };
                 let skind = if def_node.kind() == "class_definition" {
@@ -1306,19 +1462,40 @@ fn walk_py(
                 let is_test = file_is_test_path
                     && matches!(skind, SymbolKind::Function | SymbolKind::Method)
                     && name.starts_with("test_");
-                let id = emit_symbol(src, file, def_node, &name, skind, parent, doc, vis, is_test, fg);
+                let id = emit_symbol(
+                    src, file, def_node, &name, skind, parent, doc, vis, is_test, fg,
+                );
                 if matches!(skind, SymbolKind::Function | SymbolKind::Method) {
                     collect_calls_in(src, file, def_node, depth + 1, &id, CallSyntax::Python, fg);
                 }
                 let child_in_class = def_node.kind() == "class_definition";
-                walk_py(src, file, def_node, depth + 1, Some(&id), child_in_class, file_is_test_path, fg);
+                walk_py(
+                    src,
+                    file,
+                    def_node,
+                    depth + 1,
+                    Some(&id),
+                    child_in_class,
+                    file_is_test_path,
+                    fg,
+                );
             }
             "import_statement" | "import_from_statement" => {
                 for m in py_import_modules(src, def_node) {
-                    fg.edges.push(Edge::new(EdgeKind::Import, file.to_string(), m));
+                    fg.edges
+                        .push(Edge::new(EdgeKind::Import, file.to_string(), m));
                 }
             }
-            _ => walk_py(src, file, def_node, depth + 1, parent, in_class, file_is_test_path, fg),
+            _ => walk_py(
+                src,
+                file,
+                def_node,
+                depth + 1,
+                parent,
+                in_class,
+                file_is_test_path,
+                fg,
+            ),
         }
     }
 }
@@ -1439,7 +1616,11 @@ mod tests {
     }
 
     fn vis_of(fg: &FileGraph, name: &str) -> Visibility {
-        fg.symbols.iter().find(|s| s.name == name).unwrap().visibility
+        fg.symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .visibility
     }
 
     fn is_test_of(fg: &FileGraph, name: &str) -> bool {
@@ -1468,7 +1649,8 @@ mod tests {
 
     #[test]
     fn python_underscore_visibility_classified() {
-        let src = "def public_fn():\n    pass\ndef _helper():\n    pass\ndef __dunder__():\n    pass\n";
+        let src =
+            "def public_fn():\n    pass\ndef _helper():\n    pass\ndef __dunder__():\n    pass\n";
         let fg = parse_file("src/v.py", src, Lang::Python);
         assert_eq!(vis_of(&fg, "public_fn"), Visibility::Public);
         assert_eq!(vis_of(&fg, "_helper"), Visibility::Private);
@@ -1490,11 +1672,15 @@ mod tests {
     #[test]
     fn is_test_attribute_handles_cfg_attr() {
         // F28: a conditional `#[cfg_attr(<pred>, test)]` applies `test`.
-        assert!(is_test_attribute("#[cfg_attr(feature = \"integration\", test)]"));
+        assert!(is_test_attribute(
+            "#[cfg_attr(feature = \"integration\", test)]"
+        ));
         assert!(is_test_attribute("#[cfg_attr(unix, tokio::test)]"));
         // A bare `test` in the PREDICATE (not the applied attr) must not match.
         assert!(!is_test_attribute("#[cfg_attr(all(test), Serialize)]"));
-        assert!(!is_test_attribute("#[cfg_attr(feature = \"x\", derive(Debug))]"));
+        assert!(!is_test_attribute(
+            "#[cfg_attr(feature = \"x\", derive(Debug))]"
+        ));
         // Plain forms still work.
         assert!(is_test_attribute("#[test]"));
         assert!(is_test_attribute("#[tokio::test]"));
@@ -1508,7 +1694,10 @@ mod tests {
         let src = "fn outer() {}\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n    #[test]\n    fn it_works() {}\n}\n";
         let fg = parse_file("src/t.rs", src, Lang::Rust);
         assert!(!is_test_of(&fg, "outer"));
-        assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(test)] mod is a test");
+        assert!(
+            is_test_of(&fg, "helper"),
+            "plain fn inside #[cfg(test)] mod is a test"
+        );
         assert!(is_test_of(&fg, "it_works"));
     }
 
@@ -1520,7 +1709,10 @@ mod tests {
         let src = "fn outer() {}\n#[cfg(any(test, feature = \"x\"))]\nmod tests {\n    fn helper() {}\n}\n";
         let fg = parse_file("src/t.rs", src, Lang::Rust);
         assert!(!is_test_of(&fg, "outer"));
-        assert!(is_test_of(&fg, "helper"), "plain fn inside #[cfg(any(test, ...))] mod is a test");
+        assert!(
+            is_test_of(&fg, "helper"),
+            "plain fn inside #[cfg(any(test, ...))] mod is a test"
+        );
     }
 
     #[test]
@@ -1547,8 +1739,14 @@ mod tests {
     #[test]
     fn js_spec_and_dunder_tests_dir_marks_test_file() {
         let src = "function checkThing() { return 1; }\n";
-        assert!(is_test_of(&parse_file("src/thing.spec.js", src, Lang::JavaScript), "checkThing"));
-        assert!(is_test_of(&parse_file("__tests__/thing.js", src, Lang::JavaScript), "checkThing"));
+        assert!(is_test_of(
+            &parse_file("src/thing.spec.js", src, Lang::JavaScript),
+            "checkThing"
+        ));
+        assert!(is_test_of(
+            &parse_file("__tests__/thing.js", src, Lang::JavaScript),
+            "checkThing"
+        ));
     }
 
     #[test]
@@ -1581,7 +1779,10 @@ mod tests {
         let src = "package main\n\nfunc TestAdd(t *T) {\n    helper()\n}\n\nfunc helper() {}\n";
         let fg = parse_file("pkg/math_test.go", src, Lang::Go);
         assert!(is_test_of(&fg, "TestAdd"));
-        assert!(is_test_of(&fg, "helper"), "every fn in a _test.go file is a candidate test");
+        assert!(
+            is_test_of(&fg, "helper"),
+            "every fn in a _test.go file is a candidate test"
+        );
 
         // The same source in a non-test-named Go file gets no test bit.
         let fg2 = parse_file("pkg/math.go", src, Lang::Go);
@@ -1644,9 +1845,10 @@ pub trait Shape {
         assert!(add.signature.contains("fn add"));
 
         // `add` calls `helper`.
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call
-            && e.src == add.id
-            && e.dst == "helper"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
 
         // The file imports the HashMap path.
         assert!(fg
@@ -1657,9 +1859,10 @@ pub trait Shape {
         // Containment: the impl contains `origin`.
         let impl_sym = fg.symbols.iter().find(|s| s.name == "impl Point").unwrap();
         let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Contains
-            && e.src == impl_sym.id
-            && e.dst == origin.id));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Contains && e.src == impl_sym.id && e.dst == origin.id));
     }
 
     #[test]
@@ -1675,7 +1878,11 @@ pub trait Shape {
         let pad = "α".repeat(MAX_SIGNATURE); // each 'α' is 2 bytes
         let src = format!("/// doc\npub fn ɸunc_{pad}() {{}}\n");
         let fg = parse_file("src/u.rs", &src, Lang::Rust);
-        let f = fg.symbols.iter().find(|s| s.name.starts_with("ɸunc_")).unwrap();
+        let f = fg
+            .symbols
+            .iter()
+            .find(|s| s.name.starts_with("ɸunc_"))
+            .unwrap();
         // Capped to MAX_SIGNATURE chars (not bytes), and valid UTF-8.
         assert!(f.signature.chars().count() <= MAX_SIGNATURE);
     }
@@ -1783,12 +1990,21 @@ export class Point {
         assert_eq!(add.doc.as_deref(), Some("Adds two numbers."));
 
         // `add` calls `helper`; the file imports './host'.
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "./host"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Import && e.dst == "./host"));
         // class Point contains method origin.
         let point = fg.symbols.iter().find(|s| s.name == "Point").unwrap();
         let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Contains && e.src == point.id && e.dst == origin.id));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Contains && e.src == point.id && e.dst == origin.id));
     }
 
     #[test]
@@ -1799,7 +2015,10 @@ export class Point {
         assert!(names(&fg, SymbolKind::Function).contains(&"go".to_string()));
         assert!(names(&fg, SymbolKind::Function).contains(&"f".to_string()));
         let go = fg.symbols.iter().find(|s| s.name == "go").unwrap();
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == go.id && e.dst == "run"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Call && e.src == go.id && e.dst == "run"));
     }
 
     const PY: &str = r#"
@@ -1851,11 +2070,23 @@ class Point:
         let add = fg.symbols.iter().find(|s| s.name == "add").unwrap();
         assert_eq!(add.doc.as_deref(), Some("Adds two numbers."));
         // add calls helper; imports os + pkg.sub; origin calls getcwd (attr).
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "os"));
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Import && e.dst == "pkg.sub"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Call && e.src == add.id && e.dst == "helper"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Import && e.dst == "os"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Import && e.dst == "pkg.sub"));
         let origin = fg.symbols.iter().find(|s| s.name == "origin").unwrap();
-        assert!(fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == origin.id && e.dst == "getcwd"));
+        assert!(fg
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Call && e.src == origin.id && e.dst == "getcwd"));
     }
 
     #[test]
@@ -1892,7 +2123,8 @@ class Point:
         // F1 (JS): an inline arrow callback is not its own symbol, so its calls
         // fold into the enclosing function; a `const f = () => …` still gets its
         // own attribution (no double count).
-        let src = "function outer() {\n  [1].forEach((x) => { helper(x); });\n}\nfunction helper(x) {}\n";
+        let src =
+            "function outer() {\n  [1].forEach((x) => { helper(x); });\n}\nfunction helper(x) {}\n";
         let fg = parse_file("src/a.js", src, Lang::JavaScript);
         let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
         assert!(
@@ -1943,19 +2175,34 @@ fn a() {}
             .map(|e| e.dst.as_str())
             .collect();
         // Grouped `use` → one edge per module (not one literal `{…}` string).
-        assert!(imports.contains(&"std::collections::HashMap"), "{imports:?}");
-        assert!(imports.contains(&"std::collections::HashSet"), "{imports:?}");
+        assert!(
+            imports.contains(&"std::collections::HashMap"),
+            "{imports:?}"
+        );
+        assert!(
+            imports.contains(&"std::collections::HashSet"),
+            "{imports:?}"
+        );
         // Aliased `use` → the path, with the alias dropped.
         assert!(imports.contains(&"std::io::Write"), "{imports:?}");
-        assert!(!imports.iter().any(|p| p.contains(" as ")), "alias must be dropped: {imports:?}");
+        assert!(
+            !imports.iter().any(|p| p.contains(" as ")),
+            "alias must be dropped: {imports:?}"
+        );
         // Glob `use` → the module itself, no trailing `*`.
         assert!(imports.contains(&"crate::foo"), "{imports:?}");
-        assert!(!imports.iter().any(|p| p.contains('*')), "no glob star: {imports:?}");
+        assert!(
+            !imports.iter().any(|p| p.contains('*')),
+            "no glob star: {imports:?}"
+        );
         // `self` in a group → the module itself.
         assert!(imports.contains(&"serde"), "{imports:?}");
         assert!(imports.contains(&"serde::Serialize"), "{imports:?}");
         // Nothing left unexpanded.
-        assert!(!imports.iter().any(|p| p.contains('{')), "no unexpanded group: {imports:?}");
+        assert!(
+            !imports.iter().any(|p| p.contains('{')),
+            "no unexpanded group: {imports:?}"
+        );
     }
 
     #[test]
@@ -1974,12 +2221,16 @@ fn compute() -> i32 { 0 }
         let fg = parse_file("src/a.rs", src, Lang::Rust);
         let outer = fg.symbols.iter().find(|s| s.name == "outer").unwrap();
         assert!(
-            fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "compute"),
+            fg.edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Call && e.src == outer.id && e.dst == "compute"),
             "real snake_case call must still be recovered"
         );
         for bogus in ["Some", "Ok", "Foo", "Bar"] {
             assert!(
-                !fg.edges.iter().any(|e| e.kind == EdgeKind::Call && e.dst == bogus),
+                !fg.edges
+                    .iter()
+                    .any(|e| e.kind == EdgeKind::Call && e.dst == bogus),
                 "PascalCase `{bogus}` (a pattern/constructor) must not be a call edge"
             );
         }
@@ -1995,10 +2246,16 @@ fn compute() -> i32 { 0 }
             .iter()
             .filter(|e| e.kind == EdgeKind::Call && e.src == a.id && e.dst == "log")
             .count();
-        assert_eq!(log_edges, 1, "three calls to log() collapse to one Call edge");
+        assert_eq!(
+            log_edges, 1,
+            "three calls to log() collapse to one Call edge"
+        );
         // The three distinct call sites (different columns) remain as references.
         let log_refs = fg.references.iter().filter(|r| r.name == "log").count();
-        assert_eq!(log_refs, 3, "distinct call sites stay as distinct references");
+        assert_eq!(
+            log_refs, 3,
+            "distinct call sites stay as distinct references"
+        );
     }
 
     #[test]

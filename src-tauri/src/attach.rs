@@ -236,8 +236,7 @@ mod tests {
         // standard-library-adjacent way to set an arbitrary mtime,
         // including on directories, cross-platform.
         let ancient = SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60);
-        filetime::set_file_mtime(&old_dir, filetime::FileTime::from_system_time(ancient))
-            .unwrap();
+        filetime::set_file_mtime(&old_dir, filetime::FileTime::from_system_time(ancient)).unwrap();
 
         prune(3);
 
@@ -271,7 +270,11 @@ mod tests {
             path.exists(),
             "reserve_path must touch a placeholder so next_index sees it"
         );
-        assert_eq!(fs::read(&path).unwrap().len(), 0, "placeholder starts empty");
+        assert_eq!(
+            fs::read(&path).unwrap().len(),
+            0,
+            "placeholder starts empty"
+        );
         assert_eq!(path.file_name().unwrap().to_str().unwrap(), "0.png");
 
         let _ = fs::remove_dir_all(dir);
@@ -321,10 +324,17 @@ mod tests {
         let p1 = t1.join().unwrap();
         let p2 = t2.join().unwrap();
 
-        assert_ne!(p1, p2, "concurrent save_png calls must not collide on the same path");
+        assert_ne!(
+            p1, p2,
+            "concurrent save_png calls must not collide on the same path"
+        );
         let dir = attach_dir(&session);
         let entries: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(entries.len(), 2, "both concurrent writes must land as separate files");
+        assert_eq!(
+            entries.len(),
+            2,
+            "both concurrent writes must land as separate files"
+        );
 
         // Both payloads must be intact (neither overwrote the other).
         let contents: std::collections::HashSet<Vec<u8>> = entries

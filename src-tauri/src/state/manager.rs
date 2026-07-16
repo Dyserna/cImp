@@ -77,6 +77,12 @@ pub enum TabId {
     /// Same shape as [`Self::GraphMonitor`] — Shell-kind, reserved identity, no
     /// PTY, app-rendered. Materialized iff `code_audit.enabled`.
     CodeAudit,
+    /// V25: the read-only, non-closable Code Quality tab (language-gated
+    /// linters / dead-code / spell-check — the Quality half of the audit
+    /// registry). Same shape as [`Self::CodeAudit`] — Shell-kind, reserved
+    /// identity, no PTY, app-rendered. Materialized iff `code_audit.enabled`
+    /// (one feature flag covers both audit tabs in v1).
+    CodeQuality,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -100,6 +106,7 @@ impl TabId {
             TabId::GraphView => "graph-view",
             TabId::ToolActivity => "tool-activity",
             TabId::CodeAudit => "code-audit",
+            TabId::CodeQuality => "code-quality",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -117,6 +124,7 @@ impl TabId {
             "graph-view" => TabId::GraphView,
             "tool-activity" => TabId::ToolActivity,
             "code-audit" => TabId::CodeAudit,
+            "code-quality" => TabId::CodeQuality,
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
             // `create_ai_tab`). They must round-trip back to `Ai`, not
             // `Shell`, so they keep AI-kind behavior on relaunch. The
@@ -140,10 +148,7 @@ impl TabId {
     /// builder) branch without threading a separate metadata table.
     pub fn kind(&self) -> TabKind {
         match self {
-            TabId::Claude
-            | TabId::ClaudeLocal
-            | TabId::OpenCode
-            | TabId::Ai(_) => TabKind::AiTool,
+            TabId::Claude | TabId::ClaudeLocal | TabId::OpenCode | TabId::Ai(_) => TabKind::AiTool,
             // The Offload Server tab reuses Shell-kind for processing/state
             // purposes (it never runs a PTY, so this is inert), keeping it off
             // the per-kind match explosion. Its read-only behavior is keyed
@@ -154,7 +159,8 @@ impl TabId {
             | TabId::Workbench
             | TabId::GraphView
             | TabId::ToolActivity
-            | TabId::CodeAudit => TabKind::Shell,
+            | TabId::CodeAudit
+            | TabId::CodeQuality => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -181,6 +187,7 @@ impl TabId {
                 | TabId::GraphView
                 | TabId::ToolActivity
                 | TabId::CodeAudit
+                | TabId::CodeQuality
         )
     }
 
@@ -258,9 +265,13 @@ pub struct ErrorInfo {
 impl ErrorInfo {
     fn from_signal(s: &StateSignal) -> Option<Self> {
         let (kind, message) = match s {
-            StateSignal::SubprocessExited { .. } => (ErrorKind::SubprocessExited, "Subprocess stopped."),
+            StateSignal::SubprocessExited { .. } => {
+                (ErrorKind::SubprocessExited, "Subprocess stopped.")
+            }
             StateSignal::TtsError { .. } => (ErrorKind::TtsError, "Text-to-speech is unavailable."),
-            StateSignal::AudioError { .. } => (ErrorKind::AudioError, "Audio output is unavailable."),
+            StateSignal::AudioError { .. } => {
+                (ErrorKind::AudioError, "Audio output is unavailable.")
+            }
             _ => return None,
         };
         Some(Self {
@@ -311,74 +322,125 @@ pub enum AvatarState {
 /// and the per-signal route step in the run loop, never in tight loops.
 #[derive(Debug, Clone)]
 pub enum StateSignal {
-    UserKeystroke { tab: TabId },
-    UserSubmit { tab: TabId },
-    ClaudeOutputStarted { tab: TabId },
-    ClaudeOutputStopped { tab: TabId },
+    UserKeystroke {
+        tab: TabId,
+    },
+    UserSubmit {
+        tab: TabId,
+    },
+    ClaudeOutputStarted {
+        tab: TabId,
+    },
+    ClaudeOutputStopped {
+        tab: TabId,
+    },
     /// Out-of-band (transcript): the count of in-flight `Task` sub-agents for
     /// `tab` crossed the zero boundary. `active: true` when Claude launches
     /// one or more agents and none had been running; `active: false` when the
     /// last outstanding agent's result lands. Holds the avatar in Thinking
     /// while agents run so a marker blink between agent batches can't settle it
     /// to Idle. Emitted by `oob::claude`, which tails the transcript JSONL.
-    AgentsActiveChanged { tab: TabId, active: bool },
-    TtsPlaybackStarted { tab: TabId },
-    TtsPlaybackStopped { tab: TabId },
+    AgentsActiveChanged {
+        tab: TabId,
+        active: bool,
+    },
+    TtsPlaybackStarted {
+        tab: TabId,
+    },
+    TtsPlaybackStopped {
+        tab: TabId,
+    },
     /// A selection-read (Ctrl+right-click) crossed a sentence boundary in
     /// playback. `index` is the chunk now starting to play; `index ==
     /// chunk_count` is the end-of-session sentinel. Pure pass-through — the
     /// state machine does not mutate any `TabState`, it just re-emits this as
     /// `StateEvent::TtsSelectionProgress` so the frontend can advance the
     /// read-along highlight. `session` lets the frontend ignore stale reads.
-    TtsSelectionProgress { tab: TabId, session: u64, index: u32 },
+    TtsSelectionProgress {
+        tab: TabId,
+        session: u64,
+        index: u32,
+    },
     /// Subprocess for `tab` exited with the given exit code (`None` if the
     /// child wait returned an error, or if we synthesize the signal from a
     /// spawn-time failure where there is no process to exit). Phase 4 routes
     /// this per-kind: AI tabs go to Error, Shell tabs go to the closed
     /// sub-state with the code surfaced in the overlay.
-    SubprocessExited { tab: TabId, code: Option<i32> },
-    AudioError { tab: TabId },
-    TtsError { tab: TabId },
-    ErrorAcknowledged { tab: TabId },
+    SubprocessExited {
+        tab: TabId,
+        code: Option<i32>,
+    },
+    AudioError {
+        tab: TabId,
+    },
+    TtsError {
+        tab: TabId,
+    },
+    ErrorAcknowledged {
+        tab: TabId,
+    },
     /// Compose-overlay textarea content crossed the empty/non-empty edge.
     /// Always routed to the active tab (compose targets whoever is on
     /// screen).
-    ComposeContentChanged { tab: TabId, non_empty: bool },
+    ComposeContentChanged {
+        tab: TabId,
+        non_empty: bool,
+    },
     /// User activated a tab (click or Ctrl+N). Updates `active` and
     /// broadcasts so the frontend can swap avatar/terminal visuals.
-    TabActivated { tab: TabId },
+    TabActivated {
+        tab: TabId,
+    },
     /// Permission detector saw a known prompt pattern in the rendered tail.
     /// Sets `awaiting_permission` on the tab; does NOT drive the avatar
     /// state machine.
-    PermissionPromptDetected { tab: TabId },
+    PermissionPromptDetected {
+        tab: TabId,
+    },
     /// Permission detector observed the previously-matched pattern leave the
     /// rendered tail. Clears `awaiting_permission`.
-    PermissionPromptResolved { tab: TabId },
+    PermissionPromptResolved {
+        tab: TabId,
+    },
     /// Detector saw a question-pattern match in the rendered tail (e.g.
     /// Claude Code's AskUserQuestion multi-option prompt). Sets
     /// `awaiting_question` on the tab; mirrors the permission path but
     /// drives a separate notification template.
-    QuestionPromptDetected { tab: TabId },
+    QuestionPromptDetected {
+        tab: TabId,
+    },
     /// Detector observed the previously-matched question pattern leave the
     /// rendered tail. Clears `awaiting_question`.
-    QuestionPromptResolved { tab: TabId },
+    QuestionPromptResolved {
+        tab: TabId,
+    },
     /// A Shell tab's subprocess has been (re)spawned after a previous exit.
     /// Clears the `closed` flag and emits `TabClosedStateChanged { closed:
     /// false }`. AI tabs don't use this — they have no closed sub-state.
-    ShellRestarted { tab: TabId },
+    ShellRestarted {
+        tab: TabId,
+    },
     /// A new tab has been registered with the runtime (M2's
     /// `create_shell_tab`). The state manager allocates a `TabState`
     /// entry, an input-length counter, and emits `StateEvent::TabCreated`
     /// so the frontend mirrors the addition into its tabs store.
-    TabAdded { meta: TabMeta, position: usize },
+    TabAdded {
+        meta: TabMeta,
+        position: usize,
+    },
     /// A tab has been removed from the runtime (M2's `close_tab`). The
     /// state manager drops its `TabState`, drops the input-length counter,
     /// and emits `StateEvent::TabClosed`.
-    TabRemoved { tab: TabId },
+    TabRemoved {
+        tab: TabId,
+    },
     /// A tab's display name was changed (M2's `rename_tab` /
     /// `reconfigure_shell_tab`). The state manager updates its name and
     /// emits `StateEvent::TabRenamed`.
-    TabRenameRequested { tab: TabId, name: String },
+    TabRenameRequested {
+        tab: TabId,
+        name: String,
+    },
     /// A Shell tab's spawn failed at launch in a way that is not a runtime
     /// crash — typically the configured command no longer resolves on PATH
     /// or its file no longer exists. Routes the tab to the closed sub-
@@ -386,7 +448,10 @@ pub enum StateSignal {
     /// place of "Shell exited (code N)". M3 of v3 fires this from the
     /// registry's start path when `build_launch_spec` returns a
     /// `CommandNotFound`.
-    ShellLaunchFailed { tab: TabId, message: String },
+    ShellLaunchFailed {
+        tab: TabId,
+        message: String,
+    },
 }
 
 impl StateSignal {
@@ -428,15 +493,33 @@ impl StateSignal {
 // to satisfy the lint would break the frontend contract.
 #[allow(clippy::enum_variant_names)]
 pub enum StateEvent {
-    StateChanged { tab: TabId, state: AvatarState },
-    ActiveTabChanged { tab: TabId },
+    StateChanged {
+        tab: TabId,
+        state: AvatarState,
+    },
+    ActiveTabChanged {
+        tab: TabId,
+    },
     /// Read-along progress for a Ctrl+right-click selection read. `index` is
     /// the sentence chunk now beginning playback; `index == chunk_count`
     /// signals the whole selection finished. Wire tag: `tts-selection-progress`.
-    TtsSelectionProgress { tab: TabId, session: u64, index: u32 },
-    AwaitingPermissionChanged { tab: TabId, awaiting: bool },
-    AwaitingQuestionChanged { tab: TabId, awaiting: bool },
-    DoneWhileAwayChanged { tab: TabId, done: bool },
+    TtsSelectionProgress {
+        tab: TabId,
+        session: u64,
+        index: u32,
+    },
+    AwaitingPermissionChanged {
+        tab: TabId,
+        awaiting: bool,
+    },
+    AwaitingQuestionChanged {
+        tab: TabId,
+        awaiting: bool,
+    },
+    DoneWhileAwayChanged {
+        tab: TabId,
+        done: bool,
+    },
     /// Shell tab's `closed` UI flag flipped. `closed: true` is fired when
     /// the subprocess exits; `closed: false` when the user restarts it.
     /// `exit_code` is `None` for spawn-time failures or for `closed: false`
@@ -465,10 +548,15 @@ pub enum StateEvent {
     /// A tab was removed from the runtime. Frontend drops it from the tabs
     /// store; per-tab cached state (avatar, error, closed-state) is also
     /// dropped on this edge.
-    TabClosed { tab: TabId },
+    TabClosed {
+        tab: TabId,
+    },
     /// A tab's display name was updated. Triggered by both `rename_tab` and
     /// `reconfigure_shell_tab` when the latter's `name` field changed.
-    TabRenamed { tab: TabId, name: String },
+    TabRenamed {
+        tab: TabId,
+        name: String,
+    },
 }
 
 /// Wire-format projection of `TabKind` for the `TabCreated` event. The
@@ -1160,11 +1248,23 @@ fn transition(
         (Thinking, TtsPlaybackStarted { .. }) => Speaking,
         // Output stopped, but hold Thinking while sub-agents are still running
         // — their results haven't landed, so the turn isn't done.
-        (Thinking, ClaudeOutputStopped { .. }) => if agents_active { Thinking } else { Idle },
+        (Thinking, ClaudeOutputStopped { .. }) => {
+            if agents_active {
+                Thinking
+            } else {
+                Idle
+            }
+        }
         // The last agent finished (or a crash cleared the flag). Settle to Idle
         // only if Claude isn't also mid-output; otherwise stay Thinking and let
         // the eventual ClaudeOutputStopped release it.
-        (Thinking, AgentsActiveChanged { .. }) => if still_working { Thinking } else { Idle },
+        (Thinking, AgentsActiveChanged { .. }) => {
+            if still_working {
+                Thinking
+            } else {
+                Idle
+            }
+        }
         (Thinking, _) => Thinking,
 
         (Listening, UserSubmit { .. }) => Thinking,
@@ -1219,7 +1319,11 @@ fn emit_awaiting_permission(
     tab: TabId,
     awaiting: bool,
 ) {
-    dispatch(app, bcast, StateEvent::AwaitingPermissionChanged { tab, awaiting });
+    dispatch(
+        app,
+        bcast,
+        StateEvent::AwaitingPermissionChanged { tab, awaiting },
+    );
 }
 
 fn emit_awaiting_question(
@@ -1228,7 +1332,11 @@ fn emit_awaiting_question(
     tab: TabId,
     awaiting: bool,
 ) {
-    dispatch(app, bcast, StateEvent::AwaitingQuestionChanged { tab, awaiting });
+    dispatch(
+        app,
+        bcast,
+        StateEvent::AwaitingQuestionChanged { tab, awaiting },
+    );
 }
 
 fn emit_done_while_away(
@@ -1282,11 +1390,7 @@ fn emit_tab_created(
     );
 }
 
-fn emit_tab_closed_event(
-    app: &AppHandle,
-    bcast: &broadcast::Sender<StateEvent>,
-    tab: TabId,
-) {
+fn emit_tab_closed_event(app: &AppHandle, bcast: &broadcast::Sender<StateEvent>, tab: TabId) {
     dispatch(app, bcast, StateEvent::TabClosed { tab });
 }
 
@@ -1399,7 +1503,16 @@ mod tests {
     #[test]
     fn errors_interrupt_any_state() {
         for s in [Idle, Listening, Thinking, Speaking] {
-            assert_eq!(t(s, SubprocessExited { tab: tab(), code: None }), Error);
+            assert_eq!(
+                t(
+                    s,
+                    SubprocessExited {
+                        tab: tab(),
+                        code: None
+                    }
+                ),
+                Error
+            );
             assert_eq!(t(s, AudioError { tab: tab() }), Error);
             assert_eq!(t(s, TtsError { tab: tab() }), Error);
         }
@@ -1408,7 +1521,13 @@ mod tests {
     #[test]
     fn idle_compose_non_empty_listens() {
         assert_eq!(
-            t(Idle, ComposeContentChanged { tab: tab(), non_empty: true }),
+            t(
+                Idle,
+                ComposeContentChanged {
+                    tab: tab(),
+                    non_empty: true
+                }
+            ),
             Listening,
         );
     }
@@ -1416,7 +1535,13 @@ mod tests {
     #[test]
     fn idle_compose_empty_stays_idle() {
         assert_eq!(
-            t(Idle, ComposeContentChanged { tab: tab(), non_empty: false }),
+            t(
+                Idle,
+                ComposeContentChanged {
+                    tab: tab(),
+                    non_empty: false
+                }
+            ),
             Idle
         );
     }
@@ -1424,11 +1549,23 @@ mod tests {
     #[test]
     fn compose_does_not_preempt_higher_states() {
         assert_eq!(
-            t(Thinking, ComposeContentChanged { tab: tab(), non_empty: true }),
+            t(
+                Thinking,
+                ComposeContentChanged {
+                    tab: tab(),
+                    non_empty: true
+                }
+            ),
             Thinking,
         );
         assert_eq!(
-            t(Speaking, ComposeContentChanged { tab: tab(), non_empty: true }),
+            t(
+                Speaking,
+                ComposeContentChanged {
+                    tab: tab(),
+                    non_empty: true
+                }
+            ),
             Speaking,
         );
     }
@@ -1487,7 +1624,13 @@ mod tests {
         // Last agent's result landed (agents_active already flipped false in the
         // caller) and Claude isn't mid-output — settle to Idle.
         assert_eq!(
-            t(Thinking, AgentsActiveChanged { tab: tab(), active: false }),
+            t(
+                Thinking,
+                AgentsActiveChanged {
+                    tab: tab(),
+                    active: false
+                }
+            ),
             Idle
         );
     }
@@ -1497,7 +1640,13 @@ mod tests {
         // Agents done but Claude is streaming its final answer — stay Thinking
         // and let the eventual ClaudeOutputStopped release to Idle.
         assert_eq!(
-            t_with_output(Thinking, AgentsActiveChanged { tab: tab(), active: false }),
+            t_with_output(
+                Thinking,
+                AgentsActiveChanged {
+                    tab: tab(),
+                    active: false
+                }
+            ),
             Thinking
         );
     }
@@ -1506,7 +1655,13 @@ mod tests {
     fn agents_launching_from_idle_surfaces_thinking() {
         // Out-of-band agent signal beat the marker while Idle — show Thinking.
         assert_eq!(
-            t(Idle, AgentsActiveChanged { tab: tab(), active: true }),
+            t(
+                Idle,
+                AgentsActiveChanged {
+                    tab: tab(),
+                    active: true
+                }
+            ),
             Thinking
         );
     }
@@ -1553,6 +1708,7 @@ mod tests {
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
             TabId::CodeAudit,
+            TabId::CodeQuality,
         ] {
             let s = serde_json::to_string(&id).unwrap();
             let back: TabId = serde_json::from_str(&s).unwrap();
@@ -1574,6 +1730,22 @@ mod tests {
         assert_eq!(TabId::CodeAudit.kind(), TabKind::Shell);
         assert!(TabId::CodeAudit.is_reserved_dashboard());
         assert!(TabId::CodeAudit.is_builtin());
+    }
+
+    #[test]
+    fn code_quality_tab_is_a_reserved_dashboard() {
+        // V25: the Code Quality tab mirrors Code Audit — round-trips through its
+        // wire string, maps to Shell-kind, and is a reserved/non-closable
+        // builtin.
+        assert_eq!(TabId::from_str("code-quality"), TabId::CodeQuality);
+        assert_eq!(TabId::CodeQuality.as_str(), "code-quality");
+        assert_eq!(
+            serde_json::to_string(&TabId::CodeQuality).unwrap(),
+            "\"code-quality\""
+        );
+        assert_eq!(TabId::CodeQuality.kind(), TabKind::Shell);
+        assert!(TabId::CodeQuality.is_reserved_dashboard());
+        assert!(TabId::CodeQuality.is_builtin());
     }
 
     #[test]

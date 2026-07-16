@@ -3,14 +3,15 @@
 // (`../settings/ipc`) since the Settings section owns it.
 
 import { invoke } from '@tauri-apps/api/core';
-import type { AuditSnapshot } from './types';
+import type { AuditCategory, AuditSnapshot } from './types';
 
-/// Start a scan of the project root with all enabled + resolvable tools,
-/// concurrently. Returns immediately; progress streams via the `audit-status`
-/// event. Rejects (typed error string the UI surfaces) when a scan is already
-/// in flight or no tool is enabled.
-export async function auditStartScan(): Promise<void> {
-  await invoke('audit_start_scan');
+/// Start a scan of the project root with the enabled + applicable + resolvable
+/// tools of `category` (`'security'` / `'quality'`), concurrently. Returns
+/// immediately; progress streams via the `audit-status` event. Rejects (typed
+/// error string the UI surfaces) when a scan is already in flight (one at a time
+/// globally, either category) or no tool of `category` is enabled.
+export async function auditStartScan(category: AuditCategory): Promise<void> {
+  await invoke('audit_start_scan', { category });
 }
 
 /// Cancel the in-flight scan (kills the running tool children; already-completed

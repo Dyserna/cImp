@@ -166,28 +166,116 @@ struct MigrationStep {
 /// the `_shell_1_tmp` interim key). The rest accept it via the uniform
 /// signature and ignore it.
 const MIGRATION_STEPS: &[MigrationStep] = &[
-    MigrationStep { from_version: "v1.0", detect: looks_v1, transform: migrate_v1_to_v1_2 },
-    MigrationStep { from_version: "v1.1", detect: looks_v1_1, transform: migrate_v1_1_to_v1_2 },
-    MigrationStep { from_version: "v1.2", detect: looks_v1_2, transform: migrate_v1_2_to_v1_3_step },
-    MigrationStep { from_version: "v1.3", detect: looks_v1_3, transform: migrate_v1_3_to_v1_4_step },
-    MigrationStep { from_version: "v1.4", detect: looks_v1_4, transform: migrate_v1_4_to_v1_5_step },
-    MigrationStep { from_version: "v1.5", detect: looks_v1_5, transform: migrate_v1_5_to_v1_6_step },
-    MigrationStep { from_version: "v1.6", detect: looks_v1_6, transform: migrate_v1_6_to_v1_7_step },
-    MigrationStep { from_version: "v1.7", detect: looks_v1_7, transform: migrate_v1_7_to_v1_8_step },
-    MigrationStep { from_version: "v1.8", detect: looks_v1_8, transform: migrate_v1_8_to_v1_9_step },
-    MigrationStep { from_version: "v1.9", detect: looks_v1_9, transform: migrate_v1_9_to_v1_10_step },
-    MigrationStep { from_version: "v1.10", detect: looks_v1_10, transform: migrate_v1_10_to_v1_11_step },
-    MigrationStep { from_version: "v1.11", detect: looks_v1_11, transform: migrate_v1_11_to_v1_12_step },
-    MigrationStep { from_version: "v1.12", detect: looks_v1_12, transform: migrate_v1_12_to_v1_13_step },
-    MigrationStep { from_version: "v1.13", detect: looks_v1_13, transform: migrate_v1_13_to_v1_14_step },
-    MigrationStep { from_version: "v1.14", detect: looks_v1_14, transform: migrate_v1_14_to_v1_15_step },
-    MigrationStep { from_version: "v1.15", detect: looks_v1_15, transform: migrate_v1_15_to_v1_16_step },
-    MigrationStep { from_version: "v1.16", detect: looks_v1_16, transform: migrate_v1_16_to_v1_17_step },
-    MigrationStep { from_version: "v1.17", detect: looks_v1_17, transform: migrate_v1_17_to_v1_18_step },
-    MigrationStep { from_version: "v18", detect: looks_v18, transform: migrate_v18_to_v19_step },
-    MigrationStep { from_version: "v19", detect: looks_v19, transform: migrate_v19_to_v20_step },
-    MigrationStep { from_version: "v20", detect: looks_v20, transform: migrate_v20_to_v21_step },
-    MigrationStep { from_version: "v21", detect: looks_v21, transform: migrate_v21_to_v22_step },
+    MigrationStep {
+        from_version: "v1.0",
+        detect: looks_v1,
+        transform: migrate_v1_to_v1_2,
+    },
+    MigrationStep {
+        from_version: "v1.1",
+        detect: looks_v1_1,
+        transform: migrate_v1_1_to_v1_2,
+    },
+    MigrationStep {
+        from_version: "v1.2",
+        detect: looks_v1_2,
+        transform: migrate_v1_2_to_v1_3_step,
+    },
+    MigrationStep {
+        from_version: "v1.3",
+        detect: looks_v1_3,
+        transform: migrate_v1_3_to_v1_4_step,
+    },
+    MigrationStep {
+        from_version: "v1.4",
+        detect: looks_v1_4,
+        transform: migrate_v1_4_to_v1_5_step,
+    },
+    MigrationStep {
+        from_version: "v1.5",
+        detect: looks_v1_5,
+        transform: migrate_v1_5_to_v1_6_step,
+    },
+    MigrationStep {
+        from_version: "v1.6",
+        detect: looks_v1_6,
+        transform: migrate_v1_6_to_v1_7_step,
+    },
+    MigrationStep {
+        from_version: "v1.7",
+        detect: looks_v1_7,
+        transform: migrate_v1_7_to_v1_8_step,
+    },
+    MigrationStep {
+        from_version: "v1.8",
+        detect: looks_v1_8,
+        transform: migrate_v1_8_to_v1_9_step,
+    },
+    MigrationStep {
+        from_version: "v1.9",
+        detect: looks_v1_9,
+        transform: migrate_v1_9_to_v1_10_step,
+    },
+    MigrationStep {
+        from_version: "v1.10",
+        detect: looks_v1_10,
+        transform: migrate_v1_10_to_v1_11_step,
+    },
+    MigrationStep {
+        from_version: "v1.11",
+        detect: looks_v1_11,
+        transform: migrate_v1_11_to_v1_12_step,
+    },
+    MigrationStep {
+        from_version: "v1.12",
+        detect: looks_v1_12,
+        transform: migrate_v1_12_to_v1_13_step,
+    },
+    MigrationStep {
+        from_version: "v1.13",
+        detect: looks_v1_13,
+        transform: migrate_v1_13_to_v1_14_step,
+    },
+    MigrationStep {
+        from_version: "v1.14",
+        detect: looks_v1_14,
+        transform: migrate_v1_14_to_v1_15_step,
+    },
+    MigrationStep {
+        from_version: "v1.15",
+        detect: looks_v1_15,
+        transform: migrate_v1_15_to_v1_16_step,
+    },
+    MigrationStep {
+        from_version: "v1.16",
+        detect: looks_v1_16,
+        transform: migrate_v1_16_to_v1_17_step,
+    },
+    MigrationStep {
+        from_version: "v1.17",
+        detect: looks_v1_17,
+        transform: migrate_v1_17_to_v1_18_step,
+    },
+    MigrationStep {
+        from_version: "v18",
+        detect: looks_v18,
+        transform: migrate_v18_to_v19_step,
+    },
+    MigrationStep {
+        from_version: "v19",
+        detect: looks_v19,
+        transform: migrate_v19_to_v20_step,
+    },
+    MigrationStep {
+        from_version: "v20",
+        detect: looks_v20,
+        transform: migrate_v20_to_v21_step,
+    },
+    MigrationStep {
+        from_version: "v21",
+        detect: looks_v21,
+        transform: migrate_v21_to_v22_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -518,7 +606,9 @@ fn migrate_v1_1_to_v1_2(value: &mut Value, default_shell: &ShellSpec) {
         .get("claude")
         .filter(|v| v.is_object())
         .map(|v| transform_ai_tool_entry(v, AiToolBuiltin::Claude))
-        .unwrap_or_else(|| serde_json::to_value(default_claude_tab()).expect("encode claude default"));
+        .unwrap_or_else(|| {
+            serde_json::to_value(default_claude_tab()).expect("encode claude default")
+        });
     new_tabs.push(claude_entry);
 
     let aider_entry = old_tabs
@@ -965,7 +1055,10 @@ fn migrate_v1_6_to_v1_7(value: &mut Value) {
         }),
     );
 
-    if let Some(bg) = terminal.get_mut("background").and_then(Value::as_object_mut) {
+    if let Some(bg) = terminal
+        .get_mut("background")
+        .and_then(Value::as_object_mut)
+    {
         bg.entry("preview_category_flips")
             .or_insert(Value::Bool(true));
     }
@@ -1029,11 +1122,11 @@ fn migrate_v1_7_to_v1_8(value: &mut Value) {
                 .or_insert(Value::Bool(false));
 
             if was_aider {
+                obj.insert("id".to_string(), Value::String("claude-local".to_string()));
                 obj.insert(
-                    "id".to_string(),
-                    Value::String("claude-local".to_string()),
+                    "name".to_string(),
+                    Value::String("Claude (local)".to_string()),
                 );
-                obj.insert("name".to_string(), Value::String("Claude (local)".to_string()));
                 obj.insert("command".to_string(), Value::String("claude".to_string()));
                 obj.insert("args".to_string(), Value::Array(Vec::new()));
                 obj.insert("use_local_provider".to_string(), Value::Bool(true));
@@ -1060,7 +1153,11 @@ fn migrate_v1_7_to_v1_8(value: &mut Value) {
                             "Aider is awaiting permission",
                             "Claude (local) is awaiting permission",
                         ),
-                        ("error", "Aider encountered an error", "Claude (local) encountered an error"),
+                        (
+                            "error",
+                            "Aider encountered an error",
+                            "Claude (local) encountered an error",
+                        ),
                     ];
                     for (field, from_text, to_text) in canonical_aider {
                         if notifs.get(field).and_then(Value::as_str) == Some(from_text) {
@@ -1217,9 +1314,7 @@ fn migrate_v1_10_to_v1_11(value: &mut Value) {
     };
     if let Some(tabs) = root.get_mut("tabs").and_then(Value::as_array_mut) {
         for tab in tabs {
-            if let Some(notifications) = tab
-                .get_mut("notifications")
-                .and_then(Value::as_object_mut)
+            if let Some(notifications) = tab.get_mut("notifications").and_then(Value::as_object_mut)
             {
                 let keys: Vec<String> = notifications.keys().cloned().collect();
                 for key in keys {
@@ -1380,8 +1475,7 @@ fn migrate_v1_14_to_v1_15(value: &mut Value) {
 
     if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
         let already_present = tabs.iter().any(|t| {
-            t.get("id").and_then(Value::as_str)
-                == Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
+            t.get("id").and_then(Value::as_str) == Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
         });
         if !already_present {
             tabs.push(json!({
@@ -1433,8 +1527,7 @@ fn migrate_v1_15_to_v1_16(value: &mut Value) {
 
     if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
         tabs.retain(|t| {
-            t.get("id").and_then(Value::as_str)
-                != Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
+            t.get("id").and_then(Value::as_str) != Some(crate::settings::schema::SHELL_BROOT_TAB_ID)
         });
     }
 
@@ -1622,7 +1715,11 @@ fn migrate_v18_to_v19(value: &mut Value) {
             let Some(obj) = tab.as_object_mut() else {
                 continue;
             };
-            let old_id = obj.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let old_id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if !is_legacy_aider_id(&old_id) {
                 continue;
             }
@@ -1690,7 +1787,10 @@ fn migrate_v18_to_v19(value: &mut Value) {
     rewrite_opencode_tab_ids(root);
 
     // 4. Remap + dedupe enabled_ai_tabs.
-    if let Some(enabled) = root.get_mut("enabled_ai_tabs").and_then(Value::as_array_mut) {
+    if let Some(enabled) = root
+        .get_mut("enabled_ai_tabs")
+        .and_then(Value::as_array_mut)
+    {
         for entry in enabled.iter_mut() {
             if entry.as_str().is_some_and(is_legacy_aider_id) {
                 *entry = Value::String("opencode".to_string());
@@ -1808,16 +1908,27 @@ fn migrate_v20_to_v21(value: &mut Value) {
 /// `filesystem`/`git` MCP servers). Frozen literal on purpose: this is the
 /// fingerprint the v21→v22 backfill matches on, so it must NOT track the live
 /// `schema::LOCAL_DATA_TOOLS` (which has since grown `list_dir`).
-const LOCAL_DATA_TOOLS_PRE_V22: &[&str] =
-    &["read_file", "code_search", "run_command", "filesystem", "git"];
+const LOCAL_DATA_TOOLS_PRE_V22: &[&str] = &[
+    "read_file",
+    "code_search",
+    "run_command",
+    "filesystem",
+    "git",
+];
 
 /// The local-data tool set as of schema v22 — the pre-v22 five plus `list_dir`
 /// (added in the V21 milestone WITHOUT a migration; this step backfills it).
 /// Frozen literal for the same reason as [`LOCAL_DATA_TOOLS_PRE_V22`]: any
 /// future addition to `schema::LOCAL_DATA_TOOLS` needs its own migration step,
 /// not a silent retroactive change to this one.
-const LOCAL_DATA_TOOLS_V22: &[&str] =
-    &["read_file", "list_dir", "code_search", "run_command", "filesystem", "git"];
+const LOCAL_DATA_TOOLS_V22: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "code_search",
+    "run_command",
+    "filesystem",
+    "git",
+];
 
 fn looks_v21(value: &Value) -> bool {
     value
@@ -2012,10 +2123,7 @@ fn write_backup(path: &Path, from_version: &str, value: &Value) -> AppResult<()>
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| AppError::Settings(format!("backup serialize: {e}")))?;
     crate::settings::write_atomic(&target, &bytes).map_err(|e| {
-        AppError::Settings(format!(
-            "backup write {} failed: {e}",
-            target.display()
-        ))
+        AppError::Settings(format!("backup write {} failed: {e}", target.display()))
     })?;
     tracing::info!(
         backup = %target.display(),
@@ -2152,7 +2260,11 @@ mod tests {
         // Both aider tabs collapse into ONE opencode tab (the first/cloud one's
         // config wins): claude + opencode, length 2.
         let tabs = v["tabs"].as_array().unwrap();
-        assert_eq!(tabs.len(), 2, "the two aider tabs collapse into one opencode");
+        assert_eq!(
+            tabs.len(),
+            2,
+            "the two aider tabs collapse into one opencode"
+        );
         assert_eq!(tabs[0]["id"], "claude");
         assert_eq!(tabs[1]["id"], "opencode");
         assert_eq!(tabs[1]["command"], "opencode");
@@ -2332,11 +2444,22 @@ mod tests {
 
         assert_eq!(v["schema_version"], json!(22));
         let tools = v.pointer("/offload/backends/0/tool_scope/tools").unwrap();
-        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
-        assert!(names.contains(&"list_dir"), "list_dir must be backfilled: {names:?}");
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"list_dir"),
+            "list_dir must be backfilled: {names:?}"
+        );
         // Every pre-existing exclusion is preserved.
         for name in LOCAL_DATA_TOOLS_PRE_V22 {
-            assert!(names.contains(name), "dropped pre-existing exclusion {name}");
+            assert!(
+                names.contains(name),
+                "dropped pre-existing exclusion {name}"
+            );
         }
         assert!(!looks_v21(&v));
     }
@@ -2378,7 +2501,10 @@ mod tests {
             &json!(["duckduckgo"]),
             "only-scope must not be touched"
         );
-        assert_eq!(v.pointer("/offload/backends/2/tool_scope/mode").unwrap(), "all");
+        assert_eq!(
+            v.pointer("/offload/backends/2/tool_scope/mode").unwrap(),
+            "all"
+        );
     }
 
     #[test]
@@ -2557,7 +2683,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(!looks_v1_2(&v), "schema_version-bearing file matched looks_v1_2");
+        assert!(
+            !looks_v1_2(&v),
+            "schema_version-bearing file matched looks_v1_2"
+        );
         assert!(!looks_v1_3(&v));
         assert!(!looks_v1_4(&v));
         assert!(!looks_v1_5(&v));
@@ -2574,10 +2703,9 @@ mod tests {
         // The guard must not break real pre-v1.10 files: a v1.2-shape file
         // (tabs array, no layout, no schema_version) must still enter the
         // cascade at v1.2.
-        let v: Value = serde_json::from_str(
-            r#"{ "tabs": [ { "kind": "ai_tool", "id": "claude" } ] }"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{ "tabs": [ { "kind": "ai_tool", "id": "claude" } ] }"#)
+                .unwrap();
         assert!(looks_v1_2(&v));
         assert_eq!(detect_entry_version(&v), Some("v1.2"));
     }
@@ -2760,10 +2888,7 @@ mod tests {
         assert!(term_theme.get("custom").unwrap().is_null());
 
         // display.theme dropped
-        assert!(v
-            .get("display")
-            .and_then(|d| d.get("theme"))
-            .is_none());
+        assert!(v.get("display").and_then(|d| d.get("theme")).is_none());
 
         // Every tab has theme_override: null
         let tabs = v.get("tabs").unwrap().as_array().unwrap();
@@ -3036,10 +3161,7 @@ mod tests {
         .unwrap();
         assert!(looks_v1_6(&v));
         migrate_v1_6_to_v1_7(&mut v);
-        let bg = v
-            .get("terminal")
-            .and_then(|t| t.get("background"))
-            .unwrap();
+        let bg = v.get("terminal").and_then(|t| t.get("background")).unwrap();
         assert_eq!(bg.get("preview_category_flips").unwrap(), false);
     }
 
@@ -3094,11 +3216,7 @@ mod tests {
         let entry = transform_shell_1_from_interim(&interim, &shell);
         assert_eq!(entry.get("name").unwrap(), "My Shell");
         assert_eq!(
-            entry
-                .get("notifications")
-                .unwrap()
-                .get("error")
-                .unwrap(),
+            entry.get("notifications").unwrap().get("error").unwrap(),
             "boom"
         );
     }
@@ -3246,7 +3364,12 @@ mod tests {
         assert_eq!(rewritten.get("id").unwrap(), "claude-local");
         assert_eq!(rewritten.get("name").unwrap(), "Claude (local)");
         assert_eq!(rewritten.get("command").unwrap(), "claude");
-        assert!(rewritten.get("args").unwrap().as_array().unwrap().is_empty());
+        assert!(rewritten
+            .get("args")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(rewritten.get("use_local_provider").unwrap(), true);
         // tts_injection re-enabled (V20: plain speak gate, no instructions).
         let tts = rewritten.get("tts_injection").unwrap();
@@ -3258,7 +3381,10 @@ mod tests {
             n.get("awaiting_permission").unwrap(),
             "Claude (local) is awaiting permission"
         );
-        assert_eq!(n.get("error").unwrap(), "Claude (local) encountered an error");
+        assert_eq!(
+            n.get("error").unwrap(),
+            "Claude (local) encountered an error"
+        );
     }
 
     #[test]
@@ -3305,11 +3431,7 @@ mod tests {
         assert_eq!(second.get("active_tab_id").unwrap(), "claude-local");
 
         // layout_presets[0].tree references rewritten.
-        let preset_tree = v
-            .get("layout_presets")
-            .unwrap()
-            .as_array()
-            .unwrap()[0]
+        let preset_tree = v.get("layout_presets").unwrap().as_array().unwrap()[0]
             .get("tree")
             .unwrap();
         let preset_tab_ids = preset_tree.get("tab_ids").unwrap().as_array().unwrap();
@@ -3576,10 +3698,7 @@ mod tests {
         assert_eq!(margin.get("y_px").unwrap(), 24);
         // V1.11 → V1.12 stamps the literal 12 (frozen — V1.13 added
         // a follow-on step that bumps to current).
-        assert_eq!(
-            v.get("schema_version").and_then(Value::as_u64),
-            Some(12)
-        );
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(12));
         assert!(!looks_v1_11(&v));
     }
 
@@ -3624,19 +3743,16 @@ mod tests {
         assert!(looks_v1_13(&v));
         migrate_v1_13_to_v1_14(&mut v);
         assert!(v.get("claude_tabs_enabled").is_none());
-        assert_eq!(
-            v.get("enabled_ai_tabs").unwrap(),
-            &json!(["claude"]),
-        );
+        assert_eq!(v.get("enabled_ai_tabs").unwrap(), &json!(["claude"]),);
         // This step stamps a literal 14 (the final v14 → v15 step bumps to
         // CURRENT_SCHEMA_VERSION); see the comment in migrate_v1_13_to_v1_14.
-        assert_eq!(
-            v.get("schema_version").and_then(Value::as_u64),
-            Some(14),
-        );
+        assert_eq!(v.get("schema_version").and_then(Value::as_u64), Some(14),);
         // aider_local defaults stamped.
         let aider_local = v.get("aider_local").unwrap();
-        assert_eq!(aider_local.get("base_url").unwrap(), "http://localhost:11434/v1");
+        assert_eq!(
+            aider_local.get("base_url").unwrap(),
+            "http://localhost:11434/v1"
+        );
         assert_eq!(aider_local.get("auth_token").unwrap(), "ollama");
         assert_eq!(aider_local.get("model").unwrap(), "");
         assert!(!looks_v1_13(&v));
@@ -3649,10 +3765,7 @@ mod tests {
             "claude_tabs_enabled": "local",
         });
         migrate_v1_13_to_v1_14(&mut v);
-        assert_eq!(
-            v.get("enabled_ai_tabs").unwrap(),
-            &json!(["claude-local"]),
-        );
+        assert_eq!(v.get("enabled_ai_tabs").unwrap(), &json!(["claude-local"]),);
     }
 
     #[test]

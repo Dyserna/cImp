@@ -24,8 +24,8 @@ mod windows_impl {
 
     use tauri::Webview;
     use tokio::sync::oneshot;
-    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
     use webview2_com::CapturePreviewCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
     use windows::core::HSTRING;
     use windows::Win32::System::Com::{STGM_CREATE, STGM_WRITE};
     use windows::Win32::UI::Shell::SHCreateStreamOnFileW;
@@ -73,8 +73,7 @@ mod windows_impl {
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         let dest_buf = dest.to_path_buf();
 
-        if let Err(e) = webview.with_webview(move |platform| capture_now(platform, &dest_buf, tx))
-        {
+        if let Err(e) = webview.with_webview(move |platform| capture_now(platform, &dest_buf, tx)) {
             cleanup_stray_file(dest);
             return Err(AppError::Preview(format!(
                 "capture: with_webview dispatch failed: {e}"
@@ -124,18 +123,17 @@ mod windows_impl {
         tx: oneshot::Sender<Result<(), String>>,
     ) {
         let path_wide = HSTRING::from(dest.to_string_lossy().as_ref());
-        let stream = match unsafe {
-            SHCreateStreamOnFileW(&path_wide, (STGM_CREATE | STGM_WRITE).0)
-        } {
-            Ok(stream) => stream,
-            Err(e) => {
-                let _ = tx.send(Err(format!(
-                    "SHCreateStreamOnFileW({}) failed: {e}",
-                    dest.display()
-                )));
-                return;
-            }
-        };
+        let stream =
+            match unsafe { SHCreateStreamOnFileW(&path_wide, (STGM_CREATE | STGM_WRITE).0) } {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let _ = tx.send(Err(format!(
+                        "SHCreateStreamOnFileW({}) failed: {e}",
+                        dest.display()
+                    )));
+                    return;
+                }
+            };
 
         let webview2 = match unsafe { platform.controller().CoreWebView2() } {
             Ok(w) => w,
@@ -157,9 +155,13 @@ mod windows_impl {
         // it) is simply dropped — the caller's `rx.await` then surfaces the
         // generic "closed before completing" error rather than this precise
         // one. Logged here so the specific COM failure isn't lost entirely.
-        if let Err(e) =
-            unsafe { webview2.CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, &stream, &handler) }
-        {
+        if let Err(e) = unsafe {
+            webview2.CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                &stream,
+                &handler,
+            )
+        } {
             tracing::warn!(error = %e, "preview capture: CapturePreview failed to issue");
         }
     }

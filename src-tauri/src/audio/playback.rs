@@ -58,7 +58,10 @@ enum AudioCommand {
     /// sentinel only once this has arrived AND the session's audio has drained
     /// — so a momentary gap between chunks (synthesis lagging playback on a
     /// cold read) is not mistaken for end-of-read.
-    SelectionFinished { session: u64, count: u32 },
+    SelectionFinished {
+        session: u64,
+        count: u32,
+    },
 }
 
 pub struct AudioOutput {
@@ -120,7 +123,13 @@ impl AudioOutput {
         match init_rx.recv() {
             Ok(Ok(())) => {
                 spawn_volume_subscriber(cmd_tx.clone(), settings);
-                Ok(Self { cmd_tx, amplitude, playing, paused, idle_notify })
+                Ok(Self {
+                    cmd_tx,
+                    amplitude,
+                    playing,
+                    paused,
+                    idle_notify,
+                })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(AppError::Audio("audio thread died during init".into())),
@@ -148,10 +157,11 @@ impl AudioOutput {
             warn!("audio: dropping chunk with zero sample rate");
             return;
         }
-        if let Err(e) = self
-            .cmd_tx
-            .send(AudioCommand::Enqueue { samples, sample_rate, mark })
-        {
+        if let Err(e) = self.cmd_tx.send(AudioCommand::Enqueue {
+            samples,
+            sample_rate,
+            mark,
+        }) {
             warn!(error = %e, "audio command channel closed; dropping samples");
         }
     }
@@ -197,19 +207,17 @@ impl AudioOutput {
     /// audio thread emit the read's "done" sentinel only after the audio truly
     /// drains (not on a between-chunk gap).
     pub fn selection_finished(&self, session: u64, count: u32) {
-        let _ = self.cmd_tx.send(AudioCommand::SelectionFinished { session, count });
+        let _ = self
+            .cmd_tx
+            .send(AudioCommand::SelectionFinished { session, count });
     }
-
 }
 
 /// Read the active-tab cell synchronously. Falls back to Claude on a
 /// poisoned lock — that's the v2 default and we only consult this on
 /// playback edges, so a benign default keeps the avatar pipeline alive.
 fn current_active(active: &ActiveTab) -> TabId {
-    active
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or(TabId::Claude)
+    active.read().map(|g| g.clone()).unwrap_or(TabId::Claude)
 }
 
 /// Mute folds into volume: muted means volume = 0, unmuted means the
@@ -321,7 +329,11 @@ fn run_audio_thread(
         let mut appended_this_tick = 0usize;
         if let Some(cmd) = cmd {
             match cmd {
-                AudioCommand::Enqueue { samples, sample_rate, mark } => {
+                AudioCommand::Enqueue {
+                    samples,
+                    sample_rate,
+                    mark,
+                } => {
                     let source = TappedSource::new(samples, sample_rate, amplitude.clone());
                     sink.append(source);
                     marks.push_back(mark);
@@ -497,7 +509,9 @@ fn run_audio_thread(
             }
         }
         if !now_speaking && speaking {
-            let tab = speaking_tab.clone().unwrap_or_else(|| current_active(&active));
+            let tab = speaking_tab
+                .clone()
+                .unwrap_or_else(|| current_active(&active));
             match state_signals.try_send(StateSignal::TtsPlaybackStopped { tab }) {
                 Ok(()) => {
                     speaking = false;

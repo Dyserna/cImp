@@ -465,7 +465,11 @@ impl LlamaServer {
         match n {
             Some(n) => {
                 self.n_ctx.store(n as u32, Ordering::Relaxed);
-                debug!(n_ctx = n, slots = self.cmd.parallel, "offload: discovered context window");
+                debug!(
+                    n_ctx = n,
+                    slots = self.cmd.parallel,
+                    "offload: discovered context window"
+                );
                 Ok(())
             }
             None => Err(AppError::Offload("/props did not report n_ctx".into())),
@@ -624,14 +628,21 @@ mod tests {
 
     #[test]
     fn derive_provider_missing_port_errors_naming_it() {
-        let err = derive_opencode_provider("llama-server -a m").unwrap_err().to_string();
+        let err = derive_opencode_provider("llama-server -a m")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--port"), "got: {err}");
-        assert!(!err.contains("model"), "port-only miss shouldn't name model: {err}");
+        assert!(
+            !err.contains("model"),
+            "port-only miss shouldn't name model: {err}"
+        );
     }
 
     #[test]
     fn derive_provider_missing_both_names_both() {
-        let err = derive_opencode_provider("llama-server --jinja").unwrap_err().to_string();
+        let err = derive_opencode_provider("llama-server --jinja")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--port"), "got: {err}");
         assert!(err.contains("--model/-m or --alias/-a"), "got: {err}");
     }

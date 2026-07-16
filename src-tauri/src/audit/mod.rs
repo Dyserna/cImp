@@ -11,8 +11,11 @@
 //! adapters, and the `audit-status` progress events.
 
 pub mod adapters;
+pub mod census;
+pub mod parsers;
 pub mod runner;
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,14 +78,17 @@ pub async fn audit_detect_tool(
             .map(|t| t.path.clone())
             .unwrap_or_default(),
     };
-    Ok(detect_tool(id, &override_path).await)
+    // The launch project root scopes project-local `node_modules/.bin`
+    // resolution (eslint/knip) so a Detect ✓ matches what a scan will launch.
+    let root = state.launch.cwd.clone();
+    Ok(detect_tool(id, &override_path, Some(&root)).await)
 }
 
 /// The command to resolve for a tool: the per-tool `path` override verbatim
 /// (trimmed), or the bare command name when the override is empty. The single
 /// definition of the override contract — the Detect probe AND the scan runner
-/// both go through here, so a ✓ from Detect can't disagree with what a scan
-/// actually launches.
+/// both go through [`resolve_audit_binary`], so a ✓ from Detect can't disagree
+/// with what a scan actually launches.
 fn effective_command(id: AuditToolId, override_path: &str) -> String {
     let p = override_path.trim();
     if p.is_empty() {
@@ -92,13 +98,77 @@ fn effective_command(id: AuditToolId, override_path: &str) -> String {
     }
 }
 
-/// The detection core, split out so tests can exercise it without a Tauri
-/// `State`. `override_path` is the tool's configured `path` (empty = resolve the
-/// bare command name via ebin → PATH; non-empty = used verbatim).
-async fn detect_tool(id: AuditToolId, override_path: &str) -> AuditDetectResult {
-    let name = effective_command(id, override_path);
+/// Resolve a tool's binary to an on-disk path. Resolution order (V25 Phase B):
+///
+/// 1. **Per-tool `path` override** (non-empty) — used verbatim (the V23
+///    contract): a deliberate "use exactly this binary" that project-local
+///    resolution must not second-guess.
+/// 2. **Project-local `node_modules/.bin`** — for a node tool that declares
+///    [`Adapter::project_local_bin`] (eslint, knip), the project's own install
+///    beats a global one. Only consulted when there is no override and a `root`
+///    is known.
+/// 3. **ebin → PATH** on the bare [`AuditToolId::command_name`].
+///
+/// Both the Detect probe and the scan runner go through here, so the two agree.
+/// `root` is the scan/launch project root (`None` when unavailable — e.g. a
+/// unit test — collapses to override-then-ebin/PATH).
+fn resolve_audit_binary(
+    id: AuditToolId,
+    override_path: &str,
+    root: Option<&Path>,
+) -> AppResult<PathBuf> {
+    if override_path.trim().is_empty() {
+        if let (Some(bin), Some(root)) = (adapters::adapter(id).project_local_bin, root) {
+            if let Some(local) = resolve_project_local_bin(root, bin) {
+                return Ok(local);
+            }
+        }
+    }
+    crate::pty::resolve_command(&effective_command(id, override_path))
+}
 
-    let resolved = match crate::pty::resolve_command(&name) {
+/// The first existing `node_modules/.bin/<name>` shim under `root`, or `None`.
+/// On Windows the runnable shim is the `.cmd`/`.CMD`/`.bat` launcher (the bare
+/// `<name>` is a POSIX shell script npm also drops that Windows can't spawn), so
+/// those are tried first — mirroring `pty::resolve`'s Windows extension order.
+fn resolve_project_local_bin(root: &Path, name: &str) -> Option<PathBuf> {
+    let bin_dir = root.join("node_modules").join(".bin");
+    for candidate in project_local_candidates(name) {
+        let p = bin_dir.join(&candidate);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Filenames to try for a project-local node bin shim.
+fn project_local_candidates(name: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            format!("{name}.cmd"),
+            format!("{name}.CMD"),
+            format!("{name}.bat"),
+            name.to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![name.to_string()]
+    }
+}
+
+/// The detection core, split out so tests can exercise it without a Tauri
+/// `State`. `override_path` is the tool's configured `path` (empty = resolve via
+/// project-local `node_modules/.bin` then ebin → PATH; non-empty = used
+/// verbatim). `root` scopes the project-local lookup (`None` = skip it).
+async fn detect_tool(
+    id: AuditToolId,
+    override_path: &str,
+    root: Option<&Path>,
+) -> AuditDetectResult {
+    let resolved = match resolve_audit_binary(id, override_path, root) {
         Ok(p) => p,
         Err(_) => {
             return AuditDetectResult {
@@ -146,7 +216,11 @@ async fn detect_tool(id: AuditToolId, override_path: &str) -> AuditDetectResult 
             version: None,
             error: Some(format!(
                 "--version probe exited with code {}{}",
-                output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+                output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
                 parse_version(&output.stderr, &output.stdout)
                     .map(|l| format!(": {l}"))
                     .unwrap_or_default()
@@ -186,14 +260,18 @@ fn parse_version(stdout: &[u8], stderr: &[u8]) -> Option<String> {
     first_line(stdout).or_else(|| first_line(stderr))
 }
 
-/// V23 Phase B: start a scan of the project root with all enabled + resolvable
-/// tools, concurrently. Returns immediately; progress streams via the
+/// V23 Phase B / V25 Phase C: start a scan of the project root with the enabled +
+/// applicable + resolvable tools of `category` (`"security"` / `"quality"`),
+/// concurrently. Returns immediately; progress streams via the
 /// [`AUDIT_STATUS_EVENT`] event and can be re-fetched with [`audit_snapshot`].
-/// Rejected (a typed error the UI surfaces) when a scan is already in flight or
-/// no tool is enabled.
+/// Rejected (a typed error the UI surfaces) when a scan is already in flight
+/// (one at a time globally, either category) or no tool of `category` is enabled.
 #[tauri::command]
-pub async fn audit_start_scan(state: State<'_, Arc<AuditState>>) -> AppResult<()> {
-    state.inner().start_scan().map_err(AppError::Audit)
+pub async fn audit_start_scan(
+    state: State<'_, Arc<AuditState>>,
+    category: adapters::Category,
+) -> AppResult<()> {
+    state.inner().start_scan(category).map_err(AppError::Audit)
 }
 
 /// V23 Phase B: cancel the in-flight scan (kills the running tool children;
@@ -227,14 +305,22 @@ mod tests {
             Some("gitleaks 8.18.0".to_string())
         );
         // Skips leading blank lines.
-        assert_eq!(parse_version(b"\n  \n", b"fallback 1.0"), Some("fallback 1.0".to_string()));
+        assert_eq!(
+            parse_version(b"\n  \n", b"fallback 1.0"),
+            Some("fallback 1.0".to_string())
+        );
         assert_eq!(parse_version(b"", b""), None);
     }
 
     #[tokio::test]
     async fn detect_missing_tool_reports_not_found() {
         // A bare name that is neither in ebin nor on PATH.
-        let r = detect_tool(AuditToolId::OsvScanner, "cimp-definitely-not-a-real-tool-xyz").await;
+        let r = detect_tool(
+            AuditToolId::OsvScanner,
+            "cimp-definitely-not-a-real-tool-xyz",
+            None,
+        )
+        .await;
         assert!(!r.found);
         assert!(r.path.is_none());
         assert_eq!(r.error.as_deref(), Some("not found on PATH or ebin"));
@@ -252,11 +338,17 @@ mod tests {
         let exe = which::which("where").expect("where on PATH");
         #[cfg(not(windows))]
         let exe = which::which("false").expect("false on PATH");
-        let r = detect_tool(AuditToolId::Gitleaks, &exe.display().to_string()).await;
+        let r = detect_tool(AuditToolId::Gitleaks, &exe.display().to_string(), None).await;
         assert!(!r.found, "{r:?}");
         assert!(r.path.is_some());
         assert!(r.version.is_none());
-        assert!(r.error.as_deref().unwrap_or("").contains("exited with code"), "{r:?}");
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("exited with code"),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]
@@ -265,9 +357,12 @@ mod tests {
         // verbatim override so the version probe actually runs end to end. The
         // adapter id is irrelevant to detection — only the resolved exe is run.
         let cargo = which::which("cargo").expect("cargo on PATH in the test env");
-        let r = detect_tool(AuditToolId::Semgrep, &cargo.display().to_string()).await;
+        let r = detect_tool(AuditToolId::Semgrep, &cargo.display().to_string(), None).await;
         assert!(r.found, "cargo override should resolve + probe: {r:?}");
         assert!(r.path.is_some());
-        assert!(r.version.is_some(), "cargo --version should yield a line: {r:?}");
+        assert!(
+            r.version.is_some(),
+            "cargo --version should yield a line: {r:?}"
+        );
     }
 }

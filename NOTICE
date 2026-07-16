@@ -76,26 +76,6 @@ Clawdmeter / Clawd sprites:
 
 ------------------------------------------------------------------------
 
-The portable Windows zip bundles third-party CLI tools in its `ebin/`
-folder (resolved before PATH; see src-tauri/src/pty/resolve.rs). These
-are unmodified upstream release binaries, downloaded at release time and
-redistributed under their own permissive licenses. Each remains the
-property of, and is licensed by, its respective authors.
-
-broot:
-  Copyright (c) Canop (Denys Séguret) and contributors
-  Source: https://github.com/Canop/broot
-  License: MIT — https://opensource.org/licenses/MIT
-
-rustnet:
-  Copyright (c) domcyrus and contributors
-  Source: https://github.com/domcyrus/rustnet
-  License: Apache License 2.0 — same text as cImp's own LICENSE file.
-  Note: rustnet requires Npcap (https://npcap.com/) installed on the
-  user's machine to capture network traffic; it is not bundled.
-
-------------------------------------------------------------------------
-
 Data-egress notice — cloud offload backends (V8-02).
 
 cImp's task-offload feature is local and offline by default: the model,

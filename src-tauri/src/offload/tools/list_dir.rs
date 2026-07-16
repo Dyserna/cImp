@@ -65,9 +65,13 @@ struct Entry {
 }
 
 pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
-    let args: Args = serde_json::from_value(args).map_err(|e| format!("invalid list_dir args: {e}"))?;
+    let args: Args =
+        serde_json::from_value(args).map_err(|e| format!("invalid list_dir args: {e}"))?;
     let root = ctx.confine(&args.path)?;
-    let depth = args.max_depth.unwrap_or(DEFAULT_DEPTH).clamp(MIN_DEPTH, MAX_DEPTH);
+    let depth = args
+        .max_depth
+        .unwrap_or(DEFAULT_DEPTH)
+        .clamp(MIN_DEPTH, MAX_DEPTH);
     let glob = args.glob.clone();
 
     // The directory walk is blocking — run it off the async runtime, like
@@ -110,7 +114,11 @@ fn walk(root: &Path, max_depth: u32, glob: Option<&str>) -> Result<Vec<Entry>, S
                 continue;
             }
             let path = entry.path();
-            let leaf = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let leaf = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             // Always skip `.git` — never listed, never descended.
             if leaf == ".git" {
                 continue;
@@ -133,7 +141,11 @@ fn walk(root: &Path, max_depth: u32, glob: Option<&str>) -> Result<Vec<Entry>, S
                 } else {
                     entry.metadata().map(|m| m.len()).unwrap_or(0)
                 };
-                out.push(Entry { name: rel, is_dir, size });
+                out.push(Entry {
+                    name: rel,
+                    is_dir,
+                    size,
+                });
             }
             if is_dir && level < max_depth {
                 stack.push((path, level + 1));
@@ -241,7 +253,8 @@ mod tests {
 
     /// A fresh, unique temp directory for a test to populate.
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cimp-list-dir-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("cimp-list-dir-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -299,9 +312,12 @@ mod tests {
         write(&root, "b.md", "");
         write(&root, "c.rs", "");
         let ctx = ctx_for(&root);
-        let out = execute(json!({ "path": root.to_string_lossy(), "glob": "*.md" }), &ctx)
-            .await
-            .unwrap();
+        let out = execute(
+            json!({ "path": root.to_string_lossy(), "glob": "*.md" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("(2 entries)"), "out: {out}");
         assert!(out.contains("a.md"));
         assert!(out.contains("b.md"));
@@ -325,17 +341,23 @@ mod tests {
         assert!(!d1.contains("nested.txt"));
 
         // Depth 2: adds sub/nested.txt and sub/deeper (but not deep.txt).
-        let d2 = execute(json!({ "path": root.to_string_lossy(), "max_depth": 2 }), &ctx)
-            .await
-            .unwrap();
+        let d2 = execute(
+            json!({ "path": root.to_string_lossy(), "max_depth": 2 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(d2.contains("sub/nested.txt"));
         assert!(d2.contains("sub/deeper/"));
         assert!(!d2.contains("deep.txt"));
 
         // Over-max clamps to 3, reaching deep.txt.
-        let d99 = execute(json!({ "path": root.to_string_lossy(), "max_depth": 99 }), &ctx)
-            .await
-            .unwrap();
+        let d99 = execute(
+            json!({ "path": root.to_string_lossy(), "max_depth": 99 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(d99.contains("sub/deeper/deep.txt"), "d99: {d99}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -346,9 +368,12 @@ mod tests {
         write(&root, ".git/config", "x");
         write(&root, "keep.txt", "");
         let ctx = ctx_for(&root);
-        let out = execute(json!({ "path": root.to_string_lossy(), "max_depth": 3 }), &ctx)
-            .await
-            .unwrap();
+        let out = execute(
+            json!({ "path": root.to_string_lossy(), "max_depth": 3 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("(1 entry)"), "out: {out}");
         assert!(out.contains("keep.txt"));
         assert!(!out.contains(".git"));
@@ -367,8 +392,16 @@ mod tests {
             .await
             .unwrap();
         // Header reports the true total (before capping).
-        assert!(out.contains(&format!("({total} entries)")), "header: {}", out.lines().next().unwrap());
-        assert!(out.contains("[result truncated"), "no marker: {}", out.lines().last().unwrap());
+        assert!(
+            out.contains(&format!("({total} entries)")),
+            "header: {}",
+            out.lines().next().unwrap()
+        );
+        assert!(
+            out.contains("[result truncated"),
+            "no marker: {}",
+            out.lines().last().unwrap()
+        );
         assert!(out.contains(&format!("showed {MAX_ENTRIES} of {total}")));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -392,7 +425,10 @@ mod tests {
         let outside = temp_root("confine-outside");
         let ctx = ctx_for(&root);
         let err = execute(json!({ "path": outside.to_string_lossy() }), &ctx).await;
-        assert!(err.is_err(), "expected absolute-outside path to be rejected: {err:?}");
+        assert!(
+            err.is_err(),
+            "expected absolute-outside path to be rejected: {err:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
     }
@@ -402,12 +438,16 @@ mod tests {
         let mut toggles = OffloadToolToggles::default();
         assert!(toggles.list_dir, "default should be on");
         assert!(
-            super::super::enabled_defs(&toggles).iter().any(|d| d.function.name == "list_dir"),
+            super::super::enabled_defs(&toggles)
+                .iter()
+                .any(|d| d.function.name == "list_dir"),
             "list_dir should be advertised when its toggle is on"
         );
         toggles.list_dir = false;
         assert!(
-            !super::super::enabled_defs(&toggles).iter().any(|d| d.function.name == "list_dir"),
+            !super::super::enabled_defs(&toggles)
+                .iter()
+                .any(|d| d.function.name == "list_dir"),
             "list_dir must not be advertised when its toggle is off"
         );
     }
@@ -417,9 +457,10 @@ mod tests {
         let root = temp_root("dispatch");
         write(&root, "hello.txt", "");
         let ctx = ctx_for(&root);
-        let out = super::super::dispatch("list_dir", json!({ "path": root.to_string_lossy() }), &ctx)
-            .await
-            .unwrap();
+        let out =
+            super::super::dispatch("list_dir", json!({ "path": root.to_string_lossy() }), &ctx)
+                .await
+                .unwrap();
         assert!(out.contains("hello.txt"), "dispatch did not route: {out}");
         std::fs::remove_dir_all(&root).ok();
     }

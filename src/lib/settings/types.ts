@@ -1008,6 +1008,11 @@ export interface GraphSettings {
   usage_color_tool: string;
   // V16 Feature 8: the cache-write segment's color.
   usage_color_write: string;
+  // V24 Phase C follow-up: the S/A lane colors — main-session and sub-agent
+  // segments under the chart (the agent color also tints the sub-agent
+  // bars' outline).
+  usage_color_session: string;
+  usage_color_agent: string;
 }
 
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
@@ -1047,10 +1052,25 @@ export interface ExternalToolsSettings {
   broot: string;
 }
 
-/// V23 Phase A: closed set of built-in audit tools (mirror of Rust
-/// `AuditToolId`). Wire format is kebab-case; an unknown id in a settings file
-/// is dropped backend-side (forward compat), never an error.
-export type AuditToolId = 'osv-scanner' | 'gitleaks' | 'semgrep';
+/// V23 Phase A / V25 Phase B: closed set of built-in audit tools (mirror of
+/// Rust `AuditToolId`). Wire format is kebab-case; an unknown id in a settings
+/// file is dropped backend-side (forward compat), never an error. The first
+/// three are the Security category; the rest are V25 Quality tools.
+export type AuditToolId =
+  | 'osv-scanner'
+  | 'gitleaks'
+  | 'semgrep'
+  | 'oxlint'
+  | 'golangci-lint'
+  | 'ruff'
+  | 'cppcheck'
+  | 'typos'
+  | 'eslint'
+  | 'pmd'
+  | 'dotnet-analyzers'
+  | 'knip'
+  | 'cargo-machete'
+  | 'semgrep-quality';
 
 /// V23 Phase A: one configured audit tool (mirror of Rust `AuditToolConfig`).
 /// `path` empty = resolve `ebin` → PATH; non-empty = used as the command
@@ -1060,6 +1080,11 @@ export interface AuditToolConfig {
   enabled: boolean;
   path: string;
   extra_args: string[];
+  /// V25 Phase C: per-tool wall-clock timeout override in seconds. `null` (the
+  /// default) falls back to the global `CodeAuditSettings.timeout_secs`. A
+  /// build-style tool wants a longer budget than a linter — `dotnet-analyzers`
+  /// is the motivating case (≈1200 recommended).
+  timeout_secs: number | null;
 }
 
 /// V23 Phase A: Code Audit (aggregated security scanning) config (mirror of
@@ -1626,6 +1651,8 @@ export function defaultSettings(): Settings {
       usage_color_out: '#3fb950',
       usage_color_tool: '#f0c674',
       usage_color_write: '#e3738d',
+      usage_color_session: '#30363d',
+      usage_color_agent: '#3b6ea5',
     },
     workbench: {
       enabled: true,
@@ -1665,9 +1692,23 @@ export function defaultSettings(): Settings {
     code_audit: {
       enabled: false,
       tools: [
-        { id: 'osv-scanner', enabled: true, path: '', extra_args: [] },
-        { id: 'gitleaks', enabled: true, path: '', extra_args: [] },
-        { id: 'semgrep', enabled: true, path: '', extra_args: [] },
+        // Security (V23).
+        { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'gitleaks', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'semgrep', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        // Quality (V25) — enabled by default.
+        { id: 'oxlint', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'golangci-lint', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'ruff', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'cppcheck', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'typos', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'eslint', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'pmd', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'knip', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'cargo-machete', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        // Quality — default-disabled.
+        { id: 'dotnet-analyzers', enabled: false, path: '', extra_args: [], timeout_secs: null },
+        { id: 'semgrep-quality', enabled: false, path: '', extra_args: [], timeout_secs: null },
       ],
       timeout_secs: 600,
     },

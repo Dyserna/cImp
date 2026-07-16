@@ -29,7 +29,13 @@ use super::{Diag, ParserKind, Severity};
 /// is only read by [`parse_regex_custom`] (the `regex-custom` escape hatch) —
 /// it's `CheckDef::pattern`, threaded through from [`super::run`]; every other
 /// arm ignores it.
-pub fn parse(kind: ParserKind, stdout: &str, stderr: &str, cwd: &Path, pattern: Option<&str>) -> Vec<Diag> {
+pub fn parse(
+    kind: ParserKind,
+    stdout: &str,
+    stderr: &str,
+    cwd: &Path,
+    pattern: Option<&str>,
+) -> Vec<Diag> {
     match kind {
         ParserKind::CargoJson => parse_cargo_json(stdout),
         ParserKind::EslintJson => parse_eslint_json(stdout),
@@ -43,7 +49,9 @@ pub fn parse(kind: ParserKind, stdout: &str, stderr: &str, cwd: &Path, pattern: 
         ParserKind::JunitXml => parse_junit_xml(stdout),
         ParserKind::Go => parse_go(&strip_ansi(stdout), &strip_ansi(stderr)),
         ParserKind::Dotnet => parse_dotnet(&strip_ansi(stdout), &strip_ansi(stderr)),
-        ParserKind::RegexCustom => parse_regex_custom(&strip_ansi(stdout), &strip_ansi(stderr), pattern),
+        ParserKind::RegexCustom => {
+            parse_regex_custom(&strip_ansi(stdout), &strip_ansi(stderr), pattern)
+        }
         ParserKind::GenericGcc => parse_generic_gcc(&strip_ansi(stdout), &strip_ansi(stderr)),
     }
 }
@@ -131,12 +139,23 @@ fn parse_cargo_json(stdout: &str) -> Vec<Diag> {
             "warning" => Severity::Warning,
             _ => Severity::Note,
         };
-        let span = diag.spans.iter().find(|s| s.is_primary).or_else(|| diag.spans.first());
+        let span = diag
+            .spans
+            .iter()
+            .find(|s| s.is_primary)
+            .or_else(|| diag.spans.first());
         let (file, line_no, col) = match span {
             Some(s) => (s.file_name.clone(), s.line_start, Some(s.column_start)),
             None => (String::new(), 0, None),
         };
-        out.push(Diag { severity, code: diag.code.map(|c| c.code), message: diag.message, file, line: line_no, col });
+        out.push(Diag {
+            severity,
+            code: diag.code.map(|c| c.code),
+            message: diag.message,
+            file,
+            line: line_no,
+            col,
+        });
     }
     out
 }
@@ -145,7 +164,9 @@ fn parse_cargo_json(stdout: &str) -> Vec<Diag> {
 
 fn tsc_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(.+)\((\d+),(\d+)\): (error|warning) (TS\d+): (.*)$").expect("valid regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"^(.+)\((\d+),(\d+)\): (error|warning) (TS\d+): (.*)$").expect("valid regex")
+    })
 }
 
 /// tsc's project-level diagnostics carry no `file(line,col):` prefix at all —
@@ -165,7 +186,11 @@ fn parse_tsc(stdout: &str, stderr: &str) -> Vec<Diag> {
         .chain(stderr.lines())
         .filter_map(|line| {
             if let Some(caps) = re.captures(line) {
-                let severity = if &caps[4] == "error" { Severity::Error } else { Severity::Warning };
+                let severity = if &caps[4] == "error" {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                };
                 return Some(Diag {
                     severity,
                     code: Some(caps[5].to_string()),
@@ -176,7 +201,11 @@ fn parse_tsc(stdout: &str, stderr: &str) -> Vec<Diag> {
                 });
             }
             let caps = global_re.captures(line)?;
-            let severity = if &caps[1] == "error" { Severity::Error } else { Severity::Warning };
+            let severity = if &caps[1] == "error" {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
             Some(Diag {
                 severity,
                 code: Some(caps[2].to_string()),
@@ -228,8 +257,19 @@ fn parse_eslint_json(stdout: &str) -> Vec<Diag> {
     let mut out = Vec::new();
     for f in files {
         for m in f.messages {
-            let severity = if m.severity >= 2 { Severity::Error } else { Severity::Warning };
-            out.push(Diag { severity, code: m.rule_id, message: m.message, file: f.file_path.clone(), line: m.line, col: m.column });
+            let severity = if m.severity >= 2 {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            out.push(Diag {
+                severity,
+                code: m.rule_id,
+                message: m.message,
+                file: f.file_path.clone(),
+                line: m.line,
+                col: m.column,
+            });
         }
     }
     out
@@ -252,9 +292,23 @@ fn parse_pytest(stdout: &str, stderr: &str) -> Vec<Diag> {
                 None => (rest, "test failed".to_string()),
             };
             let file = nodeid.split("::").next().unwrap_or(nodeid).to_string();
-            out.push(Diag { severity: Severity::Error, code: None, message, file, line: 0, col: None });
+            out.push(Diag {
+                severity: Severity::Error,
+                code: None,
+                message,
+                file,
+                line: 0,
+                col: None,
+            });
         } else if let Some(summary) = pytest_summary_line(line) {
-            out.push(Diag { severity: Severity::Note, code: None, message: summary.to_string(), file: String::new(), line: 0, col: None });
+            out.push(Diag {
+                severity: Severity::Note,
+                code: None,
+                message: summary.to_string(),
+                file: String::new(),
+                line: 0,
+                col: None,
+            });
         }
     }
     out
@@ -285,7 +339,9 @@ fn split_nodeid_reason(rest: &str) -> Option<(&str, &str)> {
 fn pytest_summary_line(line: &str) -> Option<&str> {
     let trimmed = line.trim_matches(|c: char| c == '=' || c.is_whitespace());
     let starts_with_digit = trimmed.chars().next().is_some_and(|c| c.is_ascii_digit());
-    let has_outcome = ["passed", "failed", "error", "skipped"].iter().any(|w| trimmed.contains(w));
+    let has_outcome = ["passed", "failed", "error", "skipped"]
+        .iter()
+        .any(|w| trimmed.contains(w));
     (starts_with_digit && has_outcome).then_some(trimmed)
 }
 
@@ -365,7 +421,9 @@ fn rustc_header_re() -> &'static Regex {
     // rustc's human diagnostic header: `error[E0308]: mismatched types` /
     // `warning: unused variable` — the code bracket is optional (lints and
     // `error: aborting due to …` carry none).
-    RE.get_or_init(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").expect("valid regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").expect("valid regex")
+    })
 }
 
 fn rustc_arrow_re() -> &'static Regex {
@@ -377,13 +435,20 @@ fn rustc_arrow_re() -> &'static Regex {
 /// `test tests::foo ... FAILED` ⇒ `Some("tests::foo")`. Only `FAILED` lines
 /// produce a diagnostic — `ok`/`ignored` don't.
 fn failed_test_name(line: &str) -> Option<&str> {
-    Some(line.strip_prefix("test ")?.strip_suffix(" ... FAILED")?.trim())
+    Some(
+        line.strip_prefix("test ")?
+            .strip_suffix(" ... FAILED")?
+            .trim(),
+    )
 }
 
 /// `---- tests::foo stdout ----` (or `stderr`) ⇒ `Some("tests::foo")`.
 fn stdout_block_name(line: &str) -> Option<&str> {
     let inner = line.strip_prefix("---- ")?.strip_suffix(" ----")?;
-    let name = inner.strip_suffix(" stdout").or_else(|| inner.strip_suffix(" stderr")).unwrap_or(inner);
+    let name = inner
+        .strip_suffix(" stdout")
+        .or_else(|| inner.strip_suffix(" stderr"))
+        .unwrap_or(inner);
     Some(name.trim())
 }
 
@@ -395,7 +460,10 @@ fn capture_block<'a>(lines: &[&'a str], start: usize) -> (Vec<&'a str>, usize) {
     let mut i = start;
     while i < lines.len() {
         let t = lines[i].trim();
-        if (t.starts_with("---- ") && t.ends_with(" ----")) || t == "failures:" || t.starts_with("test result:") {
+        if (t.starts_with("---- ") && t.ends_with(" ----"))
+            || t == "failures:"
+            || t.starts_with("test result:")
+        {
             break;
         }
         block.push(lines[i]);
@@ -408,8 +476,15 @@ fn capture_block<'a>(lines: &[&'a str], start: usize) -> (Vec<&'a str>, usize) {
 /// `max` of the surviving lines: the *head* when `from_end` is false, the
 /// *tail* when true. Shared core behind [`truncate_lines`]/[`tail_lines`].
 fn slice_lines(block: &[&str], max: usize, from_end: bool) -> String {
-    let start = block.iter().position(|l| !l.trim().is_empty()).unwrap_or(block.len());
-    let end = block.iter().rposition(|l| !l.trim().is_empty()).map(|i| i + 1).unwrap_or(start);
+    let start = block
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(block.len());
+    let end = block
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(start);
     let trimmed = &block[start..end];
     if from_end {
         trimmed[trimmed.len().saturating_sub(max)..].join("\n")
@@ -428,7 +503,8 @@ fn truncate_lines(block: &[&str], max: usize) -> String {
 /// form first (the `panicked at …:line:col` line), then the older multi-line
 /// tail form (`', file:line:col`).
 fn panic_location(block: &[&str]) -> Option<(String, u32, u32)> {
-    let loc = |c: &regex::Captures| Some((c[1].to_string(), c[2].parse().ok()?, c[3].parse().ok()?));
+    let loc =
+        |c: &regex::Captures| Some((c[1].to_string(), c[2].parse().ok()?, c[3].parse().ok()?));
     for line in block {
         if let Some(c) = cargo_panic_re().captures(line) {
             return loc(&c);
@@ -452,8 +528,14 @@ fn parse_rustc_human(lines: &[&str]) -> Vec<Diag> {
     let arrow = rustc_arrow_re();
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let Some(caps) = header.captures(line.trim_end()) else { continue };
-        let severity = if &caps[1] == "error" { Severity::Error } else { Severity::Warning };
+        let Some(caps) = header.captures(line.trim_end()) else {
+            continue;
+        };
+        let severity = if &caps[1] == "error" {
+            Severity::Error
+        } else {
+            Severity::Warning
+        };
         let (mut file, mut line_no, mut col) = (String::new(), 0u32, None);
         for look in lines.iter().skip(i + 1).take(3) {
             if let Some(a) = arrow.captures(look) {
@@ -643,7 +725,10 @@ fn parse_jest_json(stdout: &str, cwd: &Path) -> Vec<Diag> {
         }
     }
     if report.num_passed_tests.is_some() || report.num_failed_tests.is_some() {
-        let (p, f) = (report.num_passed_tests.unwrap_or(0), report.num_failed_tests.unwrap_or(0));
+        let (p, f) = (
+            report.num_passed_tests.unwrap_or(0),
+            report.num_failed_tests.unwrap_or(0),
+        );
         out.push(Diag {
             severity: Severity::Note,
             code: None,
@@ -754,7 +839,11 @@ pub(crate) fn sarif_uri_to_path(cwd: &Path, uri: &str) -> String {
         None => (rest, ""),
     };
     // RFC 8089: an empty authority and `localhost` are equivalent.
-    let host = if authority.eq_ignore_ascii_case("localhost") { "" } else { authority };
+    let host = if authority.eq_ignore_ascii_case("localhost") {
+        ""
+    } else {
+        authority
+    };
     let abs = if host.is_empty() {
         // Empty authority. `/C:/…` drops its leading slash to a drive path;
         // a POSIX `/repo/…` root or an empty-authority UNC `//server/share/…`
@@ -830,9 +919,17 @@ fn parse_sarif(stdout: &str, cwd: &Path) -> Vec<Diag> {
                 // `warning`, or a missing level (SARIF's spec default), → Warning.
                 _ => Severity::Warning,
             };
-            let (file, line, col) = match r.locations.iter().find_map(|l| l.physical_location.as_ref()) {
+            let (file, line, col) = match r
+                .locations
+                .iter()
+                .find_map(|l| l.physical_location.as_ref())
+            {
                 Some(p) => {
-                    let uri = p.artifact_location.as_ref().map(|a| a.uri.as_str()).unwrap_or("");
+                    let uri = p
+                        .artifact_location
+                        .as_ref()
+                        .map(|a| a.uri.as_str())
+                        .unwrap_or("");
                     let (line, col) = match &p.region {
                         Some(reg) => (reg.start_line, reg.start_column),
                         None => (0, None),
@@ -841,7 +938,14 @@ fn parse_sarif(stdout: &str, cwd: &Path) -> Vec<Diag> {
                 }
                 None => (String::new(), 0, None),
             };
-            out.push(Diag { severity, code: r.rule_id.clone(), message: r.message.text.clone(), file, line, col });
+            out.push(Diag {
+                severity,
+                code: r.rule_id.clone(),
+                message: r.message.text.clone(),
+                file,
+                line,
+                col,
+            });
         }
     }
     out
@@ -919,8 +1023,19 @@ fn go_test_diag(label: &str, collected: Option<&Vec<String>>) -> Diag {
     let joined = collected.map(|v| v.concat()).unwrap_or_default();
     let lines: Vec<&str> = joined.lines().collect();
     let tail = tail_lines(&lines, 15);
-    let message = if tail.is_empty() { format!("{label} failed") } else { format!("{label}\n{tail}") };
-    Diag { severity: Severity::Error, code: None, message, file: String::new(), line: 0, col: None }
+    let message = if tail.is_empty() {
+        format!("{label} failed")
+    } else {
+        format!("{label}\n{tail}")
+    };
+    Diag {
+        severity: Severity::Error,
+        code: None,
+        message,
+        file: String::new(),
+        line: 0,
+        col: None,
+    }
 }
 
 /// `go test -json` event stream (one JSON object per line: `Action`, `Package`,
@@ -943,7 +1058,10 @@ fn parse_go_test_json(stdout: &str) -> Vec<Diag> {
         saw_event = true;
         let test_key = ev.test.clone().unwrap_or_default();
         if let Some(text) = &ev.output {
-            output.entry((ev.package.clone(), test_key.clone())).or_default().push(text.clone());
+            output
+                .entry((ev.package.clone(), test_key.clone()))
+                .or_default()
+                .push(text.clone());
         }
         match ev.action.as_str() {
             "pass" if ev.test.is_some() => passed += 1,
@@ -986,13 +1104,17 @@ fn dotnet_re() -> &'static Regex {
     // MSBuild canonical: `file(line,col): error|warning CODE: message`. The
     // non-greedy `.+?` up to `(line,col)` tolerates a Windows drive-letter path;
     // the code token is `\w+` (`CS0103`, `MSB3202`, `FS0001`, ...).
-    RE.get_or_init(|| Regex::new(r"^(.+?)\((\d+),(\d+)\): (error|warning) (\w+): (.+)$").expect("valid regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"^(.+?)\((\d+),(\d+)\): (error|warning) (\w+): (.+)$").expect("valid regex")
+    })
 }
 
 fn dotnet_project_suffix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // MSBuild appends the owning project in brackets: ` [C:\src\App.csproj]`.
-    RE.get_or_init(|| Regex::new(r"\s*\[[^\]]*\.(?:csproj|fsproj|vbproj|proj|sln)\]\s*$").expect("valid regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"\s*\[[^\]]*\.(?:csproj|fsproj|vbproj|proj|sln)\]\s*$").expect("valid regex")
+    })
 }
 
 /// MSBuild canonical diagnostics from `dotnet build --nologo`:
@@ -1009,7 +1131,11 @@ fn parse_dotnet(stdout: &str, stderr: &str) -> Vec<Diag> {
         .chain(stderr.lines())
         .filter_map(|line| {
             let caps = re.captures(line.trim_end())?;
-            let severity = if &caps[4] == "error" { Severity::Error } else { Severity::Warning };
+            let severity = if &caps[4] == "error" {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
             let message = suffix.replace(&caps[6], "").trim().to_string();
             if message.is_empty() {
                 return None;
@@ -1054,7 +1180,9 @@ fn junit_attr(e: &BytesStart, key: &[u8]) -> Option<String> {
 
 /// `e`'s numeric attribute `key` (a `<testsuite>` count), defaulting to 0.
 fn junit_num(e: &BytesStart, key: &[u8]) -> u64 {
-    junit_attr(e, key).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    junit_attr(e, key)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Build the failure `Diag` for a failed `<testcase>`: `classname.name` (each
@@ -1072,12 +1200,25 @@ fn junit_diag(c: &JunitCase) -> Diag {
         .as_deref()
         .filter(|m| !m.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| c.fail_text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string));
+        .or_else(|| {
+            c.fail_text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_string)
+        });
     if let Some(d) = detail {
         label.push_str(": ");
         label.push_str(&d);
     }
-    Diag { severity: Severity::Error, code: None, message: label, file: c.file.clone(), line: c.line, col: None }
+    Diag {
+        severity: Severity::Error,
+        code: None,
+        message: label,
+        file: c.file.clone(),
+        line: c.line,
+        col: None,
+    }
 }
 
 /// Streaming state for [`parse_junit_xml`]. Totals are summed across every
@@ -1102,7 +1243,11 @@ impl JunitState {
         match e.local_name().as_ref() {
             b"testsuites" => {
                 self.saw_element = true;
-                self.wrapper = Some((junit_num(e, b"tests"), junit_num(e, b"failures"), junit_num(e, b"errors")));
+                self.wrapper = Some((
+                    junit_num(e, b"tests"),
+                    junit_num(e, b"failures"),
+                    junit_num(e, b"errors"),
+                ));
             }
             b"testsuite" => {
                 self.saw_element = true;
@@ -1121,7 +1266,9 @@ impl JunitState {
                     classname: junit_attr(e, b"classname").unwrap_or_default(),
                     name: junit_attr(e, b"name").unwrap_or_default(),
                     file: junit_attr(e, b"file").unwrap_or_default(),
-                    line: junit_attr(e, b"line").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+                    line: junit_attr(e, b"line")
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0),
                     failed: false,
                     fail_message: None,
                     fail_text: String::new(),
@@ -1226,7 +1373,9 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
     let names: Vec<&str> = re.capture_names().flatten().collect();
     for required in ["file", "line", "message"] {
         if !names.contains(&required) {
-            return Err(format!("regex-custom pattern must define a named group `(?<{required}>…)`"));
+            return Err(format!(
+                "regex-custom pattern must define a named group `(?<{required}>…)`"
+            ));
         }
     }
     Ok(())
@@ -1241,8 +1390,12 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
 /// by [`validate_pattern`], but guarded here too), yields no diagnostics rather
 /// than a panic.
 fn parse_regex_custom(stdout: &str, stderr: &str, pattern: Option<&str>) -> Vec<Diag> {
-    let Some(pat) = pattern else { return Vec::new() };
-    let Ok(re) = Regex::new(pat) else { return Vec::new() };
+    let Some(pat) = pattern else {
+        return Vec::new();
+    };
+    let Ok(re) = Regex::new(pat) else {
+        return Vec::new();
+    };
     stdout
         .lines()
         .chain(stderr.lines())
@@ -1254,7 +1407,11 @@ fn parse_regex_custom(stdout: &str, stderr: &str, pattern: Option<&str>) -> Vec<
             if file.is_empty() || message.is_empty() {
                 return None;
             }
-            let severity = match caps.name("severity").map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
+            let severity = match caps
+                .name("severity")
+                .map(|m| m.as_str().to_ascii_lowercase())
+                .as_deref()
+            {
                 Some("warning") => Severity::Warning,
                 Some("note") => Severity::Note,
                 _ => Severity::Error,
@@ -1399,7 +1556,10 @@ not json at all
     fn tsc_global_error_without_location_is_captured() {
         // A broken tsconfig produces file-less errors; dropping them would
         // make the run read as zero diagnostics.
-        let diags = parse_tsc("error TS18003: No inputs were found in config file 'tsconfig.json'.\n", "");
+        let diags = parse_tsc(
+            "error TS18003: No inputs were found in config file 'tsconfig.json'.\n",
+            "",
+        );
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Severity::Error);
         assert_eq!(diags[0].code.as_deref(), Some("TS18003"));
@@ -1473,7 +1633,10 @@ not json at all
 
     #[test]
     fn pytest_parametrized_nodeid_with_dash_splits_after_brackets() {
-        let diags = parse_pytest("FAILED tests/test_foo.py::test_bar[a - b] - AssertionError: nope\n", "");
+        let diags = parse_pytest(
+            "FAILED tests/test_foo.py::test_bar[a - b] - AssertionError: nope\n",
+            "",
+        );
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].file, "tests/test_foo.py");
         assert_eq!(diags[0].message, "AssertionError: nope");
@@ -1481,7 +1644,10 @@ not json at all
 
     #[test]
     fn generic_gcc_fatal_error_is_error_severity() {
-        let diags = parse_generic_gcc("src/main.c:1:10: fatal error: bar.h: No such file or directory\n", "");
+        let diags = parse_generic_gcc(
+            "src/main.c:1:10: fatal error: bar.h: No such file or directory\n",
+            "",
+        );
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, Severity::Error);
         assert_eq!(diags[0].message, "bar.h: No such file or directory");
@@ -1516,7 +1682,11 @@ not json at all
         assert_eq!(diags[0].file, "src/math.rs");
         assert_eq!(diags[0].line, 12);
         assert_eq!(diags[0].col, Some(9));
-        assert!(diags[0].message.contains("panicked at"), "block folded in: {}", diags[0].message);
+        assert!(
+            diags[0].message.contains("panicked at"),
+            "block folded in: {}",
+            diags[0].message
+        );
         assert_eq!(diags[1].severity, Severity::Error);
         assert_eq!(diags[1].file, "src/math.rs");
         assert_eq!(diags[1].line, 20);
@@ -1529,7 +1699,11 @@ not json at all
     #[test]
     fn cargo_test_clean_run_yields_counts_note_only() {
         let diags = parse_cargo_test(CARGO_TEST_PASS, "");
-        assert_eq!(diags.len(), 1, "clean run ⇒ just the counts Note: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "clean run ⇒ just the counts Note: {diags:?}"
+        );
         assert_eq!(diags[0].severity, Severity::Note);
         assert!(diags[0].message.contains("3 passed"));
         assert!(diags[0].message.contains("test result: ok"));
@@ -1540,7 +1714,10 @@ not json at all
     #[test]
     fn cargo_test_compile_error_before_tests_surfaces_rustc_error() {
         let diags = parse_cargo_test(CARGO_COMPILE_ERROR, "");
-        let e0308 = diags.iter().find(|d| d.code.as_deref() == Some("E0308")).expect("E0308 surfaced");
+        let e0308 = diags
+            .iter()
+            .find(|d| d.code.as_deref() == Some("E0308"))
+            .expect("E0308 surfaced");
         assert_eq!(e0308.severity, Severity::Error);
         assert_eq!(e0308.file, "src/main.rs");
         assert_eq!(e0308.line, 10);
@@ -1560,7 +1737,11 @@ not json at all
         let diags = parse_cargo_test(&s, "");
         let fail = &diags[0];
         assert_eq!(fail.severity, Severity::Error);
-        assert!(fail.message.lines().count() <= 15, "block truncated: {}", fail.message.lines().count());
+        assert!(
+            fail.message.lines().count() <= 15,
+            "block truncated: {}",
+            fail.message.lines().count()
+        );
         assert_eq!(fail.file, "src/x.rs");
     }
 
@@ -1599,7 +1780,11 @@ not json at all
         assert_eq!(diags.len(), 2, "1 failure + counts Note: {diags:?}");
         assert_eq!(diags[0].severity, Severity::Error);
         assert_eq!(diags[0].file, "src/math.test.js");
-        assert!(!diags[0].message.contains('\u{1b}'), "ANSI stripped: {:?}", diags[0].message);
+        assert!(
+            !diags[0].message.contains('\u{1b}'),
+            "ANSI stripped: {:?}",
+            diags[0].message
+        );
         assert!(diags[0].message.contains("expected 2 to equal 3"));
         assert!(diags[0].message.lines().count() <= 5, "capped to ~5 lines");
         assert_eq!(diags[1].severity, Severity::Note);
@@ -1667,7 +1852,10 @@ not json at all
             "/proj/app-tests/Cargo.lock"
         );
         // A real child still relativizes; the cwd itself passes through whole.
-        assert_eq!(relativize(Path::new("/proj/app"), "/proj/app/Cargo.lock"), "Cargo.lock");
+        assert_eq!(
+            relativize(Path::new("/proj/app"), "/proj/app/Cargo.lock"),
+            "Cargo.lock"
+        );
         assert_eq!(relativize(Path::new("/proj/app"), "/proj/app"), "/proj/app");
     }
 
@@ -1685,12 +1873,18 @@ not json at all
             "drive-letter file uri"
         );
         // A relative (schemeless) uri passes through untouched.
-        assert_eq!(sarif_uri_to_path(Path::new("/repo"), "src/app.py"), "src/app.py");
+        assert_eq!(
+            sarif_uri_to_path(Path::new("/repo"), "src/app.py"),
+            "src/app.py"
+        );
 
         // 4-slash / empty-authority UNC → `//server/share/…`, matched against a
         // UNC cwd (`\\server\share` folds to `//server/share`).
         assert_eq!(
-            sarif_uri_to_path(Path::new(r"\\server\share"), "file:////server/share/src/x.rs"),
+            sarif_uri_to_path(
+                Path::new(r"\\server\share"),
+                "file:////server/share/src/x.rs"
+            ),
             "src/x.rs",
             "empty-authority UNC file uri"
         );
@@ -1717,7 +1911,10 @@ not json at all
 
         // Total on degenerate inputs — no panic, no bad byte-indexing.
         assert_eq!(sarif_uri_to_path(Path::new("/repo"), "file://"), "");
-        assert_eq!(sarif_uri_to_path(Path::new("/repo"), "file://host"), "//host");
+        assert_eq!(
+            sarif_uri_to_path(Path::new("/repo"), "file://host"),
+            "//host"
+        );
     }
 
     // ── go build / go vet ───────────────────────────────────────────────
@@ -1727,7 +1924,11 @@ not json at all
     #[test]
     fn go_parses_file_line_col_and_skips_stanza_headers() {
         let diags = parse_go(GO_OUTPUT, "");
-        assert_eq!(diags.len(), 2, "stanza header + `ok` line skipped: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            2,
+            "stanza header + `ok` line skipped: {diags:?}"
+        );
         assert_eq!(diags[0].file, "./main.go");
         assert_eq!(diags[0].line, 10);
         assert_eq!(diags[0].col, Some(6));
@@ -1736,7 +1937,11 @@ not json at all
         // A col-less `go build` line still parses.
         assert_eq!(diags[1].line, 20);
         assert_eq!(diags[1].col, None);
-        assert_eq!(diags[1].severity, Severity::Error, "severity-less go lines stay Error");
+        assert_eq!(
+            diags[1].severity,
+            Severity::Error,
+            "severity-less go lines stay Error"
+        );
     }
 
     #[test]
@@ -1756,15 +1961,24 @@ not json at all
     // ── go test -json ───────────────────────────────────────────────────
 
     const GO_TEST_JSON: &str = concat!(
-        r#"{"Action":"run","Package":"example/pkg","Test":"TestAdd"}"#, "\n",
-        r#"{"Action":"output","Package":"example/pkg","Test":"TestAdd","Output":"=== RUN   TestAdd\n"}"#, "\n",
-        r#"{"Action":"pass","Package":"example/pkg","Test":"TestAdd","Elapsed":0}"#, "\n",
-        r#"{"Action":"run","Package":"example/pkg","Test":"TestSub"}"#, "\n",
-        r#"{"Action":"output","Package":"example/pkg","Test":"TestSub","Output":"    sub_test.go:12: got 1 want 2\n"}"#, "\n",
-        r#"{"Action":"output","Package":"example/pkg","Test":"TestSub","Output":"--- FAIL: TestSub (0.00s)\n"}"#, "\n",
-        r#"{"Action":"fail","Package":"example/pkg","Test":"TestSub","Elapsed":0}"#, "\n",
-        r#"{"Action":"output","Package":"example/pkg","Output":"FAIL\texample/pkg\t0.01s\n"}"#, "\n",
-        r#"{"Action":"fail","Package":"example/pkg","Elapsed":0.01}"#, "\n",
+        r#"{"Action":"run","Package":"example/pkg","Test":"TestAdd"}"#,
+        "\n",
+        r#"{"Action":"output","Package":"example/pkg","Test":"TestAdd","Output":"=== RUN   TestAdd\n"}"#,
+        "\n",
+        r#"{"Action":"pass","Package":"example/pkg","Test":"TestAdd","Elapsed":0}"#,
+        "\n",
+        r#"{"Action":"run","Package":"example/pkg","Test":"TestSub"}"#,
+        "\n",
+        r#"{"Action":"output","Package":"example/pkg","Test":"TestSub","Output":"    sub_test.go:12: got 1 want 2\n"}"#,
+        "\n",
+        r#"{"Action":"output","Package":"example/pkg","Test":"TestSub","Output":"--- FAIL: TestSub (0.00s)\n"}"#,
+        "\n",
+        r#"{"Action":"fail","Package":"example/pkg","Test":"TestSub","Elapsed":0}"#,
+        "\n",
+        r#"{"Action":"output","Package":"example/pkg","Output":"FAIL\texample/pkg\t0.01s\n"}"#,
+        "\n",
+        r#"{"Action":"fail","Package":"example/pkg","Elapsed":0.01}"#,
+        "\n",
     );
 
     #[test]
@@ -1773,24 +1987,43 @@ not json at all
         // One per-test failure (the package-level fail is suppressed) + counts Note.
         assert_eq!(diags.len(), 2, "{diags:?}");
         assert_eq!(diags[0].severity, Severity::Error);
-        assert!(diags[0].message.starts_with("TestSub"), "name leads: {:?}", diags[0].message);
-        assert!(diags[0].message.contains("--- FAIL: TestSub"), "output tail folded in: {:?}", diags[0].message);
+        assert!(
+            diags[0].message.starts_with("TestSub"),
+            "name leads: {:?}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("--- FAIL: TestSub"),
+            "output tail folded in: {:?}",
+            diags[0].message
+        );
         assert_eq!(diags[1].severity, Severity::Note);
         assert_eq!(diags[1].message, "1 passed, 1 failed");
     }
 
     const GO_TEST_JSON_BUILD_FAIL: &str = concat!(
-        r##"{"Action":"output","Package":"example/bad","Output":"# example/bad\n"}"##, "\n",
-        r##"{"Action":"output","Package":"example/bad","Output":"./bad.go:5:2: undefined: foo\n"}"##, "\n",
-        r##"{"Action":"fail","Package":"example/bad","Elapsed":0}"##, "\n",
+        r##"{"Action":"output","Package":"example/bad","Output":"# example/bad\n"}"##,
+        "\n",
+        r##"{"Action":"output","Package":"example/bad","Output":"./bad.go:5:2: undefined: foo\n"}"##,
+        "\n",
+        r##"{"Action":"fail","Package":"example/bad","Elapsed":0}"##,
+        "\n",
     );
 
     #[test]
     fn go_test_json_package_build_failure_surfaces_output() {
         let diags = parse_go_test_json(GO_TEST_JSON_BUILD_FAIL);
-        assert_eq!(diags.len(), 2, "package build failure + counts Note: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            2,
+            "package build failure + counts Note: {diags:?}"
+        );
         assert_eq!(diags[0].severity, Severity::Error);
-        assert!(diags[0].message.contains("undefined: foo"), "build error surfaced: {:?}", diags[0].message);
+        assert!(
+            diags[0].message.contains("undefined: foo"),
+            "build error surfaced: {:?}",
+            diags[0].message
+        );
         assert_eq!(diags[1].message, "0 passed, 0 failed");
     }
 
@@ -1813,8 +2046,16 @@ not json at all
         assert_eq!(diags[0].file, "Program.cs");
         assert_eq!(diags[0].line, 10);
         assert_eq!(diags[0].col, Some(13));
-        assert!(diags[0].message.ends_with("current context"), "project suffix stripped: {:?}", diags[0].message);
-        assert!(!diags[0].message.contains(".csproj"), "no leftover suffix: {:?}", diags[0].message);
+        assert!(
+            diags[0].message.ends_with("current context"),
+            "project suffix stripped: {:?}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains(".csproj"),
+            "no leftover suffix: {:?}",
+            diags[0].message
+        );
         assert_eq!(diags[1].severity, Severity::Warning);
         assert_eq!(diags[1].code.as_deref(), Some("CS0219"));
     }
@@ -1839,7 +2080,11 @@ not json at all
     #[test]
     fn junit_bare_testsuite_failure_and_error_children() {
         let diags = parse_junit_xml(JUNIT_BARE);
-        assert_eq!(diags.len(), 3, "2 failed testcases + counts Note: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            3,
+            "2 failed testcases + counts Note: {diags:?}"
+        );
         // <failure> child, with file/line attributes (pytest emits them).
         assert_eq!(diags[0].severity, Severity::Error);
         assert_eq!(diags[0].file, "tests/foo.py");
@@ -1864,7 +2109,11 @@ not json at all
     #[test]
     fn junit_testsuites_wrapper_and_self_closing_failure() {
         let diags = parse_junit_xml(JUNIT_WRAPPED);
-        assert_eq!(diags.len(), 2, "one failure (self-closing) + counts Note: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            2,
+            "one failure (self-closing) + counts Note: {diags:?}"
+        );
         assert_eq!(diags[0].severity, Severity::Error);
         // Self-closing `<failure message=.../>` — detail from the message attr.
         assert_eq!(diags[0].message, "C.b: nope, wrong value");
@@ -1902,7 +2151,11 @@ not json at all
         let diags = parse_regex_custom("a.rs:3:7: boom\n", "", Some(pat));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].col, Some(7));
-        assert_eq!(diags[0].severity, Severity::Error, "absent severity group ⇒ Error");
+        assert_eq!(
+            diags[0].severity,
+            Severity::Error,
+            "absent severity group ⇒ Error"
+        );
         // No pattern ⇒ no diagnostics (and no panic).
         assert!(parse_regex_custom("a.rs:3:7: boom\n", "", None).is_empty());
         // Non-matching input ⇒ empty.

@@ -158,7 +158,9 @@ fn build_theme(folder_id: &str, json: &str, css: &str) -> Result<ThemeWire, Stri
     }
     let selector = format!("[data-theme=\"{}\"]", meta.id);
     if !css.contains(&selector) {
-        return Err(format!("theme.css does not contain the {selector} selector"));
+        return Err(format!(
+            "theme.css does not contain the {selector} selector"
+        ));
     }
     Ok(ThemeWire {
         id: meta.id,
@@ -181,7 +183,10 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
         match file.colors.get(key) {
             None => return Err(format!("palette {:?} missing key {key}", file.name)),
             Some(v) if !valid_hex(v) => {
-                return Err(format!("palette {:?} key {key} has invalid hex {v:?}", file.name))
+                return Err(format!(
+                    "palette {:?} key {key} has invalid hex {v:?}",
+                    file.name
+                ))
             }
             Some(_) => {}
         }
@@ -201,13 +206,19 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
 // on-disk copy.
 
 const EMBEDDED_THEME_ID: &str = "tui-blue";
-const EMBEDDED_THEME_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-blue/theme.json"));
-const EMBEDDED_THEME_CSS: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../themes/tui-blue/theme.css"));
+const EMBEDDED_THEME_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../themes/tui-blue/theme.json"
+));
+const EMBEDDED_THEME_CSS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../themes/tui-blue/theme.css"
+));
 
-const EMBEDDED_PALETTE_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../palettes/OpenCode Grey.json"));
+const EMBEDDED_PALETTE_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../palettes/OpenCode Grey.json"
+));
 
 /// The compiled-in `tui-blue` theme. `None` only if the embedded source
 /// somehow fails verification, which a unit test guards against.
@@ -257,7 +268,10 @@ fn load_themes() -> Vec<ThemeWire> {
                 let json = std::fs::read_to_string(path.join("theme.json"));
                 let css = std::fs::read_to_string(path.join("theme.css"));
                 let (Ok(json), Ok(css)) = (json, css) else {
-                    tracing::warn!(theme = folder_id, "theming: theme folder missing theme.json/theme.css; skipped");
+                    tracing::warn!(
+                        theme = folder_id,
+                        "theming: theme folder missing theme.json/theme.css; skipped"
+                    );
                     continue;
                 };
                 match build_theme(folder_id, &json, &css) {
@@ -358,11 +372,17 @@ mod tests {
     /// release and is copied next to the exe by build.rs. `CARGO_MANIFEST_DIR`
     /// is `src-tauri/`, so the repo root is one level up.
     fn repo_themes() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("themes")
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("themes")
     }
 
     fn repo_palettes() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("palettes")
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("palettes")
     }
 
     #[test]

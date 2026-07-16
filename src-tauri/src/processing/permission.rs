@@ -83,9 +83,7 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
         PermissionPattern {
             name: "claude_permission_alt_example".to_string(),
             kind: PatternKind::Permission,
-            all_of: vec![
-                "<replace with a substring unique to this prompt shape>".to_string(),
-            ],
+            all_of: vec!["<replace with a substring unique to this prompt shape>".to_string()],
             disabled: true,
         },
         // Claude Code's AskUserQuestion prompt. Unlike the permission
@@ -102,10 +100,7 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
         PermissionPattern {
             name: "claude_question".to_string(),
             kind: PatternKind::Question,
-            all_of: vec![
-                "Enter to select".to_string(),
-                "Type something".to_string(),
-            ],
+            all_of: vec!["Enter to select".to_string(), "Type something".to_string()],
             disabled: false,
         },
         // Claude's "busy" footer, shown only while a request is in flight
@@ -134,7 +129,8 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
             name: "opencode_permission".to_string(),
             kind: PatternKind::Permission,
             all_of: vec![
-                "<replace with a substring unique to opencode --mini's permission prompt>".to_string(),
+                "<replace with a substring unique to opencode --mini's permission prompt>"
+                    .to_string(),
             ],
             disabled: true,
         },
@@ -262,7 +258,10 @@ impl PermissionDetector {
             match (prev, now) {
                 (None, Some(name)) => {
                     self.last_detected.insert(kind, name.clone());
-                    out.push(PatternTransition::Detected { kind, pattern_name: name });
+                    out.push(PatternTransition::Detected {
+                        kind,
+                        pattern_name: name,
+                    });
                 }
                 (Some(prev_name), None) => {
                     self.last_detected.remove(&kind);
@@ -338,7 +337,10 @@ mod tests {
         assert!(
             out.iter().any(|t| matches!(
                 t,
-                PatternTransition::Detected { kind: PatternKind::Permission, .. }
+                PatternTransition::Detected {
+                    kind: PatternKind::Permission,
+                    ..
+                }
             )),
             "wrapped permission footer should still be detected"
         );
@@ -352,14 +354,20 @@ mod tests {
         let out = d.check(padded);
         assert!(out.iter().any(|t| matches!(
             t,
-            PatternTransition::Detected { kind: PatternKind::Permission, .. }
+            PatternTransition::Detected {
+                kind: PatternKind::Permission,
+                ..
+            }
         )));
     }
 
     #[test]
     fn normalize_ws_collapses_runs_and_newlines() {
         assert_eq!(normalize_ws("a  b\n\tc "), "a b c");
-        assert_eq!(normalize_ws("  leading and trailing  "), "leading and trailing");
+        assert_eq!(
+            normalize_ws("  leading and trailing  "),
+            "leading and trailing"
+        );
         assert_eq!(normalize_ws("cancel · Tab"), "cancel · Tab");
     }
 
@@ -395,7 +403,10 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(matches!(
             &out[0],
-            PatternTransition::Resolved { kind: PatternKind::Permission, .. }
+            PatternTransition::Resolved {
+                kind: PatternKind::Permission,
+                ..
+            }
         ));
     }
 
@@ -457,7 +468,10 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(matches!(
             &out[0],
-            PatternTransition::Detected { kind: PatternKind::Permission, .. }
+            PatternTransition::Detected {
+                kind: PatternKind::Permission,
+                ..
+            }
         ));
 
         // Now add the content marker — question kind also fires; existing
@@ -467,7 +481,10 @@ mod tests {
         assert_eq!(out2.len(), 1);
         assert!(matches!(
             &out2[0],
-            PatternTransition::Detected { kind: PatternKind::Question, .. }
+            PatternTransition::Detected {
+                kind: PatternKind::Question,
+                ..
+            }
         ));
 
         // Drop both — both Resolved fire.
@@ -488,10 +505,7 @@ mod tests {
     fn first_match_per_kind_wins() {
         // Two permission patterns; first listed should win on a shared
         // match.
-        let patterns = vec![
-            perm("first_perm", &["X"]),
-            perm("second_perm", &["X"]),
-        ];
+        let patterns = vec![perm("first_perm", &["X"]), perm("second_perm", &["X"])];
         let mut d = PermissionDetector::new(patterns);
         let out = d.check("X");
         assert_eq!(out.len(), 1);
@@ -581,7 +595,10 @@ mod tests {
         assert_eq!(out2.len(), 1, "expected exactly one transition: {out2:?}");
         assert!(matches!(
             &out2[0],
-            PatternTransition::Resolved { kind: PatternKind::Working, .. }
+            PatternTransition::Resolved {
+                kind: PatternKind::Working,
+                ..
+            }
         ));
     }
 
@@ -592,12 +609,18 @@ mod tests {
         let mut d = PermissionDetector::new(default_patterns());
         assert!(!matches!(
             d.check(PERMISSION_TAIL).first(),
-            Some(PatternTransition::Detected { kind: PatternKind::Working, .. })
+            Some(PatternTransition::Detected {
+                kind: PatternKind::Working,
+                ..
+            })
         ));
         let mut d2 = PermissionDetector::new(default_patterns());
         assert!(!matches!(
             d2.check(QUESTION_TAIL).first(),
-            Some(PatternTransition::Detected { kind: PatternKind::Working, .. })
+            Some(PatternTransition::Detected {
+                kind: PatternKind::Working,
+                ..
+            })
         ));
     }
 }

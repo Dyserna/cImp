@@ -227,8 +227,8 @@ mod tests {
         let root = base.join("root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(base.join("outside")).unwrap();
-        let err = confine_creatable(&root, &root.join("..").join("outside").join("new.txt"))
-            .unwrap_err();
+        let err =
+            confine_creatable(&root, &root.join("..").join("outside").join("new.txt")).unwrap_err();
         assert!(matches!(err, ConfineError::Escaped), "got {err:?}");
         std::fs::remove_dir_all(&base).ok();
     }
@@ -244,8 +244,8 @@ mod tests {
         let got = confine_creatable(&root, &base.join("report.xml")).unwrap();
         assert_eq!(got, Some(base.canonicalize().unwrap()));
         // And a base-joined path that climbs out is still caught.
-        let err = confine_creatable(&root, &base.join("..").join("..").join("escape.xml"))
-            .unwrap_err();
+        let err =
+            confine_creatable(&root, &base.join("..").join("..").join("escape.xml")).unwrap_err();
         assert!(matches!(err, ConfineError::Escaped), "got {err:?}");
         std::fs::remove_dir_all(&root).ok();
     }

@@ -39,7 +39,10 @@ pub fn run() {
     // V16 Feature 3: payload-shape drift report (fail-open unchanged).
     report_contract_drift(
         "compact_hook",
-        &missing_fields(&[("session_id", !session_id.is_empty()), ("cwd", !cwd_raw.is_empty())]),
+        &missing_fields(&[
+            ("session_id", !session_id.is_empty()),
+            ("cwd", !cwd_raw.is_empty()),
+        ]),
         session_id,
     );
     let cwd = resolve_cwd(cwd_raw);
@@ -53,7 +56,9 @@ pub fn run() {
 
     // The POST runs the server-side side effects even when the returned block is
     // empty (or the feature's block is gated off), so we call it unconditionally.
-    let Some(text) = post_loopback("/context/compaction", &body) else { return };
+    let Some(text) = post_loopback("/context/compaction", &body) else {
+        return;
+    };
     if text.trim().is_empty() {
         return;
     }

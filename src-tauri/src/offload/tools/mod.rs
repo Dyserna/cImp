@@ -150,7 +150,11 @@ fn enabled_defs_inner(toggles: &OffloadToolToggles, checks_configured: bool) -> 
 /// Route a native `tool_call` to its executor. `args` is the parsed
 /// arguments object. Returns the tool result (or an error string the
 /// loop surfaces to the model as a `role: tool` message — never a panic).
-pub async fn dispatch(name: &str, args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
+pub async fn dispatch(
+    name: &str,
+    args: serde_json::Value,
+    ctx: &ToolCtx,
+) -> Result<String, String> {
     match name {
         "read_file" => read_file::execute(args, ctx).await,
         "list_dir" => list_dir::execute(args, ctx).await,

@@ -528,9 +528,8 @@ impl OffloadService {
             .collect();
 
         let req = router::analyze_task(&instructions, context.as_deref(), tier);
-        let chosen = router::select(&views, &req).map_err(|e: RouteError| {
-            AppError::OffloadNotReady(e.to_string())
-        })?;
+        let chosen = router::select(&views, &req)
+            .map_err(|e: RouteError| AppError::OffloadNotReady(e.to_string()))?;
         info!(
             target: "offload",
             task_chars = instructions.len(),
@@ -556,7 +555,19 @@ impl OffloadService {
 
         // First attempt with the requested thinking mode.
         let first = self
-            .run_on(&pool[chosen], &views[chosen], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), schema.clone(), overall_deadline, Some(&mut trace), &cancel)
+            .run_on(
+                &pool[chosen],
+                &views[chosen],
+                &snap,
+                &instructions,
+                context.clone(),
+                thinking,
+                session_cwd.clone(),
+                schema.clone(),
+                overall_deadline,
+                Some(&mut trace),
+                &cancel,
+            )
             .await;
 
         // One fail-over on a connection-class failure: drop the failed
@@ -579,8 +590,20 @@ impl OffloadService {
                         self.run_rekey(&backend_name, &new_name, run_id);
                         backend_name = new_name;
                         active = next;
-                        self.run_on(&pool[next], &views[next], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), schema.clone(), overall_deadline, Some(&mut trace), &cancel)
-                            .await
+                        self.run_on(
+                            &pool[next],
+                            &views[next],
+                            &snap,
+                            &instructions,
+                            context.clone(),
+                            thinking,
+                            session_cwd.clone(),
+                            schema.clone(),
+                            overall_deadline,
+                            Some(&mut trace),
+                            &cancel,
+                        )
+                        .await
                     }
                     _ => Err(e),
                 }
@@ -606,7 +629,19 @@ impl OffloadService {
             let retry_deadline = Instant::now() + timeout;
             let pre_retry = trace.calls.len();
             result = self
-                .run_on(&pool[active], &views[active], &snap, &instructions, context.clone(), ThinkingMode::Auto, session_cwd.clone(), schema.clone(), retry_deadline, Some(&mut trace), &cancel)
+                .run_on(
+                    &pool[active],
+                    &views[active],
+                    &snap,
+                    &instructions,
+                    context.clone(),
+                    ThinkingMode::Auto,
+                    session_cwd.clone(),
+                    schema.clone(),
+                    retry_deadline,
+                    Some(&mut trace),
+                    &cancel,
+                )
                 .await;
             recovered = result.is_ok();
             // The retry's agent loop numbers its calls from step 0 again; offset
@@ -648,7 +683,19 @@ impl OffloadService {
                 let esc_deadline = Instant::now() + timeout;
                 let pre_esc = trace.calls.len();
                 let esc = self
-                    .run_on(&pool[q], &views[q], &snap, &instructions, context.clone(), thinking, session_cwd.clone(), schema.clone(), esc_deadline, Some(&mut trace), &cancel)
+                    .run_on(
+                        &pool[q],
+                        &views[q],
+                        &snap,
+                        &instructions,
+                        context.clone(),
+                        thinking,
+                        session_cwd.clone(),
+                        schema.clone(),
+                        esc_deadline,
+                        Some(&mut trace),
+                        &cancel,
+                    )
                     .await;
                 // The escalation's agent loop numbers its calls from step 0 again;
                 // offset them so they continue after the earlier steps in the run
@@ -684,7 +731,13 @@ impl OffloadService {
             (Ok(_), false) => "success",
             (Err(_), _) => "failed",
         };
-        self.run_finish(&backend_name, run_id, outcome, escalated_from, std::mem::take(&mut trace.calls));
+        self.run_finish(
+            &backend_name,
+            run_id,
+            outcome,
+            escalated_from,
+            std::mem::take(&mut trace.calls),
+        );
 
         // Mirror the completed run into the unified, persistent tool-activity
         // store (the Tool Activity tab's feed): full instruction text (+ any
@@ -748,9 +801,11 @@ impl OffloadService {
             return;
         }
         let mut log = self.run_log.lock().unwrap();
-        let rec = log
-            .get_mut(old)
-            .and_then(|dq| dq.iter().position(|r| r.id == id).and_then(|i| dq.remove(i)));
+        let rec = log.get_mut(old).and_then(|dq| {
+            dq.iter()
+                .position(|r| r.id == id)
+                .and_then(|i| dq.remove(i))
+        });
         if let Some(rec) = rec {
             let dq = log.entry(new.to_string()).or_default();
             dq.push_front(rec);
@@ -920,8 +975,14 @@ impl OffloadService {
         // and dropped separately, so there's no nesting/ordering hazard.
         let live: std::collections::HashSet<&str> =
             backends.iter().map(|b| b.name.as_str()).collect();
-        self.local_pool.lock().await.retain(|k, _| live.contains(k.as_str()));
-        self.remote_pool.lock().await.retain(|k, _| live.contains(k.as_str()));
+        self.local_pool
+            .lock()
+            .await
+            .retain(|k, _| live.contains(k.as_str()));
+        self.remote_pool
+            .lock()
+            .await
+            .retain(|k, _| live.contains(k.as_str()));
 
         entries
     }
@@ -994,8 +1055,13 @@ impl OffloadService {
                 Some(h) => h.clone(),
                 None => {
                     let h = Arc::new(
-                        LlamaServer::with_config(&b.name, server_command, b.tier, b.tool_scope.clone())
-                            .ok()?,
+                        LlamaServer::with_config(
+                            &b.name,
+                            server_command,
+                            b.tier,
+                            b.tool_scope.clone(),
+                        )
+                        .ok()?,
                     );
                     pool.insert(b.name.clone(), h.clone());
                     h
@@ -1059,7 +1125,9 @@ impl OffloadService {
         );
         let handle = {
             let mut pool = self.remote_pool.lock().await;
-            let reuse = pool.get(&b.name).filter(|h| h.base_url() == base_url.trim_end_matches('/'));
+            let reuse = pool
+                .get(&b.name)
+                .filter(|h| h.base_url() == base_url.trim_end_matches('/'));
             match reuse {
                 // Don't reuse a handle flagged for rebuild (the remote came
                 // back with fewer slots than its gate is sized for).
@@ -1261,7 +1329,14 @@ impl OffloadService {
                             .entry(b.name.clone())
                             .or_insert_with(MetricsPoller::new);
                         let m = poller
-                            .poll(&e.base_url, auth.as_deref(), e.slots, e.n_ctx, in_flight, cap)
+                            .poll(
+                                &e.base_url,
+                                auth.as_deref(),
+                                e.slots,
+                                e.n_ctx,
+                                in_flight,
+                                cap,
+                            )
                             .await;
                         ("ready", m)
                     }
@@ -1360,8 +1435,11 @@ impl OffloadService {
                 }
                 // Health polling only — must not lazy-start a cold backend.
                 let pool = this.resolve_pool(&snap, false).await;
-                let mut ready: Vec<String> =
-                    pool.iter().filter(|p| p.ready).map(|p| p.name.clone()).collect();
+                let mut ready: Vec<String> = pool
+                    .iter()
+                    .filter(|p| p.ready)
+                    .map(|p| p.name.clone())
+                    .collect();
                 ready.sort();
                 if ready != last {
                     last = ready;
@@ -1374,7 +1452,11 @@ impl OffloadService {
 
 /// Stable signature of a cached remote handle for reuse comparison.
 fn remote_sig(h: &RemoteBackend, is_cloud: bool) -> String {
-    format!("{}|{}|{is_cloud}", h.base_url(), token_fp(h.auth_token().unwrap_or("")))
+    format!(
+        "{}|{}|{is_cloud}",
+        h.base_url(),
+        token_fp(h.auth_token().unwrap_or(""))
+    )
 }
 
 /// Non-cryptographic fingerprint of an auth token, used only to detect a
@@ -1408,9 +1490,11 @@ fn compute_global_cap(snap: &OffloadSettings) -> u32 {
         .iter()
         .filter(|b| b.enabled)
         .map(|b| match &b.kind {
-            OffloadBackendKind::Local { server_command, .. } => ServerCommand::parse(server_command)
-                .map(|c| c.parallel.max(1))
-                .unwrap_or(1),
+            OffloadBackendKind::Local { server_command, .. } => {
+                ServerCommand::parse(server_command)
+                    .map(|c| c.parallel.max(1))
+                    .unwrap_or(1)
+            }
             OffloadBackendKind::Remote { .. } => 1,
         })
         .sum();
@@ -1502,7 +1586,9 @@ mod tests {
 
     #[test]
     fn connection_error_classification() {
-        assert!(is_connection_error("chat request failed: connection refused"));
+        assert!(is_connection_error(
+            "chat request failed: connection refused"
+        ));
         assert!(is_connection_error("request timed out"));
         assert!(!is_connection_error("server returned no choices"));
     }

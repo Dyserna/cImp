@@ -171,6 +171,32 @@ dependency/component breadth) — this is the *capability* breadth.
 - **Scan-coverage honesty line**: after a scan the tab shows the lockfiles/manifests osv-scanner reported actually scanning (`Cargo.lock ✓ · package-lock.json ✓`, from its SARIF `runs[].artifacts`), so a "0 findings" run over an unscannable ecosystem isn't mistaken for a clean bill of health
 - Network-reality hint in the tab (osv-scanner queries the OSV API / deps.dev; semgrep downloads rules on first run — offline scans degrade); scans recorded in the tool-activity store (kind `audit`); results live in managed state (survive tab switch, not persisted across restarts in v1)
 
+## Code Quality — Language-Gated Linters (V25)
+- Reserved **Code Quality** dashboard tab, a second half of the audit surface split off from **Code Audit**: Code Audit keeps the three *security* tools (osv-scanner / gitleaks / semgrep), Code Quality hosts eleven *quality* tools (linters, dead-code / unused-dependency detection, spell-checking) — separate tabs, each with its own chips, Scan/Cancel button, status line and findings table; both gated on the single `code_audit.enabled` flag
+- The eleven quality tools, their language gate, output format, and parser:
+
+  | Tool | Language gate | Output → parser | Notes |
+  |---|---|---|---|
+  | **oxlint** | `.js/.ts/.jsx/.tsx/.mjs/.cjs` | SARIF stdout → `sarif` | single Rust binary, zero-config |
+  | **golangci-lint** | `go.mod` or `.go` | SARIF stdout (v2 `--output.sarif.path stdout`) → `sarif` | |
+  | **ruff** | `.py` | SARIF stdout → `sarif` | single Rust binary |
+  | **cppcheck** | `.c/.cc/.cpp/.cxx/.h/.hpp` | SARIF report file (`--output-file`, needs ≥ 2.16) → `sarif` | writes to stderr otherwise; **exits 0 even with findings** |
+  | **typos** | *always applicable* | JSONL stdout → `TyposJsonl` | the one tool valuable on every project |
+  | **eslint** | `eslint.config.*` / `.eslintrc*` marker | JSON stdout → `EslintJson` | resolved project-local-first |
+  | **PMD** | `.java` | SARIF stdout → `sarif` | `pmd.bat` on Windows, needs a JRE |
+  | **Roslyn analyzers** (`dotnet-analyzers`) | `*.sln` / `*.csproj` | SARIF report file (`dotnet build /p:ErrorLog=`) → `sarif` | **default-disabled** — runs a real build (restores packages, writes obj/bin); longer timeout recommended |
+  | **knip** | `package.json` marker | JSON stdout → `KnipJson` | resolved project-local-first |
+  | **cargo-machete** | `Cargo.toml` marker | text stdout → `MacheteText` | near-instant unused-dep scan |
+  | **semgrep (quality)** (`semgrep-quality`) | *always applicable* | SARIF stdout (`--config p/best-practices`) → `sarif` | **default-disabled** — separate id so quality rulesets never enter the Security section; needs network |
+
+- **Language gating** keeps a tool off a project it doesn't apply to (no PMD chip in a Rust repo): a bounded, `.gitignore`-respecting **census** of the root (`ignore` crate walk, stopped at 20 000 entries / 2 s — a truncation only ever hides a tool, never invents one; cached ~60 s so tab-open and scan share one walk) collects lowercase extensions + a fixed marker set (`go.mod`, `Cargo.toml`, `package.json`, `*.sln`, `*.csproj`, `eslint.config.*`, `.eslintrc*`); a tool applies if ANY of its gate extensions OR markers is present. Each tab shows only applicable tools; a muted "**n tools hidden — not applicable to this project**" line accounts for the rest. Before the first scan (empty census) nothing is hidden
+- Settings lists **all** eleven tools regardless of the current project (Settings is global config), split into **Security tools** / **Quality tools** groups, each row with the same enable / path / Detect / Browse / extra-args controls as V23; after a scan a per-row "**not applicable to the current project**" hint marks the ones this project's census gates off
+- **Binary resolution** per tool: a non-empty per-tool **path override** is used verbatim → else, for a node tool (eslint / knip), the project's own **`node_modules/.bin/<tool>`** (the `.cmd`/`.bat` shim on Windows) → else **ebin → PATH** on the bare command name; nothing is bundled. `dotnet-analyzers` resolves `dotnet`, `semgrep-quality` reuses the `semgrep` binary
+- **Per-tool timeout override** (`AuditToolConfig.timeout_secs`, blank = the global scan timeout): a tool that runs a real build wants a longer budget — **~1200 s recommended for `dotnet-analyzers`**; a tool exceeding its budget is killed and reported `error` while the others are unaffected
+- **One scan at a time globally** across both tabs (the cheapest correct model): while one tab scans, the other tab's Scan button is disabled with a muted "waiting — <other> scan running" note
+- Findings-table behaviors are inherited from V23 unchanged, per tab: severity / per-tool / text filters, severity-descending sort, Graph View ⌖ jump, 500-findings-per-tool wire cap (full set via `audit_snapshot`), not-installed → Settings deep-link, and Select-all-visible / Copy-selected agent-ready markdown (Quality tab copies under a `## Code quality findings` heading)
+- Exit-code semantics are per-tool (`Adapter::classify_exit`): most quality tools treat exit 1 as findings (success); **typos** uses exit 2; **cppcheck** exits 0 with findings (the report file carries them); PMD's 4 is findings, 5 a real error. Snapshots gained a `census` block and a `skipped_not_applicable` per-tool state; the Rust↔TS wire tripwire covers the grown enum. Existing installs gain the eleven tools on first load — a load-path reconcile appends any missing built-in to `code_audit.tools`, preserving every existing entry verbatim
+
 ## Theming & Appearance
 - 12 bundled terminal palettes + custom 22-color ANSI palette editor; per-tab palette override
 - UI theme selector: TUI Orange (default) + TUI Grey, ratatui-style; external theme/palette files

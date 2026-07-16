@@ -374,7 +374,14 @@ mod tests {
     #[test]
     fn total_slots_discovery_grows_slots_and_gate() {
         let b = RemoteBackend::new(
-            "lan", "http://x", "", false, BackendTier::Fast, ToolScope::All, Some(60_000), 1,
+            "lan",
+            "http://x",
+            "",
+            false,
+            BackendTier::Fast,
+            ToolScope::All,
+            Some(60_000),
+            1,
         )
         .unwrap();
         // Before /props: the assumed single slot.
@@ -399,7 +406,14 @@ mod tests {
     #[test]
     fn per_slot_budget_uses_n_ctx_directly() {
         let b = RemoteBackend::new(
-            "lan", "http://x", "", false, BackendTier::Fast, ToolScope::All, Some(16_000), 1,
+            "lan",
+            "http://x",
+            "",
+            false,
+            BackendTier::Fast,
+            ToolScope::All,
+            Some(16_000),
+            1,
         )
         .unwrap();
         // n_ctx is per-slot already → 16000 * 80% = 12800.

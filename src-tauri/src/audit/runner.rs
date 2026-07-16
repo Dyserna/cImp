@@ -23,10 +23,11 @@ use tauri::{AppHandle, Emitter};
 use tokio_util::sync::CancellationToken;
 
 use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord};
-use crate::checks::{parsers, Diag, ParserKind};
+use crate::checks::{parsers, Diag};
 use crate::settings::{AuditToolConfig, AuditToolId, SettingsHandle};
 
-use super::adapters::{self, Adapter, ExitClass, Transport};
+use super::adapters::{self, Adapter, Category, ExitClass, Transport};
+use super::census;
 
 /// Tauri event emitted on every per-tool transition, carrying a (findings-
 /// capped) [`AuditSnapshot`]. Phase C subscribes to this.
@@ -42,7 +43,8 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const EVENT_FINDINGS_PER_TOOL_CAP: usize = 500;
 
 /// One tool's lifecycle within a scan. Serialized kebab-case, so the wire
-/// strings are exactly `idle | running | done | failed | not-installed`.
+/// strings are exactly
+/// `idle | running | done | failed | not-installed | skipped-not-applicable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolStatus {
@@ -58,6 +60,12 @@ pub enum ToolStatus {
     /// The binary could not be resolved (ebin/PATH/override) — the scan
     /// proceeds with the remaining tools.
     NotInstalled,
+    /// V25 Phase C: the tool is enabled but does not apply to this project's
+    /// [`census`](super::census) (no PMD in a Rust repo) — never launched.
+    /// Distinct from [`Idle`](Self::Idle) (disabled) and
+    /// [`NotInstalled`](Self::NotInstalled) (binary missing) so the UI can hide
+    /// it in the tab while Settings still explains why.
+    SkippedNotApplicable,
 }
 
 /// One raw audit finding: a [`Diag`] (from the SARIF parser, project-relative
@@ -76,6 +84,10 @@ pub struct AuditFinding {
 pub struct ToolState {
     /// Kebab wire id.
     pub id: AuditToolId,
+    /// V25 Phase C: the tool's [`Category`] (`"security"` / `"quality"`). A scan
+    /// runs one category, so every `ToolState` in a snapshot shares it; the field
+    /// lets the split UI filter the shared snapshot to its own tab's tools.
+    pub category: Category,
     pub status: ToolStatus,
     pub findings: Vec<AuditFinding>,
     pub duration_ms: u64,
@@ -95,9 +107,11 @@ pub struct ToolState {
 }
 
 impl ToolState {
-    fn fresh(id: AuditToolId) -> Self {
+    /// An enabled + applicable tool about to be resolved and run: `running`.
+    fn fresh(id: AuditToolId, category: Category) -> Self {
         Self {
             id,
+            category,
             status: ToolStatus::Running,
             findings: Vec::new(),
             duration_ms: 0,
@@ -108,12 +122,33 @@ impl ToolState {
     }
 
     /// A configured-but-disabled tool: shown as an `idle` chip, never scanned.
-    fn idle(id: AuditToolId) -> Self {
+    fn idle(id: AuditToolId, category: Category) -> Self {
         Self {
             status: ToolStatus::Idle,
-            ..Self::fresh(id)
+            ..Self::fresh(id, category)
         }
     }
+
+    /// V25 Phase C: an enabled tool that doesn't apply to this project's census —
+    /// reported `skipped-not-applicable`, never launched.
+    fn skipped_not_applicable(id: AuditToolId, category: Category) -> Self {
+        Self {
+            status: ToolStatus::SkippedNotApplicable,
+            ..Self::fresh(id, category)
+        }
+    }
+}
+
+/// V25 Phase C: the language census of the scanned root, serialized into every
+/// snapshot so the split UI can gate chips (hide a tool the project doesn't
+/// apply to) without a second IPC. Empty (both lists) before the first scan of
+/// this runner — the last scan's census is retained afterward.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct CensusBlock {
+    /// Lowercase, dot-less file extensions seen (sorted).
+    pub extensions: Vec<String>,
+    /// [`census::MARKERS`] tokens seen (sorted).
+    pub markers: Vec<String>,
 }
 
 /// The whole runner snapshot — the `audit-status` event payload and the
@@ -127,8 +162,13 @@ pub struct AuditSnapshot {
     pub scanning: bool,
     /// Epoch millis when the last scan started; `null` before the first scan.
     pub last_scan_at: Option<u64>,
-    /// Per-tool state, in configured order (enabled tools only).
+    /// Per-tool state, in configured order. Contains only the tools of the last
+    /// scanned [`Category`] (a scan runs one category); empty before the first
+    /// scan. The split UI filters by [`ToolState::category`] and renders from
+    /// settings until its own category's tools appear here.
     pub tools: Vec<ToolState>,
+    /// V25 Phase C: the scanned root's language census — drives chip visibility.
+    pub census: CensusBlock,
     /// True total findings across all tools, BEFORE any wire cap — so the UI
     /// can render "showing N of M".
     pub total_findings: usize,
@@ -142,6 +182,9 @@ struct Inner {
     scanning: bool,
     last_scan_at: Option<u64>,
     tools: Vec<ToolState>,
+    /// V25 Phase C: the census taken at the last scan start — serialized into
+    /// every snapshot so the UI can gate chips. Default (empty) before any scan.
+    census: CensusBlock,
     /// The current scan's cancel token (present iff `scanning`).
     cancel: Option<CancellationToken>,
 }
@@ -171,6 +214,7 @@ impl Inner {
             scanning: self.scanning,
             last_scan_at: self.last_scan_at,
             tools,
+            census: self.census.clone(),
             total_findings,
             truncated,
         }
@@ -197,6 +241,7 @@ impl AuditState {
                 scanning: false,
                 last_scan_at: None,
                 tools: Vec::new(),
+                census: CensusBlock::default(),
                 cancel: None,
             }),
         })
@@ -211,7 +256,11 @@ impl AuditState {
     /// Built under the lock, emitted after dropping it (the graph-service
     /// discipline — a same-thread listener must not re-lock `inner`).
     fn emit_event(&self) {
-        let snap = self.inner.lock().unwrap().snapshot(Some(EVENT_FINDINGS_PER_TOOL_CAP));
+        let snap = self
+            .inner
+            .lock()
+            .unwrap()
+            .snapshot(Some(EVENT_FINDINGS_PER_TOOL_CAP));
         let _ = self.app.emit(AUDIT_STATUS_EVENT, &snap);
     }
 
@@ -227,10 +276,13 @@ impl AuditState {
         self.emit_event();
     }
 
-    /// Begin a scan. Rejects (clear error) if one is already in flight or no
-    /// tool is enabled. Returns immediately; work runs on a background task and
-    /// streams progress via `audit-status`.
-    pub fn start_scan(self: &Arc<Self>) -> Result<(), String> {
+    /// Begin a scan of `category` (V25 Phase C). Only tools of that category are
+    /// considered; of those, only the `enabled && applicable(&census)` set is
+    /// launched. Rejects (clear error) if a scan of *either* category is already
+    /// in flight (one scan at a time globally) or no tool of this category is
+    /// enabled. Returns immediately; work runs on a background task and streams
+    /// progress via `audit-status`.
+    pub fn start_scan(self: &Arc<Self>, category: Category) -> Result<(), String> {
         let cfg = self.settings.current().code_audit;
         // The master switch is enforced here, not just by tab visibility —
         // the IPC commands are registered unconditionally (the offload/graph
@@ -238,42 +290,52 @@ impl AuditState {
         if !cfg.enabled {
             return Err("Code Audit is disabled — enable it in cImp settings".to_string());
         }
-        let enabled: Vec<AuditToolConfig> = cfg.tools.iter().filter(|t| t.enabled).cloned().collect();
-        if enabled.is_empty() {
-            return Err("no audit tools are enabled".to_string());
+        // Only this category's tools; the other category belongs to the other tab.
+        let in_category: Vec<&AuditToolConfig> = cfg
+            .tools
+            .iter()
+            .filter(|t| adapters::adapter(t.id).category == category)
+            .collect();
+        if !in_category.iter().any(|t| t.enabled) {
+            return Err(format!(
+                "no {} audit tools are enabled",
+                category_label(category)
+            ));
         }
 
-        let (root, cancel) = {
+        // Take the census ONCE per scan, off the lock (the walk can take up to a
+        // couple seconds) — the root is fixed for the runner's lifetime, so a
+        // quick read to fetch it and then walk is safe.
+        let root = self.inner.lock().unwrap().root.clone();
+        let census = census::cached(&root);
+        let census_block = CensusBlock {
+            extensions: census.extensions(),
+            markers: census.markers(),
+        };
+
+        // The chips (one per this-category tool) and the enabled+applicable
+        // subset to launch — pure, so the filter is unit-tested directly.
+        let (chips, to_run) = plan_scan(&cfg.tools, category, &census);
+
+        let (root, cancel, global_timeout) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.scanning {
                 return Err("a scan is already in progress".to_string());
             }
             inner.scanning = true;
             inner.last_scan_at = Some(now_ms());
-            // Every configured tool gets a chip: enabled ones start `running`
-            // (about to resolve), disabled ones sit at `idle` so the tab shows
-            // the full tool list without the frontend re-reading settings.
-            inner.tools = cfg
-                .tools
-                .iter()
-                .map(|t| {
-                    if t.enabled {
-                        ToolState::fresh(t.id)
-                    } else {
-                        ToolState::idle(t.id)
-                    }
-                })
-                .collect();
+            inner.census = census_block;
+            inner.tools = chips;
             let cancel = CancellationToken::new();
             inner.cancel = Some(cancel.clone());
-            (inner.root.clone(), cancel)
+            (inner.root.clone(), cancel, cfg.timeout_secs.max(1))
         };
         self.emit_event();
 
         let this = self.clone();
-        let timeout = Duration::from_secs(cfg.timeout_secs.max(1));
+        let global_timeout = Duration::from_secs(global_timeout);
         tauri::async_runtime::spawn(async move {
-            this.run(enabled, root, timeout, cancel).await;
+            this.run(to_run, root, global_timeout, cancel).await;
         });
         Ok(())
     }
@@ -297,17 +359,21 @@ impl AuditState {
         self: Arc<Self>,
         tools: Vec<AuditToolConfig>,
         root: PathBuf,
-        timeout: Duration,
+        global_timeout: Duration,
         cancel: CancellationToken,
     ) {
         let git_repo = root.join(".git").exists();
         let mut handles = Vec::new();
 
         for tool in tools {
-            // The same override contract Detect probes — the shared helper is
-            // the single definition, so the two can't drift.
-            let name = super::effective_command(tool.id, &tool.path);
-            match crate::pty::resolve_command(&name) {
+            // V25 Phase C: per-tool timeout override (`None` = the global
+            // `code_audit.timeout_secs`). A build-style tool (dotnet-analyzers)
+            // wants a longer budget than a linter.
+            let timeout = effective_tool_timeout(tool.timeout_secs, global_timeout);
+            // The same resolver Detect uses — override → project-local
+            // `node_modules/.bin` (eslint/knip) → ebin/PATH — so a Detect ✓
+            // can't disagree with what a scan launches.
+            match super::resolve_audit_binary(tool.id, &tool.path, Some(&root)) {
                 Err(_) => {
                     self.patch_tool(tool.id, |ts| {
                         ts.status = ToolStatus::NotInstalled;
@@ -325,7 +391,8 @@ impl AuditState {
                     let cancel = cancel.clone();
                     let root = root.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        this.run_one(tool, resolved, root, git_repo, timeout, cancel).await;
+                        this.run_one(tool, resolved, root, git_repo, timeout, cancel)
+                            .await;
                     }));
                 }
             }
@@ -377,14 +444,22 @@ impl AuditState {
         // SARIF; for report-file tools it merely truncates captured logs.
         let sarif_truncated = adapter.transport == Transport::Stdout && cap.stdout_truncated;
         let (status, findings, error) = finalize_outcome(
-            tool.id, adapter, cap.outcome, &sarif, sarif_truncated, &cap.stdout, &cap.stderr,
-            &root, timeout,
+            tool.id,
+            adapter,
+            cap.outcome,
+            &sarif,
+            sarif_truncated,
+            &cap.stdout,
+            &cap.stderr,
+            &root,
+            timeout,
         );
 
         // Scan-coverage: the lockfiles/manifests osv-scanner reports scanning,
         // pulled from the same SARIF in a second best-effort pass (osv-scanner
         // only — its `runs[].artifacts` are the audit-only coverage signal).
-        let scanned_artifacts = if tool.id == AuditToolId::OsvScanner && status == ToolStatus::Done {
+        let scanned_artifacts = if tool.id == AuditToolId::OsvScanner && status == ToolStatus::Done
+        {
             parsers::sarif_scanned_artifacts(&sarif, &root)
         } else {
             Vec::new()
@@ -415,7 +490,11 @@ impl AuditState {
 fn temp_report_path(id: AuditToolId) -> PathBuf {
     let dir = std::env::temp_dir().join("cimp-audit");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{}-{}.sarif", id.command_name(), uuid::Uuid::new_v4()))
+    dir.join(format!(
+        "{}-{}.sarif",
+        id.command_name(),
+        uuid::Uuid::new_v4()
+    ))
 }
 
 /// Read the tool's SARIF from wherever its adapter delivers it.
@@ -432,11 +511,31 @@ async fn read_sarif(transport: Transport, stdout: &str, report: Option<&Path>) -
 }
 
 /// Turn a completed [`Capture`] into the tool's terminal state. Pure — the
-/// `sarif` text has already been resolved from the adapter's transport by the
-/// caller (empty for a killed child), and `sarif_truncated` says whether that
-/// text is known-incomplete (stdout blew the capture cap / drain timed out).
-/// This is the one place the audit runner's findings-vs-error exit semantics
-/// are applied.
+/// `sarif` text (a tool's stdout or report-file contents; still named `sarif`
+/// for continuity though a quality tool may emit JSON/text) has already been
+/// resolved from the adapter's transport by the caller (empty for a killed
+/// child), and `sarif_truncated` says whether that text is known-incomplete
+/// (stdout blew the capture cap / drain timed out). This is the one place the
+/// audit runner's findings-vs-error exit semantics are applied.
+///
+/// V25 Phase C decision table (output always parsed via the adapter's parser):
+///
+/// | outcome | parsed findings | result |
+/// |---|---|---|
+/// | spawn error / cancel / timeout | — | `failed` |
+/// | [`ExitClass::Error`] (non-findings non-zero code) | — | `failed` (code + tail) |
+/// | Clean/Findings but output known-truncated | — | `failed` (incomplete) |
+/// | [`ExitClass::Clean`] (exit 0), any parsed findings | ≥ 0 | `done` (findings authoritative) |
+/// | [`ExitClass::Findings`] code, ≥ 1 parsed finding | ≥ 1 | `done` with findings |
+/// | [`ExitClass::Findings`] code, 0 parsed findings | 0 | `failed` (report lost) |
+///
+/// The Clean row is the V25 correction: cppcheck ALWAYS exits 0 (findings only
+/// in its report) and eslint exits 0 when it has warnings-only — both must be
+/// read from their parsed output on a clean exit, not assumed empty. A clean
+/// exit with genuinely empty/absent output still parses to zero findings and
+/// stays `done`-no-findings (gitleaks writes no report on a clean run). The
+/// "report lost" guard fires only for a *findings exit code* whose output didn't
+/// parse — never for a clean exit, whose empty output is a legitimate clean bill.
 #[allow(clippy::too_many_arguments)]
 fn finalize_outcome(
     id: AuditToolId,
@@ -455,7 +554,11 @@ fn finalize_outcome(
             Vec::new(),
             Some(format!("failed to launch: {e}")),
         ),
-        Outcome::Cancelled => (ToolStatus::Failed, Vec::new(), Some("scan cancelled".to_string())),
+        Outcome::Cancelled => (
+            ToolStatus::Failed,
+            Vec::new(),
+            Some("scan cancelled".to_string()),
+        ),
         Outcome::TimedOut => (
             ToolStatus::Failed,
             Vec::new(),
@@ -489,8 +592,9 @@ fn finalize_outcome(
                     // JSON) — the one thing this feature must not present as a
                     // clean pass.
                     if class == ExitClass::Findings && findings.is_empty() {
-                        let code_str =
-                            code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
+                        let code_str = code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
                         let tail = diag_tail(stderr, stdout);
                         let mut msg = format!(
                             "exit code {code_str} reports findings, but the SARIF report was empty or unreadable — findings were lost"
@@ -508,19 +612,80 @@ fn finalize_outcome(
     }
 }
 
-/// Parse a tool's SARIF into tagged findings (project-relative paths).
-fn parse_findings(id: AuditToolId, sarif: &str, root: &Path) -> Vec<AuditFinding> {
-    parsers::parse(ParserKind::Sarif, sarif, "", root, None)
+/// Parse a tool's captured output into tagged findings (project-relative paths).
+/// V25 Phase C: dispatches to the tool's adapter [`AuditParser`] — SARIF for the
+/// security trio + most linters, else the tool-specific JSON/JSONL/text decoder
+/// (eslint, typos, knip, cargo-machete) — rather than assuming SARIF. `output`
+/// is the tool's stdout (stdout transport) or report-file contents (report-file
+/// transport), already resolved by the caller.
+fn parse_findings(id: AuditToolId, output: &str, root: &Path) -> Vec<AuditFinding> {
+    adapters::adapter(id)
+        .parser
+        .parse(output, root)
         .into_iter()
         .map(|diag| AuditFinding { tool: id, diag })
         .collect()
+}
+
+/// V25 Phase C: the wall-clock timeout for one tool. A per-tool
+/// [`AuditToolConfig::timeout_secs`](crate::settings::AuditToolConfig) override
+/// (clamped to ≥ 1s) wins; `None` falls back to the global
+/// `code_audit.timeout_secs` (`global`, already clamped ≥ 1s by the caller).
+fn effective_tool_timeout(tool_secs: Option<u64>, global: Duration) -> Duration {
+    tool_secs
+        .map(|s| Duration::from_secs(s.max(1)))
+        .unwrap_or(global)
+}
+
+/// The lowercase category word used in the "no … tools are enabled" error.
+fn category_label(category: Category) -> &'static str {
+    match category {
+        Category::Security => "security",
+        Category::Quality => "quality",
+    }
+}
+
+/// V25 Phase C: pure scan planning. From the configured tools, the target
+/// `category`, and the project `census`, produce `(chips, to_run)`:
+///
+/// - `chips`: one [`ToolState`] per tool **of this category** (the other
+///   category belongs to the other tab), in configured order — `idle` when
+///   disabled, `skipped-not-applicable` when enabled but gated off by the
+///   census, `running` (about to resolve) when enabled + applicable.
+/// - `to_run`: the enabled + applicable subset actually launched.
+///
+/// Split out from [`AuditState::start_scan`] so the category + applicability
+/// filter is unit-testable without a Tauri `AppHandle`.
+fn plan_scan(
+    tools: &[AuditToolConfig],
+    category: Category,
+    census: &census::Census,
+) -> (Vec<ToolState>, Vec<AuditToolConfig>) {
+    let mut chips = Vec::new();
+    let mut to_run = Vec::new();
+    for t in tools
+        .iter()
+        .filter(|t| adapters::adapter(t.id).category == category)
+    {
+        if !t.enabled {
+            chips.push(ToolState::idle(t.id, category));
+        } else if adapters::adapter(t.id).applicable(census) {
+            chips.push(ToolState::fresh(t.id, category));
+            to_run.push(t.clone());
+        } else {
+            chips.push(ToolState::skipped_not_applicable(t.id, category));
+        }
+    }
+    (chips, to_run)
 }
 
 /// A concise `failed` message for a tool-error exit, appending a short tail of
 /// the tool's own diagnostics (stderr preferred, else stdout) so an offline /
 /// misconfigured run surfaces the tool's reason, not a bare code.
 fn exit_error_message(code: Option<i32>, stderr: &str, stdout: &str) -> String {
-    let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let code_str = code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let tail = diag_tail(stderr, stdout);
     if tail.is_empty() {
         format!("exited with code {code_str}")
@@ -532,7 +697,11 @@ fn exit_error_message(code: Option<i32>, stderr: &str, stdout: &str) -> String {
 /// The last 3 lines of the tool's own diagnostics (stderr preferred, else
 /// stdout) — the short "why" tail appended to failure messages.
 fn diag_tail(stderr: &str, stdout: &str) -> String {
-    let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
     let lines: Vec<&str> = detail.lines().collect();
     lines[lines.len().saturating_sub(3)..].join("\n")
 }
@@ -622,8 +791,14 @@ async fn spawn_and_capture(
     // Backstop reaper if cImp dies hard before kill_on_drop fires.
     crate::process_guard::guard_child(&child);
 
-    let out_task = tokio::spawn(crate::procutil::read_capped(child.stdout.take(), MAX_OUTPUT_BYTES));
-    let err_task = tokio::spawn(crate::procutil::read_capped(child.stderr.take(), MAX_OUTPUT_BYTES));
+    let out_task = tokio::spawn(crate::procutil::read_capped(
+        child.stdout.take(),
+        MAX_OUTPUT_BYTES,
+    ));
+    let err_task = tokio::spawn(crate::procutil::read_capped(
+        child.stderr.take(),
+        MAX_OUTPUT_BYTES,
+    ));
 
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
@@ -645,7 +820,12 @@ async fn spawn_and_capture(
 
     let (stdout, stdout_truncated) = crate::procutil::drain_capture(out_task).await;
     let (stderr, _) = crate::procutil::drain_capture(err_task).await;
-    Capture { stdout, stdout_truncated, stderr, outcome }
+    Capture {
+        stdout,
+        stdout_truncated,
+        stderr,
+        outcome,
+    }
 }
 
 #[cfg(test)]
@@ -790,7 +970,10 @@ mod tests {
     #[test]
     fn osv_artifacts_extract_relative_deduped() {
         let a = parsers::sarif_scanned_artifacts(OSV_ARTIFACTS_SARIF, &root());
-        assert_eq!(a, vec!["Cargo.lock".to_string(), "package-lock.json".to_string()]);
+        assert_eq!(
+            a,
+            vec!["Cargo.lock".to_string(), "package-lock.json".to_string()]
+        );
     }
 
     #[test]
@@ -919,7 +1102,15 @@ mod tests {
         let a = adapters::adapter(AuditToolId::Semgrep);
         let f = |o: Outcome| {
             finalize_outcome(
-                AuditToolId::Semgrep, a, o, "", false, "", "", &root(), Duration::from_secs(5),
+                AuditToolId::Semgrep,
+                a,
+                o,
+                "",
+                false,
+                "",
+                "",
+                &root(),
+                Duration::from_secs(5),
             )
         };
         let (s, _, e) = f(Outcome::TimedOut);
@@ -935,11 +1126,196 @@ mod tests {
         assert!(e.unwrap().contains("boom"));
     }
 
+    // ── V25 finalize: clean-exit-with-findings semantics ────────────────────
+
+    /// cppcheck ALWAYS exits 0 (no `--error-exitcode`); its findings live only
+    /// in the report. A clean (exit-0) run with a populated report must be
+    /// `done`-WITH-findings — the V25 correction to V23's "clean = empty".
+    #[test]
+    fn cppcheck_clean_exit_with_report_yields_findings() {
+        const CPPCHECK_SARIF: &str = r#"{
+          "version": "2.1.0",
+          "runs": [{
+            "tool": { "driver": { "name": "cppcheck" } },
+            "results": [{
+              "ruleId": "nullPointer",
+              "level": "error",
+              "message": { "text": "Null pointer dereference" },
+              "locations": [{
+                "physicalLocation": {
+                  "artifactLocation": { "uri": "src/main.c" },
+                  "region": { "startLine": 10 }
+                }
+              }]
+            }]
+          }]
+        }"#;
+        let a = adapters::adapter(AuditToolId::Cppcheck);
+        let (status, findings, error) = finalize_outcome(
+            AuditToolId::Cppcheck,
+            a,
+            Outcome::Exited(Some(0)), // cppcheck's normal "findings present" path
+            CPPCHECK_SARIF,
+            false,
+            "",
+            "",
+            &root(),
+            Duration::from_secs(600),
+        );
+        assert_eq!(status, ToolStatus::Done);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].diag.code.as_deref(), Some("nullPointer"));
+        assert_eq!(findings[0].diag.file, "src/main.c");
+        assert!(error.is_none());
+    }
+
+    /// eslint exits 0 when it has warnings-only, yet its JSON still carries them.
+    /// The [`AuditParser::EslintJson`](super::parsers::AuditParser) decoder runs
+    /// on the clean-exit output, so those warnings surface as `done`-with-
+    /// findings rather than a false clean bill.
+    #[test]
+    fn eslint_clean_exit_with_warnings_yields_findings() {
+        const ESLINT_JSON: &str = r#"[
+          { "filePath": "/proj/root/src/app.ts",
+            "messages": [
+              { "ruleId": "eqeqeq", "severity": 1, "message": "use ===", "line": 4, "column": 3 }
+            ]
+          }
+        ]"#;
+        let a = adapters::adapter(AuditToolId::Eslint);
+        let (status, findings, error) = finalize_outcome(
+            AuditToolId::Eslint,
+            a,
+            Outcome::Exited(Some(0)), // warnings-only ⇒ exit 0
+            ESLINT_JSON,
+            false,
+            ESLINT_JSON, // eslint's output is on stdout
+            "",
+            &root(),
+            Duration::from_secs(600),
+        );
+        assert_eq!(status, ToolStatus::Done);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].diag.severity, Severity::Warning);
+        assert_eq!(findings[0].diag.code.as_deref(), Some("eqeqeq"));
+        assert_eq!(findings[0].diag.file, "src/app.ts");
+        assert!(error.is_none());
+    }
+
+    /// A genuinely clean run (empty/absent output) stays `done`-no-findings for
+    /// every parser — the "report lost" guard is for a *findings exit code* whose
+    /// output didn't parse, never for a clean exit whose empty output is a real
+    /// clean bill.
+    #[test]
+    fn clean_exit_with_empty_output_is_done_no_findings() {
+        for id in [
+            AuditToolId::Cppcheck,
+            AuditToolId::Eslint,
+            AuditToolId::Oxlint,
+        ] {
+            let a = adapters::adapter(id);
+            let (status, findings, error) = finalize_outcome(
+                id,
+                a,
+                Outcome::Exited(Some(0)),
+                "",
+                false,
+                "",
+                "",
+                &root(),
+                Duration::from_secs(600),
+            );
+            assert_eq!(status, ToolStatus::Done, "{id:?}");
+            assert!(findings.is_empty(), "{id:?}");
+            assert!(error.is_none(), "{id:?}");
+        }
+    }
+
+    // ── V25 plan_scan: category + applicability + disabled filter ────────────
+
+    fn tool_cfg(id: AuditToolId, enabled: bool) -> AuditToolConfig {
+        AuditToolConfig {
+            id,
+            enabled,
+            path: String::new(),
+            extra_args: Vec::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// A Quality scan never launches a Security tool, hides a disabled tool as
+    /// `idle`, and reports an enabled-but-inapplicable tool `skipped-not-
+    /// applicable`; only enabled + applicable tools land in `to_run`.
+    #[test]
+    fn plan_scan_quality_filters_category_disabled_and_applicability() {
+        // A Rust + JS project: no `.py`, no `.go`.
+        let census = census::Census::from_parts(&["ts", "rs"], &["Cargo.toml", "package.json"]);
+        let tools = vec![
+            tool_cfg(AuditToolId::OsvScanner, true), // security — excluded here
+            tool_cfg(AuditToolId::Oxlint, true),     // quality, applicable (ts)
+            tool_cfg(AuditToolId::Ruff, true),       // quality, NOT applicable (no py)
+            tool_cfg(AuditToolId::CargoMachete, false), // quality, disabled
+            tool_cfg(AuditToolId::Typos, true),      // quality, always applicable
+        ];
+        let (chips, to_run) = plan_scan(&tools, Category::Quality, &census);
+
+        // No security tool leaks into a quality scan.
+        assert!(chips.iter().all(|c| c.category == Category::Quality));
+        assert!(!chips.iter().any(|c| c.id == AuditToolId::OsvScanner));
+
+        let status = |id: AuditToolId| chips.iter().find(|c| c.id == id).unwrap().status;
+        assert_eq!(status(AuditToolId::Oxlint), ToolStatus::Running);
+        assert_eq!(status(AuditToolId::Ruff), ToolStatus::SkippedNotApplicable);
+        assert_eq!(status(AuditToolId::CargoMachete), ToolStatus::Idle);
+        assert_eq!(status(AuditToolId::Typos), ToolStatus::Running);
+
+        // to_run is exactly the enabled + applicable set, in configured order.
+        let run_ids: Vec<AuditToolId> = to_run.iter().map(|t| t.id).collect();
+        assert_eq!(run_ids, vec![AuditToolId::Oxlint, AuditToolId::Typos]);
+    }
+
+    /// A Security scan excludes every Quality tool; the always-applicable trio
+    /// runs even against an empty census.
+    #[test]
+    fn plan_scan_security_excludes_quality_tools() {
+        let census = census::Census::default();
+        let tools = vec![
+            tool_cfg(AuditToolId::OsvScanner, true),
+            tool_cfg(AuditToolId::Gitleaks, true),
+            tool_cfg(AuditToolId::Oxlint, true), // quality — must not appear
+        ];
+        let (chips, to_run) = plan_scan(&tools, Category::Security, &census);
+        assert!(chips.iter().all(|c| c.category == Category::Security));
+        assert!(!chips.iter().any(|c| c.id == AuditToolId::Oxlint));
+        let run_ids: Vec<AuditToolId> = to_run.iter().map(|t| t.id).collect();
+        assert_eq!(
+            run_ids,
+            vec![AuditToolId::OsvScanner, AuditToolId::Gitleaks]
+        );
+    }
+
+    /// V25 Phase C: a per-tool `timeout_secs` override wins over the global; a
+    /// `None` override falls back to the global; a 0 override clamps to 1s.
+    #[test]
+    fn effective_tool_timeout_prefers_override_else_global() {
+        let global = Duration::from_secs(600);
+        assert_eq!(effective_tool_timeout(None, global), global);
+        assert_eq!(
+            effective_tool_timeout(Some(1200), global),
+            Duration::from_secs(1200)
+        );
+        // A 0 override is clamped to ≥ 1s (never an instant timeout).
+        assert_eq!(
+            effective_tool_timeout(Some(0), global),
+            Duration::from_secs(1)
+        );
+    }
+
     // ── snapshot wire cap ───────────────────────────────────────────────────
 
     #[test]
     fn event_snapshot_caps_findings_and_flags_truncated() {
-        let mut ts = ToolState::fresh(AuditToolId::Gitleaks);
+        let mut ts = ToolState::fresh(AuditToolId::Gitleaks, Category::Security);
         ts.status = ToolStatus::Done;
         let one = || AuditFinding {
             tool: AuditToolId::Gitleaks,
@@ -952,24 +1328,56 @@ mod tests {
                 col: None,
             },
         };
-        ts.findings = (0..EVENT_FINDINGS_PER_TOOL_CAP + 10).map(|_| one()).collect();
+        ts.findings = (0..EVENT_FINDINGS_PER_TOOL_CAP + 10)
+            .map(|_| one())
+            .collect();
         let inner = Inner {
             root: root(),
             scanning: false,
             last_scan_at: Some(123),
             tools: vec![ts],
+            census: CensusBlock::default(),
             cancel: None,
         };
         // Full snapshot (IPC): everything, never truncated.
         let full = inner.snapshot(None);
         assert_eq!(full.total_findings, EVENT_FINDINGS_PER_TOOL_CAP + 10);
         assert!(!full.truncated);
-        assert_eq!(full.tools[0].findings.len(), EVENT_FINDINGS_PER_TOOL_CAP + 10);
+        assert_eq!(
+            full.tools[0].findings.len(),
+            EVENT_FINDINGS_PER_TOOL_CAP + 10
+        );
         // Event snapshot: capped, truncated flag set, total still true.
         let evt = inner.snapshot(Some(EVENT_FINDINGS_PER_TOOL_CAP));
         assert!(evt.truncated);
         assert_eq!(evt.tools[0].findings.len(), EVENT_FINDINGS_PER_TOOL_CAP);
         assert_eq!(evt.total_findings, EVENT_FINDINGS_PER_TOOL_CAP + 10);
+    }
+
+    /// V25 Phase C: the snapshot serializes the census block (both cap modes),
+    /// so the split UI can gate chips off a single IPC/event payload.
+    #[test]
+    fn snapshot_carries_census_block() {
+        let inner = Inner {
+            root: root(),
+            scanning: false,
+            last_scan_at: None,
+            tools: vec![ToolState::fresh(AuditToolId::Oxlint, Category::Quality)],
+            census: CensusBlock {
+                extensions: vec!["rs".into(), "ts".into()],
+                markers: vec!["Cargo.toml".into()],
+            },
+            cancel: None,
+        };
+        for cap in [None, Some(EVENT_FINDINGS_PER_TOOL_CAP)] {
+            let snap = inner.snapshot(cap);
+            assert_eq!(
+                snap.census.extensions,
+                vec!["rs".to_string(), "ts".to_string()]
+            );
+            assert_eq!(snap.census.markers, vec!["Cargo.toml".to_string()]);
+            assert_eq!(snap.tools[0].category, Category::Quality);
+        }
     }
 
     // ── Rust↔TS wire tripwire (runtime types) ──────────────────────────────
@@ -992,6 +1400,7 @@ mod tests {
             last_scan_at: Some(123),
             tools: vec![ToolState {
                 id: AuditToolId::Gitleaks,
+                category: Category::Security,
                 status: ToolStatus::Done,
                 findings: vec![AuditFinding {
                     tool: AuditToolId::Gitleaks,
@@ -1009,6 +1418,10 @@ mod tests {
                 resolved: Some(PathBuf::from("C:/ebin/gitleaks.exe")),
                 scanned_artifacts: vec!["Cargo.lock".into()],
             }],
+            census: CensusBlock {
+                extensions: vec!["rs".into(), "ts".into()],
+                markers: vec!["Cargo.toml".into()],
+            },
             total_findings: 1,
             truncated: false,
         };
@@ -1028,7 +1441,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert_keys(&serde_json::to_value(&snap).expect("snapshot serializes"), AUDIT_RUNTIME_TS);
+        assert_keys(
+            &serde_json::to_value(&snap).expect("snapshot serializes"),
+            AUDIT_RUNTIME_TS,
+        );
     }
 
     #[test]
@@ -1041,6 +1457,7 @@ mod tests {
             ToolStatus::Done,
             ToolStatus::Failed,
             ToolStatus::NotInstalled,
+            ToolStatus::SkippedNotApplicable,
         ];
         fn _statuses_exhaustive(s: ToolStatus) {
             match s {
@@ -1048,14 +1465,40 @@ mod tests {
                 | ToolStatus::Running
                 | ToolStatus::Done
                 | ToolStatus::Failed
-                | ToolStatus::NotInstalled => {}
+                | ToolStatus::NotInstalled
+                | ToolStatus::SkippedNotApplicable => {}
             }
         }
         for s in statuses {
-            let wire = serde_json::to_value(s).unwrap().as_str().unwrap().to_string();
+            let wire = serde_json::to_value(s)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
             assert!(
                 AUDIT_RUNTIME_TS.contains(&format!("'{wire}'")),
                 "ToolStatus wire `{wire}` is missing from the TS `AuditToolStatus` union",
+            );
+        }
+
+        // V25 Phase C: the two Category wire strings must be in the TS
+        // `AuditCategory` union (a scan is dispatched by, and every ToolState
+        // tagged with, this value).
+        let categories = [Category::Security, Category::Quality];
+        fn _categories_exhaustive(c: Category) {
+            match c {
+                Category::Security | Category::Quality => {}
+            }
+        }
+        for c in categories {
+            let wire = serde_json::to_value(c)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                AUDIT_RUNTIME_TS.contains(&format!("'{wire}'")),
+                "Category wire `{wire}` is missing from the TS `AuditCategory` union",
             );
         }
 
@@ -1066,7 +1509,11 @@ mod tests {
             }
         }
         for sev in severities {
-            let wire = serde_json::to_value(sev).unwrap().as_str().unwrap().to_string();
+            let wire = serde_json::to_value(sev)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
             assert!(
                 AUDIT_RUNTIME_TS.contains(&format!("'{wire}'")),
                 "Severity wire `{wire}` is missing from the TS `AuditSeverity` union",
@@ -1104,8 +1551,14 @@ mod tests {
         )
         .await;
         // Returns promptly (child killed), not after the ~30s sleep.
-        assert!(started.elapsed() < Duration::from_secs(10), "child was not killed on timeout");
-        assert!(matches!(cap.outcome, Outcome::TimedOut), "expected TimedOut");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child was not killed on timeout"
+        );
+        assert!(
+            matches!(cap.outcome, Outcome::TimedOut),
+            "expected TimedOut"
+        );
     }
 
     #[tokio::test]
@@ -1128,8 +1581,14 @@ mod tests {
             &cancel,
         )
         .await;
-        assert!(started.elapsed() < Duration::from_secs(10), "child was not killed on cancel");
-        assert!(matches!(cap.outcome, Outcome::Cancelled), "expected Cancelled");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "child was not killed on cancel"
+        );
+        assert!(
+            matches!(cap.outcome, Outcome::Cancelled),
+            "expected Cancelled"
+        );
     }
 
     #[tokio::test]

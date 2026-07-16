@@ -3,12 +3,15 @@
 // the row-selection and Detect-result formatting live here where Vitest can
 // exercise them, mirroring the `checksEditor.ts` split.
 
+import type { AuditCategory, AuditCensus } from '../codeAudit/types';
+import { AUDIT_TOOL_CATEGORY, censusIsEmpty, isToolApplicable } from '../codeAudit/logic';
 import type { AuditDetectResult, AuditToolConfig, AuditToolId, Settings } from './types';
 
 /// Static per-tool presentation for the Code Audit section: display name +
-/// one-line role text, in display order. The `role` strings are the spec's
-/// (Phase A) one-liners.
+/// one-line role text, in display order (Security trio first, then the V25
+/// Quality tools). The `role` strings are the spec's one-liners.
 export const AUDIT_TOOL_META: { id: AuditToolId; name: string; role: string }[] = [
+  // Security (V23).
   {
     id: 'osv-scanner',
     name: 'osv-scanner',
@@ -19,6 +22,26 @@ export const AUDIT_TOOL_META: { id: AuditToolId; name: string; role: string }[] 
     id: 'semgrep',
     name: 'semgrep',
     role: 'SAST — requires Python, Windows support beta',
+  },
+  // Quality (V25) — language-gated linters / dead-code / spell-check.
+  { id: 'oxlint', name: 'oxlint', role: 'JS/TS linter — single Rust binary, zero-config' },
+  { id: 'golangci-lint', name: 'golangci-lint', role: 'Go meta-linter' },
+  { id: 'ruff', name: 'ruff', role: 'Python linter — single Rust binary' },
+  { id: 'cppcheck', name: 'cppcheck', role: 'C/C++ static analysis' },
+  { id: 'typos', name: 'typos', role: 'source spell-checker — applies to every project' },
+  { id: 'eslint', name: 'eslint', role: 'JS/TS linter — uses the project-local config' },
+  { id: 'pmd', name: 'PMD', role: 'Java static analysis — needs a JRE' },
+  { id: 'knip', name: 'knip', role: 'unused files / exports / dependencies (Node)' },
+  { id: 'cargo-machete', name: 'cargo-machete', role: 'unused Rust dependencies' },
+  {
+    id: 'dotnet-analyzers',
+    name: 'Roslyn analyzers',
+    role: 'runs a real .NET build (writes obj/bin) — default-disabled, longer timeout',
+  },
+  {
+    id: 'semgrep-quality',
+    name: 'semgrep (quality)',
+    role: 'best-practices rulesets — default-disabled, needs network',
   },
 ];
 
@@ -42,6 +65,33 @@ export function auditToolRows(settings: Settings): AuditToolRow[] {
   }
   return rows;
 }
+
+/// V25 Phase D: the per-tool rows split into the Security and Quality groups the
+/// Settings section renders under separate headers. Non-applicable tools are NOT
+/// hidden here (Settings is global config) — the section shows a census-based
+/// hint instead (`toolNotApplicable`).
+export interface AuditToolGroups {
+  security: AuditToolRow[];
+  quality: AuditToolRow[];
+}
+
+export function auditToolGroups(settings: Settings): AuditToolGroups {
+  const security: AuditToolRow[] = [];
+  const quality: AuditToolRow[] = [];
+  for (const row of auditToolRows(settings)) {
+    (AUDIT_TOOL_CATEGORY[row.meta.id] === 'quality' ? quality : security).push(row);
+  }
+  return { security, quality };
+}
+
+/// Whether the Settings section should show the "not applicable to the current
+/// project" hint for `id`: the latest scan's census gates it off. An empty
+/// census (before any scan) shows no hint — nothing is known to gate on yet.
+export function toolNotApplicable(id: AuditToolId, census: AuditCensus): boolean {
+  return !censusIsEmpty(census) && !isToolApplicable(id, census);
+}
+
+export type { AuditCategory };
 
 /// The per-tool Detect probe state the section tracks: `undefined` before any
 /// probe, `'probing'` while the IPC is in flight, or a result.

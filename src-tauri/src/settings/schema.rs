@@ -1755,6 +1755,11 @@ pub struct GraphSettings {
     /// V16 Feature 8: the cache-write segment's color — new alongside the
     /// four above now that `cache_make` is plotted as its own segment.
     pub usage_color_write: String,
+    /// V24 Phase C follow-up: the S/A lane colors — main-session and
+    /// sub-agent segments under the chart (the agent color also tints the
+    /// sub-agent bars' outline). Edited via the same legend swatches.
+    pub usage_color_session: String,
+    pub usage_color_agent: String,
 }
 
 impl GraphSettings {
@@ -1863,6 +1868,8 @@ impl Default for GraphSettings {
             usage_color_out: "#3fb950".to_string(),
             usage_color_tool: "#f0c674".to_string(),
             usage_color_write: "#e3738d".to_string(),
+            usage_color_session: "#30363d".to_string(),
+            usage_color_agent: "#3b6ea5".to_string(),
         }
     }
 }

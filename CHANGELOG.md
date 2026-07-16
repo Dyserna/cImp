@@ -5,6 +5,52 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] — 2026-07-16
+
+### Added
+
+- **Code Audit over MCP (V26).** A new `cimp --code-audit-mcp` stdio server
+  (`cimp-code-audit`) exposes two zero-argument tools — `security_audit` and
+  `quality_audit` — to Claude Code and OpenCode, proxied to the running app
+  over the loopback `/audit/run` NDJSON stream; the offload worker gets the
+  same tools natively (offered to **local** backends only, since reports carry
+  repo paths and code quotes). Agent-triggered scans reuse the exact UI
+  semantics and stream live into the Code Audit tab. Per-consumer exposure
+  toggles (Claude / OpenCode / offload) live in a Settings "MCP exposure"
+  group (schema v23→v24) and are re-enforced at every run.
+- **Census-driven quality auto-select.** `code_audit.quality_auto_select`
+  (default on) keeps each Quality tool enabled iff it is factory-default-
+  enabled AND applicable to the project's language census; applied at scan
+  start, on tab mount/re-show, and on Settings open (real census, ≤60 s
+  cache), so chip gating and "not applicable" hints work before the first
+  scan. A manual quality-checkbox edit flips to manual mode so choices stick;
+  "Auto-select for this project" in Settings re-applies and re-enables auto.
+
+### Changed
+
+- **Code Quality tab retired — Quality is now a sub-tab of Code Audit.** The
+  separate V25 reserved tab is gone; the Code Audit tab hosts
+  **Security | Quality** sub-tabs. Both panels stay mounted, so a scan keeps
+  streaming into the hidden sub-tab, and persisted filters survive. Settings
+  schema v22→v23 drops persisted code-quality tab entries.
+
+### Fixed
+
+- **Executable pickers accept `.cmd`/`.bat`/`.com` launchers.** The Browse
+  dialogs (audit tool path overrides, bottom-bar external tools, tab command)
+  filtered to `*.exe` only, hiding npm bin shims (`eslint.cmd`, `knip.cmd`)
+  and Java launchers (`pmd.bat`) that the resolver and spawn path already
+  handle fine.
+- **Active-tab flapping.** Two `set_active_tab` round-trips in flight at once
+  could re-arm each other through the `ActiveTabChanged` forward-sync,
+  flipping the focused pane back and forth for seconds. Applying a broadcast
+  is now terminal and can never generate another push.
+- **Non-AI tabs left-align their titles.** Only AI-tool tabs light the status
+  dot, so only they keep the reserved indicator slot; dashboard and shell
+  tabs drop it instead of centering their label around a phantom dot.
+- **Usage chart zoom resets per session** and the S/A lane spans the full
+  scroll width instead of stopping at the visible card edge.
+
 ## [0.45.0] — 2026-07-16
 
 ### Added

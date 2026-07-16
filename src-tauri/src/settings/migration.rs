@@ -281,6 +281,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v22,
         transform: migrate_v22_to_v23_step,
     },
+    MigrationStep {
+        from_version: "v23",
+        detect: looks_v23,
+        transform: migrate_v23_to_v24_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2017,10 +2022,46 @@ fn migrate_v22_to_v23(value: &mut Value) {
         });
     }
 
-    // Final cascade step ⇒ stamp CURRENT (23).
+    // Stamp a *literal* 23 (not CURRENT_SCHEMA_VERSION): the v23 → v24 step
+    // runs next in the same cascade pass and gates on `schema_version == 23`,
+    // so this step must leave that concrete value for the next detector.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(23u8)),
+    );
+}
+
+fn looks_v23(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 23)
+}
+
+fn migrate_v23_to_v24_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v23_to_v24(value)
+}
+
+/// V23 → V24: pure version stamp for the V26 Code-Audit MCP-exposure flags.
+///
+/// V26 added three additive bools to `CodeAuditSettings`
+/// (`expose_claude` / `expose_opencode` / `expose_offload`), all
+/// `#[serde(default)]` → true. An existing v23 file that lacks them
+/// round-trips with every flag defaulting on (see the schema test
+/// `code_audit_v23_json_without_expose_flags_loads_true`), so no data
+/// transform is needed. This step exists purely to advance the version marker
+/// so the cascade's fixpoint guard (`migrate_if_needed`) doesn't flag a v23
+/// file as under-migrated. Final cascade step ⇒ stamp CURRENT (24).
+///
+/// Idempotent: a second pass finds `schema_version == 24` so `looks_v23` is
+/// false.
+fn migrate_v23_to_v24(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(24u8)),
     );
 }
 
@@ -2617,6 +2658,36 @@ mod tests {
         assert_eq!(v["schema_version"], json!(23));
         let once = v.clone();
         migrate_v22_to_v23(&mut v);
+        assert_eq!(v, once);
+    }
+
+    #[test]
+    fn looks_v23_detects_v23_and_not_others() {
+        assert!(looks_v23(&json!({ "schema_version": 23 })));
+        assert!(!looks_v23(&json!({ "schema_version": 22 })));
+        assert!(!looks_v23(&json!({ "schema_version": 24 })));
+        assert!(!looks_v23(&json!({})));
+    }
+
+    /// V26: a v23 file — including one carrying a `code_audit` block that
+    /// predates the three MCP-exposure flags — round-trips through the v23→v24
+    /// step with everything but the version marker untouched; the new
+    /// `expose_*` fields simply aren't present on disk (they deserialize to
+    /// their `#[serde(default)]` = true values). Running the step twice is a
+    /// no-op.
+    #[test]
+    fn v23_to_v24_only_stamps_version_and_is_idempotent() {
+        let mut v = json!({
+            "schema_version": 23,
+            "code_audit": { "enabled": true, "tools": [] }
+        });
+        migrate_v23_to_v24(&mut v);
+        assert_eq!(v["schema_version"], json!(24));
+        // The code_audit block is carried through verbatim — no expose_* keys
+        // are injected on disk; serde defaults fill them on load.
+        assert_eq!(v["code_audit"], json!({ "enabled": true, "tools": [] }));
+        let once = v.clone();
+        migrate_v23_to_v24(&mut v);
         assert_eq!(v, once);
     }
 

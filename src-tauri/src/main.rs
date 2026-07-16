@@ -14,6 +14,7 @@ mod fsutil;
 mod graph;
 mod ipc;
 mod logging;
+mod mcp_stdio;
 mod notifications;
 mod offload;
 mod oob;
@@ -163,22 +164,43 @@ fn main() {
     //
     // V19: an optional `--consumer <name>` (default `claude`, or `opencode`)
     // selects which per-consumer MCP-server set the app proxies to this child.
-    {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.iter().any(|a| a == "--offload-mcp") {
-            let consumer = args
-                .iter()
-                .position(|a| a == "--consumer")
-                .and_then(|i| args.get(i + 1))
-                .map(String::as_str)
-                .unwrap_or("claude");
-            offload::mcp::run(consumer);
-            return;
-        }
+    //
+    // Collected once — shared by the two MCP-child checks below and the normal
+    // launch path's `extra_args`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--offload-mcp") {
+        let consumer = args
+            .iter()
+            .position(|a| a == "--consumer")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .unwrap_or("claude");
+        offload::mcp::run(consumer);
+        return;
+    }
+
+    // V26 code-audit MCP server: a host agent invokes `cimp --code-audit-mcp`
+    // (Claude via `--mcp-config`; OpenCode via the injected `mcp` block) and
+    // speaks newline-delimited JSON-RPC over stdio, exposing exactly two
+    // zero-argument tools (`security_audit` / `quality_audit`). Like the offload
+    // child it stays GUI-free and proxies to the running app's loopback
+    // (`POST /audit/run`) — the audit needs the app's live `AuditState`, so
+    // there is no headless fallback. Handled before any Tauri init, and it takes
+    // the same optional `--consumer <name>` (default `claude`); the app's
+    // loopback re-checks that consumer's expose toggle on every run.
+    if args.iter().any(|a| a == "--code-audit-mcp") {
+        let consumer = args
+            .iter()
+            .position(|a| a == "--consumer")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .unwrap_or("claude");
+        audit::mcp::run(consumer);
+        return;
     }
 
     let launch_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let extra_args: Vec<String> = std::env::args().skip(1).collect();
+    let extra_args: Vec<String> = args;
     // V14 Phase B: one id per app run, scoping the compose overlay's
     // image-attachment temp dir (`attach::attach_dir`). See
     // `LaunchContext::launch_id`'s doc comment.
@@ -614,6 +636,12 @@ fn main() {
                         settings_for_graph.clone(),
                         audit_root,
                     );
+                    // V26: publish the runner as the process global BEFORE
+                    // `manage` moves it — this is how the offload worker's native
+                    // audit tools (which run outside any Tauri command context)
+                    // reach the state. The managed `Arc` and the global point at
+                    // the same runner.
+                    crate::audit::set_global(audit_state.clone());
                     app.manage(audit_state);
                 }
 

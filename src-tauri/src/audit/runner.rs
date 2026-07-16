@@ -252,6 +252,25 @@ impl AuditState {
         self.inner.lock().unwrap().snapshot(None)
     }
 
+    /// Whether the per-consumer expose toggle for `consumer` is on —
+    /// `"opencode"` / `"offload"` map to their own flags; anything else
+    /// (including the child's default, `"claude"`) maps to `expose_claude`.
+    ///
+    /// The loopback `/audit/run` route re-checks this on every run so that
+    /// unchecking an expose toggle takes effect for already-running tabs —
+    /// advertisement is gated separately at spawn/injection time
+    /// (`tabs::config`), and a child spawned while its consumer was opted in
+    /// outlives that gate. The master `enabled` switch is enforced by
+    /// [`begin_scan`](Self::begin_scan), not here.
+    pub fn consumer_exposed(&self, consumer: &str) -> bool {
+        let ca = self.settings.current().code_audit;
+        match consumer {
+            "opencode" => ca.expose_opencode,
+            "offload" => ca.expose_offload,
+            _ => ca.expose_claude,
+        }
+    }
+
     /// Emit the current state as a (findings-capped) `audit-status` event.
     /// Built under the lock, emitted after dropping it (the graph-service
     /// discipline — a same-thread listener must not re-lock `inner`).
@@ -276,13 +295,31 @@ impl AuditState {
         self.emit_event();
     }
 
-    /// Begin a scan of `category` (V25 Phase C). Only tools of that category are
-    /// considered; of those, only the `enabled && applicable(&census)` set is
-    /// launched. Rejects (clear error) if a scan of *either* category is already
-    /// in flight (one scan at a time globally) or no tool of this category is
-    /// enabled. Returns immediately; work runs on a background task and streams
-    /// progress via `audit-status`.
-    pub fn start_scan(self: &Arc<Self>, category: Category) -> Result<(), String> {
+    /// Plan and *arm* a scan of `category`, but do not drive it — the shared
+    /// prologue of [`start_scan`](Self::start_scan) (fire-and-forget, UI) and
+    /// [`run_scan_and_wait`](Self::run_scan_and_wait) (awaited, the V26 code-audit
+    /// MCP surface). Everything the two callers do *identically* lives here so
+    /// they can never drift: master-switch enforcement, the census, quality
+    /// auto-selection, the category + "nothing enabled" guard, `plan_scan`, and
+    /// the busy check + `scanning` state transition under the lock, followed by
+    /// the first `audit-status` emit.
+    ///
+    /// On success returns `(to_run, root, global_timeout, cancel)` — the
+    /// enabled+applicable subset to launch, the scan root, the resolved global
+    /// wall-clock budget, and this scan's cancel token — leaving the runner in
+    /// the `scanning` state with its chips already emitted. The caller's only
+    /// remaining job is to drive `run(to_run, root, global_timeout, cancel)`
+    /// (spawned or awaited) which clears `scanning` when it finishes.
+    ///
+    /// Rejects (leaving state untouched) exactly as before: the master switch is
+    /// off (enforced here, not just by tab visibility — the IPC commands and the
+    /// MCP surface are registered unconditionally, so the graph/offload gating
+    /// discipline applies), no tool of this category is enabled, or a scan of
+    /// *either* category is already in flight (one scan at a time, globally).
+    fn begin_scan(
+        self: &Arc<Self>,
+        category: Category,
+    ) -> Result<(Vec<AuditToolConfig>, PathBuf, Duration, CancellationToken), String> {
         let cfg = self.settings.current().code_audit;
         // The master switch is enforced here, not just by tab visibility —
         // the IPC commands are registered unconditionally (the offload/graph
@@ -302,10 +339,16 @@ impl AuditState {
             markers: census.markers(),
         };
 
-        // Auto mode: sync the quality tools' enabled flags to the fresh census
+        // Auto mode: sync the QUALITY tools' enabled flags to the fresh census
         // (no-op in manual mode), then re-read the config so the plan below
-        // uses the synced flags.
-        let cfg = if self.apply_quality_auto_select(&census) {
+        // uses the synced flags. Only for a Quality scan: auto-select never
+        // touches security tools, and with the V26 MCP surface a scan can be
+        // agent-triggered in the background — a `security_audit` call must not
+        // rewrite persisted quality checkboxes as a side effect. (A Quality
+        // scan keeps the sync by design: the report is documented to match the
+        // auto-selected Code Audit view 1:1, and `refresh_census` already
+        // applies the same sync on tab/Settings open.)
+        let cfg = if category == Category::Quality && self.apply_quality_auto_select(&census) {
             self.settings.current().code_audit
         } else {
             cfg
@@ -344,12 +387,46 @@ impl AuditState {
         };
         self.emit_event();
 
+        Ok((to_run, root, Duration::from_secs(global_timeout), cancel))
+    }
+
+    /// Begin a scan of `category` (V25 Phase C). Only tools of that category are
+    /// considered; of those, only the `enabled && applicable(&census)` set is
+    /// launched. Rejects (clear error) if a scan of *either* category is already
+    /// in flight (one scan at a time globally) or no tool of this category is
+    /// enabled. Returns immediately; work runs on a background task and streams
+    /// progress via `audit-status`.
+    pub fn start_scan(self: &Arc<Self>, category: Category) -> Result<(), String> {
+        let (to_run, root, global_timeout, cancel) = self.begin_scan(category)?;
         let this = self.clone();
-        let global_timeout = Duration::from_secs(global_timeout);
         tauri::async_runtime::spawn(async move {
             this.run(to_run, root, global_timeout, cancel).await;
         });
         Ok(())
+    }
+
+    /// Run a scan of `category` to completion and return its final (uncapped)
+    /// snapshot — the awaited twin of [`start_scan`](Self::start_scan), added for
+    /// the V26 code-audit MCP surface. An MCP tool call (`security_audit` /
+    /// `quality_audit`, via the loopback `/audit/run` route) needs *one* value it
+    /// can format and return, so unlike the UI's fire-and-forget path this drives
+    /// [`run`](Self::run) inline instead of spawning it, and returns the snapshot
+    /// `run` captured under the same lock acquisition that cleared the `scanning`
+    /// flag — a separate `snapshot()` read here would race a scan that starts in
+    /// the gap and replaces `inner.tools`.
+    ///
+    /// The `audit-status` stream is unaffected — [`run`](Self::run) emits per-tool
+    /// exactly as it does for `start_scan` (the runner holds the `AppHandle`), so
+    /// an MCP-triggered scan animates live in the Code Audit tab. Errors pass
+    /// through from [`begin_scan`](Self::begin_scan) unchanged: master switch off,
+    /// no tool of this category enabled, or `"a scan is already in progress"` when
+    /// a UI (or other MCP) scan is mid-flight.
+    pub async fn run_scan_and_wait(
+        self: &Arc<Self>,
+        category: Category,
+    ) -> Result<AuditSnapshot, String> {
+        let (to_run, root, global_timeout, cancel) = self.begin_scan(category)?;
+        Ok(self.clone().run(to_run, root, global_timeout, cancel).await)
     }
 
     /// Sync every QUALITY tool's persisted `enabled` flag to `census` when
@@ -430,14 +507,18 @@ impl AuditState {
 
     /// The orchestration body: resolve each enabled tool, mark unresolvable ones
     /// `not-installed`, spawn the resolvable ones concurrently, await them all,
-    /// then clear the scanning flag.
+    /// then clear the scanning flag. Returns the final (uncapped) snapshot,
+    /// captured under the same lock acquisition that clears `scanning`, so an
+    /// awaiting caller ([`run_scan_and_wait`](Self::run_scan_and_wait)) reads
+    /// *this* scan's result — never the state of a next scan that squeezes in
+    /// after the flag clears. The fire-and-forget path drops it.
     async fn run(
         self: Arc<Self>,
         tools: Vec<AuditToolConfig>,
         root: PathBuf,
         global_timeout: Duration,
         cancel: CancellationToken,
-    ) {
+    ) -> AuditSnapshot {
         let git_repo = root.join(".git").exists();
         let mut handles = Vec::new();
 
@@ -478,12 +559,14 @@ impl AuditState {
             let _ = h.await;
         }
 
-        {
+        let snap = {
             let mut inner = self.inner.lock().unwrap();
             inner.scanning = false;
             inner.cancel = None;
-        }
+            inner.snapshot(None)
+        };
         self.emit_event();
+        snap
     }
 
     /// Run one resolved tool end to end: spawn, capture, classify, parse SARIF,
@@ -1339,6 +1422,24 @@ mod tests {
             assert!(error.is_none(), "{id:?}");
         }
     }
+
+    // ── begin_scan / run_scan_and_wait guard coverage ──────────────────────
+    //
+    // `begin_scan` (shared by `start_scan` and the V26 `run_scan_and_wait` MCP
+    // surface) has three reject paths — master switch off, "no <category> audit
+    // tools are enabled", and "a scan is already in progress". Its ONLY pure,
+    // AppHandle-free logic is the census + `plan_scan` planning, which the
+    // `plan_scan_*` and `auto_select_quality_*` tests below already pin
+    // directly. The three rejects themselves live behind `&Arc<AuditState>`,
+    // which needs a Tauri `AppHandle`: this crate builds `tauri` WITHOUT the
+    // `test` feature and has no `tauri::test` mock anywhere, so no `AuditState`
+    // is constructible in a unit test. Rather than bolt on a mock runtime (or
+    // extract the two one-line guards purely just to satisfy a test), the guard
+    // behavior is verified live per the V26 MCP verification recipe (busy →
+    // "scan already in progress" tool error; disabled master switch → refused).
+    // `run_scan_and_wait` adds no new guard logic of its own — it shares
+    // `begin_scan` verbatim with the already-exercised `start_scan` and only
+    // awaits `run` inline instead of spawning it.
 
     // ── V25 plan_scan: category + applicability + disabled filter ────────────
 

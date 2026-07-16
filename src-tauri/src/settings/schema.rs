@@ -81,7 +81,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 23;
+pub const CURRENT_SCHEMA_VERSION: u8 = 24;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1185,8 +1185,9 @@ fn default_true() -> bool {
 /// bundled — the tools resolve ebin → PATH — so it is strictly opt-in.
 ///
 /// Additive `#[serde(default)]` block — old settings files round-trip with the
-/// feature disabled and the three default tools present. No schema-version bump
-/// (V8/V16 precedent).
+/// feature disabled and the three default tools present. The original V23 block
+/// shipped without a schema-version bump (V8/V16 precedent); the V26 `expose_*`
+/// additions ride the v23→v24 pure version stamp.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct CodeAuditSettings {
@@ -1210,6 +1211,30 @@ pub struct CodeAuditSettings {
     /// mode) so user choices stick, and the Settings section's "Auto-select for
     /// this project" button turns it back on. Security tools are never touched.
     pub quality_auto_select: bool,
+    /// V26: advertise the `cimp-code-audit` MCP server to Claude Code tabs.
+    /// When on (default), `tabs::config::build_pre_args` inserts the server
+    /// into the session's `--mcp-config` overlay so `security_audit` /
+    /// `quality_audit` appear in Claude's tool list. Exposure is ANDed with the
+    /// master `enabled` switch at the injection site (a disabled feature never
+    /// advertises), the loopback `/audit/run` route re-checks this flag per run
+    /// (so unchecking it takes effect for already-running tabs, no restart
+    /// needed), and `begin_scan` re-enforces the master switch.
+    pub expose_claude: bool,
+    /// V26: advertise the `cimp-code-audit` MCP server to OpenCode tabs,
+    /// injected into the generated `OPENCODE_CONFIG_CONTENT` `mcp` block by
+    /// `tabs::config::build_opencode_config`. Same `enabled`-AND gate and
+    /// per-run `/audit/run` re-check as `expose_claude` (unchecking blocks
+    /// scans immediately). OpenCode caches `tools/list` at connect, so the
+    /// *advertised list* only refreshes after a tab restart (known caveat).
+    pub expose_opencode: bool,
+    /// V26: advertise the code-audit native tools to the offload worker (the
+    /// local model), gated in `offload::service::run_on` alongside the graph
+    /// tools — enabled AND this flag AND a local backend. The scan always runs
+    /// in-process via the process-global `AuditState`, but the report (repo
+    /// paths + scanner messages) is local data, so remote backends are excluded
+    /// exactly like the graph tools; `HostRouter::call` re-gates dispatch and
+    /// `begin_scan` re-enforces the master switch on every scan.
+    pub expose_offload: bool,
 }
 
 impl Default for CodeAuditSettings {
@@ -1219,6 +1244,14 @@ impl Default for CodeAuditSettings {
             tools: default_audit_tools(),
             timeout_secs: 600,
             quality_auto_select: true,
+            // Exposure defaults on for all three consumers: the master
+            // `enabled` switch (default false) is the real gate, so a fresh
+            // install advertises nothing until Code Audit is turned on, at
+            // which point every consumer sees the tools unless the user opts a
+            // specific one out.
+            expose_claude: true,
+            expose_opencode: true,
+            expose_offload: true,
         }
     }
 }
@@ -4094,6 +4127,9 @@ mod tests {
             }],
             timeout_secs: 600,
             quality_auto_select: true,
+            expose_claude: true,
+            expose_opencode: true,
+            expose_offload: true,
         };
         let top = serde_json::to_value(&s).expect("CodeAuditSettings serializes");
         for key in top.as_object().expect("object").keys() {
@@ -4124,6 +4160,12 @@ mod tests {
         // (and every fresh install) follows the project's language census until
         // the user edits a quality checkbox.
         assert!(s.code_audit.quality_auto_select);
+        // V26: all three MCP-exposure flags default on. The master `enabled`
+        // switch (false above) is what actually keeps a fresh install silent;
+        // these gate per-consumer opt-out once the feature is turned on.
+        assert!(s.code_audit.expose_claude);
+        assert!(s.code_audit.expose_opencode);
+        assert!(s.code_audit.expose_offload);
         let ids: Vec<AuditToolId> = s.code_audit.tools.iter().map(|t| t.id).collect();
         assert_eq!(
             ids,
@@ -4158,6 +4200,26 @@ mod tests {
             disabled,
             vec![AuditToolId::DotnetAnalyzers, AuditToolId::SemgrepQuality]
         );
+    }
+
+    #[test]
+    fn code_audit_v23_json_without_expose_flags_loads_true() {
+        // V26: a pre-V26 (schema v23) `code_audit` block that predates the
+        // three MCP-exposure flags deserializes with all three defaulting on —
+        // the container-level `#[serde(default)]` fills the absent fields from
+        // `CodeAuditSettings::default()`. This is why the v23 → v24 migration
+        // is a pure version stamp (no data transform): the additive bools
+        // round-trip for free.
+        let ca: CodeAuditSettings = serde_json::from_value(json!({
+            "enabled": true,
+            "timeout_secs": 600,
+            "quality_auto_select": true,
+            "tools": []
+        }))
+        .expect("v23 code_audit block deserializes");
+        assert!(ca.expose_claude);
+        assert!(ca.expose_opencode);
+        assert!(ca.expose_offload);
     }
 
     #[test]

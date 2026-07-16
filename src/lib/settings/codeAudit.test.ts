@@ -16,7 +16,15 @@ function tool(id: AuditToolId, over: Partial<AuditToolConfig> = {}): AuditToolCo
 
 function settingsWith(tools: AuditToolConfig[]): Settings {
   const s = defaultSettings();
-  s.code_audit = { enabled: false, tools, timeout_secs: 600, quality_auto_select: true };
+  s.code_audit = {
+    enabled: false,
+    tools,
+    timeout_secs: 600,
+    quality_auto_select: true,
+    expose_claude: true,
+    expose_opencode: true,
+    expose_offload: true,
+  };
   return s;
 }
 
@@ -68,6 +76,15 @@ describe('auditToolRows', () => {
 
   test('every meta role string is non-empty', () => {
     for (const m of AUDIT_TOOL_META) expect(m.role.length).toBeGreaterThan(0);
+  });
+});
+
+describe('MCP exposure defaults (V26)', () => {
+  test('all three expose toggles default true', () => {
+    const ca = defaultSettings().code_audit;
+    expect(ca.expose_claude).toBe(true);
+    expect(ca.expose_opencode).toBe(true);
+    expect(ca.expose_offload).toBe(true);
   });
 });
 

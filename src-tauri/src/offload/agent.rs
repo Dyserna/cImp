@@ -166,13 +166,21 @@ pub struct HostRouter {
     /// dispatch on it as defense-in-depth so a hallucinated `graph_*` call on a
     /// non-opted-in remote backend can't reach the local index.
     allow_graph: bool,
+    /// V26: whether the code-audit tools (`security_audit`/`quality_audit`) may
+    /// run here — feature flag AND `expose_offload` AND a local backend (the
+    /// audit report carries repo paths + scanner messages, local data like the
+    /// graph). Re-gated at dispatch exactly like `allow_graph`, so a
+    /// hallucinated audit call on an opted-out or remote backend can't trigger
+    /// a scan or receive its report.
+    allow_audit: bool,
 }
 
 impl HostRouter {
     /// Build the merged, scope-filtered router. `native_defs` are the enabled
     /// native tool defs; `mcp_defs` are the host's namespaced read-class
     /// tools (`McpHost::tool_defs().await`). `allow_graph` gates the `graph_*`
-    /// tools (already reflected in `native_defs` by the caller).
+    /// tools and `allow_audit` the audit tools (both already reflected in
+    /// `native_defs` by the caller).
     pub fn new(
         native_defs: Vec<ToolDef>,
         mcp_defs: Vec<ToolDef>,
@@ -180,6 +188,7 @@ impl HostRouter {
         host: std::sync::Arc<super::mcp_host::McpHost>,
         scope: ToolScope,
         allow_graph: bool,
+        allow_audit: bool,
     ) -> Self {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
@@ -192,6 +201,7 @@ impl HostRouter {
             host,
             scope,
             allow_graph,
+            allow_audit,
         }
     }
 }
@@ -213,6 +223,15 @@ impl ToolRouter for HostRouter {
             return Err(format!(
                 "tool `{name}` is not available on this backend (code-graph access for a remote \
                  offload worker is off — enable it in cImp Settings → Code Graph)"
+            ));
+        }
+        // V26: re-gate the code-audit tools the same way — an unadvertised tool
+        // name can still be *called* by the model, and the audit report is
+        // local data that must not reach an opted-out or remote backend.
+        if matches!(name, "security_audit" | "quality_audit") && !self.allow_audit {
+            return Err(format!(
+                "tool `{name}` is not available on this backend (code audit is not exposed to \
+                 the offload worker, or this backend is remote — see cImp Settings → Code Audit)"
             ));
         }
         // Namespaced ids (`<server>__<tool>`) belong to an MCP server; bare

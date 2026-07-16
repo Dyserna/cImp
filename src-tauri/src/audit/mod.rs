@@ -12,12 +12,13 @@
 
 pub mod adapters;
 pub mod census;
+pub mod mcp;
 pub mod parsers;
 pub mod runner;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tauri::State;
@@ -27,6 +28,30 @@ use crate::ipc::AppState;
 use crate::settings::AuditToolId;
 
 pub use runner::{AuditSnapshot, AuditState};
+
+/// V26 — process-global handle to the managed [`AuditState`], set once in
+/// `main.rs` right where the state is constructed. The audit runner is a Tauri
+/// `manage`d singleton reachable from IPC via `State<Arc<AuditState>>`, but the
+/// **offload worker's native audit tools** (Stage 4) run in-process *outside*
+/// any Tauri command context and so can't reach the managed state that way —
+/// exactly the seam `crate::graph::offload_query` provides for the graph. This
+/// [`OnceLock`] is that seam for audits: `set_global` at startup, `global()`
+/// from the worker.
+static GLOBAL: OnceLock<Arc<AuditState>> = OnceLock::new();
+
+/// Publish the managed [`AuditState`] as the process global. Idempotent — a
+/// second call is ignored (there is only ever one runner per launch), so a
+/// stray double-set can never swap the live state out from under a consumer.
+pub fn set_global(state: Arc<AuditState>) {
+    let _ = GLOBAL.set(state);
+}
+
+/// The process-global [`AuditState`], or `None` before `main.rs` has set it
+/// (e.g. a headless subcommand that never builds the runner). The offload
+/// worker's native audit tools (Stage 4) reach the runner through this.
+pub fn global() -> Option<Arc<AuditState>> {
+    GLOBAL.get().cloned()
+}
 
 /// How long the `--version` probe may run before it's abandoned as
 /// "not found / unresponsive". Short — this backs an interactive button.

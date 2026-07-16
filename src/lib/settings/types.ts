@@ -1099,6 +1099,18 @@ export interface CodeAuditSettings {
   /// this to false (manual mode); the Settings section's "Auto-select for this
   /// project" button turns it back on. Security tools are never touched.
   quality_auto_select: boolean;
+  /// V26: advertise the `cimp-code-audit` MCP server (security_audit /
+  /// quality_audit) to Claude Code tabs. ANDed with `enabled` at the injection
+  /// site; default true. (Backend field mirror — the settings-UI checkboxes
+  /// land in a later stage.)
+  expose_claude: boolean;
+  /// V26: advertise `cimp-code-audit` to OpenCode tabs. OpenCode caches
+  /// tools/list at connect, so toggling needs a tab restart. Default true.
+  expose_opencode: boolean;
+  /// V26: advertise the code-audit native tools to the offload worker. Default
+  /// true. A scan always runs in-process, so a remote worker only ever gets the
+  /// free-text report.
+  expose_offload: boolean;
 }
 
 /// V23 Phase A: the `audit_detect_tool` IPC result (mirror of Rust
@@ -1697,6 +1709,9 @@ export function defaultSettings(): Settings {
     code_audit: {
       enabled: false,
       quality_auto_select: true,
+      expose_claude: true,
+      expose_opencode: true,
+      expose_offload: true,
       tools: [
         // Security (V23).
         { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },

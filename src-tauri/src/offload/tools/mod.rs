@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::offload::openai::ToolDef;
 use crate::settings::{CommandPolicy, OffloadToolToggles};
 
+pub mod audit_tools;
 pub mod code_search;
 pub mod graph_tools;
 pub mod list_dir;
@@ -165,10 +166,45 @@ pub async fn dispatch(
         // beside the `graph_` route below because both share the graph module's
         // project-root resolution + activity recording.
         "run_check" => run_check::execute(args, ctx).await,
+        // V26 code-audit tools — the two fixed names route to the same executor
+        // (which maps each to its category). Advertised only when the service
+        // decided to offer them (enabled + `expose_offload` + local backend)
+        // and re-gated in the router's `call` via `allow_audit`, exactly like
+        // the graph tools — the scan runs locally either way, but its report
+        // is local data that must not reach an opted-out or remote backend.
+        "security_audit" | "quality_audit" => audit_tools::execute(name, args, ctx).await,
         // V9-01 graph tools (advertised only when the service decided to offer
         // them — feature on + local-or-opted-in remote — and re-gated in the
         // router's `call`).
         n if n.starts_with("graph_") => graph_tools::dispatch(name, args, ctx).await,
         other => Err(format!("unknown native tool: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx() -> ToolCtx {
+        let cwd = std::env::current_dir().unwrap();
+        ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd)
+    }
+
+    /// V26: both audit tool names route into `audit_tools::execute` rather than
+    /// falling through to the unknown-tool arm. In a unit test the audit global
+    /// is never set, so a correctly-routed call errors — all this test pins is
+    /// that it is NOT the unknown-tool error (the exact executor message is
+    /// owned and pinned by `audit_tools`'s own test, not double-pinned here).
+    #[tokio::test]
+    async fn dispatch_routes_the_audit_tools() {
+        for name in ["security_audit", "quality_audit"] {
+            let err = dispatch(name, serde_json::json!({}), &test_ctx())
+                .await
+                .expect_err("no audit global in a unit test → error");
+            assert!(
+                !err.contains("unknown native tool"),
+                "`{name}` must route to audit_tools::execute, got: {err}"
+            );
+        }
     }
 }

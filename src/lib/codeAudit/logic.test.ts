@@ -274,6 +274,9 @@ describe('configuredToolStates / chipToolStates', () => {
     enabled: true,
     timeout_secs: 600,
     quality_auto_select: true,
+    expose_claude: true,
+    expose_opencode: true,
+    expose_offload: true,
     tools: [
       { id: 'semgrep', enabled: false, path: '', extra_args: [], timeout_secs: null },
       { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },
@@ -551,6 +554,9 @@ describe('chipToolStates falls back per category', () => {
     enabled: true,
     timeout_secs: 600,
     quality_auto_select: true,
+    expose_claude: true,
+    expose_opencode: true,
+    expose_offload: true,
     tools: [
       { id: 'oxlint', enabled: true, path: '', extra_args: [], timeout_secs: null },
       { id: 'ruff', enabled: true, path: '', extra_args: [], timeout_secs: null },
@@ -573,7 +579,7 @@ describe('chipToolStates falls back per category', () => {
 describe('partitionChips (chip gating + hidden count)', () => {
   test('empty census hides nothing', () => {
     const states = configuredToolStates(
-      { enabled: true, timeout_secs: 600, quality_auto_select: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
+      { enabled: true, timeout_secs: 600, quality_auto_select: true, expose_claude: true, expose_opencode: true, expose_offload: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
       'quality',
     );
     const p = partitionChips(states, { extensions: [], markers: [] });
@@ -585,7 +591,7 @@ describe('partitionChips (chip gating + hidden count)', () => {
     // A Rust + JS project: no .py, no .java, no .go, no .cs, no .c.
     const census = { extensions: ['rs', 'ts'], markers: ['Cargo.toml', 'package.json'] };
     const states = configuredToolStates(
-      { enabled: true, timeout_secs: 600, quality_auto_select: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
+      { enabled: true, timeout_secs: 600, quality_auto_select: true, expose_claude: true, expose_opencode: true, expose_offload: true, tools: toolsInCategory('quality').map((id) => ({ id, enabled: true, path: '', extra_args: [], timeout_secs: null })) },
       'quality',
     );
     const p = partitionChips(states, census);

@@ -21,18 +21,18 @@
 //! Dispatched in `main()` before Tauri init, exactly like `--statusline`,
 //! so it stays GUI-free and fast to spawn.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Semaphore;
 
 use crate::error::AppError;
+use crate::mcp_stdio::tool_error;
 
-use super::loopback::read_discovery;
+use super::loopback::{parse_result_line, proxy_base};
 
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};
 use crate::offload::router::{self, BackendView, RouteError, TierHint};
@@ -85,74 +85,12 @@ async fn serve() {
         tokio::spawn(async move { events_relay(stdout).await });
     }
 
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-
-    // Set by a spawned handler when its response write fails (Claude closed
-    // stdout): stop accepting new work whose results could never be delivered.
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue, // ignore malformed frames
-        };
-        let id = req.get("id").cloned();
-        let method = req
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let params = req.get("params").cloned().unwrap_or(Value::Null);
-
-        // Notifications (no id) get no response — don't spawn a handler for them
-        // (it would run `handle` only to discard the result).
-        if id.is_none() {
-            continue;
-        }
-
-        // Spawn each request so multiple in-flight tool calls run concurrently
-        // — e.g. two parallel `offload_task`s must occupy both llama-server
-        // slots at once. Awaiting `handle` inline here serialized them: the read
-        // loop wouldn't pull the second request off stdin until the first
-        // (minutes-long) offload finished. Responses are matched by `id`, so
-        // out-of-order completion is fine; the shared `stdout` mutex serializes
-        // the writes.
-        let stdout = stdout.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            // Run the handler on its own task so a panic inside it surfaces as a
-            // JSON-RPC error (the client gets a reply) rather than being swallowed
-            // by the dropped JoinHandle — which would hang the caller forever
-            // waiting on a response that never comes.
-            let response = match tokio::spawn(handle_owned(method, params)).await {
-                Ok(r) => r,
-                Err(e) => Err((-32603, format!("offload handler panicked: {e}"))),
-            };
-            let id = id.unwrap_or(Value::Null);
-            let frame = match response {
-                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                Err((code, message)) => {
-                    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-                }
-            };
-            let mut bytes = frame.to_string();
-            bytes.push('\n');
-            let mut out = stdout.lock().await;
-            if out.write_all(bytes.as_bytes()).await.is_err() || out.flush().await.is_err() {
-                // stdout is gone (Claude closed the pipe): signal the read loop to
-                // stop spawning handlers whose results can't be delivered.
-                shutdown.store(true, Ordering::Relaxed);
-            }
-        });
-    }
+    // The shared stdio JSON-RPC loop (`mcp_stdio`): spawns each request so
+    // multiple in-flight tool calls run concurrently (two parallel
+    // `offload_task`s must occupy both llama-server slots at once), captures
+    // handler panics as JSON-RPC errors, and stops accepting work once a
+    // response write fails (Claude closed the pipe).
+    crate::mcp_stdio::serve(stdout, "offload", handle_owned).await;
 }
 
 /// Owned-argument wrapper around [`handle`] so it can run on its own
@@ -532,10 +470,6 @@ async fn handle_batch_tool(params: Value) -> Result<Value, (i64, String)> {
     }
 }
 
-fn tool_error(message: &str) -> Value {
-    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-}
-
 /// V21 F9: extract an optional JSON-Schema `schema` argument from an
 /// `offload_task` / `offload_batch`-subtask arguments object. Only a JSON object
 /// is accepted (a schema must be an object); a string/array/null/absent value
@@ -597,12 +531,6 @@ fn offload_batch_tool() -> Value {
 // When the app is up, the child forwards to it (warm pool + global gate +
 // MCP host). All three helpers fail soft to `None`/fallback when the app is
 // unreachable, so offload still works headless.
-
-/// Base URL of the app's loopback endpoint from the discovery file.
-fn proxy_base() -> Option<(String, String)> {
-    let d = read_discovery()?;
-    Some((format!("http://127.0.0.1:{}", d.port), d.token))
-}
 
 /// Fetch the live capability description from `GET /describe`. `None` when
 /// the app is unreachable (the caller renders the config-derived fallback).
@@ -705,7 +633,7 @@ async fn proxy_run(
                 buf.extend_from_slice(&bytes);
                 while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                     let raw: Vec<u8> = buf.drain(..=nl).collect();
-                    if let Some(r) = parse_run_line(&raw) {
+                    if let Some(r) = parse_result_line(&raw, "offload failed") {
                         result = Some(r);
                     }
                 }
@@ -717,39 +645,11 @@ async fn proxy_run(
     // A trailing unterminated line (e.g. a one-shot non-streamed error body
     // that carries no final newline).
     if result.is_none() && !buf.is_empty() {
-        if let Some(r) = parse_run_line(&buf) {
+        if let Some(r) = parse_result_line(&buf, "offload failed") {
             result = Some(r);
         }
     }
     Some(result.unwrap_or_else(|| Err("offload stream ended without a result".into())))
-}
-
-/// Parse one NDJSON line from the streamed `/run` body. Returns `None` for a
-/// heartbeat (`{"hb":true}`) or unparseable line, `Some(Ok(text))` for the
-/// final success line, `Some(Err(..))` for a task-level error line.
-fn parse_run_line(raw: &[u8]) -> Option<Result<String, String>> {
-    let line = std::str::from_utf8(raw).ok()?.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let v: Value = serde_json::from_str(line).ok()?;
-    if v.get("hb").is_some() {
-        return None; // heartbeat
-    }
-    let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-    if ok {
-        Some(Ok(v
-            .get("text")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string()))
-    } else {
-        Some(Err(v
-            .get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("offload failed")
-            .to_string()))
-    }
 }
 
 /// Forward a `graph_*` tool call to the app's warm path (`POST /graph_run`), so
@@ -1367,24 +1267,30 @@ fn current_offload_settings() -> OffloadSettings {
 mod tests {
     use super::*;
 
+    /// Pins this child's use of the shared loopback line parser: heartbeats
+    /// (`{"hb":true}` — anything without `ok`) and blanks are skipped, the
+    /// single `ok`-bearing line is the result, and this child's fallback error
+    /// text applies.
     #[test]
-    fn parse_run_line_skips_heartbeats_and_blanks() {
-        assert!(parse_run_line(b"{\"hb\":true}\n").is_none());
-        assert!(parse_run_line(b"   \n").is_none());
-        assert!(parse_run_line(b"not json").is_none());
+    fn parse_result_line_skips_heartbeats_and_blanks() {
+        let parse = |raw: &[u8]| parse_result_line(raw, "offload failed");
+        assert!(parse(b"{\"hb\":true}\n").is_none());
+        assert!(parse(b"   \n").is_none());
+        assert!(parse(b"not json").is_none());
     }
 
     #[test]
-    fn parse_run_line_reads_success_and_error() {
-        let ok = parse_run_line(b"{\"ok\":true,\"text\":\"done\"}\n");
+    fn parse_result_line_reads_success_and_error() {
+        let parse = |raw: &[u8]| parse_result_line(raw, "offload failed");
+        let ok = parse(b"{\"ok\":true,\"text\":\"done\"}\n");
         assert_eq!(ok, Some(Ok("done".to_string())));
 
-        let err = parse_run_line(b"{\"ok\":false,\"error\":\"no backend\"}");
+        let err = parse(b"{\"ok\":false,\"error\":\"no backend\"}");
         assert_eq!(err, Some(Err("no backend".to_string())));
 
         // `ok:false` with no message falls back to a generic error.
         assert_eq!(
-            parse_run_line(b"{\"ok\":false}"),
+            parse(b"{\"ok\":false}"),
             Some(Err("offload failed".to_string()))
         );
     }

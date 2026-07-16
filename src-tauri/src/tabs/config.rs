@@ -345,26 +345,46 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         }
     }
 
-    // V8-01: point Claude at our own `cimp --offload-mcp` MCP server so
-    // the `offload_task` tool is available in this session. Session-scoped
-    // (a `--mcp-config` overlay), never written to `~/.claude`. Claude
-    // spawns the `command` as argv (no shell), so the raw exe path is
-    // correct — no shell-quoting needed (unlike the statusLine command).
-    // V8-01 + V9-01: point Claude at our `cimp --offload-mcp` server, which
-    // carries the `offload_task` tool, the `graph_*` tools, AND any MCP server
-    // exposed to Claude Code. Inject it whenever ANY of those is in play — the
-    // graph tools and Claude-exposed MCP servers must reach Claude even when
-    // offload is disabled (they ride the same MCP child).
-    if settings.offload.enabled || settings.graph.enabled || settings.offload.any_claude_mcp() {
-        if let Ok(exe) = std::env::current_exe() {
-            let mcp = serde_json::json!({
-                "mcpServers": {
-                    "cimp-offload": {
-                        "command": exe.to_string_lossy(),
-                        "args": ["--offload-mcp"]
-                    }
-                }
-            });
+    // Point Claude at our own stdio MCP servers via a session-scoped
+    // `--mcp-config` overlay, never written to `~/.claude`. Claude spawns each
+    // `command` as argv (no shell), so the raw exe path is correct — no
+    // shell-quoting needed (unlike the statusLine command). Up to two servers
+    // ride the same overlay, each under its own gate:
+    //
+    //   - V8-01 + V9-01 `cimp-offload` (`--offload-mcp`) carries the
+    //     `offload_task` tool, the `graph_*` tools, AND any MCP server exposed
+    //     to Claude Code. Injected whenever ANY of those is in play — the graph
+    //     tools and Claude-exposed MCP servers must reach Claude even when
+    //     offload is disabled (they ride the same MCP child).
+    //   - V26 `cimp-code-audit` (`--code-audit-mcp`) carries `security_audit` /
+    //     `quality_audit`. Injected when Code Audit is enabled AND opted in for
+    //     the Claude consumer (`code_audit.expose_claude`).
+    //
+    // The `--mcp-config` flag is emitted only if at least one server made the
+    // cut, so behavior is unchanged (no flag) when every gate is off.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.to_string_lossy().to_string();
+        let mut servers = serde_json::Map::new();
+        if settings.offload.enabled || settings.graph.enabled || settings.offload.any_claude_mcp() {
+            servers.insert(
+                "cimp-offload".to_string(),
+                serde_json::json!({
+                    "command": exe,
+                    "args": ["--offload-mcp"]
+                }),
+            );
+        }
+        if settings.code_audit.enabled && settings.code_audit.expose_claude {
+            servers.insert(
+                "cimp-code-audit".to_string(),
+                serde_json::json!({
+                    "command": exe,
+                    "args": ["--code-audit-mcp"]
+                }),
+            );
+        }
+        if !servers.is_empty() {
+            let mcp = serde_json::json!({ "mcpServers": servers });
             args.push("--mcp-config".to_string());
             args.push(mcp.to_string());
         }
@@ -781,6 +801,10 @@ fn git_exclude_opencode(working_dir: &Path) {
 /// - `mcp.cimp-offload` → `cimp --offload-mcp --consumer opencode`, injected
 ///   whenever offload, the graph, or an OpenCode-exposed MCP server is in play
 ///   (mirrors the Claude `--mcp-config` gate in `build_pre_args`).
+/// - V26 `mcp.cimp-code-audit` → `cimp --code-audit-mcp --consumer opencode`,
+///   injected when Code Audit is enabled AND opted in for the OpenCode consumer
+///   (`code_audit.expose_opencode`). OpenCode caches `tools/list` at connect, so
+///   flipping the flag needs a tab restart to take effect (known caveat).
 /// - `instructions` → the managed guidance file (TTS + offload + graph), when
 ///   any guidance applies. The file content is written on the launch path; here
 ///   we only reference its (deterministic) path.
@@ -799,20 +823,39 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
         serde_json::Value::String("https://opencode.ai/config.json".to_string()),
     );
 
-    // The single `cimp --offload-mcp` child carries `offload_task`, the
-    // `graph_*` tools, and any OpenCode-exposed MCP server. Inject it whenever
-    // ANY of those is in play (same shape as the Claude gate).
-    if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp() {
-        if let Ok(exe) = std::env::current_exe() {
-            config.insert(
-                "mcp".to_string(),
+    // Build the `mcp` object from up to two stdio children, each under its own
+    // gate (mirrors the two-server `--mcp-config` map in `build_pre_args`):
+    //   - `cimp-offload` carries `offload_task`, the `graph_*` tools, and any
+    //     OpenCode-exposed MCP server — injected whenever ANY of those is in
+    //     play.
+    //   - V26 `cimp-code-audit` carries `security_audit` / `quality_audit` —
+    //     injected when Code Audit is enabled AND `expose_opencode` is on.
+    // The `mcp` key is emitted only if at least one server made the cut, so an
+    // all-gates-off config omits it exactly as before.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.to_string_lossy().to_string();
+        let mut mcp = serde_json::Map::new();
+        if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp()
+        {
+            mcp.insert(
+                "cimp-offload".to_string(),
                 serde_json::json!({
-                    "cimp-offload": {
-                        "type": "local",
-                        "command": [exe.to_string_lossy(), "--offload-mcp", "--consumer", "opencode"]
-                    }
+                    "type": "local",
+                    "command": [exe, "--offload-mcp", "--consumer", "opencode"]
                 }),
             );
+        }
+        if settings.code_audit.enabled && settings.code_audit.expose_opencode {
+            mcp.insert(
+                "cimp-code-audit".to_string(),
+                serde_json::json!({
+                    "type": "local",
+                    "command": [exe, "--code-audit-mcp", "--consumer", "opencode"]
+                }),
+            );
+        }
+        if !mcp.is_empty() {
+            config.insert("mcp".to_string(), serde_json::Value::Object(mcp));
         }
     }
 
@@ -1453,6 +1496,79 @@ mod tests {
     }
 
     #[test]
+    fn code_audit_enabled_alone_injects_code_audit_server() {
+        // V26: Code Audit rides its own `--code-audit-mcp` child, so the server
+        // must appear in `--mcp-config` when the feature is on even with offload
+        // + graph both off. With the default `expose_claude` true, no other
+        // server is present — the audit server stands alone in the map.
+        let mut settings = Settings::default();
+        settings.offload.enabled = false;
+        settings.graph.enabled = false;
+        settings.code_audit.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config present when Code Audit is enabled");
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert_eq!(
+            cfg["mcpServers"]["cimp-code-audit"]["args"][0],
+            "--code-audit-mcp"
+        );
+        // Offload rides a different gate that is off here — it must NOT appear.
+        assert!(
+            cfg["mcpServers"]["cimp-offload"].is_null(),
+            "cimp-offload must be absent when its gate is off"
+        );
+    }
+
+    #[test]
+    fn code_audit_server_absent_when_feature_disabled() {
+        // The master switch off ⇒ no audit server even though `expose_claude`
+        // defaults true; with offload + graph also off, `--mcp-config` is
+        // omitted entirely (behavior unchanged from before V26).
+        let mut settings = Settings::default();
+        settings.code_audit.enabled = false;
+        assert!(settings.code_audit.expose_claude, "default is opted-in");
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(!args.iter().any(|a| a == "--mcp-config"));
+    }
+
+    #[test]
+    fn code_audit_server_absent_when_expose_claude_off() {
+        // Feature on but the Claude consumer opted out ⇒ the audit server is not
+        // advertised to Claude. With offload + graph off there is nothing else
+        // to inject, so `--mcp-config` is omitted.
+        let mut settings = Settings::default();
+        settings.code_audit.enabled = true;
+        settings.code_audit.expose_claude = false;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        assert!(
+            !args.iter().any(|a| a == "--mcp-config"),
+            "no server should be injected when the only enabled feature is opted out"
+        );
+    }
+
+    #[test]
+    fn code_audit_and_offload_share_one_mcp_config() {
+        // Both gates on ⇒ both servers ride a single `--mcp-config` overlay.
+        let mut settings = Settings::default();
+        settings.offload.enabled = true;
+        settings.code_audit.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let count = args.iter().filter(|a| *a == "--mcp-config").count();
+        assert_eq!(count, 1, "exactly one --mcp-config carries both servers");
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        assert_eq!(cfg["mcpServers"]["cimp-offload"]["args"][0], "--offload-mcp");
+        assert_eq!(
+            cfg["mcpServers"]["cimp-code-audit"]["args"][0],
+            "--code-audit-mcp"
+        );
+    }
+
+    #[test]
     fn graph_enabled_injects_graph_guidance() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
@@ -1592,6 +1708,45 @@ mod tests {
         assert!(
             cfg["mcp"]["cimp-offload"].is_object(),
             "graph alone injects the mcp block"
+        );
+    }
+
+    #[test]
+    fn opencode_config_injects_code_audit_when_enabled() {
+        // V26: Code Audit enabled (offload + graph off) injects only the
+        // `cimp-code-audit` entry, launched as a local child carrying the
+        // opencode consumer discriminator.
+        let mut settings = Settings::default();
+        settings.code_audit.enabled = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        assert_eq!(cfg["mcp"]["cimp-code-audit"]["type"], "local");
+        let cmd: Vec<&str> = cfg["mcp"]["cimp-code-audit"]["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Exact shape: [exe, "--code-audit-mcp", "--consumer", "opencode"].
+        assert_eq!(cmd.len(), 4, "got: {cmd:?}");
+        assert_eq!(&cmd[1..], ["--code-audit-mcp", "--consumer", "opencode"]);
+        // Offload gate is off ⇒ its entry must be absent.
+        assert!(
+            cfg["mcp"]["cimp-offload"].is_null(),
+            "cimp-offload absent when its gate is off"
+        );
+    }
+
+    #[test]
+    fn opencode_config_no_code_audit_when_expose_opencode_off() {
+        // Feature on but the OpenCode consumer opted out ⇒ no audit entry, and
+        // with offload + graph off the whole `mcp` block is omitted.
+        let mut settings = Settings::default();
+        settings.code_audit.enabled = true;
+        settings.code_audit.expose_opencode = false;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        assert!(
+            cfg.get("mcp").is_none(),
+            "no mcp block when the only enabled feature is opted out of OpenCode"
         );
     }
 

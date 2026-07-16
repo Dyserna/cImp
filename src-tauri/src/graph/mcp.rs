@@ -1441,9 +1441,7 @@ fn fmt_list(items: &[String], max_rows: usize) -> String {
     lines.join("\n")
 }
 
-fn tool_error(message: &str) -> Value {
-    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-}
+use crate::mcp_stdio::tool_error;
 
 // ── project resolution + settings helpers ────────────────────────────────
 

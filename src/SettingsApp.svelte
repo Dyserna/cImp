@@ -5147,6 +5147,57 @@
                 })}
             />
           </label>
+
+          <h3>MCP exposure</h3>
+          <small class="hint">
+            Advertise the <code>cimp-code-audit</code> MCP server
+            (<code>security_audit</code> / <code>quality_audit</code>, native
+            worker tools for offload) so AI consumers can trigger audits
+            themselves. Each requires Code Audit enabled above. OpenCode caches
+            its tool list at connect — flip a toggle and restart the tab.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.code_audit.expose_claude}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.code_audit.expose_claude = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Expose to Claude Code</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.code_audit.expose_opencode}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.code_audit.expose_opencode = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Expose to OpenCode</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.code_audit.expose_offload}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.code_audit.expose_offload = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Expose to offload worker</span>
+          </label>
         </section>
       {:else if activeSection === 'pricing'}
         <section>

@@ -887,18 +887,34 @@ impl OffloadService {
             &cwd,
         );
         let mut native_defs = tools::enabled_defs(&snap.tools);
+        // One settings snapshot for both feature gates below.
+        let cur = self.settings.current();
         // V9-01: offer the graph tools to the worker when the feature is on AND
         // either this backend is local or the user opted a remote backend in
         // (a remote — LAN or cloud — would receive the project's code
         // structure). `allow_graph` re-gates dispatch as defense-in-depth.
-        let graph = self.settings.current().graph;
         let allow_graph = worker_graph_allowed(
-            graph.enabled,
+            cur.graph.enabled,
             entry.is_remote,
-            graph.allow_remote_worker_access,
+            cur.graph.allow_remote_worker_access,
         );
         if allow_graph {
             native_defs.extend(tools::graph_tools::defs());
+        }
+        // V26: offer the code-audit tools to the worker when the feature is
+        // enabled AND the offload consumer is opted in (`expose_offload`,
+        // default true) AND the backend is local. The scan itself always runs
+        // locally inside the app (via the process-global `AuditState`), but its
+        // *report* — repo file:line paths plus scanner messages that can quote
+        // the offending code — is local data, so it must not cross to a
+        // remote/LAN/cloud backend: the same boundary `worker_graph_allowed`
+        // enforces for the graph tools. `allow_audit` re-gates dispatch in the
+        // router as defense-in-depth (advertisement alone doesn't stop a
+        // hallucinated call), and `begin_scan` re-enforces the master switch.
+        let allow_audit =
+            cur.code_audit.enabled && cur.code_audit.expose_offload && !entry.is_remote;
+        if allow_audit {
+            native_defs.extend(tools::audit_tools::defs());
         }
         let mcp_defs = self.host.tool_defs_for_offload().await;
         let router = HostRouter::new(
@@ -908,6 +924,7 @@ impl OffloadService {
             self.host.clone(),
             entry.tool_scope.clone(),
             allow_graph,
+            allow_audit,
         );
         let cfg = AgentConfig {
             base_url: entry.base_url.clone(),

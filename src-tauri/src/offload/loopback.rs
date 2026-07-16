@@ -69,6 +69,14 @@ pub fn read_discovery() -> Option<Discovery> {
     serde_json::from_str(&text).ok()
 }
 
+/// Base URL + bearer token of the running app's loopback endpoint, from the
+/// discovery file — the one endpoint resolver every stdio MCP child uses
+/// (`offload/mcp.rs`, `audit/mcp.rs`). `None` ⇒ the app isn't running.
+pub fn proxy_base() -> Option<(String, String)> {
+    let d = read_discovery()?;
+    Some((format!("http://127.0.0.1:{}", d.port), d.token))
+}
+
 /// A per-launch random bearer token (two v4 UUIDs of entropy, hex). Avoids
 /// pulling a separate RNG crate — `uuid` is already a dependency.
 fn make_token() -> String {
@@ -214,6 +222,77 @@ struct RunResult {
     error: Option<String>,
 }
 
+/// Parse one NDJSON line of a loopback-streamed run body (`/run`,
+/// `/audit/run`) from the child's side — kept beside [`RunResult`] so the
+/// encoder and the decoder of the wire shape live in one file. The final
+/// result line is the ONLY one carrying an `ok` boolean; every other line —
+/// heartbeats of any shape, blanks, unparseable bytes — yields `None`, so the
+/// heartbeat wire format is not load-bearing. `fallback_error` fills in when
+/// an `ok:false` line carries no `error` text.
+pub fn parse_result_line(raw: &[u8], fallback_error: &str) -> Option<Result<String, String>> {
+    let line = std::str::from_utf8(raw).ok()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ok = v.get("ok").and_then(|b| b.as_bool())?;
+    if ok {
+        Some(Ok(v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string()))
+    } else {
+        Some(Err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or(fallback_error)
+            .to_string()))
+    }
+}
+
+/// The stream head shared by the NDJSON-streaming routes (`/run`,
+/// `/audit/run`): no `Content-Length` — the body is close-delimited — sent up
+/// front so the child's `send()` resolves immediately and it knows the app is
+/// alive before the (possibly long) task even starts.
+const NDJSON_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+    Content-Type: application/x-ndjson\r\n\
+    Cache-Control: no-cache\r\n\
+    Connection: close\r\n\r\n";
+
+/// One heartbeat line of an NDJSON-streamed run body. Carries no `ok` field,
+/// so [`parse_result_line`] skips it; the exact shape is not load-bearing.
+const HEARTBEAT_LINE: &[u8] = b"{\"hb\":true}\n";
+
+/// Write the shared [`NDJSON_HEAD`] stream head.
+async fn write_ndjson_head<W>(wr: &mut W, label: &str) -> AppResult<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    wr.write_all(NDJSON_HEAD)
+        .await
+        .map_err(|e| AppError::Offload(format!("{label} head: {e}")))?;
+    wr.flush().await.ok();
+    Ok(())
+}
+
+/// Serialize + write the final [`RunResult`] line: one JSON object (serde
+/// emits no embedded newlines) + `\n`, then the caller lets the connection
+/// close. This is the single `ok`-bearing line [`parse_result_line`] keys off.
+async fn write_result_line<W>(wr: &mut W, r: &RunResult, label: &str) -> AppResult<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut line = serde_json::to_vec(r)
+        .unwrap_or_else(|_| br#"{"ok":false,"error":"failed to serialize result"}"#.to_vec());
+    line.push(b'\n');
+    wr.write_all(&line)
+        .await
+        .map_err(|e| AppError::Offload(format!("{label} result: {e}")))?;
+    wr.flush().await.ok();
+    Ok(())
+}
+
 /// A parsed HTTP request: method, path, headers (lowercased keys), and body.
 struct Request {
     method: String,
@@ -356,6 +435,7 @@ async fn handle_conn(
     match (req.method.as_str(), route) {
         ("POST", "/run") => handle_run(&mut stream, &service, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
+        ("POST", "/audit/run") => handle_audit_run(&mut stream, &app, &req).await,
         ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
         ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &app, &req).await,
         ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
@@ -444,17 +524,7 @@ async fn handle_run(
     // Split so heartbeats/result (write half) and the disconnect probe (read
     // half) can run concurrently on the one connection.
     let (mut rd, mut wr) = stream.split();
-    // Stream head — no Content-Length; the body is close-delimited NDJSON. Sent
-    // up front so the proxy's `send()` resolves immediately and it knows the app
-    // is alive before the (possibly long) task even starts.
-    let head = "HTTP/1.1 200 OK\r\n\
-                Content-Type: application/x-ndjson\r\n\
-                Cache-Control: no-cache\r\n\
-                Connection: close\r\n\r\n";
-    wr.write_all(head.as_bytes())
-        .await
-        .map_err(|e| AppError::Offload(format!("run head: {e}")))?;
-    wr.flush().await.ok();
+    write_ndjson_head(&mut wr, "run").await?;
 
     let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
     beat.tick().await; // consume the immediate first tick
@@ -481,7 +551,7 @@ async fn handle_run(
             _ = beat.tick() => {
                 // A failed heartbeat write means the client went away; cancel
                 // and let the task unwind (its stream drop frees the slot).
-                if wr.write_all(b"{\"hb\":true}\n").await.is_err() {
+                if wr.write_all(HEARTBEAT_LINE).await.is_err() {
                     debug!("offload loopback: heartbeat write failed; caller gone, cancelling");
                     cancel.cancel();
                     break (&mut run_fut).await;
@@ -496,23 +566,15 @@ async fn handle_run(
             text: Some(text),
             error: None,
         },
+        // `ok:false` is a task-level error the child renders as a tool result
+        // so Claude can read + adapt.
         Err(e) => RunResult {
             ok: false,
             text: None,
             error: Some(e.to_string()),
         },
     };
-    // Final line: one JSON object (serde emits no embedded newlines) + `\n`,
-    // then the connection closes. `ok:false` here too is a task-level error the
-    // child renders as a tool result so Claude can read + adapt.
-    let mut line = serde_json::to_vec(&r)
-        .unwrap_or_else(|_| br#"{"ok":false,"error":"failed to serialize result"}"#.to_vec());
-    line.push(b'\n');
-    wr.write_all(&line)
-        .await
-        .map_err(|e| AppError::Offload(format!("run result: {e}")))?;
-    wr.flush().await.ok();
-    Ok(())
+    write_result_line(&mut wr, &r, "run").await
 }
 
 /// A `POST /graph_run` request body (the warm code-graph query path).
@@ -593,6 +655,159 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     };
     // 200 even on a tool-level error: the child renders `error` as a tool result.
     write_json(stream, 200, &r).await
+}
+
+/// A `POST /audit/run` request body (V26 code-audit MCP surface).
+///
+/// Deliberately tiny: `category` reuses
+/// [`Category`](crate::audit::adapters::Category)'s own lowercase serde (so
+/// `"security"` / `"quality"` deserialize directly — a bad word is a clean parse
+/// error → 400). `consumer` names the agent that triggered the scan (`claude` /
+/// `opencode`, from the child's `--consumer` flag; absent on a legacy child ⇒
+/// `claude`) and selects which `expose_*` toggle the route re-enforces at run
+/// time — see [`handle_audit_run`]. No `cwd`: an audit always runs against the
+/// app's own launch project root, never the caller's directory.
+#[derive(Deserialize)]
+struct AuditRunBody {
+    category: crate::audit::adapters::Category,
+    #[serde(default)]
+    consumer: Option<String>,
+}
+
+/// `POST /audit/run` (V26): run one full code-audit scan of the requested
+/// category to completion and **stream** the reply as newline-delimited JSON —
+/// periodic [`HEARTBEAT_LINE`]s while the (possibly minutes-long) scan runs,
+/// then exactly one final `RunResult { ok, text, error }` line. This is the
+/// app-side half of the `cimp-code-audit` MCP server: the stdio child
+/// (`audit/mcp.rs::run_via_loopback`) POSTs here and forwards the result to
+/// Claude / OpenCode.
+///
+/// **Per-consumer re-gate:** the `expose_claude` / `expose_opencode` toggles
+/// gate MCP-server *advertisement* at tab spawn, but a child spawned while its
+/// consumer was opted in outlives the toggle — so this route re-enforces the
+/// toggle named by `body.consumer` on every run. Unchecking "Expose to …" thus
+/// takes effect immediately for already-running tabs (they get a clean tool
+/// error), no restart needed for the *enforcement* half. The master `enabled`
+/// switch is separately re-enforced by `begin_scan`.
+///
+/// **Why a stream, framed exactly like `handle_run`:** the child aborts after
+/// 45 s of silence, and a real audit can outlast that, so the heartbeats (every
+/// [`HEARTBEAT_INTERVAL`]) prove the scan is still alive — the child skips any
+/// line lacking an `ok` field and keeps only the single `ok`-bearing final line
+/// (see [`parse_result_line`]). The response carries no `Content-Length`
+/// (`Connection: close`, close-delimited); each JSON is emitted on its own line
+/// so the child's line reader always sees complete frames.
+///
+/// **Why no caller-disconnect probe (unlike `handle_run`):** the audit entry
+/// [`run_audit`](crate::audit::mcp::run_audit) is not cancellable, and
+/// `run_scan_and_wait` clears the runner's `scanning` flag only when the scan's
+/// `run()` future completes. Dropping that future to react to a disconnect would
+/// wedge the runner in `scanning`, so instead a failed heartbeat write (the
+/// caller-gone signal) drains the scan to completion off the wire and discards
+/// the unsendable result — the runner ends clean either way. There is also no
+/// llama-server slot to free promptly, which is the only reason `handle_run`
+/// probes at all.
+///
+/// Tool-level failures (master switch off, no tools enabled, `"a scan is already
+/// in progress"`) flow through as the final `{ok:false, error}` line over HTTP
+/// 200 — the child renders them as a readable tool error, mirroring
+/// [`handle_graph_run`]. Only a malformed body is a 400.
+async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
+    let body: AuditRunBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            // Malformed body / unknown category → 400 (the child treats any
+            // non-200 as a hard failure), mirroring `handle_graph_run`.
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    let category = body.category;
+    let consumer = body
+        .consumer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude")
+        .to_ascii_lowercase();
+
+    // Resolve the runner from managed state at request time (robust to the
+    // audit-vs-loopback startup order). `main.rs` manages it as `Arc<AuditState>`
+    // (and publishes the same handle via `audit::set_global`). Not ready → a
+    // single `ok:false` line over 200, same shape as `handle_graph_run`.
+    let state = match app.try_state::<Arc<crate::audit::AuditState>>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some("audit service not ready".into()),
+            };
+            return write_json(stream, 200, &r).await;
+        }
+    };
+
+    // Re-enforce this consumer's expose toggle at run time (see the doc
+    // comment above): a still-registered child whose consumer has since been
+    // opted out gets a clean tool error, not a scan.
+    if !state.consumer_exposed(&consumer) {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(format!(
+                "code audit is not exposed to {consumer} — re-enable it in cImp Settings → Code Audit"
+            )),
+        };
+        return write_json(stream, 200, &r).await;
+    }
+
+    write_ndjson_head(stream, "audit").await?;
+
+    // Run the scan concurrently with the heartbeat interval: whichever branch
+    // fires, `run_audit` still owns clearing `scanning`.
+    let run_fut = crate::audit::mcp::run_audit(&state, category);
+    tokio::pin!(run_fut);
+
+    let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    beat.tick().await; // consume the immediate first tick
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            r = &mut run_fut => break r,
+            _ = beat.tick() => {
+                // A failed heartbeat write means the caller went away. Stop
+                // beating, but drain the (uncancellable) scan to completion so
+                // the runner leaves `scanning` — then drop the unsendable result.
+                if stream.write_all(HEARTBEAT_LINE).await.is_err() {
+                    debug!("audit loopback: heartbeat write failed; caller gone, draining scan");
+                    let _ = (&mut run_fut).await;
+                    return Ok(());
+                }
+                stream.flush().await.ok();
+            }
+        }
+    };
+
+    let r = match result {
+        Ok(text) => RunResult {
+            ok: true,
+            text: Some(text),
+            error: None,
+        },
+        // Busy / disabled / no-tools errors intentionally arrive here as
+        // `ok:false` — a tool result the child surfaces, not a protocol failure.
+        Err(e) => RunResult {
+            ok: false,
+            text: None,
+            error: Some(e),
+        },
+    };
+    write_result_line(stream, &r, "audit").await
 }
 
 /// A `POST /context/retrieve` request body (from the Claude UserPromptSubmit
@@ -1550,5 +1765,22 @@ mod tests {
         assert_eq!(back.port, 8123);
         assert_eq!(back.token, "tok");
         assert_eq!(back.pid, 42);
+    }
+
+    #[test]
+    fn audit_run_body_parses_both_categories_and_rejects_junk() {
+        use crate::audit::adapters::Category;
+        // Both wire categories deserialize; `consumer` is optional and ignored.
+        let sec: AuditRunBody =
+            serde_json::from_slice(br#"{"category":"security","consumer":"claude"}"#).unwrap();
+        assert_eq!(sec.category, Category::Security);
+        assert_eq!(sec.consumer.as_deref(), Some("claude"));
+        let qual: AuditRunBody = serde_json::from_slice(br#"{"category":"quality"}"#).unwrap();
+        assert_eq!(qual.category, Category::Quality);
+        assert!(qual.consumer.is_none(), "consumer defaults to None when absent");
+        // A bad category word (or a missing `category`) is a clean parse error →
+        // the route answers 400.
+        assert!(serde_json::from_slice::<AuditRunBody>(br#"{"category":"bogus"}"#).is_err());
+        assert!(serde_json::from_slice::<AuditRunBody>(br#"{"consumer":"x"}"#).is_err());
     }
 }

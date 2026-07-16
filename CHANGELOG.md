@@ -5,10 +5,19 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.47.0] — 2026-07-16
 
 ### Changed
 
+- **Tool Activity tab renamed to "Tools", sub-tabs reordered.** The tab strip
+  now shows "Tools" (the tab id stays `tool-activity`; existing layouts pick
+  up the new name automatically), and its sections run Activities · Offload
+  server · Offload tools · Graph index · Graph view · Graph tools ·
+  Code audit.
+- **Tools sections fill the pane.** The Activities feed card and the
+  Graph/Offload tools reference lists now size to the tab (scrolling
+  internally) instead of stopping at a fixed height, and the two reference
+  lists are always expanded — the collapse toggle is gone.
 - **Code Audit tab retired — the Security | Quality panels are now a
   "Code audit" sub-tab of Tool Activity.** The separate V23 reserved tab is
   gone; the audit surface renders as a section inside the Tool Activity tab

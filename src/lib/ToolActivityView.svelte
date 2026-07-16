@@ -372,7 +372,6 @@
       title="Graph tools"
       tools={GRAPH_TOOLS}
       note="MCP tools exposed to Claude (and the offload worker) while the graph is enabled. Ask in natural language — Claude picks the tool."
-      persistKey="tool-activity.graph-tools"
     />
   {:else if section === 'graph-index'}
     <!-- The graph indexer dashboard (status cards + rebuild/pause actions),
@@ -383,7 +382,6 @@
       title="Offload tools"
       tools={OFFLOAD_TOOLS}
       note="offload_task is the tool Claude calls to delegate; the rest are the tools the local worker uses to complete the task."
-      persistKey="tool-activity.offload-tools"
     />
   {:else if section === 'offload-server'}
     <!-- The live backend dashboard (event-driven, remount-cheap), in normal
@@ -561,6 +559,13 @@
   }
   .history {
     --hrow-h: 1.55rem;
+    /* Fill the rest of the pane (the container is a flex column); the row
+       list below scrolls internally. The floor keeps a usable feed on short
+       panes — the container scrolls beyond that. */
+    flex: 1;
+    min-height: calc(8 * var(--hrow-h) + 6rem);
+    display: flex;
+    flex-direction: column;
   }
   .history-head {
     display: flex;
@@ -598,10 +603,10 @@
   .history-rows {
     display: flex;
     flex-direction: column;
-    /* Bounded like the predecessors' 5-row .history-body (scaled up for a
-       dedicated tab): the feed scrolls internally, so new rows never grow
-       the card or jump the page layout. */
-    max-height: calc(24 * var(--hrow-h));
+    /* The feed scrolls internally within the flex-sized card, so new rows
+       never grow the card or jump the page layout. */
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
   }
   .feature-note {

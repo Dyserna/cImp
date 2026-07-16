@@ -1,77 +1,53 @@
 <script lang="ts">
-  // A collapsible reference panel listing the tools a feature exposes, each
-  // with a one-line description and a short example prompt. Styled to match the
-  // "Raw server log" collapsible in the Offload server dashboard (caret toggle
-  // + a bordered, sunken panel). Reused by the Tool Activity tab's reference
-  // sections.
-  import { loadCardOpen, saveCardOpen } from './viewSection';
+  // A reference panel listing the tools a feature exposes, each with a
+  // one-line description and a short example prompt. Always expanded and
+  // sized to fill the hosting section (the list scrolls internally). Reused
+  // by the Tool Activity tab's reference sections.
 
   interface ToolRef {
     name: string;
     desc: string;
     example: string;
   }
-  // `persistKey` (optional) makes the open/collapsed state survive the
-  // destroy/recreate cycle of the hosting tab (and app restarts) — see
-  // viewSection.ts. No key → ephemeral, as before.
   let {
     title = 'Tools',
     tools,
     note = '',
-    persistKey,
-  }: { title?: string; tools: ToolRef[]; note?: string; persistKey?: string } = $props();
-
-  // svelte-ignore state_referenced_locally — persistKey is a static
-  // identity; only the initial value matters for seeding the open state.
-  let open = $state(persistKey ? loadCardOpen('tools-ref', persistKey) : false);
-  $effect(() => {
-    if (persistKey) saveCardOpen('tools-ref', persistKey, open);
-  });
+  }: { title?: string; tools: ToolRef[]; note?: string } = $props();
 </script>
 
 <div class="tools-ref">
-  <button type="button" class="tools-toggle" onclick={() => (open = !open)}>
-    <span class="caret" class:open>▸</span>
+  <div class="tools-title">
     {title}
     <span class="muted">({tools.length})</span>
-  </button>
-  {#if open}
-    <div class="tools-view">
-      {#if note}<div class="tools-note">{note}</div>{/if}
-      {#each tools as t (t.name)}
-        <div class="tool">
-          <code class="tool-name">{t.name}</code>
-          <div class="tool-desc">{t.desc}</div>
-          <div class="tool-eg"><span class="eg">e.g.</span> {t.example}</div>
-        </div>
-      {/each}
-    </div>
-  {/if}
+  </div>
+  <div class="tools-view">
+    {#if note}<div class="tools-note">{note}</div>{/if}
+    {#each tools as t (t.name)}
+      <div class="tool">
+        <code class="tool-name">{t.name}</code>
+        <div class="tool-desc">{t.desc}</div>
+        <div class="tool-eg"><span class="eg">e.g.</span> {t.example}</div>
+      </div>
+    {/each}
+  </div>
 </div>
 
 <style>
   .tools-ref {
-    margin-top: 0.6rem;
-    border-top: 1px solid var(--border-subtle, #21262d);
-    padding-top: 0.5rem;
+    /* Fill the hosting flex column (the Tools tab section area); the list
+       below scrolls internally instead of growing the page. */
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
-  .tools-toggle {
-    background: none;
-    border: none;
+  .tools-title {
     color: var(--text-secondary, #8b949e);
-    cursor: pointer;
-    font: inherit;
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
     padding: 0.2rem 0;
-  }
-  .caret {
-    display: inline-block;
-    transition: transform 0.12s ease;
-  }
-  .caret.open {
-    transform: rotate(90deg);
   }
   .muted {
     color: var(--text-secondary, #8b949e);
@@ -79,7 +55,8 @@
   }
   .tools-view {
     margin-top: 0.4rem;
-    max-height: 24rem;
+    flex: 1;
+    min-height: 0;
     overflow: auto;
     background: var(--surface-sunken, #161b22);
     border: 1px solid var(--border-subtle, #21262d);

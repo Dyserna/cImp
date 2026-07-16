@@ -322,7 +322,7 @@
                   ? 'Not in the code graph (file isn’t indexed)'
                   : gs && gs.degree === 0
                     ? 'No imports or calls in the code graph'
-                    : 'Show in Graph view (Tool Activity)'}
+                    : 'Show in Graph view (Tools)'}
                 aria-label="Show {f.path} in the Graph view"
                 disabled={gs !== undefined && (!gs.indexed || gs.degree === 0)}
                 onclick={() => jumpToGraph(f.path)}

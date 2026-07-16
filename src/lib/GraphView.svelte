@@ -1755,7 +1755,7 @@
     {:else if loading && nodeCount === 0}
       <p class="banner">Loading graph…</p>
     {:else if nodeCount === 0}
-      <p class="banner">No indexed graph yet. Build the code graph first (Tool Activity → Graph index → Rebuild index).</p>
+      <p class="banner">No indexed graph yet. Build the code graph first (Tools → Graph index → Rebuild index).</p>
     {:else if revealMiss}
       <p class="banner">{revealMiss}</p>
     {/if}

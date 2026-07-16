@@ -1,5 +1,6 @@
 <script lang="ts">
-  // The read-only, app-rendered Tool Activity tab — one place to see what
+  // The read-only, app-rendered Tool Activity tab (displayed as "Tools" in
+  // the tab strip) — one place to see what
   // tools the agents are using and which tools are available. Seven sections:
   // Activities (the unified, newest-first feed from the backend's persistent
   // activity store — graph/context tool calls plus completed offload_task
@@ -90,11 +91,11 @@
     | 'code-audit';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'activities', label: 'Activities' },
-    { id: 'graph-tools', label: 'Graph tools' },
+    { id: 'offload-server', label: 'Offload server' },
+    { id: 'offload-tools', label: 'Offload tools' },
     { id: 'graph-index', label: 'Graph index' },
     { id: 'graph-view', label: 'Graph view' },
-    { id: 'offload-tools', label: 'Offload tools' },
-    { id: 'offload-server', label: 'Offload server' },
+    { id: 'graph-tools', label: 'Graph tools' },
     { id: 'code-audit', label: 'Code audit' },
   ];
   // The selection survives the component's destroy/recreate cycle (tab
@@ -285,7 +286,7 @@
 
 <div class="tool-activity">
   <header>
-    <h2>Tool Activity</h2>
+    <h2>Tools</h2>
   </header>
 
   <nav class="sections">

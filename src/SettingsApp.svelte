@@ -2759,7 +2759,7 @@
                     (s.ui.tool_activity_tab = (e.currentTarget as HTMLInputElement).checked),
                 )}
             />
-            <span>Show the <strong>Tool Activity</strong> tab</span>
+            <span>Show the <strong>Tools</strong> tab</span>
           </label>
           <small class="hint">
             One place to watch tool usage: a unified feed of code-intelligence
@@ -3432,7 +3432,7 @@
                   <span>Show command on start</span>
                 </label>
                 <small class="hint">
-                  The Start button in Tool Activity → Offload server opens the
+                  The Start button in Tools → Offload server opens the
                   command in an editable popup first — edits apply to that
                   launch only and are not saved here.
                 </small>
@@ -4126,7 +4126,7 @@
           </label>
           <small class="hint">
             Watch the local model load + server logs live in the
-            <strong>Tool Activity</strong> tab's <strong>Offload server</strong>
+            <strong>Tools</strong> tab's <strong>Offload server</strong>
             section.
           </small>
         </section>
@@ -4443,7 +4443,7 @@
               </label>
               <small class="hint">
                 Changing the model or dimensions starts a background re-embed.
-                Use <strong>Rebuild embeddings</strong> in Tool Activity →
+                Use <strong>Rebuild embeddings</strong> in Tools →
                 Graph index after a silent model swap behind the same name.
               </small>
             {/if}
@@ -4799,7 +4799,7 @@
               Tune V15's code-intelligence features: <code>graph_path</code>
               (shortest-path tracing), <code>graph_architecture</code> (god
               nodes, subsystems, surprising edges), and the live Graph view
-              (Tool Activity tab).
+              (Tools tab).
               Edge confidence (extracted/inferred/ambiguous) is always on.
             </small>
             <label>
@@ -4862,7 +4862,7 @@
             </label>
             <small class="hint">
               Draws the code graph and pulses nodes as agents read/edit/query
-              the codebase, in the Tool Activity tab's "Graph view" section.
+              the codebase, in the Tools tab's "Graph view" section.
               Off by default — it's a human-facing visual, not on any agent
               path.
             </small>
@@ -4994,7 +4994,7 @@
             bundled — each tool resolves from the <code>ebin\</code> drop-in
             folder first, then your PATH; point cImp at a specific build with
             Browse, or check availability with Detect. Enable the feature to show
-            the Code audit section in the Tool Activity tab.
+            the Code audit section in the Tools tab.
           </small>
           <label class="checkbox">
             <input
@@ -5008,7 +5008,7 @@
                     ).checked),
                 )}
             />
-            <span>Enable Code Audit (Tool Activity → Code audit)</span>
+            <span>Enable Code Audit (Tools → Code audit)</span>
           </label>
 
           {#snippet auditToolRow(row: AuditToolRow)}
@@ -5106,7 +5106,7 @@
           <h3>Security tools</h3>
           <small class="hint">
             Shown in the Code audit section's <strong>Security</strong> sub-tab
-            (Tool Activity tab).
+            (Tools tab).
           </small>
           {#each auditGroups.security as row (row.meta.id)}
             {@render auditToolRow(row)}
@@ -5115,7 +5115,7 @@
           <h3>Quality tools</h3>
           <small class="hint">
             Shown in the Code audit section's <strong>Quality</strong> sub-tab
-            (Tool Activity tab).
+            (Tools tab).
             Language-gated — a tool only appears there (and only runs) when the
             project contains files it applies to. All tools are listed here
             regardless of the current project.

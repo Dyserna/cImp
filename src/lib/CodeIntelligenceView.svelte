@@ -1195,7 +1195,7 @@
           </div>
           <div>
             <span class="num">{usage.offload_local_tasks.toLocaleString()}</span>
-            <span class="lbl">tasks served locally — see <em>Tool Activity → Offload server</em></span>
+            <span class="lbl">tasks served locally — see <em>Tools → Offload server</em></span>
           </div>
           <div>
             <span

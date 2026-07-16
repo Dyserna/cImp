@@ -2864,14 +2864,15 @@ pub fn default_workbench_tab() -> TabConfig {
     })
 }
 
-/// The reserved, non-closable Tool Activity tab. Same shape as the Code Graph
-/// monitor tab — Shell-kind with no command (app-rendered, no PTY).
+/// The reserved, non-closable Tools tab (formerly "Tool Activity" — the
+/// rename reaches existing installs via `sync_name`). Same shape as the Code
+/// Graph monitor tab — Shell-kind with no command (app-rendered, no PTY).
 /// Materialized/removed by the integrity check per `ui.tool_activity_tab`.
 pub fn default_tool_activity_tab() -> TabConfig {
     TabConfig::Shell(ShellTabConfig {
         id: TOOL_ACTIVITY_TAB_ID.to_string(),
         builtin: true,
-        name: "Tool Activity".to_string(),
+        name: "Tools".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,

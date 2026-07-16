@@ -403,7 +403,7 @@
               <button
                 type="button"
                 class="loc-jump"
-                title="Reveal in Graph view (Tool Activity)"
+                title="Reveal in Graph view (Tools)"
                 onclick={() => jump(row)}
               >{row.file}{row.line > 0 ? `:${row.line}` : ''}</button>
             {:else}

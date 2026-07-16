@@ -1046,7 +1046,7 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
     // section now; the v25 → v26 migration drops old persisted entries.
     ReservedTabSpec {
         id: TOOL_ACTIVITY_TAB_ID,
-        log_name: "Tool Activity",
+        log_name: "Tools",
         flag: "tool_activity_tab",
         enabled: |s| s.ui.tool_activity_tab,
         default_tab: default_tool_activity_tab,

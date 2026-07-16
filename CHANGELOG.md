@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Graph View tab retired — the live force graph is now a "Graph view"
+  sub-tab of Tool Activity.** The separate V15 reserved tab is gone; the
+  visualization renders as a section inside the Tool Activity tab (still
+  gated by the `graph_viz` setting, off by default), mounted lazily on the
+  first visit and kept alive across section switches so the laid-out
+  simulation survives. The Workbench diff and Code Audit ⌖ jumps now reveal
+  Tool Activity and flip it to the Graph view section. Settings schema
+  v25→v26 drops persisted graph-view tab entries (offload-server-retirement
+  precedent, including the integrity-check retired-id prune for stale
+  overlays).
 - **Graph index dashboard moved to Tool Activity.** The Code Intelligence
   tab's Overview → Index group (Rebuild index / Rebuild embeddings / Test
   connection / Pause watch, the embedder probe, and the per-root index cards

@@ -388,8 +388,8 @@ export interface VizEdgeRow {
   drawn: boolean;
 }
 
-/// A bounded {nodes, edges} subgraph for the Graph View tab. Mirror of Rust
-/// `VizGraphResult`.
+/// A bounded {nodes, edges} subgraph for the Graph view (Tool Activity tab).
+/// Mirror of Rust `VizGraphResult`.
 export interface VizGraphResult {
   nodes: VizNodeRow[];
   edges: VizEdgeRow[];

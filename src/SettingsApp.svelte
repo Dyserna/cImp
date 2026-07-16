@@ -4798,7 +4798,8 @@
             <small class="hint">
               Tune V15's code-intelligence features: <code>graph_path</code>
               (shortest-path tracing), <code>graph_architecture</code> (god
-              nodes, subsystems, surprising edges), and the live Graph View tab.
+              nodes, subsystems, surprising edges), and the live Graph view
+              (Tool Activity tab).
               Edge confidence (extracted/inferred/ambiguous) is always on.
             </small>
             <label>
@@ -4857,12 +4858,13 @@
                 onchange={(e) =>
                   patch((s) => (s.graph.graph_viz = (e.currentTarget as HTMLInputElement).checked))}
               />
-              <span>Show the <strong>Graph View</strong> tab (live 2D/3D force graph)</span>
+              <span>Enable the <strong>Graph view</strong> (live 3D force graph)</span>
             </label>
             <small class="hint">
-              A dedicated tab that draws the code graph and pulses nodes as agents
-              read/edit/query the codebase. Off by default — it's a human-facing
-              visual, not on any agent path.
+              Draws the code graph and pulses nodes as agents read/edit/query
+              the codebase, in the Tool Activity tab's "Graph view" section.
+              Off by default — it's a human-facing visual, not on any agent
+              path.
             </small>
             {#if snapshot.graph.graph_viz}
               <label>
@@ -4881,13 +4883,13 @@
                     )}
                 />
               </label>
-              <h3>Graph View tuning</h3>
+              <h3>Graph view tuning</h3>
               <small class="hint">
                 Multipliers on the built-in layout/appearance (1.0 = default;
                 0.2–5, folder spacing up to 50). One size doesn't fit every
                 repo — a dense monorepo usually wants smaller nodes and wider
                 spacing than a small project. Changes apply live to an open
-                Graph View tab.
+                Graph view.
               </small>
               {#each [
                 { key: 'graph_viz_node_scale', label: 'File node size', max: 5 },

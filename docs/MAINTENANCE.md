@@ -1478,10 +1478,12 @@ propagation (id-sorted, bounded iters) — approximate and honestly labelled
 "heuristic"; there is **no** warm-index cache in V1 (computed on demand each
 call), so if a large repo makes it slow, add caching keyed off the index epoch.
 
-**The Graph View tab is a fourth reserved app-rendered tab (`TabId::GraphView`).**
-It follows the Code Graph monitor pattern exactly — Shell-kind id, no PTY,
-rendered by `Pane.svelte` (`isGraphViewTab`), materialized/removed by
-`reconcile_graph_view_tab` per `graph.graph_viz` (default off). The visualization
+**The Graph view is a section inside the Tool Activity tab** (it was its own
+reserved tab until schema v26; the v25 → v26 migration plus the integrity
+check's `RETIRED_TAB_IDS` prune drop old `graph-view` entries). Gated by
+`graph.graph_viz` (default off); `ToolActivityView.svelte` mounts it lazily on
+the first section visit and then keeps it alive hidden (display:none) so the
+laid-out simulation survives section switches. The visualization
 is a **self-contained** Canvas 2D force graph in `src/lib/GraphView.svelte` — no
 three.js / d3 dependency was added, keeping the bundle lean and offline. Live
 activity is a 1.5 s poll of `graphHistory()` (there's no push event for

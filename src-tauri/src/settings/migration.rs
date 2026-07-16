@@ -291,6 +291,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v24,
         transform: migrate_v24_to_v25_step,
     },
+    MigrationStep {
+        from_version: "v25",
+        detect: looks_v25,
+        transform: migrate_v25_to_v26_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2108,10 +2113,55 @@ fn migrate_v24_to_v25(value: &mut Value) {
         });
     }
 
-    // Final cascade step ⇒ stamp CURRENT (25).
+    // Stamps a *literal* 25 (not `CURRENT_SCHEMA_VERSION`): the v25 → v26
+    // step runs next in the same cascade pass and gates on
+    // `schema_version == 25`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(25u8)),
+    );
+}
+
+fn looks_v25(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 25)
+}
+
+fn migrate_v25_to_v26_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v25_to_v26(value)
+}
+
+/// V25 → V26: drop the retired `graph-view` reserved tab.
+///
+/// The V15 Feature 4 stretch shipped the live force-graph visualization as
+/// its own reserved tab (materialized iff `graph.graph_viz`); it's now the
+/// "Graph view" section inside the Tool Activity tab, so the separate tab
+/// entry must go. Without this step the old materialized entry would
+/// deserialize as a plain closable Shell tab named "Graph View" (the
+/// `TabId::GraphView` variant no longer exists) with no view behind it.
+/// Layout-tree references to the id don't need scrubbing here — the frontend's
+/// `validateAndRepairLayout` drops any pane tab id absent from `tabs`.
+///
+/// Idempotent: a second pass finds `schema_version == 26` so `looks_v25` is
+/// false, and the retain is a no-op once the entry is gone.
+fn migrate_v25_to_v26(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
+        tabs.retain(|t| {
+            t.get("id").and_then(Value::as_str)
+                != Some(crate::settings::schema::GRAPH_VIEW_TAB_ID)
+        });
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (26).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(26u8)),
     );
 }
 
@@ -2783,6 +2833,51 @@ mod tests {
         assert_eq!(v["schema_version"], json!(25));
         let once = v.clone();
         migrate_v24_to_v25(&mut v);
+        assert_eq!(v, once);
+    }
+
+    #[test]
+    fn looks_v25_detects_v25_and_not_others() {
+        assert!(looks_v25(&json!({ "schema_version": 25 })));
+        assert!(!looks_v25(&json!({ "schema_version": 24 })));
+        assert!(!looks_v25(&json!({ "schema_version": 26 })));
+        assert!(!looks_v25(&json!({})));
+    }
+
+    /// v25 → v26: the retired `graph-view` reserved tab entry is dropped;
+    /// every other tab survives untouched.
+    #[test]
+    fn v25_to_v26_drops_retired_graph_view_tab() {
+        let mut v = json!({
+            "schema_version": 25,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude", "builtin": true },
+                { "kind": "shell", "id": "graph-view", "builtin": true, "name": "Graph View" },
+                { "kind": "shell", "id": "tool-activity", "builtin": true, "name": "Tool Activity" },
+                { "kind": "shell", "id": "shell-default-1", "builtin": false }
+            ]
+        });
+        migrate_v25_to_v26(&mut v);
+        assert_eq!(v["schema_version"], json!(26));
+        let ids: Vec<&str> = v["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["claude", "tool-activity", "shell-default-1"]);
+    }
+
+    /// A v25 file that never materialized the Graph View tab (graph_viz off —
+    /// the default) just gets its version marker advanced; running the step
+    /// twice is a no-op.
+    #[test]
+    fn v25_to_v26_is_idempotent_and_stamps_version() {
+        let mut v = json!({ "schema_version": 25, "tabs": [] });
+        migrate_v25_to_v26(&mut v);
+        assert_eq!(v["schema_version"], json!(26));
+        let once = v.clone();
+        migrate_v25_to_v26(&mut v);
         assert_eq!(v, once);
     }
 

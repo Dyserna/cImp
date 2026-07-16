@@ -48,16 +48,10 @@ export function isWorkbenchTab(id: TabId): boolean {
   return id === WORKBENCH_TAB_ID;
 }
 
-/// V15 Feature 4: the reserved id of the read-only, app-rendered Graph View tab
-/// (live 2D/3D force-graph of the code graph). Shell-kind on the backend — no
-/// PTY — same pattern as the Code Graph monitor tab. Materialized only while
-/// `graph.graph_viz` is on.
-export const GRAPH_VIEW_TAB_ID = 'graph-view';
-
-/// True for the Graph View tab.
-export function isGraphViewTab(id: TabId): boolean {
-  return id === GRAPH_VIEW_TAB_ID;
-}
+// The V15 "graph-view" reserved tab is retired (schema v26) — the live
+// force-graph lives inside the Tool Activity tab as the "Graph view" section
+// now (ToolActivityView.svelte); the v25 → v26 migration drops old persisted
+// entries.
 
 /// The reserved id of the read-only, app-rendered Tool Activity tab — the
 /// unified feed of graph-tool calls + offload requests, plus the graph/offload
@@ -92,8 +86,8 @@ export function isPreviewTabId(id: TabId): boolean {
 }
 
 /// THE single source of truth for "app-rendered, no-PTY" tabs: the reserved
-/// dashboards (Code Graph monitor, Note, Workbench, Graph View, Tool
-/// Activity, Code Audit) plus Preview tabs (an embedded webview). Every guard
+/// dashboards (Code Graph monitor, Note, Workbench, Tool Activity, Code
+/// Audit) plus Preview tabs (an embedded webview). Every guard
 /// that used to hand-enumerate these must call this instead — a new
 /// app-rendered tab is added HERE (plus its own isXTab predicate above) and
 /// nowhere else. Mirrors the Rust side's reserved-tab set.
@@ -102,7 +96,6 @@ export function isAppRenderedTab(id: TabId): boolean {
     isGraphMonitorTab(id) ||
     isNoteTab(id) ||
     isWorkbenchTab(id) ||
-    isGraphViewTab(id) ||
     isToolActivityTab(id) ||
     isCodeAuditTab(id) ||
     isPreviewTabId(id)

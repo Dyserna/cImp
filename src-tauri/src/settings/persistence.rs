@@ -43,9 +43,9 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_audit_tools, default_code_audit_tab, default_graph_monitor_tab,
-    default_graph_view_tab, default_shell_1_tab, default_tool_activity_tab,
-    default_workbench_tab, starter_prompt_templates, AiTabId, HarnessVersions,
-    LayoutNodePersisted, LlmPricingModel, PromptTemplate, Settings, TabConfig,
+    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
+    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
+    PromptTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
@@ -1041,14 +1041,9 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         default_tab: default_workbench_tab,
         sync_name: false,
     },
-    ReservedTabSpec {
-        id: GRAPH_VIEW_TAB_ID,
-        log_name: "Graph View",
-        flag: "graph_viz",
-        enabled: |s| s.graph.graph_viz,
-        default_tab: default_graph_view_tab,
-        sync_name: true,
-    },
+    // The V15 "Graph View" reserved tab is retired (schema v26) — the live
+    // force-graph lives inside the Tool Activity tab as the "Graph view"
+    // section now; the v25 → v26 migration drops old persisted entries.
     ReservedTabSpec {
         id: TOOL_ACTIVITY_TAB_ID,
         log_name: "Tool Activity",
@@ -1078,7 +1073,11 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
 /// (see `load`), so an overlay written by an older version re-introduces the
 /// entry through the merge. This list feeds the integrity check's fail-safe
 /// prune, which catches every source: overlays, hand-edits, imported files.
-const RETIRED_TAB_IDS: [&str; 2] = [OFFLOAD_SERVER_TAB_ID, CODE_QUALITY_TAB_ID];
+const RETIRED_TAB_IDS: [&str; 3] = [
+    OFFLOAD_SERVER_TAB_ID,
+    CODE_QUALITY_TAB_ID,
+    GRAPH_VIEW_TAB_ID,
+];
 
 /// Drop every tab whose id is in [`RETIRED_TAB_IDS`]. Returns `true` if
 /// anything was removed.
@@ -1326,7 +1325,8 @@ pub fn integrity_check(settings: &mut Settings) -> bool {
         changed = true;
     }
 
-    // 4a. Drop retired reserved feature tabs (offload-server, code-quality).
+    // 4a. Drop retired reserved feature tabs (offload-server, code-quality,
+    //     graph-view).
     //     The global-file schema migrations prune these, but the per-folder
     //     overlay is never migrated (see `load`) — an overlay written by an
     //     older version re-introduces the entry through the merge, where it
@@ -1595,20 +1595,20 @@ mod tests {
     fn reconcile_reserved_tabs_materializes_and_removes_both_live() {
         let mut s = base_test_settings();
         s.graph.enabled = true;
-        s.graph.graph_viz = true;
+        s.workbench.enabled = true;
         // The live toggle path uses reconcile_reserved_tabs (not the full
         // integrity pass) to materialize both reserved tabs at once.
         assert!(reconcile_reserved_tabs(&mut s));
         assert!(s.tabs.iter().any(|t| t.id() == GRAPH_MONITOR_TAB_ID));
-        assert!(s.tabs.iter().any(|t| t.id() == GRAPH_VIEW_TAB_ID));
+        assert!(s.tabs.iter().any(|t| t.id() == WORKBENCH_TAB_ID));
         // Idempotent: no flag change → no tab change.
         assert!(!reconcile_reserved_tabs(&mut s));
         // Disabling both prunes both.
         s.graph.enabled = false;
-        s.graph.graph_viz = false;
+        s.workbench.enabled = false;
         assert!(reconcile_reserved_tabs(&mut s));
         assert!(s.tabs.iter().all(|t| t.id() != GRAPH_MONITOR_TAB_ID));
-        assert!(s.tabs.iter().all(|t| t.id() != GRAPH_VIEW_TAB_ID));
+        assert!(s.tabs.iter().all(|t| t.id() != WORKBENCH_TAB_ID));
     }
 
     #[test]
@@ -2003,11 +2003,12 @@ mod tests {
     }
 
     /// A stale per-folder overlay written before the offload-server /
-    /// code-quality retirements re-introduces the retired tab entry through
-    /// the merge — the overlay is never schema-migrated (see `load`), so the
-    /// v24→v25 / v22→v23 prunes never see it. The integrity check must drop
-    /// it (it would otherwise boot as a plain Shell tab with no view behind
-    /// it and fail to spawn a PTY), while leaving user shells untouched.
+    /// code-quality / graph-view retirements re-introduces the retired tab
+    /// entry through the merge — the overlay is never schema-migrated (see
+    /// `load`), so the schema-version prunes never see it. The integrity
+    /// check must drop it (it would otherwise boot as a plain Shell tab with
+    /// no view behind it and fail to spawn a PTY), while leaving user shells
+    /// untouched.
     #[test]
     fn integrity_drops_retired_reserved_tabs() {
         let mut s = base_test_settings();
@@ -2015,6 +2016,7 @@ mod tests {
         for (id, name) in [
             (OFFLOAD_SERVER_TAB_ID, "Offload Server"),
             (CODE_QUALITY_TAB_ID, "Code Quality"),
+            (GRAPH_VIEW_TAB_ID, "Graph View"),
             ("shell-user-1", "Build Watch"),
         ] {
             s.tabs
@@ -2035,6 +2037,7 @@ mod tests {
         assert!(changed);
         assert!(!s.tabs.iter().any(|t| t.id() == OFFLOAD_SERVER_TAB_ID));
         assert!(!s.tabs.iter().any(|t| t.id() == CODE_QUALITY_TAB_ID));
+        assert!(!s.tabs.iter().any(|t| t.id() == GRAPH_VIEW_TAB_ID));
         assert!(s.tabs.iter().any(|t| t.id() == "shell-user-1"));
         // Idempotent: a second pass finds nothing to repair.
         assert!(!integrity_check(&mut s));

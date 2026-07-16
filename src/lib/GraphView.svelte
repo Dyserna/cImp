@@ -6,9 +6,11 @@
   // small self-contained force simulation (no external deps — plain
   // Canvas 2D + TypeScript), and pulses nodes as the graph tool history shows
   // an agent (cloud or the local offload worker) touching them, so a viewer
-  // can watch the agent "walk" the codebase live. Mirrors the app-rendered
-  // (no PTY) tab pattern used by WorkbenchView/CodeIntelligenceView —
-  // `position:absolute;inset:0` so it sits above the pane's terminal slot.
+  // can watch the agent "walk" the codebase live. Formerly its own reserved
+  // tab (retired in schema v26) — now the "Graph view" section inside the
+  // Tool Activity tab, mounted lazily and kept alive hidden on section
+  // switches (ToolActivityView); the IntersectionObserver below pauses the
+  // render loop whenever the section (or tab) is off-screen.
   import { onMount, onDestroy } from 'svelte';
   import {
     graphVizSnapshot,
@@ -1898,8 +1900,9 @@
 
 <style>
   .graph-view {
-    /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot —
-       same convention as WorkbenchView/CodeIntelligenceView. */
+    /* Fill the host: the Tool Activity tab's `.graph-host` (position:
+       relative, flex-grown to the remaining pane height) — kept from the
+       retired-tab days, when this filled the pane directly. */
     position: absolute;
     inset: 0;
     display: flex;

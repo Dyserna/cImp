@@ -24,7 +24,7 @@
   import { settings } from './settings/store';
   import { revealFileInGraph } from './graphReveal';
   import { revealTab } from './tabs/visibility';
-  import { GRAPH_VIEW_TAB_ID } from './tabs/types';
+  import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { graphVizFileStatus, onGraphStatus, type VizFileStatus } from './graph';
   import { WORKBENCH_TAB_ID } from './tabs/types';
   import { appViewVisibility } from './appViewVisibility';
@@ -244,12 +244,15 @@
     }
   }
 
-  // Jump to this file's node in the Graph View tab, as if it were clicked
-  // there. The button only renders when the settings-gated Graph View tab
-  // can exist, so revealTab never silently no-ops.
+  // Jump to this file's node in the Graph view (Tool Activity tab), as if it
+  // were clicked there. revealFileInGraph flips the Tool Activity section to
+  // Graph view (ToolActivityView's graphReveal subscription) and GraphView
+  // consumes the path; the button only renders when the visualization and
+  // the Tool Activity tab are both enabled, so revealTab never silently
+  // no-ops.
   function jumpToGraph(path: string): void {
     revealFileInGraph(path);
-    revealTab(GRAPH_VIEW_TAB_ID);
+    revealTab(TOOL_ACTIVITY_TAB_ID);
   }
 </script>
 
@@ -310,7 +313,7 @@
                 </span>
               {/if}
             </button>
-            {#if $settings.graph.enabled && $settings.graph.graph_viz}
+            {#if $settings.graph.enabled && $settings.graph.graph_viz && $settings.ui.tool_activity_tab}
               {@const gs = graphStatuses.get(f.path)}
               <button
                 type="button"
@@ -319,8 +322,8 @@
                   ? 'Not in the code graph (file isn’t indexed)'
                   : gs && gs.degree === 0
                     ? 'No imports or calls in the code graph'
-                    : 'Show in Graph View'}
-                aria-label="Show {f.path} in Graph View"
+                    : 'Show in Graph view (Tool Activity)'}
+                aria-label="Show {f.path} in the Graph view"
                 disabled={gs !== undefined && (!gs.indexed || gs.degree === 0)}
                 onclick={() => jumpToGraph(f.path)}
               >⌖</button>

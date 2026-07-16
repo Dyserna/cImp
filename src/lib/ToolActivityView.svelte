@@ -1,14 +1,15 @@
 <script lang="ts">
   // The read-only, app-rendered Tool Activity tab — one place to see what
-  // tools the agents are using and which tools are available. Five sections:
+  // tools the agents are using and which tools are available. Six sections:
   // Activities (the unified, newest-first feed from the backend's persistent
   // activity store — graph/context tool calls plus completed offload_task
   // runs, surviving app restarts), Graph tools, and Offload tools (the two
   // reference lists, moved here from the Code Intelligence and Offload Server
   // tabs), Graph index (the graph indexer dashboard + rebuild actions, moved
-  // here from the Code Intelligence tab's Overview), plus Offload server (the
-  // live backend dashboard — formerly the reserved Offload Server tab,
-  // retired in schema v25). Rows are clickable
+  // here from the Code Intelligence tab's Overview), Graph view (the live
+  // force-graph — formerly the reserved Graph View tab, retired in schema
+  // v26), plus Offload server (the live backend dashboard — formerly the
+  // reserved Offload Server tab, retired in schema v25). Rows are clickable
   // (a popup shows the captured request/response), individually deletable,
   // and the whole history can be cleared. Same reserved/no-PTY pattern as
   // CodeIntelligenceView; rendered by Pane.svelte for the `tool-activity`
@@ -28,6 +29,8 @@
   import ToolsReference from './ToolsReference.svelte';
   import OffloadServerView from './OffloadServerView.svelte';
   import GraphIndexView from './GraphIndexView.svelte';
+  import GraphView from './GraphView.svelte';
+  import { graphReveal } from './graphReveal';
   import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import { loadViewSection, saveViewSection } from './viewSection';
@@ -74,11 +77,18 @@
     { name: 'run_check', desc: "Worker runs one of the project's configured checks (build/typecheck/lint/test) to verify a claim before stating it. Inert until checks are configured.", example: 'Does the test suite pass? Prove it with run_check.' },
   ];
 
-  type Section = 'activities' | 'graph-tools' | 'graph-index' | 'offload-tools' | 'offload-server';
+  type Section =
+    | 'activities'
+    | 'graph-tools'
+    | 'graph-index'
+    | 'graph-view'
+    | 'offload-tools'
+    | 'offload-server';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'activities', label: 'Activities' },
     { id: 'graph-tools', label: 'Graph tools' },
     { id: 'graph-index', label: 'Graph index' },
+    { id: 'graph-view', label: 'Graph view' },
     { id: 'offload-tools', label: 'Offload tools' },
     { id: 'offload-server', label: 'Offload server' },
   ];
@@ -88,6 +98,23 @@
     loadViewSection('tool-activity', SECTIONS.map((s) => s.id), 'activities'),
   );
   $effect(() => saveViewSection('tool-activity', section));
+
+  // Unlike the other sections, the Graph view keeps an expensive laid-out
+  // force simulation, so it is NOT destroyed on a section switch: mounted
+  // lazily on the first visit (while `graph.graph_viz` is on), then kept
+  // alive hidden via display:none — GraphView's own IntersectionObserver
+  // pauses its render loop while hidden, so an inactive section costs
+  // nothing. Toggling `graph_viz` off unmounts it for real.
+  let graphViewMounted = $state(false);
+  $effect(() => {
+    if (section === 'graph-view' && $settings.graph.graph_viz) graphViewMounted = true;
+  });
+  // The Workbench/Code-Audit "show in graph" jump writes the graphReveal
+  // store (GraphView consumes and clears it) and reveals THIS tab — flipping
+  // to the Graph view section is our part of that handoff.
+  $effect(() => {
+    if ($graphReveal) section = 'graph-view';
+  });
 
   // The unified feed is poll-based (same 2s cadence CodeIntelligenceView
   // used); both feed kinds land in the backend's single persistent store, so
@@ -344,6 +371,19 @@
     <!-- The live backend dashboard (event-driven, remount-cheap), in normal
          flow so this container keeps owning the scroll. -->
     <OffloadServerView />
+  {:else if section === 'graph-view' && !$settings.graph.graph_viz}
+    <div class="feature-note">
+      The Graph view (live force graph of the code graph) is disabled. Turn it
+      on in Settings → Code Intelligence to draw it here.
+    </div>
+  {/if}
+
+  <!-- Kept mounted (hidden, not destroyed) across section switches so the
+       laid-out simulation survives — see the graphViewMounted note above. -->
+  {#if graphViewMounted && $settings.graph.graph_viz}
+    <div class="graph-host" class:hidden={section !== 'graph-view'}>
+      <GraphView />
+    </div>
   {/if}
 </div>
 
@@ -406,6 +446,23 @@
     font-size: 13px;
     color: var(--text, #ddd);
     box-sizing: border-box;
+    /* Flex column (children stack exactly as in normal flow) so the Graph
+       view host below can flex-grow to the remaining pane height — a canvas
+       has no natural height to size the section by. */
+    display: flex;
+    flex-direction: column;
+  }
+  /* The Graph view's positioning context: GraphView's root is
+     absolute-inset (its original tab convention), so the host provides the
+     size — the rest of the pane, but never less than a usable canvas (the
+     container scrolls beyond that). */
+  .graph-host {
+    position: relative;
+    flex: 1;
+    min-height: 420px;
+  }
+  .graph-host.hidden {
+    display: none;
   }
   header {
     display: flex;

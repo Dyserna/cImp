@@ -17,7 +17,7 @@
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { settings } from './settings/store';
   import { openSettingsWindowToSection } from './settings/ipc';
-  import { CODE_AUDIT_TAB_ID, GRAPH_VIEW_TAB_ID } from './tabs/types';
+  import { CODE_AUDIT_TAB_ID, TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
   import { revealTab } from './tabs/visibility';
   import { revealFileInGraph } from './graphReveal';
@@ -124,9 +124,12 @@
   const myTotal = $derived(categoryFindingsCount(snapshot, category));
   const selCount = $derived(selectedRows(allRows, selected).length);
   const lock = $derived(scanLock(snapshot.scanning, activeCategory, category));
-  // The Graph View ⌖ jump only makes sense when that (settings-gated) tab can
-  // exist — otherwise `revealTab` would silently no-op.
-  const canJump = $derived($settings.graph.enabled && $settings.graph.graph_viz);
+  // The Graph view ⌖ jump only makes sense when the visualization is enabled
+  // AND its host (the Tool Activity tab) can exist — otherwise `revealTab`
+  // would silently no-op.
+  const canJump = $derived(
+    $settings.graph.enabled && $settings.graph.graph_viz && $settings.ui.tool_activity_tab,
+  );
 
   // ── Live snapshot wiring ──────────────────────────────────────────────────
   let unlisten: UnlistenFn | null = null;
@@ -254,7 +257,7 @@
   function jump(row: FindingRow): void {
     if (!canJump) return;
     revealFileInGraph(row.file.replace(/\\/g, '/'));
-    revealTab(GRAPH_VIEW_TAB_ID);
+    revealTab(TOOL_ACTIVITY_TAB_ID);
   }
 
   function openSettings(): void {
@@ -399,7 +402,7 @@
               <button
                 type="button"
                 class="loc-jump"
-                title="Reveal in Graph View"
+                title="Reveal in Graph view (Tool Activity)"
                 onclick={() => jump(row)}
               >{row.file}{row.line > 0 ? `:${row.line}` : ''}</button>
             {:else}

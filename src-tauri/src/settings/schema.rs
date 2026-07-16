@@ -44,10 +44,12 @@ pub const GRAPH_MONITOR_TAB_ID: &str = "graph-monitor";
 /// `workbench.enabled` (reconciled by the integrity check, exactly like the
 /// Code Graph monitor tab). App-rendered like the graph monitor — no PTY.
 pub const WORKBENCH_TAB_ID: &str = "workbench-1";
-/// V15 Feature 4: reserved id of the read-only, app-rendered Graph View tab
-/// (live 2D/3D force-graph of the code graph). Materialized iff
-/// `graph.graph_viz` (reconciled by the integrity check, exactly like the Code
-/// Graph monitor tab). App-rendered like the monitor — no PTY.
+/// Legacy id of the V15 Feature 4 reserved Graph View tab. Retired in schema
+/// v26: the live force-graph moved INSIDE the Tool Activity tab as the
+/// "Graph view" section (ToolActivityView.svelte), so there is no separate
+/// reserved tab anymore. This constant survives only so the v25 → v26
+/// migration (and the integrity check's retired-tab prune) can find and drop
+/// the old materialized `graph-view` entry from existing settings files.
 pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
 /// Reserved id of the read-only, app-rendered Tool Activity tab — a unified
 /// feed of graph-tool calls + offload requests, plus the graph/offload tool
@@ -81,7 +83,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 25;
+pub const CURRENT_SCHEMA_VERSION: u8 = 26;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1758,9 +1760,10 @@ pub struct GraphSettings {
     /// V15 Feature 2: ignore communities smaller than this in the architecture
     /// report (singletons/pairs are noise, not subsystems).
     pub arch_min_community_size: u32,
-    /// V15 Feature 4 (STRETCH): master toggle for the reserved **Graph View**
-    /// tab (2D/3D live force-graph). Off by default — it's the human-facing
-    /// visual, not on any agent path.
+    /// V15 Feature 4 (STRETCH): master toggle for the **Graph view** live
+    /// force-graph (the Tool Activity tab's "Graph view" section — formerly
+    /// its own reserved tab, retired in schema v26). Off by default — it's
+    /// the human-facing visual, not on any agent path.
     pub graph_viz: bool,
     /// V15 Feature 4: cap on the rendered subgraph node count so large repos
     /// stay smooth (the view is bounded orientation, never the whole graph).
@@ -2847,24 +2850,6 @@ pub fn default_workbench_tab() -> TabConfig {
         id: WORKBENCH_TAB_ID.to_string(),
         builtin: true,
         name: "Workbench".to_string(),
-        command: String::new(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        notifications: ShellNotificationConfig::default(),
-        theme_override: None,
-        background_override: None,
-    })
-}
-
-/// V15 Feature 4: the reserved, non-closable Graph View tab. Same shape as the
-/// Code Graph monitor tab — Shell-kind with no command (app-rendered, no PTY).
-/// Materialized/removed by the integrity check per `graph.graph_viz`.
-pub fn default_graph_view_tab() -> TabConfig {
-    TabConfig::Shell(ShellTabConfig {
-        id: GRAPH_VIEW_TAB_ID.to_string(),
-        builtin: true,
-        name: "Graph View".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,

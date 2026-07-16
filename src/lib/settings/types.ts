@@ -983,7 +983,9 @@ export interface GraphSettings {
   arch_max_communities: number;
   /// V15 Feature 2: ignore communities smaller than this in the report.
   arch_min_community_size: number;
-  /// V15 Feature 4 (STRETCH): master toggle for the reserved Graph View tab.
+  /// V15 Feature 4 (STRETCH): master toggle for the Graph view live
+  /// force-graph (the Tool Activity tab's "Graph view" section — formerly
+  /// its own reserved tab, retired in schema v26).
   graph_viz: boolean;
   /// V15 Feature 4: cap on the rendered subgraph node count.
   graph_viz_max_nodes: number;

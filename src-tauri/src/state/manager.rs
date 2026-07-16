@@ -59,10 +59,6 @@ pub enum TabId {
     /// checkpoint timeline / worktrees). Same shape as [`Self::GraphMonitor`]
     /// — Shell-kind, reserved identity, no PTY, app-rendered.
     Workbench,
-    /// V15 Feature 4: the read-only, non-closable Graph View tab (live 2D/3D
-    /// force-graph of the code graph). Same shape as [`Self::GraphMonitor`] —
-    /// Shell-kind, reserved identity, no PTY, app-rendered.
-    GraphView,
     /// The read-only, non-closable Tool Activity tab (unified graph-call +
     /// offload-request feed plus the tool reference lists). Same shape as
     /// [`Self::GraphMonitor`] — Shell-kind, reserved identity, no PTY,
@@ -92,7 +88,6 @@ impl TabId {
             TabId::OpenCode => "opencode",
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
-            TabId::GraphView => "graph-view",
             TabId::ToolActivity => "tool-activity",
             TabId::CodeAudit => "code-audit",
             TabId::Ai(s) => s.as_str(),
@@ -108,13 +103,14 @@ impl TabId {
             "opencode" => TabId::OpenCode,
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
-            "graph-view" => TabId::GraphView,
             "tool-activity" => TabId::ToolActivity,
             "code-audit" => TabId::CodeAudit,
             // "code-quality" (the retired V25 reserved tab — its Quality view
-            // now lives inside Code Audit as a sub-tab) and "offload-server"
+            // now lives inside Code Audit as a sub-tab), "offload-server"
             // (the retired V8-03 reserved tab — its dashboard now lives inside
-            // Tool Activity as the "Offload server" section) intentionally
+            // Tool Activity as the "Offload server" section) and "graph-view"
+            // (the retired V15 reserved tab — its force-graph now lives inside
+            // Tool Activity as the "Graph view" section) intentionally
             // fall through to `Shell` below; the settings migrations prune any
             // persisted entry before the id ever reaches the runtime.
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
@@ -148,7 +144,6 @@ impl TabId {
             TabId::Shell(_)
             | TabId::GraphMonitor
             | TabId::Workbench
-            | TabId::GraphView
             | TabId::ToolActivity
             | TabId::CodeAudit => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
@@ -161,7 +156,7 @@ impl TabId {
 
     /// THE single enumeration of the reserved app-rendered dashboard tabs:
     /// Shell-kind with a reserved identity and NO PTY (Code Graph monitor,
-    /// Workbench, Graph View, Tool Activity, Code Audit). Every guard
+    /// Workbench, Tool Activity, Code Audit). Every guard
     /// that needs "is this one of the reserved dashboards?" — the pty-write
     /// swallow, the close refusal, the builtin flag — derives from this
     /// predicate, so a new reserved dashboard is added HERE (plus `as_str`/
@@ -173,7 +168,6 @@ impl TabId {
             self,
             TabId::GraphMonitor
                 | TabId::Workbench
-                | TabId::GraphView
                 | TabId::ToolActivity
                 | TabId::CodeAudit
         )
@@ -1740,6 +1734,19 @@ mod tests {
         // prunes it before it's ever seeded.
         let id = TabId::from_str("offload-server");
         assert_eq!(id, TabId::Shell("offload-server".to_string()));
+        assert!(!id.is_reserved_dashboard());
+        assert!(!id.is_builtin());
+    }
+
+    #[test]
+    fn retired_graph_view_id_routes_to_shell() {
+        // The V15 Graph View reserved tab was folded into Tool Activity as
+        // the "Graph view" section (schema v26); its wire id no longer maps
+        // to a reserved variant. A stray persisted id parses as a plain Shell
+        // (closable, not a dashboard) — and the v25 → v26 migration prunes it
+        // before it's ever seeded.
+        let id = TabId::from_str("graph-view");
+        assert_eq!(id, TabId::Shell("graph-view".to_string()));
         assert!(!id.is_reserved_dashboard());
         assert!(!id.is_builtin());
     }

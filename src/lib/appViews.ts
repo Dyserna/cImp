@@ -1,17 +1,16 @@
 // Keep-alive registry for the reserved app-rendered views (Code
-// Intelligence, Note, Workbench, Graph View, Tool Activity, Code Audit).
+// Intelligence, Note, Workbench, Tool Activity, Code Audit).
 // Mirrors
 // the terminal registry (terminals.ts): each view is mounted ONCE into a
 // registry-owned host element (lazily, on first activation) and panes just
 // attach/detach that host — so switching tabs, hiding/un-hiding, or moving
 // the tab between panes never destroys the component, and every bit of its
-// in-memory state (selections, expansions, scroll, the Graph View's laid-out
-// simulation) survives.
+// in-memory state (selections, expansions, scroll, the Graph view section's
+// laid-out simulation inside Tool Activity) survives.
 //
 // Cost control: a detached view keeps running, so anything periodic in a
 // view must gate itself on appViewVisibility (appViewVisibility.ts) — the
-// registry flips that store on attach/detach. GraphView needs nothing extra:
-// its IntersectionObserver already pauses the render loop when detached.
+// registry flips that store on attach/detach.
 //
 // The view is unmounted for real only when its tab is closed (feature toggled
 // off, builtin removed) — see the tab-closed hook in avatarState.ts.
@@ -20,7 +19,6 @@ import { mount, unmount, type Component } from 'svelte';
 import {
   CODE_AUDIT_TAB_ID,
   GRAPH_MONITOR_TAB_ID,
-  GRAPH_VIEW_TAB_ID,
   NOTE_TAB_ID,
   TOOL_ACTIVITY_TAB_ID,
   WORKBENCH_TAB_ID,
@@ -30,7 +28,6 @@ import { setAppViewVisible } from './appViewVisibility';
 import CodeIntelligenceView from './CodeIntelligenceView.svelte';
 import NoteView from './NoteView.svelte';
 import WorkbenchView from './WorkbenchView.svelte';
-import GraphView from './GraphView.svelte';
 import ToolActivityView from './ToolActivityView.svelte';
 import CodeAuditView from './CodeAuditView.svelte';
 
@@ -38,7 +35,6 @@ const COMPONENTS = new Map<TabId, Component>([
   [GRAPH_MONITOR_TAB_ID, CodeIntelligenceView as Component],
   [NOTE_TAB_ID, NoteView as Component],
   [WORKBENCH_TAB_ID, WorkbenchView as Component],
-  [GRAPH_VIEW_TAB_ID, GraphView as Component],
   [TOOL_ACTIVITY_TAB_ID, ToolActivityView as Component],
   [CODE_AUDIT_TAB_ID, CodeAuditView as Component],
 ]);

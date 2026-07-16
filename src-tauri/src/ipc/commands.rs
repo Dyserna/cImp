@@ -868,7 +868,6 @@ pub async fn settings_update(
     const RESERVED_TAB_FLAGS: &[(TabId, fn(&Settings) -> bool)] = &[
         (TabId::GraphMonitor, |s| s.graph.enabled),
         (TabId::Workbench, |s| s.workbench.enabled),
-        (TabId::GraphView, |s| s.graph.graph_viz),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
         (TabId::CodeAudit, |s| s.code_audit.enabled),
     ];
@@ -1803,7 +1802,8 @@ pub struct VizGraphResult {
 }
 
 /// V15 Feature 4 (Graph View): a bounded {nodes, edges} subgraph for the live
-/// visualization tab. `root` defaults to the launch directory.
+/// visualization (Tool Activity → Graph view). `root` defaults to the launch
+/// directory.
 #[tauri::command]
 pub async fn graph_viz_snapshot(
     service: State<'_, std::sync::Arc<crate::graph::GraphService>>,

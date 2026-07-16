@@ -226,7 +226,7 @@ export function startAvatarStateListener(): Promise<void> {
         // start life invisibly hidden.
         forgetHiddenTab(e.tab);
         destroyTerminal(e.tab);
-        // Keep-alive app views (Workbench, Graph View, …) are only truly
+        // Keep-alive app views (Workbench, Tool Activity, …) are only truly
         // unmounted here — a plain hide/tab-switch just detaches them.
         destroyAppView(e.tab);
         dropPerTabEntries(e.tab);

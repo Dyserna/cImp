@@ -5,10 +5,21 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.45.0] — 2026-07-16
 
 ### Added
 
+- **Usage chart: horizontal scroll + wheel zoom.** The "This session" stacked
+  bar chart no longer drops the oldest turns to fit the card width: once bars
+  hit their minimum width the chart scrolls horizontally (the S/A lane pans
+  with it), the mouse wheel zooms the bar width around the cursor
+  (shift+wheel pans), and the view stays pinned to the newest turns unless
+  you've scrolled back into history. Zooming out fully returns to
+  fill-the-card mode; only a hard 1000-turn render cap remains.
+- **S/A lane color pickers.** The chart legend's "S session" / "A agent"
+  swatches are now color inputs like the five segment swatches, persisted in
+  settings (`graph.usage_color_session` / `usage_color_agent`); the agent
+  color also tints the sub-agent bars' outline.
 - **Code Quality — language-gated linters (V25).** A new reserved **Code
   Quality** dashboard tab splits the audit surface in two: **Code Audit** keeps
   the three security tools (osv-scanner / gitleaks / semgrep), Code Quality
@@ -35,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Drilled-in sessions refresh live.** Selecting a session in the Sessions
+  card froze the "This session" card at the click-time snapshot — selecting
+  the *current* session meant re-clicking it to see new turns. The card now
+  refetches the selected session's detail whenever its row advances on the
+  Overview poll; idle historical sessions still fetch exactly once.
 - **Upgraded installs gain the Quality tools.** A settings file persisted before
   V25 carried only the three security entries; a load-path reconcile now appends
   any missing built-in audit tool (preserving every existing entry — enabled /

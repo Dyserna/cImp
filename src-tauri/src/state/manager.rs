@@ -64,11 +64,6 @@ pub enum TabId {
     /// [`Self::GraphMonitor`] — Shell-kind, reserved identity, no PTY,
     /// app-rendered.
     ToolActivity,
-    /// V23: the read-only, non-closable Code Audit tab (aggregated security
-    /// scanning — user-triggered scan, per-tool progress, one findings table).
-    /// Same shape as [`Self::GraphMonitor`] — Shell-kind, reserved identity, no
-    /// PTY, app-rendered. Materialized iff `code_audit.enabled`.
-    CodeAudit,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -89,7 +84,6 @@ impl TabId {
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
             TabId::ToolActivity => "tool-activity",
-            TabId::CodeAudit => "code-audit",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -104,13 +98,15 @@ impl TabId {
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
             "tool-activity" => TabId::ToolActivity,
-            "code-audit" => TabId::CodeAudit,
             // "code-quality" (the retired V25 reserved tab — its Quality view
-            // now lives inside Code Audit as a sub-tab), "offload-server"
-            // (the retired V8-03 reserved tab — its dashboard now lives inside
-            // Tool Activity as the "Offload server" section) and "graph-view"
-            // (the retired V15 reserved tab — its force-graph now lives inside
-            // Tool Activity as the "Graph view" section) intentionally
+            // now lives inside the Code Audit surface as a sub-tab),
+            // "offload-server" (the retired V8-03 reserved tab — its dashboard
+            // now lives inside Tool Activity as the "Offload server" section),
+            // "graph-view" (the retired V15 reserved tab — its force-graph now
+            // lives inside Tool Activity as the "Graph view" section) and
+            // "code-audit" (the retired V23 reserved tab — its Security |
+            // Quality panels now live inside Tool Activity as the "Code audit"
+            // section) intentionally
             // fall through to `Shell` below; the settings migrations prune any
             // persisted entry before the id ever reaches the runtime.
             // Spawned AI-tab duplicates carry an `"ai-<uuid>"` id (see
@@ -144,8 +140,7 @@ impl TabId {
             TabId::Shell(_)
             | TabId::GraphMonitor
             | TabId::Workbench
-            | TabId::ToolActivity
-            | TabId::CodeAudit => TabKind::Shell,
+            | TabId::ToolActivity => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -156,7 +151,7 @@ impl TabId {
 
     /// THE single enumeration of the reserved app-rendered dashboard tabs:
     /// Shell-kind with a reserved identity and NO PTY (Code Graph monitor,
-    /// Workbench, Tool Activity, Code Audit). Every guard
+    /// Workbench, Tool Activity). Every guard
     /// that needs "is this one of the reserved dashboards?" — the pty-write
     /// swallow, the close refusal, the builtin flag — derives from this
     /// predicate, so a new reserved dashboard is added HERE (plus `as_str`/
@@ -166,10 +161,7 @@ impl TabId {
     pub fn is_reserved_dashboard(&self) -> bool {
         matches!(
             self,
-            TabId::GraphMonitor
-                | TabId::Workbench
-                | TabId::ToolActivity
-                | TabId::CodeAudit
+            TabId::GraphMonitor | TabId::Workbench | TabId::ToolActivity
         )
     }
 
@@ -1689,7 +1681,7 @@ mod tests {
             TabId::Ai("ai-1234".to_string()),
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
-            TabId::CodeAudit,
+            TabId::ToolActivity,
         ] {
             let s = serde_json::to_string(&id).unwrap();
             let back: TabId = serde_json::from_str(&s).unwrap();
@@ -1698,19 +1690,16 @@ mod tests {
     }
 
     #[test]
-    fn code_audit_tab_is_a_reserved_dashboard() {
-        // V23: the Code Audit tab round-trips through its wire string, maps to
-        // Shell-kind (like the other reserved dashboards), and is a
-        // reserved/non-closable builtin.
-        assert_eq!(TabId::from_str("code-audit"), TabId::CodeAudit);
-        assert_eq!(TabId::CodeAudit.as_str(), "code-audit");
-        assert_eq!(
-            serde_json::to_string(&TabId::CodeAudit).unwrap(),
-            "\"code-audit\""
-        );
-        assert_eq!(TabId::CodeAudit.kind(), TabKind::Shell);
-        assert!(TabId::CodeAudit.is_reserved_dashboard());
-        assert!(TabId::CodeAudit.is_builtin());
+    fn retired_code_audit_id_routes_to_shell() {
+        // The V23 Code Audit reserved tab was folded into Tool Activity as
+        // the "Code audit" section (schema v27); its wire id no longer maps
+        // to a reserved variant. A stray persisted id parses as a plain Shell
+        // (closable, not a dashboard) — and the v26 → v27 migration prunes it
+        // before it's ever seeded.
+        let id = TabId::from_str("code-audit");
+        assert_eq!(id, TabId::Shell("code-audit".to_string()));
+        assert!(!id.is_reserved_dashboard());
+        assert!(!id.is_builtin());
     }
 
     #[test]

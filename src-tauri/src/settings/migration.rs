@@ -296,6 +296,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v25,
         transform: migrate_v25_to_v26_step,
     },
+    MigrationStep {
+        from_version: "v26",
+        detect: looks_v26,
+        transform: migrate_v26_to_v27_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2158,10 +2163,56 @@ fn migrate_v25_to_v26(value: &mut Value) {
         });
     }
 
-    // Final cascade step ⇒ stamp CURRENT (26).
+    // Stamps a *literal* 26 (not `CURRENT_SCHEMA_VERSION`): the v26 → v27
+    // step runs next in the same cascade pass and gates on
+    // `schema_version == 26`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(26u8)),
+    );
+}
+
+fn looks_v26(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 26)
+}
+
+fn migrate_v26_to_v27_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v26_to_v27(value)
+}
+
+/// V26 → V27: drop the retired `code-audit` reserved tab.
+///
+/// V23 shipped the aggregated security scanner as its own reserved tab
+/// (materialized iff `code_audit.enabled`, with the V25 Quality view merged
+/// in as a sub-tab); it's now the "Code audit" section inside the Tool
+/// Activity tab, so the separate tab entry must go. Without this step the
+/// old materialized entry would deserialize as a plain closable Shell tab
+/// named "Code Audit" (the `TabId::CodeAudit` variant no longer exists) with
+/// no view behind it. Layout-tree references to the id don't need scrubbing
+/// here — the frontend's `validateAndRepairLayout` drops any pane tab id
+/// absent from `tabs`.
+///
+/// Idempotent: a second pass finds `schema_version == 27` so `looks_v26` is
+/// false, and the retain is a no-op once the entry is gone.
+fn migrate_v26_to_v27(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
+        tabs.retain(|t| {
+            t.get("id").and_then(Value::as_str)
+                != Some(crate::settings::schema::CODE_AUDIT_TAB_ID)
+        });
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (27).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(27u8)),
     );
 }
 
@@ -2878,6 +2929,51 @@ mod tests {
         assert_eq!(v["schema_version"], json!(26));
         let once = v.clone();
         migrate_v25_to_v26(&mut v);
+        assert_eq!(v, once);
+    }
+
+    #[test]
+    fn looks_v26_detects_v26_and_not_others() {
+        assert!(looks_v26(&json!({ "schema_version": 26 })));
+        assert!(!looks_v26(&json!({ "schema_version": 25 })));
+        assert!(!looks_v26(&json!({ "schema_version": 27 })));
+        assert!(!looks_v26(&json!({})));
+    }
+
+    /// v26 → v27: the retired `code-audit` reserved tab entry is dropped;
+    /// every other tab survives untouched.
+    #[test]
+    fn v26_to_v27_drops_retired_code_audit_tab() {
+        let mut v = json!({
+            "schema_version": 26,
+            "tabs": [
+                { "kind": "ai_tool", "id": "claude", "builtin": true },
+                { "kind": "shell", "id": "code-audit", "builtin": true, "name": "Code Audit" },
+                { "kind": "shell", "id": "tool-activity", "builtin": true, "name": "Tool Activity" },
+                { "kind": "shell", "id": "shell-default-1", "builtin": false }
+            ]
+        });
+        migrate_v26_to_v27(&mut v);
+        assert_eq!(v["schema_version"], json!(27));
+        let ids: Vec<&str> = v["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["claude", "tool-activity", "shell-default-1"]);
+    }
+
+    /// A v26 file that never materialized the Code Audit tab (code_audit off —
+    /// the default) just gets its version marker advanced; running the step
+    /// twice is a no-op.
+    #[test]
+    fn v26_to_v27_is_idempotent_and_stamps_version() {
+        let mut v = json!({ "schema_version": 26, "tabs": [] });
+        migrate_v26_to_v27(&mut v);
+        assert_eq!(v["schema_version"], json!(27));
+        let once = v.clone();
+        migrate_v26_to_v27(&mut v);
         assert_eq!(v, once);
     }
 

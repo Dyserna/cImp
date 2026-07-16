@@ -57,10 +57,12 @@ pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
 /// reconciled by the integrity check, exactly like the Code Graph monitor
 /// tab). App-rendered like the monitor — no PTY.
 pub const TOOL_ACTIVITY_TAB_ID: &str = "tool-activity";
-/// V23: reserved id of the read-only, app-rendered Code Audit tab (aggregated
-/// security scanning). Materialized iff `code_audit.enabled` (reconciled by the
-/// integrity check, exactly like the Code Graph monitor tab). App-rendered like
-/// the monitor — no PTY.
+/// Legacy id of the V23 reserved Code Audit tab. Retired in schema v27: the
+/// Security | Quality audit panels moved INSIDE the Tool Activity tab as the
+/// "Code audit" section (ToolActivityView.svelte), so there is no separate
+/// reserved tab anymore. This constant survives only so the v26 → v27
+/// migration (and the integrity check's retired-tab prune) can find and drop
+/// the old materialized `code-audit` entry from existing settings files.
 pub const CODE_AUDIT_TAB_ID: &str = "code-audit";
 /// Legacy id of the V25 reserved Code Quality tab. Retired in schema v23: the
 /// Quality view moved INSIDE the Code Audit tab as a sub-tab (Security |
@@ -83,7 +85,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 26;
+pub const CURRENT_SCHEMA_VERSION: u8 = 27;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1193,7 +1195,9 @@ fn default_true() -> bool {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct CodeAuditSettings {
-    /// Master switch. Off = no Code Audit tab, no scanning, no bottom-bar entry.
+    /// Master switch. Off = no "Code audit" section in the Tool Activity tab
+    /// (its reserved tab was retired in schema v27), no scanning, no
+    /// bottom-bar entry.
     pub enabled: bool,
     /// The configured audit tools (v1 default: osv-scanner, gitleaks, semgrep).
     /// An entry whose `id` isn't a known [`AuditToolId`] is dropped with a warn
@@ -2868,24 +2872,6 @@ pub fn default_tool_activity_tab() -> TabConfig {
         id: TOOL_ACTIVITY_TAB_ID.to_string(),
         builtin: true,
         name: "Tool Activity".to_string(),
-        command: String::new(),
-        args: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        notifications: ShellNotificationConfig::default(),
-        theme_override: None,
-        background_override: None,
-    })
-}
-
-/// V23: the reserved, non-closable Code Audit tab. Same shape as the Code Graph
-/// monitor tab — Shell-kind with no command (app-rendered, no PTY).
-/// Materialized/removed by the integrity check per `code_audit.enabled`.
-pub fn default_code_audit_tab() -> TabConfig {
-    TabConfig::Shell(ShellTabConfig {
-        id: CODE_AUDIT_TAB_ID.to_string(),
-        builtin: true,
-        name: "Code Audit".to_string(),
         command: String::new(),
         args: Vec::new(),
         cwd: None,

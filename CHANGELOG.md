@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Code Audit tab retired — the Security | Quality panels are now a
+  "Code audit" sub-tab of Tool Activity.** The separate V23 reserved tab is
+  gone; the audit surface renders as a section inside the Tool Activity tab
+  (still gated by `code_audit.enabled`, off by default; a Settings pointer
+  shows when disabled), mounted lazily on the first visit and kept alive
+  across section switches so a running scan keeps streaming. Settings schema
+  v26→v27 drops persisted code-audit tab entries, and the id joins the
+  integrity check's retired-tab prune for stale overlays.
+- **Agent code-audit calls now land in the Activities feed.** Every
+  `security_audit`/`quality_audit` MCP call (Claude Code, OpenCode, or the
+  offload worker) records one roll-up row in the persistent tool-activity
+  store with consumer attribution, duration, finding count, and the full
+  report as the captured response — alongside the existing per-scanner rows.
+  Refused calls (busy runner, feature disabled) are recorded as failed rows.
 - **Graph View tab retired — the live force graph is now a "Graph view"
   sub-tab of Tool Activity.** The separate V15 reserved tab is gone; the
   visualization renders as a section inside the Tool Activity tab (still

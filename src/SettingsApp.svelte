@@ -4994,7 +4994,7 @@
             bundled — each tool resolves from the <code>ebin\</code> drop-in
             folder first, then your PATH; point cImp at a specific build with
             Browse, or check availability with Detect. Enable the feature to show
-            the Code Audit tab.
+            the Code audit section in the Tool Activity tab.
           </small>
           <label class="checkbox">
             <input
@@ -5008,7 +5008,7 @@
                     ).checked),
                 )}
             />
-            <span>Enable Code Audit (show the tab)</span>
+            <span>Enable Code Audit (Tool Activity → Code audit)</span>
           </label>
 
           {#snippet auditToolRow(row: AuditToolRow)}
@@ -5105,7 +5105,8 @@
 
           <h3>Security tools</h3>
           <small class="hint">
-            Shown in the Code Audit tab's <strong>Security</strong> sub-tab.
+            Shown in the Code audit section's <strong>Security</strong> sub-tab
+            (Tool Activity tab).
           </small>
           {#each auditGroups.security as row (row.meta.id)}
             {@render auditToolRow(row)}
@@ -5113,7 +5114,8 @@
 
           <h3>Quality tools</h3>
           <small class="hint">
-            Shown in the Code Audit tab's <strong>Quality</strong> sub-tab.
+            Shown in the Code audit section's <strong>Quality</strong> sub-tab
+            (Tool Activity tab).
             Language-gated — a tool only appears there (and only runs) when the
             project contains files it applies to. All tools are listed here
             regardless of the current project.

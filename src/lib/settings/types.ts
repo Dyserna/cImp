@@ -1090,8 +1090,9 @@ export interface AuditToolConfig {
 }
 
 /// V23 Phase A: Code Audit (aggregated security scanning) config (mirror of
-/// Rust `CodeAuditSettings`). Off by default; `enabled` gates the reserved Code
-/// Audit dashboard tab (like `ui.tool_activity_tab`) and the bottom-bar entry.
+/// Rust `CodeAuditSettings`). Off by default; `enabled` gates the "Code audit"
+/// section inside the Tool Activity tab (its reserved tab was retired in
+/// schema v27) and the bottom-bar entry.
 export interface CodeAuditSettings {
   enabled: boolean;
   tools: AuditToolConfig[];

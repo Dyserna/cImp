@@ -1,11 +1,13 @@
 <script lang="ts">
-  // V23 Phase C / V25 Phase D: the reserved, app-rendered Code Audit tab.
-  // One tab, two sub-tabs (the Code Intelligence section pattern): Security
-  // (osv-scanner / gitleaks / semgrep) and Quality (language-gated linters /
-  // dead-code / spell-check), each a full `AuditPanel` instance. BOTH panels
-  // stay mounted — only the inactive one is display:none — so a running scan
-  // keeps streaming into a hidden sub-tab, matching the keep-alive behavior
-  // the app-view registry (appViews.ts) gives the tab as a whole.
+  // V23 Phase C / V25 Phase D: the Code Audit surface — formerly its own
+  // reserved tab, since schema v27 the "Code audit" section inside the Tool
+  // Activity tab (ToolActivityView keeps it alive hidden across section
+  // switches). One surface, two sub-tabs (the Code Intelligence section
+  // pattern): Security (osv-scanner / gitleaks / semgrep) and Quality
+  // (language-gated linters / dead-code / spell-check), each a full
+  // `AuditPanel` instance. BOTH panels stay mounted — only the inactive one
+  // is display:none — so a running scan keeps streaming into a hidden
+  // sub-tab.
   import AuditPanel from './AuditPanel.svelte';
   import { loadViewSection, saveViewSection } from './viewSection';
 

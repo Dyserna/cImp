@@ -306,9 +306,9 @@ pub async fn audit_cancel_scan(state: State<'_, Arc<AuditState>>) -> AppResult<(
     state.cancel_scan().map_err(AppError::Audit)
 }
 
-/// V23 Phase B: the full (uncapped) runner snapshot — what the Code Audit tab
-/// reads on mount and to fetch the complete findings set after a truncated
-/// event.
+/// V23 Phase B: the full (uncapped) runner snapshot — what the Code audit
+/// view (Tool Activity tab) reads on mount and to fetch the complete findings
+/// set after a truncated event.
 #[tauri::command]
 pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
     state.snapshot()

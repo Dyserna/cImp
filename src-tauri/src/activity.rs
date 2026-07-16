@@ -82,7 +82,9 @@ pub enum ActivityKind {
     /// One completed `offload_task` run.
     Offload,
     /// V23: one completed audit tool run (a scanned tool within a Code Audit
-    /// scan).
+    /// scan, source `"audit"`), or a whole `security_audit`/`quality_audit`
+    /// agent call (roll-up row, source = the consumer — see
+    /// `audit::mcp::run_audit`).
     Audit,
 }
 
@@ -130,7 +132,9 @@ pub struct ActivityEntry {
     pub root: String,
     /// Who issued it: `"claude"` / `"opencode"` / `"offload"` /
     /// `"read_advisor"` / `"auto_check"` for graph entries; the backend name
-    /// for offload entries.
+    /// for offload entries; `"audit"` for per-scanner audit rows and the
+    /// consumer (`"claude"` / `"opencode"` / `"offload"`) for audit roll-up
+    /// rows.
     pub source: String,
     /// The tool name, e.g. `graph_find_symbol` or `offload_task`.
     pub tool: String,

@@ -1,6 +1,6 @@
 <script lang="ts">
   // The read-only, app-rendered Tool Activity tab — one place to see what
-  // tools the agents are using and which tools are available. Six sections:
+  // tools the agents are using and which tools are available. Seven sections:
   // Activities (the unified, newest-first feed from the backend's persistent
   // activity store — graph/context tool calls plus completed offload_task
   // runs, surviving app restarts), Graph tools, and Offload tools (the two
@@ -8,8 +8,10 @@
   // tabs), Graph index (the graph indexer dashboard + rebuild actions, moved
   // here from the Code Intelligence tab's Overview), Graph view (the live
   // force-graph — formerly the reserved Graph View tab, retired in schema
-  // v26), plus Offload server (the live backend dashboard — formerly the
-  // reserved Offload Server tab, retired in schema v25). Rows are clickable
+  // v26), Offload server (the live backend dashboard — formerly the
+  // reserved Offload Server tab, retired in schema v25), plus Code audit
+  // (the Security | Quality scan panels — formerly the reserved Code Audit
+  // tab, retired in schema v27). Rows are clickable
   // (a popup shows the captured request/response), individually deletable,
   // and the whole history can be cleared. Same reserved/no-PTY pattern as
   // CodeIntelligenceView; rendered by Pane.svelte for the `tool-activity`
@@ -30,6 +32,7 @@
   import OffloadServerView from './OffloadServerView.svelte';
   import GraphIndexView from './GraphIndexView.svelte';
   import GraphView from './GraphView.svelte';
+  import CodeAuditView from './CodeAuditView.svelte';
   import { graphReveal } from './graphReveal';
   import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
@@ -83,7 +86,8 @@
     | 'graph-index'
     | 'graph-view'
     | 'offload-tools'
-    | 'offload-server';
+    | 'offload-server'
+    | 'code-audit';
   const SECTIONS: { id: Section; label: string }[] = [
     { id: 'activities', label: 'Activities' },
     { id: 'graph-tools', label: 'Graph tools' },
@@ -91,6 +95,7 @@
     { id: 'graph-view', label: 'Graph view' },
     { id: 'offload-tools', label: 'Offload tools' },
     { id: 'offload-server', label: 'Offload server' },
+    { id: 'code-audit', label: 'Code audit' },
   ];
   // The selection survives the component's destroy/recreate cycle (tab
   // switch, hide/un-hide) and app restarts — see viewSection.ts.
@@ -114,6 +119,18 @@
   // to the Graph view section is our part of that handoff.
   $effect(() => {
     if ($graphReveal) section = 'graph-view';
+  });
+
+  // The Code audit section gets the same keep-alive-hidden treatment: a
+  // running scan streams into its (possibly hidden) AuditPanel and the
+  // panels' selections are ephemeral, so destroying the view on a section
+  // switch would drop mid-scan state. Mounted lazily on the first visit
+  // (while `code_audit.enabled` is on), then kept alive via display:none —
+  // the panels are event-driven, so a hidden section costs nothing. Toggling
+  // `code_audit.enabled` off unmounts it for real.
+  let codeAuditMounted = $state(false);
+  $effect(() => {
+    if (section === 'code-audit' && $settings.code_audit.enabled) codeAuditMounted = true;
   });
 
   // The unified feed is poll-based (same 2s cadence CodeIntelligenceView
@@ -376,6 +393,11 @@
       The Graph view (live force graph of the code graph) is disabled. Turn it
       on in Settings → Code Intelligence to draw it here.
     </div>
+  {:else if section === 'code-audit' && !$settings.code_audit.enabled}
+    <div class="feature-note">
+      Code Audit is disabled. Turn it on in Settings → Code Audit to run
+      security and quality scans here.
+    </div>
   {/if}
 
   <!-- Kept mounted (hidden, not destroyed) across section switches so the
@@ -383,6 +405,14 @@
   {#if graphViewMounted && $settings.graph.graph_viz}
     <div class="graph-host" class:hidden={section !== 'graph-view'}>
       <GraphView />
+    </div>
+  {/if}
+
+  <!-- Kept mounted (hidden, not destroyed) across section switches so a
+       running scan keeps streaming — see the codeAuditMounted note above. -->
+  {#if codeAuditMounted && $settings.code_audit.enabled}
+    <div class="audit-host" class:hidden={section !== 'code-audit'}>
+      <CodeAuditView />
     </div>
   {/if}
 </div>
@@ -462,6 +492,18 @@
     min-height: 420px;
   }
   .graph-host.hidden {
+    display: none;
+  }
+  /* The Code audit section's positioning context: CodeAuditView's root is
+     absolute-inset (its original tab convention), so the host provides the
+     size — the rest of the pane, but never less than a usable table (the
+     container scrolls beyond that). */
+  .audit-host {
+    position: relative;
+    flex: 1;
+    min-height: 420px;
+  }
+  .audit-host.hidden {
     display: none;
   }
   header {

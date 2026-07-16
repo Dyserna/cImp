@@ -10,9 +10,9 @@
 //! [`crate::audit::global`] handle (the seam `crate::graph::offload_query` is for
 //! the graph): the worker runs in-process but *outside* any Tauri command
 //! context, so it can't reach the `manage`d state the way an IPC command does.
-//! A scan the worker triggers streams live into the Code Audit tab just like a
-//! UI- or Claude-triggered one, because every consumer funnels through the same
-//! [`crate::audit::mcp::run_audit`].
+//! A scan the worker triggers streams live into the Code audit view (Tool
+//! Activity tab) just like a UI- or Claude-triggered one, because every
+//! consumer funnels through the same [`crate::audit::mcp::run_audit`].
 //!
 //! Whether these are offered at all is decided by the caller (the service):
 //! `code_audit.enabled` AND `expose_offload` AND a **local** backend. The scan
@@ -96,7 +96,9 @@ pub async fn execute(
     };
     let state = crate::audit::global()
         .ok_or_else(|| "code audit is unavailable in this process".to_string())?;
-    crate::audit::mcp::run_audit(&state, category).await
+    // "offload" = the worker's source label in the tool-activity feed (the
+    // same label the graph tools use for worker-issued calls).
+    crate::audit::mcp::run_audit(&state, category, "offload").await
 }
 
 #[cfg(test)]

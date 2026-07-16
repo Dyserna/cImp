@@ -65,16 +65,10 @@ export function isToolActivityTab(id: TabId): boolean {
   return id === TOOL_ACTIVITY_TAB_ID;
 }
 
-/// V23: the reserved id of the read-only, app-rendered Code Audit tab
-/// (aggregated security + quality scanning, as Security | Quality sub-tabs).
-/// Shell-kind on the backend — no PTY — same pattern as the Code Graph
-/// monitor tab. Materialized while `code_audit.enabled` is on (default false).
-export const CODE_AUDIT_TAB_ID = 'code-audit';
-
-/// True for the Code Audit tab.
-export function isCodeAuditTab(id: TabId): boolean {
-  return id === CODE_AUDIT_TAB_ID;
-}
+// The V23 "code-audit" reserved tab is retired (schema v27) — the Security |
+// Quality audit panels live inside the Tool Activity tab as the "Code audit"
+// section now (ToolActivityView.svelte); the v26 → v27 migration drops old
+// persisted entries.
 
 /// True for a Preview tab's id (`"preview-<uuid>"` — see `create_preview_tab`
 /// / `TabId::Preview` on the backend). Unlike the reserved dashboards above,
@@ -86,8 +80,8 @@ export function isPreviewTabId(id: TabId): boolean {
 }
 
 /// THE single source of truth for "app-rendered, no-PTY" tabs: the reserved
-/// dashboards (Code Graph monitor, Note, Workbench, Tool Activity, Code
-/// Audit) plus Preview tabs (an embedded webview). Every guard
+/// dashboards (Code Graph monitor, Note, Workbench, Tool Activity) plus
+/// Preview tabs (an embedded webview). Every guard
 /// that used to hand-enumerate these must call this instead — a new
 /// app-rendered tab is added HERE (plus its own isXTab predicate above) and
 /// nowhere else. Mirrors the Rust side's reserved-tab set.
@@ -97,7 +91,6 @@ export function isAppRenderedTab(id: TabId): boolean {
     isNoteTab(id) ||
     isWorkbenchTab(id) ||
     isToolActivityTab(id) ||
-    isCodeAuditTab(id) ||
     isPreviewTabId(id)
   );
 }

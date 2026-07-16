@@ -17,7 +17,7 @@
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { settings } from './settings/store';
   import { openSettingsWindowToSection } from './settings/ipc';
-  import { CODE_AUDIT_TAB_ID, TOOL_ACTIVITY_TAB_ID } from './tabs/types';
+  import { TOOL_ACTIVITY_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
   import { revealTab } from './tabs/visibility';
   import { revealFileInGraph } from './graphReveal';
@@ -158,11 +158,12 @@
 
   // Keep-alive (appViews.ts): this component mounts ONCE per app lifetime, so
   // the mount-time census would go stale as the project gains/loses languages.
-  // Re-take it on every hidden→visible transition of the Code Audit tab —
+  // Re-take it on every hidden→visible transition of the host Tool Activity
+  // tab (the audit panels live in its "Code audit" section since schema v27) —
   // fresh files (a new `.py`, a `package.json`) re-gate the chips and, in auto
   // mode, re-select the quality tools. The ≤60s backend cache makes rapid tab
   // switching free, and the backend skips the walk while a scan runs.
-  const unsubShown = onAppViewShown(CODE_AUDIT_TAB_ID, () => {
+  const unsubShown = onAppViewShown(TOOL_ACTIVITY_TAB_ID, () => {
     void pullFull(true);
   });
 

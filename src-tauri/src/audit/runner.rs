@@ -417,7 +417,7 @@ impl AuditState {
     ///
     /// The `audit-status` stream is unaffected — [`run`](Self::run) emits per-tool
     /// exactly as it does for `start_scan` (the runner holds the `AppHandle`), so
-    /// an MCP-triggered scan animates live in the Code Audit tab. Errors pass
+    /// an MCP-triggered scan animates live in the Code audit view. Errors pass
     /// through from [`begin_scan`](Self::begin_scan) unchanged: master switch off,
     /// no tool of this category enabled, or `"a scan is already in progress"` when
     /// a UI (or other MCP) scan is mid-flight.

@@ -26,7 +26,8 @@
 //!
 //! Both the child (via the loopback route, Stage 3) and the worker ultimately
 //! call the same [`run_audit`], so a scan triggered by *any* consumer streams
-//! live into the Code Audit tab exactly as a UI-triggered scan does.
+//! live into the Code audit section (Tool Activity tab) exactly as a
+//! UI-triggered scan does — and lands as a roll-up row in the Activities feed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -323,9 +324,60 @@ fn category_title(category: Category) -> &'static str {
 /// completion and format its snapshot. Everything category-specific stays behind
 /// [`AuditState::run_scan_and_wait`]; this only threads the result through
 /// [`format_result`].
-pub async fn run_audit(state: &Arc<AuditState>, category: Category) -> Result<String, String> {
-    let snapshot = state.run_scan_and_wait(category).await?;
-    Ok(format_result(&snapshot, category))
+///
+/// `source` names the agent that issued the call (`"claude"` / `"opencode"`
+/// from the stdio child's `--consumer` flag, `"offload"` for the worker) and
+/// is recorded on the roll-up activity entry below. Every agent-triggered
+/// audit thus lands in the persistent tool-activity store (the Tool Activity
+/// tab's Activities feed) as ONE `security_audit`/`quality_audit` row with
+/// consumer attribution — alongside the per-scanner rows the runner records
+/// (kind `audit`, source `"audit"`) for every scan, UI-triggered ones
+/// included. Failures (busy runner, feature disabled) are recorded too, as
+/// `ok:false` rows, so a refused agent call is visible.
+pub async fn run_audit(
+    state: &Arc<AuditState>,
+    category: Category,
+    source: &str,
+) -> Result<String, String> {
+    use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord};
+
+    let started = now_ms();
+    let outcome = state.run_scan_and_wait(category).await;
+    let (result, findings, root) = match outcome {
+        Ok(snapshot) => {
+            let text = format_result(&snapshot, category);
+            let root = snapshot.root.clone();
+            (Ok(text), snapshot.total_findings, root)
+        }
+        // The scan never ran, so no snapshot came back — pull the root from
+        // the runner's current state for the failure row.
+        Err(e) => (Err(e), 0, state.snapshot().root),
+    };
+
+    let tool = match category {
+        Category::Security => "security_audit",
+        Category::Quality => "quality_audit",
+    };
+    activity::record_bg(ActivityRecord {
+        entry: ActivityEntry::new(
+            ActivityKind::Audit,
+            started,
+            activity::root_key(std::path::Path::new(&root)),
+            source.to_string(),
+            tool.to_string(),
+            root,
+            findings,
+            now_ms().saturating_sub(started),
+            result.is_ok(),
+        ),
+        request: format!("{tool} ({source})"),
+        response: match &result {
+            Ok(text) => text.clone(),
+            Err(e) => format!("[error] {e}"),
+        },
+    });
+
+    result
 }
 
 // ── The `cimp --code-audit-mcp` stdio child ────────────────────────────────

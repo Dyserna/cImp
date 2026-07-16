@@ -983,7 +983,8 @@ the V22 parser fixtures are maintained.
 
 With a build of the app running and `code_audit.enabled` on:
 
-1. **Fresh clone, no tools on PATH** → the Code Audit tab shows all three chips
+1. **Fresh clone, no tools on PATH** → the Code audit view (Tool Activity →
+   Code audit) shows all three chips
    `not installed`; **Settings → Code Audit → Detect** on each agrees (not found
    on PATH or ebin).
 2. **Drop `osv-scanner.exe` + `gitleaks.exe` in `ebin/`** → Detect finds each
@@ -1075,7 +1076,8 @@ re-enables auto. Frontend mirror: `autoSelectQuality` in `codeAudit/logic.ts`.
 ### Live-verify recipe (run by hand before release)
 
 With a build running and `code_audit.enabled` on. Security and Quality are
-**sub-tabs of the one Code Audit tab**; each tool's install hint, then Detect in
+**sub-tabs of the one Code audit view (Tool Activity → Code audit)**; each
+tool's install hint, then Detect in
 **Settings → Code Audit → Quality tools**, then scan a small fixture project of
 that language and confirm the finding lands in the **Quality** sub-tab:
 
@@ -1112,7 +1114,7 @@ that language and confirm the finding lands in the **Quality** sub-tab:
 
 **Gating checks (this repo has no Java/Go/Python):**
 
-12. Open the Code Audit tab's **Quality** sub-tab in *this* repo → the **PMD /
+12. Open the Code audit view's **Quality** sub-tab in *this* repo → the **PMD /
     golangci-lint / ruff** chips are **absent** (census sees no `.java`/`.go`/`.py`),
     and the muted "**n tools hidden — not applicable to this project**" line
     accounts for them. oxlint/eslint/knip/cargo-machete/typos DO show (this repo
@@ -1144,9 +1146,10 @@ that language and confirm the finding lands in the **Quality** sub-tab:
     reconcile), and any customized security entry (disabled / custom path / extra
     args / timeout) is preserved verbatim.
 17. Take a v0.45.0 config that has the old separate `code-quality` tab entry in
-    `tabs` (schema 22), launch → the migration stamps schema 23 and the entry is
-    gone: ONE Code Audit tab with Security | Quality sub-tabs, no stray closable
-    "Code Quality" shell tab.
+    `tabs` (schema 22), launch → the migration cascade prunes it (and, since
+    schema 27, the `code-audit` entry too): ONE Code audit view with Security |
+    Quality sub-tabs inside Tool Activity, no stray closable "Code Quality" or
+    "Code Audit" shell tab.
 
 **Cross-sub-tab lock + toggle stability:**
 

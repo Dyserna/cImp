@@ -755,6 +755,19 @@
   // Non-reactive: stick to the right edge (newest turns) as data lands,
   // unless the user scrolled back into history.
   let pinnedRight = true;
+  // Zoom is per-session: when the card switches to a DIFFERENT session
+  // (drill-in, back-to-live, or the live session rolling over) reset to
+  // auto-fit — a column width chosen for one session's turn count means
+  // nothing for another's. Non-reactive prev guard = no reset on refetches
+  // of the same session.
+  let zoomSessionId: string | null | undefined;
+  $effect(() => {
+    const sid = selectedId ?? usage?.current?.session_id ?? null;
+    if (sid === zoomSessionId) return;
+    zoomSessionId = sid;
+    zoomCol = null;
+    pinnedRight = true;
+  });
   // Column width at which all shown turns exactly fill the viewport (may be
   // sub-minimum when the session is long — that's the scroll trigger).
   let fitCol = $derived(
@@ -762,10 +775,20 @@
       ? (ubarsWidth - BAR_GAP * (shownTurns.length - 1)) / shownTurns.length
       : 0,
   );
-  let colPx = $derived(zoomCol ?? Math.max(fitCol, BAR_MIN_COL));
+  // The fill-the-card floor applies to a REMEMBERED zoom too: a zoomCol
+  // picked on a long session can sit below the fit width of a shorter one
+  // selected later (or below the new fit after a window resize) — without
+  // this clamp that stale zoom leaves the chart narrower than the card.
+  let colPx = $derived(Math.max(zoomCol ?? 0, fitCol, BAR_MIN_COL));
   // Fixed-width columns (scroll mode) whenever the user zoomed or the fit
-  // width dropped below the minimum; otherwise columns flex to fill.
-  let fixedCols = $derived(zoomCol !== null || (fitCol > 0 && fitCol < BAR_MIN_COL));
+  // width dropped below the minimum; otherwise columns flex to fill. fitCol
+  // goes NEGATIVE once the inter-bar gaps alone exceed the viewport (very
+  // long sessions), so "measured" is length+width — not fitCol > 0, which
+  // dropped the explicit chart/lane widths at full zoom-out and let the S/A
+  // lane collapse to the viewport while the bars still overflowed.
+  let fixedCols = $derived(
+    zoomCol !== null || (shownTurns.length > 0 && ubarsWidth > 0 && fitCol < BAR_MIN_COL),
+  );
   let chartWidthPx = $derived(
     shownTurns.length > 0 ? colPx * shownTurns.length + BAR_GAP * (shownTurns.length - 1) : 0,
   );

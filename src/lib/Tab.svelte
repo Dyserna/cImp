@@ -13,6 +13,7 @@
     builtin = false,
     canSkipCloseConfirm = false,
     renaming = $bindable(false),
+    showIndicator = true,
     avatarState = 'Idle' as AvatarState,
     awaitingPermission = false,
     doneWhileAway = false,
@@ -38,6 +39,10 @@
     /// from the context menu); the input here flips it back on submit
     /// or cancel.
     renaming?: boolean;
+    /// Whether to reserve the status-dot slot. Only AI-tool tabs ever light
+    /// an indicator (permission waits, thinking, done-while-away); every
+    /// other tab omits the slot entirely so its label sits flush left.
+    showIndicator?: boolean;
     avatarState?: AvatarState;
     awaitingPermission?: boolean;
     doneWhileAway?: boolean;
@@ -212,11 +217,13 @@
       </span>
     </span>
   {:else if renaming}
-    <span
-      class="indicator indicator-{indicator ?? 'none'}"
-      aria-label={indicator ? `status: ${indicator}` : undefined}
-      aria-hidden={indicator ? undefined : true}
-    ></span>
+    {#if showIndicator}
+      <span
+        class="indicator indicator-{indicator ?? 'none'}"
+        aria-label={indicator ? `status: ${indicator}` : undefined}
+        aria-hidden={indicator ? undefined : true}
+      ></span>
+    {/if}
     <input
       bind:this={renameInputEl}
       bind:value={renameValue}
@@ -229,12 +236,14 @@
       onpointerdown={(e) => e.stopPropagation()}
     />
   {:else}
-    <span
-      class="indicator indicator-{indicator ?? 'none'}"
-      aria-label={indicator ? `status: ${indicator}` : undefined}
-      aria-hidden={indicator ? undefined : true}
-    ></span>
-    <span class="label">{label}</span>
+    {#if showIndicator}
+      <span
+        class="indicator indicator-{indicator ?? 'none'}"
+        aria-label={indicator ? `status: ${indicator}` : undefined}
+        aria-hidden={indicator ? undefined : true}
+      ></span>
+    {/if}
+    <span class="label" class:label-left={!showIndicator}>{label}</span>
     {#if onnew}
       <span
         class="spawn"
@@ -316,6 +325,11 @@
     text-overflow: ellipsis;
     flex: 1 1 auto;
     min-width: 0;
+  }
+  /* Without an indicator slot the label owns the whole tab width; the
+     button's UA text-align: center would float short titles mid-tab. */
+  .label-left {
+    text-align: left;
   }
   .tab:active {
     cursor: grabbing;

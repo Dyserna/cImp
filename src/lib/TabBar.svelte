@@ -240,6 +240,7 @@
             active={pane.active_tab_id === id}
             builtin={meta.builtin}
             canSkipCloseConfirm={$perTabClosedState[id]?.closed ?? false}
+            showIndicator={meta.kind === 'ai-tool'}
             avatarState={$perTabAvatarState[id] ?? 'Idle'}
             awaitingPermission={$perTabAwaitingPermission[id] ?? false}
             doneWhileAway={$perTabDoneWhileAway[id] ?? false}

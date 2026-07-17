@@ -828,6 +828,11 @@
   // Claude Code directly now, not just the offload worker.)
   type OffloadSubSection = 'pool' | 'tools';
   let offloadSubSection = $state<OffloadSubSection>('pool');
+  // Sub-tab nav within the Code Intelligence section: index/build knobs under
+  // 'graph'; semantic search + the embedding server under 'semantic'; context
+  // injection + the read advisor under 'efficiency'; the 3D view under 'viz'.
+  type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
+  let graphSubSection = $state<GraphSubSection>('graph');
   function subSectionForTabId(tabId: string): TabsSubSection {
     if (
       tabId === 'claude' ||
@@ -4281,6 +4286,47 @@
           </label>
 
           {#if snapshot.graph.enabled}
+            <hr class="card-divider lg" />
+            <div class="sub-tabs" role="tablist" aria-label="Code Intelligence sub-sections">
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'graph'}
+                aria-selected={graphSubSection === 'graph'}
+                onclick={() => (graphSubSection = 'graph')}
+              >
+                Code graph
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'semantic'}
+                aria-selected={graphSubSection === 'semantic'}
+                onclick={() => (graphSubSection = 'semantic')}
+              >
+                Semantic search
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'efficiency'}
+                aria-selected={graphSubSection === 'efficiency'}
+                onclick={() => (graphSubSection = 'efficiency')}
+              >
+                Token efficiency
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'viz'}
+                aria-selected={graphSubSection === 'viz'}
+                onclick={() => (graphSubSection = 'viz')}
+              >
+                Graph view
+              </button>
+            </div>
+
+            {#if graphSubSection === 'graph'}
             <div class="button-row">
               <button type="button" disabled={graphBusy} onclick={runGraphRebuild}>
                 {graphBusy ? 'Rebuilding…' : 'Rebuild index'}
@@ -4393,6 +4439,114 @@
               </button>
             </div>
 
+            <h3>Tool surface</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.lean_tools}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.lean_tools = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Lean tool surface (hide cold-tail graph tools)</span>
+            </label>
+            <small class="hint">
+              Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
+              <code>graph_struct_search</code>, <code>graph_path</code>, and
+              <code>graph_architecture</code> from the tool list advertised to the
+              cloud session and the offload worker — trimming the descriptors
+              cache-written once per session. Advertisement-only: each hidden tool
+              still answers if an agent calls it by name. The Code Intelligence tab
+              shows the current surface size.
+            </small>
+
+            <h3>Architecture &amp; path tracing</h3>
+            <small class="hint">
+              Tune V15's code-intelligence features: <code>graph_path</code>
+              (shortest-path tracing), <code>graph_architecture</code> (god
+              nodes, subsystems, surprising edges), and the live Graph view
+              (Tools tab).
+              Edge confidence (extracted/inferred/ambiguous) is always on.
+            </small>
+            <label>
+              <span>Path tracing max hops (1–32)</span>
+              <input
+                type="number"
+                min="1"
+                max="32"
+                value={snapshot.graph.path_max_hops}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.path_max_hops = Math.min(
+                        32,
+                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Max subsystems reported</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_max_communities}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_max_communities = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 12,
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Minimum subsystem size</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_min_community_size}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_min_community_size = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 3,
+                      )),
+                  )}
+              />
+            </label>
+
+            <h3>Offload worker access</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.allow_remote_worker_access}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.allow_remote_worker_access = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Allow a <strong>remote</strong> offload worker to query the graph</span>
+            </label>
+            <small class="hint">
+              ⚠ <strong>Privacy:</strong> the local offload worker can always
+              query the graph. A <strong>remote</strong> backend — whether a box
+              on your LAN or a public cloud API — would receive your project's
+              code structure (symbol names, call relationships, doc snippets).
+              Leave this off unless you trust the remote. The cloud Claude
+              session's <code>graph_*</code> tools are unaffected by this
+              setting.
+            </small>
+            {:else if graphSubSection === 'semantic'}
             <h3>Semantic search</h3>
             <label class="checkbox">
               <input
@@ -4414,7 +4568,7 @@
               tools and guidance an AI tab sees — restart Claude/OpenCode tabs
               to pick it up.
             </small>
-            {#if snapshot.graph.semantic_search}
+            <h3>Embedding server</h3>
               <label>
                 <span>Embedding endpoint</span>
                 <input
@@ -4466,8 +4620,7 @@
                 Use <strong>Rebuild embeddings</strong> in Tools →
                 Graph index after a silent model swap behind the same name.
               </small>
-            {/if}
-
+            {:else if graphSubSection === 'efficiency'}
             <h3>Context injection</h3>
             <label class="checkbox">
               <input
@@ -4606,7 +4759,6 @@
               </small>
             {/if}
 
-            <h3>Token efficiency</h3>
             <label class="checkbox">
               <input
                 type="checkbox"
@@ -4790,88 +4942,7 @@
               {/if}
             </small>
 
-            <h3>Tool surface</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.lean_tools}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.lean_tools = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Lean tool surface (hide cold-tail graph tools)</span>
-            </label>
-            <small class="hint">
-              Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
-              <code>graph_struct_search</code>, <code>graph_path</code>, and
-              <code>graph_architecture</code> from the tool list advertised to the
-              cloud session and the offload worker — trimming the descriptors
-              cache-written once per session. Advertisement-only: each hidden tool
-              still answers if an agent calls it by name. The Code Intelligence tab
-              shows the current surface size.
-            </small>
-
-            <h3>Architecture &amp; path tracing</h3>
-            <small class="hint">
-              Tune V15's code-intelligence features: <code>graph_path</code>
-              (shortest-path tracing), <code>graph_architecture</code> (god
-              nodes, subsystems, surprising edges), and the live Graph view
-              (Tools tab).
-              Edge confidence (extracted/inferred/ambiguous) is always on.
-            </small>
-            <label>
-              <span>Path tracing max hops (1–32)</span>
-              <input
-                type="number"
-                min="1"
-                max="32"
-                value={snapshot.graph.path_max_hops}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.path_max_hops = Math.min(
-                        32,
-                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Max subsystems reported</span>
-              <input
-                type="number"
-                min="1"
-                value={snapshot.graph.arch_max_communities}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.arch_max_communities = Math.max(
-                        1,
-                        Number((e.currentTarget as HTMLInputElement).value) || 12,
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Minimum subsystem size</span>
-              <input
-                type="number"
-                min="1"
-                value={snapshot.graph.arch_min_community_size}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.arch_min_community_size = Math.max(
-                        1,
-                        Number((e.currentTarget as HTMLInputElement).value) || 3,
-                      )),
-                  )}
-              />
-            </label>
+            {:else if graphSubSection === 'viz'}
             <label class="checkbox">
               <input
                 type="checkbox"
@@ -4964,31 +5035,7 @@
                 </label>
               </div>
             {/if}
-
-            <h3>Offload worker access</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.allow_remote_worker_access}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.allow_remote_worker_access = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Allow a <strong>remote</strong> offload worker to query the graph</span>
-            </label>
-            <small class="hint">
-              ⚠ <strong>Privacy:</strong> the local offload worker can always
-              query the graph. A <strong>remote</strong> backend — whether a box
-              on your LAN or a public cloud API — would receive your project's
-              code structure (symbol names, call relationships, doc snippets).
-              Leave this off unless you trust the remote. The cloud Claude
-              session's <code>graph_*</code> tools are unaffected by this
-              setting.
-            </small>
+            {/if}
           {/if}
         </section>
       {:else if activeSection === 'checks'}
@@ -6416,6 +6463,7 @@
      Bottom bar → Status bar arrangement and Claude context bar sections).
      Reset to a normal positive gap. */
   button + small.hint,
+  .button-row + small.hint,
   label.checkbox + small.hint {
     margin-top: var(--space-1);
   }

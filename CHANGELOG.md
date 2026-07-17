@@ -5,7 +5,30 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.48.0] — 2026-07-17
+
+### Changed
+
+- **Code Intelligence settings split into four sub-tabs.** The one long
+  scroll is now Code graph (rebuild/status, indexing, ignores, tool
+  surface, architecture & path tracing, offload worker access) ·
+  Semantic search (toggle plus the embedding server config, now always
+  visible instead of hidden behind the toggle) · Token efficiency
+  (context injection, read advisor, local-model digests) · Graph view
+  (enable, max nodes, tuning, edge colors).
+- **Code Audit settings split into three sub-tabs.** Settings (feature
+  toggle, scan settings, MCP exposure) · Security tools · Quality
+  tools, using the same sub-tab nav as Code Intelligence.
+- **Offload backend template libraries are now truly machine-global.**
+  Saved server-command / remote-backend templates write through to the
+  global settings.json and never pin into a project overlay; templates
+  stranded in an existing overlay are promoted into the global baseline
+  once on load. Mid-session promotions stick — the settings diff
+  baseline now tracks the physical global file instead of being frozen
+  at launch.
+- **MCP tool-server editor rows stack into card-like groups.** Each
+  server lays out as name + Remove, a full-width URL field, and the
+  access checkboxes, with clear spacing between server groups.
 
 ### Fixed
 
@@ -50,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Code Audit tool-list scope controls.** Save to global / Load from
+  global / Clear all buttons on both scanner sub-tabs, plus a per-tool
+  global/local badge (comparing enabled, extra args, and timeout; exe
+  paths stay machine-scope). Edits still default to the project
+  overlay; Save promotes the tool config to the global file, Load
+  re-adopts it and drops the project copy.
 - **"Restart the AI tab" hint when MCP exposure changes.** Enabling Code
   Audit (or flipping any setting that changes which MCP servers are
   advertised) now shows a toast in the main window and a Settings hint —

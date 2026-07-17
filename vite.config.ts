@@ -105,6 +105,9 @@ export default defineConfig(async () => ({
     }
   },
   build: {
+    // Desktop WebView loads assets from disk, so code-splitting the app
+    // chunk buys nothing; raise the advisory limit above our ~750 kB bundle.
+    chunkSizeWarningLimit: 1000,
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),

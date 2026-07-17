@@ -365,7 +365,15 @@
         <button type="button" class="test" onclick={() => runTest(i)} disabled={testBusy[i]}>
           {testBusy[i] ? 'Testing…' : 'Test'}
         </button>
-        <button type="button" class="remove" aria-label="Remove check" onclick={() => removeCheck(i)}>
+        <!-- `icon` opts out of the TUI themes' `[ … ]` bracket framing (their
+             `section button:not(.icon)::before/::after` rules) — brackets
+             don't fit in this 28px box and wrap it three lines tall. -->
+        <button
+          type="button"
+          class="remove icon"
+          aria-label="Remove check"
+          onclick={() => removeCheck(i)}
+        >
           ×
         </button>
       </div>
@@ -508,6 +516,34 @@
     gap: var(--space-3);
   }
 
+  /* Base look for every button in the editor (Detect, Test, Apply/Cancel,
+     + Add check). Deliberately element-level — the lowest scoped
+     specificity — so a TUI theme's flat `[ … ]` section-button reset
+     (`html[data-theme] section button`) outranks it; class selectors here
+     would win instead and draw this box AROUND the theme's brackets. Only
+     the `.remove` icon button keeps class-level visuals below: it opts out
+     of the brackets via `icon`, so its box is correct under every theme. */
+  button {
+    background: var(--surface-input);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    padding: var(--space-1) 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: var(--font-size-xs);
+  }
+  button:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+  button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  button:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
   /* Exposure status line. */
   .exposure {
     display: flex;
@@ -544,20 +580,6 @@
   }
   .detect-btn {
     margin-left: auto;
-    background: var(--surface-input);
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-    padding: var(--space-1) 10px;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    font-size: var(--font-size-xs);
-  }
-  .detect-btn:hover:not(:disabled) {
-    border-color: var(--accent);
-  }
-  .detect-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
   }
   .toolbar .detect-btn {
     margin-left: 0;
@@ -666,31 +688,19 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .card-head .test {
-    background: var(--surface-input);
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-    padding: var(--space-1) 10px;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    font-size: var(--font-size-xs);
-  }
-  .card-head .test:hover:not(:disabled) {
-    border-color: var(--accent);
-  }
-  .card-head .test:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
+  /* Class-level (not element-level) ON PURPOSE: `icon` skips the TUI
+     bracket framing, but the TUI section-button reset still strips
+     background/border — these higher-specificity rules keep the compact
+     box in every theme. */
   .remove {
     width: 28px;
+    flex: none;
     padding: 0;
     line-height: 24px;
     background: var(--surface-2);
     border: 1px solid var(--border-default);
     color: var(--text-quiet-strong);
     border-radius: var(--radius-sm);
-    cursor: pointer;
     font-size: 16px;
   }
   .remove:hover {
@@ -841,16 +851,5 @@
 
   .add {
     align-self: flex-start;
-    background: var(--surface-2);
-    border: 1px solid var(--border-default);
-    color: var(--text-quiet-strong);
-    padding: var(--space-1) 10px;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    font-size: var(--font-size-xs);
-  }
-  .add:hover {
-    background: var(--surface-input);
-    color: var(--text-primary);
   }
 </style>

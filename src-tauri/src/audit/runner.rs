@@ -43,8 +43,8 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const EVENT_FINDINGS_PER_TOOL_CAP: usize = 500;
 
 /// One tool's lifecycle within a scan. Serialized kebab-case, so the wire
-/// strings are exactly
-/// `idle | running | done | failed | not-installed | skipped-not-applicable`.
+/// strings are exactly `idle | running | done | failed | not-installed |
+/// path-invalid | skipped-not-applicable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolStatus {
@@ -57,9 +57,15 @@ pub enum ToolStatus {
     Done,
     /// A tool error: non-findings exit code, spawn failure, timeout, or cancel.
     Failed,
-    /// The binary could not be resolved (ebin/PATH/override) — the scan
-    /// proceeds with the remaining tools.
+    /// The binary could not be resolved with NO path configured (not in ebin,
+    /// not on PATH) — the scan proceeds with the remaining tools.
     NotInstalled,
+    /// The binary could not be resolved at the path the user CONFIGURED —
+    /// distinct from [`NotInstalled`](Self::NotInstalled) so the UI/report can
+    /// say "your configured path is wrong" instead of the misleading "not
+    /// installed" (a stale per-project path or a path from another machine,
+    /// e.g. an overlay copied between projects).
+    PathInvalid,
     /// V25 Phase C: the tool is enabled but does not apply to this project's
     /// [`census`](super::census) (no PMD in a Rust repo) — never launched.
     /// Distinct from [`Idle`](Self::Idle) (disabled) and
@@ -250,6 +256,13 @@ impl AuditState {
     /// The full (uncapped) snapshot for tab mount.
     pub fn snapshot(&self) -> AuditSnapshot {
         self.inner.lock().unwrap().snapshot(None)
+    }
+
+    /// The launch project root every scan runs against — the loopback
+    /// `/audit/run` route compares it against the requesting child's cwd to
+    /// reject misrouted requests (multi-instance wrong-instance guard).
+    pub fn root(&self) -> PathBuf {
+        self.inner.lock().unwrap().root.clone()
     }
 
     /// Whether the per-consumer expose toggle for `consumer` is on —
@@ -532,9 +545,28 @@ impl AuditState {
             // can't disagree with what a scan launches.
             match super::resolve_audit_binary(tool.id, &tool.path, Some(&root)) {
                 Err(_) => {
+                    // Distinguish "no path configured and not discoverable"
+                    // from "the configured path itself is broken" — the first
+                    // is fixed by installing or setting a path, the second by
+                    // correcting the path in Settings.
+                    let (status, error) = if tool.path.trim().is_empty() {
+                        (
+                            ToolStatus::NotInstalled,
+                            "not found on PATH or ebin — install it or set its path in Settings"
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            ToolStatus::PathInvalid,
+                            format!(
+                                "configured path not found: {} — fix it in Settings",
+                                tool.path.trim()
+                            ),
+                        )
+                    };
                     self.patch_tool(tool.id, |ts| {
-                        ts.status = ToolStatus::NotInstalled;
-                        ts.error = Some("not found on PATH or ebin".to_string());
+                        ts.status = status;
+                        ts.error = Some(error);
                         ts.resolved = None;
                     });
                 }
@@ -1708,6 +1740,7 @@ mod tests {
             ToolStatus::Done,
             ToolStatus::Failed,
             ToolStatus::NotInstalled,
+            ToolStatus::PathInvalid,
             ToolStatus::SkippedNotApplicable,
         ];
         fn _statuses_exhaustive(s: ToolStatus) {
@@ -1717,6 +1750,7 @@ mod tests {
                 | ToolStatus::Done
                 | ToolStatus::Failed
                 | ToolStatus::NotInstalled
+                | ToolStatus::PathInvalid
                 | ToolStatus::SkippedNotApplicable => {}
             }
         }

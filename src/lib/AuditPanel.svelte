@@ -272,6 +272,7 @@
     done: '✓',
     failed: '✗',
     'not-installed': '⚠',
+    'path-invalid': '⚠',
   };
 </script>
 
@@ -313,7 +314,7 @@
         {#if c.spinner}<span class="spinner" aria-hidden="true"></span>{/if}
         {#if CHIP_ICON[c.kind]}<span class="chip-icon">{CHIP_ICON[c.kind]}</span>{/if}
         <span class="chip-label">{c.label}</span>
-        {#if c.kind === 'not-installed'}
+        {#if c.kind === 'not-installed' || c.kind === 'path-invalid'}
           <button type="button" class="chip-link" onclick={openSettings}>Settings</button>
         {/if}
       </span>
@@ -556,12 +557,19 @@
   .chip.failed .chip-label {
     color: #ffb4ab;
   }
-  .chip.not-installed {
+  .chip.not-installed,
+  .chip.path-invalid {
     border-color: rgba(227, 179, 65, 0.5);
   }
   .chip.not-installed .chip-icon,
   .chip.not-installed .chip-label {
     color: #e3b341;
+  }
+  /* A configured-but-broken path is a user error, not a missing install —
+     tint it toward the failed red so it reads as "fix me". */
+  .chip.path-invalid .chip-icon,
+  .chip.path-invalid .chip-label {
+    color: #ffb4ab;
   }
   .chip.running .chip-name {
     color: #58a6ff;

@@ -18,9 +18,10 @@ mod schema;
 pub use broadcaster::SettingsHandle;
 pub use persistence::{
     apply_portable_avatar_paths, load_readonly, mutate_global_harness_versions,
-    note_harness_version, read_global_harness_versions, read_global_llm_pricing,
-    read_global_prompt_templates, read_project_prompt_templates, reconcile_audit_tools,
-    reconcile_reserved_tabs, write_global_llm_pricing, write_global_prompt_templates,
+    note_harness_version, read_global_audit_tools, read_global_harness_versions,
+    read_global_llm_pricing, read_global_prompt_templates, read_project_prompt_templates,
+    reconcile_audit_tools, reconcile_reserved_tabs, write_global_audit_tools,
+    write_global_llm_pricing, write_global_prompt_templates,
 };
 pub use schema::*;
 

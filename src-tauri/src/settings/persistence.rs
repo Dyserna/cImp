@@ -45,7 +45,7 @@ use crate::settings::schema::{
     default_ai_tab, default_audit_tools, default_graph_monitor_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
-    PromptTemplate, Settings, TabConfig,
+    PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate, Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
@@ -191,6 +191,18 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         v
     });
 
+    // 2b. Promote legacy overlay scanner paths (empty slots only) and
+    //     offload template libraries (new names only) into the global
+    //     baseline — see the machine-scope notes above
+    //     `promote_overlay_audit_paths` / `promote_overlay_offload_templates`.
+    //     Persisted below via the post-load `save`, which also rewrites the
+    //     overlay in the stripped shape.
+    let promoted = overlay_value.as_ref().is_some_and(|ov| {
+        let paths = promote_overlay_audit_paths(&mut global, ov);
+        let templates = promote_overlay_offload_templates(&mut global, ov);
+        paths || templates
+    });
+
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
         Ok(v) => v,
@@ -205,6 +217,11 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     let overlay_existed = overlay_value.is_some();
     if let Some(overlay) = overlay_value {
         deep_merge(&mut merged, overlay);
+        // 3b. Paths and template libraries always come from the
+        //     (post-promotion) global baseline — an overlay's copies are
+        //     legacy data, not authority.
+        enforce_global_audit_paths(&mut merged, &global);
+        enforce_global_offload_templates(&mut merged, &global);
     }
 
     let mut settings: Settings = match serde_json::from_value(merged) {
@@ -247,10 +264,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // overlay. The load-time post-repair save below relies on this too.
     let _ = integrity_check(&mut global);
 
-    if repaired {
+    if repaired || promoted {
         // Persist the post-repair state back to its source of truth. If a
         // custom overlay was in play, we recompute and rewrite the diff;
-        // otherwise we rewrite global.
+        // otherwise we rewrite global. (A path promotion always has an
+        // overlay in play; `save` both writes the promoted paths through to
+        // the physical global file and rewrites the overlay stripped, so the
+        // promotion never re-fires.)
         if overlay_existed {
             // `global` is already integrity-checked (above), so invariants
             // enforced on both sides don't get mistaken for user
@@ -666,18 +686,325 @@ fn strip_overlay_banned(v: &mut Value) {
     }
 }
 
+// ── Audit scanner paths: machine-scope splitting ─────────────────────────────
+//
+// Scanner exe paths (`code_audit.tools[].path`) are MACHINE facts (where
+// gitleaks.exe lives on this box), but the `tools` array as a whole is
+// project-scoped (the `enabled` flags follow each project's census and the
+// user's per-project selection) and the generic `diff` replaces arrays
+// WHOLESALE — the two scopes share one array. Left alone, whichever project
+// the user configured a scanner from keeps the path hostage in ITS overlay
+// while every other project sees "" (the V26 field report: paths set up in
+// one repo, audits in a second repo resolved nothing). The splitting rules:
+//
+//   * LOAD — a legacy overlay's non-empty paths are promoted into the global
+//     baseline's EMPTY slots once, then the merged view's paths are ALWAYS
+//     overwritten from the global baseline: overlays carry no path authority.
+//   * SAVE — the live paths are written through to the PHYSICAL global file
+//     (`sync_audit_paths_into` + `save_to`, the same bypass pattern as
+//     `write_global_prompt_templates`), and `path` is normalized to "" on
+//     both diff sides so no new overlay ever pins a copy.
+//
+// `load_readonly` is deliberately exempt: the MCP children it serves never
+// read `code_audit.tools` (scans run in the app, not the child).
+
+/// The serde wire id (`osv-scanner`, `semgrep-quality`, …) of a typed tool id.
+fn audit_wire_id(id: crate::settings::schema::AuditToolId) -> String {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// LOAD step 1: promote a legacy overlay's non-empty scanner paths into the
+/// global baseline's empty slots (first project launched wins per slot; a
+/// non-empty global path is never overwritten). Returns true when `global`
+/// changed — the caller persists via the post-load `save`, which also
+/// rewrites the overlay in the stripped shape so promotion is one-time.
+fn promote_overlay_audit_paths(global: &mut Settings, overlay: &Value) -> bool {
+    let Some(entries) = overlay
+        .get("code_audit")
+        .and_then(|c| c.get("tools"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for e in entries {
+        let (Some(id), Some(path)) = (
+            e.get("id").and_then(Value::as_str),
+            e.get("path").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(t) = global
+            .code_audit
+            .tools
+            .iter_mut()
+            .find(|t| audit_wire_id(t.id) == id)
+        {
+            if t.path.trim().is_empty() {
+                t.path = path.to_string();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// LOAD step 2: overwrite the merged view's scanner paths from the
+/// (post-promotion) global baseline. Entries for ids the baseline doesn't
+/// know are left untouched (forward compat — the lenient deserializer drops
+/// them later anyway).
+fn enforce_global_audit_paths(merged: &mut Value, global: &Settings) {
+    let Some(entries) = merged
+        .get_mut("code_audit")
+        .and_then(|c| c.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for e in entries {
+        let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let Some(t) = global
+            .code_audit
+            .tools
+            .iter()
+            .find(|t| audit_wire_id(t.id) == id)
+        else {
+            continue;
+        };
+        if let Some(o) = e.as_object_mut() {
+            o.insert("path".to_string(), Value::String(t.path.clone()));
+        }
+    }
+}
+
+/// SAVE step 1 (pure half of the write-through): copy the live scanner paths
+/// onto the on-disk global settings. Returns true when anything changed —
+/// the caller only rewrites the physical file then.
+fn sync_audit_paths_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    for t in &current.code_audit.tools {
+        if let Some(g) = disk_global
+            .code_audit
+            .tools
+            .iter_mut()
+            .find(|g| g.id == t.id)
+        {
+            if g.path != t.path {
+                g.path = t.path.clone();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// SAVE step 2: normalize every scanner path to "" on a diff side so the
+/// overlay never carries one.
+fn strip_audit_tool_paths(v: &mut Value) {
+    if let Some(entries) = v
+        .get_mut("code_audit")
+        .and_then(|c| c.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    {
+        for e in entries {
+            if let Some(o) = e.as_object_mut() {
+                o.insert("path".to_string(), Value::String(String::new()));
+            }
+        }
+    }
+}
+
+// ── Offload backend template libraries: machine-scope splitting ──────────────
+//
+// `offload.server_command_templates` and `offload.remote_backend_templates`
+// are documented as GLOBAL libraries (a saved llama-server command should be
+// loadable from any project), but they rode the normal diff/save flow: a
+// template saved while a project overlay was active got pinned in THAT
+// project's overlay and every other project saw an empty library. Same
+// treatment as the audit scanner paths above, applied to whole arrays:
+//
+//   * LOAD — a legacy overlay's templates are promoted into the global
+//     baseline once (by name; an existing global name is never overwritten),
+//     then the merged view's arrays are ALWAYS overwritten from the global
+//     baseline: overlays carry no template authority.
+//   * SAVE — the live arrays are written through to the PHYSICAL global file
+//     and replaced with `[]` on both diff sides so no new overlay carries a
+//     copy.
+//
+// `load_readonly` stays exempt like the audit paths: the MCP children never
+// read the template libraries (they're a Settings-UI paste convenience).
+
+/// LOAD step 1: promote a legacy overlay's templates into the global
+/// baseline, keyed by name (a name already present globally wins). Returns
+/// true when `global` changed — persisted by the caller's post-load `save`,
+/// which also rewrites the overlay stripped so promotion is one-time.
+fn promote_overlay_offload_templates(global: &mut Settings, overlay: &Value) -> bool {
+    let mut changed = false;
+    if let Some(entries) = overlay
+        .get("offload")
+        .and_then(|o| o.get("server_command_templates"))
+        .and_then(Value::as_array)
+    {
+        for e in entries {
+            let Ok(t) = serde_json::from_value::<ServerCommandTemplate>(e.clone()) else {
+                continue;
+            };
+            if !t.name.trim().is_empty()
+                && !global
+                    .offload
+                    .server_command_templates
+                    .iter()
+                    .any(|g| g.name == t.name)
+            {
+                global.offload.server_command_templates.push(t);
+                changed = true;
+            }
+        }
+    }
+    if let Some(entries) = overlay
+        .get("offload")
+        .and_then(|o| o.get("remote_backend_templates"))
+        .and_then(Value::as_array)
+    {
+        for e in entries {
+            let Ok(t) = serde_json::from_value::<RemoteBackendTemplate>(e.clone()) else {
+                continue;
+            };
+            if !t.name.trim().is_empty()
+                && !global
+                    .offload
+                    .remote_backend_templates
+                    .iter()
+                    .any(|g| g.name == t.name)
+            {
+                global.offload.remote_backend_templates.push(t);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// LOAD step 2: overwrite the merged view's template arrays from the
+/// (post-promotion) global baseline.
+fn enforce_global_offload_templates(merged: &mut Value, global: &Settings) {
+    let Some(off) = merged.get_mut("offload").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Ok(v) = serde_json::to_value(&global.offload.server_command_templates) {
+        off.insert("server_command_templates".to_string(), v);
+    }
+    if let Ok(v) = serde_json::to_value(&global.offload.remote_backend_templates) {
+        off.insert("remote_backend_templates".to_string(), v);
+    }
+}
+
+/// SAVE step 1 (pure half of the write-through): copy the live template
+/// arrays onto the on-disk global settings. Returns true when anything
+/// changed — the caller only rewrites the physical file then.
+fn sync_offload_templates_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    if disk_global.offload.server_command_templates != current.offload.server_command_templates {
+        disk_global.offload.server_command_templates =
+            current.offload.server_command_templates.clone();
+        changed = true;
+    }
+    if disk_global.offload.remote_backend_templates != current.offload.remote_backend_templates {
+        disk_global.offload.remote_backend_templates =
+            current.offload.remote_backend_templates.clone();
+        changed = true;
+    }
+    changed
+}
+
+/// Read the audit tool config from the PHYSICAL global settings file,
+/// reconciled to the current tool set (a stale file gains missing tools at
+/// their defaults). Powers the Settings → Code Audit "Load from global"
+/// action and the per-tool global/local scope indicator.
+pub fn read_global_audit_tools() -> (Vec<crate::settings::schema::AuditToolConfig>, bool) {
+    let mut s = global_path()
+        .ok()
+        .map(|p| read_settings_or_default(&p))
+        .unwrap_or_default();
+    let _ = reconcile_audit_tools(&mut s);
+    (s.code_audit.tools, s.code_audit.quality_auto_select)
+}
+
+/// Write the live audit tool config (tools + `quality_auto_select`) through
+/// to the PHYSICAL global settings file (read-modify-write; every other
+/// field preserved — the `write_global_prompt_templates` pattern). Powers
+/// the "Save to global" action. The caller must also bring the in-memory
+/// baseline in line (`SettingsHandle::mutate_global`) so the next overlay
+/// diff drops the now-global config instead of keeping a project copy.
+pub fn write_global_audit_tools(current: &Settings) -> AppResult<()> {
+    let gpath = global_path()?;
+    let mut disk = read_settings_or_default(&gpath);
+    disk.code_audit.tools = current.code_audit.tools.clone();
+    disk.code_audit.quality_auto_select = current.code_audit.quality_auto_select;
+    save_to(&gpath, &disk)
+}
+
+/// SAVE step 2: empty both template arrays on a diff side so the overlay
+/// never carries them.
+fn strip_offload_templates(v: &mut Value) {
+    if let Some(off) = v.get_mut("offload").and_then(Value::as_object_mut) {
+        off.insert(
+            "server_command_templates".to_string(),
+            Value::Array(Vec::new()),
+        );
+        off.insert(
+            "remote_backend_templates".to_string(),
+            Value::Array(Vec::new()),
+        );
+    }
+}
+
 /// Write the diff between `settings` and `global` to the custom overlay
 /// file in `launch_cwd`. If the diff is empty, deletes any existing
 /// overlay (so a user who reverts every change ends up with a clean
 /// directory).
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
+
+    // Scanner paths and the offload template libraries are machine-scope:
+    // write them through to the PHYSICAL global file (read-modify-write,
+    // every other field preserved — the `write_global_prompt_templates`
+    // pattern) so every project sees them, then normalize both diff sides
+    // below so no overlay pins a copy. Best-effort: a failed global write
+    // must not block the overlay save (the values stay live in memory and
+    // re-sync on the next save).
+    if let Ok(gpath) = global_path() {
+        if gpath.exists() {
+            let mut disk = read_settings_or_default(&gpath);
+            let paths_changed = sync_audit_paths_into(&mut disk, settings);
+            let templates_changed = sync_offload_templates_into(&mut disk, settings);
+            if paths_changed || templates_changed {
+                if let Err(e) = save_to(&gpath, &disk) {
+                    tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
+                }
+            }
+        }
+    }
+
     let mut current = serde_json::to_value(settings)
         .map_err(|e| AppError::Settings(format!("serialize current: {e}")))?;
     let mut baseline = serde_json::to_value(global)
         .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
     strip_overlay_banned(&mut current);
     strip_overlay_banned(&mut baseline);
+    strip_audit_tool_paths(&mut current);
+    strip_audit_tool_paths(&mut baseline);
+    strip_offload_templates(&mut current);
+    strip_offload_templates(&mut baseline);
 
     match diff(&current, &baseline) {
         Some(delta) => {
@@ -2796,5 +3123,263 @@ mod tests {
         assert!(read_project_prompt_templates(&dir).is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Audit scanner paths: machine-scope splitting ──────────────────────────
+
+    use crate::settings::schema::AuditToolId;
+
+    fn set_tool_path(s: &mut Settings, id: AuditToolId, p: &str) {
+        s.code_audit
+            .tools
+            .iter_mut()
+            .find(|t| t.id == id)
+            .expect("tool seeded by default")
+            .path = p.to_string();
+    }
+
+    fn get_tool_path(s: &Settings, id: AuditToolId) -> String {
+        s.code_audit
+            .tools
+            .iter()
+            .find(|t| t.id == id)
+            .expect("tool seeded by default")
+            .path
+            .clone()
+    }
+
+    #[test]
+    fn audit_path_promotion_fills_only_empty_global_slots() {
+        let mut global = base_test_settings();
+        set_tool_path(&mut global, AuditToolId::Semgrep, "C:\\global\\semgrep.exe");
+        let overlay = serde_json::json!({
+            "code_audit": { "tools": [
+                { "id": "gitleaks", "path": "P:\\ebin\\gitleaks.exe" },
+                { "id": "semgrep", "path": "D:\\stale\\semgrep.exe" },
+                { "id": "ruff", "path": "   " },
+            ]}
+        });
+
+        assert!(promote_overlay_audit_paths(&mut global, &overlay));
+        // Empty global slot: filled from the legacy overlay.
+        assert_eq!(
+            get_tool_path(&global, AuditToolId::Gitleaks),
+            "P:\\ebin\\gitleaks.exe"
+        );
+        // Non-empty global slot: the overlay copy never overwrites it.
+        assert_eq!(
+            get_tool_path(&global, AuditToolId::Semgrep),
+            "C:\\global\\semgrep.exe"
+        );
+        // Whitespace-only overlay path: not a promotion.
+        assert_eq!(get_tool_path(&global, AuditToolId::Ruff), "");
+
+        // Idempotent: a second pass changes nothing.
+        assert!(!promote_overlay_audit_paths(&mut global, &overlay));
+    }
+
+    #[test]
+    fn merged_audit_paths_come_from_global_not_overlay() {
+        let mut global = base_test_settings();
+        set_tool_path(&mut global, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
+
+        // Simulate the deep-merge outcome: the overlay's tools array replaced
+        // the global's wholesale, with empty/stale path copies.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let tools = merged["code_audit"]["tools"].as_array_mut().unwrap();
+        for t in tools.iter_mut() {
+            t["path"] = serde_json::json!("");
+        }
+
+        enforce_global_audit_paths(&mut merged, &global);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        assert_eq!(
+            get_tool_path(&settings, AuditToolId::Gitleaks),
+            "P:\\ebin\\gitleaks.exe",
+            "the merged view must take paths from the global baseline"
+        );
+    }
+
+    #[test]
+    fn overlay_diff_never_carries_audit_paths() {
+        // A settings state that differs from global ONLY in a scanner path
+        // must produce NO overlay at all once both sides are stripped — the
+        // path lands in the global file via the save() write-through instead.
+        let global = base_test_settings();
+        let mut current = global.clone();
+        set_tool_path(&mut current, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
+
+        let mut cur_v = serde_json::to_value(&current).unwrap();
+        let mut base_v = serde_json::to_value(&global).unwrap();
+        strip_audit_tool_paths(&mut cur_v);
+        strip_audit_tool_paths(&mut base_v);
+        assert!(
+            diff(&cur_v, &base_v).is_none(),
+            "a path-only change must not create an overlay"
+        );
+
+        // A real per-project difference (an `enabled` flip) still diffs — and
+        // the emitted tools array carries only stripped paths.
+        let mut current2 = current.clone();
+        current2
+            .code_audit
+            .tools
+            .iter_mut()
+            .find(|t| t.id == AuditToolId::Gitleaks)
+            .unwrap()
+            .enabled = false;
+        let mut cur2_v = serde_json::to_value(&current2).unwrap();
+        strip_audit_tool_paths(&mut cur2_v);
+        let delta = diff(&cur2_v, &base_v).expect("enabled flip must diff");
+        let tools = delta["code_audit"]["tools"].as_array().unwrap();
+        assert!(
+            tools
+                .iter()
+                .all(|t| t["path"].as_str() == Some("")),
+            "overlay tools entries must carry no path copies: {delta}"
+        );
+    }
+
+    #[test]
+    fn sync_audit_paths_into_disk_global_reports_changes() {
+        let mut disk = base_test_settings();
+        let mut live = base_test_settings();
+        set_tool_path(&mut live, AuditToolId::Semgrep, "C:\\py\\semgrep.exe");
+
+        assert!(sync_audit_paths_into(&mut disk, &live));
+        assert_eq!(
+            get_tool_path(&disk, AuditToolId::Semgrep),
+            "C:\\py\\semgrep.exe"
+        );
+        // Unchanged on a second sync — the physical file isn't rewritten.
+        assert!(!sync_audit_paths_into(&mut disk, &live));
+
+        // Clearing a path in the live settings clears the global slot too
+        // (the Clear button means "forget the configured path everywhere").
+        set_tool_path(&mut live, AuditToolId::Semgrep, "");
+        assert!(sync_audit_paths_into(&mut disk, &live));
+        assert_eq!(get_tool_path(&disk, AuditToolId::Semgrep), "");
+    }
+
+    fn cmd_template(name: &str, command: &str) -> ServerCommandTemplate {
+        ServerCommandTemplate {
+            name: name.to_string(),
+            command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn offload_template_promotion_adds_new_names_only() {
+        let mut global = base_test_settings();
+        global
+            .offload
+            .server_command_templates
+            .push(cmd_template("qwen", "llama-server --global"));
+        let overlay = serde_json::json!({
+            "offload": {
+                "server_command_templates": [
+                    { "name": "qwen", "command": "llama-server --stale" },
+                    { "name": "embed", "command": "llama-server --embedding" },
+                    { "name": "   ", "command": "llama-server --anon" },
+                ],
+                "remote_backend_templates": [
+                    { "name": "lan-box", "base_url": "http://10.0.0.2:8080", "auth_token": "t" },
+                ],
+            }
+        });
+
+        assert!(promote_overlay_offload_templates(&mut global, &overlay));
+        // Existing global name: never overwritten by the overlay copy.
+        assert_eq!(
+            global.offload.server_command_templates[0].command,
+            "llama-server --global"
+        );
+        // New name: promoted. Whitespace-only name: skipped.
+        assert_eq!(global.offload.server_command_templates.len(), 2);
+        assert_eq!(global.offload.server_command_templates[1].name, "embed");
+        assert_eq!(global.offload.remote_backend_templates.len(), 1);
+        assert_eq!(global.offload.remote_backend_templates[0].name, "lan-box");
+
+        // Idempotent: a second pass changes nothing.
+        assert!(!promote_overlay_offload_templates(&mut global, &overlay));
+    }
+
+    #[test]
+    fn merged_offload_templates_come_from_global_not_overlay() {
+        let mut global = base_test_settings();
+        global
+            .offload
+            .server_command_templates
+            .push(cmd_template("qwen", "llama-server -m qwen.gguf"));
+
+        // Simulate the deep-merge outcome: the overlay's (stale/empty) arrays
+        // replaced the global's wholesale.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        merged["offload"]["server_command_templates"] = serde_json::json!([]);
+
+        enforce_global_offload_templates(&mut merged, &global);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        assert_eq!(
+            settings.offload.server_command_templates,
+            global.offload.server_command_templates,
+            "the merged view must take template libraries from the global baseline"
+        );
+    }
+
+    #[test]
+    fn overlay_diff_never_carries_offload_templates() {
+        // A settings state that differs from global ONLY in a template
+        // library must produce NO overlay at all once both sides are
+        // stripped — the library lands in the global file via the save()
+        // write-through instead.
+        let global = base_test_settings();
+        let mut current = global.clone();
+        current
+            .offload
+            .server_command_templates
+            .push(cmd_template("qwen", "llama-server -m qwen.gguf"));
+
+        let mut cur_v = serde_json::to_value(&current).unwrap();
+        let mut base_v = serde_json::to_value(&global).unwrap();
+        strip_offload_templates(&mut cur_v);
+        strip_offload_templates(&mut base_v);
+        assert!(
+            diff(&cur_v, &base_v).is_none(),
+            "a template-only change must not create an overlay"
+        );
+
+        // A real per-project offload difference still diffs — without the
+        // template keys riding along.
+        let mut current2 = current.clone();
+        current2.offload.server_command = "llama-server --project-specific".to_string();
+        let mut cur2_v = serde_json::to_value(&current2).unwrap();
+        strip_offload_templates(&mut cur2_v);
+        let delta = diff(&cur2_v, &base_v).expect("offload change must diff");
+        assert!(
+            delta["offload"].get("server_command_templates").is_none(),
+            "overlay must not carry a template library copy: {delta}"
+        );
+    }
+
+    #[test]
+    fn sync_offload_templates_into_disk_global_reports_changes() {
+        let mut disk = base_test_settings();
+        let mut live = base_test_settings();
+        live.offload
+            .server_command_templates
+            .push(cmd_template("qwen", "llama-server -m qwen.gguf"));
+
+        assert!(sync_offload_templates_into(&mut disk, &live));
+        assert_eq!(
+            disk.offload.server_command_templates,
+            live.offload.server_command_templates
+        );
+        // Unchanged on a second sync — the physical file isn't rewritten.
+        assert!(!sync_offload_templates_into(&mut disk, &live));
+
+        // Deleting a template in the live settings deletes it globally too.
+        live.offload.server_command_templates.clear();
+        assert!(sync_offload_templates_into(&mut disk, &live));
+        assert!(disk.offload.server_command_templates.is_empty());
     }
 }

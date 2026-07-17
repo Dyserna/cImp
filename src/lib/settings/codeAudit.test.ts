@@ -7,6 +7,7 @@ import {
   auditToolGroups,
   auditToolRows,
   formatDetect,
+  toolMatchesGlobal,
   toolNotApplicable,
 } from './codeAudit';
 
@@ -113,6 +114,39 @@ describe('auditToolGroups (V25 Security / Quality split)', () => {
     const g = auditToolGroups(settingsWith([tool('gitleaks'), tool('oxlint'), tool('typos')]));
     expect(g.security.map((r) => r.meta.id)).toEqual(['gitleaks']);
     expect(g.quality.map((r) => r.meta.id)).toEqual(['oxlint', 'typos']);
+  });
+});
+
+describe('toolMatchesGlobal (per-tool scope badge)', () => {
+  const globalTools = [
+    tool('gitleaks'),
+    tool('oxlint', { enabled: false, extra_args: ['--fix'], timeout_secs: 90 }),
+  ];
+
+  test('matching enabled/extra_args/timeout_secs → global', () => {
+    expect(toolMatchesGlobal(tool('gitleaks'), globalTools)).toBe(true);
+    expect(
+      toolMatchesGlobal(
+        tool('oxlint', { enabled: false, extra_args: ['--fix'], timeout_secs: 90 }),
+        globalTools,
+      ),
+    ).toBe(true);
+  });
+
+  test('any project-scoped field difference → local', () => {
+    expect(toolMatchesGlobal(tool('gitleaks', { enabled: false }), globalTools)).toBe(false);
+    expect(toolMatchesGlobal(tool('gitleaks', { extra_args: ['-v'] }), globalTools)).toBe(false);
+    expect(toolMatchesGlobal(tool('gitleaks', { timeout_secs: 30 }), globalTools)).toBe(false);
+  });
+
+  test('path differences never make a tool local (machine-scope)', () => {
+    expect(
+      toolMatchesGlobal(tool('gitleaks', { path: 'C:\\ebin\\gitleaks.exe' }), globalTools),
+    ).toBe(true);
+  });
+
+  test('a tool the global file does not know is local', () => {
+    expect(toolMatchesGlobal(tool('ruff'), globalTools)).toBe(false);
   });
 });
 

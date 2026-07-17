@@ -10,12 +10,16 @@
   import {
     aiToolTabDefaults,
     auditDetectTool,
+    auditToolsGlobalConfig,
+    auditToolsLoadGlobal,
+    auditToolsSaveGlobal,
     consumeSettingsDeepLink,
     harnessVersionsGet,
     listVoices,
     llmPricingGet,
     llmPricingSet,
     requestTabRestart,
+    type AuditGlobalToolConfig,
   } from './lib/settings/ipc';
   import { listen } from '@tauri-apps/api/event';
   import type {
@@ -86,6 +90,7 @@
   import {
     auditToolGroups,
     formatDetect,
+    toolMatchesGlobal,
     toolNotApplicable,
     type AuditToolRow,
   } from './lib/settings/codeAudit';
@@ -828,6 +833,15 @@
   // Claude Code directly now, not just the offload worker.)
   type OffloadSubSection = 'pool' | 'tools';
   let offloadSubSection = $state<OffloadSubSection>('pool');
+  // Sub-tab nav within the Code Intelligence section: index/build knobs under
+  // 'graph'; semantic search + the embedding server under 'semantic'; context
+  // injection + the read advisor under 'efficiency'; the 3D view under 'viz'.
+  type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
+  let graphSubSection = $state<GraphSubSection>('graph');
+  // Sub-tab nav within the Code Audit section: feature toggle + scan/MCP
+  // settings under 'settings'; the two scanner lists under their own tabs.
+  type AuditSubSection = 'settings' | 'security' | 'quality';
+  let auditSubSection = $state<AuditSubSection>('settings');
   function subSectionForTabId(tabId: string): TabsSubSection {
     if (
       tabId === 'claude' ||
@@ -908,6 +922,7 @@
     await initSettings();
     if (disposed) return;
     startBackendStatusPolling();
+    void refreshAuditGlobalConfig();
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -1139,7 +1154,8 @@
     });
   }
 
-  // Restart-affecting subset: command + args + cwd + env. Notifications,
+  // Restart-affecting subset: command + args + cwd + env + the local-provider
+  // toggle (it synthesizes ANTHROPIC_* env at launch). Notifications,
   // first_launch_notice_dismissed, and (V20) the tts_injection speak gate
   // apply live and are excluded — the out-of-band TTS source reads the toggle
   // per-utterance, so flipping it takes effect without relaunching the tab.
@@ -1149,6 +1165,7 @@
       args: t.args,
       cwd: t.cwd,
       env: t.env,
+      use_local_provider: t.use_local_provider,
     };
   }
 
@@ -1387,6 +1404,60 @@
   function commitAudit(): void {
     if (!snapshot) return;
     void applySettings($state.snapshot(snapshot));
+  }
+
+  // ── Tool-config scope (global vs project) ──────────────────────────────
+  // The global settings file's tool config, for the per-tool scope badge.
+  // Tool edits are project-scoped by default (they diff into the project
+  // overlay); the Save/Load buttons promote to / re-adopt from global.
+  let auditGlobalConfig = $state<AuditGlobalToolConfig | null>(null);
+  let auditScopeError = $state<string | null>(null);
+
+  async function refreshAuditGlobalConfig(): Promise<void> {
+    try {
+      auditGlobalConfig = await auditToolsGlobalConfig();
+    } catch (e) {
+      console.warn('audit_tools_global_config failed', e);
+    }
+  }
+
+  function auditToolScope(tool: AuditToolConfig): 'global' | 'local' {
+    if (!auditGlobalConfig) return 'global';
+    return toolMatchesGlobal(tool, auditGlobalConfig.tools) ? 'global' : 'local';
+  }
+
+  async function auditSaveGlobal(): Promise<void> {
+    auditScopeError = null;
+    try {
+      auditGlobalConfig = await auditToolsSaveGlobal();
+    } catch (e) {
+      auditScopeError = `Save to global failed: ${e}`;
+    }
+  }
+
+  async function auditLoadGlobal(): Promise<void> {
+    auditScopeError = null;
+    try {
+      // The backend mutates the live settings too; the snapshot follows via
+      // the settings-changed broadcast.
+      auditGlobalConfig = await auditToolsLoadGlobal();
+    } catch (e) {
+      auditScopeError = `Load from global failed: ${e}`;
+    }
+  }
+
+  // "Clear all": an all-off tool config saved as a normal project setting
+  // (paths are machine-scope and stay).
+  function auditClearAll(): void {
+    auditScopeError = null;
+    patch((s) => {
+      for (const t of s.code_audit.tools) {
+        t.enabled = false;
+        t.extra_args = [];
+        t.timeout_secs = null;
+      }
+      s.code_audit.quality_auto_select = false;
+    });
   }
 
   function imagePicker(state: keyof Settings['avatar']['images']) {
@@ -2869,7 +2940,8 @@
                   Settings for this tab when <em>Use local LLM provider</em>
                   is enabled. Run a LiteLLM (or compatible) proxy that translates the
                   Anthropic Messages API to your local model — cImp does not start
-                  the proxy. See the
+                  the proxy. These values become <code>ANTHROPIC_*</code> env vars
+                  at tab launch — restart the tab after editing them. See the
                   <a
                     href="https://docs.litellm.ai/docs/proxy/quick_start"
                     target="_blank"
@@ -3312,6 +3384,11 @@
             />
             <span>Inject offload guidance into the system prompt</span>
           </label>
+          <small class="hint">
+            The <code>offload_task</code> tool and its guidance are injected
+            when an AI tab starts — restart the Claude/OpenCode tab
+            (Tabs → Restart) after changing either toggle.
+          </small>
 
           <hr class="card-divider lg" />
           <div class="sub-tabs" role="tablist" aria-label="Offload sub-sections">
@@ -3725,7 +3802,8 @@
                   tab is ready to work. Overrides any existing
                   <code>local-llama</code>. Auto-sync re-derives it from the
                   primary local backend at launch and on save, but only while the
-                  offload server is enabled.
+                  offload server is enabled. OpenCode reads the provider from its
+                  launch config — restart the OpenCode tab to apply a change.
                 </small>
                 {#if opencodeProviderMsg && opencodeProviderMsg.i === i}
                   <small class={opencodeProviderMsg.ok ? 'hint' : 'error'}>{opencodeProviderMsg.text}</small>
@@ -4080,9 +4158,11 @@
                         updatePolicy(i, (p) => (p.env[j].value = (e.currentTarget as HTMLInputElement).value))}
                       placeholder="cat"
                     />
+                    <!-- `icon` opts out of the TUI themes' `[ … ]` bracket
+                         framing — brackets around a lone × wrap it tall. -->
                     <button
                       type="button"
-                      class="secondary"
+                      class="secondary icon"
                       aria-label="Remove environment variable"
                       onclick={() => updatePolicy(i, (p) => (p.env = p.env.filter((_, idx) => idx !== j)))}
                     >
@@ -4145,7 +4225,7 @@
           <h3>Server status</h3>
           <small class="hint top">
             Live health of the warm MCP host's connections. Updates as you add,
-            remove, or enable/disable servers below — no restart needed.
+            remove, or enable/disable servers below — no cImp restart needed.
           </small>
           {#if serviceStatus && serviceStatus.mcp_servers.length > 0}
             <ul class="mcp-health">
@@ -4169,11 +4249,14 @@
 
           <h3>Tool servers</h3>
           <small class="hint top">
-            Add an HTTP MCP endpoint by name + URL; changes apply live. cImp's
-            warm MCP host aggregates the read-class tools from these servers and
-            keeps the connections warm. Advanced stdio servers (command/args/env)
-            remain editable in <code>settings.json</code> under
-            <code>offload.mcp_servers</code>.
+            Add an HTTP MCP endpoint by name + URL; changes apply live for the
+            warm host and the offload worker. cImp's warm MCP host aggregates
+            the read-class tools from these servers and keeps the connections
+            warm. Claude Code and OpenCode capture their tool list when the tab
+            starts — after adding a server or flipping its Claude Code/OpenCode
+            exposure, restart the tab (Tabs → Restart) for the tools to appear.
+            Advanced stdio servers (command/args/env) remain editable in
+            <code>settings.json</code> under <code>offload.mcp_servers</code>.
           </small>
           <!-- Keyed by index deliberately: name/url are editable and the
                snapshot is replaced (cloned) on every edit, so a name/url/object
@@ -4183,18 +4266,23 @@
                field to bleed) — the index-key caveat is harmless here. -->
           {#each snapshot.offload.mcp_servers as srv, i (i)}
             <div class="mcp-row">
+              <div class="mcp-line">
+                <label class="mcp-field grow">
+                  <span>Name</span>
+                  <input
+                    type="text"
+                    placeholder="duckduckgo"
+                    value={srv.name}
+                    oninput={(e) =>
+                      setMcpServer(i, (m) => (m.name = (e.currentTarget as HTMLInputElement).value.trim()))}
+                    onchange={commitMcpEdits}
+                  />
+                </label>
+                <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
+                  Remove
+                </button>
+              </div>
               <label class="mcp-field">
-                <span>Name</span>
-                <input
-                  type="text"
-                  placeholder="duckduckgo"
-                  value={srv.name}
-                  oninput={(e) =>
-                    setMcpServer(i, (m) => (m.name = (e.currentTarget as HTMLInputElement).value.trim()))}
-                  onchange={commitMcpEdits}
-                />
-              </label>
-              <label class="mcp-field grow">
                 <span>URL</span>
                 <input
                   type="text"
@@ -4205,39 +4293,38 @@
                   onchange={commitMcpEdits}
                 />
               </label>
-              <label class="mcp-enable" title="Expose this server's tools to Claude Code">
-                <input
-                  type="checkbox"
-                  checked={srv.claude_access}
-                  onchange={(e) =>
-                    setMcpAccess(i, 'claude_access', (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>Claude Code</span>
-              </label>
-              <label class="mcp-enable" title="Expose this server's tools to the offload worker">
-                <input
-                  type="checkbox"
-                  checked={srv.offload_access}
-                  onchange={(e) =>
-                    setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>Offload</span>
-              </label>
-              <label class="mcp-enable" title="Expose this server's tools to OpenCode">
-                <input
-                  type="checkbox"
-                  checked={srv.opencode_access}
-                  onchange={(e) =>
-                    setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>OpenCode</span>
-              </label>
-              <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
-                Remove
-              </button>
+              <div class="mcp-enable-row">
+                <label class="mcp-enable" title="Expose this server's tools to Claude Code">
+                  <input
+                    type="checkbox"
+                    checked={srv.claude_access}
+                    onchange={(e) =>
+                      setMcpAccess(i, 'claude_access', (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Claude Code</span>
+                </label>
+                <label class="mcp-enable" title="Expose this server's tools to the offload worker">
+                  <input
+                    type="checkbox"
+                    checked={srv.offload_access}
+                    onchange={(e) =>
+                      setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Offload</span>
+                </label>
+                <label class="mcp-enable" title="Expose this server's tools to OpenCode">
+                  <input
+                    type="checkbox"
+                    checked={srv.opencode_access}
+                    onchange={(e) =>
+                      setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>OpenCode</span>
+                </label>
+              </div>
             </div>
           {/each}
-          <div class="button-row">
+          <div class="button-row mcp-add">
             <button type="button" onclick={addMcpServer}>Add MCP server</button>
           </div>
         </section>
@@ -4263,6 +4350,47 @@
           </label>
 
           {#if snapshot.graph.enabled}
+            <hr class="card-divider lg" />
+            <div class="sub-tabs" role="tablist" aria-label="Code Intelligence sub-sections">
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'graph'}
+                aria-selected={graphSubSection === 'graph'}
+                onclick={() => (graphSubSection = 'graph')}
+              >
+                Code graph
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'semantic'}
+                aria-selected={graphSubSection === 'semantic'}
+                onclick={() => (graphSubSection = 'semantic')}
+              >
+                Semantic search
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'efficiency'}
+                aria-selected={graphSubSection === 'efficiency'}
+                onclick={() => (graphSubSection = 'efficiency')}
+              >
+                Token efficiency
+              </button>
+              <button
+                type="button"
+                role="tab"
+                class:active={graphSubSection === 'viz'}
+                aria-selected={graphSubSection === 'viz'}
+                onclick={() => (graphSubSection = 'viz')}
+              >
+                Graph view
+              </button>
+            </div>
+
+            {#if graphSubSection === 'graph'}
             <div class="button-row">
               <button type="button" disabled={graphBusy} onclick={runGraphRebuild}>
                 {graphBusy ? 'Rebuilding…' : 'Rebuild index'}
@@ -4375,6 +4503,114 @@
               </button>
             </div>
 
+            <h3>Tool surface</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.lean_tools}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.lean_tools = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Lean tool surface (hide cold-tail graph tools)</span>
+            </label>
+            <small class="hint">
+              Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
+              <code>graph_struct_search</code>, <code>graph_path</code>, and
+              <code>graph_architecture</code> from the tool list advertised to the
+              cloud session and the offload worker — trimming the descriptors
+              cache-written once per session. Advertisement-only: each hidden tool
+              still answers if an agent calls it by name. The Code Intelligence tab
+              shows the current surface size.
+            </small>
+
+            <h3>Architecture &amp; path tracing</h3>
+            <small class="hint">
+              Tune V15's code-intelligence features: <code>graph_path</code>
+              (shortest-path tracing), <code>graph_architecture</code> (god
+              nodes, subsystems, surprising edges), and the live Graph view
+              (Tools tab).
+              Edge confidence (extracted/inferred/ambiguous) is always on.
+            </small>
+            <label>
+              <span>Path tracing max hops (1–32)</span>
+              <input
+                type="number"
+                min="1"
+                max="32"
+                value={snapshot.graph.path_max_hops}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.path_max_hops = Math.min(
+                        32,
+                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Max subsystems reported</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_max_communities}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_max_communities = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 12,
+                      )),
+                  )}
+              />
+            </label>
+            <label>
+              <span>Minimum subsystem size</span>
+              <input
+                type="number"
+                min="1"
+                value={snapshot.graph.arch_min_community_size}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.arch_min_community_size = Math.max(
+                        1,
+                        Number((e.currentTarget as HTMLInputElement).value) || 3,
+                      )),
+                  )}
+              />
+            </label>
+
+            <h3>Offload worker access</h3>
+            <label class="checkbox">
+              <input
+                type="checkbox"
+                checked={snapshot.graph.allow_remote_worker_access}
+                onchange={(e) =>
+                  patch(
+                    (s) =>
+                      (s.graph.allow_remote_worker_access = (
+                        e.currentTarget as HTMLInputElement
+                      ).checked),
+                  )}
+              />
+              <span>Allow a <strong>remote</strong> offload worker to query the graph</span>
+            </label>
+            <small class="hint">
+              ⚠ <strong>Privacy:</strong> the local offload worker can always
+              query the graph. A <strong>remote</strong> backend — whether a box
+              on your LAN or a public cloud API — would receive your project's
+              code structure (symbol names, call relationships, doc snippets).
+              Leave this off unless you trust the remote. The cloud Claude
+              session's <code>graph_*</code> tools are unaffected by this
+              setting.
+            </small>
+            {:else if graphSubSection === 'semantic'}
             <h3>Semantic search</h3>
             <label class="checkbox">
               <input
@@ -4392,9 +4628,11 @@
               Needs an OpenAI-compatible <code>/v1/embeddings</code> endpoint
               (e.g. a <code>llama-server --embedding</code> on a spare GPU box).
               Degrades to full-text search when the endpoint is unreachable; the
-              structural graph never depends on it.
+              structural graph never depends on it. Toggling this changes the
+              tools and guidance an AI tab sees — restart Claude/OpenCode tabs
+              to pick it up.
             </small>
-            {#if snapshot.graph.semantic_search}
+            <h3>Embedding server</h3>
               <label>
                 <span>Embedding endpoint</span>
                 <input
@@ -4446,8 +4684,7 @@
                 Use <strong>Rebuild embeddings</strong> in Tools →
                 Graph index after a silent model swap behind the same name.
               </small>
-            {/if}
-
+            {:else if graphSubSection === 'efficiency'}
             <h3>Context injection</h3>
             <label class="checkbox">
               <input
@@ -4586,7 +4823,6 @@
               </small>
             {/if}
 
-            <h3>Token efficiency</h3>
             <label class="checkbox">
               <input
                 type="checkbox"
@@ -4716,7 +4952,8 @@
                 <code>Read</code>. Strict — only a provable whole-file read of one
                 file is intercepted; anything with a pipe, redirect, glob, second
                 path, or a partial-read verb (<code>sed</code>, <code>head</code>)
-                runs untouched.
+                runs untouched. Installs a second hook matcher — re-launch the
+                Claude tab to pick it up.
               </small>
               <label>
                 <span>First-read digest tier (KiB, 0 = off)</span>
@@ -4769,88 +5006,7 @@
               {/if}
             </small>
 
-            <h3>Tool surface</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.lean_tools}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.lean_tools = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Lean tool surface (hide cold-tail graph tools)</span>
-            </label>
-            <small class="hint">
-              Drop <code>graph_cycles</code>, <code>graph_dead_exports</code>,
-              <code>graph_struct_search</code>, <code>graph_path</code>, and
-              <code>graph_architecture</code> from the tool list advertised to the
-              cloud session and the offload worker — trimming the descriptors
-              cache-written once per session. Advertisement-only: each hidden tool
-              still answers if an agent calls it by name. The Code Intelligence tab
-              shows the current surface size.
-            </small>
-
-            <h3>Architecture &amp; path tracing</h3>
-            <small class="hint">
-              Tune V15's code-intelligence features: <code>graph_path</code>
-              (shortest-path tracing), <code>graph_architecture</code> (god
-              nodes, subsystems, surprising edges), and the live Graph view
-              (Tools tab).
-              Edge confidence (extracted/inferred/ambiguous) is always on.
-            </small>
-            <label>
-              <span>Path tracing max hops (1–32)</span>
-              <input
-                type="number"
-                min="1"
-                max="32"
-                value={snapshot.graph.path_max_hops}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.path_max_hops = Math.min(
-                        32,
-                        Math.max(1, Number((e.currentTarget as HTMLInputElement).value) || 8),
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Max subsystems reported</span>
-              <input
-                type="number"
-                min="1"
-                value={snapshot.graph.arch_max_communities}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.arch_max_communities = Math.max(
-                        1,
-                        Number((e.currentTarget as HTMLInputElement).value) || 12,
-                      )),
-                  )}
-              />
-            </label>
-            <label>
-              <span>Minimum subsystem size</span>
-              <input
-                type="number"
-                min="1"
-                value={snapshot.graph.arch_min_community_size}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.arch_min_community_size = Math.max(
-                        1,
-                        Number((e.currentTarget as HTMLInputElement).value) || 3,
-                      )),
-                  )}
-              />
-            </label>
+            {:else if graphSubSection === 'viz'}
             <label class="checkbox">
               <input
                 type="checkbox"
@@ -4943,31 +5099,7 @@
                 </label>
               </div>
             {/if}
-
-            <h3>Offload worker access</h3>
-            <label class="checkbox">
-              <input
-                type="checkbox"
-                checked={snapshot.graph.allow_remote_worker_access}
-                onchange={(e) =>
-                  patch(
-                    (s) =>
-                      (s.graph.allow_remote_worker_access = (
-                        e.currentTarget as HTMLInputElement
-                      ).checked),
-                  )}
-              />
-              <span>Allow a <strong>remote</strong> offload worker to query the graph</span>
-            </label>
-            <small class="hint">
-              ⚠ <strong>Privacy:</strong> the local offload worker can always
-              query the graph. A <strong>remote</strong> backend — whether a box
-              on your LAN or a public cloud API — would receive your project's
-              code structure (symbol names, call relationships, doc snippets).
-              Leave this off unless you trust the remote. The cloud Claude
-              session's <code>graph_*</code> tools are unaffected by this
-              setting.
-            </small>
+            {/if}
           {/if}
         </section>
       {:else if activeSection === 'checks'}
@@ -4975,7 +5107,7 @@
           <h2>Checks</h2>
           <small class="hint">
             Project checker commands the <code>run_check</code> tool exposes to
-            Claude and the offload worker — a build, typecheck, lint, or test run
+            Claude, OpenCode, and the offload worker — a build, typecheck, lint, or test run
             turned into bounded, deduplicated diagnostics instead of a raw dump.
             Configured per project; changes land in this project's
             <code>.cimp/config.json</code> overlay.
@@ -4993,23 +5125,40 @@
             project root and merges their findings into one table. Nothing is
             bundled — each tool resolves from the <code>ebin\</code> drop-in
             folder first, then your PATH; point cImp at a specific build with
-            Browse, or check availability with Detect. Enable the feature to show
-            the Code audit section in the Tools tab.
+            Browse, or check availability with Detect. Configured paths are
+            machine-wide (saved to the global settings, shared by every
+            project); the enable checkboxes stay per-project. Enable the
+            feature to show the Code audit section in the Tools tab.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.code_audit.enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.code_audit.enabled = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Enable Code Audit (Tools → Code audit)</span>
-          </label>
+          <div class="sub-tabs" role="tablist" aria-label="Code Audit sub-sections">
+            <button
+              type="button"
+              role="tab"
+              class:active={auditSubSection === 'settings'}
+              aria-selected={auditSubSection === 'settings'}
+              onclick={() => (auditSubSection = 'settings')}
+            >
+              Settings
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={auditSubSection === 'security'}
+              aria-selected={auditSubSection === 'security'}
+              onclick={() => (auditSubSection = 'security')}
+            >
+              Security tools
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={auditSubSection === 'quality'}
+              aria-selected={auditSubSection === 'quality'}
+              onclick={() => (auditSubSection = 'quality')}
+            >
+              Quality tools
+            </button>
+          </div>
 
           {#snippet auditToolRow(row: AuditToolRow)}
             {@const det = auditDetect[row.meta.id]}
@@ -5027,6 +5176,13 @@
                 />
                 <span class="audit-name">{row.meta.name}</span>
                 <span class="audit-role">{row.meta.role}</span>
+                <span
+                  class="audit-scope"
+                  class:local={auditToolScope(row.tool) === 'local'}
+                  title="Whether this tool's config matches the global settings file (paths are always machine-wide)"
+                >
+                  {auditToolScope(row.tool)}
+                </span>
               </label>
               {#if toolNotApplicable(row.meta.id, auditCensus)}
                 <small class="hint audit-na">
@@ -5103,43 +5259,47 @@
             </div>
           {/snippet}
 
-          <h3>Security tools</h3>
-          <small class="hint">
-            Shown in the Code audit section's <strong>Security</strong> sub-tab
-            (Tools tab).
-          </small>
-          {#each auditGroups.security as row (row.meta.id)}
-            {@render auditToolRow(row)}
-          {/each}
-
-          <h3>Quality tools</h3>
-          <small class="hint">
-            Shown in the Code audit section's <strong>Quality</strong> sub-tab
-            (Tools tab).
-            Language-gated — a tool only appears there (and only runs) when the
-            project contains files it applies to. All tools are listed here
-            regardless of the current project.
-          </small>
-          {#if snapshot.code_audit.quality_auto_select}
-            <small class="hint audit-auto-note">
-              Selection: <strong>automatic</strong> — follows the project's
-              languages (heavyweight opt-ins stay off); editing a checkbox
-              switches to manual.
-            </small>
-          {:else}
-            <div class="audit-auto-row">
-              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
-                Auto-select for this project
+          {#snippet auditScopeControls()}
+            <div class="button-row">
+              <button type="button" class="secondary" onclick={() => void auditSaveGlobal()}>
+                Save to global
               </button>
-              <small class="hint">
-                re-select the tools matching the project's languages and keep
-                them in sync automatically
-              </small>
+              <button type="button" class="secondary" onclick={() => void auditLoadGlobal()}>
+                Load from global
+              </button>
+              <button type="button" class="secondary danger" onclick={auditClearAll}>
+                Clear all
+              </button>
             </div>
-          {/if}
-          {#each auditGroups.quality as row (row.meta.id)}
-            {@render auditToolRow(row)}
-          {/each}
+            <small class="hint">
+              Tool changes are saved to this project by default
+              (<strong>local</strong> badge). <strong>Save to global</strong>
+              makes the current tool config the default for every project;
+              <strong>Load from global</strong> discards this project's tool
+              config in favor of the global one; <strong>Clear all</strong>
+              saves an all-off tool config to this project. Tool paths are
+              always machine-wide.
+            </small>
+            {#if auditScopeError}
+              <small class="hint status-error">{auditScopeError}</small>
+            {/if}
+          {/snippet}
+
+          {#if auditSubSection === 'settings'}
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.code_audit.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.code_audit.enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Enable Code Audit (Tools → Code audit)</span>
+          </label>
 
           <h3>Scan settings</h3>
           <label>
@@ -5162,8 +5322,10 @@
             Advertise the <code>cimp-code-audit</code> MCP server
             (<code>security_audit</code> / <code>quality_audit</code>, native
             worker tools for offload) so AI consumers can trigger audits
-            themselves. Each requires Code Audit enabled above. OpenCode caches
-            its tool list at connect — flip a toggle and restart the tab.
+            themselves. Each requires Code Audit enabled above. The server set
+            is injected when an AI tab starts — after enabling Code Audit or
+            flipping an exposure here, restart the Claude/OpenCode tab
+            (Tabs → Restart) for the tools to appear.
           </small>
           <label class="checkbox">
             <input
@@ -5207,6 +5369,46 @@
             />
             <span>Expose to offload worker</span>
           </label>
+          {:else if auditSubSection === 'security'}
+          <small class="hint top">
+            Shown in the Code audit section's <strong>Security</strong> sub-tab
+            (Tools tab).
+          </small>
+          {@render auditScopeControls()}
+          {#each auditGroups.security as row (row.meta.id)}
+            {@render auditToolRow(row)}
+          {/each}
+
+          {:else if auditSubSection === 'quality'}
+          <small class="hint top">
+            Shown in the Code audit section's <strong>Quality</strong> sub-tab
+            (Tools tab).
+            Language-gated — a tool only appears there (and only runs) when the
+            project contains files it applies to. All tools are listed here
+            regardless of the current project.
+          </small>
+          {@render auditScopeControls()}
+          {#if snapshot.code_audit.quality_auto_select}
+            <small class="hint audit-auto-note">
+              Selection: <strong>automatic</strong> — follows the project's
+              languages (heavyweight opt-ins stay off); editing a checkbox
+              switches to manual.
+            </small>
+          {:else}
+            <div class="audit-auto-row">
+              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
+                Auto-select for this project
+              </button>
+              <small class="hint">
+                re-select the tools matching the project's languages and keep
+                them in sync automatically
+              </small>
+            </div>
+          {/if}
+          {#each auditGroups.quality as row (row.meta.id)}
+            {@render auditToolRow(row)}
+          {/each}
+          {/if}
         </section>
       {:else if activeSection === 'pricing'}
         <section>
@@ -5365,7 +5567,10 @@
             on, cImp periodically snapshots your working tree into a separate
             shadow git repo (your own <code>.git</code> is never touched).
             Enable this to start capturing checkpoints; restore one from the
-            Workbench tab's Timeline section.
+            Workbench tab's Timeline section. The per-prompt checkpoint trigger
+            rides a Claude prompt hook installed at tab launch (needs the code
+            graph) — if context injection is off, restart the Claude tab after
+            enabling this.
           </small>
           <label>
             <span>Max checkpoints kept</span>
@@ -5757,12 +5962,30 @@
   .mcp-detail {
     color: var(--text-secondary);
   }
-  /* Editable MCP server rows (name + url + enable + remove). */
+  /* Editable MCP server groups: three stacked lines per server —
+     name + remove, full-width URL, then the access checkboxes. */
   .mcp-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.4rem;
+  }
+  .mcp-row + .mcp-row {
+    /* Two blank-line-ish breathing room between server info groups. */
+    margin-top: 1.5rem;
+  }
+  .button-row.mcp-add {
+    margin-top: 1.5rem;
+  }
+  .mcp-line {
     display: flex;
     align-items: flex-end;
     gap: 0.5rem;
-    margin-top: 0.4rem;
+  }
+  .mcp-enable-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
     flex-wrap: wrap;
   }
   /* LLM pricing editor: shared column template so the header row and every
@@ -5790,6 +6013,9 @@
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
+    /* Cancel the global `label` bottom margin: the .mcp-row column gap owns
+       line spacing, and the stray margin misaligns the Remove button. */
+    margin-bottom: 0;
   }
   .mcp-field.grow {
     flex: 1 1 16rem;
@@ -5802,7 +6028,7 @@
     align-items: center;
     gap: 0.3rem;
     white-space: nowrap;
-    padding-bottom: 0.35rem;
+    margin-bottom: 0;
   }
   .mcp-enable input {
     width: auto;
@@ -6237,6 +6463,21 @@
     opacity: 0.7;
     font-size: 0.85em;
   }
+  /* Per-tool scope badge: does this tool's config match the global file
+     ("global") or carry a project override ("local")? */
+  .audit-tool .audit-scope {
+    margin-left: auto;
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    padding: 0 0.3rem;
+    white-space: nowrap;
+  }
+  .audit-tool .audit-scope.local {
+    color: var(--accent, #d77757);
+    border-color: currentcolor;
+  }
   small.hint.audit-detect {
     margin: 0;
     font-family: var(--font-mono, monospace);
@@ -6367,6 +6608,7 @@
      Bottom bar → Status bar arrangement and Claude context bar sections).
      Reset to a normal positive gap. */
   button + small.hint,
+  .button-row + small.hint,
   label.checkbox + small.hint {
     margin-top: var(--space-1);
   }

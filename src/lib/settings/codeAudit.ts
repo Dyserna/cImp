@@ -91,6 +91,25 @@ export function toolNotApplicable(id: AuditToolId, census: AuditCensus): boolean
   return !censusIsEmpty(census) && !isToolApplicable(id, census);
 }
 
+/// Whether a tool's project-scoped config matches the global settings file's
+/// entry for the same id — the per-tool "global"/"local" scope indicator.
+/// Compares `enabled`, `extra_args`, and `timeout_secs` only: `path` is
+/// machine-scope (always written through to the global file) and never makes
+/// a tool "local". A tool the global file doesn't know counts as local.
+export function toolMatchesGlobal(
+  tool: AuditToolConfig,
+  globalTools: AuditToolConfig[],
+): boolean {
+  const g = globalTools.find((t) => t.id === tool.id);
+  if (!g) return false;
+  return (
+    tool.enabled === g.enabled &&
+    (tool.timeout_secs ?? null) === (g.timeout_secs ?? null) &&
+    tool.extra_args.length === g.extra_args.length &&
+    tool.extra_args.every((a, i) => a === g.extra_args[i])
+  );
+}
+
 export type { AuditCategory };
 
 /// The per-tool Detect probe state the section tracks: `undefined` before any

@@ -40,7 +40,7 @@ use super::adapters::Category;
 use super::runner::{AuditSnapshot, AuditState, ToolStatus};
 use crate::checks::Severity;
 use crate::mcp_stdio::tool_error;
-use crate::offload::loopback::{parse_result_line, proxy_base};
+use crate::offload::loopback::{parse_result_line, proxy_base_for};
 use crate::settings::AuditToolId;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -123,7 +123,8 @@ fn audit_tool(name: &str, description: &str) -> Value {
 /// 1. A **summary line**: the category, the scan root, tool counts by outcome,
 ///    and finding counts by severity.
 /// 2. One **status line per tool** in the category — `done` (N findings +
-///    duration), `failed` (error), `not installed`, `skipped (not applicable)`,
+///    duration), `failed` (error), `not installed`, `misconfigured` (a
+///    configured path that doesn't resolve), `skipped (not applicable)`,
 ///    or `disabled` (idle).
 /// 3. The **findings**, errors first (then warnings, then notes; emit order
 ///    within each band), each as `SEVERITY file:line [tool/code] message`. Tool
@@ -144,6 +145,7 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
     let mut done = 0usize;
     let mut failed = 0usize;
     let mut not_installed = 0usize;
+    let mut misconfigured = 0usize;
     let mut skipped = 0usize;
     let mut disabled = 0usize;
     for t in &tools {
@@ -151,6 +153,7 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
             ToolStatus::Done => done += 1,
             ToolStatus::Failed => failed += 1,
             ToolStatus::NotInstalled => not_installed += 1,
+            ToolStatus::PathInvalid => misconfigured += 1,
             ToolStatus::SkippedNotApplicable => skipped += 1,
             ToolStatus::Idle => disabled += 1,
             // A completed snapshot shouldn't carry `Running`, but count it as
@@ -185,7 +188,8 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
     // 1) Summary line.
     out.push_str(&format!(
         "{} audit of {}: {} tool{} — {done} completed, {failed} failed, \
-         {not_installed} not installed, {skipped} not applicable, {disabled} disabled. \
+         {not_installed} not installed, {misconfigured} misconfigured, \
+         {skipped} not applicable, {disabled} disabled. \
          Findings: {total_findings} ({errors} error{}, {warnings} warning{}, {notes} note{}).\n",
         category_title(category),
         snapshot.root,
@@ -265,7 +269,15 @@ fn status_line(t: &super::runner::ToolState) -> String {
             "failed — {}",
             t.error.as_deref().unwrap_or("unknown error")
         ),
-        ToolStatus::NotInstalled => "not installed".to_string(),
+        ToolStatus::NotInstalled => {
+            "not installed (no path configured, not on PATH/ebin)".to_string()
+        }
+        ToolStatus::PathInvalid => format!(
+            "misconfigured — {}",
+            t.error
+                .as_deref()
+                .unwrap_or("configured path not found — fix it in cImp Settings")
+        ),
         ToolStatus::SkippedNotApplicable => "skipped (not applicable)".to_string(),
         ToolStatus::Idle => "disabled".to_string(),
         ToolStatus::Running => "running".to_string(),
@@ -477,9 +489,13 @@ fn http_client() -> Result<reqwest::Client, String> {
 /// the streamed NDJSON reply.
 ///
 /// **Contract with the Stage-3 loopback route:**
-/// - Request body: `{"category": "security"|"quality", "consumer": "<name>"}`
-///   (bearer-authenticated). The scan root is the app's own launch project, so
-///   this deliberately sends **no** `cwd`.
+/// - Request body: `{"category": ..., "consumer": "<name>", "cwd": "<dir>"}`
+///   (bearer-authenticated). The scan root is the app's own launch project;
+///   `cwd` (this child's working dir — the agent's project) is sent for
+///   VERIFICATION only: the route rejects a request whose cwd falls outside
+///   its root, so a misrouted child (stale/foreign discovery entry) gets a
+///   "wrong instance" error instead of a silently-wrong-project scan. The
+///   endpoint itself is picked root-aware via `proxy_base_for`.
 /// - Response: newline-delimited JSON. Any number of heartbeat lines (to keep a
 ///   minutes-long scan's connection alive) followed by exactly one final result
 ///   line — the loopback's `RunResult { ok, text, error }`. The **final line is
@@ -491,7 +507,8 @@ fn http_client() -> Result<reqwest::Client, String> {
 ///
 /// App not discoverable / not listening ⇒ the "cImp is not running" tool error.
 async fn run_via_loopback(category: Category) -> Result<String, String> {
-    let Some((base, token)) = proxy_base() else {
+    let cwd = std::env::current_dir().ok();
+    let Some((base, token)) = proxy_base_for(cwd.as_deref()) else {
         return Err("cImp is not running — start cImp to run code audits.".into());
     };
     let client = http_client()?;
@@ -502,6 +519,7 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
     let body = json!({
         "category": category,
         "consumer": consumer(),
+        "cwd": cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
     });
     let mut resp = match client
         .post(format!("{base}/audit/run"))
@@ -705,9 +723,32 @@ mod tests {
         assert!(out.contains("failed — network unreachable"), "{out}");
         // Outcome tally in the summary reflects all four.
         assert!(
-            out.contains("0 completed, 1 failed, 1 not installed, 1 not applicable, 1 disabled"),
+            out.contains(
+                "0 completed, 1 failed, 1 not installed, 0 misconfigured, \
+                 1 not applicable, 1 disabled"
+            ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn path_invalid_renders_as_misconfigured() {
+        // A configured-but-broken path must read as a user-fixable
+        // misconfiguration (with the offending path), not "not installed".
+        let tools = vec![tool_state(
+            AuditToolId::Gitleaks,
+            Category::Security,
+            ToolStatus::PathInvalid,
+            vec![],
+            0,
+            Some("configured path not found: C:\\tools\\gitleaks.exe — fix it in Settings"),
+        )];
+        let out = format_result(&snapshot(tools), Category::Security);
+        assert!(
+            out.contains("gitleaks — misconfigured — configured path not found: C:\\tools\\gitleaks.exe"),
+            "{out}"
+        );
+        assert!(out.contains("1 misconfigured"), "{out}");
     }
 
     #[test]

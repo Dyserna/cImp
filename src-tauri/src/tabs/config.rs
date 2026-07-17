@@ -215,6 +215,98 @@ fn command_is(command: &str, name: &str) -> bool {
 ///     the global `statusline.enabled`. The overlay merges with the
 ///     user's own Claude settings (only `statusLine` is set), so it
 ///     scopes the context bar to cImp without touching `~/.claude`.
+/// The four "is this MCP server advertised to this consumer" gates, factored
+/// out so the injection sites below and the restart-hint edge detector in
+/// `ipc::commands::settings_update` can never drift apart. Servers are
+/// injected only at TAB SPAWN (`--mcp-config` / `OPENCODE_CONFIG_CONTENT`),
+/// so a running AI tab keeps its old server set until restarted — any edit
+/// that flips one of these must surface a restart hint.
+pub(crate) fn advertises_offload_to_claude(s: &Settings) -> bool {
+    s.offload.enabled || s.graph.enabled || s.offload.any_claude_mcp()
+}
+
+pub(crate) fn advertises_audit_to_claude(s: &Settings) -> bool {
+    s.code_audit.enabled && s.code_audit.expose_claude
+}
+
+pub(crate) fn advertises_offload_to_opencode(s: &Settings) -> bool {
+    s.offload.enabled || s.graph.enabled || s.offload.any_opencode_mcp()
+}
+
+pub(crate) fn advertises_audit_to_opencode(s: &Settings) -> bool {
+    s.code_audit.enabled && s.code_audit.expose_opencode
+}
+
+/// Per-consumer spawn-injection signature — `[claude, opencode]`. Captures
+/// every Settings-derived input that reaches an AI tab only at spawn (the
+/// `--mcp-config` server set, the `compose_capability_guidance` gates, the
+/// `--settings` statusline/hooks overlay, the `claude_local` env for
+/// local-provider tabs, the OpenCode plugin's baked flags and the injected
+/// `local-llama` provider). Compared across a Settings save to decide whether
+/// a "restart the AI tab" hint is due. Coarse by design: any difference means
+/// a fresh tab would be launched differently from the one still running.
+pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
+    // Guidance addendum gates, shared verbatim by both consumers (Claude's
+    // `--append-system-prompt` and OpenCode's managed instructions file).
+    let guidance = serde_json::json!([
+        s.offload.enabled && s.offload.inject_guidance,
+        s.graph.enabled,
+        s.graph.enabled && s.graph.semantic_search,
+        s.graph.enabled && s.graph.promote_pinned_facts,
+    ]);
+    let read_hook = s.graph.enabled && s.graph.read_advisor && !s.harness_versions.e1_blocked();
+    let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
+    // `claude_local` env vars are synthesized at spawn, but only for Claude
+    // tabs that opted in — irrelevant edits shouldn't nag.
+    let local_env = s
+        .tabs
+        .iter()
+        .any(|t| {
+            matches!(t, TabConfig::AiTool(c)
+                if c.use_local_provider && command_is(&c.command, "claude"))
+        })
+        .then(|| {
+            serde_json::json!([
+                s.claude_local.base_url,
+                s.claude_local.auth_token,
+                s.claude_local.model_alias,
+            ])
+        });
+    let claude = serde_json::json!({
+        "mcp": [advertises_offload_to_claude(s), advertises_audit_to_claude(s)],
+        "guidance": guidance.clone(),
+        "statusline": s.statusline.enabled,
+        // The `--settings` hooks overlay gates, in `build_pre_args` order:
+        // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
+        // PostToolUse auto-check.
+        "hooks": [
+            s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
+            s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
+            read_hook,
+            read_hook && s.graph.read_advisor_shell,
+            post_edit,
+        ],
+        "local_env": local_env,
+    });
+    let opencode = serde_json::json!({
+        "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
+        "guidance": guidance,
+        // `write_opencode_plugin` inputs: plugin presence + its baked
+        // CIMP_INJECT_ENABLED / CIMP_AUTO_CHECK_ENABLED flags.
+        "plugin": [
+            s.graph.enabled,
+            s.graph.enabled && s.graph.context_injection,
+            post_edit,
+        ],
+        // The injected `local-llama` provider block (`build_opencode_config`).
+        "provider": s
+            .offload
+            .resolve_opencode_provider()
+            .map(|p| serde_json::json!([p.base_url, p.model, p.api_key])),
+    });
+    [claude, opencode]
+}
+
 fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     if !command_is(&cfg.command, "claude") {
         return Vec::new();
@@ -365,7 +457,7 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     if let Ok(exe) = std::env::current_exe() {
         let exe = exe.to_string_lossy().to_string();
         let mut servers = serde_json::Map::new();
-        if settings.offload.enabled || settings.graph.enabled || settings.offload.any_claude_mcp() {
+        if advertises_offload_to_claude(settings) {
             servers.insert(
                 "cimp-offload".to_string(),
                 serde_json::json!({
@@ -374,7 +466,7 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                 }),
             );
         }
-        if settings.code_audit.enabled && settings.code_audit.expose_claude {
+        if advertises_audit_to_claude(settings) {
             servers.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
@@ -613,8 +705,11 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     }
-    // Need the loopback endpoint to reach the app; without it, skip (and clean).
-    let Some(disc) = crate::offload::loopback::read_discovery() else {
+    // Need the loopback endpoint to reach the app; without it, skip (and
+    // clean). This runs IN the app at tab spawn, so it must bake THIS
+    // instance's endpoint — `read_own_discovery` (pid-keyed), never the
+    // shared last-writer-wins file a sibling instance may have overwritten.
+    let Some(disc) = crate::offload::loopback::read_own_discovery() else {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     };
@@ -835,8 +930,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
     if let Ok(exe) = std::env::current_exe() {
         let exe = exe.to_string_lossy().to_string();
         let mut mcp = serde_json::Map::new();
-        if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp()
-        {
+        if advertises_offload_to_opencode(settings) {
             mcp.insert(
                 "cimp-offload".to_string(),
                 serde_json::json!({
@@ -845,7 +939,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
                 }),
             );
         }
-        if settings.code_audit.enabled && settings.code_audit.expose_opencode {
+        if advertises_audit_to_opencode(settings) {
             mcp.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
@@ -1569,6 +1663,41 @@ mod tests {
     }
 
     #[test]
+    fn every_advertised_mcp_server_gets_a_loopback() {
+        // Tripwire for the V26 gap: any settings combo that injects an MCP
+        // server (Claude `--mcp-config` or the OpenCode `mcp` block) MUST also
+        // flip `Settings::loopback_needed()` — the injected children proxy
+        // every call over the loopback, so advertising without serving strands
+        // them all with "cImp is not running" while the app is visibly up.
+        // Sweep each feature axis alone and combined.
+        for (offload, graph, audit) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut settings = Settings::default();
+            settings.offload.enabled = offload;
+            settings.graph.enabled = graph;
+            settings.code_audit.enabled = audit;
+            let claude_advertises = build_pre_args(&claude_cfg(), &settings)
+                .iter()
+                .any(|a| a == "--mcp-config");
+            let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings)
+                .get("mcp")
+                .is_some();
+            if claude_advertises || opencode_advertises {
+                assert!(
+                    settings.loopback_needed(),
+                    "advertised an MCP server without a loopback: \
+                     offload={offload} graph={graph} audit={audit}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn graph_enabled_injects_graph_guidance() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
@@ -1980,5 +2109,65 @@ mod tests {
         assert!(fact_promotion_block(&dir, &settings).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restart-hint edge (`update_settings`) compares this signature
+    /// across a save — it must move on every spawn-baked setting, stay put on
+    /// live-applied tuning, and stay per-consumer where injection is.
+    #[test]
+    fn spawn_inject_sig_tracks_spawn_time_settings() {
+        let base = spawn_inject_sig(&Settings::default());
+
+        // Claude-only: the `--settings` statusline overlay. Flipped relative
+        // to the default (it ships enabled), not hardcoded.
+        let mut s = Settings::default();
+        s.statusline.enabled = !s.statusline.enabled;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], base[0], "statusline flip must move the Claude sig");
+        assert_eq!(sig[1], base[1], "statusline is Claude-only");
+
+        // Both consumers: guidance + MCP + plugin follow the graph toggle.
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        let with_graph = spawn_inject_sig(&s);
+        assert_ne!(with_graph[0], base[0]);
+        assert_ne!(with_graph[1], base[1]);
+
+        // Both consumers: context injection = Claude hook gate + the
+        // OpenCode plugin's baked CIMP_INJECT_ENABLED flag.
+        s.graph.context_injection = true;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], with_graph[0]);
+        assert_ne!(sig[1], with_graph[1]);
+
+        // Claude-only: the checkpoint prompt-hook gate (injection off).
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        s.workbench.checkpoints = true;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], with_graph[0], "checkpoints widen the hook gate");
+        assert_eq!(sig[1], with_graph[1], "the OpenCode plugin always POSTs");
+
+        // `claude_local` edits count only once a Claude tab opted into the
+        // local provider.
+        let mut s = Settings::default();
+        s.claude_local.base_url = "http://localhost:4000".to_string();
+        assert_eq!(
+            spawn_inject_sig(&s)[0],
+            base[0],
+            "no tab uses the local provider yet"
+        );
+        let mut tab = claude_cfg();
+        tab.use_local_provider = true;
+        s.tabs.push(TabConfig::AiTool(tab));
+        assert_ne!(spawn_inject_sig(&s)[0], base[0]);
+
+        // Live-applied tuning must NOT nag: the read-advisor thresholds are
+        // read per-invocation by the loopback handler, not baked at spawn.
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        s.graph.read_advisor_min_lines += 25;
+        s.graph.context_per_file_chars += 100;
+        assert_eq!(spawn_inject_sig(&s), with_graph);
     }
 }

@@ -35,6 +35,8 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// adapter's [`super::adapters::Applicability::markers`] references verbatim;
 /// [`marker_for`] maps a concrete filename to its token. Glob-shaped markers
 /// (`*.sln`, `*.csproj`) and the eslint-config families collapse to one token.
+/// Only the lockstep test reads it — production code goes through [`marker_for`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub const MARKERS: &[&str] = &[
     "go.mod",
     "Cargo.toml",

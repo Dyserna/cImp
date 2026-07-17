@@ -101,7 +101,86 @@ use crate::stt::SttHandle;
 use crate::tabs::{TabRegistry, TabRegistryHandle};
 use crate::tts::{spawn_tts_worker, ActiveTab, AiTtsSuppressed, SpeakSession, TtsRequest};
 
+/// Usage text for `cimp --help`. Lists the drop-in `claude` forwarding
+/// contract and the service flags so an agent probing the CLI learns the
+/// surface instead of launching a GUI window per probe.
+fn help_text() -> String {
+    format!(
+        "\
+cimp {} — code Imp: a TTS/avatar terminal for AI coding agents
+
+USAGE:
+  cimp [CLAUDE_ARGS...]   launch the GUI in the current directory; unrecognized
+                          args are forwarded verbatim to the Claude tab
+                          (drop-in `claude` replacement, e.g. `cimp --resume <id>`)
+
+INFO:
+  -h, --help              print this help and exit
+  -V, --version           print the cimp version and exit
+
+SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
+  --statusline                           Claude Code status-line renderer
+  --context-hook                         UserPromptSubmit hook shim
+  --precompact-hook                      PreCompact hook shim
+  --read-hook                            PreToolUse read-advisor hook shim
+  --postedit-hook                        PostToolUse checks hook shim
+  --offload-mcp [--consumer <name>]      stdio MCP server (offload + graph + proxied servers)
+  --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
+
+The MCP servers and hooks proxy to a RUNNING cImp instance launched in the
+project directory; they are injected automatically into the AI tabs cImp
+spawns and have no standalone mode.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Best-effort attach to the parent's console so `--help`/`--version` output
+/// is visible when a release build (`windows_subsystem = "windows"`) is run
+/// from an interactive terminal. Only attaches when stdout has no handle at
+/// all — when stdio is piped (agents, hooks, statusline) the inherited pipe
+/// handles must stay untouched.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() {
+    // `--help`/`--version` guard: agents reflexively probe unknown CLIs with
+    // `cimp --help`, and before this guard every such invocation fell through
+    // to the full GUI launch — each probe opened a real window (observed with
+    // Claude Code running `cimp --help`, `cimp help`, `cimp code-audit --help`
+    // in a project where the audit MCP server wasn't advertised). Handled
+    // first and GUI-free like the service shims below. Everything else still
+    // falls through: `cimp` is a drop-in `claude` replacement and forwards
+    // unrecognized args to the Claude tab.
+    {
+        let early: Vec<String> = std::env::args().skip(1).collect();
+        let wants_help = early.iter().any(|a| a == "--help" || a == "-h")
+            || early.first().is_some_and(|a| a == "help");
+        if wants_help {
+            attach_parent_console();
+            println!("{}", help_text());
+            return;
+        }
+        if early.iter().any(|a| a == "--version" || a == "-V") {
+            attach_parent_console();
+            println!("cimp {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+    }
+
     // Status-line subcommand: Claude Code invokes `cimp --statusline`,
     // pipes the session JSON to our stdin, and reads the rendered context
     // bar from our stdout. Handle it before any Tauri/audio/settings init
@@ -537,10 +616,15 @@ fn main() {
                 // below call it, but the loopback binds a port and the pollers
                 // spawn tasks, so it must run at most once.
                 let offload_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // Start the runtime (loopback + warm host) when offload is enabled
-                // OR a server is exposed to Claude Code — Claude reaches MCP tools
-                // over the loopback independent of offload.
-                if settings_for_offload.current().offload.mcp_host_needed() {
+                // Start the runtime (loopback + warm host) when ANY feature
+                // whose out-of-process children dial back in needs it: offload
+                // enabled, an MCP server exposed to Claude Code/OpenCode, the
+                // graph (its tools ride the injected cimp-offload server and
+                // the hook shims), or Code Audit exposed to a stdio consumer
+                // (`cimp --code-audit-mcp` proxies to `/audit/run`). Gating on
+                // offload alone stranded audit-only/graph-only projects with
+                // "cImp is not running" tool errors.
+                if settings_for_offload.current().loopback_needed() {
                     if !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         start_offload_runtime(
                             app.handle().clone(),
@@ -568,7 +652,7 @@ fn main() {
                         loop {
                             match rx.recv().await {
                                 Ok(s) => {
-                                    if s.offload.mcp_host_needed()
+                                    if s.loopback_needed()
                                         && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
                                     {
                                         info!("offload: MCP host needed at runtime — starting offload runtime");
@@ -867,6 +951,9 @@ fn main() {
             audit::audit_cancel_scan,
             audit::audit_snapshot,
             audit::audit_refresh_census,
+            audit::audit_tools_global_config,
+            audit::audit_tools_save_global,
+            audit::audit_tools_load_global,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -977,13 +1064,19 @@ fn start_offload_runtime(
         supervisor.autostart_all().await;
     });
     // V8-03: warm the MCP host, start the loopback endpoint (writes the
-    // discovery file), and watch backend health so `/events` →
+    // discovery files), and watch backend health so `/events` →
     // `tools/list_changed` tracks up/down.
     tauri::async_runtime::spawn(async move {
         service.warm_host().await;
         service.spawn_health_watch();
         service.spawn_metrics_poller();
-        match crate::offload::loopback::Loopback::start(service.clone(), app_handle.clone()).await {
+        // The launch root rides the discovery entry so MCP children spawned
+        // by a DIFFERENT project's agent can't misroute to this instance
+        // (per-instance `.cimp-discovery/<pid>.json`; see loopback.rs).
+        let root = app_handle.state::<AppState>().launch.cwd.clone();
+        match crate::offload::loopback::Loopback::start(service.clone(), app_handle.clone(), &root)
+            .await
+        {
             Ok(lb) => {
                 app_handle.manage(lb);
             }

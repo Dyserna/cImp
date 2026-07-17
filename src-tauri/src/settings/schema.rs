@@ -726,6 +726,19 @@ impl Settings {
     pub fn find_tab_mut(&mut self, id: &str) -> Option<&mut TabConfig> {
         self.tabs.iter_mut().find(|t| t.id() == id)
     }
+
+    /// Whether the loopback endpoint (and the offload runtime that owns it)
+    /// must run: true when ANY feature whose out-of-process children — MCP
+    /// stdio servers, hook shims — dial back into the app over the loopback
+    /// is on. The advertise gates in `tabs::config` (`build_pre_args`,
+    /// `build_opencode_config`) must stay a subset of this: advertising a
+    /// server whose endpoint never starts strands every tool call with
+    /// "cImp is not running" while the app is visibly running (the V26 Code
+    /// Audit gap — `offload.mcp_host_needed()` alone misses `graph` and
+    /// `code_audit`, which both inject servers on their own).
+    pub fn loopback_needed(&self) -> bool {
+        self.offload.mcp_host_needed() || self.graph.enabled || self.code_audit.mcp_exposed()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -1259,6 +1272,17 @@ impl Default for CodeAuditSettings {
             expose_opencode: true,
             expose_offload: true,
         }
+    }
+}
+
+impl CodeAuditSettings {
+    /// Whether the `cimp-code-audit` MCP server is advertised to at least one
+    /// stdio consumer (Claude Code or OpenCode) — i.e. an out-of-process
+    /// child will need the loopback. `expose_offload` is deliberately absent:
+    /// the offload worker runs in-process and is already covered by
+    /// `offload.enabled`.
+    pub fn mcp_exposed(&self) -> bool {
+        self.enabled && (self.expose_claude || self.expose_opencode)
     }
 }
 
@@ -2615,11 +2639,13 @@ impl OffloadSettings {
         self.mcp_servers.iter().any(|m| m.opencode_access)
     }
 
-    /// Whether the warm MCP host + loopback endpoint need to run. True when
-    /// offload is enabled (the worker needs the host) OR any MCP server is
-    /// exposed to Claude Code or OpenCode directly (each reaches it over the
-    /// loopback, independent of offload). Drives runtime startup, the warm-host
-    /// lifecycle, and the per-tab MCP injection.
+    /// Whether the warm MCP HOST (the pool of user-configured MCP servers)
+    /// needs to run: offload is enabled (the worker needs the host) OR any
+    /// MCP server is exposed to Claude Code or OpenCode directly (each
+    /// reaches it over the loopback, independent of offload). Drives the
+    /// warm-host lifecycle. NOTE: runtime/loopback startup gates on the
+    /// broader [`Settings::loopback_needed`] — graph and Code Audit children
+    /// need the loopback without needing the host.
     pub fn mcp_host_needed(&self) -> bool {
         self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
     }

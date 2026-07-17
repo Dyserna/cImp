@@ -5,6 +5,105 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0] — 2026-07-17
+
+### Changed
+
+- **Code Intelligence settings split into four sub-tabs.** The one long
+  scroll is now Code graph (rebuild/status, indexing, ignores, tool
+  surface, architecture & path tracing, offload worker access) ·
+  Semantic search (toggle plus the embedding server config, now always
+  visible instead of hidden behind the toggle) · Token efficiency
+  (context injection, read advisor, local-model digests) · Graph view
+  (enable, max nodes, tuning, edge colors).
+- **Code Audit settings split into three sub-tabs.** Settings (feature
+  toggle, scan settings, MCP exposure) · Security tools · Quality
+  tools, using the same sub-tab nav as Code Intelligence.
+- **Offload backend template libraries are now truly machine-global.**
+  Saved server-command / remote-backend templates write through to the
+  global settings.json and never pin into a project overlay; templates
+  stranded in an existing overlay are promoted into the global baseline
+  once on load. Mid-session promotions stick — the settings diff
+  baseline now tracks the physical global file instead of being frozen
+  at launch.
+- **MCP tool-server editor rows stack into card-like groups.** Each
+  server lays out as name + Remove, a full-width URL field, and the
+  access checkboxes, with clear spacing between server groups.
+
+### Fixed
+
+- **`cimp --help` / `--version` no longer launch the GUI.** Both (plus `-h`,
+  `-V`, and a leading `help`) print usage/version and exit — previously any
+  unrecognized invocation fell through to a full app launch, so an AI agent
+  probing the CLI (`cimp --help`, `cimp code-audit --help`) opened real
+  windows. All other args still forward to the Claude tab (the drop-in
+  `claude` contract, e.g. `cimp --resume <id>`).
+- **Code-audit / graph MCP tools no longer strand with "cImp is not running"
+  when offload is off.** The loopback endpoint now starts whenever ANY
+  feature that advertises an MCP server needs it (offload, graph, Code Audit
+  exposure) — previously it keyed on offload alone, so an audit-only or
+  graph-only project advertised tools whose endpoint never came up. A
+  tripwire test keeps the advertise and serve gates aligned.
+- **Multi-instance MCP routing.** Discovery is now per-instance
+  (`.cimp-discovery/<pid>.json` next to the exe, each entry carrying its
+  launch root) and children resolve the instance whose root contains their
+  cwd — previously the single last-writer-wins `.cimp-offload.json` could
+  route project A's audits/graph/hook calls to project B's instance. Stale
+  entries from hard-killed instances are swept at startup, the legacy file
+  is kept in step as a fallback, and `/audit/run` additionally rejects a
+  misrouted child with a clear "this instance serves X" error instead of
+  scanning the wrong project.
+- **Audit scanner paths now apply machine-wide.** Configured scanner exe
+  paths (`code_audit.tools[].path`) were silently saved into the active
+  project's overlay, so paths set up in one repo resolved to nothing in
+  every other repo. Paths now live in the global settings file (legacy
+  overlay paths are promoted once at load); the per-project overlay keeps
+  only the enable flags and extra args.
+- **TUI themes: settings editor buttons unwrapped.** Under the TUI themes
+  (whose "[ Save ]" bracket convention wraps every settings-section button
+  in `[ … ]` pseudo-elements) the compact × remove buttons in the Checks,
+  environment, and args editors wrapped three lines tall, and their text
+  buttons (Test, Detect & configure, + Add …) drew a box around the
+  brackets. The × buttons now use the themes' `icon` opt-out and keep their
+  compact box; the text buttons moved their visuals to element-level
+  selectors so the TUI reset can flatten them into proper bracket buttons.
+  Modern themes render pixel-identical to before. A dev-only harness
+  (`src/dev/checks-harness.html`) renders the checks editor under both
+  theme families for future settings-UI work.
+
+### Added
+
+- **Code Audit tool-list scope controls.** Save to global / Load from
+  global / Clear all buttons on both scanner sub-tabs, plus a per-tool
+  global/local badge (comparing enabled, extra args, and timeout; exe
+  paths stay machine-scope). Edits still default to the project
+  overlay; Save promotes the tool config to the global file, Load
+  re-adopts it and drops the project copy.
+- **"Restart the AI tab" hint when MCP exposure changes.** Enabling Code
+  Audit (or flipping any setting that changes which MCP servers are
+  advertised) now shows a toast in the main window and a Settings hint —
+  servers are injected at tab spawn, so a running Claude/OpenCode session
+  can't gain them mid-flight.
+- **Restart warnings on every spawn-baked setting.** The restart-hint toast
+  now fires for ALL settings that only reach an AI tab at launch, not just
+  the MCP server set: capability guidance (offload nudge, graph, semantic
+  search, pinned facts), the Claude `--settings` overlay (status line,
+  context-injection / checkpoint prompt hook, compaction hook, read advisor
+  + its shell matcher, post-edit auto-check), the OpenCode plugin flags and
+  injected `local-llama` provider, and the local-provider `ANTHROPIC_*` env
+  (only when a Claude tab actually opted in). Settings hints were added or
+  corrected to match: offload enable/guidance, the MCP tool-server editor
+  (whose "changes apply live" only ever applied to the warm host — AI tabs
+  capture their tool list at connect), semantic search, the shell-read
+  matcher, Workbench checkpoints, the Local LLM provider fields, and Add to
+  OpenCode. Flipping a tab's "Use local LLM provider" now also trips the
+  per-tab Restart Required badge.
+- **Distinct "misconfigured" audit-tool status.** A tool whose CONFIGURED
+  path doesn't resolve now reports `path-invalid` ("configured path not
+  found: <path> — fix it in Settings", with a Settings link in the chip)
+  instead of the misleading "not installed"; the MCP report summary counts
+  it separately.
+
 ## [0.47.0] — 2026-07-16
 
 ### Changed

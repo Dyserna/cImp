@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.47.0"
+version = "0.48.0"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"
@@ -206,6 +206,7 @@ winreg = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

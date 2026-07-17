@@ -102,9 +102,12 @@
         placeholder="value"
         oninput={(e) => updateValue(i, (e.currentTarget as HTMLInputElement).value)}
       />
+      <!-- `icon` opts out of the TUI themes' `[ … ]` bracket framing (their
+           `section button:not(.icon)::before/::after` rules) — brackets
+           don't fit in this 28px box and wrap it three lines tall. -->
       <button
         type="button"
-        class="remove"
+        class="remove icon"
         aria-label="Remove"
         onclick={() => removeAt(i)}
       >
@@ -151,33 +154,11 @@
     color: var(--text-tertiary);
     font-family: monospace;
   }
-  .remove {
-    width: 28px;
-    padding: 0;
-    line-height: 24px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-default);
-    color: var(--text-quiet-strong);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    font-size: 16px;
-    transition:
-      background var(--motion-fast) var(--easing-standard),
-      color var(--motion-fast) var(--easing-standard),
-      border-color var(--motion-fast) var(--easing-standard);
-  }
-  .remove:hover {
-    background: var(--surface-danger-bg);
-    color: var(--text-danger-pale);
-    border-color: var(--border-danger-strong);
-  }
-  .remove:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .add {
-    align-self: flex-start;
-    margin-top: var(--space-1);
+  /* Base button look. Deliberately element-level — the lowest scoped
+     specificity — so a TUI theme's flat `[ … ]` section-button reset
+     (`html[data-theme] section button`) outranks it; a class selector here
+     would win instead and draw this box AROUND the theme's brackets. */
+  button {
     background: var(--surface-2);
     border: 1px solid var(--border-default);
     color: var(--text-quiet-strong);
@@ -187,14 +168,38 @@
     font-size: var(--font-size-xs);
     transition:
       background var(--motion-fast) var(--easing-standard),
-      color var(--motion-fast) var(--easing-standard);
+      color var(--motion-fast) var(--easing-standard),
+      border-color var(--motion-fast) var(--easing-standard);
   }
-  .add:hover {
+  button:hover {
     background: var(--surface-input);
     color: var(--text-primary);
   }
-  .add:focus-visible {
+  button:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+  /* Class-level (not element-level) ON PURPOSE: `icon` skips the TUI
+     bracket framing, but the TUI section-button reset still strips
+     background/border — these higher-specificity rules keep the compact
+     box in every theme. */
+  .remove {
+    width: 28px;
+    padding: 0;
+    line-height: 24px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-default);
+    color: var(--text-quiet-strong);
+    border-radius: var(--radius-sm);
+    font-size: 16px;
+  }
+  .remove:hover {
+    background: var(--surface-danger-bg);
+    color: var(--text-danger-pale);
+    border-color: var(--border-danger-strong);
+  }
+  .add {
+    align-self: flex-start;
+    margin-top: var(--space-1);
   }
 </style>

@@ -4197,18 +4197,23 @@
                field to bleed) — the index-key caveat is harmless here. -->
           {#each snapshot.offload.mcp_servers as srv, i (i)}
             <div class="mcp-row">
+              <div class="mcp-line">
+                <label class="mcp-field grow">
+                  <span>Name</span>
+                  <input
+                    type="text"
+                    placeholder="duckduckgo"
+                    value={srv.name}
+                    oninput={(e) =>
+                      setMcpServer(i, (m) => (m.name = (e.currentTarget as HTMLInputElement).value.trim()))}
+                    onchange={commitMcpEdits}
+                  />
+                </label>
+                <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
+                  Remove
+                </button>
+              </div>
               <label class="mcp-field">
-                <span>Name</span>
-                <input
-                  type="text"
-                  placeholder="duckduckgo"
-                  value={srv.name}
-                  oninput={(e) =>
-                    setMcpServer(i, (m) => (m.name = (e.currentTarget as HTMLInputElement).value.trim()))}
-                  onchange={commitMcpEdits}
-                />
-              </label>
-              <label class="mcp-field grow">
                 <span>URL</span>
                 <input
                   type="text"
@@ -4219,39 +4224,38 @@
                   onchange={commitMcpEdits}
                 />
               </label>
-              <label class="mcp-enable" title="Expose this server's tools to Claude Code">
-                <input
-                  type="checkbox"
-                  checked={srv.claude_access}
-                  onchange={(e) =>
-                    setMcpAccess(i, 'claude_access', (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>Claude Code</span>
-              </label>
-              <label class="mcp-enable" title="Expose this server's tools to the offload worker">
-                <input
-                  type="checkbox"
-                  checked={srv.offload_access}
-                  onchange={(e) =>
-                    setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>Offload</span>
-              </label>
-              <label class="mcp-enable" title="Expose this server's tools to OpenCode">
-                <input
-                  type="checkbox"
-                  checked={srv.opencode_access}
-                  onchange={(e) =>
-                    setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>OpenCode</span>
-              </label>
-              <button type="button" class="secondary danger" onclick={() => removeMcpServer(i)}>
-                Remove
-              </button>
+              <div class="mcp-enable-row">
+                <label class="mcp-enable" title="Expose this server's tools to Claude Code">
+                  <input
+                    type="checkbox"
+                    checked={srv.claude_access}
+                    onchange={(e) =>
+                      setMcpAccess(i, 'claude_access', (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Claude Code</span>
+                </label>
+                <label class="mcp-enable" title="Expose this server's tools to the offload worker">
+                  <input
+                    type="checkbox"
+                    checked={srv.offload_access}
+                    onchange={(e) =>
+                      setMcpAccess(i, 'offload_access', (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Offload</span>
+                </label>
+                <label class="mcp-enable" title="Expose this server's tools to OpenCode">
+                  <input
+                    type="checkbox"
+                    checked={srv.opencode_access}
+                    onchange={(e) =>
+                      setMcpAccess(i, 'opencode_access', (e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>OpenCode</span>
+                </label>
+              </div>
             </div>
           {/each}
-          <div class="button-row">
+          <div class="button-row mcp-add">
             <button type="button" onclick={addMcpServer}>Add MCP server</button>
           </div>
         </section>
@@ -5781,12 +5785,30 @@
   .mcp-detail {
     color: var(--text-secondary);
   }
-  /* Editable MCP server rows (name + url + enable + remove). */
+  /* Editable MCP server groups: three stacked lines per server —
+     name + remove, full-width URL, then the access checkboxes. */
   .mcp-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.4rem;
+  }
+  .mcp-row + .mcp-row {
+    /* Two blank-line-ish breathing room between server info groups. */
+    margin-top: 1.5rem;
+  }
+  .button-row.mcp-add {
+    margin-top: 1.5rem;
+  }
+  .mcp-line {
     display: flex;
     align-items: flex-end;
     gap: 0.5rem;
-    margin-top: 0.4rem;
+  }
+  .mcp-enable-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
     flex-wrap: wrap;
   }
   /* LLM pricing editor: shared column template so the header row and every
@@ -5814,6 +5836,9 @@
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
+    /* Cancel the global `label` bottom margin: the .mcp-row column gap owns
+       line spacing, and the stray margin misaligns the Remove button. */
+    margin-bottom: 0;
   }
   .mcp-field.grow {
     flex: 1 1 16rem;
@@ -5826,7 +5851,7 @@
     align-items: center;
     gap: 0.3rem;
     white-space: nowrap;
-    padding-bottom: 0.35rem;
+    margin-bottom: 0;
   }
   .mcp-enable input {
     width: auto;

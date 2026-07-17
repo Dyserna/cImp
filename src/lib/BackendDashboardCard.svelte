@@ -76,7 +76,7 @@
   });
 
   $effect(() => {
-    logLines;
+    void logLines;
     if (showLog && logEl) logEl.scrollTop = logEl.scrollHeight;
   });
 

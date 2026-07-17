@@ -9,6 +9,7 @@
   import { avatarVisible } from './avatarState';
   import { avatar as avatarSettings, waveform as waveformSettings } from './settings/store';
 
+  // oxlint-disable-next-line no-unassigned-vars -- assigned via bind:this
   let canvasEl: HTMLCanvasElement;
   let ctx: CanvasRenderingContext2D | null = null;
   let animationId = 0;

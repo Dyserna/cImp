@@ -1,0 +1,35 @@
+# Config for the `typos` scanner (Code Audit → quality). Every entry below is a
+# confirmed false positive from the 2026-07-17 audit sweep; identity mappings
+# accept the word as spelled. Trade-off: a future *real* typo matching one of
+# these words won't be flagged.
+
+[default.extend-words]
+# Crate / product names
+ratatui = "ratatui"
+# Legitimate variant spelling used consistently across the codebase
+unparseable = "unparseable"
+# Hyphenated prose ("mis-splits", "mis-detection") — typos splits on the hyphen
+mis = "mis"
+# Deliberate typo fixtures in the audit parser's own tests
+# (src-tauri/src/audit/parsers.rs, src/lib/codeAudit/logic.test.ts,
+# src/lib/diffWords.test.ts, src-tauri/src/tabs/config.rs)
+teh = "teh"
+funciton = "funciton"
+namee = "namee"
+faill = "faill"
+# Test fixtures: content_hash("abd"), streaming chunk "Hel", latin-1 "caf\xe9"
+abd = "abd"
+hel = "hel"
+caf = "caf"
+# Short identifiers (ancestor loop var, params map, CSS classes, data arrays)
+anc = "anc"
+pn = "pn"
+aloc = "aloc"
+useg = "useg"
+datas = "datas"
+# Svelte plural ("writables fire on subscribe")
+writables = "writables"
+# camelCase-split shrapnel: ANDed → "Ded", ScatterND → "ND", IIFEs → "IIF"
+ded = "ded"
+nd = "nd"
+iif = "iif"

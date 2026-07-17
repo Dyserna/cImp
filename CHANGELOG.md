@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advertised) now shows a toast in the main window and a Settings hint —
   servers are injected at tab spawn, so a running Claude/OpenCode session
   can't gain them mid-flight.
+- **Restart warnings on every spawn-baked setting.** The restart-hint toast
+  now fires for ALL settings that only reach an AI tab at launch, not just
+  the MCP server set: capability guidance (offload nudge, graph, semantic
+  search, pinned facts), the Claude `--settings` overlay (status line,
+  context-injection / checkpoint prompt hook, compaction hook, read advisor
+  + its shell matcher, post-edit auto-check), the OpenCode plugin flags and
+  injected `local-llama` provider, and the local-provider `ANTHROPIC_*` env
+  (only when a Claude tab actually opted in). Settings hints were added or
+  corrected to match: offload enable/guidance, the MCP tool-server editor
+  (whose "changes apply live" only ever applied to the warm host — AI tabs
+  capture their tool list at connect), semantic search, the shell-read
+  matcher, Workbench checkpoints, the Local LLM provider fields, and Add to
+  OpenCode. Flipping a tab's "Use local LLM provider" now also trips the
+  per-tab Restart Required badge.
 - **Distinct "misconfigured" audit-tool status.** A tool whose CONFIGURED
   path doesn't resolve now reports `path-invalid` ("configured path not
   found: <path> — fix it in Settings", with a Settings link in the chip)

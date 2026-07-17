@@ -201,18 +201,18 @@
       // compose overlay). Idempotent; safe even when STT is disabled —
       // the backend simply never emits until the user records.
       initStt();
-      // Settings edits that change which MCP servers are advertised to an
-      // AI tab (offload / graph / Code Audit exposure) only take effect at
-      // tab spawn — surface the backend's edge hint as a toast so the user
-      // knows to restart the tab (Settings → Tabs → Restart) instead of
-      // wondering why the tools didn't appear.
+      // Settings edits that are baked into an AI tab at spawn (MCP server
+      // exposure, hooks, guidance, statusline, local-provider env, the
+      // OpenCode provider) only take effect at tab spawn — surface the
+      // backend's edge hint as a toast so the user knows to restart the tab
+      // (Settings → Tabs → Restart) instead of wondering why nothing changed.
       void listen<string[]>('ai-tab-restart-hint', (e) => {
         const names = (e.payload ?? [])
           .map((c) => (c === 'claude' ? 'Claude' : c === 'opencode' ? 'OpenCode' : c))
           .join(' and ');
         if (!names) return;
         showToast(
-          `MCP tool changes take effect after restarting the ${names} tab${
+          `Some of the saved changes take effect after restarting the ${names} tab${
             e.payload.length > 1 ? 's' : ''
           } (Settings → Tabs → Restart).`,
           8000,

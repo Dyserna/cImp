@@ -875,7 +875,7 @@ pub async fn settings_update(
     // Snapshot the pre-update flags (reserved tabs via the table, plus the
     // STT pair handled separately below) and the effective `graph.ignore`
     // list for the resync edge at the bottom.
-    let (was_reserved, was_stt, was_stt_device, was_graph_ignore, was_mcp_sig) = {
+    let (was_reserved, was_stt, was_stt_device, was_graph_ignore, was_spawn_sig) = {
         let old = state.settings.current();
         let was: Vec<bool> = RESERVED_TAB_FLAGS
             .iter()
@@ -886,7 +886,7 @@ pub async fn settings_update(
             old.stt.enabled,
             old.stt.device,
             normalized_ignore(&old.graph.ignore),
-            crate::tabs::mcp_advertise_sig(&old),
+            crate::tabs::spawn_inject_sig(&old),
         )
     };
 
@@ -963,20 +963,22 @@ pub async fn settings_update(
         graph.spawn_ignore_resync();
     }
 
-    // On an advertised-MCP-server edge (offload/graph/code-audit/user-server
-    // exposure flips), tell the main window to show a restart hint: servers
-    // are injected only at tab spawn (`--mcp-config` for Claude,
-    // `OPENCODE_CONFIG_CONTENT` for OpenCode), so a running AI tab keeps its
-    // old tool set until restarted. The V26 field report: Code Audit enabled
-    // mid-session advertised nothing, the agent went probing for a CLI and
-    // opened GUI instances. Payload = the consumer names whose set changed.
-    let now_mcp_sig = crate::tabs::mcp_advertise_sig(&now);
-    if now_mcp_sig != was_mcp_sig {
+    // On a spawn-injection edge — anything baked into an AI tab only at
+    // launch: the advertised MCP server set (`--mcp-config` for Claude,
+    // `OPENCODE_CONFIG_CONTENT` for OpenCode), the guidance addendum, the
+    // `--settings` statusline/hooks overlay, the local-provider env, the
+    // OpenCode plugin flags/provider — tell the main window to show a restart
+    // hint: a running AI tab keeps its old injection until restarted. The V26
+    // field report: Code Audit enabled mid-session advertised nothing, the
+    // agent went probing for a CLI and opened GUI instances. Payload = the
+    // consumer names whose spawn injection changed.
+    let now_spawn_sig = crate::tabs::spawn_inject_sig(&now);
+    if now_spawn_sig != was_spawn_sig {
         let mut consumers: Vec<&'static str> = Vec::new();
-        if now_mcp_sig[0] != was_mcp_sig[0] {
+        if now_spawn_sig[0] != was_spawn_sig[0] {
             consumers.push("claude");
         }
-        if now_mcp_sig[1] != was_mcp_sig[1] {
+        if now_spawn_sig[1] != was_spawn_sig[1] {
             consumers.push("opencode");
         }
         // Best-effort UI hint — never fail the save over it.

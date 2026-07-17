@@ -237,20 +237,74 @@ pub(crate) fn advertises_audit_to_opencode(s: &Settings) -> bool {
     s.code_audit.enabled && s.code_audit.expose_opencode
 }
 
-/// Per-consumer advertised-server signature — `[claude, opencode]`, each
-/// `(offload, audit)` presence. Compared across a Settings save to decide
-/// whether a "restart the AI tab" hint is due.
-pub(crate) fn mcp_advertise_sig(s: &Settings) -> [(bool, bool); 2] {
-    [
-        (
-            advertises_offload_to_claude(s),
-            advertises_audit_to_claude(s),
-        ),
-        (
-            advertises_offload_to_opencode(s),
-            advertises_audit_to_opencode(s),
-        ),
-    ]
+/// Per-consumer spawn-injection signature — `[claude, opencode]`. Captures
+/// every Settings-derived input that reaches an AI tab only at spawn (the
+/// `--mcp-config` server set, the `compose_capability_guidance` gates, the
+/// `--settings` statusline/hooks overlay, the `claude_local` env for
+/// local-provider tabs, the OpenCode plugin's baked flags and the injected
+/// `local-llama` provider). Compared across a Settings save to decide whether
+/// a "restart the AI tab" hint is due. Coarse by design: any difference means
+/// a fresh tab would be launched differently from the one still running.
+pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
+    // Guidance addendum gates, shared verbatim by both consumers (Claude's
+    // `--append-system-prompt` and OpenCode's managed instructions file).
+    let guidance = serde_json::json!([
+        s.offload.enabled && s.offload.inject_guidance,
+        s.graph.enabled,
+        s.graph.enabled && s.graph.semantic_search,
+        s.graph.enabled && s.graph.promote_pinned_facts,
+    ]);
+    let read_hook = s.graph.enabled && s.graph.read_advisor && !s.harness_versions.e1_blocked();
+    let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
+    // `claude_local` env vars are synthesized at spawn, but only for Claude
+    // tabs that opted in — irrelevant edits shouldn't nag.
+    let local_env = s
+        .tabs
+        .iter()
+        .any(|t| {
+            matches!(t, TabConfig::AiTool(c)
+                if c.use_local_provider && command_is(&c.command, "claude"))
+        })
+        .then(|| {
+            serde_json::json!([
+                s.claude_local.base_url,
+                s.claude_local.auth_token,
+                s.claude_local.model_alias,
+            ])
+        });
+    let claude = serde_json::json!({
+        "mcp": [advertises_offload_to_claude(s), advertises_audit_to_claude(s)],
+        "guidance": guidance.clone(),
+        "statusline": s.statusline.enabled,
+        // The `--settings` hooks overlay gates, in `build_pre_args` order:
+        // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
+        // PostToolUse auto-check.
+        "hooks": [
+            s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
+            s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
+            read_hook,
+            read_hook && s.graph.read_advisor_shell,
+            post_edit,
+        ],
+        "local_env": local_env,
+    });
+    let opencode = serde_json::json!({
+        "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
+        "guidance": guidance,
+        // `write_opencode_plugin` inputs: plugin presence + its baked
+        // CIMP_INJECT_ENABLED / CIMP_AUTO_CHECK_ENABLED flags.
+        "plugin": [
+            s.graph.enabled,
+            s.graph.enabled && s.graph.context_injection,
+            post_edit,
+        ],
+        // The injected `local-llama` provider block (`build_opencode_config`).
+        "provider": s
+            .offload
+            .resolve_opencode_provider()
+            .map(|p| serde_json::json!([p.base_url, p.model, p.api_key])),
+    });
+    [claude, opencode]
 }
 
 fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
@@ -2055,5 +2109,65 @@ mod tests {
         assert!(fact_promotion_block(&dir, &settings).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restart-hint edge (`update_settings`) compares this signature
+    /// across a save — it must move on every spawn-baked setting, stay put on
+    /// live-applied tuning, and stay per-consumer where injection is.
+    #[test]
+    fn spawn_inject_sig_tracks_spawn_time_settings() {
+        let base = spawn_inject_sig(&Settings::default());
+
+        // Claude-only: the `--settings` statusline overlay. Flipped relative
+        // to the default (it ships enabled), not hardcoded.
+        let mut s = Settings::default();
+        s.statusline.enabled = !s.statusline.enabled;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], base[0], "statusline flip must move the Claude sig");
+        assert_eq!(sig[1], base[1], "statusline is Claude-only");
+
+        // Both consumers: guidance + MCP + plugin follow the graph toggle.
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        let with_graph = spawn_inject_sig(&s);
+        assert_ne!(with_graph[0], base[0]);
+        assert_ne!(with_graph[1], base[1]);
+
+        // Both consumers: context injection = Claude hook gate + the
+        // OpenCode plugin's baked CIMP_INJECT_ENABLED flag.
+        s.graph.context_injection = true;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], with_graph[0]);
+        assert_ne!(sig[1], with_graph[1]);
+
+        // Claude-only: the checkpoint prompt-hook gate (injection off).
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        s.workbench.checkpoints = true;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], with_graph[0], "checkpoints widen the hook gate");
+        assert_eq!(sig[1], with_graph[1], "the OpenCode plugin always POSTs");
+
+        // `claude_local` edits count only once a Claude tab opted into the
+        // local provider.
+        let mut s = Settings::default();
+        s.claude_local.base_url = "http://localhost:4000".to_string();
+        assert_eq!(
+            spawn_inject_sig(&s)[0],
+            base[0],
+            "no tab uses the local provider yet"
+        );
+        let mut tab = claude_cfg();
+        tab.use_local_provider = true;
+        s.tabs.push(TabConfig::AiTool(tab));
+        assert_ne!(spawn_inject_sig(&s)[0], base[0]);
+
+        // Live-applied tuning must NOT nag: the read-advisor thresholds are
+        // read per-invocation by the loopback handler, not baked at spawn.
+        let mut s = Settings::default();
+        s.graph.enabled = true;
+        s.graph.read_advisor_min_lines += 25;
+        s.graph.context_per_file_chars += 100;
+        assert_eq!(spawn_inject_sig(&s), with_graph);
     }
 }

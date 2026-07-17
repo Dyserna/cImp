@@ -8,5 +8,5 @@ pub mod registry;
 
 /// The advertised-MCP-server signature, re-exported for the Settings save
 /// path's restart-hint edge detector (`ipc::commands::settings_update`).
-pub(crate) use config::mcp_advertise_sig;
+pub(crate) use config::spawn_inject_sig;
 pub use registry::{TabMetaWire, TabRegistry, TabRegistryHandle};

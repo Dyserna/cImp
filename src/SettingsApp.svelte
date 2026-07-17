@@ -1139,7 +1139,8 @@
     });
   }
 
-  // Restart-affecting subset: command + args + cwd + env. Notifications,
+  // Restart-affecting subset: command + args + cwd + env + the local-provider
+  // toggle (it synthesizes ANTHROPIC_* env at launch). Notifications,
   // first_launch_notice_dismissed, and (V20) the tts_injection speak gate
   // apply live and are excluded — the out-of-band TTS source reads the toggle
   // per-utterance, so flipping it takes effect without relaunching the tab.
@@ -1149,6 +1150,7 @@
       args: t.args,
       cwd: t.cwd,
       env: t.env,
+      use_local_provider: t.use_local_provider,
     };
   }
 
@@ -2869,7 +2871,8 @@
                   Settings for this tab when <em>Use local LLM provider</em>
                   is enabled. Run a LiteLLM (or compatible) proxy that translates the
                   Anthropic Messages API to your local model — cImp does not start
-                  the proxy. See the
+                  the proxy. These values become <code>ANTHROPIC_*</code> env vars
+                  at tab launch — restart the tab after editing them. See the
                   <a
                     href="https://docs.litellm.ai/docs/proxy/quick_start"
                     target="_blank"
@@ -3312,6 +3315,11 @@
             />
             <span>Inject offload guidance into the system prompt</span>
           </label>
+          <small class="hint">
+            The <code>offload_task</code> tool and its guidance are injected
+            when an AI tab starts — restart the Claude/OpenCode tab
+            (Tabs → Restart) after changing either toggle.
+          </small>
 
           <hr class="card-divider lg" />
           <div class="sub-tabs" role="tablist" aria-label="Offload sub-sections">
@@ -3725,7 +3733,8 @@
                   tab is ready to work. Overrides any existing
                   <code>local-llama</code>. Auto-sync re-derives it from the
                   primary local backend at launch and on save, but only while the
-                  offload server is enabled.
+                  offload server is enabled. OpenCode reads the provider from its
+                  launch config — restart the OpenCode tab to apply a change.
                 </small>
                 {#if opencodeProviderMsg && opencodeProviderMsg.i === i}
                   <small class={opencodeProviderMsg.ok ? 'hint' : 'error'}>{opencodeProviderMsg.text}</small>
@@ -4145,7 +4154,7 @@
           <h3>Server status</h3>
           <small class="hint top">
             Live health of the warm MCP host's connections. Updates as you add,
-            remove, or enable/disable servers below — no restart needed.
+            remove, or enable/disable servers below — no cImp restart needed.
           </small>
           {#if serviceStatus && serviceStatus.mcp_servers.length > 0}
             <ul class="mcp-health">
@@ -4169,11 +4178,14 @@
 
           <h3>Tool servers</h3>
           <small class="hint top">
-            Add an HTTP MCP endpoint by name + URL; changes apply live. cImp's
-            warm MCP host aggregates the read-class tools from these servers and
-            keeps the connections warm. Advanced stdio servers (command/args/env)
-            remain editable in <code>settings.json</code> under
-            <code>offload.mcp_servers</code>.
+            Add an HTTP MCP endpoint by name + URL; changes apply live for the
+            warm host and the offload worker. cImp's warm MCP host aggregates
+            the read-class tools from these servers and keeps the connections
+            warm. Claude Code and OpenCode capture their tool list when the tab
+            starts — after adding a server or flipping its Claude Code/OpenCode
+            exposure, restart the tab (Tabs → Restart) for the tools to appear.
+            Advanced stdio servers (command/args/env) remain editable in
+            <code>settings.json</code> under <code>offload.mcp_servers</code>.
           </small>
           <!-- Keyed by index deliberately: name/url are editable and the
                snapshot is replaced (cloned) on every edit, so a name/url/object
@@ -4392,7 +4404,9 @@
               Needs an OpenAI-compatible <code>/v1/embeddings</code> endpoint
               (e.g. a <code>llama-server --embedding</code> on a spare GPU box).
               Degrades to full-text search when the endpoint is unreachable; the
-              structural graph never depends on it.
+              structural graph never depends on it. Toggling this changes the
+              tools and guidance an AI tab sees — restart Claude/OpenCode tabs
+              to pick it up.
             </small>
             {#if snapshot.graph.semantic_search}
               <label>
@@ -4716,7 +4730,8 @@
                 <code>Read</code>. Strict — only a provable whole-file read of one
                 file is intercepted; anything with a pipe, redirect, glob, second
                 path, or a partial-read verb (<code>sed</code>, <code>head</code>)
-                runs untouched.
+                runs untouched. Installs a second hook matcher — re-launch the
+                Claude tab to pick it up.
               </small>
               <label>
                 <span>First-read digest tier (KiB, 0 = off)</span>
@@ -5369,7 +5384,10 @@
             on, cImp periodically snapshots your working tree into a separate
             shadow git repo (your own <code>.git</code> is never touched).
             Enable this to start capturing checkpoints; restore one from the
-            Workbench tab's Timeline section.
+            Workbench tab's Timeline section. The per-prompt checkpoint trigger
+            rides a Claude prompt hook installed at tab launch (needs the code
+            graph) — if context injection is off, restart the Claude tab after
+            enabling this.
           </small>
           <label>
             <span>Max checkpoints kept</span>

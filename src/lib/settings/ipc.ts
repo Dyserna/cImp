@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AiToolTabConfig,
   AuditDetectResult,
+  AuditToolConfig,
   AuditToolId,
   HarnessVersions,
   LlmPricingModel,
@@ -101,4 +102,29 @@ export async function harnessVersionsGet(): Promise<HarnessVersions> {
 /// config, so it stays "resolve normally" unless the user browses.
 export async function auditDetectTool(id: AuditToolId, path: string): Promise<AuditDetectResult> {
   return invoke('audit_detect_tool', { id, path });
+}
+
+/// The audit tool config as stored in the PHYSICAL global settings file
+/// (reconciled to the current tool set). Backs the Settings → Code Audit
+/// per-tool global/local scope indicator.
+export interface AuditGlobalToolConfig {
+  tools: AuditToolConfig[];
+  quality_auto_select: boolean;
+}
+
+export async function auditToolsGlobalConfig(): Promise<AuditGlobalToolConfig> {
+  return invoke('audit_tools_global_config');
+}
+
+/// "Save to global": write the live tool config through to the physical
+/// global settings file (and drop the project overlay's copy). Returns the
+/// new global config for indicator refresh.
+export async function auditToolsSaveGlobal(): Promise<AuditGlobalToolConfig> {
+  return invoke('audit_tools_save_global');
+}
+
+/// "Load from global": adopt the global file's tool config as the live
+/// config, removing the project's own copy. Returns the adopted config.
+export async function auditToolsLoadGlobal(): Promise<AuditGlobalToolConfig> {
+  return invoke('audit_tools_load_global');
 }

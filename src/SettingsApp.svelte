@@ -10,12 +10,16 @@
   import {
     aiToolTabDefaults,
     auditDetectTool,
+    auditToolsGlobalConfig,
+    auditToolsLoadGlobal,
+    auditToolsSaveGlobal,
     consumeSettingsDeepLink,
     harnessVersionsGet,
     listVoices,
     llmPricingGet,
     llmPricingSet,
     requestTabRestart,
+    type AuditGlobalToolConfig,
   } from './lib/settings/ipc';
   import { listen } from '@tauri-apps/api/event';
   import type {
@@ -86,6 +90,7 @@
   import {
     auditToolGroups,
     formatDetect,
+    toolMatchesGlobal,
     toolNotApplicable,
     type AuditToolRow,
   } from './lib/settings/codeAudit';
@@ -917,6 +922,7 @@
     await initSettings();
     if (disposed) return;
     startBackendStatusPolling();
+    void refreshAuditGlobalConfig();
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
     unsub = settings.subscribe((s) => {
@@ -1398,6 +1404,60 @@
   function commitAudit(): void {
     if (!snapshot) return;
     void applySettings($state.snapshot(snapshot));
+  }
+
+  // ── Tool-config scope (global vs project) ──────────────────────────────
+  // The global settings file's tool config, for the per-tool scope badge.
+  // Tool edits are project-scoped by default (they diff into the project
+  // overlay); the Save/Load buttons promote to / re-adopt from global.
+  let auditGlobalConfig = $state<AuditGlobalToolConfig | null>(null);
+  let auditScopeError = $state<string | null>(null);
+
+  async function refreshAuditGlobalConfig(): Promise<void> {
+    try {
+      auditGlobalConfig = await auditToolsGlobalConfig();
+    } catch (e) {
+      console.warn('audit_tools_global_config failed', e);
+    }
+  }
+
+  function auditToolScope(tool: AuditToolConfig): 'global' | 'local' {
+    if (!auditGlobalConfig) return 'global';
+    return toolMatchesGlobal(tool, auditGlobalConfig.tools) ? 'global' : 'local';
+  }
+
+  async function auditSaveGlobal(): Promise<void> {
+    auditScopeError = null;
+    try {
+      auditGlobalConfig = await auditToolsSaveGlobal();
+    } catch (e) {
+      auditScopeError = `Save to global failed: ${e}`;
+    }
+  }
+
+  async function auditLoadGlobal(): Promise<void> {
+    auditScopeError = null;
+    try {
+      // The backend mutates the live settings too; the snapshot follows via
+      // the settings-changed broadcast.
+      auditGlobalConfig = await auditToolsLoadGlobal();
+    } catch (e) {
+      auditScopeError = `Load from global failed: ${e}`;
+    }
+  }
+
+  // "Clear all": an all-off tool config saved as a normal project setting
+  // (paths are machine-scope and stay).
+  function auditClearAll(): void {
+    auditScopeError = null;
+    patch((s) => {
+      for (const t of s.code_audit.tools) {
+        t.enabled = false;
+        t.extra_args = [];
+        t.timeout_secs = null;
+      }
+      s.code_audit.quality_auto_select = false;
+    });
   }
 
   function imagePicker(state: keyof Settings['avatar']['images']) {
@@ -5116,6 +5176,13 @@
                 />
                 <span class="audit-name">{row.meta.name}</span>
                 <span class="audit-role">{row.meta.role}</span>
+                <span
+                  class="audit-scope"
+                  class:local={auditToolScope(row.tool) === 'local'}
+                  title="Whether this tool's config matches the global settings file (paths are always machine-wide)"
+                >
+                  {auditToolScope(row.tool)}
+                </span>
               </label>
               {#if toolNotApplicable(row.meta.id, auditCensus)}
                 <small class="hint audit-na">
@@ -5190,6 +5257,32 @@
                 oncommit={commitAudit}
               />
             </div>
+          {/snippet}
+
+          {#snippet auditScopeControls()}
+            <div class="button-row">
+              <button type="button" class="secondary" onclick={() => void auditSaveGlobal()}>
+                Save to global
+              </button>
+              <button type="button" class="secondary" onclick={() => void auditLoadGlobal()}>
+                Load from global
+              </button>
+              <button type="button" class="secondary danger" onclick={auditClearAll}>
+                Clear all
+              </button>
+            </div>
+            <small class="hint">
+              Tool changes are saved to this project by default
+              (<strong>local</strong> badge). <strong>Save to global</strong>
+              makes the current tool config the default for every project;
+              <strong>Load from global</strong> discards this project's tool
+              config in favor of the global one; <strong>Clear all</strong>
+              saves an all-off tool config to this project. Tool paths are
+              always machine-wide.
+            </small>
+            {#if auditScopeError}
+              <small class="hint status-error">{auditScopeError}</small>
+            {/if}
           {/snippet}
 
           {#if auditSubSection === 'settings'}
@@ -5281,6 +5374,7 @@
             Shown in the Code audit section's <strong>Security</strong> sub-tab
             (Tools tab).
           </small>
+          {@render auditScopeControls()}
           {#each auditGroups.security as row (row.meta.id)}
             {@render auditToolRow(row)}
           {/each}
@@ -5293,6 +5387,7 @@
             project contains files it applies to. All tools are listed here
             regardless of the current project.
           </small>
+          {@render auditScopeControls()}
           {#if snapshot.code_audit.quality_auto_select}
             <small class="hint audit-auto-note">
               Selection: <strong>automatic</strong> — follows the project's
@@ -6367,6 +6462,21 @@
     margin-left: var(--space-2);
     opacity: 0.7;
     font-size: 0.85em;
+  }
+  /* Per-tool scope badge: does this tool's config match the global file
+     ("global") or carry a project override ("local")? */
+  .audit-tool .audit-scope {
+    margin-left: auto;
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    padding: 0 0.3rem;
+    white-space: nowrap;
+  }
+  .audit-tool .audit-scope.local {
+    color: var(--accent, #d77757);
+    border-color: currentcolor;
   }
   small.hint.audit-detect {
     margin: 0;

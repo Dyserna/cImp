@@ -951,6 +951,9 @@ fn main() {
             audit::audit_cancel_scan,
             audit::audit_snapshot,
             audit::audit_refresh_census,
+            audit::audit_tools_global_config,
+            audit::audit_tools_save_global,
+            audit::audit_tools_load_global,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

@@ -339,6 +339,78 @@ pub async fn audit_refresh_census(
         .map_err(|e| AppError::Audit(format!("census task failed: {e}")))
 }
 
+// ── Tool-config scope actions (Settings → Code Audit) ────────────────────────
+//
+// The tool config (enabled / extra_args / timeout_secs + quality_auto_select)
+// is PROJECT-scoped by default: edits ride the normal settings flow and diff
+// into the project overlay. These commands are the explicit scope actions on
+// top: promote the current config to the global baseline ("Save to global"),
+// re-adopt the global config ("Load from global" — clears the project copy),
+// and read the global config for the per-tool global/local indicator. `path`
+// stays machine-scope via the existing write-through regardless.
+
+/// The audit tool config as stored in the PHYSICAL global settings file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditGlobalToolConfig {
+    pub tools: Vec<crate::settings::AuditToolConfig>,
+    pub quality_auto_select: bool,
+}
+
+fn read_global_tool_config() -> AuditGlobalToolConfig {
+    let (tools, quality_auto_select) = crate::settings::read_global_audit_tools();
+    AuditGlobalToolConfig {
+        tools,
+        quality_auto_select,
+    }
+}
+
+/// The global-file tool config, for the Settings section's per-tool
+/// global/local scope indicator. Read-only.
+#[tauri::command]
+pub async fn audit_tools_global_config(
+    _state: State<'_, AppState>,
+) -> AppResult<AuditGlobalToolConfig> {
+    Ok(read_global_tool_config())
+}
+
+/// "Save to global": write the live tool config through to the physical
+/// global settings file and bring the in-memory diff baseline in line, so
+/// the project overlay drops its (now-global) copy on the next save.
+/// Returns the new global config so the UI can refresh its indicators.
+#[tauri::command]
+pub async fn audit_tools_save_global(
+    state: State<'_, AppState>,
+) -> AppResult<AuditGlobalToolConfig> {
+    let live = state.settings.current();
+    crate::settings::write_global_audit_tools(&live)?;
+    state.settings.mutate_global(|g| {
+        g.code_audit.tools = live.code_audit.tools.clone();
+        g.code_audit.quality_auto_select = live.code_audit.quality_auto_select;
+    });
+    Ok(read_global_tool_config())
+}
+
+/// "Load from global": adopt the physical global file's tool config as the
+/// live config AND as the diff baseline — live == baseline means the project
+/// overlay's copy is removed on the next save, so future global changes show
+/// through again. Returns the adopted config for the UI's indicators.
+#[tauri::command]
+pub async fn audit_tools_load_global(
+    state: State<'_, AppState>,
+) -> AppResult<AuditGlobalToolConfig> {
+    let cfg = read_global_tool_config();
+    let (tools, auto) = (cfg.tools.clone(), cfg.quality_auto_select);
+    state.settings.mutate(|s| {
+        s.code_audit.tools = tools.clone();
+        s.code_audit.quality_auto_select = auto;
+    });
+    state.settings.mutate_global(|g| {
+        g.code_audit.tools = tools;
+        g.code_audit.quality_auto_select = auto;
+    });
+    Ok(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

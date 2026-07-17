@@ -37,9 +37,12 @@ pub struct SettingsHandle {
     inner: Arc<Mutex<Settings>>,
     tx: broadcast::Sender<Settings>,
     save_tx: mpsc::UnboundedSender<()>,
-    // Kept so `flush()` can persist synchronously (e.g. on shutdown) without
-    // routing through the debounced saver task. The saver owns its own copies.
-    global: Arc<Settings>,
+    // The global BASELINE every overlay diff is computed against. Resolved
+    // from disk at startup; shared-mutable (`mutate_global`) because the
+    // explicit "save/load global" flows rewrite the physical global file
+    // mid-session and the baseline must track it — otherwise the next diff
+    // re-pins the promoted values into the project overlay.
+    global: Arc<Mutex<Settings>>,
     launch_cwd: Arc<PathBuf>,
     // Serializes (snapshot-read + persistence::save) across the debounced
     // saver and `flush()`. Both hold this across the READ as well as the
@@ -56,6 +59,7 @@ impl SettingsHandle {
         let (save_tx, save_rx) = mpsc::unbounded_channel::<()>();
         let inner = Arc::new(Mutex::new(initial));
         let save_lock = Arc::new(Mutex::new(()));
+        let global = Arc::new(Mutex::new(global));
 
         spawn_saver(
             inner.clone(),
@@ -69,7 +73,7 @@ impl SettingsHandle {
             inner,
             tx,
             save_tx,
-            global: Arc::new(global),
+            global,
             launch_cwd: Arc::new(launch_cwd),
             save_lock,
         }
@@ -161,10 +165,34 @@ impl SettingsHandle {
             Err(poisoned) => poisoned.into_inner(),
         };
         let snapshot = self.current();
-        if let Err(e) = persistence::save(&snapshot, &self.launch_cwd, &self.global) {
+        let global = match self.global.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Err(e) = persistence::save(&snapshot, &self.launch_cwd, &global) {
             tracing::warn!(error = %e, "settings: flush save failed");
         } else {
             tracing::debug!("settings: flushed");
+        }
+    }
+
+    /// Mutate the in-memory global BASELINE the overlay diff is computed
+    /// against, then request a save so the overlay is recomputed against the
+    /// new baseline. For the explicit "save/load global" flows only: the
+    /// caller has just rewritten (or re-read) the PHYSICAL global file and
+    /// the baseline must be brought in line with it — a value equal on both
+    /// diff sides drops out of the project overlay. This never writes the
+    /// physical global file itself.
+    pub fn mutate_global<F: FnOnce(&mut Settings)>(&self, f: F) {
+        {
+            let mut g = match self.global.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            f(&mut g);
+        }
+        if self.save_tx.send(()).is_err() {
+            tracing::warn!("settings: saver task is gone; changes will not persist");
         }
     }
 }
@@ -172,7 +200,7 @@ impl SettingsHandle {
 fn spawn_saver(
     inner: Arc<Mutex<Settings>>,
     mut rx: mpsc::UnboundedReceiver<()>,
-    global: Settings,
+    global: Arc<Mutex<Settings>>,
     launch_cwd: PathBuf,
     save_lock: Arc<Mutex<()>>,
 ) {
@@ -200,7 +228,11 @@ fn spawn_saver(
                 Ok(g) => g.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             };
-            if let Err(e) = persistence::save(&snapshot, &launch_cwd, &global) {
+            let baseline = match global.lock() {
+                Ok(g) => g.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Err(e) = persistence::save(&snapshot, &launch_cwd, &baseline) {
                 tracing::warn!(error = %e, "settings: save failed");
             } else {
                 tracing::debug!("settings: saved");

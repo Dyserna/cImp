@@ -10,7 +10,15 @@ import type { AuditDetectResult, AuditToolConfig, AuditToolId, Settings } from '
 /// Static per-tool presentation for the Code Audit section: display name +
 /// one-line role text, in display order (Security trio first, then the V25
 /// Quality tools). The `role` strings are the spec's one-liners.
-export const AUDIT_TOOL_META: { id: AuditToolId; name: string; role: string }[] = [
+/// `rulesetDefault`, when present, is the adapter's built-in registry ruleset
+/// slug — the section then renders the per-tool ruleset override input (the
+/// two semgrep tools; mirrors the Rust adapters' `Arg::Ruleset` defaults).
+export const AUDIT_TOOL_META: {
+  id: AuditToolId;
+  name: string;
+  role: string;
+  rulesetDefault?: string;
+}[] = [
   // Security (V23).
   {
     id: 'osv-scanner',
@@ -22,6 +30,7 @@ export const AUDIT_TOOL_META: { id: AuditToolId; name: string; role: string }[] 
     id: 'semgrep',
     name: 'semgrep',
     role: 'SAST — requires Python, Windows support beta',
+    rulesetDefault: 'auto',
   },
   // Quality (V25) — language-gated linters / dead-code / spell-check.
   { id: 'oxlint', name: 'oxlint', role: 'JS/TS linter — single Rust binary, zero-config' },
@@ -42,6 +51,7 @@ export const AUDIT_TOOL_META: { id: AuditToolId; name: string; role: string }[] 
     id: 'semgrep-quality',
     name: 'semgrep (quality)',
     role: 'best-practices rulesets — default-disabled, needs network',
+    rulesetDefault: 'p/r2c-best-practices',
   },
 ];
 
@@ -93,9 +103,10 @@ export function toolNotApplicable(id: AuditToolId, census: AuditCensus): boolean
 
 /// Whether a tool's project-scoped config matches the global settings file's
 /// entry for the same id — the per-tool "global"/"local" scope indicator.
-/// Compares `enabled`, `extra_args`, and `timeout_secs` only: `path` is
-/// machine-scope (always written through to the global file) and never makes
-/// a tool "local". A tool the global file doesn't know counts as local.
+/// Compares `enabled`, `extra_args`, `ruleset`, and `timeout_secs` only:
+/// `path` is machine-scope (always written through to the global file) and
+/// never makes a tool "local". A tool the global file doesn't know counts as
+/// local.
 export function toolMatchesGlobal(
   tool: AuditToolConfig,
   globalTools: AuditToolConfig[],
@@ -105,6 +116,7 @@ export function toolMatchesGlobal(
   return (
     tool.enabled === g.enabled &&
     (tool.timeout_secs ?? null) === (g.timeout_secs ?? null) &&
+    (tool.ruleset ?? '') === (g.ruleset ?? '') &&
     tool.extra_args.length === g.extra_args.length &&
     tool.extra_args.every((a, i) => a === g.extra_args[i])
   );

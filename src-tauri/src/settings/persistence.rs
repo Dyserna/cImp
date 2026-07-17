@@ -2053,6 +2053,7 @@ mod tests {
                 enabled: false,
                 path: r"C:\tools\osv.exe".to_string(),
                 extra_args: vec!["--offline".to_string()],
+                ruleset: String::new(),
                 timeout_secs: Some(42),
             },
             AuditToolConfig {
@@ -2060,6 +2061,7 @@ mod tests {
                 enabled: true,
                 path: String::new(),
                 extra_args: vec![],
+                ruleset: String::new(),
                 timeout_secs: None,
             },
             AuditToolConfig {
@@ -2067,6 +2069,7 @@ mod tests {
                 enabled: true,
                 path: String::new(),
                 extra_args: vec![],
+                ruleset: String::new(),
                 timeout_secs: None,
             },
         ];
@@ -2127,6 +2130,7 @@ mod tests {
             enabled: true,
             path: String::new(),
             extra_args: vec![],
+            ruleset: String::new(),
             timeout_secs: None,
         }];
         assert!(reconcile_audit_tools(&mut s));
@@ -2149,6 +2153,7 @@ mod tests {
                 enabled: true,
                 path: String::new(),
                 extra_args: vec![],
+                ruleset: String::new(),
                 timeout_secs: None,
             },
             AuditToolConfig {
@@ -2156,6 +2161,7 @@ mod tests {
                 enabled: true,
                 path: String::new(),
                 extra_args: vec![],
+                ruleset: String::new(),
                 timeout_secs: None,
             },
             AuditToolConfig {
@@ -2163,6 +2169,7 @@ mod tests {
                 enabled: true,
                 path: String::new(),
                 extra_args: vec![],
+                ruleset: String::new(),
                 timeout_secs: None,
             },
         ];

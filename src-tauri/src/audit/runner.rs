@@ -618,7 +618,8 @@ impl AuditState {
             Transport::ReportFile => Some(temp_report_path(tool.id)),
             Transport::Stdout => None,
         };
-        let argv = adapter.full_argv(&root, report_path.as_deref(), git_repo, &tool.extra_args);
+        let argv =
+            adapter.full_argv(&root, report_path.as_deref(), git_repo, &tool.extra_args, &tool.ruleset);
 
         let cap = spawn_and_capture(&resolved, &argv, adapter.env, &root, timeout, &cancel).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -1481,6 +1482,7 @@ mod tests {
             enabled,
             path: String::new(),
             extra_args: Vec::new(),
+            ruleset: String::new(),
             timeout_secs: None,
         }
     }

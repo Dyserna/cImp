@@ -79,6 +79,12 @@ pub enum Arg {
     /// `/p:ErrorLog={report},version=2.1`). `{report}` renders empty when the
     /// runner passes no report path. [`Transport::ReportFile`] only.
     ReportIn(&'static str),
+    /// A registry ruleset slug (the value after a `--config`-style flag):
+    /// renders the user's per-tool `ruleset` setting when non-empty, else this
+    /// built-in default. Exists because registry slugs can vanish server-side
+    /// without notice (`p/best-practices` 404'd 2026-07) — an override is then
+    /// a settings edit, not a rebuild. Only the two semgrep adapters carry it.
+    Ruleset(&'static str),
 }
 
 /// How a tool's exit code classifies once it has run to completion.
@@ -133,8 +139,16 @@ pub struct Adapter {
 
 impl Adapter {
     /// Render the fixed argv (no `extra_args`) for a concrete scan: choose the
-    /// git vs `dir` template, then substitute [`Arg::Root`] / [`Arg::Report`].
-    pub fn resolve_argv(&self, root: &Path, report: Option<&Path>, git_repo: bool) -> Vec<String> {
+    /// git vs `dir` template, then substitute [`Arg::Root`] / [`Arg::Report`] /
+    /// [`Arg::Ruleset`]. `ruleset` `None` (or empty via [`full_argv`]) keeps
+    /// each [`Arg::Ruleset`] token's built-in default.
+    fn render_argv(
+        &self,
+        root: &Path,
+        report: Option<&Path>,
+        git_repo: bool,
+        ruleset: Option<&str>,
+    ) -> Vec<String> {
         let template = match (self.dir_argv, git_repo) {
             (Some(dir), false) => dir,
             _ => self.argv,
@@ -153,23 +167,51 @@ impl Adapter {
                         .unwrap_or_default();
                     tpl.replace("{report}", &path)
                 }
+                Arg::Ruleset(default) => ruleset.unwrap_or(default).to_string(),
             })
             .collect()
     }
 
-    /// The full argv the runner spawns: the fixed template followed by the
-    /// user's per-tool `extra_args` (appended verbatim, after the fixed argv —
-    /// the settings contract).
+    /// Render the fixed argv (no `extra_args`, built-in rulesets) for a
+    /// concrete scan. Test-only convenience — the runner goes through
+    /// [`full_argv`](Self::full_argv).
+    #[cfg(test)]
+    pub fn resolve_argv(&self, root: &Path, report: Option<&Path>, git_repo: bool) -> Vec<String> {
+        self.render_argv(root, report, git_repo, None)
+    }
+
+    /// The full argv the runner spawns: the fixed template (with the user's
+    /// `ruleset` substituted for any [`Arg::Ruleset`] token — empty keeps the
+    /// built-in default) followed by the user's per-tool `extra_args`
+    /// (appended verbatim, after the fixed argv — the settings contract).
     pub fn full_argv(
         &self,
         root: &Path,
         report: Option<&Path>,
         git_repo: bool,
         extra_args: &[String],
+        ruleset: &str,
     ) -> Vec<String> {
-        let mut argv = self.resolve_argv(root, report, git_repo);
+        let mut argv = self.render_argv(
+            root,
+            report,
+            git_repo,
+            (!ruleset.is_empty()).then_some(ruleset),
+        );
         argv.extend(extra_args.iter().cloned());
         argv
+    }
+
+    /// The built-in registry ruleset, if this adapter carries an
+    /// [`Arg::Ruleset`] token (the two semgrep tools). `None` = the tool has
+    /// no ruleset concept and the per-tool `ruleset` setting is ignored.
+    /// Test-only — the Settings UI hardcodes the two defaults in its metadata.
+    #[cfg(test)]
+    pub fn default_ruleset(&self) -> Option<&'static str> {
+        self.argv.iter().find_map(|a| match a {
+            Arg::Ruleset(d) => Some(*d),
+            _ => None,
+        })
     }
 
     /// Whether this tool applies to a project with the given [`Census`]: always
@@ -257,7 +299,7 @@ static SEMGREP: Adapter = Adapter {
     argv: &[
         Arg::Lit("scan"),
         Arg::Lit("--config"),
-        Arg::Lit("auto"),
+        Arg::Ruleset("auto"),
         Arg::Lit("--sarif"),
         Arg::Lit("--quiet"),
         Arg::Root,
@@ -503,14 +545,16 @@ static CARGO_MACHETE: Adapter = Adapter {
 };
 
 /// semgrep with a quality ruleset — same shape as the Security [`SEMGREP`] but
-/// `--config p/best-practices` (exit 1 on findings). Separate id so quality
+/// `--config p/r2c-best-practices` (exit 1 on findings). Separate id so quality
 /// rules never appear in the Security section. **Default-disabled** (its
 /// registry ruleset needs network). Always applicable.
+/// `p/best-practices` vanished from the registry (HTTP 404 as of 2026-07-17,
+/// semgrep exit 7); the older-named `p/r2c-best-practices` pack still resolves.
 static SEMGREP_QUALITY: Adapter = Adapter {
     argv: &[
         Arg::Lit("scan"),
         Arg::Lit("--config"),
-        Arg::Lit("p/best-practices"),
+        Arg::Ruleset("p/r2c-best-practices"),
         Arg::Lit("--sarif"),
         Arg::Lit("--quiet"),
         Arg::Root,
@@ -557,7 +601,7 @@ mod tests {
     #[test]
     fn osv_argv_substitutes_root_and_appends_extra_args() {
         let a = adapter(AuditToolId::OsvScanner);
-        let argv = a.full_argv(&root(), None, true, &["--offline".to_string()]);
+        let argv = a.full_argv(&root(), None, true, &["--offline".to_string()], "");
         assert_eq!(
             argv,
             vec![
@@ -577,7 +621,7 @@ mod tests {
     fn gitleaks_git_form_substitutes_root_and_report() {
         let a = adapter(AuditToolId::Gitleaks);
         let report = PathBuf::from("/tmp/gl.sarif");
-        let argv = a.full_argv(&root(), Some(&report), true, &[]);
+        let argv = a.full_argv(&root(), Some(&report), true, &[], "");
         assert_eq!(
             argv,
             vec![
@@ -608,7 +652,7 @@ mod tests {
     #[test]
     fn semgrep_argv_and_forced_utf8_env() {
         let a = adapter(AuditToolId::Semgrep);
-        let argv = a.full_argv(&root(), None, false, &["--config".into(), "p/ci".into()]);
+        let argv = a.full_argv(&root(), None, false, &["--config".into(), "p/ci".into()], "");
         assert_eq!(
             argv,
             vec![
@@ -743,7 +787,7 @@ mod tests {
         // extra args appended.
         let ox = adapter(AuditToolId::Oxlint);
         assert_eq!(
-            ox.full_argv(&root(), None, true, &["--deny-warnings".into()]),
+            ox.full_argv(&root(), None, true, &["--deny-warnings".into()], ""),
             vec!["--format", "sarif", "--deny-warnings"]
         );
         assert_eq!(ox.transport, Transport::Stdout);
@@ -849,7 +893,7 @@ mod tests {
         assert!(a.resolve_argv(&root(), None, true).is_empty());
         // Extra args still append after the (empty) fixed argv.
         assert_eq!(
-            a.full_argv(&root(), None, true, &["--with-metadata".into()]),
+            a.full_argv(&root(), None, true, &["--with-metadata".into()], ""),
             vec!["--with-metadata"]
         );
     }
@@ -862,7 +906,7 @@ mod tests {
             vec![
                 "scan",
                 "--config",
-                "p/best-practices",
+                "p/r2c-best-practices",
                 "--sarif",
                 "--quiet",
                 "/proj/root"
@@ -870,6 +914,43 @@ mod tests {
         );
         assert_eq!(a.env, &[("PYTHONUTF8", "1")]);
         assert_eq!(a.category, Category::Quality);
+    }
+
+    #[test]
+    fn ruleset_setting_overrides_the_config_slug() {
+        // A non-empty per-tool `ruleset` replaces the built-in slug; empty
+        // keeps it. Extra args still append after.
+        let a = adapter(AuditToolId::SemgrepQuality);
+        assert_eq!(
+            a.full_argv(&root(), None, true, &[], "p/default"),
+            vec![
+                "scan",
+                "--config",
+                "p/default",
+                "--sarif",
+                "--quiet",
+                "/proj/root"
+            ]
+        );
+        assert_eq!(
+            a.full_argv(&root(), None, true, &[], "")[2],
+            "p/r2c-best-practices"
+        );
+    }
+
+    #[test]
+    fn default_ruleset_present_only_on_the_semgrep_tools() {
+        assert_eq!(adapter(AuditToolId::Semgrep).default_ruleset(), Some("auto"));
+        assert_eq!(
+            adapter(AuditToolId::SemgrepQuality).default_ruleset(),
+            Some("p/r2c-best-practices")
+        );
+        // A tool without the token ignores the setting entirely.
+        assert_eq!(adapter(AuditToolId::Oxlint).default_ruleset(), None);
+        assert_eq!(
+            adapter(AuditToolId::Oxlint).full_argv(&root(), None, true, &[], "p/default"),
+            vec!["--format", "sarif"]
+        );
     }
 
     #[test]

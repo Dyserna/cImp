@@ -1105,7 +1105,7 @@ pub enum AuditToolId {
     Knip,
     /// cargo-machete — unused Rust dependencies (text output).
     CargoMachete,
-    /// semgrep with a quality ruleset (`p/best-practices`). Separate id from the
+    /// semgrep with a quality ruleset (`p/r2c-best-practices`). Separate id from the
     /// Security `semgrep`; default-disabled (registry configs need network).
     SemgrepQuality,
 }
@@ -1141,7 +1141,8 @@ impl AuditToolId {
 /// (Phase B). `path`, when non-empty, is used as the launch command verbatim —
 /// overriding the normal `ebin/` → PATH resolution (the `ExternalToolsSettings`
 /// contract); empty (the default) means "resolve normally". `extra_args` are
-/// appended after the adapter's fixed argv (e.g. a custom semgrep `--config`).
+/// appended after the adapter's fixed argv (e.g. an `--exclude` filter; a
+/// semgrep ruleset swap belongs in `ruleset`, not here — see that field).
 /// `id` is required on the wire — a missing/unknown id makes the whole entry
 /// fail to deserialize, which the tolerant `tools` deserializer then drops.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -1153,6 +1154,16 @@ pub struct AuditToolConfig {
     pub path: String,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Registry ruleset override for a tool whose adapter carries an
+    /// `Arg::Ruleset` token (the two semgrep tools — `--config <slug>`). Empty
+    /// (the default) uses the adapter's built-in slug (`auto` /
+    /// `p/r2c-best-practices`). Exists because registry slugs can vanish
+    /// server-side without notice (`p/best-practices` 404'd 2026-07) — the
+    /// recovery is then a settings edit, not a rebuild. Ignored by every other
+    /// tool. `extra_args` can't serve this purpose: semgrep *merges* repeated
+    /// `--config` flags, so an appended slug can't replace a dead baked-in one.
+    #[serde(default)]
+    pub ruleset: String,
     /// V25 Phase C: per-tool wall-clock timeout override in seconds. `None` (the
     /// default) falls back to the global [`CodeAuditSettings::timeout_secs`]. A
     /// tool that runs a real build wants a longer budget than a linter —
@@ -1172,6 +1183,7 @@ impl AuditToolConfig {
             enabled: true,
             path: String::new(),
             extra_args: Vec::new(),
+            ruleset: String::new(),
             timeout_secs: None,
         }
     }
@@ -1185,6 +1197,7 @@ impl AuditToolConfig {
             enabled: false,
             path: String::new(),
             extra_args: Vec::new(),
+            ruleset: String::new(),
             timeout_secs: None,
         }
     }
@@ -4100,6 +4113,7 @@ mod tests {
                 enabled: true,
                 path: "C:/tools/semgrep.exe".into(),
                 extra_args: vec!["--config".into(), "auto".into()],
+                ruleset: "p/ci".into(),
                 timeout_secs: Some(1200),
             }],
             timeout_secs: 600,

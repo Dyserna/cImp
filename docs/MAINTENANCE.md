@@ -1109,7 +1109,7 @@ that language and confirm the finding lands in the **Quality** sub-tab:
     `dotnet build` (restores packages, writes obj/bin) and the `/p:ErrorLog` SARIF
     report merges. Confirm it does **not** run when left disabled.
 11. **semgrep (quality)** (default-disabled; enable it, `pipx install semgrep`,
-    online) → scans with `--config p/best-practices`; findings show under the
+    online) → scans with `--config p/r2c-best-practices`; findings show under the
     **Quality** sub-tab only — the Security semgrep entry stays pure SAST.
 
 **Gating checks (this repo has no Java/Go/Python):**

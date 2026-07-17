@@ -12,7 +12,7 @@ import {
 } from './codeAudit';
 
 function tool(id: AuditToolId, over: Partial<AuditToolConfig> = {}): AuditToolConfig {
-  return { id, enabled: true, path: '', extra_args: [], timeout_secs: null, ...over };
+  return { id, enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null, ...over };
 }
 
 function settingsWith(tools: AuditToolConfig[]): Settings {
@@ -137,6 +137,13 @@ describe('toolMatchesGlobal (per-tool scope badge)', () => {
     expect(toolMatchesGlobal(tool('gitleaks', { enabled: false }), globalTools)).toBe(false);
     expect(toolMatchesGlobal(tool('gitleaks', { extra_args: ['-v'] }), globalTools)).toBe(false);
     expect(toolMatchesGlobal(tool('gitleaks', { timeout_secs: 30 }), globalTools)).toBe(false);
+    expect(toolMatchesGlobal(tool('gitleaks', { ruleset: 'p/default' }), globalTools)).toBe(false);
+  });
+
+  test('a missing ruleset field (pre-upgrade global snapshot) equals empty', () => {
+    const legacy = [tool('gitleaks')] as AuditToolConfig[];
+    delete (legacy[0] as Partial<AuditToolConfig>).ruleset;
+    expect(toolMatchesGlobal(tool('gitleaks'), legacy)).toBe(true);
   });
 
   test('path differences never make a tool local (machine-scope)', () => {

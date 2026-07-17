@@ -1076,12 +1076,19 @@ export type AuditToolId =
 
 /// V23 Phase A: one configured audit tool (mirror of Rust `AuditToolConfig`).
 /// `path` empty = resolve `ebin` → PATH; non-empty = used as the command
-/// verbatim. `extra_args` are appended after the adapter's fixed argv.
+/// verbatim. `extra_args` are appended after the adapter's fixed argv (a
+/// semgrep ruleset swap belongs in `ruleset`, not here).
 export interface AuditToolConfig {
   id: AuditToolId;
   enabled: boolean;
   path: string;
   extra_args: string[];
+  /// Ruleset override for the tools with a ruleset selector: the two semgrep
+  /// tools (`--config <slug>`) and PMD (`-R <ruleset>`). Empty uses the
+  /// adapter's built-in value; exists so an upstream-owned default breaking
+  /// (e.g. a slug vanishing from the semgrep registry) is a settings edit,
+  /// not a rebuild. Ignored by every other tool.
+  ruleset: string;
   /// V25 Phase C: per-tool wall-clock timeout override in seconds. `null` (the
   /// default) falls back to the global `CodeAuditSettings.timeout_secs`. A
   /// build-style tool wants a longer budget than a linter — `dotnet-analyzers`
@@ -1717,22 +1724,22 @@ export function defaultSettings(): Settings {
       expose_offload: true,
       tools: [
         // Security (V23).
-        { id: 'osv-scanner', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'gitleaks', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'semgrep', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'osv-scanner', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'gitleaks', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'semgrep', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
         // Quality (V25) — enabled by default.
-        { id: 'oxlint', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'golangci-lint', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'ruff', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'cppcheck', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'typos', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'eslint', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'pmd', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'knip', enabled: true, path: '', extra_args: [], timeout_secs: null },
-        { id: 'cargo-machete', enabled: true, path: '', extra_args: [], timeout_secs: null },
+        { id: 'oxlint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'golangci-lint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'ruff', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'cppcheck', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'typos', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'eslint', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'pmd', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'knip', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'cargo-machete', enabled: true, path: '', extra_args: [], ruleset: '', timeout_secs: null },
         // Quality — default-disabled.
-        { id: 'dotnet-analyzers', enabled: false, path: '', extra_args: [], timeout_secs: null },
-        { id: 'semgrep-quality', enabled: false, path: '', extra_args: [], timeout_secs: null },
+        { id: 'dotnet-analyzers', enabled: false, path: '', extra_args: [], ruleset: '', timeout_secs: null },
+        { id: 'semgrep-quality', enabled: false, path: '', extra_args: [], ruleset: '', timeout_secs: null },
       ],
       timeout_secs: 600,
     },

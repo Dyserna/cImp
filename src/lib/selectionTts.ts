@@ -138,7 +138,7 @@ async function launch(
   painting = highlight.enabled;
   chunkCount = chunks.length;
   chunkSpans = spans;
-  chunkState = new Array(chunkCount).fill('none');
+  chunkState = Array.from({ length: chunkCount }, (): ChunkState => 'none');
   chunkDecorations = Array.from({ length: chunkCount }, () => []);
   rowMarkers = new Map();
 

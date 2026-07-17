@@ -5,6 +5,40 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] — 2026-07-17
+
+### Fixed
+
+- **semgrep (quality) ran into a dead registry ruleset.** Semgrep silently
+  removed `p/best-practices` from its registry (HTTP 404 → semgrep exit 7
+  before scanning), so the tool always errored. The default is now the
+  surviving canonical slug `p/r2c-best-practices` — same rule pack under its
+  original r2c-era name; no newer replacement pack exists. The security
+  semgrep's `--config auto` was unaffected.
+
+### Added
+
+- **Per-tool "Ruleset" override for the audit tools that select one.** The
+  two semgrep tools (`--config <slug>`) and PMD (`-R <ruleset>`) no longer
+  bake their ruleset into the binary: each Settings row gains a Ruleset field
+  (blank = the built-in default: `auto` / `p/r2c-best-practices` /
+  `rulesets/java/quickstart.xml`). If an upstream-owned default breaks again,
+  the fix is a settings edit instead of waiting for a release. The field
+  counts toward the per-tool global/local scope badge and survives old
+  settings files untouched. (`extra_args` can't do this for semgrep — it
+  *merges* repeated `--config` flags rather than replacing the dead one.)
+
+### Changed
+
+- **Quality-audit sweep: the repo's own audit reports 0 findings.** All 113
+  findings triaged and resolved — real fixes (unused `ndarray` dependency
+  dropped, a misspelled art asset renamed to `Transition.mp4`, unused catch binding,
+  `new Array(n)` → `Array.from`, useless spread fallback, Svelte 5 `$effect`
+  dependency reads wrapped in `void`) plus a new `_typos.toml` allowlisting
+  the false positives (audit-parser test fixtures, short identifiers/CSS
+  classes, crate names, camelCase-split shrapnel), each entry documented with
+  its reason.
+
 ## [0.48.0] — 2026-07-17
 
 ### Changed

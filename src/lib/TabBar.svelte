@@ -96,7 +96,7 @@
   // shift scrollWidth without firing scroll). UI-hidden tabs are absent
   // from pane.tab_ids entirely, so hide/show flows through this too.
   $effect(() => {
-    pane.tab_ids.length;
+    void pane.tab_ids.length;
     queueMicrotask(updateScrollEdges);
   });
 

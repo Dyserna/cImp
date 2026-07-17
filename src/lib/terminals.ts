@@ -571,7 +571,7 @@ export function createTerminal(
     // terminal's geometry so the replayed scrollback's cursor positions
     // line up with the new grid. fit-on-attach corrects any minor
     // host-size differences after the snapshot lands.
-    ...(options.initialGeometry ?? {}),
+    ...options.initialGeometry,
   });
   // V20: AI tabs keep the mouse local (shell-like selection: copy-on-select,
   // right-click paste, select-to-speak) by suppressing the fullscreen app's

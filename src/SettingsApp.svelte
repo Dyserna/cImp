@@ -1454,6 +1454,7 @@
       for (const t of s.code_audit.tools) {
         t.enabled = false;
         t.extra_args = [];
+        t.ruleset = '';
         t.timeout_secs = null;
       }
       s.code_audit.quality_auto_select = false;
@@ -5248,12 +5249,32 @@
                     })}
                 />
               </label>
+              {#if row.meta.rulesetDefault}
+                <label class="audit-timeout">
+                  <span>
+                    Ruleset (blank uses {row.meta.rulesetDefault}; if the
+                    default breaks upstream the tool shows an error — set the
+                    replacement here)
+                  </span>
+                  <input
+                    type="text"
+                    placeholder={row.meta.rulesetDefault}
+                    value={row.tool.ruleset}
+                    oninput={(e) =>
+                      patchAuditTool(
+                        row.meta.id,
+                        (t) =>
+                          (t.ruleset = (e.currentTarget as HTMLInputElement).value.trim()),
+                      )}
+                  />
+                </label>
+              {/if}
               <small class="hint">
                 Extra arguments (appended after the tool's fixed argv):
               </small>
               <ArrayEditor
                 bind:items={snapshot!.code_audit.tools[row.index].extra_args}
-                placeholder="e.g. --config auto"
+                placeholder="e.g. --exclude vendor"
                 oncommit={commitAudit}
               />
             </div>

@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "cimp"
-version = "0.48.0"
+version = "0.49.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -765,7 +765,6 @@ dependencies = [
  "filetime",
  "ignore",
  "misaki-rs",
- "ndarray 0.16.1",
  "notify",
  "nvml-wrapper",
  "ort",
@@ -3327,21 +3326,6 @@ dependencies = [
  "num-traits",
  "rawpointer",
  "serde",
-]
-
-[[package]]
-name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
 ]
 
 [[package]]

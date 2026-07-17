@@ -151,6 +151,7 @@
   }
 
   // ── DOM refs ─────────────────────────────────────────────────────────────
+  // oxlint-disable-next-line no-unassigned-vars -- assigned via bind:this
   let containerEl: HTMLDivElement;
   // Reactive ($state) so the lifecycle $effect acquires the 2D context off
   // the binding itself — robust to mount order and to the element ever being

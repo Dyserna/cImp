@@ -80,7 +80,7 @@ try {
     cwd: join(repo, 'src-tauri'),
     stdio: 'inherit',
   });
-} catch (e) {
+} catch {
   console.error('error: cargo update failed — make sure cargo is on PATH');
   process.exit(1);
 }

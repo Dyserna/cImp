@@ -45,7 +45,7 @@ export function wordDiff(oldLine: string, newLine: string): { left: WordDiffPart
   // Standard LCS DP table, built bottom-up from the end so the greedy
   // backtrace below can walk forward (i, j both increasing) while still
   // reading correct "rest of the sequence" lengths at each step.
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array.from({ length: m + 1 }, () => 0));
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
       dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);

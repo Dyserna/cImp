@@ -60,7 +60,7 @@
   // `onMount` fetch — that would fire a duplicate `workbench_checkpoints`
   // call every time the view mounts).
   $effect(() => {
-    $workbenchCheckpointsVersion;
+    void $workbenchCheckpointsVersion;
     void refresh();
   });
 

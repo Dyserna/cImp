@@ -5107,7 +5107,7 @@
           <h2>Checks</h2>
           <small class="hint">
             Project checker commands the <code>run_check</code> tool exposes to
-            Claude and the offload worker — a build, typecheck, lint, or test run
+            Claude, OpenCode, and the offload worker — a build, typecheck, lint, or test run
             turned into bounded, deduplicated diagnostics instead of a raw dump.
             Configured per project; changes land in this project's
             <code>.cimp/config.json</code> overlay.

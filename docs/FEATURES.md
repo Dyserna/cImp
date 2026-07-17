@@ -183,7 +183,7 @@ dependency/component breadth) — this is the *capability* breadth.
   | **cppcheck** | `.c/.cc/.cpp/.cxx/.h/.hpp` | SARIF report file (`--output-file`, needs ≥ 2.16) → `sarif` | writes to stderr otherwise; **exits 0 even with findings** |
   | **typos** | *always applicable* | JSONL stdout → `TyposJsonl` | the one tool valuable on every project |
   | **eslint** | `eslint.config.*` / `.eslintrc*` marker | JSON stdout → `EslintJson` | resolved project-local-first |
-  | **PMD** | `.java` | SARIF stdout → `sarif` | `pmd.bat` on Windows, needs a JRE |
+  | **PMD** | `.java` | SARIF stdout (`-R rulesets/java/quickstart.xml`, overridable per-tool via the Settings `ruleset` field) → `sarif` | `pmd.bat` on Windows, needs a JRE |
   | **Roslyn analyzers** (`dotnet-analyzers`) | `*.sln` / `*.csproj` | SARIF report file (`dotnet build /p:ErrorLog=`) → `sarif` | **default-disabled** — runs a real build (restores packages, writes obj/bin); longer timeout recommended |
   | **knip** | `package.json` marker | JSON stdout → `KnipJson` | resolved project-local-first |
   | **cargo-machete** | `Cargo.toml` marker | text stdout → `MacheteText` | near-instant unused-dep scan |

@@ -5252,9 +5252,9 @@
               {#if row.meta.rulesetDefault}
                 <label class="audit-timeout">
                   <span>
-                    Registry ruleset for --config (blank uses
-                    {row.meta.rulesetDefault}; a slug the registry dropped shows
-                    as a tool error — set the replacement here)
+                    Ruleset (blank uses {row.meta.rulesetDefault}; if the
+                    default breaks upstream the tool shows an error — set the
+                    replacement here)
                   </span>
                   <input
                     type="text"

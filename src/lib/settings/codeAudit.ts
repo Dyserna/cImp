@@ -10,9 +10,9 @@ import type { AuditDetectResult, AuditToolConfig, AuditToolId, Settings } from '
 /// Static per-tool presentation for the Code Audit section: display name +
 /// one-line role text, in display order (Security trio first, then the V25
 /// Quality tools). The `role` strings are the spec's one-liners.
-/// `rulesetDefault`, when present, is the adapter's built-in registry ruleset
-/// slug — the section then renders the per-tool ruleset override input (the
-/// two semgrep tools; mirrors the Rust adapters' `Arg::Ruleset` defaults).
+/// `rulesetDefault`, when present, is the adapter's built-in ruleset — the
+/// section then renders the per-tool ruleset override input (the two semgrep
+/// tools + PMD; mirrors the Rust adapters' `Arg::Ruleset` defaults).
 export const AUDIT_TOOL_META: {
   id: AuditToolId;
   name: string;
@@ -39,7 +39,12 @@ export const AUDIT_TOOL_META: {
   { id: 'cppcheck', name: 'cppcheck', role: 'C/C++ static analysis' },
   { id: 'typos', name: 'typos', role: 'source spell-checker — applies to every project' },
   { id: 'eslint', name: 'eslint', role: 'JS/TS linter — uses the project-local config' },
-  { id: 'pmd', name: 'PMD', role: 'Java static analysis — needs a JRE' },
+  {
+    id: 'pmd',
+    name: 'PMD',
+    role: 'Java static analysis — needs a JRE',
+    rulesetDefault: 'rulesets/java/quickstart.xml',
+  },
   { id: 'knip', name: 'knip', role: 'unused files / exports / dependencies (Node)' },
   { id: 'cargo-machete', name: 'cargo-machete', role: 'unused Rust dependencies' },
   {

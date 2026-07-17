@@ -79,11 +79,13 @@ pub enum Arg {
     /// `/p:ErrorLog={report},version=2.1`). `{report}` renders empty when the
     /// runner passes no report path. [`Transport::ReportFile`] only.
     ReportIn(&'static str),
-    /// A registry ruleset slug (the value after a `--config`-style flag):
+    /// A ruleset selector (the value after a `--config`/`-R`-style flag):
     /// renders the user's per-tool `ruleset` setting when non-empty, else this
-    /// built-in default. Exists because registry slugs can vanish server-side
-    /// without notice (`p/best-practices` 404'd 2026-07) — an override is then
-    /// a settings edit, not a rebuild. Only the two semgrep adapters carry it.
+    /// built-in default. Exists because semgrep registry slugs can vanish
+    /// server-side without notice (`p/best-practices` 404'd 2026-07) — an
+    /// override is then a settings edit, not a rebuild. Carried by the two
+    /// semgrep adapters and PMD (whose bundled quickstart ruleset is likewise
+    /// upstream-owned).
     Ruleset(&'static str),
 }
 
@@ -202,10 +204,10 @@ impl Adapter {
         argv
     }
 
-    /// The built-in registry ruleset, if this adapter carries an
-    /// [`Arg::Ruleset`] token (the two semgrep tools). `None` = the tool has
-    /// no ruleset concept and the per-tool `ruleset` setting is ignored.
-    /// Test-only — the Settings UI hardcodes the two defaults in its metadata.
+    /// The built-in ruleset, if this adapter carries an [`Arg::Ruleset`]
+    /// token (the two semgrep tools + PMD). `None` = the tool has no ruleset
+    /// concept and the per-tool `ruleset` setting is ignored.
+    /// Test-only — the Settings UI hardcodes the defaults in its metadata.
     #[cfg(test)]
     pub fn default_ruleset(&self) -> Option<&'static str> {
         self.argv.iter().find_map(|a| match a {
@@ -465,7 +467,7 @@ static PMD: Adapter = Adapter {
         Arg::Lit("-d"),
         Arg::Root,
         Arg::Lit("-R"),
-        Arg::Lit("rulesets/java/quickstart.xml"),
+        Arg::Ruleset("rulesets/java/quickstart.xml"),
         Arg::Lit("-f"),
         Arg::Lit("sarif"),
     ],
@@ -939,11 +941,15 @@ mod tests {
     }
 
     #[test]
-    fn default_ruleset_present_only_on_the_semgrep_tools() {
+    fn default_ruleset_present_only_on_ruleset_tools() {
         assert_eq!(adapter(AuditToolId::Semgrep).default_ruleset(), Some("auto"));
         assert_eq!(
             adapter(AuditToolId::SemgrepQuality).default_ruleset(),
             Some("p/r2c-best-practices")
+        );
+        assert_eq!(
+            adapter(AuditToolId::Pmd).default_ruleset(),
+            Some("rulesets/java/quickstart.xml")
         );
         // A tool without the token ignores the setting entirely.
         assert_eq!(adapter(AuditToolId::Oxlint).default_ruleset(), None);
@@ -951,6 +957,14 @@ mod tests {
             adapter(AuditToolId::Oxlint).full_argv(&root(), None, true, &[], "p/default"),
             vec!["--format", "sarif"]
         );
+    }
+
+    #[test]
+    fn pmd_ruleset_setting_overrides_the_r_argument() {
+        let a = adapter(AuditToolId::Pmd);
+        let argv = a.full_argv(&root(), None, true, &[], "rulesets/java/errorprone.xml");
+        assert_eq!(argv[3], "-R");
+        assert_eq!(argv[4], "rulesets/java/errorprone.xml");
     }
 
     #[test]

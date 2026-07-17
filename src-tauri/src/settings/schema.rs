@@ -1154,13 +1154,14 @@ pub struct AuditToolConfig {
     pub path: String,
     #[serde(default)]
     pub extra_args: Vec<String>,
-    /// Registry ruleset override for a tool whose adapter carries an
-    /// `Arg::Ruleset` token (the two semgrep tools — `--config <slug>`). Empty
-    /// (the default) uses the adapter's built-in slug (`auto` /
-    /// `p/r2c-best-practices`). Exists because registry slugs can vanish
-    /// server-side without notice (`p/best-practices` 404'd 2026-07) — the
-    /// recovery is then a settings edit, not a rebuild. Ignored by every other
-    /// tool. `extra_args` can't serve this purpose: semgrep *merges* repeated
+    /// Ruleset override for a tool whose adapter carries an `Arg::Ruleset`
+    /// token: the two semgrep tools (`--config <slug>`) and PMD
+    /// (`-R <ruleset>`). Empty (the default) uses the adapter's built-in
+    /// value (`auto` / `p/r2c-best-practices` / `rulesets/java/quickstart.xml`).
+    /// Exists because these defaults are upstream-owned and can break without
+    /// notice (semgrep's `p/best-practices` 404'd 2026-07) — the recovery is
+    /// then a settings edit, not a rebuild. Ignored by every other tool.
+    /// `extra_args` can't serve this purpose: semgrep *merges* repeated
     /// `--config` flags, so an appended slug can't replace a dead baked-in one.
     #[serde(default)]
     pub ruleset: String,

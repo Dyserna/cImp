@@ -1083,9 +1083,10 @@ export interface AuditToolConfig {
   enabled: boolean;
   path: string;
   extra_args: string[];
-  /// Registry ruleset override for the two semgrep tools (`--config <slug>`).
-  /// Empty uses the adapter's built-in slug (`auto` / `p/r2c-best-practices`);
-  /// exists so a slug vanishing from the semgrep registry is a settings edit,
+  /// Ruleset override for the tools with a ruleset selector: the two semgrep
+  /// tools (`--config <slug>`) and PMD (`-R <ruleset>`). Empty uses the
+  /// adapter's built-in value; exists so an upstream-owned default breaking
+  /// (e.g. a slug vanishing from the semgrep registry) is a settings edit,
   /// not a rebuild. Ignored by every other tool.
   ruleset: string;
   /// V25 Phase C: per-tool wall-clock timeout override in seconds. `null` (the

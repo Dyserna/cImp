@@ -833,6 +833,10 @@
   // injection + the read advisor under 'efficiency'; the 3D view under 'viz'.
   type GraphSubSection = 'graph' | 'semantic' | 'efficiency' | 'viz';
   let graphSubSection = $state<GraphSubSection>('graph');
+  // Sub-tab nav within the Code Audit section: feature toggle + scan/MCP
+  // settings under 'settings'; the two scanner lists under their own tabs.
+  type AuditSubSection = 'settings' | 'security' | 'quality';
+  let auditSubSection = $state<AuditSubSection>('settings');
   function subSectionForTabId(tabId: string): TabsSubSection {
     if (
       tabId === 'claude' ||
@@ -5066,20 +5070,35 @@
             project); the enable checkboxes stay per-project. Enable the
             feature to show the Code audit section in the Tools tab.
           </small>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.code_audit.enabled}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.code_audit.enabled = (
-                      e.currentTarget as HTMLInputElement
-                    ).checked),
-                )}
-            />
-            <span>Enable Code Audit (Tools → Code audit)</span>
-          </label>
+          <div class="sub-tabs" role="tablist" aria-label="Code Audit sub-sections">
+            <button
+              type="button"
+              role="tab"
+              class:active={auditSubSection === 'settings'}
+              aria-selected={auditSubSection === 'settings'}
+              onclick={() => (auditSubSection = 'settings')}
+            >
+              Settings
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={auditSubSection === 'security'}
+              aria-selected={auditSubSection === 'security'}
+              onclick={() => (auditSubSection = 'security')}
+            >
+              Security tools
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class:active={auditSubSection === 'quality'}
+              aria-selected={auditSubSection === 'quality'}
+              onclick={() => (auditSubSection = 'quality')}
+            >
+              Quality tools
+            </button>
+          </div>
 
           {#snippet auditToolRow(row: AuditToolRow)}
             {@const det = auditDetect[row.meta.id]}
@@ -5173,43 +5192,21 @@
             </div>
           {/snippet}
 
-          <h3>Security tools</h3>
-          <small class="hint">
-            Shown in the Code audit section's <strong>Security</strong> sub-tab
-            (Tools tab).
-          </small>
-          {#each auditGroups.security as row (row.meta.id)}
-            {@render auditToolRow(row)}
-          {/each}
-
-          <h3>Quality tools</h3>
-          <small class="hint">
-            Shown in the Code audit section's <strong>Quality</strong> sub-tab
-            (Tools tab).
-            Language-gated — a tool only appears there (and only runs) when the
-            project contains files it applies to. All tools are listed here
-            regardless of the current project.
-          </small>
-          {#if snapshot.code_audit.quality_auto_select}
-            <small class="hint audit-auto-note">
-              Selection: <strong>automatic</strong> — follows the project's
-              languages (heavyweight opt-ins stay off); editing a checkbox
-              switches to manual.
-            </small>
-          {:else}
-            <div class="audit-auto-row">
-              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
-                Auto-select for this project
-              </button>
-              <small class="hint">
-                re-select the tools matching the project's languages and keep
-                them in sync automatically
-              </small>
-            </div>
-          {/if}
-          {#each auditGroups.quality as row (row.meta.id)}
-            {@render auditToolRow(row)}
-          {/each}
+          {#if auditSubSection === 'settings'}
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.code_audit.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.code_audit.enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Enable Code Audit (Tools → Code audit)</span>
+          </label>
 
           <h3>Scan settings</h3>
           <label>
@@ -5279,6 +5276,44 @@
             />
             <span>Expose to offload worker</span>
           </label>
+          {:else if auditSubSection === 'security'}
+          <small class="hint top">
+            Shown in the Code audit section's <strong>Security</strong> sub-tab
+            (Tools tab).
+          </small>
+          {#each auditGroups.security as row (row.meta.id)}
+            {@render auditToolRow(row)}
+          {/each}
+
+          {:else if auditSubSection === 'quality'}
+          <small class="hint top">
+            Shown in the Code audit section's <strong>Quality</strong> sub-tab
+            (Tools tab).
+            Language-gated — a tool only appears there (and only runs) when the
+            project contains files it applies to. All tools are listed here
+            regardless of the current project.
+          </small>
+          {#if snapshot.code_audit.quality_auto_select}
+            <small class="hint audit-auto-note">
+              Selection: <strong>automatic</strong> — follows the project's
+              languages (heavyweight opt-ins stay off); editing a checkbox
+              switches to manual.
+            </small>
+          {:else}
+            <div class="audit-auto-row">
+              <button type="button" class="secondary" onclick={applyQualityAutoSelect}>
+                Auto-select for this project
+              </button>
+              <small class="hint">
+                re-select the tools matching the project's languages and keep
+                them in sync automatically
+              </small>
+            </div>
+          {/if}
+          {#each auditGroups.quality as row (row.meta.id)}
+            {@render auditToolRow(row)}
+          {/each}
+          {/if}
         </section>
       {:else if activeSection === 'pricing'}
         <section>

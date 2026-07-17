@@ -215,6 +215,44 @@ fn command_is(command: &str, name: &str) -> bool {
 ///     the global `statusline.enabled`. The overlay merges with the
 ///     user's own Claude settings (only `statusLine` is set), so it
 ///     scopes the context bar to cImp without touching `~/.claude`.
+/// The four "is this MCP server advertised to this consumer" gates, factored
+/// out so the injection sites below and the restart-hint edge detector in
+/// `ipc::commands::settings_update` can never drift apart. Servers are
+/// injected only at TAB SPAWN (`--mcp-config` / `OPENCODE_CONFIG_CONTENT`),
+/// so a running AI tab keeps its old server set until restarted — any edit
+/// that flips one of these must surface a restart hint.
+pub(crate) fn advertises_offload_to_claude(s: &Settings) -> bool {
+    s.offload.enabled || s.graph.enabled || s.offload.any_claude_mcp()
+}
+
+pub(crate) fn advertises_audit_to_claude(s: &Settings) -> bool {
+    s.code_audit.enabled && s.code_audit.expose_claude
+}
+
+pub(crate) fn advertises_offload_to_opencode(s: &Settings) -> bool {
+    s.offload.enabled || s.graph.enabled || s.offload.any_opencode_mcp()
+}
+
+pub(crate) fn advertises_audit_to_opencode(s: &Settings) -> bool {
+    s.code_audit.enabled && s.code_audit.expose_opencode
+}
+
+/// Per-consumer advertised-server signature — `[claude, opencode]`, each
+/// `(offload, audit)` presence. Compared across a Settings save to decide
+/// whether a "restart the AI tab" hint is due.
+pub(crate) fn mcp_advertise_sig(s: &Settings) -> [(bool, bool); 2] {
+    [
+        (
+            advertises_offload_to_claude(s),
+            advertises_audit_to_claude(s),
+        ),
+        (
+            advertises_offload_to_opencode(s),
+            advertises_audit_to_opencode(s),
+        ),
+    ]
+}
+
 fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     if !command_is(&cfg.command, "claude") {
         return Vec::new();
@@ -365,7 +403,7 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
     if let Ok(exe) = std::env::current_exe() {
         let exe = exe.to_string_lossy().to_string();
         let mut servers = serde_json::Map::new();
-        if settings.offload.enabled || settings.graph.enabled || settings.offload.any_claude_mcp() {
+        if advertises_offload_to_claude(settings) {
             servers.insert(
                 "cimp-offload".to_string(),
                 serde_json::json!({
@@ -374,7 +412,7 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                 }),
             );
         }
-        if settings.code_audit.enabled && settings.code_audit.expose_claude {
+        if advertises_audit_to_claude(settings) {
             servers.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
@@ -613,8 +651,11 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     }
-    // Need the loopback endpoint to reach the app; without it, skip (and clean).
-    let Some(disc) = crate::offload::loopback::read_discovery() else {
+    // Need the loopback endpoint to reach the app; without it, skip (and
+    // clean). This runs IN the app at tab spawn, so it must bake THIS
+    // instance's endpoint — `read_own_discovery` (pid-keyed), never the
+    // shared last-writer-wins file a sibling instance may have overwritten.
+    let Some(disc) = crate::offload::loopback::read_own_discovery() else {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     };
@@ -835,8 +876,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
     if let Ok(exe) = std::env::current_exe() {
         let exe = exe.to_string_lossy().to_string();
         let mut mcp = serde_json::Map::new();
-        if settings.offload.enabled || settings.graph.enabled || settings.offload.any_opencode_mcp()
-        {
+        if advertises_offload_to_opencode(settings) {
             mcp.insert(
                 "cimp-offload".to_string(),
                 serde_json::json!({
@@ -845,7 +885,7 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
                 }),
             );
         }
-        if settings.code_audit.enabled && settings.code_audit.expose_opencode {
+        if advertises_audit_to_opencode(settings) {
             mcp.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
@@ -1566,6 +1606,41 @@ mod tests {
             cfg["mcpServers"]["cimp-code-audit"]["args"][0],
             "--code-audit-mcp"
         );
+    }
+
+    #[test]
+    fn every_advertised_mcp_server_gets_a_loopback() {
+        // Tripwire for the V26 gap: any settings combo that injects an MCP
+        // server (Claude `--mcp-config` or the OpenCode `mcp` block) MUST also
+        // flip `Settings::loopback_needed()` — the injected children proxy
+        // every call over the loopback, so advertising without serving strands
+        // them all with "cImp is not running" while the app is visibly up.
+        // Sweep each feature axis alone and combined.
+        for (offload, graph, audit) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut settings = Settings::default();
+            settings.offload.enabled = offload;
+            settings.graph.enabled = graph;
+            settings.code_audit.enabled = audit;
+            let claude_advertises = build_pre_args(&claude_cfg(), &settings)
+                .iter()
+                .any(|a| a == "--mcp-config");
+            let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings)
+                .get("mcp")
+                .is_some();
+            if claude_advertises || opencode_advertises {
+                assert!(
+                    settings.loopback_needed(),
+                    "advertised an MCP server without a loopback: \
+                     offload={offload} graph={graph} audit={audit}"
+                );
+            }
+        }
     }
 
     #[test]

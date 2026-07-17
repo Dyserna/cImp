@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { listen } from '@tauri-apps/api/event';
   import LayoutNodeRenderer from './lib/LayoutNodeRenderer.svelte';
   import StatusBar from './lib/StatusBar.svelte';
   import TuiTitleBar from './lib/TuiTitleBar.svelte';
@@ -94,6 +95,7 @@
   let removeDebugKeys: (() => void) | undefined;
   let unsubLayoutSave: (() => void) | undefined;
   let unsubFollowAvatar: (() => void) | undefined;
+  let unlistenRestartHint: (() => void) | undefined;
 
   // Set to true by the cleanup returned from onMount. Checked at the
   // single `await` suspension point inside the async IIFE (and once
@@ -111,6 +113,8 @@
     removeDebugKeys?.();
     unsubLayoutSave?.();
     unsubFollowAvatar?.();
+    unlistenRestartHint?.();
+    unlistenRestartHint = undefined;
     unsubSettings = undefined;
     unsubContent = undefined;
     unsubFocusedTab = undefined;
@@ -197,6 +201,26 @@
       // compose overlay). Idempotent; safe even when STT is disabled —
       // the backend simply never emits until the user records.
       initStt();
+      // Settings edits that change which MCP servers are advertised to an
+      // AI tab (offload / graph / Code Audit exposure) only take effect at
+      // tab spawn — surface the backend's edge hint as a toast so the user
+      // knows to restart the tab (Settings → Tabs → Restart) instead of
+      // wondering why the tools didn't appear.
+      void listen<string[]>('ai-tab-restart-hint', (e) => {
+        const names = (e.payload ?? [])
+          .map((c) => (c === 'claude' ? 'Claude' : c === 'opencode' ? 'OpenCode' : c))
+          .join(' and ');
+        if (!names) return;
+        showToast(
+          `MCP tool changes take effect after restarting the ${names} tab${
+            e.payload.length > 1 ? 's' : ''
+          } (Settings → Tabs → Restart).`,
+          8000,
+        );
+      }).then((un) => {
+        if (disposed) un();
+        else unlistenRestartHint = un;
+      });
       // Position-bound tab-switch handler: 1-indexed lookup against the
       // *focused pane's* tab list (V4-03 reinterpretation of v1.2's
       // global Ctrl+N). No-op when the focused pane has fewer than N

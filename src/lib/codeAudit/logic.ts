@@ -331,6 +331,16 @@ export function toolChip(tool: AuditToolState): ChipDisplay {
         spinner: false,
         tooltip: tool.error ?? 'not found on PATH or ebin',
       };
+    case 'path-invalid':
+      // Distinct from not-installed: a path IS configured but doesn't
+      // resolve (stale per-project path, moved binary). The component reuses
+      // the not-installed Settings link for the fix-it affordance.
+      return {
+        kind: 'path-invalid',
+        label: 'bad path',
+        spinner: false,
+        tooltip: tool.error ?? 'configured path not found — fix it in Settings',
+      };
     case 'skipped-not-applicable':
       // V25 Phase C: enabled but gated off by the project census. The Security
       // trio is always applicable so this never arises in this tab; Phase D's

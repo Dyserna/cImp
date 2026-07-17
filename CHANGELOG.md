@@ -5,6 +5,51 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`cimp --help` / `--version` no longer launch the GUI.** Both (plus `-h`,
+  `-V`, and a leading `help`) print usage/version and exit — previously any
+  unrecognized invocation fell through to a full app launch, so an AI agent
+  probing the CLI (`cimp --help`, `cimp code-audit --help`) opened real
+  windows. All other args still forward to the Claude tab (the drop-in
+  `claude` contract, e.g. `cimp --resume <id>`).
+- **Code-audit / graph MCP tools no longer strand with "cImp is not running"
+  when offload is off.** The loopback endpoint now starts whenever ANY
+  feature that advertises an MCP server needs it (offload, graph, Code Audit
+  exposure) — previously it keyed on offload alone, so an audit-only or
+  graph-only project advertised tools whose endpoint never came up. A
+  tripwire test keeps the advertise and serve gates aligned.
+- **Multi-instance MCP routing.** Discovery is now per-instance
+  (`.cimp-discovery/<pid>.json` next to the exe, each entry carrying its
+  launch root) and children resolve the instance whose root contains their
+  cwd — previously the single last-writer-wins `.cimp-offload.json` could
+  route project A's audits/graph/hook calls to project B's instance. Stale
+  entries from hard-killed instances are swept at startup, the legacy file
+  is kept in step as a fallback, and `/audit/run` additionally rejects a
+  misrouted child with a clear "this instance serves X" error instead of
+  scanning the wrong project.
+- **Audit scanner paths now apply machine-wide.** Configured scanner exe
+  paths (`code_audit.tools[].path`) were silently saved into the active
+  project's overlay, so paths set up in one repo resolved to nothing in
+  every other repo. Paths now live in the global settings file (legacy
+  overlay paths are promoted once at load); the per-project overlay keeps
+  only the enable flags and extra args.
+
+### Added
+
+- **"Restart the AI tab" hint when MCP exposure changes.** Enabling Code
+  Audit (or flipping any setting that changes which MCP servers are
+  advertised) now shows a toast in the main window and a Settings hint —
+  servers are injected at tab spawn, so a running Claude/OpenCode session
+  can't gain them mid-flight.
+- **Distinct "misconfigured" audit-tool status.** A tool whose CONFIGURED
+  path doesn't resolve now reports `path-invalid` ("configured path not
+  found: <path> — fix it in Settings", with a Settings link in the chip)
+  instead of the misleading "not installed"; the MCP report summary counts
+  it separately.
+
 ## [0.47.0] — 2026-07-16
 
 ### Changed

@@ -32,7 +32,15 @@ use tokio::sync::Semaphore;
 use crate::error::AppError;
 use crate::mcp_stdio::tool_error;
 
-use super::loopback::{parse_result_line, proxy_base};
+use super::loopback::{parse_result_line, proxy_base_for};
+
+/// Root-aware endpoint resolution for this child: its cwd is the agent's
+/// project directory (inherited at spawn — the injected mcp-config sets no
+/// cwd), so with several cImp instances off one install the child connects
+/// to the instance actually serving ITS project, not the last one launched.
+fn proxy_base() -> Option<(String, String)> {
+    proxy_base_for(std::env::current_dir().ok().as_deref())
+}
 
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};
 use crate::offload::router::{self, BackendView, RouteError, TierHint};

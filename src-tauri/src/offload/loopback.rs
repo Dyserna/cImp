@@ -20,7 +20,7 @@
 //! documented in MAINTENANCE.md.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,7 +40,17 @@ use super::router::TierHint;
 use super::service::OffloadService;
 
 /// Discovery-file name under the portable root (next to `settings.json`).
+/// Legacy single-instance location, still written for anything that only
+/// knows this path; the per-instance directory below is authoritative.
 const DISCOVERY_FILE: &str = ".cimp-offload.json";
+
+/// Per-instance discovery DIRECTORY under the portable root: one
+/// `<pid>.json` per running instance, each carrying that instance's launch
+/// `root`. The legacy single file is last-writer-wins, so with two cImp
+/// instances open a child spawned by project A's agent could connect to
+/// project B's app — and audits/graph queries would run against the WRONG
+/// project. Readers resolve root-aware via [`read_discovery_for`].
+const DISCOVERY_DIR: &str = ".cimp-discovery";
 
 /// The discovery file the child reads to find + authenticate to the app.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,33 +58,175 @@ pub struct Discovery {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+    /// The launch project root this instance serves (canonicalized at
+    /// write). `#[serde(default)]` — absent in legacy files.
+    #[serde(default)]
+    pub root: String,
 }
 
-/// `<exe-dir>/.cimp-offload.json` — the portable-root discovery path. Falls
-/// back to the cwd if `current_exe()` is unavailable (mirrors
-/// `settings::global_path`).
-pub fn discovery_path() -> PathBuf {
-    match std::env::current_exe()
+/// The portable root (exe dir), falling back to the cwd if `current_exe()`
+/// is unavailable (mirrors `settings::global_path`).
+fn portable_root() -> PathBuf {
+    std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-    {
-        Some(dir) => dir.join(DISCOVERY_FILE),
-        None => PathBuf::from(DISCOVERY_FILE),
-    }
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Read the discovery file, if present and parseable.
+/// `<exe-dir>/.cimp-offload.json` — the legacy portable-root discovery path.
+pub fn discovery_path() -> PathBuf {
+    portable_root().join(DISCOVERY_FILE)
+}
+
+/// `<exe-dir>/.cimp-discovery/` — the per-instance discovery directory.
+fn discovery_dir() -> PathBuf {
+    portable_root().join(DISCOVERY_DIR)
+}
+
+/// This process's per-instance discovery file.
+fn own_discovery_path() -> PathBuf {
+    discovery_dir().join(format!("{}.json", std::process::id()))
+}
+
+/// Read the legacy single discovery file, if present and parseable.
 pub fn read_discovery() -> Option<Discovery> {
     let text = std::fs::read_to_string(discovery_path()).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-/// Base URL + bearer token of the running app's loopback endpoint, from the
-/// discovery file — the one endpoint resolver every stdio MCP child uses
-/// (`offload/mcp.rs`, `audit/mcp.rs`). `None` ⇒ the app isn't running.
-pub fn proxy_base() -> Option<(String, String)> {
-    let d = read_discovery()?;
+/// Every parseable per-instance discovery entry (stale ones included — they
+/// are swept at instance start; see [`sweep_stale_discoveries`]).
+fn read_all_discoveries() -> Vec<Discovery> {
+    let Ok(entries) = std::fs::read_dir(discovery_dir()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|t| serde_json::from_str(&t).ok())
+        .collect()
+}
+
+/// This instance's own discovery entry — the per-instance file first, then
+/// the legacy file when it still belongs to this pid. Used by in-app writers
+/// that bake port+token into generated artifacts (the OpenCode plugin) and
+/// must never pick up a sibling instance's endpoint.
+pub fn read_own_discovery() -> Option<Discovery> {
+    if let Ok(text) = std::fs::read_to_string(own_discovery_path()) {
+        if let Ok(d) = serde_json::from_str::<Discovery>(&text) {
+            return Some(d);
+        }
+    }
+    read_discovery().filter(|d| d.pid == std::process::id())
+}
+
+/// Canonicalized-or-raw form of a path for ancestry comparison. Both the
+/// writer (instance root) and readers (child cwd) go through this, so the
+/// `\\?\` extended prefix `std::fs::canonicalize` adds on Windows appears on
+/// both sides and cancels out in the component-wise comparison.
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Component-wise "is `root` an ancestor of (or equal to) `hint`" — case
+/// insensitive on Windows, where on-disk casing and agent-reported cwds
+/// routinely disagree.
+fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
+    let rc: Vec<_> = root.components().collect();
+    let hc: Vec<_> = hint.components().collect();
+    if rc.is_empty() || rc.len() > hc.len() {
+        return false;
+    }
+    rc.iter().zip(hc.iter()).all(|(a, b)| {
+        let (a, b) = (a.as_os_str().to_string_lossy(), b.as_os_str().to_string_lossy());
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(&b)
+        } else {
+            a == b
+        }
+    })
+}
+
+/// Pick the instance serving `hint` from the per-instance entries: the
+/// DEEPEST root that is an ancestor of the hint wins (nested checkouts
+/// resolve to the closest instance; same-root duplicates tie-break on pid —
+/// arbitrary but deterministic). With no hint or no match: a sole surviving
+/// entry is unambiguous, else fall back to the legacy last-writer-wins file.
+/// Pure — unit-tested directly.
+fn select_discovery(mut entries: Vec<Discovery>, hint: Option<&Path>) -> Option<Discovery> {
+    if let Some(h) = hint {
+        let mut best: Option<(usize, &Discovery)> = None;
+        for d in &entries {
+            if d.root.is_empty() {
+                continue;
+            }
+            let root = PathBuf::from(&d.root);
+            if is_ancestor_or_equal(&root, h) {
+                let depth = root.components().count();
+                let better = match &best {
+                    None => true,
+                    Some((bd, bde)) => depth > *bd || (depth == *bd && d.pid > bde.pid),
+                };
+                if better {
+                    best = Some((depth, d));
+                }
+            }
+        }
+        if let Some((_, d)) = best {
+            return Some(d.clone());
+        }
+    }
+    if entries.len() == 1 {
+        return entries.pop();
+    }
+    read_discovery()
+}
+
+/// Root-aware discovery: resolve the instance serving `hint` (a child's cwd
+/// or a hook payload's cwd). `None` hint degrades to sole-entry / legacy.
+pub fn read_discovery_for(hint: Option<&Path>) -> Option<Discovery> {
+    let hint = hint.map(canon);
+    select_discovery(read_all_discoveries(), hint.as_deref())
+}
+
+/// Base URL + bearer token of the loopback endpoint of the instance serving
+/// `hint` — the one endpoint resolver every stdio MCP child uses
+/// (`offload/mcp.rs`, `audit/mcp.rs`). `None` ⇒ no instance is running.
+pub fn proxy_base_for(hint: Option<&Path>) -> Option<(String, String)> {
+    let d = read_discovery_for(hint)?;
     Some((format!("http://127.0.0.1:{}", d.port), d.token))
+}
+
+/// Delete per-instance entries whose endpoint no longer answers — hard-killed
+/// instances leave their `<pid>.json` behind (removal is graceful-exit only).
+/// Run once per instance start; a 200ms connect probe per entry bounds the
+/// cost. Entries for OUR pid are removed unconditionally (a previous run's
+/// leftover under a reused pid — ours gets rewritten right after).
+async fn sweep_stale_discoveries(own_pid: u32) {
+    for d in read_all_discoveries() {
+        let stale = if d.pid == own_pid {
+            true
+        } else {
+            !tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(("127.0.0.1", d.port)),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+        };
+        if stale {
+            let path = discovery_dir().join(format!("{}.json", d.pid));
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    debug!(error = %e, pid = d.pid, "offload loopback: stale discovery cleanup failed");
+                }
+            } else if d.pid != own_pid {
+                info!(pid = d.pid, port = d.port, "offload loopback: swept stale discovery entry");
+            }
+        }
+    }
 }
 
 /// A per-launch random bearer token (two v4 UUIDs of entropy, hex). Avoids
@@ -96,13 +248,22 @@ pub struct Loopback {
     #[allow(dead_code)]
     pub token: String,
     discovery: PathBuf,
+    /// This instance's `<pid>.json` under the per-instance directory.
+    own_file: PathBuf,
 }
 
 impl Loopback {
-    /// Bind the endpoint, write the discovery file, and spawn the accept
-    /// loop. Returns the handle (managed in `AppState`). Idempotent at the
-    /// file level — an existing (stale) discovery file is overwritten.
-    pub async fn start(service: Arc<OffloadService>, app: AppHandle) -> AppResult<Arc<Self>> {
+    /// Bind the endpoint, write the discovery files (the per-instance
+    /// `<pid>.json` plus the legacy single file), sweep stale sibling
+    /// entries, and spawn the accept loop. Returns the handle (managed in
+    /// `AppState`). Idempotent at the file level — existing (stale) files
+    /// are overwritten. `root` is the launch project root this instance
+    /// serves; children match their cwd against it (`read_discovery_for`).
+    pub async fn start(
+        service: Arc<OffloadService>,
+        app: AppHandle,
+        root: &Path,
+    ) -> AppResult<Arc<Self>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|e| AppError::Offload(format!("loopback bind failed: {e}")))?;
@@ -112,14 +273,24 @@ impl Loopback {
             .port();
         let token = make_token();
         let discovery = discovery_path();
+        let own_file = own_discovery_path();
+
+        sweep_stale_discoveries(std::process::id()).await;
 
         let disc = Discovery {
             port,
             token: token.clone(),
             pid: std::process::id(),
+            root: canon(root).to_string_lossy().to_string(),
         };
+        if let Some(parent) = own_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        write_discovery(&own_file, &disc)?;
+        // Keep the legacy single file in step (last-writer-wins, as before):
+        // it is the no-hint / no-per-instance-match fallback.
         write_discovery(&discovery, &disc)?;
-        info!(port, "offload loopback: listening on 127.0.0.1");
+        info!(port, root = %disc.root, "offload loopback: listening on 127.0.0.1");
 
         // Accept loop.
         let accept_token = token.clone();
@@ -148,6 +319,7 @@ impl Loopback {
             port,
             token,
             discovery,
+            own_file,
         }))
     }
 
@@ -161,6 +333,12 @@ impl Loopback {
     /// children. (The start-time clobber itself is inherent to running two
     /// instances from one install and is left as last-writer-wins.)
     pub fn stop(&self) {
+        // The per-instance file is ours by construction (pid-named).
+        if let Err(e) = std::fs::remove_file(&self.own_file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                debug!(error = %e, "offload loopback: own discovery cleanup failed");
+            }
+        }
         if let Some(d) = read_discovery() {
             if d.pid != std::process::id() {
                 debug!(
@@ -672,6 +850,11 @@ struct AuditRunBody {
     category: crate::audit::adapters::Category,
     #[serde(default)]
     consumer: Option<String>,
+    /// The child's working directory (the agent's project), sent for
+    /// verification only — the scan always runs against this app's own
+    /// launch root. `#[serde(default)]` keeps older children compatible.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// `POST /audit/run` (V26): run one full code-audit scan of the requested
@@ -763,6 +946,26 @@ async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
             )),
         };
         return write_json(stream, 200, &r).await;
+    }
+
+    // Wrong-instance guard: the scan always runs against THIS app's launch
+    // root, so a child whose cwd falls outside it was misrouted (stale or
+    // foreign discovery entry — possible with several cImp instances off one
+    // install). A clean error beats silently auditing the wrong project.
+    if let Some(child_cwd) = body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let served_root = canon(&state.root());
+        if !is_ancestor_or_equal(&served_root, &canon(Path::new(child_cwd))) {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!(
+                    "this cImp instance serves {} — launch cImp in {} (or close the other instance) to audit it",
+                    served_root.display(),
+                    child_cwd
+                )),
+            };
+            return write_json(stream, 200, &r).await;
+        }
     }
 
     write_ndjson_head(stream, "audit").await?;
@@ -1759,12 +1962,87 @@ mod tests {
             port: 8123,
             token: "tok".into(),
             pid: 42,
+            root: "P:\\proj".into(),
         };
         let s = serde_json::to_string(&d).unwrap();
         let back: Discovery = serde_json::from_str(&s).unwrap();
         assert_eq!(back.port, 8123);
         assert_eq!(back.token, "tok");
         assert_eq!(back.pid, 42);
+        // Legacy files (pre-root) still parse: `root` defaults empty.
+        let legacy: Discovery =
+            serde_json::from_str(r#"{"port":1,"token":"t","pid":9}"#).unwrap();
+        assert_eq!(legacy.root, "");
+    }
+
+    fn disc(pid: u32, port: u16, root: &str) -> Discovery {
+        Discovery {
+            port,
+            token: format!("tok{pid}"),
+            pid,
+            root: root.to_string(),
+        }
+    }
+
+    #[test]
+    fn select_discovery_routes_by_root() {
+        // Two instances off one install: a child whose cwd is inside project
+        // B must reach B's instance, never last-writer-wins.
+        let entries = vec![disc(1, 1001, "P:\\proj\\a"), disc(2, 1002, "P:\\proj\\b")];
+        let picked =
+            select_discovery(entries, Some(Path::new("P:\\proj\\b\\src"))).expect("match");
+        assert_eq!(picked.pid, 2);
+    }
+
+    #[test]
+    fn select_discovery_deepest_matching_root_wins() {
+        // Nested checkouts: the closest (deepest) serving instance wins.
+        let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
+        let picked =
+            select_discovery(entries, Some(Path::new("P:\\proj\\nested\\src"))).expect("match");
+        assert_eq!(picked.pid, 2);
+        // A hint outside the nested root resolves to the outer instance.
+        let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
+        let picked =
+            select_discovery(entries, Some(Path::new("P:\\proj\\other"))).expect("match");
+        assert_eq!(picked.pid, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn select_discovery_is_case_insensitive_on_windows() {
+        let entries = vec![disc(1, 1001, "p:\\PROJ\\A")];
+        let picked =
+            select_discovery(entries, Some(Path::new("P:\\proj\\a\\deep"))).expect("match");
+        assert_eq!(picked.pid, 1);
+    }
+
+    #[test]
+    fn select_discovery_sole_entry_wins_without_a_root_match() {
+        // One running instance is unambiguous even when the hint doesn't
+        // land inside its root (e.g. an agent launched outside any project).
+        let entries = vec![disc(7, 1007, "P:\\elsewhere")];
+        let picked = select_discovery(entries, Some(Path::new("Q:\\other"))).expect("sole entry");
+        assert_eq!(picked.pid, 7);
+    }
+
+    #[test]
+    fn is_ancestor_or_equal_rejects_prefix_strings_and_unrelated() {
+        assert!(is_ancestor_or_equal(
+            Path::new("P:\\proj\\a"),
+            Path::new("P:\\proj\\a")
+        ));
+        // Component-wise, not string-prefix: `P:\proj\a` is NOT an ancestor
+        // of `P:\proj\ab`.
+        assert!(!is_ancestor_or_equal(
+            Path::new("P:\\proj\\a"),
+            Path::new("P:\\proj\\ab")
+        ));
+        assert!(!is_ancestor_or_equal(
+            Path::new("P:\\proj\\a\\deep"),
+            Path::new("P:\\proj\\a")
+        ));
+        assert!(!is_ancestor_or_equal(Path::new(""), Path::new("P:\\proj")));
     }
 
     #[test]

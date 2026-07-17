@@ -191,6 +191,14 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         v
     });
 
+    // 2b. Promote legacy overlay scanner paths into the global baseline
+    //     (empty slots only) — see the machine-scope notes above
+    //     `promote_overlay_audit_paths`. Persisted below via the post-load
+    //     `save`, which also rewrites the overlay in the stripped shape.
+    let promoted = overlay_value
+        .as_ref()
+        .is_some_and(|ov| promote_overlay_audit_paths(&mut global, ov));
+
     // 3. Merge the (now both-current-shape) global + overlay.
     let mut merged = match serde_json::to_value(&global) {
         Ok(v) => v,
@@ -205,6 +213,9 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     let overlay_existed = overlay_value.is_some();
     if let Some(overlay) = overlay_value {
         deep_merge(&mut merged, overlay);
+        // 3b. Paths always come from the (post-promotion) global baseline —
+        //     an overlay's path copies are legacy data, not authority.
+        enforce_global_audit_paths(&mut merged, &global);
     }
 
     let mut settings: Settings = match serde_json::from_value(merged) {
@@ -247,10 +258,13 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     // overlay. The load-time post-repair save below relies on this too.
     let _ = integrity_check(&mut global);
 
-    if repaired {
+    if repaired || promoted {
         // Persist the post-repair state back to its source of truth. If a
         // custom overlay was in play, we recompute and rewrite the diff;
-        // otherwise we rewrite global.
+        // otherwise we rewrite global. (A path promotion always has an
+        // overlay in play; `save` both writes the promoted paths through to
+        // the physical global file and rewrites the overlay stripped, so the
+        // promotion never re-fires.)
         if overlay_existed {
             // `global` is already integrity-checked (above), so invariants
             // enforced on both sides don't get mistaken for user
@@ -666,18 +680,175 @@ fn strip_overlay_banned(v: &mut Value) {
     }
 }
 
+// ── Audit scanner paths: machine-scope splitting ─────────────────────────────
+//
+// Scanner exe paths (`code_audit.tools[].path`) are MACHINE facts (where
+// gitleaks.exe lives on this box), but the `tools` array as a whole is
+// project-scoped (the `enabled` flags follow each project's census and the
+// user's per-project selection) and the generic `diff` replaces arrays
+// WHOLESALE — the two scopes share one array. Left alone, whichever project
+// the user configured a scanner from keeps the path hostage in ITS overlay
+// while every other project sees "" (the V26 field report: paths set up in
+// one repo, audits in a second repo resolved nothing). The splitting rules:
+//
+//   * LOAD — a legacy overlay's non-empty paths are promoted into the global
+//     baseline's EMPTY slots once, then the merged view's paths are ALWAYS
+//     overwritten from the global baseline: overlays carry no path authority.
+//   * SAVE — the live paths are written through to the PHYSICAL global file
+//     (`sync_audit_paths_into` + `save_to`, the same bypass pattern as
+//     `write_global_prompt_templates`), and `path` is normalized to "" on
+//     both diff sides so no new overlay ever pins a copy.
+//
+// `load_readonly` is deliberately exempt: the MCP children it serves never
+// read `code_audit.tools` (scans run in the app, not the child).
+
+/// The serde wire id (`osv-scanner`, `semgrep-quality`, …) of a typed tool id.
+fn audit_wire_id(id: crate::settings::schema::AuditToolId) -> String {
+    serde_json::to_value(id)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// LOAD step 1: promote a legacy overlay's non-empty scanner paths into the
+/// global baseline's empty slots (first project launched wins per slot; a
+/// non-empty global path is never overwritten). Returns true when `global`
+/// changed — the caller persists via the post-load `save`, which also
+/// rewrites the overlay in the stripped shape so promotion is one-time.
+fn promote_overlay_audit_paths(global: &mut Settings, overlay: &Value) -> bool {
+    let Some(entries) = overlay
+        .get("code_audit")
+        .and_then(|c| c.get("tools"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for e in entries {
+        let (Some(id), Some(path)) = (
+            e.get("id").and_then(Value::as_str),
+            e.get("path").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(t) = global
+            .code_audit
+            .tools
+            .iter_mut()
+            .find(|t| audit_wire_id(t.id) == id)
+        {
+            if t.path.trim().is_empty() {
+                t.path = path.to_string();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// LOAD step 2: overwrite the merged view's scanner paths from the
+/// (post-promotion) global baseline. Entries for ids the baseline doesn't
+/// know are left untouched (forward compat — the lenient deserializer drops
+/// them later anyway).
+fn enforce_global_audit_paths(merged: &mut Value, global: &Settings) {
+    let Some(entries) = merged
+        .get_mut("code_audit")
+        .and_then(|c| c.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for e in entries {
+        let Some(id) = e.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let Some(t) = global
+            .code_audit
+            .tools
+            .iter()
+            .find(|t| audit_wire_id(t.id) == id)
+        else {
+            continue;
+        };
+        if let Some(o) = e.as_object_mut() {
+            o.insert("path".to_string(), Value::String(t.path.clone()));
+        }
+    }
+}
+
+/// SAVE step 1 (pure half of the write-through): copy the live scanner paths
+/// onto the on-disk global settings. Returns true when anything changed —
+/// the caller only rewrites the physical file then.
+fn sync_audit_paths_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    for t in &current.code_audit.tools {
+        if let Some(g) = disk_global
+            .code_audit
+            .tools
+            .iter_mut()
+            .find(|g| g.id == t.id)
+        {
+            if g.path != t.path {
+                g.path = t.path.clone();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// SAVE step 2: normalize every scanner path to "" on a diff side so the
+/// overlay never carries one.
+fn strip_audit_tool_paths(v: &mut Value) {
+    if let Some(entries) = v
+        .get_mut("code_audit")
+        .and_then(|c| c.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    {
+        for e in entries {
+            if let Some(o) = e.as_object_mut() {
+                o.insert("path".to_string(), Value::String(String::new()));
+            }
+        }
+    }
+}
+
 /// Write the diff between `settings` and `global` to the custom overlay
 /// file in `launch_cwd`. If the diff is empty, deletes any existing
 /// overlay (so a user who reverts every change ends up with a clean
 /// directory).
 pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppResult<()> {
     let path = custom_path(launch_cwd);
+
+    // Scanner paths are machine-scope: write them through to the PHYSICAL
+    // global file (read-modify-write, every other field preserved — the
+    // `write_global_prompt_templates` pattern) so every project sees them,
+    // then normalize `path` on both diff sides below so no overlay pins a
+    // copy. Best-effort: a failed global write must not block the overlay
+    // save (the paths stay live in memory and re-sync on the next save).
+    if let Ok(gpath) = global_path() {
+        if gpath.exists() {
+            let mut disk = read_settings_or_default(&gpath);
+            if sync_audit_paths_into(&mut disk, settings) {
+                if let Err(e) = save_to(&gpath, &disk) {
+                    tracing::warn!(error = %e, "settings: audit-path global write-through failed");
+                }
+            }
+        }
+    }
+
     let mut current = serde_json::to_value(settings)
         .map_err(|e| AppError::Settings(format!("serialize current: {e}")))?;
     let mut baseline = serde_json::to_value(global)
         .map_err(|e| AppError::Settings(format!("serialize global: {e}")))?;
     strip_overlay_banned(&mut current);
     strip_overlay_banned(&mut baseline);
+    strip_audit_tool_paths(&mut current);
+    strip_audit_tool_paths(&mut baseline);
 
     match diff(&current, &baseline) {
         Some(delta) => {
@@ -2796,5 +2967,141 @@ mod tests {
         assert!(read_project_prompt_templates(&dir).is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Audit scanner paths: machine-scope splitting ──────────────────────────
+
+    use crate::settings::schema::AuditToolId;
+
+    fn set_tool_path(s: &mut Settings, id: AuditToolId, p: &str) {
+        s.code_audit
+            .tools
+            .iter_mut()
+            .find(|t| t.id == id)
+            .expect("tool seeded by default")
+            .path = p.to_string();
+    }
+
+    fn get_tool_path(s: &Settings, id: AuditToolId) -> String {
+        s.code_audit
+            .tools
+            .iter()
+            .find(|t| t.id == id)
+            .expect("tool seeded by default")
+            .path
+            .clone()
+    }
+
+    #[test]
+    fn audit_path_promotion_fills_only_empty_global_slots() {
+        let mut global = base_test_settings();
+        set_tool_path(&mut global, AuditToolId::Semgrep, "C:\\global\\semgrep.exe");
+        let overlay = serde_json::json!({
+            "code_audit": { "tools": [
+                { "id": "gitleaks", "path": "P:\\ebin\\gitleaks.exe" },
+                { "id": "semgrep", "path": "D:\\stale\\semgrep.exe" },
+                { "id": "ruff", "path": "   " },
+            ]}
+        });
+
+        assert!(promote_overlay_audit_paths(&mut global, &overlay));
+        // Empty global slot: filled from the legacy overlay.
+        assert_eq!(
+            get_tool_path(&global, AuditToolId::Gitleaks),
+            "P:\\ebin\\gitleaks.exe"
+        );
+        // Non-empty global slot: the overlay copy never overwrites it.
+        assert_eq!(
+            get_tool_path(&global, AuditToolId::Semgrep),
+            "C:\\global\\semgrep.exe"
+        );
+        // Whitespace-only overlay path: not a promotion.
+        assert_eq!(get_tool_path(&global, AuditToolId::Ruff), "");
+
+        // Idempotent: a second pass changes nothing.
+        assert!(!promote_overlay_audit_paths(&mut global, &overlay));
+    }
+
+    #[test]
+    fn merged_audit_paths_come_from_global_not_overlay() {
+        let mut global = base_test_settings();
+        set_tool_path(&mut global, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
+
+        // Simulate the deep-merge outcome: the overlay's tools array replaced
+        // the global's wholesale, with empty/stale path copies.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let tools = merged["code_audit"]["tools"].as_array_mut().unwrap();
+        for t in tools.iter_mut() {
+            t["path"] = serde_json::json!("");
+        }
+
+        enforce_global_audit_paths(&mut merged, &global);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        assert_eq!(
+            get_tool_path(&settings, AuditToolId::Gitleaks),
+            "P:\\ebin\\gitleaks.exe",
+            "the merged view must take paths from the global baseline"
+        );
+    }
+
+    #[test]
+    fn overlay_diff_never_carries_audit_paths() {
+        // A settings state that differs from global ONLY in a scanner path
+        // must produce NO overlay at all once both sides are stripped — the
+        // path lands in the global file via the save() write-through instead.
+        let global = base_test_settings();
+        let mut current = global.clone();
+        set_tool_path(&mut current, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
+
+        let mut cur_v = serde_json::to_value(&current).unwrap();
+        let mut base_v = serde_json::to_value(&global).unwrap();
+        strip_audit_tool_paths(&mut cur_v);
+        strip_audit_tool_paths(&mut base_v);
+        assert!(
+            diff(&cur_v, &base_v).is_none(),
+            "a path-only change must not create an overlay"
+        );
+
+        // A real per-project difference (an `enabled` flip) still diffs — and
+        // the emitted tools array carries only stripped paths.
+        let mut current2 = current.clone();
+        current2
+            .code_audit
+            .tools
+            .iter_mut()
+            .find(|t| t.id == AuditToolId::Gitleaks)
+            .unwrap()
+            .enabled = false;
+        let mut cur2_v = serde_json::to_value(&current2).unwrap();
+        strip_audit_tool_paths(&mut cur2_v);
+        let delta = diff(&cur2_v, &base_v).expect("enabled flip must diff");
+        let tools = delta["code_audit"]["tools"].as_array().unwrap();
+        assert!(
+            tools
+                .iter()
+                .all(|t| t["path"].as_str() == Some("")),
+            "overlay tools entries must carry no path copies: {delta}"
+        );
+    }
+
+    #[test]
+    fn sync_audit_paths_into_disk_global_reports_changes() {
+        let mut disk = base_test_settings();
+        let mut live = base_test_settings();
+        set_tool_path(&mut live, AuditToolId::Semgrep, "C:\\py\\semgrep.exe");
+
+        assert!(sync_audit_paths_into(&mut disk, &live));
+        assert_eq!(
+            get_tool_path(&disk, AuditToolId::Semgrep),
+            "C:\\py\\semgrep.exe"
+        );
+        // Unchanged on a second sync — the physical file isn't rewritten.
+        assert!(!sync_audit_paths_into(&mut disk, &live));
+
+        // Clearing a path in the live settings clears the global slot too
+        // (the Clear button means "forget the configured path everywhere").
+        set_tool_path(&mut live, AuditToolId::Semgrep, "");
+        assert!(sync_audit_paths_into(&mut disk, &live));
+        assert_eq!(get_tool_path(&disk, AuditToolId::Semgrep), "");
     }
 }

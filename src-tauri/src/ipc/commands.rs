@@ -850,6 +850,7 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
 
 #[tauri::command]
 pub async fn settings_update(
+    app: AppHandle,
     state: State<'_, AppState>,
     graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
     mut settings: Settings,
@@ -874,7 +875,7 @@ pub async fn settings_update(
     // Snapshot the pre-update flags (reserved tabs via the table, plus the
     // STT pair handled separately below) and the effective `graph.ignore`
     // list for the resync edge at the bottom.
-    let (was_reserved, was_stt, was_stt_device, was_graph_ignore) = {
+    let (was_reserved, was_stt, was_stt_device, was_graph_ignore, was_mcp_sig) = {
         let old = state.settings.current();
         let was: Vec<bool> = RESERVED_TAB_FLAGS
             .iter()
@@ -885,6 +886,7 @@ pub async fn settings_update(
             old.stt.enabled,
             old.stt.device,
             normalized_ignore(&old.graph.ignore),
+            crate::tabs::mcp_advertise_sig(&old),
         )
     };
 
@@ -959,6 +961,30 @@ pub async fn settings_update(
     // resync is a no-op walk when the edit doesn't affect any indexed file.
     if now.graph.enabled && normalized_ignore(&now.graph.ignore) != was_graph_ignore {
         graph.spawn_ignore_resync();
+    }
+
+    // On an advertised-MCP-server edge (offload/graph/code-audit/user-server
+    // exposure flips), tell the main window to show a restart hint: servers
+    // are injected only at tab spawn (`--mcp-config` for Claude,
+    // `OPENCODE_CONFIG_CONTENT` for OpenCode), so a running AI tab keeps its
+    // old tool set until restarted. The V26 field report: Code Audit enabled
+    // mid-session advertised nothing, the agent went probing for a CLI and
+    // opened GUI instances. Payload = the consumer names whose set changed.
+    let now_mcp_sig = crate::tabs::mcp_advertise_sig(&now);
+    if now_mcp_sig != was_mcp_sig {
+        let mut consumers: Vec<&'static str> = Vec::new();
+        if now_mcp_sig[0] != was_mcp_sig[0] {
+            consumers.push("claude");
+        }
+        if now_mcp_sig[1] != was_mcp_sig[1] {
+            consumers.push("opencode");
+        }
+        // Best-effort UI hint — never fail the save over it.
+        let _ = app.emit_to(
+            EventTarget::webview_window("main"),
+            "ai-tab-restart-hint",
+            consumers,
+        );
     }
     Ok(())
 }

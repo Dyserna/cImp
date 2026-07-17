@@ -21,16 +21,19 @@ export type AuditSeverity = 'error' | 'warning' | 'note';
 /// Per-tool lifecycle status within a scan (mirror of Rust `ToolStatus`,
 /// kebab-case): `idle` (configured but not part of this scan), `running`,
 /// `done` (ran to completion — `findings` authoritative even when empty),
-/// `failed` (tool error / timeout / cancel), `not-installed` (unresolvable),
-/// `skipped-not-applicable` (V25: enabled but the project's census doesn't
-/// match this tool — e.g. no PMD in a Rust repo; the split UI hides it in the
-/// tab while Settings still lists it).
+/// `failed` (tool error / timeout / cancel), `not-installed` (no path
+/// configured and not found on PATH/ebin), `path-invalid` (the CONFIGURED
+/// path doesn't resolve — fix it in Settings), `skipped-not-applicable`
+/// (V25: enabled but the project's census doesn't match this tool — e.g. no
+/// PMD in a Rust repo; the split UI hides it in the tab while Settings still
+/// lists it).
 export type AuditToolStatus =
   | 'idle'
   | 'running'
   | 'done'
   | 'failed'
   | 'not-installed'
+  | 'path-invalid'
   | 'skipped-not-applicable';
 
 /// V25 Phase C: which tab/section a tool belongs to (mirror of Rust

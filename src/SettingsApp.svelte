@@ -4993,8 +4993,10 @@
             project root and merges their findings into one table. Nothing is
             bundled — each tool resolves from the <code>ebin\</code> drop-in
             folder first, then your PATH; point cImp at a specific build with
-            Browse, or check availability with Detect. Enable the feature to show
-            the Code audit section in the Tools tab.
+            Browse, or check availability with Detect. Configured paths are
+            machine-wide (saved to the global settings, shared by every
+            project); the enable checkboxes stay per-project. Enable the
+            feature to show the Code audit section in the Tools tab.
           </small>
           <label class="checkbox">
             <input
@@ -5162,8 +5164,10 @@
             Advertise the <code>cimp-code-audit</code> MCP server
             (<code>security_audit</code> / <code>quality_audit</code>, native
             worker tools for offload) so AI consumers can trigger audits
-            themselves. Each requires Code Audit enabled above. OpenCode caches
-            its tool list at connect — flip a toggle and restart the tab.
+            themselves. Each requires Code Audit enabled above. The server set
+            is injected when an AI tab starts — after enabling Code Audit or
+            flipping an exposure here, restart the Claude/OpenCode tab
+            (Tabs → Restart) for the tools to appear.
           </small>
           <label class="checkbox">
             <input

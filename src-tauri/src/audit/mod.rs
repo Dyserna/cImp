@@ -196,11 +196,19 @@ async fn detect_tool(
     let resolved = match resolve_audit_binary(id, override_path, root) {
         Ok(p) => p,
         Err(_) => {
+            // Same distinction the scan runner makes: an empty override that
+            // resolves nowhere is "not installed"; a non-empty override that
+            // fails is a broken configured path.
+            let error = if override_path.trim().is_empty() {
+                "not found on PATH or ebin".to_string()
+            } else {
+                format!("configured path not found: {}", override_path.trim())
+            };
             return AuditDetectResult {
                 found: false,
                 path: None,
                 version: None,
-                error: Some("not found on PATH or ebin".to_string()),
+                error: Some(error),
             };
         }
     };
@@ -356,7 +364,10 @@ mod tests {
 
     #[tokio::test]
     async fn detect_missing_tool_reports_not_found() {
-        // A bare name that is neither in ebin nor on PATH.
+        // A CONFIGURED override that resolves nowhere is a misconfiguration —
+        // the error names the offending value (distinct from the empty-path
+        // "not found on PATH or ebin" case, which the scan runner also
+        // branches on).
         let r = detect_tool(
             AuditToolId::OsvScanner,
             "cimp-definitely-not-a-real-tool-xyz",
@@ -365,7 +376,10 @@ mod tests {
         .await;
         assert!(!r.found);
         assert!(r.path.is_none());
-        assert_eq!(r.error.as_deref(), Some("not found on PATH or ebin"));
+        assert_eq!(
+            r.error.as_deref(),
+            Some("configured path not found: cimp-definitely-not-a-real-tool-xyz")
+        );
         assert!(r.version.is_none());
     }
 

@@ -78,8 +78,14 @@ pub fn run() {
 /// response's `text` field, or `None` on any error/timeout/miss. Shared by the
 /// V11 `--precompact-hook` / `--read-hook` shims so the framing (Bearer auth,
 /// Content-Length, `Connection: close`, 2xx-only, short timeout) lives once.
+///
+/// Discovery is root-aware by this shim's own cwd: Claude spawns hook shims
+/// in the project directory (the same fact `resolve_cwd` leans on), so with
+/// several cImp instances off one install the hook reaches the instance
+/// serving ITS project rather than the last one launched.
 pub(crate) fn post_loopback(path: &str, body: &str) -> Option<String> {
-    let disc = crate::offload::loopback::read_discovery()?;
+    let cwd = std::env::current_dir().ok();
+    let disc = crate::offload::loopback::read_discovery_for(cwd.as_deref())?;
     post_context(disc.port, &disc.token, path, body)
 }
 

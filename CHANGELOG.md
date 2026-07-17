@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other repo. Paths now live in the global settings file (legacy
   overlay paths are promoted once at load); the per-project overlay keeps
   only the enable flags and extra args.
+- **TUI themes: settings editor buttons unwrapped.** Under the TUI themes
+  (whose "[ Save ]" bracket convention wraps every settings-section button
+  in `[ … ]` pseudo-elements) the compact × remove buttons in the Checks,
+  environment, and args editors wrapped three lines tall, and their text
+  buttons (Test, Detect & configure, + Add …) drew a box around the
+  brackets. The × buttons now use the themes' `icon` opt-out and keep their
+  compact box; the text buttons moved their visuals to element-level
+  selectors so the TUI reset can flatten them into proper bracket buttons.
+  Modern themes render pixel-identical to before. A dev-only harness
+  (`src/dev/checks-harness.html`) renders the checks editor under both
+  theme families for future settings-UI work.
 
 ### Added
 

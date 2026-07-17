@@ -4089,9 +4089,11 @@
                         updatePolicy(i, (p) => (p.env[j].value = (e.currentTarget as HTMLInputElement).value))}
                       placeholder="cat"
                     />
+                    <!-- `icon` opts out of the TUI themes' `[ … ]` bracket
+                         framing — brackets around a lone × wrap it tall. -->
                     <button
                       type="button"
-                      class="secondary"
+                      class="secondary icon"
                       aria-label="Remove environment variable"
                       onclick={() => updatePolicy(i, (p) => (p.env = p.env.filter((_, idx) => idx !== j)))}
                     >

@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- Dev-only harness: renders ChecksEditor standalone (no Tauri IPC) so its
+     layout/CSS can be inspected in a plain browser. Open via the Vite dev
+     server at /src/dev/checks-harness.html; append ?theme=modern for the
+     non-TUI base tokens. Not a build entry point. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>ChecksEditor harness</title>
+  </head>
+  <body>
+    <!-- <section> matters: the TUI themes' button rules target `section button`,
+         exactly like the real Settings window's category sections. -->
+    <section id="harness" style="max-width: 720px; margin: 24px auto; padding: 16px"></section>
+    <script type="module" src="/src/dev/checks_harness_main.ts"></script>
+  </body>
+</html>

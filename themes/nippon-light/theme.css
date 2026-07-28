@@ -1,0 +1,603 @@
+/* nippon-light theme — the TUI layout dressed in the Nippon palette
+   (colorpoint.io "nippon": #ccdcd6 / #728e9d / #314d59 / #ecd778 /
+   #c2b089), light variant. Self-contained per the theme isolation
+   policy (see src/theme.css): the token block below plus the structural
+   overrides that follow are this theme's complete definition. Surfaces
+   are a whitened ramp of the pale sage #ccdcd6; the accent family is
+   keyed off the teal-blue #314d59. */
+[data-theme="nippon-light"] {
+  /* Surfaces — pale sage ramp derived from #ccdcd6, lightened toward
+     white. Depth comes from borders, plus slightly deeper sage on
+     hover. */
+  --surface-0:       var(--term-bg, #e9f0ed);   /* body bg — follows terminal palette */
+  --surface-1:       var(--term-bg, #e9f0ed);   /* panes — follows terminal palette */
+  --surface-2:       var(--term-bg, #e0e9e5);   /* tab bar / dialog body — follows terminal palette */
+  --surface-3:       #d6e2dc;   /* hover-elevated */
+  --surface-4:       #c7d7cf;   /* deeper hover */
+
+  --surface-sunken:  var(--term-bg, #e9f0ed);
+  --surface-deep:    var(--term-bg, #dde6e2);
+  --surface-input:   var(--term-bg, #f2f6f4);
+
+  /* Text — dark teal ink derived from #314d59. */
+  --text-primary:    var(--term-fg, #23343c);   /* main text — follows terminal palette fg */
+  --text-bright:     var(--term-fg, #16242b);   /* strongest ink — follows terminal fg */
+  --text-on-accent:  #f2f6f4;   /* pale sage reads on the teal fill */
+  /* Neutral text ramp from the terminal palette (term-fg → term-bg blend).
+     On a light bg, mixing ink toward the bg lightens it — the same
+     formula as the dark themes yields the quiet/tertiary/disabled steps. */
+  --text-secondary:  color-mix(in srgb, var(--term-fg, #23343c) 88%, var(--term-bg, #e9f0ed));
+  --text-quiet:      color-mix(in srgb, var(--term-fg, #35494f) 72%, var(--term-bg, #e9f0ed));
+  --text-quiet-strong: color-mix(in srgb, var(--term-fg, #2c4048) 80%, var(--term-bg, #e9f0ed));
+  --text-tertiary:   color-mix(in srgb, var(--term-fg, #4a5f66) 58%, var(--term-bg, #e9f0ed));
+  --text-faint:      color-mix(in srgb, var(--term-fg, #5d7278) 46%, var(--term-bg, #e9f0ed));
+  --text-disabled:   color-mix(in srgb, var(--term-fg, #6f8288) 38%, var(--term-bg, #e9f0ed));
+  --text-disabled-deep: color-mix(in srgb, var(--term-fg, #829399) 30%, var(--term-bg, #e9f0ed));
+
+  /* Accent — nippon teal-blue. #314d59 is the anchor; hover steps
+     lighten toward the steel blue #728e9d. */
+  --accent:          #314d59;   /* nippon teal */
+  --accent-hover:    #3e5f6e;
+  --accent-bright:   #4d7183;
+  --accent-soft:     #728e9d;   /* nippon steel blue for muted CTAs */
+  --accent-soft-hover: #5f7d8d;
+  --accent-info:     #4d6e80;
+  --accent-fg:       #f2f6f4;
+  --accent-muted:    rgba(49, 77, 89, 0.12);
+
+  /* Waveform / avatar-border default — matches the teal accent. */
+  --waveform-color:  #314d59;
+
+  /* Semantics — darkened, palette-adjacent hues that hold contrast on
+     the pale sage surfaces; semantic colors do not follow the accent. */
+  --success:         #587c60;   /* deep sage green */
+  --warning:         #a08430;   /* dark gold (from #ecd778) */
+  --danger:          #a04b3e;   /* muted vermilion */
+  --awaiting:        var(--warning);
+
+  /* Danger — muted vermilion on warm-tinted light surfaces. */
+  --surface-danger:         #f0ddd8;
+  --surface-danger-strong:  #ecd2cb;
+  --surface-danger-hover:   #e5c4bb;
+  --surface-danger-bg:      #f5e8e4;
+  --surface-danger-deep:    #f9f0ed;
+  --surface-danger-soft:    #f2e2dd;
+  --surface-danger-faint:   #faf3f1;
+  --text-danger-soft:       #a04b3e;
+  --text-danger-strong:     #8a3a2e;
+  --text-danger-bright:     #a04b3e;
+  --text-danger-quiet:      #b8604f;
+  --text-danger-faint:      #c98f80;
+  --text-danger-pale:       #ad6a5b;
+  --text-danger-pastel:     #b97f70;
+  --text-danger-extra:      #c79a8d;
+  --text-danger-mute:       #a58e88;
+  --border-danger-strong:   #a04b3e;
+  --border-danger:          #b8604f;
+  --border-danger-soft:     #d4a99e;
+
+  /* Warning — dark gold on pale gold-tinted surfaces. */
+  --surface-warning:        #f2e9cf;
+  --surface-warning-deep:   #f7f0dd;
+  --surface-warning-faint:  #faf6ea;
+  --text-warning:           #a08430;
+  --text-warning-bright:    #806a20;
+  --border-warning:         #bf9d3a;
+
+  /* Success — deep sage green. */
+  --surface-success:        #dfeae1;
+  --text-success:           #587c60;
+  --text-success-bright:    #46684f;
+
+  /* Info — nippon steel blue, darkened for light-surface contrast. */
+  --surface-info:           #dde8ec;
+  --surface-info-deep:      #e8f0f3;
+  --surface-info-faint:     #f1f6f8;
+  --text-info:              #4d6e80;
+  --text-info-bright:       #3d5a6a;
+  --text-info-quiet:        #728e9d;
+  --border-info:            #728e9d;
+  --border-info-soft:       #b5c8d1;
+  --accent-purple:          #8a6480;   /* muted mauve (kind-color) */
+
+  /* Borders — sage-grey ramp between the surface steps. */
+  --border-faint:    #d6e0da;
+  --border-subtle:   #c4d2cb;
+  --border-default:  #a9bcb3;
+  --border-strong:   #8ba198;
+  --border-focus:    var(--accent);
+
+  /* Radii — fully square. Terminals don't round. */
+  --radius-sm:    0;
+  --radius-md:    0;
+  --radius-lg:    0;
+  --radius-pill:  0;
+
+  /* Elevation — none. Borders carry the depth. */
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+
+  /* Motion — instant. CRTs don't ease. */
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+
+  /* Typography — monospace cascade. */
+  font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
+    'Source Code Pro', Consolas, 'Courier New', monospace;
+}
+
+/* Structural overrides for `nippon-light`. Where the base `:root` look relies
+   on filled surfaces, shadows, and rounded corners, the TUI look uses 1px
+   box borders, transparent fills, square corners, and titles embedded
+   in the top border of each pane (the ratatui aesthetic).
+
+   This file is self-contained on purpose: see the "Theme isolation
+   policy" comment at the top of `theme.css`. Even though `tui-grey` has
+   identical structural rules today, each theme gets its own copy — the
+   duplication is the point.
+
+   Specificity note: most existing per-component rules are Svelte
+   scoped (`.s-HASH section { … }`, specificity 0,1,1). To win source-
+   order ties without `!important`, these rules use `html[data-theme]`
+   selectors (specificity 0,1,1 + 1 element = 0,1,2). */
+
+html[data-theme="nippon-light"] body {
+  font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
+    'Source Code Pro', Consolas, 'Courier New', monospace;
+}
+
+/* Outer window border. Under TUI we hide OS decorations
+   (setDecorations(false), wired from main.ts on theme change) and
+   draw our own 1px frame. The custom TuiTitleBar provides the top
+   horizontal line via its border-bottom; the window only paints the
+   three remaining sides. */
+html[data-theme="nippon-light"] main {
+  border-left: 1px solid var(--border-default);
+  border-right: 1px solid var(--border-default);
+  border-bottom: 1px solid var(--border-default);
+  box-sizing: border-box;
+}
+
+/* SettingsApp: the .root flex container sits below a sibling
+   TuiTitleBar (mounted inside #app). Shrink its height to leave room
+   for the 22px title bar, and frame the same three sides.
+
+   Selector pinned to `#app > .root` so the height rule targets only the
+   top-level container, not any nested `.root` wrappers elsewhere in the
+   chrome (which would otherwise inherit the 100vh-minus-titlebar height). */
+html[data-theme="nippon-light"] #app > .root {
+  height: calc(100vh - 22px);
+  border-left: 1px solid var(--border-default);
+  border-right: 1px solid var(--border-default);
+  border-bottom: 1px solid var(--border-default);
+  box-sizing: border-box;
+}
+
+/* Bordered pane with title-on-border. The title element (h2, or the
+   first h3 if no h2) is absolutely positioned over the top edge with a
+   matching background slice that masks the underlying border line. */
+html[data-theme="nippon-light"] section {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+  padding: 1.4em 1.5ch 1ch;
+  margin-top: 0.8em;
+  position: relative;
+}
+
+html[data-theme="nippon-light"] section > h2,
+html[data-theme="nippon-light"] section > h3:first-of-type {
+  position: absolute;
+  top: -0.7em;
+  left: 1.5ch;
+  margin: 0;
+  padding: 0 0.5ch;
+  background: var(--surface-0);
+  color: var(--accent);
+  font-size: var(--font-size-md);
+  font-weight: 400;
+  line-height: 1;
+  border: none;
+  text-transform: none;
+}
+
+/* Sub-headings inside a panel: no top divider, no border-top, just
+   bold yellow text. Tokens already handle color via `--text-warning`,
+   we just need to neutralise the existing styled divider. */
+html[data-theme="nippon-light"] section h3 {
+  border-top: none;
+  padding-top: 0;
+  margin-top: var(--space-4);
+  color: var(--accent);
+  font-weight: 400;
+}
+html[data-theme="nippon-light"] section h3::before {
+  content: '─ ';
+  color: var(--border-default);
+}
+
+/* Dialogs get the same bordered-pane treatment so modals match the
+   panel aesthetic. The title element varies (h1/h2/.title) per dialog
+   — we cover the common cases. */
+html[data-theme="nippon-light"] dialog {
+  background: var(--surface-0);
+  border: 1px solid var(--border-strong);
+  border-radius: 0;
+  box-shadow: none;
+  padding: 1.4em 1.5ch 1ch;
+  position: relative;
+}
+html[data-theme="nippon-light"] dialog::backdrop {
+  /* Teal-tinted scrim, lighter than the dark themes' black — a 0.6
+     black wash reads far too heavy on the pale sage surfaces. */
+  background: rgba(35, 52, 60, 0.35);
+}
+html[data-theme="nippon-light"] dialog > h1,
+html[data-theme="nippon-light"] dialog > h2,
+html[data-theme="nippon-light"] dialog > header > h1,
+html[data-theme="nippon-light"] dialog > header > h2,
+html[data-theme="nippon-light"] dialog > .title {
+  position: absolute;
+  top: -0.7em;
+  left: 1.5ch;
+  margin: 0;
+  padding: 0 0.5ch;
+  background: var(--surface-0);
+  color: var(--accent);
+  font-size: var(--font-size-md);
+  font-weight: 400;
+  line-height: 1;
+  border: none;
+}
+
+/* Inputs and selects: flat, no fill, single underline-style border.
+   Focus inverts to the accent color rather than glowing. */
+html[data-theme="nippon-light"] input[type='text'],
+html[data-theme="nippon-light"] input[type='number'],
+html[data-theme="nippon-light"] input[type='password'],
+html[data-theme="nippon-light"] input[type='search'],
+html[data-theme="nippon-light"] input[type='email'],
+html[data-theme="nippon-light"] input[type='url'],
+html[data-theme="nippon-light"] select,
+html[data-theme="nippon-light"] textarea {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+  color: var(--text-primary);
+  font-family: inherit;
+  box-shadow: none;
+}
+html[data-theme="nippon-light"] input[type='text']:focus,
+html[data-theme="nippon-light"] input[type='number']:focus,
+html[data-theme="nippon-light"] input[type='password']:focus,
+html[data-theme="nippon-light"] input[type='search']:focus,
+html[data-theme="nippon-light"] input[type='email']:focus,
+html[data-theme="nippon-light"] input[type='url']:focus,
+html[data-theme="nippon-light"] select:focus,
+html[data-theme="nippon-light"] textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: none;
+}
+
+/* The closed `<select>` is transparent (above), but the open dropdown
+   popup is OS-rendered and falls back to a light background unless we
+   style `<option>` explicitly. Chromium honors these on the popup
+   surface. */
+html[data-theme="nippon-light"] select option,
+html[data-theme="nippon-light"] select optgroup {
+  background-color: var(--surface-sunken);
+  color: var(--text-primary);
+}
+html[data-theme="nippon-light"] select option:checked,
+html[data-theme="nippon-light"] select option:hover {
+  background-color: var(--accent-muted);
+  color: var(--text-primary);
+}
+
+html[data-theme="nippon-light"] input[type='checkbox'] {
+  appearance: none;
+  width: 1.2ch;
+  height: 1.2ch;
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+  background: transparent;
+  position: relative;
+  cursor: pointer;
+  vertical-align: middle;
+}
+html[data-theme="nippon-light"] input[type='checkbox']:checked {
+  background: transparent;
+  border-color: var(--accent);
+}
+html[data-theme="nippon-light"] input[type='checkbox']:checked::after {
+  content: '×';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  font-size: 1.4em;
+  line-height: 1;
+}
+
+/* Buttons: only style buttons that live inside a dialog, settings
+   section, or a recognised action row. This avoids hijacking icon-only
+   buttons elsewhere (tab close X, scroll arrows, the new-tab + button).
+   Bracket framing is the TUI convention, e.g. "[ Save ]". */
+html[data-theme="nippon-light"] dialog button,
+html[data-theme="nippon-light"] section button,
+html[data-theme="nippon-light"] .actions button,
+html[data-theme="nippon-light"] .button-row button {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  transition: color 0ms;
+}
+html[data-theme="nippon-light"] dialog button:not(.icon)::before,
+html[data-theme="nippon-light"] section button:not(.icon)::before,
+html[data-theme="nippon-light"] .actions button:not(.icon)::before,
+html[data-theme="nippon-light"] .button-row button:not(.icon)::before {
+  content: '[ ';
+  color: var(--text-quiet);
+}
+html[data-theme="nippon-light"] dialog button:not(.icon)::after,
+html[data-theme="nippon-light"] section button:not(.icon)::after,
+html[data-theme="nippon-light"] .actions button:not(.icon)::after,
+html[data-theme="nippon-light"] .button-row button:not(.icon)::after {
+  content: ' ]';
+  color: var(--text-quiet);
+}
+html[data-theme="nippon-light"] dialog button:hover,
+html[data-theme="nippon-light"] section button:hover,
+html[data-theme="nippon-light"] .actions button:hover,
+html[data-theme="nippon-light"] .button-row button:hover {
+  background: transparent;
+  color: var(--accent);
+}
+html[data-theme="nippon-light"] dialog button:hover::before,
+html[data-theme="nippon-light"] dialog button:hover::after,
+html[data-theme="nippon-light"] section button:hover::before,
+html[data-theme="nippon-light"] section button:hover::after,
+html[data-theme="nippon-light"] .actions button:hover::before,
+html[data-theme="nippon-light"] .actions button:hover::after,
+html[data-theme="nippon-light"] .button-row button:hover::before,
+html[data-theme="nippon-light"] .button-row button:hover::after {
+  color: var(--accent);
+}
+
+/* Tab bar: pipe-separated list, no rounded fills. The Svelte-scoped
+   .tab styles cover most of it; we just neutralise the colored fill on
+   the active tab and add a `>` indicator instead. */
+html[data-theme="nippon-light"] .tab {
+  background: transparent !important;
+  border-radius: 0 !important;
+  border: 1px solid transparent !important;
+}
+html[data-theme="nippon-light"] .tab.active {
+  background: transparent !important;
+  border: 1px solid var(--accent) !important;
+  color: var(--accent) !important;
+}
+html[data-theme="nippon-light"] .tab:hover {
+  background: transparent !important;
+  color: var(--text-bright) !important;
+}
+
+/* Selection: invert to accent. The classic TUI focus signal. */
+html[data-theme="nippon-light"] ::selection {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+/* Settings sidebar nav: flat list, no fills, just a `>` cursor on the
+   active item. */
+html[data-theme="nippon-light"] .sidebar button.active,
+html[data-theme="nippon-light"] nav button.active,
+html[data-theme="nippon-light"] [role='tab'][aria-selected='true'] {
+  background: transparent !important;
+  color: var(--accent) !important;
+}
+
+/* Scrollbar restyle: thin gray block, no rounding, no fade-on-hover. */
+html[data-theme="nippon-light"] *::-webkit-scrollbar-thumb {
+  background-color: var(--border-default);
+  border-radius: 0;
+  border: 0;
+}
+html[data-theme="nippon-light"] *::-webkit-scrollbar-thumb:hover {
+  background-color: var(--border-strong);
+}
+
+/* StatusBar (bottom strip) — two lines tall to fit the stacked Claude Code
+   usage meter (current + weekly session rows). Drop the filled background;
+   the top border is enough separation. Tighter horizontal padding (1ch
+   instead of 12px) to align with the TUI grid. */
+html[data-theme="nippon-light"] .status-bar {
+  height: 44px !important;
+  flex: 0 0 44px !important;
+  background: transparent !important;
+  border-top: 1px solid var(--border-default) !important;
+  padding: 0 1ch !important;
+}
+
+/* Status buttons (Mute, Announce, Settings, Avatar toggle): flat,
+   narrow, accent-on-hover. The 22px height matches the strip. */
+html[data-theme="nippon-light"] .status-button {
+  height: 22px !important;
+  width: auto !important;
+  min-width: 3ch;
+  padding: 0 1ch !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  color: var(--text-quiet) !important;
+}
+html[data-theme="nippon-light"] .status-button:hover:not([aria-pressed='true']) {
+  background: transparent !important;
+  color: var(--accent) !important;
+}
+html[data-theme="nippon-light"] .status-button[aria-pressed='true'] {
+  background: transparent !important;
+  border: 1px solid var(--accent) !important;
+  color: var(--accent) !important;
+}
+html[data-theme="nippon-light"] .status-button:focus-visible {
+  outline: 1px solid var(--accent) !important;
+  outline-offset: -1px !important;
+}
+
+/* Glyphs (emoji icons): force monochrome rendering, darkened so they
+   read as ink on the pale sage surfaces. `font-variant-emoji: text` is
+   the modern way to coerce text-style rendering; the filter chain is a
+   fallback for browsers that don't honor it yet.
+
+   `translateY(1px)` nudges the glyphs into the optical center of the
+   22px bar — emoji baselines sit slightly above the visual middle of
+   the line box, so flex `align-items: center` alone leaves them
+   reading as too high. */
+html[data-theme="nippon-light"] .glyph {
+  font-variant-emoji: text;
+  filter: grayscale(1) brightness(0.85);
+  transform: translateY(1px);
+}
+
+/* Per-glyph optical-center fixup: the bell emoji sits 1px higher
+   inside its line box than the others, so its translation gets bumped
+   to 2px to match. Targeted via the AnnouncementsButton's `title` —
+   only it carries the word "announcement". */
+html[data-theme="nippon-light"] [title*="announcement" i] .glyph {
+  transform: translateY(2px);
+}
+
+/* VolumeSlider: keep the slider but flatten any chrome around it. */
+html[data-theme="nippon-light"] .volume-control {
+  color: var(--text-quiet) !important;
+}
+
+/* Hint text: dim. */
+html[data-theme="nippon-light"] small.hint {
+  color: var(--text-quiet);
+}
+
+/* Main app shell — the pane (terminal + its tab bar) becomes a single
+   bordered box. Focus is communicated by the border color flipping to
+   the accent, replacing the modern-dark inset shadow.
+
+   `box-sizing: border-box` is critical: the parent split allocates
+   flex space, and the 1px border must count INSIDE that allocation,
+   otherwise nested splits overflow the viewport and push StatusBar
+   off the bottom. No outer margin for the same reason. */
+html[data-theme="nippon-light"] .pane {
+  border: 1px solid var(--border-default);
+  box-sizing: border-box;
+}
+html[data-theme="nippon-light"] .pane.focused {
+  border-color: var(--accent);
+}
+/* Suppress the modern-dark inset shadow on the focused pane's tab bar —
+   the box border carries focus now. */
+html[data-theme="nippon-light"] .pane.focused .tab-bar {
+  box-shadow: none !important;
+}
+
+/* Pane content: already paints var(--surface-0) which is pale sage
+   under this theme; no override needed. */
+
+/* Tab bar — strip the filled band so the tabs float on the pane's
+   pale sage background. The bottom border becomes a divider between tab
+   row and terminal area, drawn in the pane's border color. Bar height
+   shrinks to ~22px so the row reads as a single line of monospace
+   text rather than a chunky GUI strip. */
+html[data-theme="nippon-light"] .tab-bar {
+  background: transparent !important;
+  border-bottom: 1px solid var(--border-default) !important;
+  height: 22px !important;
+  flex: 0 0 22px !important;
+}
+
+/* Tabs themselves: monospace (the Svelte-scoped style hardcodes
+   system-ui sans-serif), no pill margin, single-line. The .tab.active
+   accent-bordered rule lower down still applies. */
+html[data-theme="nippon-light"] .tab {
+  font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code',
+    'Source Code Pro', Consolas, 'Courier New', monospace !important;
+  height: 100% !important;
+  margin: 0 !important;
+  line-height: 20px !important;
+  padding: 0 1ch !important;
+  min-width: 0 !important;
+}
+
+/* New-tab + button width matches the slimmer bar. */
+html[data-theme="nippon-light"] .new-tab {
+  width: 22px !important;
+  line-height: 20px !important;
+}
+
+/* Edge-fade gradients: the modern-dark version fades into surface-2
+   (the tab bar's own background). Under TUI the bar is transparent, so
+   re-aim the gradient at the body background (surface-0) instead. */
+html[data-theme="nippon-light"] .tab-list.fade-left::before {
+  background: linear-gradient(to right, var(--surface-0), transparent) !important;
+}
+html[data-theme="nippon-light"] .tab-list.fade-right::after {
+  background: linear-gradient(to left, var(--surface-0), transparent) !important;
+}
+
+/* `+` new-tab button: lose the hover fill, keep the divider as a
+   single TUI-line on its left edge. */
+html[data-theme="nippon-light"] .tab-bar-end {
+  border-left: 1px solid var(--border-default) !important;
+}
+html[data-theme="nippon-light"] .new-tab:hover {
+  background: transparent !important;
+  color: var(--accent) !important;
+}
+
+/* Splitter — visually a single 1px line, but with a 5px-wide hit area
+   so the mouse can actually grab it. The painted line is a pseudo-
+   element centered inside the transparent splitter element. */
+html[data-theme="nippon-light"] .splitter {
+  background: transparent !important;
+  position: relative;
+  outline: none !important;
+}
+html[data-theme="nippon-light"] .split.horizontal > .splitter {
+  width: 5px !important;
+}
+html[data-theme="nippon-light"] .split.vertical > .splitter {
+  height: 5px !important;
+}
+html[data-theme="nippon-light"] .splitter::after {
+  content: '';
+  position: absolute;
+  background: var(--border-default);
+  pointer-events: none;
+}
+html[data-theme="nippon-light"] .split.horizontal > .splitter::after {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+}
+html[data-theme="nippon-light"] .split.vertical > .splitter::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-0.5px);
+}
+html[data-theme="nippon-light"] .splitter:hover::after,
+html[data-theme="nippon-light"] .splitter:focus-visible::after {
+  background: var(--accent);
+}

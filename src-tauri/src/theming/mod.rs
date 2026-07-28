@@ -265,6 +265,12 @@ fn load_themes() -> Vec<ThemeWire> {
                     tracing::warn!(path = %path.display(), "theming: non-UTF-8 theme folder name; skipped");
                     continue;
                 };
+                // Hidden/service folders (e.g. a stray `.cimp/` graph dir from
+                // a tool run rooted at themes/) are never themes — skip them
+                // silently rather than warning about a missing theme.json.
+                if folder_id.starts_with('.') {
+                    continue;
+                }
                 let json = std::fs::read_to_string(path.join("theme.json"));
                 let css = std::fs::read_to_string(path.join("theme.css"));
                 let (Ok(json), Ok(css)) = (json, css) else {
@@ -395,13 +401,17 @@ mod tests {
                 continue;
             }
             let id = path.file_name().unwrap().to_str().unwrap().to_string();
+            // Same rule as load_themes: hidden/service folders are not themes.
+            if id.starts_with('.') {
+                continue;
+            }
             let json = std::fs::read_to_string(path.join("theme.json")).expect("theme.json");
             let css = std::fs::read_to_string(path.join("theme.css")).expect("theme.css");
             build_theme(&id, &json, &css)
                 .unwrap_or_else(|e| panic!("shipped theme {id} invalid: {e}"));
             count += 1;
         }
-        assert_eq!(count, 4, "expected 4 shipped themes");
+        assert_eq!(count, 6, "expected 6 shipped themes");
     }
 
     #[test]
@@ -418,7 +428,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped palette {:?} invalid: {e}", path));
             count += 1;
         }
-        assert_eq!(count, 13, "expected 13 shipped palettes");
+        assert_eq!(count, 15, "expected 15 shipped palettes");
     }
 
     #[test]

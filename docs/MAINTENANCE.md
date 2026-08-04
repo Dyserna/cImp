@@ -31,6 +31,14 @@ apply / defer / watch decision before anything is changed.
    Compare against the inventory tables in this doc; note any rows where the
    doc's pin column has drifted from reality (the doc is only trustworthy if
    the run keeps it true — update the tables and the "as of vX" header).
+   **Advisory scan: osv-scanner is the primary source** (`osv-scanner scan
+   source -r .` or dogfood the app's own `security_audit` MCP tool) — it
+   serves RustSec *plus* GitHub advisories (GHSA), which is exactly the
+   superset that caught CVE-2026-42184 when RustSec missed it. `cargo audit`
+   is a *cross-check only*; its accepted-risk baseline lives in
+   `src-tauri/.cargo/audit.toml` (each entry has a rationale + revisit
+   trigger — re-evaluate every entry as part of this step, and run it from
+   `src-tauri/` or the baseline won't load).
 3. **Deep-dep changelogs.** For the hairy deps with their own sections (`ort`,
    `whisper-rs`, tauri, tree-sitter grammars, cozo), read release notes for
    anything newer than the pin — looking for: fixes we're waiting on, breaking
@@ -111,6 +119,12 @@ npx npm-check-updates               # proposes package.json bumps (review, don't
 
 # Tauri toolchain sanity
 cargo tauri --version ; node --version ; rustc --version
+
+# Security advisories — osv.dev (RustSec + GHSA superset) is PRIMARY
+osv-scanner scan source -r .        # or run the app's own security_audit tool
+cd src-tauri && cargo audit         # cross-check only; reads the accepted-risk
+                                    # baseline at src-tauri/.cargo/audit.toml
+                                    # (must run from src-tauri/ to pick it up)
 ```
 
 Bump policy: move one ecosystem at a time, run `cargo test` + `npm run check` +

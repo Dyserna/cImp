@@ -2244,7 +2244,9 @@
                 />
               </div>
             </div>
-            <small class="hint">
+            <!-- `top`: this hint follows the swatch row, not a label — the
+                 default hint's -8px pull-up would drag it into the swatches. -->
+            <small class="hint top">
               Tints buttons, borders, tabs, and the waveform. Presets match
               the four classic TUI accents; the swatch on the right picks
               anything.

@@ -22,6 +22,26 @@
 //! parent session's spend; its reads, prompts, and text are not the parent's
 //! working set, turn clocks, or TTS). `drift_tick` is the canary that fires
 //! when this contract moves again.
+//!
+//! ## Format tolerance (the transcript is an UNSTABLE contract)
+//!
+//! Claude Code declares the transcript JSONL format unstable — it can change on
+//! any release (2.1.212 added `effort` to assistant messages; 2.x renamed the
+//! sub-agent launcher `Task` → `Agent`). Every reader in this module therefore
+//! walks an untyped [`serde_json::Value`] with `get`/`as_str`, never a typed
+//! serde struct or enum:
+//!
+//!  * **Unknown fields** are ignored by construction (no struct to reject them,
+//!    and nothing here uses `deny_unknown_fields`).
+//!  * **Unknown enum-ish values** — a new `type`, a new tool `name`, a new
+//!    `source` variant — fall through the `match`/`==` arms as "not one of the
+//!    shapes we act on", leaving the rest of the line's taps untouched instead
+//!    of failing the whole line.
+//!  * **Unparseable lines** are skipped and logged ([`parse_transcript_line`]);
+//!    the tail keeps draining the lines after them.
+//!
+//! Keep new readers to that discipline: a typed struct here would turn an
+//! upstream field addition into a dead tap.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -227,7 +247,7 @@ async fn drain_new_lines(
         if line.is_empty() {
             continue;
         }
-        if let Ok(obj) = serde_json::from_str::<Value>(line) {
+        if let Some(obj) = parse_transcript_line(path, line) {
             note_cli_version(&obj, version_noted);
             // Canary fact: an inline sidechain line means the 1.x sub-agent
             // contract is (still) live — see `SubagentState::drift_tick`.
@@ -613,6 +633,18 @@ fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::g
 /// numbers overwrites this one in place rather than leaving a duplicate zero
 /// row. `None` for any non-assistant line or an assistant line with no
 /// `message.id`.
+///
+/// ## Historical-data caveat: usage recorded before Claude Code 2.1.214
+///
+/// Up to and including 2.1.213, Claude Code double-counted tokens and cost for
+/// streamed responses (fixed in 2.1.214). Whatever the transcript's `usage`
+/// block said is what we stored, so `usage_stat` rows written by sessions on a
+/// pre-2.1.214 CLI can be inflated — treat old Usage-tab totals and any
+/// cross-period cost comparison spanning that upgrade as approximate. Live data
+/// is unaffected, and there is deliberately **no** correction/backfill logic:
+/// we cannot tell an inflated row from a genuinely large turn after the fact,
+/// and the CLI version that wrote a session is only known globally (the
+/// `harness_versions` tripwire fed by [`note_cli_version`]), not per row.
 fn parse_usage_line(
     obj: &Value,
     origin: crate::graph::UsageOrigin,
@@ -1106,7 +1138,7 @@ impl SubagentState {
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                if let Some(obj) = parse_transcript_line(&path, line) {
                     // Sub-agent transcript file (2.x contract): every turn here
                     // is Agent spend against the parent session.
                     record_usage(
@@ -1210,6 +1242,32 @@ fn report_subagent_drift(project_dir: &Path, session_id: &str, summary: &str) {
         request: format!("sub-agent transcript contract drift (session {session_id})"),
         response: summary.to_string(),
     });
+}
+
+/// Parse one transcript JSONL line, or `None` when it isn't valid JSON.
+///
+/// Claude Code documents the transcript format as unstable ("can break on any
+/// release"), so a line this tap cannot read must never stop the tail: it is
+/// skipped with a `debug!` naming the file, and the NEXT line is drained
+/// normally. Both drains ([`drain_new_lines`] and [`SubagentState::scan`]) go
+/// through here so the skip-and-log posture holds for parent and sub-agent
+/// transcripts alike. Partial trailing lines never reach this function —
+/// [`read_complete_lines`] holds them back until their newline lands — so a
+/// failure here is a genuinely malformed line, not a mid-write read.
+fn parse_transcript_line(path: &Path, line: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let prefix: String = line.chars().take(120).collect();
+            debug!(
+                file = %path.display(),
+                error = %e,
+                line = %prefix,
+                "Claude OOB: unparseable transcript line skipped"
+            );
+            None
+        }
+    }
 }
 
 /// Read complete new lines from `path` starting at `offset`: the chunk up to
@@ -2051,5 +2109,165 @@ mod tests {
         assert!(subs.skip_backlog);
         assert!(subs.files.is_empty());
         assert!(!subs.launch_seen && !subs.completion_seen && subs.drift_ticks == 0);
+    }
+
+    // ── Format tolerance: the transcript is an UNSTABLE upstream contract ──
+
+    #[test]
+    fn assistant_line_with_effort_and_unknown_fields_is_read_normally() {
+        // CLI 2.1.212 added `message.effort`; assume more fields will follow.
+        // Every reader here walks an untyped Value, so unknown keys — at the
+        // top level, inside `message`, and inside a content block — must be
+        // ignored rather than failing the line.
+        let line = obj(
+            r#"{"type":"assistant","uuid":"u1","parentUuid":"u0","brandNewTopLevel":{"x":1},
+                "message":{"id":"m1","model":"claude-x","effort":"high",
+                  "stop_reason":null,"brandNewInner":[1,2],
+                  "content":[
+                    {"type":"thinking","thinking":"hmm","signature":"sig"},
+                    {"type":"text","text":"Hello there.","brandNewBlockField":true},
+                    {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.rs"}}],
+                  "usage":{"input_tokens":100,"output_tokens":20,
+                    "cache_read_input_tokens":50,"cache_creation_input_tokens":5,
+                    "brandNewUsageField":7}}}"#,
+        );
+
+        // TTS tap: the text block is still found.
+        let spoken = assistant_texts(&line);
+        assert_eq!(spoken.len(), 1);
+        assert_eq!(spoken[0].1, "Hello there.");
+
+        // Usage tap: `effort` and the unknown usage key don't disturb the counts.
+        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+            .expect("an `effort`-carrying assistant line still yields a Turn");
+        assert_eq!(
+            ev,
+            crate::graph::UsageEvent::Turn {
+                msg_id: "m1".to_string(),
+                model: Some("claude-x".to_string()),
+                in_tok: 100,
+                out_tok: 20,
+                cache_read: 50,
+                cache_make: 5,
+                origin: crate::graph::UsageOrigin::Session,
+            }
+        );
+
+        // Agent tracking: a non-agent tool on such a line is still ignored.
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        let delta = update_agents(&line, &mut agents, &ctx);
+        assert!(!delta.launched && !delta.completed);
+        assert!(sig.try_recv().is_err());
+    }
+
+    #[test]
+    fn unknown_line_types_and_new_source_variants_are_inert() {
+        // `SessionStart.source` gained a `"fork"` variant (CLI 2.1.x). cImp
+        // registers no SessionStart hook and deserializes no enum from the
+        // transcript, so such a line simply matches none of the taps: no
+        // panic, no state change, and — critically — the lines around it are
+        // unaffected. This test pins that "unknown variant ⇒ inert" posture.
+        let fork = obj(
+            r#"{"type":"system","subtype":"session_start","source":"fork",
+                "sessionId":"abc","cwd":"P:\\repo","brandNewField":42}"#,
+        );
+        assert!(assistant_texts(&fork).is_empty());
+        assert!(parse_usage_line(&fork, crate::graph::UsageOrigin::Session).is_none());
+        assert!(extract_tool_results(&fork).is_empty());
+        assert!(!is_user_prompt(&fork), "not a turn boundary");
+
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        agents.insert("toolu_live".to_string());
+        let delta = update_agents(&fork, &mut agents, &ctx);
+        assert!(!delta.launched && !delta.completed);
+        assert!(
+            agents.contains("toolu_live"),
+            "an unrecognized line must not disturb tracked agents"
+        );
+        assert!(sig.try_recv().is_err());
+
+        // A wholly unknown top-level `type` behaves the same way.
+        let alien = obj(r#"{"type":"some-future-record","payload":{"anything":true}}"#);
+        assert!(assistant_texts(&alien).is_empty());
+        assert!(parse_usage_line(&alien, crate::graph::UsageOrigin::Session).is_none());
+        assert!(!is_user_prompt(&alien));
+    }
+
+    #[test]
+    fn parse_transcript_line_skips_corrupt_lines_only() {
+        let path = Path::new("transcript.jsonl");
+        assert!(parse_transcript_line(path, r#"{"type":"assistant"}"#).is_some());
+        // Truncated / garbage / non-object lines are all skipped, not fatal.
+        assert!(parse_transcript_line(path, r#"{"type":"assist"#).is_none());
+        assert!(parse_transcript_line(path, "\u{0}\u{1}not json at all").is_none());
+        assert!(parse_transcript_line(path, "{,}").is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_skips_a_corrupt_line_and_keeps_processing_later_lines() {
+        // Regression guard for the unstable-format contract: one unreadable
+        // line (a truncated write, an unknown binary blob, a future framing)
+        // must not abort the tail. The launch on line 1 is only cleared by the
+        // tool_result on line 4 — if the corrupt line 2 killed the drain, the
+        // agent would stay outstanding and no inactive edge would arrive.
+        let dir = std::env::temp_dir().join(format!("oob-corrupt-line-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        // No `version` key anywhere: `note_cli_version` must stay out of the
+        // global harness-version file during tests.
+        let content = concat!(
+            r#"{"type":"assistant","message":{"id":"m1","effort":"high","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{}}]}}"#,
+            "\n",
+            "{\"type\":\"assistant\",\"message\":{ TRUNCATED MID-WRITE",
+            "\n",
+            r#"{"type":"system","subtype":"session_start","source":"fork"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let (ctx, mut sig) = agent_ctx();
+        let mut seen = HashSet::new();
+        let mut agents = HashSet::new();
+        let mut tool_names = ToolNameRing::default();
+        let mut commit_calls = IdRing::default();
+        let mut version_noted = false;
+        let mut subs = SubagentState::default();
+        let offset = drain_new_lines(
+            &path,
+            0,
+            &mut seen,
+            &mut agents,
+            &mut tool_names,
+            &mut commit_calls,
+            &mut version_noted,
+            &mut subs,
+            &dir,
+            "session-1",
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            offset,
+            content.len() as u64,
+            "the whole chunk is consumed despite the corrupt line"
+        );
+        assert!(
+            agents.is_empty(),
+            "the tool_result AFTER the corrupt line still cleared the agent"
+        );
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1908,7 +1908,7 @@
     inset: 0;
     display: flex;
     flex-direction: column;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 13px;
     box-sizing: border-box;
   }
@@ -1917,7 +1917,7 @@
     align-items: center;
     gap: 8px;
     padding: 10px 12px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     flex: 0 0 auto;
   }
   .search {
@@ -1928,9 +1928,9 @@
   .search input {
     width: 100%;
     box-sizing: border-box;
-    background: var(--panel, #1e1e1e);
-    border: 1px solid var(--border, #444);
-    color: var(--text, #ddd);
+    background: var(--surface-input, #1e1e1e);
+    border: 1px solid var(--border-default, #444);
+    color: var(--text-primary, #ddd);
     border-radius: 5px;
     padding: 4px 8px;
     font-size: 12px;
@@ -1947,8 +1947,8 @@
     margin: 0;
     padding: 4px;
     list-style: none;
-    background: var(--panel, #1e1e1e);
-    border: 1px solid var(--border, #444);
+    background: var(--surface-2, #1e1e1e);
+    border: 1px solid var(--border-default, #444);
     border-radius: 6px;
     box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
     max-height: 280px;
@@ -1961,7 +1961,7 @@
     align-items: baseline;
     border: none;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     padding: 4px 6px;
     border-radius: 4px;
     cursor: pointer;
@@ -1971,7 +1971,7 @@
   .search-results button.sel,
   .search-results button:hover {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
   }
   .sr-file {
     flex: 1 1 auto;
@@ -1988,9 +1988,9 @@
   button.secondary {
     padding: 4px 10px;
     border-radius: 5px;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     cursor: pointer;
     font-size: 12px;
   }
@@ -2025,14 +2025,14 @@
     padding: 8px 10px;
     border-radius: 6px;
     font-size: 12px;
-    border: 1px solid var(--border, #444);
-    background: var(--panel, #1e1e1e);
+    border: 1px solid var(--border-default, #444);
+    background: var(--surface-2, #1e1e1e);
     opacity: 0.95;
   }
   .banner.err {
-    background: rgba(179, 38, 30, 0.18);
-    border-color: #b3261e;
-    color: #ffb4ab;
+    background: var(--surface-danger, rgba(179, 38, 30, 0.18));
+    border-color: var(--border-danger, #b3261e);
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .banner.err button {
     margin-left: 8px;
@@ -2044,9 +2044,9 @@
     max-width: 320px;
     padding: 6px 8px;
     border-radius: 5px;
-    border: 1px solid var(--border, #444);
-    background: var(--panel, #1e1e1e);
-    color: var(--text, #ddd);
+    border: 1px solid var(--border-default, #444);
+    background: var(--surface-2, #1e1e1e);
+    color: var(--text-primary, #ddd);
     font-size: 11px;
     line-height: 1.4;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
@@ -2067,9 +2067,9 @@
     display: flex;
     flex-direction: column;
     border-radius: 6px;
-    border: 1px solid var(--border, #444);
-    background: var(--panel, #1e1e1e);
-    color: var(--text, #ddd);
+    border: 1px solid var(--border-default, #444);
+    background: var(--surface-2, #1e1e1e);
+    color: var(--text-primary, #ddd);
     font-size: 11px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
   }
@@ -2078,7 +2078,7 @@
     align-items: flex-start;
     gap: 4px;
     padding: 8px;
-    border-bottom: 1px solid var(--border, #444);
+    border-bottom: 1px solid var(--border-default, #444);
   }
   .conn-head .nav {
     flex: 0 0 auto;
@@ -2086,10 +2086,10 @@
     height: 20px;
     padding: 0;
     line-height: 1;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     border-radius: 4px;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     cursor: pointer;
   }
@@ -2099,7 +2099,7 @@
   }
   .conn-head .nav:not(:disabled):hover {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
   }
   .conn-title {
     flex: 1 1 auto;
@@ -2137,7 +2137,7 @@
     width: 100%;
     border: none;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     padding: 2px;
     border-radius: 4px;
     cursor: pointer;
@@ -2146,7 +2146,7 @@
   }
   .conn-row:hover {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
   }
   .conn-file {
     flex: 1 1 auto;
@@ -2167,9 +2167,9 @@
     z-index: 4;
     max-width: 240px;
     border-radius: 6px;
-    border: 1px solid var(--border, #444);
-    background: var(--panel, #1e1e1e);
-    color: var(--text, #ddd);
+    border: 1px solid var(--border-default, #444);
+    background: var(--surface-2, #1e1e1e);
+    color: var(--text-primary, #ddd);
     font-size: 11px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
   }
@@ -2180,7 +2180,7 @@
     padding: 6px 10px;
     border: none;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 11px;
     font-weight: 600;
     cursor: pointer;
@@ -2225,7 +2225,7 @@
     height: 0;
     flex: 0 0 auto;
     display: inline-block;
-    border-top: 2px solid var(--text, #ddd);
+    border-top: 2px solid var(--text-primary, #ddd);
   }
   .dashline.solid {
     border-top-style: solid;

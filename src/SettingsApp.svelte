@@ -6060,7 +6060,7 @@
   }
   .pricing-head-row {
     font-size: var(--font-size-sm);
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
     margin-top: 0.8rem;
   }
   .pricing-head-row .num,
@@ -6122,7 +6122,7 @@
     color: var(--accent, #6abf69);
   }
   .policy-status .unguarded {
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
   }
   .policy-card {
     border: 1px solid var(--border-subtle);
@@ -6195,7 +6195,7 @@
     padding-left: 0.5rem;
   }
   button.danger {
-    color: #d06b6b;
+    color: var(--text-danger-soft, #d06b6b);
   }
   .badge {
     font-size: var(--font-size-sm);
@@ -6204,8 +6204,8 @@
     border: 1px solid var(--border-subtle);
   }
   .badge.warn {
-    color: #d08770;
-    border-color: #d08770;
+    color: var(--text-warning, #d08770);
+    border-color: var(--border-warning, #d08770);
   }
   /* Multiline, word-wrapping Server command field so every argument of a long
      llama-server invocation stays visible without horizontal scrolling. */
@@ -6511,7 +6511,7 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3) 0;
-    border-top: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+    border-top: 1px solid var(--border-default, rgba(128, 128, 128, 0.25));
   }
   .audit-tool .audit-name {
     font-weight: 600;

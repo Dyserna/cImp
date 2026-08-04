@@ -133,7 +133,7 @@
     padding: 0 2px;
     border-radius: 6px;
     background: var(--accent);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     font-size: 9px;
     font-weight: 700;
     line-height: 12px;

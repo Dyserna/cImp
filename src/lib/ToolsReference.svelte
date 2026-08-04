@@ -81,9 +81,10 @@
   .tool-name {
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 0.92em;
-    /* Hardcoded blue accent (not --text-*, which follow the terminal palette
-       and can render pink/magenta) so tool names stay legible in any theme. */
-    color: #58a6ff;
+    /* Semantic info token (not the neutral --text-* ramp, which follows the
+       terminal palette) — theme-defined, so tool names stay legible on light
+       themes too; hex only as the fallback. */
+    color: var(--text-info, #58a6ff);
   }
   .tool-desc {
     margin-top: 0.15rem;

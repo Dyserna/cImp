@@ -441,7 +441,7 @@
     overflow-y: auto;
     padding: 16px;
     font-size: 13px;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     box-sizing: border-box;
   }
   header {
@@ -485,14 +485,14 @@
   .waiting {
     font-size: 11px;
     opacity: 0.7;
-    color: #e3b341;
+    color: var(--text-warning, #e3b341);
     font-style: italic;
   }
   .btn {
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 6px;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     padding: 3px 12px;
     cursor: pointer;
@@ -506,17 +506,17 @@
   }
   .btn.scan {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     border-color: var(--accent, #3b6ea5);
   }
   .btn.cancel {
-    color: #ffb4ab;
-    border-color: rgba(255, 180, 171, 0.5);
+    color: var(--text-danger-soft, #ffb4ab);
+    border-color: var(--border-danger-soft, rgba(255, 180, 171, 0.5));
   }
   .scan-error {
-    border: 1px solid rgba(255, 180, 171, 0.5);
-    background: rgba(255, 180, 171, 0.08);
-    color: #ffb4ab;
+    border: 1px solid var(--border-danger-soft, rgba(255, 180, 171, 0.5));
+    background: var(--surface-danger-bg, rgba(255, 180, 171, 0.08));
+    color: var(--text-danger-soft, #ffb4ab);
     border-radius: 6px;
     padding: 6px 10px;
     margin-bottom: 10px;
@@ -532,11 +532,11 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 14px;
     padding: 2px 10px;
     font-size: 12px;
-    background: var(--panel, #1e1e1e);
+    background: var(--surface-card, #1e1e1e);
   }
   .chip-name {
     font-weight: 600;
@@ -545,34 +545,34 @@
     opacity: 0.8;
   }
   .chip.done {
-    border-color: rgba(63, 185, 80, 0.5);
+    border-color: color-mix(in srgb, var(--success, #3fb950) 50%, transparent);
   }
   .chip.done .chip-icon {
-    color: #3fb950;
+    color: var(--text-success, #3fb950);
   }
   .chip.failed {
-    border-color: rgba(255, 180, 171, 0.5);
+    border-color: var(--border-danger-soft, rgba(255, 180, 171, 0.5));
   }
   .chip.failed .chip-icon,
   .chip.failed .chip-label {
-    color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .chip.not-installed,
   .chip.path-invalid {
-    border-color: rgba(227, 179, 65, 0.5);
+    border-color: var(--border-warning, rgba(227, 179, 65, 0.5));
   }
   .chip.not-installed .chip-icon,
   .chip.not-installed .chip-label {
-    color: #e3b341;
+    color: var(--text-warning, #e3b341);
   }
   /* A configured-but-broken path is a user error, not a missing install —
      tint it toward the failed red so it reads as "fix me". */
   .chip.path-invalid .chip-icon,
   .chip.path-invalid .chip-label {
-    color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .chip.running .chip-name {
-    color: #58a6ff;
+    color: var(--text-info, #58a6ff);
   }
   .chip-link {
     border: none;
@@ -592,8 +592,8 @@
   .spinner {
     width: 10px;
     height: 10px;
-    border: 2px solid rgba(255, 255, 255, 0.25);
-    border-top-color: #58a6ff;
+    border: 2px solid var(--border-default, rgba(255, 255, 255, 0.25));
+    border-top-color: var(--accent, #58a6ff);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
@@ -609,7 +609,7 @@
     gap: 12px;
     margin-bottom: 8px;
     padding-bottom: 8px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
   }
   .ctl {
     display: inline-flex;
@@ -619,9 +619,9 @@
   }
   select,
   input[type='text'] {
-    background: var(--panel, #1e1e1e);
-    color: var(--text, #ddd);
-    border: 1px solid var(--border, #3a3a3a);
+    background: var(--surface-input, #1e1e1e);
+    color: var(--text-primary, #ddd);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 5px;
     padding: 2px 6px;
     font-size: 12px;
@@ -682,7 +682,7 @@
   .table {
     display: flex;
     flex-direction: column;
-    border: 1px solid var(--border, #2a2a2a);
+    border: 1px solid var(--border-faint, #2a2a2a);
     border-radius: 8px;
     overflow: hidden;
   }
@@ -692,7 +692,7 @@
     align-items: center;
     gap: 8px;
     padding: 4px 8px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
     font-size: 0.9em;
   }
   .trow:last-child {
@@ -706,7 +706,7 @@
     background: rgba(255, 255, 255, 0.03);
   }
   .trow.selected {
-    background: rgba(88, 166, 255, 0.1);
+    background: var(--accent-muted, rgba(88, 166, 255, 0.1));
   }
   .trow:hover:not(.thead) {
     background: rgba(255, 255, 255, 0.04);
@@ -717,13 +717,13 @@
     font-size: 0.82em;
   }
   .sev-error {
-    color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .sev-warning {
-    color: #e3b341;
+    color: var(--text-warning, #e3b341);
   }
   .sev-note {
-    color: #58a6ff;
+    color: var(--text-info, #58a6ff);
   }
   .c-tool,
   .c-rule,

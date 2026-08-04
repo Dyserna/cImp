@@ -314,7 +314,7 @@
 <style>
   .graph-index {
     font-size: 13px;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
   }
   .actions {
     display: flex;
@@ -324,15 +324,15 @@
   button {
     padding: 4px 10px;
     border-radius: 5px;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     cursor: pointer;
     font-size: 12px;
   }
   button.secondary {
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
   }
   button:disabled {
     opacity: 0.5;
@@ -349,17 +349,17 @@
     padding: 7px 10px;
     border-radius: 6px;
     font-size: 12px;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
   }
   .probe.ok {
-    background: rgba(46, 125, 50, 0.18);
-    border-color: #2e7d32;
-    color: #b8e6bb;
+    background: var(--surface-success, rgba(46, 125, 50, 0.18));
+    border-color: var(--success, #2e7d32);
+    color: var(--text-success, #b8e6bb);
   }
   .probe.err {
-    background: rgba(179, 38, 30, 0.18);
-    border-color: #b3261e;
-    color: #ffb4ab;
+    background: var(--surface-danger, rgba(179, 38, 30, 0.18));
+    border-color: var(--border-danger, #b3261e);
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .probe-dot {
     width: 8px;
@@ -369,11 +369,11 @@
     background: currentColor;
   }
   .card {
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 8px;
     padding: 12px;
     margin-bottom: 12px;
-    background: var(--panel, #1e1e1e);
+    background: var(--surface-card, #1e1e1e);
   }
   .row {
     display: flex;
@@ -393,8 +393,8 @@
     margin-left: 6px;
     padding: 1px 8px;
     border-radius: 10px;
-    background: #444;
-    color: #fff;
+    background: var(--surface-4, #444);
+    color: var(--text-bright, #fff);
     font-size: 11px;
     font-weight: 600;
     line-height: 16px;
@@ -402,16 +402,20 @@
     text-transform: capitalize;
   }
   .badge.ok {
-    background: #2e7d32;
+    background: var(--surface-success, #2e7d32);
+    color: var(--text-success, #fff);
   }
   .badge.busy {
-    background: #1565c0;
+    background: var(--surface-info, #1565c0);
+    color: var(--text-info, #fff);
   }
   .badge.warn {
-    background: #b26a00;
+    background: var(--surface-warning, #b26a00);
+    color: var(--text-warning, #fff);
   }
   .badge.err {
-    background: #b3261e;
+    background: var(--surface-danger-strong, #b3261e);
+    color: var(--text-danger-strong, #fff);
   }
   .counts {
     display: flex;
@@ -452,13 +456,13 @@
     display: inline-block;
   }
   .lang-legend .dot.green {
-    border-color: #2e7d32;
+    border-color: var(--success, #2e7d32);
   }
   .lang-legend .dot.yellow {
-    border-color: #b26a00;
+    border-color: var(--warning, #b26a00);
   }
   .lang-legend .dot.red {
-    border-color: #b3261e;
+    border-color: var(--danger, #b3261e);
   }
   .langs {
     display: grid;
@@ -474,7 +478,7 @@
     min-width: 0;
     padding: 3px 8px;
     border-radius: 5px;
-    border: 1.5px solid var(--border, #444);
+    border: 1.5px solid var(--border-default, #444);
     background: transparent;
     color: inherit;
     font-size: 11px;
@@ -496,16 +500,16 @@
     font-weight: 600;
   }
   .lang-btn.green {
-    border-color: #2e7d32;
-    color: #b8e6bb;
+    border-color: var(--success, #2e7d32);
+    color: var(--text-success, #b8e6bb);
   }
   .lang-btn.yellow {
-    border-color: #b26a00;
-    color: #f0c674;
+    border-color: var(--warning, #b26a00);
+    color: var(--text-warning, #f0c674);
   }
   .lang-btn.red {
-    border-color: #b3261e;
-    color: #ffb4ab;
+    border-color: var(--danger, #b3261e);
+    color: var(--text-danger-soft, #ffb4ab);
     cursor: default;
   }
   .lang-btn.green:hover:not(:disabled),
@@ -543,13 +547,13 @@
   }
   .embed {
     margin-top: 10px;
-    border-top: 1px solid var(--border, #333);
+    border-top: 1px solid var(--border-subtle, #333);
     padding-top: 10px;
   }
   .bar {
     height: 6px;
     border-radius: 3px;
-    background: #333;
+    background: var(--surface-3, #333);
     overflow: hidden;
     margin: 8px 0 6px;
   }
@@ -566,7 +570,7 @@
     gap: 4px;
   }
   .error {
-    color: #ff8a80;
+    color: var(--text-danger-soft, #ff8a80);
     font-size: 12px;
     margin: 6px 0 0;
   }

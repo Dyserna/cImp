@@ -171,7 +171,7 @@
     border-radius: 5px;
     border: 1px solid var(--accent, #58a6ff);
     background: var(--accent, #58a6ff);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     cursor: pointer;
     transition:
       background 0.12s ease,

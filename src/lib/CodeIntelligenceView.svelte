@@ -2380,7 +2380,7 @@
     overflow-y: auto;
     padding: 16px;
     font-size: 13px;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     box-sizing: border-box;
   }
   header {
@@ -2401,15 +2401,15 @@
   button {
     padding: 4px 10px;
     border-radius: 5px;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     cursor: pointer;
     font-size: 12px;
   }
   button.secondary {
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
   }
   button:disabled {
     opacity: 0.5;
@@ -2431,7 +2431,7 @@
     display: flex;
     gap: 4px;
     margin-bottom: 14px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     padding-bottom: 8px;
     flex-wrap: wrap;
   }
@@ -2440,7 +2440,7 @@
     border-radius: 6px;
     border: 1px solid transparent;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     cursor: pointer;
     opacity: 0.7;
@@ -2451,7 +2451,7 @@
   }
   .seg.active {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
   }
@@ -2475,7 +2475,7 @@
     padding: 6px 12px;
     background: transparent;
     border: none;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     cursor: pointer;
     text-align: left;
   }
@@ -2490,8 +2490,8 @@
     padding: 0 10px;
     background: transparent;
     border: none;
-    border-left: 1px solid var(--border, #333);
-    color: var(--text, #ddd);
+    border-left: 1px solid var(--border-subtle, #333);
+    color: var(--text-primary, #ddd);
     opacity: 0.6;
     cursor: pointer;
     font-size: 15px;
@@ -2507,19 +2507,19 @@
     margin-left: 6px;
     padding: 0 6px;
     border-radius: 999px;
-    background: var(--warn, #c9820a);
-    color: #fff;
+    background: var(--surface-warning, #c9820a);
+    color: var(--text-warning, #fff);
     font-size: 10px;
     font-weight: 600;
     line-height: 16px;
     vertical-align: middle;
   }
   .card {
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 8px;
     padding: 12px;
     margin-bottom: 12px;
-    background: var(--panel, #1e1e1e);
+    background: var(--surface-card, #1e1e1e);
   }
   /* The Overview section's group divider (Usage). */
   .group-head {
@@ -2529,14 +2529,14 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     opacity: 0.7;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     padding-bottom: 4px;
   }
   .group-head:first-of-type {
     margin-top: 0;
   }
   .error {
-    color: #ff8a80;
+    color: var(--text-danger-soft, #ff8a80);
     font-size: 12px;
     margin: 6px 0 0;
   }
@@ -2589,7 +2589,7 @@
     gap: 8px;
     align-items: baseline;
     padding: 3px 4px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
     font-size: 12px;
     white-space: nowrap;
   }
@@ -2678,11 +2678,11 @@
   }
   button.mini.danger {
     background: transparent;
-    border-color: #b3261e;
-    color: #ffb4ab;
+    border-color: var(--border-danger, #b3261e);
+    color: var(--text-danger-soft, #ffb4ab);
   }
   button.mini.danger:hover {
-    background: rgba(179, 38, 30, 0.15);
+    background: var(--surface-danger, rgba(179, 38, 30, 0.15));
   }
   .preview-in {
     display: flex;
@@ -2694,9 +2694,9 @@
     min-width: 0;
     padding: 5px 8px;
     border-radius: 5px;
-    border: 1px solid var(--border, #444);
-    background: var(--panel, #1e1e1e);
-    color: var(--text, #ddd);
+    border: 1px solid var(--border-default, #444);
+    background: var(--surface-input, #1e1e1e);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
   }
   .preview-meta {
@@ -2707,7 +2707,7 @@
   }
   .preview-md {
     background: rgba(0, 0, 0, 0.25);
-    border: 1px solid var(--border, #333);
+    border: 1px solid var(--border-subtle, #333);
     border-radius: 6px;
     padding: 8px 10px;
     font-size: 11.5px;
@@ -2727,7 +2727,7 @@
     padding: 0 5px;
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.1);
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 9.5px;
     font-weight: 600;
     text-transform: uppercase;
@@ -2768,7 +2768,7 @@
   }
   .proposal {
     padding: 8px 4px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
   }
   .proposal:last-child {
     border-bottom: none;
@@ -2829,7 +2829,7 @@
     width: 11px;
     height: 11px;
     padding: 0;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     border-radius: 2px;
     background: none;
     cursor: pointer;
@@ -2988,7 +2988,7 @@
     gap: 3px;
     height: 130px;
     margin-bottom: 4px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     padding-bottom: 2px;
   }
   .ubars-legend .zoom-hint {
@@ -3045,10 +3045,13 @@
   /* Colors flow from settings via the legend pickers (like the segments). */
   .saseg.session {
     background: var(--sa-session, #30363d);
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
   }
   .saseg.agent {
     background: var(--sa-agent, #3b6ea5);
+    /* Deliberately theme-independent: the fill is a user-picked chart color
+       (settings legend picker), so the text contrasts with that, not the
+       theme. */
     color: #fff;
   }
 
@@ -3087,7 +3090,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
   }
   /* The main row area is a <button> (it selects the session — drilling the
      "This session" + Cost cards into it) — strip the UA button chrome so it
@@ -3160,7 +3163,7 @@
      old popup's markup. */
   .costrow {
     padding: 8px 0;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
   }
   .costrow:last-child {
     border-bottom: none;
@@ -3190,7 +3193,7 @@
     padding: 1px 6px;
     border-radius: 999px;
     background: var(--surface-raised, rgba(255, 255, 255, 0.08));
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
   }
   .cm-pick {
     flex: 0 0 auto;
@@ -3242,17 +3245,17 @@
   .cost-table th,
   .cost-table td {
     padding: 4px 8px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
   }
   .cost-table thead th {
     text-align: right;
     font-weight: 600;
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
   }
   .cost-table tbody th {
     text-align: left;
     font-weight: 500;
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
     white-space: nowrap;
   }
   .cost-table td {
@@ -3262,10 +3265,10 @@
   .cost-table tbody tr:last-child th,
   .cost-table tbody tr:last-child td {
     font-weight: 600;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
   }
   .cost-hint {
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
   }
   /* Constant width + right alignment so the percentages line up too. */
   .arow.sessrow .aloc {
@@ -3308,7 +3311,7 @@
     transform: translateY(-50%);
     width: 1px;
     height: 0.8em;
-    background: var(--border, #444);
+    background: var(--border-default, #444);
   }
 
   .eff-counters {
@@ -3345,16 +3348,16 @@
   }
   .conf.extracted {
     background: rgba(255, 255, 255, 0.08);
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     opacity: 0.75;
   }
   .conf.inferred {
-    background: rgba(178, 106, 0, 0.28);
-    color: #f0c674;
+    background: var(--surface-warning, rgba(178, 106, 0, 0.28));
+    color: var(--text-warning, #f0c674);
   }
   .conf.ambiguous {
-    background: rgba(179, 38, 30, 0.28);
-    color: #ffb4ab;
+    background: var(--surface-danger, rgba(179, 38, 30, 0.28));
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .arow.dep {
     grid-template-columns: 1fr 6rem 2fr auto auto;
@@ -3409,7 +3412,7 @@
     gap: 4px;
   }
   .subsys {
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
     padding: 4px 2px;
     font-size: 12px;
   }

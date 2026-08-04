@@ -15,6 +15,14 @@
   --surface-3:       #d6e2dc;   /* hover-elevated */
   --surface-4:       #c7d7cf;   /* deeper hover */
 
+  /* Card — background for cards / sectioned areas inside tabs and
+     sub-tabs. Slightly darker than the body background so grouped
+     content reads as a distinct region; derived from --surface-0 so it
+     follows the terminal palette. On the light surfaces a small black
+     mix is already clearly visible, so the ratio is gentler than the
+     dark themes'. */
+  --surface-card:    color-mix(in srgb, var(--surface-0) 95%, #000);
+
   --surface-sunken:  var(--term-bg, #e9f0ed);
   --surface-deep:    var(--term-bg, #dde6e2);
   --surface-input:   var(--term-bg, #f2f6f4);
@@ -178,7 +186,7 @@ html[data-theme="nippon-light"] #app > .root {
    first h3 if no h2) is absolutely positioned over the top edge with a
    matching background slice that masks the underlying border line. */
 html[data-theme="nippon-light"] section {
-  background: transparent;
+  background: var(--surface-card);
   border: 1px solid var(--border-default);
   border-radius: 0;
   padding: 1.4em 1.5ch 1ch;
@@ -193,7 +201,11 @@ html[data-theme="nippon-light"] section > h3:first-of-type {
   left: 1.5ch;
   margin: 0;
   padding: 0 0.5ch;
-  background: var(--surface-0);
+  /* The title straddles the section's top border (element spans -0.7em
+     to +0.3em, so the border line sits ~70% down). Split the mask at
+     that line: body bg above, card bg below, so neither half shows a
+     mismatched patch now that sections are filled with --surface-card. */
+  background: linear-gradient(to bottom, var(--surface-0) 70%, var(--surface-card) 70%);
   color: var(--accent);
   font-size: var(--font-size-md);
   font-weight: 400;

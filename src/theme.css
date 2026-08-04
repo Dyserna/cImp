@@ -49,6 +49,12 @@
   --surface-3:       #303644;   /* hover-elevated, active-tab fill */
   --surface-4:       #3a4051;   /* deeper hover, alt-input bg in dialogs */
 
+  /* Card — background for cards / sectioned areas inside tabs and
+     sub-tabs. Slightly darker than the body background so grouped
+     content reads as a distinct region; derived from --surface-0 so it
+     follows the terminal palette. */
+  --surface-card:    color-mix(in srgb, var(--surface-0) 80%, #000);
+
   /* Sunken — for content inset into a panel/dialog. Also follow the
      terminal palette so the settings sidebar / inputs / dropdowns match. */
   --surface-sunken:  var(--term-bg, #181b22);   /* input bg in dialogs/settings */

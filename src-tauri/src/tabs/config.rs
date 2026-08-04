@@ -1381,6 +1381,88 @@ mod tests {
         assert!(overlay.get("hooks").is_some());
     }
 
+    /// CD-4 (maintenance 2026-08-04) — the Claude Code `--settings` contract.
+    /// Two guarantees, asserted against the largest overlay we can emit:
+    ///
+    ///   * **No permission rules, no plugins.** Claude Code 2.1.214 narrowed
+    ///     single-segment permission globs (`Edit(src/**)` now matches only
+    ///     `<cwd>/src` depth) and deprecated the `Write(path)` / `Glob(path)` /
+    ///     `NotebookEdit(path)` rule forms in favor of `Edit(path)` /
+    ///     `Read(path)`; plugins delivered through `--settings` were broken in
+    ///     2.1.181–2.1.214. cImp's overlay carries neither, so none of that
+    ///     applies — pinning the key set makes the negative durable: a future
+    ///     `permissions`/`plugins` key has to come past this note.
+    ///   * **Size.** Settings over 2 MiB hard-fail at startup (2.1.214). The
+    ///     overlay is bounded by construction — fixed-shape JSON whose only
+    ///     variable part is this binary's own path, repeated once per hook
+    ///     command — and no user-supplied JSON is ever merged into it (the
+    ///     `.cimp.custom.config.json` overlay is cImp's *own* settings layer
+    ///     and never reaches Claude). A static ceiling is therefore enough;
+    ///     there is nothing unbounded to re-check at spawn time.
+    #[test]
+    fn settings_overlay_matches_claude_settings_contract() {
+        let mut settings = Settings::default();
+        // Every overlay-producing gate on at once — the biggest overlay
+        // `build_pre_args` can build.
+        settings.statusline.enabled = true;
+        settings.workbench.checkpoints = true;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        settings.graph.compaction_context = true;
+        settings.graph.read_advisor = true;
+        settings.graph.read_advisor_shell = true;
+        settings.graph.auto_check = true;
+        settings.checks = vec![crate::checks::CheckDef {
+            name: "cargo".to_string(),
+            cmd: "cargo check".to_string(),
+            ..Default::default()
+        }];
+
+        let args = build_pre_args(&claude_cfg(), &settings);
+        let i = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("overlay present");
+        let raw = &args[i + 1];
+        let overlay: serde_json::Value =
+            serde_json::from_str(raw).expect("--settings value is valid JSON");
+
+        // Sanity: this really is the maxed-out overlay, not a degenerate one.
+        let hooks = overlay["hooks"].as_object().expect("hooks object");
+        for k in ["UserPromptSubmit", "PreCompact", "PreToolUse", "PostToolUse"] {
+            assert!(hooks.contains_key(k), "expected hook {k} in {overlay}");
+        }
+        assert_eq!(
+            overlay["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(2),
+            "Read + Bash read-advisor matchers",
+        );
+
+        // The whole overlay is exactly these two keys.
+        let mut keys: Vec<&str> = overlay
+            .as_object()
+            .expect("overlay is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["hooks", "statusLine"],
+            "unexpected `--settings` key — see the permission-glob / plugin \
+             contract notes on this test before adding one",
+        );
+
+        // Ceiling: ~230x headroom over the real maxed-out overlay (measured
+        // 1135 bytes) and 8x below Claude Code's 2 MiB hard-fail.
+        const MAX_OVERLAY_BYTES: usize = 256 * 1024;
+        assert!(
+            raw.len() < MAX_OVERLAY_BYTES,
+            "overlay is {} bytes, ceiling is {MAX_OVERLAY_BYTES}",
+            raw.len(),
+        );
+    }
+
     #[test]
     fn opencode_plugin_source_bakes_endpoint_and_flag() {
         let js = opencode_plugin_source(54321, "deadbeef00", true, true);

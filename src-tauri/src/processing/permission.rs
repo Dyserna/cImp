@@ -67,7 +67,10 @@ pub enum PatternKind {
     Working,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `PartialEq` is load-bearing for the loader: `patterns_file` compares a
+// freshly parsed patterns.json against snapshots of the default sets shipped
+// by earlier releases to decide whether the file is still pristine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionPattern {
     /// Stable identifier for logging / debugging. Not user-visible.
     pub name: String,

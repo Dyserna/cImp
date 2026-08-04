@@ -78,6 +78,10 @@ regex = "1"
 # real XML reader rather than a fragile regex. Pure Rust, already in the tree
 # transitively (promoted to a direct dep here). Default features.
 quick-xml = "0.41"
+# Usage push: converts the status-line payload's `rate_limits.resets_at`
+# (Unix epoch seconds) to the ISO-8601 strings the usage widget renders.
+# Already in the tree transitively; minimal features — no clock/timezone use.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

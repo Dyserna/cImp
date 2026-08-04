@@ -13,6 +13,12 @@
 //!     Tauri/audio/settings init so it is instant and never spins up the
 //!     GUI.
 //!
+//! Side channel: the same stdin JSON carries `rate_limits` (the account's
+//! 5h/7d subscription quota, Claude Code ≥ 2.1.80). Each invocation extracts
+//! it and persists it via `crate::usage::store_pushed_usage` for the
+//! bottom-bar usage widget — that push is the widget's only data source (see
+//! `crate::usage` for the why and the file contract).
+//!
 //! Scope: the `--settings` overlay *merges* (CLI flags sit above the
 //! user's `settings.json` in Claude Code's precedence and only the keys
 //! we set are overridden), so this affects cImp-launched Claude tabs
@@ -140,6 +146,12 @@ pub fn run() {
     let mut out = std::io::stdout();
     let _ = out.write_all(line.as_bytes());
     let _ = out.flush();
+    // Bar first, push second: Claude Code is waiting on our stdout, the
+    // usage widget can wait a few ms. Absent `rate_limits` (API-key auth,
+    // no response yet) skips the write so a good push is never clobbered.
+    if let Some(snapshot) = extract_rate_limits(&input) {
+        crate::usage::store_pushed_usage(&snapshot);
+    }
 }
 
 /// Subset of Claude Code's status line stdin JSON that we consume. Lenient
@@ -224,6 +236,41 @@ fn render(input: &str) -> String {
         palette.paint(Slot::Text, &pct_str),
         palette.paint(Slot::Text, &tokens),
     )
+}
+
+/// Pull the subscription quota out of the status-line payload's
+/// `rate_limits` object (documented shape: `used_percentage` 0–100,
+/// `resets_at` Unix epoch seconds; either window independently absent).
+/// Walked as raw `Value` — deliberately not part of [`Input`] — so a shape
+/// change here can never fail the whole parse and take the bar down with it.
+/// `None` when no window carries a usable percentage (nothing worth pushing).
+fn extract_rate_limits(input: &str) -> Option<crate::usage::UsageSnapshot> {
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    let rl = v.get("rate_limits")?;
+    let window = |key: &str| -> Option<crate::usage::UsageWindow> {
+        let w = rl.get(key)?;
+        let utilization = w.get("used_percentage")?.as_f64()?;
+        // Docs say epoch seconds; accept an ISO string too in case the
+        // upstream field ever changes representation.
+        let resets_at = w.get("resets_at").and_then(|r| {
+            r.as_str()
+                .map(str::to_string)
+                .or_else(|| r.as_i64().and_then(crate::usage::epoch_secs_to_iso))
+        });
+        Some(crate::usage::UsageWindow {
+            utilization,
+            resets_at,
+        })
+    };
+    let five_hour = window("five_hour");
+    let seven_day = window("seven_day");
+    if five_hour.is_none() && seven_day.is_none() {
+        return None;
+    }
+    Some(crate::usage::UsageSnapshot {
+        five_hour,
+        seven_day,
+    })
 }
 
 /// Compact a token count for display: `940`, `12k`, `200k`, `1.0M`.
@@ -463,6 +510,56 @@ mod tests {
             "context_window":{"used_percentage":0.0,"total_input_tokens":0,"context_window_size":200000}}"#;
         let line = strip_ansi(&render(json));
         assert_eq!(line, "Haiku  ░░░░░░░░░░ 0% (0/200k)");
+    }
+
+    #[test]
+    fn extracts_rate_limits_with_epoch_reset() {
+        // The documented payload shape: percentages + epoch-seconds resets.
+        let json = r#"{"model":{"display_name":"Opus"},
+            "rate_limits":{
+                "five_hour":{"used_percentage":23.5,"resets_at":1738425600},
+                "seven_day":{"used_percentage":41.2,"resets_at":1738857600}}}"#;
+        let snap = extract_rate_limits(json).expect("snapshot extracted");
+        let five = snap.five_hour.expect("five_hour window");
+        assert_eq!(five.utilization, 23.5);
+        assert_eq!(five.resets_at.as_deref(), Some("2025-02-01T16:00:00+00:00"));
+        assert_eq!(snap.seven_day.expect("seven_day window").utilization, 41.2);
+    }
+
+    #[test]
+    fn extracts_partial_and_stringly_rate_limits() {
+        // One window absent, the other with an ISO-string reset (future-proof
+        // leniency) — extraction still yields the present window.
+        let json = r#"{"rate_limits":{
+            "seven_day":{"used_percentage":9.0,"resets_at":"2026-08-05T12:00:00+02:00"}}}"#;
+        let snap = extract_rate_limits(json).expect("snapshot extracted");
+        assert!(snap.five_hour.is_none());
+        let seven = snap.seven_day.expect("seven_day window");
+        assert_eq!(seven.utilization, 9.0);
+        assert_eq!(seven.resets_at.as_deref(), Some("2026-08-05T12:00:00+02:00"));
+    }
+
+    #[test]
+    fn no_push_without_usable_rate_limits() {
+        // Absent object, empty object, and malformed windows all yield None
+        // (nothing is written over a previous good push).
+        assert!(extract_rate_limits(r#"{"model":{"display_name":"Opus"}}"#).is_none());
+        assert!(extract_rate_limits(r#"{"rate_limits":{}}"#).is_none());
+        assert!(extract_rate_limits(
+            r#"{"rate_limits":{"five_hour":{"used_percentage":"not-a-number"}}}"#
+        )
+        .is_none());
+        assert!(extract_rate_limits("not json").is_none());
+    }
+
+    #[test]
+    fn rate_limits_missing_reset_is_tolerated() {
+        // Windows at 0% can omit/null the reset time; the window still pushes.
+        let json = r#"{"rate_limits":{"five_hour":{"used_percentage":0.0,"resets_at":null}}}"#;
+        let snap = extract_rate_limits(json).expect("snapshot extracted");
+        let five = snap.five_hour.expect("five_hour window");
+        assert_eq!(five.utilization, 0.0);
+        assert!(five.resets_at.is_none());
     }
 
     #[test]

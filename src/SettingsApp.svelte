@@ -2506,8 +2506,11 @@
           <h2>Claude session usage</h2>
           <small class="hint top">
             Shows your Claude Code session (5h) and weekly (7d) quota in the
-            bottom bar, next to Layouts. Data comes from Claude's usage
-            endpoint; the widget hides when you're not logged into Claude.
+            bottom bar, next to Layouts. The numbers are reported by the Claude
+            tab's status line, so they need the context statusline (below) left
+            on and a Claude tab that has sent at least one message; the widget
+            hides until then, and dims when the last report gets old (Claude
+            tab closed or idle too long).
           </small>
           <label class="checkbox">
             <input
@@ -2576,8 +2579,9 @@
             />
           </label>
           <small class="hint">
-            How often the usage figures refresh. Minimum 15s; the countdown
-            ticks every second locally between refreshes.
+            How often the widget re-reads the status line's latest report (a
+            local read — no network). Minimum 15s; the countdown ticks every
+            second locally between refreshes.
           </small>
         </section>
 
@@ -2703,7 +2707,8 @@
             inside each Claude tab — e.g. <code>Opus ▓▓▓▓▓░░░░░ 50% (100k/200k)</code>,
             themed to your terminal palette. cImp wires this up only for the
             Claude tabs it launches; your global Claude Code configuration is
-            left untouched.
+            left untouched. The status line also feeds the session-usage meter
+            above — turning it off leaves that meter with no data.
           </small>
           <label class="checkbox">
             <input

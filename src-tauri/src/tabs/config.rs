@@ -334,9 +334,19 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         let mut overlay = serde_json::Map::new();
         if settings.statusline.enabled {
             if let Some(command) = crate::statusline::launch_command() {
+                // `refreshInterval` (seconds) re-runs the command on a timer in
+                // addition to event-driven updates, so the `rate_limits` usage
+                // push (see `crate::usage`) keeps flowing — and the bottom-bar
+                // widget stays fresh — while the tab sits idle. 30s beats the
+                // widget's 90s stale threshold with margin; the render itself
+                // is a local subprocess, so the cost is negligible.
                 overlay.insert(
                     "statusLine".to_string(),
-                    serde_json::json!({ "type": "command", "command": command }),
+                    serde_json::json!({
+                        "type": "command",
+                        "command": command,
+                        "refreshInterval": 30,
+                    }),
                 );
             }
         }
@@ -1128,6 +1138,9 @@ mod tests {
 
         let overlay = settings_overlay(&args).expect("statusLine overlay present");
         assert_eq!(overlay["statusLine"]["type"], "command");
+        // Idle-refresh timer that keeps the usage push (and the bottom-bar
+        // widget) alive between turns; must stay under usage::STALE_AFTER.
+        assert_eq!(overlay["statusLine"]["refreshInterval"], 30);
         let cmd = overlay["statusLine"]["command"]
             .as_str()
             .expect("command is a string");

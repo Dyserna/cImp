@@ -564,13 +564,14 @@ pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
     crate::stt::list_input_devices()
 }
 
-/// Fetch the current Claude Code usage snapshot (session 5h + weekly 7d) for
-/// the bottom-bar usage tracker. Returns `None` when usage can't be obtained
-/// (not logged in, endpoint unreachable) — the frontend hides the widget in
-/// that case. Polled by the frontend on `usage.poll_interval_secs`.
+/// Read the current Claude Code usage snapshot (session 5h + weekly 7d) for
+/// the bottom-bar usage tracker: a local read of the status-line push file
+/// (see `crate::usage`) — no network. `snapshot` is `None` when no Claude tab
+/// has pushed data (or the last push expired) — the frontend hides the widget
+/// in that case. Polled by the frontend on `usage.poll_interval_secs`.
 #[tauri::command]
 pub async fn get_claude_usage() -> AppResult<crate::usage::UsageResult> {
-    Ok(crate::usage::fetch_usage().await)
+    Ok(crate::usage::pushed_usage())
 }
 
 /// Sample the system-monitor stats (CPU / memory / GPU / network) for the

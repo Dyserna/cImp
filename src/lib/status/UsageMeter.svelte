@@ -3,30 +3,34 @@
   // Layouts). Shows the session (5h) and weekly (7d) quota windows, each as a
   // proportional bar, a rounded percentage, a live countdown to reset, and the
   // local reset clock time. Every element is individually toggleable via
-  // `settings.usage`; the whole widget hides when disabled or when usage can't
-  // be fetched (not logged into Claude / endpoint unreachable).
+  // `settings.usage`; the whole widget hides when disabled or when no data
+  // exists (no Claude tab has pushed a quota reading yet, or the last one
+  // expired).
   //
-  // Data comes from the backend `get_claude_usage` command, which GETs an
-  // undocumented Anthropic oauth/usage endpoint. We poll on
-  // `usage.poll_interval_secs`; the countdown ticks locally between polls.
+  // Data path: each `cimp --statusline` run inside a Claude tab persists the
+  // payload's `rate_limits` (5h/7d quota) to a push file; the backend
+  // `get_claude_usage` command reads that file — a local read, no network.
+  // We poll it on `usage.poll_interval_secs`; the countdown ticks locally
+  // between polls.
   import { settings } from '../settings/store';
   import { getClaudeUsage, type UsageResult, type UsageSnapshot } from '../ipc';
 
-  // Floor on the poll cadence so a hand-edited tiny interval can't hammer the
-  // undocumented endpoint.
+  // Floor on the poll cadence so a hand-edited tiny interval can't busy-poll.
+  // The read is a local file, so this is UI hygiene rather than protection of
+  // a remote endpoint.
   const MIN_POLL_SECS = 15;
-  // On a 429, wait this many normal intervals before the next poll (so a 60s
-  // cadence backs off to 300s), then a success snaps straight back to normal.
-  // The endpoint is aggressively rate-limited, so a single 429 means "ease off
-  // briefly" rather than "keep hammering at the configured rate".
+  // Legacy (retired endpoint-poll path): on a 429, wait this many normal
+  // intervals before the next poll. The push path never reports a rate-limit,
+  // so this branch is inert — kept alongside the backend's disabled poller in
+  // case that data source is ever resurrected.
   const RATE_LIMIT_BACKOFF = 5;
 
   let snapshot = $state<UsageSnapshot | null>(null);
-  // True when the last fetch was a 429. Keeps the widget visible (with stale /
-  // placeholder data) during a rate-limit instead of hiding it.
+  // Legacy: true when the last fetch was a 429 (endpoint-poll era). Always
+  // false under the push path.
   let rateLimited = $state(false);
-  // True when `snapshot` is the backend's cached last-good rather than a fresh
-  // read (429 / transient failure). Dims the numbers to signal they may be old.
+  // True when `snapshot` is an aging push — the Claude tab that produced it
+  // closed or went quiet. Dims the numbers to signal they may be old.
   let stale = $state(false);
   let now = $state(Date.now());
 
@@ -66,17 +70,15 @@
     }
   }
 
-  // Poll loop. The backend now returns its cached last-good snapshot (flagged
-  // `stale`) on a 429 / transient failure, so we adopt whatever snapshot comes
-  // back and only fall back to placeholders on a truly cold rate-limit.
-  //   - fresh success → show snapshot, clear stale/rate-limit, poll at pollMs.
-  //   - 429 → adopt the (stale) snapshot if present; back off to pollMs ×
-  //     RATE_LIMIT_BACKOFF (never sooner than the server's Retry-After), then a
-  //     later success resumes the normal cadence.
-  //   - unavailable / not logged in (snapshot null, not rate-limited) → clear
-  //     the snapshot so the widget hides; poll at the normal cadence so it
-  //     reappears within one interval after the user logs in.
+  // Poll loop over the local push file (via the backend command).
+  //   - fresh push → show snapshot undimmed, poll at pollMs.
+  //   - aging push (`stale`) → show snapshot dimmed; the Claude tab that fed
+  //     it has closed or gone quiet.
+  //   - no data (snapshot null) → hide; poll at the normal cadence so the
+  //     widget appears within one interval of a Claude tab's first push.
   //   - thrown transport / IPC error → keep last-good, back off exponentially.
+  //   - the rate-limit branch below is legacy from the endpoint-poll era and
+  //     can no longer trigger; see RATE_LIMIT_BACKOFF above.
   $effect(() => {
     if (!enabled) {
       snapshot = null;
@@ -172,9 +174,9 @@
     return `${wd} ${time}`;
   }
 
-  // Show the widget when we have data OR we're rate-limited (placeholder /
-  // stale). Stays hidden only when genuinely unavailable with no prior data
-  // (e.g. not logged into Claude).
+  // Show the widget when we have data (the rate-limited half of the OR is
+  // legacy and can no longer trigger). Hidden until a Claude tab pushes its
+  // first quota reading, and again once the last push expires.
   const visible = $derived(!!snapshot || rateLimited);
 
   // The two quota windows in display order. `w` is null while we have no
@@ -205,7 +207,7 @@
     title={rateLimited && !snapshot
       ? 'Claude Code usage — rate limited, retrying…'
       : stale
-        ? 'Claude Code usage — last known (rate limited, refreshing…)'
+        ? 'Claude Code usage — last known (no recent report from a Claude tab)'
         : 'Claude Code usage'}
   >
     <!-- label column: name + duration in their own tracks so (5h)/(7d)

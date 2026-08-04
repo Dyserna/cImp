@@ -105,14 +105,16 @@ export interface UsageSnapshot {
   seven_day: UsageWindow | null;
 }
 
-/// Outcome of a usage fetch:
-///   - `snapshot` set, `stale` false → fresh success.
-///   - `snapshot` set, `stale` true → last-good served during a 429 / transient
-///     failure; render it but signal it may be out of date.
-///   - `rate_limited` → 429; retry after `retry_after_secs` (or the caller's
-///     cooldown), keeping whatever snapshot came back on screen.
-///   - all empty → unavailable (not logged in) or a cold rate-limit with no
-///     cached snapshot yet.
+/// Outcome of a usage read. Data is pushed by the Claude tab's status line
+/// (`cimp --statusline` persists the payload's `rate_limits`) and read back
+/// from disk — no network involved:
+///   - `snapshot` set, `stale` false → a fresh push from a live Claude tab.
+///   - `snapshot` set, `stale` true → the last push is aging (tab closed or
+///     gone quiet); render dimmed.
+///   - all empty → no push data (no Claude tab has reported yet, or the last
+///     push expired) — hide the widget.
+///   - `rate_limited` / `retry_after_secs` are legacy fields from the retired
+///     endpoint-poll path (kept in the shape; always false / null now).
 export interface UsageResult {
   snapshot: UsageSnapshot | null;
   rate_limited: boolean;

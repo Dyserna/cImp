@@ -3360,9 +3360,9 @@ pub struct UsageSettings {
     pub show_countdown: bool,
     /// Show the local reset clock time.
     pub show_reset_clock: bool,
-    /// How often the frontend polls the usage endpoint, in seconds. The UI
-    /// clamps this to a sane minimum so the undocumented endpoint isn't
-    /// hammered.
+    /// How often the frontend re-reads the status-line usage push (a local
+    /// file — see `crate::usage`), in seconds. The UI clamps this to a sane
+    /// minimum as busy-poll hygiene.
     pub poll_interval_secs: u32,
 }
 

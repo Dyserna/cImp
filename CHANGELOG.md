@@ -5,6 +5,50 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.1] — 2026-08-04
+
+### Added
+
+- **Nippon dark + light themes and terminal palettes.** Two new TUI-style
+  themes built from the colorpoint.io "nippon" palette — `nippon-dark`
+  (teal surfaces, gold accent) and `nippon-light` (pale sage surfaces,
+  teal accent) — each with a matching terminal palette.
+- **Usage Overview dashboard card.** A collapsible Dashboard card at the
+  top of Code Intelligence's Overview with a session/sub-agent token
+  donut (per-kind inner ring) and a cost donut, following live/drill-in
+  selection like the other cards.
+
+### Changed
+
+- **The four `tui-*` themes collapsed into one built-in `tui` theme with
+  a user-picked accent.** tui-orange/-blue/-green/-grey differed only in
+  accent; they are replaced by a single `tui` theme compiled into the
+  binary, with the accent family derived from the new Settings → Theme →
+  Accent color picker (`ui.tui_accent`, presets for the four classic
+  accents plus a free color swatch). Settings migrate automatically
+  (schema v28); on-disk themes are unchanged.
+- **The Usage Effectiveness card is collapsible** like the other Usage
+  cards, open by default, state persisted.
+
+### Fixed
+
+- **Cards and status colors ignored theme/palette changes** (#2). Two bug
+  classes: ~90 raw status/surface hexes (GitHub-dark-baked badges, pills,
+  borders, feed accents) replaced with the semantic theme tokens, and
+  ~70 `var()` uses of tokens that were never defined (`--text`,
+  `--border`, `--panel`, …) — where the dark fallback always won —
+  remapped to the real token set. Switching theme (esp. dark ↔
+  `nippon-light`) and terminal palette now live-updates the Tools
+  sub-tabs, Code Intelligence, Workbench, and Settings cards.
+- **New `--surface-card` token: cards and sectioned areas are slightly
+  darker than the body background.** Defined in all theme blocks and
+  derived from `--surface-0` via `color-mix`, so it follows terminal
+  palettes; TUI-style themes fill `section` panes with it and every
+  `.card` surface uses it.
+- **The accent-picker hint no longer slides up under the color
+  swatches** (the default hint style's -8px label pull-up applied where
+  there was no label).
+
 ## [0.49.0] — 2026-07-17
 
 ### Fixed

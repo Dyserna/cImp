@@ -1,0 +1,22 @@
+# cargo-audit baseline — accepted-risk advisories.
+#
+# Every entry here MUST carry: the advisory, why it is accepted, and when to
+# revisit. Entries with no revisit trigger are not allowed; this file is a
+# decision log, not a mute button. Re-evaluate ALL entries on each maintenance
+# run (docs/MAINTENANCE.md).
+
+[advisories]
+# RUSTSEC-2026-0041 — lz4_flex 0.10 (HIGH 8.2), transitive via cozo -> swapvec.
+# Decision D-1, maintenance run 2026-08-04 (docs/reviews/maintenance-run-2026-08-04.md):
+# no patch path exists (cozo is dormant and pins swapvec ^0.3, which pins
+# lz4_flex 0.10); exposure is low because lz4_flex only ever decompresses
+# cozo's OWN spilled swap data, never attacker-supplied input. Accepted-risk.
+# Revisit: next maintenance run — evaluate a [patch.crates-io] override for
+# swapvec/lz4_flex; a graph-store migration off cozo is the last resort.
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — quick-xml 0.39.4 (DoS-class),
+# transitive on a Linux-only build-time codegen path; our ROOT quick-xml pin
+# (0.41) is the patched series. Assessed in the same maintenance run: no
+# runtime exposure on any shipped platform. Accepted-risk.
+# Revisit: clears itself when the transitive consumer moves to quick-xml
+# >=0.40; check `cargo tree -i quick-xml@0.39.4` on each maintenance run.
+ignore = ["RUSTSEC-2026-0041", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]

@@ -65,6 +65,12 @@
     costGrandTotal,
     originShareLine,
     FREE_RATES,
+    originKindTotals,
+    kindsTotal,
+    donutArcs,
+    arcPath,
+    fmtPct,
+    type CostTokens,
     type PriceRates,
     type CostOverride,
     type CostRowState,
@@ -521,6 +527,11 @@
   //   Selected   = the already-fetched `selectedSession.per_model`.
   let costCardOpen = $state(loadCardOpen('code-intelligence', 'usage-cost'));
   $effect(() => saveCardOpen('code-intelligence', 'usage-cost', costCardOpen));
+  // V28: the Dashboard card (donuts) — open by default; it's the Overview's
+  // at-a-glance header. It shares the Cost card's per-model + pricing needs,
+  // so the two effects below gate on EITHER card being open.
+  let dashCardOpen = $state(loadCardOpen('code-intelligence', 'usage-dashboard', true));
+  $effect(() => saveCardOpen('code-intelligence', 'usage-dashboard', dashCardOpen));
   // The ONE LLM price table for every Usage-section consumer. `null` = not
   // fetched yet (fetch on first need); `[]` = fetched, empty.
   let pricingTable = $state<LlmPricingModel[] | null>(null);
@@ -580,22 +591,24 @@
     }
   }
 
-  // Refresh the shared price table each time the Cost card opens (Settings edits
-  // keep applying — the popup's freshness contract, now shared with the toggle
-  // + Sessions rows).
+  // Refresh the shared price table each time the Cost or Dashboard card opens
+  // (Settings edits keep applying — the popup's freshness contract, now shared
+  // with the toggle + Sessions rows).
   $effect(() => {
-    if (costCardOpen) void refreshPricingTable();
+    if (costCardOpen || dashCardOpen) void refreshPricingTable();
   });
 
-  // Live mode: lazy-fetch the current session's detail when the card is open,
-  // refetch when its turn count advances, and drop it when the card CLOSES so a
-  // reopen refetches. No fetch while closed or in selected mode; the turn-count
-  // + in-flight guards keep it to at most one fetch per poll tick.
+  // Live mode: lazy-fetch the current session's detail while a per-model
+  // consumer (Cost or Dashboard card) is open, refetch when its turn count
+  // advances, and drop it when BOTH close so a reopen refetches. No fetch
+  // while closed or in selected mode; the turn-count + in-flight guards keep
+  // it to at most one fetch per poll tick.
   $effect(() => {
-    if (!costCardOpen || selectedSession) {
-      // Card closed → clear so a reopen refetches. (Selected mode just parks
-      // the live detail; it isn't shown, so leave it.)
-      if (!costCardOpen && (liveDetail || liveDetailAt)) {
+    const needDetail = costCardOpen || dashCardOpen;
+    if (!needDetail || selectedSession) {
+      // Both cards closed → clear so a reopen refetches. (Selected mode just
+      // parks the live detail; it isn't shown, so leave it.)
+      if (!needDetail && (liveDetail || liveDetailAt)) {
         liveDetail = null;
         liveDetailAt = null;
         liveFetchKey = '';
@@ -640,6 +653,7 @@
   const costGrand = $derived(
     costGrandTotal(costPerModel, (i) => costRowByModel[costPerModel[i].model].rates),
   );
+
 
   // Applies a proposal by writing the ONE named `graph.*` field it targets
   // through the normal settings round-trip (`applySettings` — visible in
@@ -945,6 +959,141 @@
     return Math.max(1e-9, ...shownTurns.map((t) => turnCost(t, currentRates).total));
   });
 
+  // ── V28: Dashboard card — donut data ─────────────────────────────────
+  // Token donut: outer ring session|agent, inner ring the four exact token
+  // kinds per origin (aligned under their outer arc — same cumulative
+  // angles). Sourced from the full turn series of the shown session, so it
+  // follows drill-in/live exactly like the other cards.
+  const DASH_KIND_SEGS = CHART_SEGS.filter((s) => s.key !== 'tool');
+  const DASH_KIND_FIELD = {
+    in: 'in_tok',
+    cache: 'cache_read',
+    write: 'cache_make',
+    out: 'out_tok',
+  } as const;
+  // ≈2px surface gap at each ring's mid-radius (viewBox units = px at the
+  // rendered size below).
+  const DASH_GAP_OUTER = 2 / 54;
+  const DASH_GAP_INNER = 2 / 35;
+  const dashKinds = $derived(originKindTotals(usageTurns));
+  const dashSessionTok = $derived(kindsTotal(dashKinds.session));
+  const dashAgentTok = $derived(kindsTotal(dashKinds.agent));
+  const dashTokenTotal = $derived(dashSessionTok + dashAgentTok);
+  const dashOuterArcs = $derived(
+    donutArcs(
+      [
+        { key: 'session', value: dashSessionTok },
+        { key: 'agent', value: dashAgentTok },
+      ],
+      DASH_GAP_OUTER,
+    ),
+  );
+  // A kind-seg key ('in' | 'cache' | 'write' | 'out') looked up in one
+  // origin's CostTokens — shared by the inner ring and the legend.
+  function dashKindValue(kinds: CostTokens, key: string): number {
+    return kinds[DASH_KIND_FIELD[key as keyof typeof DASH_KIND_FIELD]];
+  }
+  const dashInnerArcs = $derived(
+    donutArcs(
+      (['session', 'agent'] as const).flatMap((o) =>
+        DASH_KIND_SEGS.map((s) => ({
+          key: `${o}:${s.key}`,
+          value: dashKindValue(dashKinds[o], s.key),
+        })),
+      ),
+      DASH_GAP_INNER,
+    ),
+  );
+  const DASH_ORIGIN_LABEL: Record<string, string> = {
+    session: 'main session',
+    agent: 'sub-agents',
+  };
+  const DASH_KIND_LABEL = Object.fromEntries(DASH_KIND_SEGS.map((s) => [s.key, s.label])) as Record<
+    string,
+    string
+  >;
+  // An inner arc's "session:cache"-style key split back into its parts for
+  // the tooltip / fill class.
+  function dashInnerParts(key: string): { origin: string; kind: string } {
+    const i = key.indexOf(':');
+    return { origin: key.slice(0, i), kind: key.slice(i + 1) };
+  }
+  // The token donut's legend: one row per origin, each with its kind split.
+  // `seg` is the SA_SEGS entry backing the row's color picker — same
+  // settings-backed commit machinery as the This-session legend, so a pick
+  // in either card recolors both.
+  const dashLegendRows = $derived([
+    { origin: 'session', seg: SA_SEGS[0], tok: dashSessionTok, kinds: dashKinds.session },
+    { origin: 'agent', seg: SA_SEGS[1], tok: dashAgentTok, kinds: dashKinds.agent },
+  ]);
+
+  // Cost donut: per-model share of the session's estimated cost, at the same
+  // resolved rates as the Cost card (overrides included) — the two can never
+  // disagree. A model with no price match prices at $0 (no arc); the legend
+  // marks it "no price" instead of hiding it.
+  const dashCostRows = $derived(
+    costPerModel.map((m) => {
+      const st = costRowByModel[m.model];
+      return {
+        model: m.model,
+        cost: sessionCost(m.totals, st.rates).total,
+        tokens: kindsTotal(m.totals),
+        unpriced: st.matchedRow === null && !costOverrideByModel[m.model],
+      };
+    }),
+  );
+  const dashCostArcs = $derived(
+    donutArcs(
+      dashCostRows.map((r) => ({ key: r.model, value: r.cost })),
+      DASH_GAP_OUTER,
+    ),
+  );
+
+  // Model → categorical slot, assigned first-seen and never re-ranked, so a
+  // model keeps its hue as shares shift between polls (color follows the
+  // entity). Non-reactive on purpose: assignment happens during render and
+  // must not invalidate it. Slots validated for the dark card surface
+  // (dataviz six-checks); models past the 6th share the overflow gray —
+  // realistic sessions carry 2–4 models.
+  const DASH_MODEL_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#9085e9'];
+  const DASH_MODEL_OVERFLOW = '#8b8b86';
+  const dashModelSlot = new Map<string, number>();
+  // User overrides on top of the slot palette, keyed by model id. Unlike the
+  // token segment colors (fixed settings fields), model ids are dynamic, so
+  // these live in the localStorage view prefs — a per-machine view choice,
+  // same posture as the other viewSection state. Invalid entries are dropped
+  // at load so a corrupt pref can never paint a non-color.
+  const dashModelColors = $state<Record<string, string>>(loadDashModelColors());
+  function loadDashModelColors(): Record<string, string> {
+    try {
+      const parsed: unknown = JSON.parse(
+        loadViewString('code-intelligence', 'dash-model-colors') ?? '{}',
+      );
+      const out: Record<string, string> = {};
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v)) out[k] = v;
+        }
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+  $effect(() =>
+    saveViewString('code-intelligence', 'dash-model-colors', JSON.stringify(dashModelColors)),
+  );
+  function dashModelColor(model: string): string {
+    const over = dashModelColors[model];
+    if (over) return over;
+    let i = dashModelSlot.get(model);
+    if (i === undefined) {
+      i = dashModelSlot.size;
+      dashModelSlot.set(model, i);
+    }
+    return DASH_MODEL_COLORS[i] ?? DASH_MODEL_OVERFLOW;
+  }
+
   // V16 Feature 4 honest-accounting: the panel's displaced figure is NET of
   // bypassed reminds (a displaced Read that came back via `cat` displaced
   // nothing). Subtract `bypassed_advice_chars` — the reminder-TEXT chars of
@@ -1162,6 +1311,156 @@
   {#if section === 'overview'}
   <h3 class="group-head">Usage</h3>
   <div class="usage-sec">
+    <!-- V28: Dashboard — the Overview's at-a-glance donuts. Left: session vs
+         sub-agent token spend (outer ring) over its per-origin kind split
+         (inner ring, aligned under its origin's arc). Right: est. cost share
+         per model, priced at the Cost card's resolved rates so the two can
+         never disagree. Segment colors flow from the same settings-backed
+         CSS vars as the stacked-bar chart — the legend pickers here and in
+         the This-session card write the same settings, so recoloring in
+         either card recolors both. Model colors are per-machine view prefs
+         (dynamic keys don't fit fixed settings fields). -->
+    <details
+      class="card"
+      bind:open={dashCardOpen}
+      style="--ubar-in: {chartColors.in}; --ubar-cache: {chartColors.cache}; --ubar-write: {chartColors.write}; --ubar-out: {chartColors.out}; --sa-session: {chartColors.session}; --sa-agent: {chartColors.agent}"
+    >
+      <summary class="history-head">
+        Dashboard
+        {#if selectedRow}
+          <span class="muted">· {selectedRow.agent} · <code>{selectedRow.session_id.slice(0, 8)}</code>…</span>
+        {:else}
+          <span class="muted">· this session</span>
+        {/if}
+      </summary>
+      <div class="donuts">
+        <div class="donut-block">
+          <div class="donut-title">Tokens · session vs sub-agents</div>
+          {#if dashTokenTotal === 0}
+            <p class="placeholder">
+              {selectedSession ? 'No usage recorded for this session.' : 'No usage recorded yet this session.'}
+            </p>
+          {:else}
+            <div class="donut-row">
+              <svg
+                class="donut"
+                viewBox="0 0 132 132"
+                role="img"
+                aria-label="Session vs sub-agent token usage"
+              >
+                {#each dashOuterArcs as a (a.key)}
+                  <path class="dseg {a.key}" d={arcPath(66, 66, 62, 46, a.a0, a.a1)}>
+                    <title
+                      >{DASH_ORIGIN_LABEL[a.key]}: {a.value.toLocaleString()} tok · {fmtPct(
+                        a.share,
+                      )}</title
+                    >
+                  </path>
+                {/each}
+                {#each dashInnerArcs as a (a.key)}
+                  {@const p = dashInnerParts(a.key)}
+                  <path class="dseg {p.kind}" d={arcPath(66, 66, 42, 28, a.a0, a.a1)}>
+                    <title
+                      >{DASH_ORIGIN_LABEL[p.origin]} {DASH_KIND_LABEL[p.kind]}: {a.value.toLocaleString()} tok
+                      · {fmtPct(a.share)}</title
+                    >
+                  </path>
+                {/each}
+                <text class="donut-num" x="66" y="63">{fmtTok(dashTokenTotal)}</text>
+                <text class="donut-sub" x="66" y="77">tokens</text>
+              </svg>
+              <div class="donut-legend">
+                {#each dashLegendRows as r (r.origin)}
+                  <div class="dl-head">
+                    <input
+                      type="color"
+                      class="dot"
+                      value={chartColors[r.seg.key]}
+                      title="{r.seg.label} — click to pick a color (shared with the This-session chart)"
+                      oninput={(e) => (chartPreview[r.seg.key] = e.currentTarget.value)}
+                      onchange={(e) => commitChartColor(r.seg, e.currentTarget.value)}
+                    />
+                    <span class="dl-name">{DASH_ORIGIN_LABEL[r.origin]}</span>
+                    <span class="tnum" title="{r.tok.toLocaleString()} tokens">{fmtTok(r.tok)}</span>
+                    <span class="muted">{fmtPct(dashTokenTotal > 0 ? r.tok / dashTokenTotal : 0)}</span>
+                  </div>
+                  <div class="dl-kinds">
+                    {#each DASH_KIND_SEGS as s (s.key)}
+                      {@const v = dashKindValue(r.kinds, s.key)}
+                      <span class="dl-kind" title="{s.label}: {v.toLocaleString()} tokens">
+                        <input
+                          type="color"
+                          class="dot sm"
+                          value={chartColors[s.key]}
+                          title="{s.label} — click to pick a color (shared with the This-session chart)"
+                          oninput={(e) => (chartPreview[s.key] = e.currentTarget.value)}
+                          onchange={(e) => commitChartColor(s, e.currentTarget.value)}
+                        />{fmtTok(v)}
+                      </span>
+                    {/each}
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+
+        <div class="donut-block">
+          <div class="donut-title">Est. cost · by model</div>
+          {#if dashCostRows.length === 0}
+            <p class="placeholder">
+              {selectedSession
+                ? 'No per-model usage recorded for this session.'
+                : 'No per-model usage recorded yet this session.'}
+            </p>
+          {:else if pricingTable === null}
+            <p class="placeholder">loading prices…</p>
+          {:else}
+            <div class="donut-row">
+              {#if costGrand > 0}
+                <svg
+                  class="donut"
+                  viewBox="0 0 132 132"
+                  role="img"
+                  aria-label="Estimated cost share by model"
+                >
+                  {#each dashCostArcs as a (a.key)}
+                    <path fill={dashModelColor(a.key)} d={arcPath(66, 66, 62, 40, a.a0, a.a1)}>
+                      <title>{a.key}: {fmtUsd(a.value)} · {fmtPct(a.share)}</title>
+                    </path>
+                  {/each}
+                  <text class="donut-num" x="66" y="63">{fmtUsd(costGrand)}</text>
+                  <text class="donut-sub" x="66" y="77">est. total</text>
+                </svg>
+              {:else}
+                <p class="placeholder donut-empty">
+                  No price rows match these models — add rates in Settings → LLM pricing, or pick
+                  them per model in the Cost card below.
+                </p>
+              {/if}
+              <div class="donut-legend">
+                {#each dashCostRows as r (r.model)}
+                  <div class="dl-head">
+                    <input
+                      type="color"
+                      class="dot"
+                      value={dashModelColor(r.model)}
+                      title="{r.model} — click to pick a color"
+                      oninput={(e) => (dashModelColors[r.model] = e.currentTarget.value)}
+                    />
+                    <code class="dl-model" title="{r.model} · {r.tokens.toLocaleString()} tokens">{r.model}</code>
+                    <span class="tnum">{fmtUsd(r.cost)}</span>
+                    <span class="muted">{fmtPct(costGrand > 0 ? r.cost / costGrand : 0)}</span>
+                    {#if r.unpriced}<span class="est-badge">no price match</span>{/if}
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+      </div>
+    </details>
+
     <!-- Effectiveness: measured counters, never fabricated savings. -->
     <section class="card">
       <div class="history-head">Effectiveness</div>
@@ -2519,8 +2818,10 @@
     gap: 5px;
   }
   /* Each legend dot is a native color input stripped down to its swatch —
-     click to recolor that segment (persisted via settings). */
-  .ubars-legend input.dot {
+     click to recolor that segment (persisted via settings; V28 the donut
+     legends share the same treatment). */
+  .ubars-legend input.dot,
+  .donut-legend input.dot {
     width: 11px;
     height: 11px;
     padding: 0;
@@ -2530,13 +2831,21 @@
     cursor: pointer;
     -webkit-appearance: none;
     appearance: none;
+    flex: 0 0 auto;
   }
-  .ubars-legend input.dot::-webkit-color-swatch-wrapper {
+  .ubars-legend input.dot::-webkit-color-swatch-wrapper,
+  .donut-legend input.dot::-webkit-color-swatch-wrapper {
     padding: 0;
   }
-  .ubars-legend input.dot::-webkit-color-swatch {
+  .ubars-legend input.dot::-webkit-color-swatch,
+  .donut-legend input.dot::-webkit-color-swatch {
     border: none;
     border-radius: 1px;
+  }
+  /* The donut kind rows are compact — a slightly smaller picker dot. */
+  .donut-legend input.dot.sm {
+    width: 9px;
+    height: 9px;
   }
   .useg.in {
     background: var(--ubar-in, #58a6ff);
@@ -2561,6 +2870,102 @@
   }
   .useg.tool {
     background: var(--ubar-tool, #f0c674);
+  }
+  /* V28: Dashboard donuts. Ring fills reuse the settings-backed segment
+     vars; identity never rides on color alone — every ring has its legend
+     rows (values + %) and per-segment tooltips. */
+  .donuts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 28px;
+    align-items: flex-start;
+  }
+  .donut-block {
+    flex: 1 1 300px;
+    min-width: 260px;
+  }
+  .donut-title {
+    font-size: 11px;
+    font-weight: 600;
+    opacity: 0.7;
+    margin-bottom: 6px;
+  }
+  .donut-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  svg.donut {
+    width: 132px;
+    height: 132px;
+    flex: 0 0 auto;
+  }
+  .dseg.session {
+    fill: var(--sa-session, #30363d);
+  }
+  .dseg.agent {
+    fill: var(--sa-agent, #3b6ea5);
+  }
+  .dseg.in {
+    fill: var(--ubar-in, #58a6ff);
+  }
+  .dseg.cache {
+    fill: var(--ubar-cache, #d2a8ff);
+  }
+  .dseg.write {
+    fill: var(--ubar-write, #e3738d);
+  }
+  .dseg.out {
+    fill: var(--ubar-out, #3fb950);
+  }
+  /* Center figures inherit the app text color (theme-safe). */
+  .donut-num {
+    fill: currentColor;
+    font-size: 15px;
+    font-weight: 600;
+    text-anchor: middle;
+  }
+  .donut-sub {
+    fill: currentColor;
+    opacity: 0.55;
+    font-size: 9px;
+    text-anchor: middle;
+  }
+  .donut-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11px;
+    min-width: 0;
+  }
+  .dl-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dl-name {
+    font-weight: 600;
+  }
+  .dl-model {
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dl-kinds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 1px 0 4px 15px;
+    opacity: 0.85;
+  }
+  .dl-kind {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .donut-empty {
+    max-width: 34ch;
   }
   /* Horizontal scroll + zoom viewport around the bars and the S/A lane —
      scrolls once bars hit their minimum width (or the user wheel-zooms in),

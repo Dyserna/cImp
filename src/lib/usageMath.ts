@@ -368,6 +368,134 @@ export function originShareLine(origins: { session_tok: number; agent_tok: numbe
   return `session ${fmtTok(origins.session_tok)} · agents ${fmtTok(origins.agent_tok)} tok`;
 }
 
+// ── V28: Overview dashboard donuts ─────────────────────────────────────
+// The dashboard card's two donuts: session-vs-agent tokens (outer ring)
+// nested over the per-origin kind breakdown (inner ring), and per-model
+// cost share. The aggregation + ring geometry is pure so it's testable
+// without mounting the SVG.
+
+/// Per-origin sums of the four EXACT token kinds across a turn series — the
+/// token donut's source. Tool-result chars are excluded on purpose: the
+/// donut shows transcript-exact tokens only; the chars/4 tool estimate
+/// stays a stacked-bar concern (it overlaps the next turn's input anyway).
+export interface OriginKinds {
+  session: CostTokens;
+  agent: CostTokens;
+}
+
+export function originKindTotals(
+  turns: readonly Pick<TurnUsage, 'in_tok' | 'out_tok' | 'cache_read' | 'cache_make' | 'origin'>[],
+): OriginKinds {
+  const zero = (): CostTokens => ({ in_tok: 0, out_tok: 0, cache_read: 0, cache_make: 0 });
+  const out: OriginKinds = { session: zero(), agent: zero() };
+  for (const t of turns) {
+    const o = t.origin === 'agent' ? out.agent : out.session;
+    o.in_tok += t.in_tok;
+    o.out_tok += t.out_tok;
+    o.cache_read += t.cache_read;
+    o.cache_make += t.cache_make;
+  }
+  return out;
+}
+
+/// A CostTokens' four kinds summed — one origin's (or model's) total.
+export function kindsTotal(t: CostTokens): number {
+  return t.in_tok + t.cache_read + t.cache_make + t.out_tok;
+}
+
+/// One drawn donut-ring segment. `a0`/`a1` are the DRAWN angles (radians,
+/// 0 = 12 o'clock, increasing clockwise) — the inter-segment gap inset is
+/// already applied, while `share` stays the true proportion.
+export interface DonutArc {
+  key: string;
+  value: number;
+  share: number;
+  a0: number;
+  a1: number;
+}
+
+/// Lay out one donut ring: proportional spans from 12 o'clock clockwise.
+/// Zero/negative/non-finite values are dropped (they'd draw nothing); each
+/// kept segment is inset by up to `gapAngle / 2` per side — clamped to 30%
+/// of its own span so a sliver never inverts — which keeps segment
+/// BOUNDARIES at their exact cumulative angles (nested rings built from
+/// consistent data therefore stay aligned). A single nonzero value takes
+/// the full circle with no gap. Empty when the total is 0 — the caller
+/// renders a placeholder, never a fabricated ring.
+export function donutArcs(
+  items: readonly { key: string; value: number }[],
+  gapAngle: number,
+): DonutArc[] {
+  const kept = items.filter((x) => Number.isFinite(x.value) && x.value > 0);
+  const total = kept.reduce((s, x) => s + x.value, 0);
+  if (total <= 0) return [];
+  const solo = kept.length === 1;
+  const out: DonutArc[] = [];
+  let acc = 0;
+  for (const x of kept) {
+    const span = (x.value / total) * 2 * Math.PI;
+    const pad = solo ? 0 : Math.min(gapAngle / 2, span * 0.3);
+    out.push({
+      key: x.key,
+      value: x.value,
+      share: x.value / total,
+      a0: acc + pad,
+      a1: acc + span - pad,
+    });
+    acc += span;
+  }
+  return out;
+}
+
+/// SVG path for an annular sector between radii `rIn` < `rOut`, from angle
+/// `a0` to `a1` (radians, 0 = 12 o'clock, clockwise, center `cx`,`cy`).
+/// A span within ε of the full circle renders as a complete ring (outer
+/// circle clockwise + inner counter-clockwise, nonzero winding) — a plain
+/// arc command degenerates when its endpoints coincide.
+export function arcPath(
+  cx: number,
+  cy: number,
+  rOut: number,
+  rIn: number,
+  a0: number,
+  a1: number,
+): string {
+  // toFixed can emit "-0.000" at the axis crossings (cos/sin epsilon) —
+  // normalize so paths compare cleanly.
+  const fx = (v: number): string => {
+    const s = v.toFixed(3);
+    return s === '-0.000' ? '0.000' : s;
+  };
+  const px = (r: number, a: number): string => `${fx(cx + r * Math.sin(a))} ${fx(cy - r * Math.cos(a))}`;
+  const span = a1 - a0;
+  if (span <= 0) return '';
+  if (span >= 2 * Math.PI - 1e-4) {
+    return (
+      `M ${px(rOut, 0)} A ${rOut} ${rOut} 0 1 1 ${px(rOut, Math.PI)} ` +
+      `A ${rOut} ${rOut} 0 1 1 ${px(rOut, 0)} Z ` +
+      `M ${px(rIn, 0)} A ${rIn} ${rIn} 0 1 0 ${px(rIn, Math.PI)} ` +
+      `A ${rIn} ${rIn} 0 1 0 ${px(rIn, 0)} Z`
+    );
+  }
+  const large = span > Math.PI ? 1 : 0;
+  return (
+    `M ${px(rOut, a0)} A ${rOut} ${rOut} 0 ${large} 1 ${px(rOut, a1)} ` +
+    `L ${px(rIn, a1)} A ${rIn} ${rIn} 0 ${large} 0 ${px(rIn, a0)} Z`
+  );
+}
+
+/// Share-of-ring percentage for donut legends/tooltips: whole percents,
+/// with the honest edges — a nonzero sliver reads "<1%", a dominant-but-
+/// not-total share reads ">99%", and only a true 0/1 reads "0%"/"100%".
+export function fmtPct(share: number): string {
+  if (!Number.isFinite(share) || share <= 0) return '0%';
+  if (share >= 1) return '100%';
+  const pct = share * 100;
+  if (pct < 1) return '<1%';
+  if (pct > 99) return '>99%';
+  return `${Math.round(pct)}%`;
+}
+
 /// Compact token-count formatter for the Sessions table's per-row billing
 /// stats, where four multi-million counts share one line ("61.2M", "9.9k",
 /// "412"). One decimal below 10k, integer k below 1M (the 999,500 boundary

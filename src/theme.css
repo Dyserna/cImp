@@ -4,16 +4,18 @@
 
    The `:root` block below is the BASE / FALLBACK token set — a neutral cool
    slate-blue palette (the legacy `modern-dark` look) applied before any theme
-   CSS is present. It is never normally seen: the default `tui-orange` theme is
-   set on <html> synchronously at boot. The actual themes are not defined here:
-   each one lives in its own folder (`theme.json` + `theme.css`) shipped in
-   the portable release at `<exe-dir>/themes/<id>/` (source of truth is the
-   repo-root `themes/` folder; `build.rs` copies it next to the dev exe).
-   Nothing is embedded or seeded at runtime — the backend reads + verifies
-   them from disk and the frontend injects each theme's CSS into <head>. The
-   active theme is selected by the `data-theme` attribute on <html>, exactly
-   as before — the per-theme `[data-theme="<id>"]` block (which redeclares the
-   full token set) wins over these defaults.
+   CSS is present. It is never normally seen: the default built-in `tui` theme
+   is set on <html> synchronously at boot. The actual themes are not defined
+   here. The `tui` theme is hardcoded into the backend binary
+   (`src-tauri/src/theming/tui_theme.css`, accent driven by the user-picked
+   `--tui-accent` variable); every other theme lives in its own folder
+   (`theme.json` + `theme.css`) shipped in the portable release at
+   `<exe-dir>/themes/<id>/` (source of truth is the repo-root `themes/`
+   folder; `build.rs` copies it next to the dev exe) — the backend reads +
+   verifies them from disk and the frontend injects each theme's CSS into
+   <head>. The active theme is selected by the `data-theme` attribute on
+   <html>, exactly as before — the per-theme `[data-theme="<id>"]` block
+   (which redeclares the full token set) wins over these defaults.
 
    --- Theme isolation policy --------------------------------------------
 

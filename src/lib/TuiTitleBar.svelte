@@ -1,7 +1,8 @@
 <script lang="ts">
   // Custom TUI-styled window title bar. Mounted whenever the active theme
-  // sets `decorations: false` — true for both shipped `tui-*` themes. A
-  // future native-chrome theme would use the OS bar via setDecorations(true).
+  // sets `decorations: false` — true for the built-in `tui` theme and the
+  // shipped disk themes. A future native-chrome theme would use the OS bar
+  // via setDecorations(true).
   //
   // The bar is a single 22px-tall row with a drag region in the middle
   // (data-tauri-drag-region — Tauri natively turns mousedown into a

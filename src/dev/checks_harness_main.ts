@@ -4,15 +4,17 @@ import ChecksEditor from '../lib/settings/ChecksEditor.svelte';
 import type { CheckDef } from '../lib/settings/types';
 import '../theme.css';
 import '../app.css';
-// The real app injects the active theme's CSS from disk at runtime; the
-// harness imports one TUI theme directly to reproduce its structural
-// button overrides (`section button` bracket framing).
-import '../../themes/tui-blue/theme.css';
+// The real app injects the active theme's CSS at runtime; the harness
+// imports the built-in TUI theme's CSS (compiled into the backend binary,
+// canonical copy lives next to the Rust theming module) directly to
+// reproduce its structural button overrides (`section button` bracket
+// framing).
+import '../../src-tauri/src/theming/tui_theme.css';
 
 // `?theme=modern` renders with the base `:root` tokens only (no TUI
-// structural overrides); default exercises the tui-blue bracket rules.
+// structural overrides); default exercises the TUI bracket rules.
 document.documentElement.dataset.theme =
-  new URLSearchParams(location.search).get('theme') === 'modern' ? 'modern-dark' : 'tui-blue';
+  new URLSearchParams(location.search).get('theme') === 'modern' ? 'modern-dark' : 'tui';
 
 const checks: CheckDef[] = [
   {

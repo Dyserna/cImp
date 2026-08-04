@@ -3,17 +3,18 @@ import SettingsApp from './SettingsApp.svelte';
 import { settings } from './lib/settings/store';
 import { themeFromSetting, applyTerminalPaletteVars } from './lib/themes/resolve';
 import { initThemeRegistry, themeMeta } from './lib/themes/registry';
+import { applyTuiAccent, TUI_THEME_ID } from './lib/themes/accent';
 import { installReloadBlocker } from './lib/shortcuts/blockReload';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './theme.css';
 import './app.css';
 
-document.documentElement.dataset.theme = 'tui-blue';
+document.documentElement.dataset.theme = TUI_THEME_ID;
 
 // Match the main window: no user-triggered reload in the settings window either.
 installReloadBlocker();
 
-let currentThemeId = 'tui-blue';
+let currentThemeId: string = TUI_THEME_ID;
 let lastDecorations: boolean | null = null;
 
 function applyChrome() {
@@ -29,10 +30,11 @@ function applyChrome() {
 void initThemeRegistry().finally(applyChrome);
 
 settings.subscribe((s) => {
-  currentThemeId = s.ui?.theme || 'tui-blue';
+  currentThemeId = s.ui?.theme || TUI_THEME_ID;
   if (document.documentElement.dataset.theme !== currentThemeId) {
     document.documentElement.dataset.theme = currentThemeId;
   }
+  applyTuiAccent(s.ui?.tui_accent);
   if (s.terminal?.theme) applyTerminalPaletteVars(themeFromSetting(s.terminal.theme));
   applyChrome();
 });

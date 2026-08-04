@@ -7,13 +7,14 @@
 // Settings UI plus a synchronous `themeMeta(id)` lookup used by the window
 // entry points to drive `data-theme` and the OS-chrome (decorations) toggle.
 //
-// Everything degrades to a built-in `tui-blue` fallback: the backend always
-// includes the embedded tui-blue theme even when the on-disk folder is empty,
-// and if the IPC itself fails we still hold the metadata fallback below so the
-// chrome logic never sees `undefined`.
+// Everything degrades to the built-in `tui` theme: the backend always
+// includes it (its CSS is compiled into the binary) even when the on-disk
+// themes folder is empty, and if the IPC itself fails we still hold the
+// metadata fallback below so the chrome logic never sees `undefined`.
 
 import { invoke } from '@tauri-apps/api/core';
 import { writable, type Readable } from 'svelte/store';
+import { TUI_THEME_ID } from './accent';
 import { FALLBACK_PALETTES, setPalettes, type ThemeColors } from './index';
 
 /// A UI theme as delivered by the backend: metadata plus the CSS to inject.
@@ -33,13 +34,13 @@ export interface PaletteWire {
 }
 
 /// Metadata fallback used before the registry loads and if the fetch fails.
-/// Matches the embedded tui-blue theme.json on the Rust side. `css` is empty
-/// here — the real CSS arrives from the backend (or, in the empty-folder case,
-/// from the backend's embedded copy); a fetch failure leaves the base
+/// Matches the built-in `tui` theme's metadata on the Rust side. `css` is
+/// empty here — the real CSS arrives from the backend (compiled into the
+/// binary, so it's always in the response); a fetch failure leaves the base
 /// `theme.css` :root tokens in effect, which is a usable degraded state.
 const FALLBACK_THEME: ThemeEntry = {
-  id: 'tui-blue',
-  name: 'TUI - Blue',
+  id: TUI_THEME_ID,
+  name: 'TUI',
   decorations: false,
   palette: 'OpenCode Grey',
   css: '',
@@ -60,8 +61,9 @@ export const paletteRegistry: Readable<PaletteWire[]> = palettesStore;
 
 let byId = new Map<string, ThemeEntry>([[FALLBACK_THEME.id, FALLBACK_THEME]]);
 
-/// Synchronous metadata lookup. Unknown ids fall back to tui-blue so the
-/// chrome logic (decorations toggle, palette pairing) always has an answer.
+/// Synchronous metadata lookup. Unknown ids fall back to the built-in `tui`
+/// theme so the chrome logic (decorations toggle, palette pairing) always
+/// has an answer.
 export function themeMeta(id: string): ThemeEntry {
   return byId.get(id) ?? byId.get(FALLBACK_THEME.id) ?? FALLBACK_THEME;
 }

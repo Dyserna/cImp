@@ -2449,22 +2449,27 @@ mod tests {
 
     #[test]
     fn ui_theme_round_trip_and_default() {
-        // Default file has ui.theme = "tui-blue" (new installs land here).
+        // Default file has ui.theme = "tui" — the built-in theme — with the
+        // default blue accent (new installs land here).
         let s = Settings::default();
-        assert_eq!(s.ui.theme, "tui-blue");
+        assert_eq!(s.ui.theme, "tui");
+        assert_eq!(s.ui.tui_accent, "#7aa2f7");
 
-        // Round-trip preserves a hand-edited value (here: a user who
-        // switched to tui-grey or set a future theme).
+        // Round-trip preserves hand-edited values (here: a user who
+        // switched to a disk theme and picked a custom accent).
         let mut s = Settings::default();
-        s.ui.theme = "tui-grey".to_string();
+        s.ui.theme = "nippon-dark".to_string();
+        s.ui.tui_accent = "#d77757".to_string();
         let text = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-grey");
+        assert_eq!(parsed.ui.theme, "nippon-dark");
+        assert_eq!(parsed.ui.tui_accent, "#d77757");
 
         // A v1.3 file without the `ui` field still parses (serde(default)).
         let v1_3_json = r#"{"tabs":[]}"#;
         let parsed: Settings = serde_json::from_str(v1_3_json).unwrap();
-        assert_eq!(parsed.ui.theme, "tui-blue");
+        assert_eq!(parsed.ui.theme, "tui");
+        assert_eq!(parsed.ui.tui_accent, "#7aa2f7");
     }
 
     // --- Layered config (global + custom overlay) -----------------------

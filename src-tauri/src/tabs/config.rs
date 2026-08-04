@@ -635,7 +635,33 @@ fn build_extra_args(
     // reduced palette hid commands like `/connect`; cImp now drives every AI tab
     // fullscreen and sources TTS out-of-band (OpenCode's `GET /event` stream),
     // not by scraping the linear terminal stream. See MILESTONE-V20.
-    out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
+    //
+    // D-8 (maintenance 2026-08-04): cImp does not merely decline to inject
+    // `--mini` — it must actively strip a user-supplied one from an OpenCode
+    // tab's stored `args`. `resolve_oob_source` unconditionally appends
+    // `--port <N> --hostname 127.0.0.1` to every OpenCode launch (that port is
+    // the TTS event tap), and `opencode --mini --port N` HARD-FAILS: the two
+    // flags are mutually exclusive. So the combination is reachable — the
+    // v19→v20 migration stripped `--mini` from stored args once, but nothing
+    // stops it coming back via a hand-edited settings file, a `.cimp.custom.
+    // config.json` overlay, or a settings file carried over from another
+    // machine. Dropping it keeps the tab launchable (the flag is inert under
+    // V20 anyway) instead of handing the user an opaque OpenCode usage error;
+    // the launch log records the correction.
+    let mini_guard = command_is(&cfg.command, "opencode");
+    for arg in cfg.args.iter().filter(|s| !s.is_empty()) {
+        if mini_guard && is_mini_flag(arg) {
+            tracing::warn!(
+                tab = %cfg.id,
+                arg = %arg,
+                "opencode tab: dropping `--mini` from args — cImp launches OpenCode \
+                 fullscreen with `--port` for the TTS event tap, and OpenCode rejects \
+                 `--mini` combined with `--port`. Remove it from the tab's args.",
+            );
+            continue;
+        }
+        out.push(arg.clone());
+    }
 
     // cimp is documented as a drop-in replacement for `claude`, so
     // invocation args (`cimp --resume <id>`, etc.) flow into every
@@ -650,6 +676,13 @@ fn build_extra_args(
         }
     }
     out
+}
+
+/// D-8: does `arg` set OpenCode's `--mini` flag? Matches the bare flag and the
+/// `--mini=<value>` form (clap accepts both for a bool flag), so neither
+/// spelling can survive into a launch that also carries `--port`.
+fn is_mini_flag(arg: &str) -> bool {
+    arg == "--mini" || arg.starts_with("--mini=")
 }
 
 /// Deterministic path of the managed OpenCode instructions file for `cfg`.
@@ -903,6 +936,8 @@ fn git_exclude_opencode(working_dir: &Path) {
 /// `--mcp-config` / `--settings` / `--append-system-prompt`):
 ///
 /// - `$schema` marker.
+/// - `subagent_depth: 2` (D-8) — pins nested-subagent behavior across the
+///   OpenCode 1.18.2 default change (see the injection site).
 /// - `mcp.cimp-offload` → `cimp --offload-mcp --consumer opencode`, injected
 ///   whenever offload, the graph, or an OpenCode-exposed MCP server is in play
 ///   (mirrors the Claude `--mcp-config` gate in `build_pre_args`).
@@ -927,6 +962,27 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
         "$schema".to_string(),
         serde_json::Value::String("https://opencode.ai/config.json".to_string()),
     );
+
+    // D-8 (maintenance 2026-08-04): pin `subagent_depth`. OpenCode 1.18.2
+    // introduced this key with a default of **1**, which lets a primary agent
+    // launch subagents but blocks those subagents from launching their own —
+    // a silent behavior change for any workflow that nested before. cImp's
+    // installed OpenCode predates it, so upgrading would quietly break nesting
+    // unless the injected config states an intent. `2` restores one level of
+    // nesting (the pre-1.18.2 shape) without going unbounded.
+    //
+    // Deliberately a CONSTANT, not a setting: `spawn_inject_sig` only needs an
+    // entry for Settings-derived spawn injections, and a constant can never
+    // differ between a running tab and a fresh one.
+    //
+    // Key verified 2026-08-04 against both https://opencode.ai/docs/config/
+    // ("You can control how deeply subagents can invoke other subagents using
+    // the `subagent_depth` option… The default is 1") and the live schema at
+    // https://opencode.ai/config.json (top-level integer, minimum 0,
+    // "Maximum subagent nesting depth. Defaults to 1, which prevents subagents
+    // from launching subagents."). Additive, so a user's own project config
+    // still merges underneath and can override it.
+    config.insert("subagent_depth".to_string(), serde_json::Value::from(2u64));
 
     // Build the `mcp` object from up to two stdio children, each under its own
     // gate (mirrors the two-server `--mcp-config` map in `build_pre_args`):
@@ -1899,6 +1955,68 @@ mod tests {
         );
     }
 
+    /// D-8 — the `--mini` × `--port` guard. `resolve_oob_source` always
+    /// appends `--port <N> --hostname 127.0.0.1` to an OpenCode launch, and
+    /// OpenCode hard-fails when `--mini` is combined with `--port`. A stored
+    /// `--mini` (hand-edited settings, a carried-over config file) must
+    /// therefore never reach the command line — while every other user arg
+    /// survives untouched.
+    #[test]
+    fn opencode_strips_user_supplied_mini_but_keeps_other_args() {
+        let settings = Settings::default();
+        let mut cfg = opencode_cfg();
+        cfg.args = vec![
+            "--mini".to_string(),
+            "--model".to_string(),
+            "x".to_string(),
+            "--mini=true".to_string(),
+            String::new(),
+            "--continue".to_string(),
+        ];
+        let args = build_extra_args(&cfg, &settings, &[]);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--mini")),
+            "stored --mini must be stripped (it hard-fails with the injected --port), got: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "x".to_string(),
+                "--continue".to_string()
+            ],
+            "only --mini is dropped; every other user arg is preserved in order",
+        );
+    }
+
+    /// The guard is OpenCode-specific: another AI tool's `--mini` (whatever it
+    /// may mean there) is none of cImp's business — no `--port` is injected for
+    /// it, so there is no conflict to resolve.
+    #[test]
+    fn mini_guard_is_opencode_only() {
+        let settings = Settings::default();
+        let mut cfg = claude_cfg();
+        cfg.command = "some-other-tool".to_string();
+        cfg.args = vec!["--mini".to_string()];
+        assert_eq!(
+            build_extra_args(&cfg, &settings, &[]),
+            vec!["--mini".to_string()],
+            "non-opencode tabs keep their own args verbatim",
+        );
+    }
+
+    #[test]
+    fn is_mini_flag_matches_both_spellings() {
+        assert!(is_mini_flag("--mini"));
+        assert!(is_mini_flag("--mini=true"));
+        assert!(is_mini_flag("--mini=false"));
+        // Near misses stay put.
+        assert!(!is_mini_flag("--minimal"));
+        assert!(!is_mini_flag("--mini-mode"));
+        assert!(!is_mini_flag("-m"));
+        assert!(!is_mini_flag("mini"));
+    }
+
     #[test]
     fn opencode_config_content_is_valid_json() {
         let settings = Settings::default();
@@ -1909,6 +2027,31 @@ mod tests {
         let cfg: serde_json::Value =
             serde_json::from_str(raw).expect("OPENCODE_CONFIG_CONTENT is valid JSON");
         assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
+    }
+
+    /// D-8 — `subagent_depth` is pinned unconditionally. OpenCode 1.18.2 made
+    /// the default 1 (subagents may not launch subagents); cImp states 2 so an
+    /// upgrade can't silently change nesting behavior. Constant by design: it
+    /// derives from no setting, so it needs no `spawn_inject_sig` entry and
+    /// must be present in the barest possible config.
+    #[test]
+    fn opencode_config_pins_subagent_depth() {
+        for settings in [Settings::default(), {
+            // Every injection gate on — the key survives a maximal config too.
+            let mut s = Settings::default();
+            s.offload.enabled = true;
+            s.graph.enabled = true;
+            s.code_audit.enabled = true;
+            s.code_audit.expose_opencode = true;
+            s
+        }] {
+            let cfg = build_opencode_config(&opencode_cfg(), &settings);
+            assert_eq!(
+                cfg["subagent_depth"],
+                serde_json::json!(2),
+                "subagent_depth must be pinned to 2 in every OpenCode config",
+            );
+        }
     }
 
     #[test]

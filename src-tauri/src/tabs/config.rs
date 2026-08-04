@@ -1077,6 +1077,24 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
         }
     }
 
+    // Maintenance D-2 (2026-08-04): Claude Code ≥ 2.1.212 auto-backgrounds any
+    // MCP call that runs past ~2 minutes — the tool returns a task id straight
+    // away and the real result arrives later as a notification. cImp's loopback
+    // proxy and offload/audit result handling assume a synchronous MCP return,
+    // and several `cimp-offload` tools (offload_task, offload_batch,
+    // security_audit, quality_audit, graph indexing) routinely exceed that, so
+    // auto-backgrounding would silently truncate them. `0` disables the
+    // behaviour outright. Unconditional for every Claude tab (not a user
+    // setting, so no `spawn_inject_sig` entry / restart hint is needed) and
+    // deliberately outside the `use_local_provider` gate above. Revisit when
+    // out-of-band MCP completion lands (issue #15 / NC-4).
+    if command_is(&cfg.command, "claude") {
+        env.insert(
+            "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_string(),
+            "0".to_string(),
+        );
+    }
+
     // Claude against a local provider: synthesize `ANTHROPIC_*` env. OpenCode's
     // local provider arrives inside `OPENCODE_CONFIG_CONTENT` (a `provider`
     // block, see `build_opencode_config`), not as env vars, so it is handled
@@ -2030,6 +2048,60 @@ mod tests {
             Some("1"),
             "an explicit per-tab value must pass through the env merge",
         );
+    }
+
+    // ── Maintenance D-2: MCP auto-backgrounding kill switch ───────────────
+
+    #[test]
+    fn claude_disables_mcp_auto_backgrounding() {
+        // Unconditional for Claude tabs — including with the local-provider
+        // opt-in off, i.e. outside the `ANTHROPIC_*` gate.
+        let settings = Settings::default();
+        let env = compose_ai_env(&claude_cfg(), &settings);
+        assert_eq!(
+            env.get("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")
+                .map(String::as_str),
+            Some("0"),
+            "long cimp-offload MCP calls must not be auto-backgrounded",
+        );
+        assert!(
+            !env.contains_key("ANTHROPIC_BASE_URL"),
+            "sanity: local-provider env is off in this case",
+        );
+    }
+
+    #[test]
+    fn per_tab_env_overrides_mcp_auto_background_ms() {
+        let settings = Settings::default();
+        let mut cfg = claude_cfg();
+        cfg.env.insert(
+            "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_string(),
+            "120000".to_string(),
+        );
+        let env = compose_ai_env(&cfg, &settings);
+        assert_eq!(
+            env.get("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")
+                .map(String::as_str),
+            Some("120000"),
+            "an explicit per-tab value must win over the synthesized constant",
+        );
+    }
+
+    #[test]
+    fn non_claude_tabs_get_no_mcp_auto_background_env() {
+        let settings = Settings::default();
+        let mut other = claude_cfg();
+        other.command = "some-other-tool".to_string();
+        for cfg in [opencode_cfg(), other] {
+            let env = compose_ai_env(&cfg, &settings);
+            assert!(
+                !env.contains_key("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"),
+                "only Claude tabs get the Claude-specific kill switch (command: {})",
+                cfg.command,
+            );
+        }
+        // Shell tabs never reach `compose_ai_env` at all — `build_launch_spec`
+        // passes their `env` through verbatim.
     }
 
     // ── V12 Phase E: fact promotion block ─────────────────────────────────

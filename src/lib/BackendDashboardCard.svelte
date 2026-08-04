@@ -298,7 +298,7 @@
   .card {
     border: 1px solid var(--border-subtle, #21262d);
     border-radius: 7px;
-    background: var(--surface-1, #11161d);
+    background: var(--surface-card, #11161d);
     padding: 0.7rem 0.8rem;
   }
   .card.live {
@@ -544,12 +544,13 @@
   .run-dot.running {
     animation: pulse 1.1s ease-in-out infinite;
   }
-  /* Run-log text uses hardcoded neutrals (not the --text-* tokens, which
-     follow the terminal palette's --term-fg and can render pink/magenta) so the
-     diagnostic panel stays legible in any palette. */
+  /* Run-log text follows the theme's neutral text ramp (hex only as the
+     var() fallback) — the ramp is terminal-palette-derived by design, so the
+     diagnostic panel matches the rest of the chrome and stays readable on
+     light themes. */
   .run-id {
     font-family: var(--font-mono, ui-monospace, monospace);
-    color: #6e7681;
+    color: var(--text-faint, #6e7681);
     flex: 0 0 auto;
   }
   .run-mode {
@@ -557,7 +558,7 @@
     text-transform: uppercase;
     font-size: 0.78em;
     letter-spacing: 0.04em;
-    color: #8b949e;
+    color: var(--text-quiet, #8b949e);
     border: 1px solid var(--border-subtle, #21262d);
     border-radius: 3px;
     padding: 0 0.25rem;
@@ -568,11 +569,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: #adbac7;
+    color: var(--text-secondary, #adbac7);
   }
   .run-meta {
     flex: 0 0 auto;
-    color: #768390;
+    color: var(--text-tertiary, #768390);
     font-size: 0.92em;
   }
   .run-outcome {
@@ -583,8 +584,8 @@
     flex: none;
     padding: 0 0.3rem;
     border-radius: 3px;
-    background: rgba(210, 153, 34, 0.18);
-    color: #d29922;
+    background: var(--surface-warning, rgba(210, 153, 34, 0.18));
+    color: var(--text-warning, #d29922);
     font-size: 0.82em;
     font-weight: 600;
     white-space: nowrap;
@@ -595,13 +596,12 @@
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 0.82em;
     line-height: 1.5;
-    /* Hardcoded neutral text — NOT the --text-* tokens, which follow the
-       terminal palette's --term-fg and can be pink/magenta. The run log is a
-       diagnostic table; it should stay legible in any palette. */
-    color: #adbac7;
+    /* Neutral text ramp tokens (hex only as fallback) — palette-derived by
+       design, matching the rest of the chrome. */
+    color: var(--text-secondary, #adbac7);
   }
   .run-calls .muted {
-    color: #6e7681;
+    color: var(--text-faint, #6e7681);
   }
   .crow {
     display: flex;
@@ -611,17 +611,17 @@
   }
   .ckind {
     flex: 0 0 6.5rem;
-    color: #8b949e;
+    color: var(--text-quiet, #8b949e);
   }
   .ckind.final {
-    color: #58a6ff;
+    color: var(--text-info, #58a6ff);
   }
   .ckind.verify {
-    color: #d29922;
+    color: var(--text-warning, #d29922);
   }
   .cstep {
     flex: 0 0 3.5rem;
-    color: #6e7681;
+    color: var(--text-faint, #6e7681);
   }
   .ctok {
     flex: 0 0 auto;
@@ -629,15 +629,15 @@
   .cdur,
   .ctps {
     flex: 0 0 auto;
-    color: #768390;
+    color: var(--text-tertiary, #768390);
   }
   .cresult {
     flex: 1 1 auto;
     text-align: right;
-    color: #768390;
+    color: var(--text-tertiary, #768390);
   }
   .cresult.bad {
-    color: #f85149;
+    color: var(--text-danger-bright, #f85149);
     font-weight: 600;
   }
   code {

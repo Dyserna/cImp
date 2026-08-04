@@ -159,7 +159,7 @@
     overflow-y: auto;
     padding: 16px;
     font-size: 13px;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     box-sizing: border-box;
   }
   header {
@@ -177,7 +177,7 @@
     display: flex;
     gap: 4px;
     margin-bottom: 14px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     padding-bottom: 8px;
     flex-wrap: wrap;
   }
@@ -186,7 +186,7 @@
     border-radius: 6px;
     border: 1px solid transparent;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     cursor: pointer;
     opacity: 0.7;
@@ -197,7 +197,7 @@
   }
   .seg.active {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
   }
@@ -206,13 +206,13 @@
     padding: 8px 10px;
     border-radius: 6px;
     font-size: 12px;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     background: rgba(255, 255, 255, 0.04);
     opacity: 0.9;
   }
   .banner.err {
-    background: rgba(179, 38, 30, 0.18);
-    border-color: #b3261e;
-    color: #ffb4ab;
+    background: var(--surface-danger, rgba(179, 38, 30, 0.18));
+    border-color: var(--border-danger, #b3261e);
+    color: var(--text-danger-soft, #ffb4ab);
   }
 </style>

@@ -83,7 +83,7 @@
   // `decorations` metadata (false = OS chrome hidden, we draw our own bar).
   // Derived from the registry store so it re-evaluates when the registry
   // finishes loading, not just when the theme id changes. Unknown / not-yet-
-  // loaded themes default to the custom bar (matches the tui-orange fallback).
+  // loaded themes default to the custom bar (matches the built-in tui theme).
   let useCustomTitleBar = $derived(
     !($themeRegistry.find((t) => t.id === $settings.ui.theme)?.decorations ?? false),
   );

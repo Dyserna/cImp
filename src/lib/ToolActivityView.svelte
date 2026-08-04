@@ -473,7 +473,7 @@
     overflow-y: auto;
     padding: 16px;
     font-size: 13px;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     box-sizing: border-box;
     /* Flex column (children stack exactly as in normal flow) so the Graph
        view host below can flex-grow to the remaining pane height — a canvas
@@ -521,7 +521,7 @@
     display: flex;
     gap: 4px;
     margin-bottom: 14px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     padding-bottom: 8px;
     flex-wrap: wrap;
   }
@@ -530,7 +530,7 @@
     border-radius: 6px;
     border: 1px solid transparent;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     cursor: pointer;
     opacity: 0.7;
@@ -541,16 +541,16 @@
   }
   .seg.active {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
   }
   .card {
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 8px;
     padding: 12px;
     margin-bottom: 12px;
-    background: var(--panel, #1e1e1e);
+    background: var(--surface-card, #1e1e1e);
   }
   .caveat {
     font-size: 11px;
@@ -576,10 +576,10 @@
     margin-bottom: 6px;
   }
   .clear-btn {
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: 6px;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 11px;
     font-weight: 400;
     padding: 2px 10px;
@@ -592,8 +592,8 @@
   }
   /* Armed state: the second click clears for real. */
   .clear-btn.arm {
-    color: #ffb4ab;
-    border-color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
+    border-color: var(--text-danger-soft, #ffb4ab);
     opacity: 1;
   }
   .history-empty {
@@ -610,12 +610,12 @@
     overflow-y: auto;
   }
   .feature-note {
-    border: 1px solid rgba(227, 179, 65, 0.5);
+    border: 1px solid var(--border-warning, rgba(227, 179, 65, 0.5));
     border-radius: 8px;
     padding: 8px 12px;
     margin-bottom: 12px;
-    background: rgba(227, 179, 65, 0.08);
-    color: #e3b341;
+    background: var(--surface-warning-faint, rgba(227, 179, 65, 0.08));
+    color: var(--text-warning, #e3b341);
     font-size: 12px;
   }
   .hrow {
@@ -626,7 +626,7 @@
     height: var(--hrow-h);
     box-sizing: border-box;
     padding: 0 4px;
-    border-bottom: 1px solid var(--border, #2a2a2a);
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
     font-size: 0.86em;
     white-space: nowrap;
     cursor: pointer;
@@ -637,14 +637,14 @@
     outline: none;
   }
   .hrow.err {
-    color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
   }
   /* Per-row delete: kept invisible until the row is hovered/focused so the
      feed stays visually calm. */
   .hdel {
     border: none;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 1em;
     line-height: 1;
     padding: 0 2px;
@@ -658,7 +658,7 @@
   }
   .hdel:hover {
     opacity: 1 !important;
-    color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
   }
   .hkind,
   .hsrc {
@@ -669,38 +669,40 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Feed-kind accents: graph = blue, offload = green, audit = orange.
-     Hardcoded hex (not --text-*, which follow the terminal palette) so they
-     stay legible in any theme — same rationale as ToolsReference's tool names. */
+  /* Feed-kind accents: graph = info, offload = success, audit = orange.
+     Semantic theme tokens (not the neutral --text-* ramp, which follows the
+     terminal palette) so each theme keeps them legible — dark ink variants
+     on light themes. Orange has no token of its own, so it's mixed from the
+     warning/danger semantics to stay distinct from read_advisor's yellow. */
   .hkind.graph {
-    color: #58a6ff;
+    color: var(--text-info, #58a6ff);
   }
   .hkind.offload {
-    color: #3fb950;
+    color: var(--text-success, #3fb950);
   }
   .hkind.audit {
-    color: #f0883e;
+    color: color-mix(in srgb, var(--warning, #f0a020) 60%, var(--danger, #f06080));
   }
   /* Agent-source accents for graph rows (claude/opencode/offload, plus the
      backend-internal read_advisor/auto_check services), matching the palette
      the Code Intelligence activity feed used. */
   .hsrc.claude {
-    color: #58a6ff;
+    color: var(--text-info, #58a6ff);
   }
   .hsrc.opencode {
-    color: #d2a8ff;
+    color: var(--accent-purple, #d2a8ff);
   }
   .hsrc.offload {
-    color: #3fb950;
+    color: var(--text-success, #3fb950);
   }
   .hsrc.read_advisor {
-    color: #e3b341;
+    color: var(--text-warning, #e3b341);
   }
   .hsrc.auto_check {
-    color: #f0883e;
+    color: color-mix(in srgb, var(--warning, #f0a020) 60%, var(--danger, #f06080));
   }
   .hsrc.audit {
-    color: #f0883e;
+    color: color-mix(in srgb, var(--warning, #f0a020) 60%, var(--danger, #f06080));
   }
   .hmain {
     overflow: hidden;
@@ -732,11 +734,11 @@
     flex-direction: column;
     width: min(820px, calc(100vw - 40px));
     max-height: min(80vh, 900px);
-    background: var(--surface-3, var(--panel, #1e1e1e));
-    border: 1px solid var(--border-subtle, var(--border, #3a3a3a));
+    background: var(--surface-3, #1e1e1e);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     border-radius: var(--radius-lg, 10px);
     padding: 14px 16px;
-    color: var(--text-primary, var(--text, #ddd));
+    color: var(--text-primary, #ddd);
     z-index: 101;
     box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.5));
     box-sizing: border-box;
@@ -760,14 +762,14 @@
     font-family: var(--font-mono, monospace);
   }
   .detail-failed {
-    color: #ffb4ab;
+    color: var(--text-danger-soft, #ffb4ab);
     text-transform: uppercase;
     font-size: 0.8em;
   }
   .detail-close {
     border: none;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 16px;
     line-height: 1;
     cursor: pointer;
@@ -804,7 +806,7 @@
     margin: 0;
     padding: 8px 10px;
     background: var(--surface-sunken, rgba(0, 0, 0, 0.3));
-    border: 1px solid var(--border, #2a2a2a);
+    border: 1px solid var(--border-faint, #2a2a2a);
     border-radius: 6px;
     font-size: 12px;
     white-space: pre-wrap;
@@ -821,9 +823,9 @@
   .detail-actions button {
     padding: 4px 12px;
     border-radius: 6px;
-    border: 1px solid var(--border, #3a3a3a);
+    border: 1px solid var(--border-subtle, #3a3a3a);
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     cursor: pointer;
   }
@@ -831,10 +833,10 @@
     background: rgba(255, 255, 255, 0.06);
   }
   .detail-delete {
-    color: #ffb4ab;
-    border-color: rgba(255, 180, 171, 0.5);
+    color: var(--text-danger-soft, #ffb4ab);
+    border-color: var(--border-danger-soft, rgba(255, 180, 171, 0.5));
   }
   .detail-delete:hover {
-    border-color: #ffb4ab;
+    border-color: var(--text-danger-soft, #ffb4ab);
   }
 </style>

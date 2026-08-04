@@ -301,6 +301,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v26,
         transform: migrate_v26_to_v27_step,
     },
+    MigrationStep {
+        from_version: "v27",
+        detect: looks_v27,
+        transform: migrate_v27_to_v28_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2209,10 +2214,77 @@ fn migrate_v26_to_v27(value: &mut Value) {
         });
     }
 
-    // Final cascade step ⇒ stamp CURRENT (27).
+    // Stamps a *literal* 27 (not `CURRENT_SCHEMA_VERSION`): the v27 → v28
+    // step runs next in the same cascade pass and gates on
+    // `schema_version == 27`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(27u8)),
+    );
+}
+
+fn looks_v27(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 27)
+}
+
+fn migrate_v27_to_v28_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v27_to_v28(value)
+}
+
+/// V27 → V28: collapse the four accent-variant TUI themes into the single
+/// built-in `tui` theme + a user-selectable accent color.
+///
+/// `tui-orange` / `tui-blue` / `tui-green` / `tui-grey` were identical
+/// Gruvbox-surfaced themes differing only in their accent family; they are
+/// replaced by one hardcoded `tui` theme whose accent is the new
+/// `ui.tui_accent` setting. Each legacy id maps to `"tui"` with its old
+/// accent anchor seeded, so every user keeps the look they had. Any other
+/// theme id (nippon-*, user-provided disk themes) is left untouched —
+/// `tui_accent` then simply deserializes to its default via serde.
+///
+/// Idempotent: a second pass finds `schema_version == 28` so `looks_v27` is
+/// false, and `"tui"` itself is not in the legacy map.
+fn migrate_v27_to_v28(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    const LEGACY_TUI_ACCENTS: [(&str, &str); 4] = [
+        ("tui-orange", "#d77757"),
+        ("tui-blue", "#7aa2f7"),
+        ("tui-green", "#98c379"),
+        ("tui-grey", "#c8ccd0"),
+    ];
+
+    if let Some(ui) = root.get_mut("ui").and_then(Value::as_object_mut) {
+        let legacy_accent = ui
+            .get("theme")
+            .and_then(Value::as_str)
+            .and_then(|theme| {
+                LEGACY_TUI_ACCENTS
+                    .iter()
+                    .find(|(id, _)| *id == theme)
+                    .map(|(_, accent)| *accent)
+            });
+        if let Some(accent) = legacy_accent {
+            ui.insert(
+                "theme".to_string(),
+                Value::String(crate::theming::TUI_THEME_ID.to_string()),
+            );
+            ui.insert(
+                "tui_accent".to_string(),
+                Value::String(accent.to_string()),
+            );
+        }
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (28).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(28u8)),
     );
 }
 
@@ -2974,6 +3046,58 @@ mod tests {
         assert_eq!(v["schema_version"], json!(27));
         let once = v.clone();
         migrate_v26_to_v27(&mut v);
+        assert_eq!(v, once);
+    }
+
+    /// Each legacy accent-variant TUI theme collapses to the built-in `tui`
+    /// id with its old accent anchor seeded into `ui.tui_accent`, so users
+    /// keep the look they had.
+    #[test]
+    fn v27_to_v28_maps_legacy_tui_themes_to_accent() {
+        for (legacy, accent) in [
+            ("tui-orange", "#d77757"),
+            ("tui-blue", "#7aa2f7"),
+            ("tui-green", "#98c379"),
+            ("tui-grey", "#c8ccd0"),
+        ] {
+            let mut v = json!({
+                "schema_version": 27,
+                "ui": { "theme": legacy, "tool_activity_tab": true }
+            });
+            migrate_v27_to_v28(&mut v);
+            assert_eq!(v["schema_version"], json!(28), "{legacy}");
+            assert_eq!(v["ui"]["theme"], json!("tui"), "{legacy}");
+            assert_eq!(v["ui"]["tui_accent"], json!(accent), "{legacy}");
+        }
+    }
+
+    /// Non-TUI themes (disk themes like nippon-dark, or unknown custom ids)
+    /// pass through untouched — no theme rewrite, no accent seeded (serde's
+    /// struct default fills `tui_accent` at parse time).
+    #[test]
+    fn v27_to_v28_leaves_other_themes_alone() {
+        let mut v = json!({
+            "schema_version": 27,
+            "ui": { "theme": "nippon-dark", "tool_activity_tab": true }
+        });
+        migrate_v27_to_v28(&mut v);
+        assert_eq!(v["schema_version"], json!(28));
+        assert_eq!(v["ui"]["theme"], json!("nippon-dark"));
+        assert!(v["ui"].get("tui_accent").is_none());
+    }
+
+    /// Running the step twice is a no-op: `"tui"` itself is not a legacy id,
+    /// and the version gate stops re-entry from the cascade.
+    #[test]
+    fn v27_to_v28_is_idempotent_and_stamps_version() {
+        let mut v = json!({
+            "schema_version": 27,
+            "ui": { "theme": "tui-green", "tool_activity_tab": true }
+        });
+        migrate_v27_to_v28(&mut v);
+        assert_eq!(v["schema_version"], json!(28));
+        let once = v.clone();
+        migrate_v27_to_v28(&mut v);
         assert_eq!(v, once);
     }
 

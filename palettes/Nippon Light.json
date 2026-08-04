@@ -1,0 +1,27 @@
+{
+  "name": "Nippon Light",
+  "colors": {
+    "foreground": "#23343c",
+    "background": "#e9f0ed",
+    "cursor": "#314d59",
+    "cursorAccent": "#e9f0ed",
+    "selectionBackground": "#b9cec6",
+    "selectionForeground": "#1b2930",
+    "black": "#23343c",
+    "red": "#a04b3e",
+    "green": "#587c60",
+    "yellow": "#a08430",
+    "blue": "#4d6e80",
+    "magenta": "#8a6480",
+    "cyan": "#47756e",
+    "white": "#ccdcd6",
+    "brightBlack": "#5b7280",
+    "brightRed": "#b8604f",
+    "brightGreen": "#6f9175",
+    "brightYellow": "#bf9d3a",
+    "brightBlue": "#728e9d",
+    "brightMagenta": "#a07d97",
+    "brightCyan": "#5d8f87",
+    "brightWhite": "#f5f9f7"
+  }
+}

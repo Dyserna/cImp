@@ -18,14 +18,22 @@
 //! before it joins the registry, and anything that fails verification is
 //! skipped with a `tracing::warn!` (it never appears in Settings).
 //!
-//! As a last-resort fallback, the embedded theme (`tui-blue`) and embedded
-//! palette (`OpenCode Grey`) are compiled into the binary via `include_str!`
-//! — so even if both folders are missing/empty or every file on disk is
-//! malformed, those two are always present and the app stays usable. They are
-//! also the defaults new installs land on, so the fallback matches the normal
-//! look. A valid on-disk copy of the same id/name overrides its embedded
-//! namesake, so the embed is invisible whenever the files are present (the
-//! normal case).
+//! The `tui` theme is different: it is *built in*, not just a fallback. Its
+//! CSS is compiled into the binary (`tui_theme.css`, `include_str!`) and its
+//! metadata lives in code, so it is always present and always wins over any
+//! on-disk folder that tries to claim the `tui` id. Its accent color is not
+//! baked into the CSS — the frontend injects the user-picked `ui.tui_accent`
+//! setting as the `--tui-accent` CSS variable and the theme derives the whole
+//! accent family from it. The on-disk `themes/` folder remains the extension
+//! point for every other theme (nippon-dark/-light ship there today; retired
+//! or future themes can be dropped in).
+//!
+//! The embedded palette (`OpenCode Grey`) is a last-resort fallback: even if
+//! the palettes folder is missing/empty or every file on disk is malformed,
+//! it is always present and the app stays usable. It is also the default new
+//! installs land on. A valid on-disk palette of the same name overrides the
+//! embedded copy, so the embed is invisible whenever the file is present
+//! (the normal case).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -197,38 +205,34 @@ fn build_palette(json: &str) -> Result<PaletteWire, String> {
     })
 }
 
-// ---- embedded fallback ---------------------------------------------------
+// ---- built-in theme + embedded palette -----------------------------------
 //
-// Only one theme/palette is embedded as a last-resort fallback — `tui-blue`
-// and `OpenCode Grey`. These are also the defaults new installs land on, so the
-// fallback matches the normal look. Compiled in from the same repo-root source
-// files that ship in the release, so the embed can never drift from the
-// on-disk copy.
+// The `tui` theme is hardcoded: CSS compiled in via `include_str!`, metadata
+// in code. It is always in the registry and always wins over a same-id disk
+// folder — the default look can never be broken or shadowed by disk state.
+// `OpenCode Grey` is embedded as a last-resort palette fallback and is the
+// default new installs land on.
 
-const EMBEDDED_THEME_ID: &str = "tui-blue";
-const EMBEDDED_THEME_JSON: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../themes/tui-blue/theme.json"
-));
-const EMBEDDED_THEME_CSS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../themes/tui-blue/theme.css"
-));
+/// Id of the built-in, always-available TUI theme.
+pub const TUI_THEME_ID: &str = "tui";
+
+const TUI_THEME_CSS: &str = include_str!("tui_theme.css");
 
 const EMBEDDED_PALETTE_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../palettes/OpenCode Grey.json"
 ));
 
-/// The compiled-in `tui-blue` theme. `None` only if the embedded source
-/// somehow fails verification, which a unit test guards against.
-fn embedded_theme() -> Option<ThemeWire> {
-    match build_theme(EMBEDDED_THEME_ID, EMBEDDED_THEME_JSON, EMBEDDED_THEME_CSS) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            tracing::error!(error = %e, "theming: embedded tui-blue failed verification");
-            None
-        }
+/// The compiled-in `tui` theme. Metadata mirrors what a theme.json would
+/// say: custom title bar (no OS decorations), paired with the OpenCode Grey
+/// terminal palette (the embedded + default palette).
+fn builtin_tui_theme() -> ThemeWire {
+    ThemeWire {
+        id: TUI_THEME_ID.to_string(),
+        name: "TUI".to_string(),
+        decorations: false,
+        palette: "OpenCode Grey".to_string(),
+        css: TUI_THEME_CSS.to_string(),
     }
 }
 
@@ -245,14 +249,12 @@ fn embedded_palette() -> Option<PaletteWire> {
 
 // ---- load ----------------------------------------------------------------
 
-/// Discover + verify every theme under `<exe-dir>/themes`, with the embedded
-/// `tui-orange` as a base so the list is never empty. A valid on-disk theme
-/// with the same id overrides the embedded copy. Sorted by id.
+/// Discover + verify every theme under `<exe-dir>/themes`, plus the built-in
+/// `tui` theme — inserted last so it always exists and a disk folder can
+/// never override it (it's hardcoded by design; see the module docs).
+/// Sorted by id.
 fn load_themes() -> Vec<ThemeWire> {
     let mut map: BTreeMap<String, ThemeWire> = BTreeMap::new();
-    if let Some(t) = embedded_theme() {
-        map.insert(t.id.clone(), t);
-    }
 
     if let Some(dir) = themes_dir() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -265,6 +267,22 @@ fn load_themes() -> Vec<ThemeWire> {
                     tracing::warn!(path = %path.display(), "theming: non-UTF-8 theme folder name; skipped");
                     continue;
                 };
+                // Hidden/service folders (e.g. a stray `.cimp/` graph dir from
+                // a tool run rooted at themes/) are never themes — skip them
+                // silently rather than warning about a missing theme.json.
+                if folder_id.starts_with('.') {
+                    continue;
+                }
+                // The `tui` id belongs to the built-in theme, which is
+                // hardcoded and non-overridable; a disk folder claiming it
+                // is ignored loudly.
+                if folder_id == TUI_THEME_ID {
+                    tracing::warn!(
+                        theme = folder_id,
+                        "theming: the `tui` theme is built in and cannot be overridden; folder skipped"
+                    );
+                    continue;
+                }
                 let json = std::fs::read_to_string(path.join("theme.json"));
                 let css = std::fs::read_to_string(path.join("theme.css"));
                 let (Ok(json), Ok(css)) = (json, css) else {
@@ -285,6 +303,10 @@ fn load_themes() -> Vec<ThemeWire> {
             }
         }
     }
+
+    // Built-in theme goes in last: always present, never overridden.
+    let tui = builtin_tui_theme();
+    map.insert(tui.id.clone(), tui);
 
     map.into_values().collect()
 }
@@ -395,13 +417,19 @@ mod tests {
                 continue;
             }
             let id = path.file_name().unwrap().to_str().unwrap().to_string();
+            // Same rule as load_themes: hidden/service folders are not themes.
+            if id.starts_with('.') {
+                continue;
+            }
             let json = std::fs::read_to_string(path.join("theme.json")).expect("theme.json");
             let css = std::fs::read_to_string(path.join("theme.css")).expect("theme.css");
             build_theme(&id, &json, &css)
                 .unwrap_or_else(|e| panic!("shipped theme {id} invalid: {e}"));
             count += 1;
         }
-        assert_eq!(count, 4, "expected 4 shipped themes");
+        // The TUI theme is built into the binary now; only the nippon pair
+        // ships as folders.
+        assert_eq!(count, 2, "expected 2 shipped themes");
     }
 
     #[test]
@@ -418,18 +446,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("shipped palette {:?} invalid: {e}", path));
             count += 1;
         }
-        assert_eq!(count, 13, "expected 13 shipped palettes");
+        assert_eq!(count, 15, "expected 15 shipped palettes");
     }
 
     #[test]
-    fn load_falls_back_to_embedded_when_disk_empty() {
+    fn load_always_includes_builtin_when_disk_empty() {
         // The test binary runs from target/debug/deps/, which has no themes/ or
         // palettes/ folder next to it (build.rs stages those in target/debug/,
         // one level up) — so this exercises the real "nothing on disk" path.
-        // The embedded defaults must still be present.
+        // The built-in theme and embedded palette must still be present.
         assert!(
-            load_themes().iter().any(|t| t.id == EMBEDDED_THEME_ID),
-            "load_themes must include the embedded tui-blue fallback"
+            load_themes().iter().any(|t| t.id == TUI_THEME_ID),
+            "load_themes must include the built-in tui theme"
         );
         assert!(
             load_palettes().iter().any(|p| p.name == "OpenCode Grey"),
@@ -438,30 +466,24 @@ mod tests {
     }
 
     #[test]
-    fn embedded_fallbacks_verify() {
-        // The compiled-in last-resort fallbacks must always be valid and be the
-        // two documented defaults (also the new-install defaults).
-        let theme = embedded_theme().expect("embedded tui-blue verifies");
-        assert_eq!(theme.id, EMBEDDED_THEME_ID);
-        assert!(!theme.decorations);
-        assert_eq!(theme.palette, "OpenCode Grey");
+    fn builtin_theme_and_embedded_palette_verify() {
+        // The built-in theme must satisfy the same contract build_theme
+        // enforces for disk themes: valid id, matching CSS selector,
+        // non-empty name/palette/css — plus the documented metadata (custom
+        // title bar, paired with the default OpenCode Grey palette).
+        let t = builtin_tui_theme();
+        assert!(valid_id(&t.id));
+        assert!(t.css.contains("[data-theme=\"tui\"]"));
+        assert!(!t.decorations);
+        assert_eq!(t.palette, "OpenCode Grey");
+        // The accent family must key off the injected user accent — the
+        // whole point of the single built-in theme.
+        assert!(t.css.contains("--tui-accent"));
+        assert!(t.css.contains("--tui-text-on-accent"));
 
         let palette = embedded_palette().expect("embedded OpenCode Grey verifies");
         assert_eq!(palette.name, "OpenCode Grey");
         assert_eq!(palette.colors.len(), REQUIRED_PALETTE_KEYS.len());
-    }
-
-    #[test]
-    fn embedded_tui_blue_theme_pairs_with_opencode_grey() {
-        // The embedded `tui-blue` fallback theme — also the default new-install
-        // theme — must exist on disk, hide the OS chrome, and pair with the
-        // OpenCode Grey palette (the embedded + default terminal palette).
-        let dir = repo_themes().join("tui-blue");
-        let json = std::fs::read_to_string(dir.join("theme.json")).expect("tui-blue theme.json");
-        let css = std::fs::read_to_string(dir.join("theme.css")).expect("tui-blue theme.css");
-        let t = build_theme("tui-blue", &json, &css).expect("tui-blue valid");
-        assert!(!t.decorations);
-        assert_eq!(t.palette, "OpenCode Grey");
     }
 
     #[test]

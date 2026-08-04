@@ -19,7 +19,8 @@ const STATE_FILES: Record<AvatarState, string> = {
 };
 
 /// Themes that ship a bundled avatar set under `avatars/<theme>/`.
-/// Unknown values (custom themes, typos, legacy strings) fall back to
+/// Unknown values (custom themes, typos, legacy strings — including the
+/// built-in `tui` theme, which has no avatar set of its own) fall back to
 /// `tui-orange`, the default avatar set, so the overlay never breaks.
 /// Per the theme isolation policy in `src/theme.css`, every theme owns
 /// its own avatar folder — derivative themes get a copy of the source

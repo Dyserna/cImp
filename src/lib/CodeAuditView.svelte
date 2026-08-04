@@ -56,7 +56,7 @@
     display: flex;
     flex-direction: column;
     font-size: 13px;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
   }
   /* Title above the section row — the Workbench / Code Intelligence header
      layout. The 16px side padding lives on the header/nav (not the
@@ -80,14 +80,14 @@
     flex-wrap: wrap;
     margin: 0 16px;
     padding-bottom: 8px;
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
   }
   .seg {
     padding: 4px 12px;
     border-radius: 6px;
     border: 1px solid transparent;
     background: transparent;
-    color: var(--text, #ddd);
+    color: var(--text-primary, #ddd);
     font-size: 12px;
     cursor: pointer;
     opacity: 0.7;
@@ -98,7 +98,7 @@
   }
   .seg.active {
     background: var(--accent, #3b6ea5);
-    color: #fff;
+    color: var(--accent-fg, #fff);
     opacity: 1;
     border-color: var(--accent, #3b6ea5);
   }

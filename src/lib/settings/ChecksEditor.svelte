@@ -668,7 +668,7 @@
     padding: var(--space-3);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
-    background: var(--surface-2);
+    background: var(--surface-card, var(--surface-2));
   }
   .card-head {
     display: flex;

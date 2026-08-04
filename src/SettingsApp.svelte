@@ -103,6 +103,7 @@
   import type { AuditCensus } from './lib/codeAudit/types';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
+  import { TUI_THEME_ID, TUI_ACCENT_PRESETS, normalizeTuiAccent } from './lib/themes/accent';
   import type { ThemeColorsWire } from './lib/settings/types';
 
   // Whether the active theme uses the OS-native chrome — drives the custom
@@ -2213,6 +2214,44 @@
               {/each}
             </select>
           </label>
+
+          {#if snapshot.ui.theme === TUI_THEME_ID}
+            <!-- Accent picker — TUI-only: the built-in theme derives its whole
+                 accent family from this one color; disk themes carry their own
+                 fixed accents, so the control hides for them. -->
+            <div class="accent-row">
+              <span>Accent color</span>
+              <div class="accent-controls">
+                {#each TUI_ACCENT_PRESETS as p}
+                  <button
+                    type="button"
+                    class="icon accent-swatch"
+                    class:selected={normalizeTuiAccent(snapshot.ui.tui_accent) === p.color}
+                    style:background={p.color}
+                    title={p.name}
+                    aria-label={`Accent: ${p.name}`}
+                    onclick={() => patch((s) => (s.ui.tui_accent = p.color))}
+                  ></button>
+                {/each}
+                <input
+                  type="color"
+                  aria-label="Custom accent color"
+                  value={normalizeTuiAccent(snapshot.ui.tui_accent)}
+                  oninput={(e) => {
+                    const color = (e.currentTarget as HTMLInputElement).value;
+                    patch((s) => (s.ui.tui_accent = color));
+                  }}
+                />
+              </div>
+            </div>
+            <!-- `top`: this hint follows the swatch row, not a label — the
+                 default hint's -8px pull-up would drag it into the swatches. -->
+            <small class="hint top">
+              Tints buttons, borders, tabs, and the waveform. Presets match
+              the four classic TUI accents; the swatch on the right picks
+              anything.
+            </small>
+          {/if}
 
           <h3>Terminal palette</h3>
           <small class="hint top">
@@ -6023,7 +6062,7 @@
   }
   .pricing-head-row {
     font-size: var(--font-size-sm);
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
     margin-top: 0.8rem;
   }
   .pricing-head-row .num,
@@ -6085,7 +6124,7 @@
     color: var(--accent, #6abf69);
   }
   .policy-status .unguarded {
-    color: var(--text-subtle, #999);
+    color: var(--text-quiet, #999);
   }
   .policy-card {
     border: 1px solid var(--border-subtle);
@@ -6158,7 +6197,7 @@
     padding-left: 0.5rem;
   }
   button.danger {
-    color: #d06b6b;
+    color: var(--text-danger-soft, #d06b6b);
   }
   .badge {
     font-size: var(--font-size-sm);
@@ -6167,8 +6206,8 @@
     border: 1px solid var(--border-subtle);
   }
   .badge.warn {
-    color: #d08770;
-    border-color: #d08770;
+    color: var(--text-warning, #d08770);
+    border-color: var(--border-warning, #d08770);
   }
   /* Multiline, word-wrapping Server command field so every argument of a long
      llama-server invocation stays visible without horizontal scrolling. */
@@ -6474,7 +6513,7 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3) 0;
-    border-top: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+    border-top: 1px solid var(--border-default, rgba(128, 128, 128, 0.25));
   }
   .audit-tool .audit-name {
     font-weight: 600;
@@ -6692,6 +6731,38 @@
   }
   .palette-row > span:first-child {
     grid-column: 1 / -1;
+  }
+  .accent-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+  .accent-controls {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+  }
+  /* Preset swatches are icon-class buttons (no TUI bracket framing) painted
+     in their accent color; the active one gets a bordered frame. */
+  .accent-swatch {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--border-default);
+    cursor: pointer;
+  }
+  .accent-swatch.selected {
+    outline: 1px solid var(--text-bright);
+    outline-offset: 1px;
+  }
+  .accent-controls input[type='color'] {
+    width: 44px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--border-default);
+    background: transparent;
+    cursor: pointer;
   }
   .claude-tabs-radio {
     border: 1px solid var(--border-subtle);

@@ -25,6 +25,11 @@ import {
   costGrandTotal,
   originShareLine,
   FREE_RATES,
+  originKindTotals,
+  kindsTotal,
+  donutArcs,
+  arcPath,
+  fmtPct,
   type PriceRates,
   type CostOverride,
 } from './usageMath';
@@ -503,5 +508,159 @@ describe('fmtUsd', () => {
 
   test('non-finite guards to $0.00', () => {
     expect(fmtUsd(Number.NaN)).toBe('$0.00');
+  });
+});
+
+// ── V28: Overview dashboard donuts ─────────────────────────────────────
+
+describe('originKindTotals', () => {
+  const t = (
+    origin: 'session' | 'agent',
+    over: Partial<{ in_tok: number; cache_read: number; cache_make: number; out_tok: number }> = {},
+  ) => ({ in_tok: 0, cache_read: 0, cache_make: 0, out_tok: 0, ...over, origin });
+
+  test('splits kind sums by origin', () => {
+    const out = originKindTotals([
+      t('session', { in_tok: 10, cache_read: 100, cache_make: 5, out_tok: 20 }),
+      t('agent', { in_tok: 1, cache_read: 50, out_tok: 2 }),
+      t('session', { in_tok: 3, out_tok: 4 }),
+    ]);
+    expect(out.session).toEqual({ in_tok: 13, out_tok: 24, cache_read: 100, cache_make: 5 });
+    expect(out.agent).toEqual({ in_tok: 1, out_tok: 2, cache_read: 50, cache_make: 0 });
+  });
+
+  test('empty turn series yields all-zero origins', () => {
+    const out = originKindTotals([]);
+    expect(kindsTotal(out.session)).toBe(0);
+    expect(kindsTotal(out.agent)).toBe(0);
+  });
+});
+
+describe('kindsTotal', () => {
+  test('sums the four exact kinds (no tool estimate)', () => {
+    expect(kindsTotal({ in_tok: 1, out_tok: 2, cache_read: 3, cache_make: 4 })).toBe(10);
+  });
+});
+
+describe('donutArcs', () => {
+  const TAU = 2 * Math.PI;
+
+  test('spans are proportional and boundaries sit at cumulative shares', () => {
+    const arcs = donutArcs(
+      [
+        { key: 'a', value: 3 },
+        { key: 'b', value: 1 },
+      ],
+      0.04,
+    );
+    expect(arcs).toHaveLength(2);
+    expect(arcs[0].share).toBeCloseTo(0.75);
+    expect(arcs[1].share).toBeCloseTo(0.25);
+    // Drawn angles are the cumulative boundaries inset by gap/2 each side.
+    expect(arcs[0].a0).toBeCloseTo(0.02);
+    expect(arcs[0].a1).toBeCloseTo(0.75 * TAU - 0.02);
+    expect(arcs[1].a0).toBeCloseTo(0.75 * TAU + 0.02);
+    expect(arcs[1].a1).toBeCloseTo(TAU - 0.02);
+  });
+
+  test('zero and negative values are dropped, shares stay of the kept total', () => {
+    const arcs = donutArcs(
+      [
+        { key: 'a', value: 0 },
+        { key: 'b', value: 2 },
+        { key: 'c', value: -5 },
+        { key: 'd', value: 2 },
+      ],
+      0,
+    );
+    expect(arcs.map((a) => a.key)).toEqual(['b', 'd']);
+    expect(arcs[0].share).toBeCloseTo(0.5);
+  });
+
+  test('a single nonzero value takes the full circle with no gap', () => {
+    const arcs = donutArcs([{ key: 'only', value: 7 }], 0.1);
+    expect(arcs).toHaveLength(1);
+    expect(arcs[0].a0).toBe(0);
+    expect(arcs[0].a1).toBeCloseTo(TAU);
+  });
+
+  test('all-zero input yields no arcs (placeholder, never a fabricated ring)', () => {
+    expect(donutArcs([{ key: 'a', value: 0 }], 0.04)).toEqual([]);
+    expect(donutArcs([], 0.04)).toEqual([]);
+  });
+
+  test('a sliver keeps ≥40% of its span (gap clamp never inverts it)', () => {
+    const arcs = donutArcs(
+      [
+        { key: 'big', value: 999 },
+        { key: 'tiny', value: 1 },
+      ],
+      0.1,
+    );
+    const tiny = arcs[1];
+    const span = (1 / 1000) * TAU;
+    expect(tiny.a1).toBeGreaterThan(tiny.a0);
+    expect(tiny.a1 - tiny.a0).toBeCloseTo(span * 0.4);
+  });
+
+  test('non-finite values are dropped, not propagated into angles', () => {
+    const arcs = donutArcs(
+      [
+        { key: 'a', value: Number.NaN },
+        { key: 'b', value: 4 },
+      ],
+      0,
+    );
+    expect(arcs.map((a) => a.key)).toEqual(['b']);
+    expect(arcs[0].a1).toBeCloseTo(TAU);
+  });
+});
+
+describe('arcPath', () => {
+  test('a quarter arc starts at 12 o\'clock and ends at 3 o\'clock', () => {
+    const d = arcPath(0, 0, 10, 5, 0, Math.PI / 2);
+    // Start point: top of the outer radius (0, -10); the L lands on the
+    // inner radius at 3 o'clock (5, 0).
+    expect(d.startsWith('M 0.000 -10.000 ')).toBe(true);
+    expect(d).toContain('L 5.000 0.000');
+    expect(d.endsWith('Z')).toBe(true);
+    // Minor arc → large-arc flag 0, outer sweep clockwise (1).
+    expect(d).toContain('A 10 10 0 0 1');
+    expect(d).toContain('A 5 5 0 0 0');
+  });
+
+  test('a span past half the circle sets the large-arc flag', () => {
+    const d = arcPath(0, 0, 10, 5, 0, 1.5 * Math.PI);
+    expect(d).toContain('A 10 10 0 1 1');
+  });
+
+  test('a full circle renders as a two-subpath ring, not a degenerate arc', () => {
+    const d = arcPath(66, 66, 62, 46, 0, 2 * Math.PI);
+    // Two closed subpaths (outer + inner), four arc commands total.
+    expect(d.match(/Z/g)).toHaveLength(2);
+    expect(d.match(/A /g)).toHaveLength(4);
+  });
+
+  test('zero or negative span renders nothing', () => {
+    expect(arcPath(0, 0, 10, 5, 1, 1)).toBe('');
+    expect(arcPath(0, 0, 10, 5, 1, 0.5)).toBe('');
+  });
+});
+
+describe('fmtPct', () => {
+  test('whole percents in the middle of the range', () => {
+    expect(fmtPct(0.5)).toBe('50%');
+    expect(fmtPct(0.334)).toBe('33%');
+  });
+
+  test('honest edges: slivers and near-totals never round to 0%/100%', () => {
+    expect(fmtPct(0.004)).toBe('<1%');
+    expect(fmtPct(0.996)).toBe('>99%');
+    expect(fmtPct(0)).toBe('0%');
+    expect(fmtPct(1)).toBe('100%');
+  });
+
+  test('non-finite guards to 0%', () => {
+    expect(fmtPct(Number.NaN)).toBe('0%');
   });
 });

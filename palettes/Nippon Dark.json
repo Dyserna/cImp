@@ -1,0 +1,27 @@
+{
+  "name": "Nippon Dark",
+  "colors": {
+    "foreground": "#ccdcd6",
+    "background": "#16242b",
+    "cursor": "#ecd778",
+    "cursorAccent": "#16242b",
+    "selectionBackground": "#2c4652",
+    "selectionForeground": "#e7efec",
+    "black": "#1c2e37",
+    "red": "#c07a68",
+    "green": "#8aa78f",
+    "yellow": "#ecd778",
+    "blue": "#728e9d",
+    "magenta": "#a98ba0",
+    "cyan": "#7fa8a0",
+    "white": "#ccdcd6",
+    "brightBlack": "#4a626d",
+    "brightRed": "#d99a88",
+    "brightGreen": "#a3c2a8",
+    "brightYellow": "#f4e6a3",
+    "brightBlue": "#9ab4c2",
+    "brightMagenta": "#c4a8bb",
+    "brightCyan": "#9cc4bd",
+    "brightWhite": "#e7efec"
+  }
+}

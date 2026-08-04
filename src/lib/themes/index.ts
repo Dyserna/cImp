@@ -9,9 +9,9 @@
 // so the resolver returns a complete xterm.js `ITheme` *synchronously* — before
 // the backend registry has loaded, and after any IPC failure: `Default` (the
 // merge base for "Custom" palettes; its fg/bg preserves the pre-V1.4 hardcoded
-// look), `OpenCode Grey` (the default terminal palette, paired with the default
-// tui-blue theme and embedded as the backend fallback), `GitHub Dark`, and
-// `Tomorrow Night`.
+// look), `OpenCode Grey` (the default terminal palette, paired with the
+// built-in `tui` theme and embedded as the backend fallback), `GitHub Dark`,
+// and `Tomorrow Night`.
 
 import type { ITheme } from '@xterm/xterm';
 

@@ -85,7 +85,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 27;
+pub const CURRENT_SCHEMA_VERSION: u8 = 28;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -3437,21 +3437,27 @@ impl Default for StatuslineSettings {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Active UI chrome theme. Four values currently ship, all ratatui-style
-    /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
-    /// Claude Code's accent orange, #d77757), `"tui-blue"` and `"tui-green"`
-    /// (the same Gruvbox layout with blue #7aa2f7 / green #98c379 accents),
-    /// and `"tui-grey"` (the OpenCode Grey palette + OpenCode's cool
-    /// light-grey accent, #c8ccd0). New installs land
-    /// on `"tui-blue"` (paired with the OpenCode Grey terminal palette via
-    /// its theme.json). The
-    /// avatar still defaults to the animated `impSprites` mascot independently
-    /// (see [`AvatarKind`] / [`SpriteSettings`]).
-    /// The pre-V1.13 `"tui"` value is rewritten to `"tui-orange"` by the
-    /// v12 → v13 migration so existing users keep a Gruvbox look. Existing
-    /// settings.json files otherwise keep whatever value they were
-    /// persisted with.
+    /// Active UI chrome theme. `"tui"` is the built-in ratatui-style theme
+    /// (custom title bar, square borders, Gruvbox surfaces) — hardcoded in
+    /// the binary and always available; its accent color comes from
+    /// `tui_accent` below. Any other value refers to an on-disk theme under
+    /// `<exe-dir>/themes/` (`"nippon-dark"` / `"nippon-light"` ship today).
+    /// New installs land on `"tui"` (paired with the OpenCode Grey terminal
+    /// palette). The avatar still defaults to the animated `impSprites`
+    /// mascot independently (see [`AvatarKind`] / [`SpriteSettings`]).
+    ///
+    /// History: the pre-V1.13 `"tui"` value was rewritten to `"tui-orange"`
+    /// by the v12 → v13 migration when the four accent-variant tui themes
+    /// shipped; the v27 → v28 migration collapses those four back into the
+    /// single `"tui"` id, seeding `tui_accent` with each variant's old
+    /// accent so users keep their look.
     pub theme: String,
+    /// Accent color of the built-in `"tui"` theme, as a `#rrggbb` hex
+    /// string. Injected by the frontend as the `--tui-accent` CSS variable;
+    /// the theme derives its whole accent family (hover/bright/soft/muted)
+    /// from it. Ignored by on-disk themes — the picker only shows for
+    /// `"tui"`. Invalid values fall back to the default blue frontend-side.
+    pub tui_accent: String,
     /// Arrangement of the bottom status bar's movable left cluster. See
     /// [`StatusBarLayout`]. Added after the `theme` field; old files
     /// lacking the key deserialize to the default `[usage, system_stats]`
@@ -3467,12 +3473,18 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: "tui-blue".to_string(),
+            theme: crate::theming::TUI_THEME_ID.to_string(),
+            tui_accent: DEFAULT_TUI_ACCENT.to_string(),
             status_bar: StatusBarLayout::default(),
             tool_activity_tab: true,
         }
     }
 }
+
+/// Default accent for the built-in `tui` theme — the blue the pre-v28
+/// `tui-blue` default theme used, so new installs keep the familiar look.
+/// Mirrors `DEFAULT_TUI_ACCENT` in `src/lib/themes/accent.ts`.
+pub const DEFAULT_TUI_ACCENT: &str = "#7aa2f7";
 
 /// A display panel in the status bar's movable left cluster: `usage` =
 /// Claude session meter, `system_stats` = CPU/GPU/network panel.
@@ -3560,7 +3572,7 @@ pub struct TerminalThemeSettings {
 impl Default for TerminalThemeSettings {
     fn default() -> Self {
         Self {
-            // Paired with the default `tui-blue` UI theme (whose theme.json
+            // Paired with the default built-in `tui` UI theme (whose metadata
             // points at the OpenCode Grey palette). The frontend's theme picker
             // re-pairs this when the user switches UI theme.
             name: "OpenCode Grey".to_string(),

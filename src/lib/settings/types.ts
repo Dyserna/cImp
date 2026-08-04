@@ -366,15 +366,21 @@ export interface ProcessingSettings {
 }
 
 export interface UiSettings {
-  /// Active UI chrome theme. The shipped values are all ratatui-style
-  /// (custom title bar, square borders): `"tui-orange"` (Gruvbox surfaces +
-  /// Claude Code's accent orange), `"tui-blue"`, `"tui-green"`, and
-  /// `"tui-grey"` (OpenCode Grey palette + OpenCode's cool light-grey
-  /// accent). New installs default to `"tui-blue"` (paired with the OpenCode
-  /// Grey terminal palette); the avatar still defaults to the animated
+  /// Active UI chrome theme. `"tui"` is the built-in ratatui-style theme
+  /// (custom title bar, square borders, Gruvbox surfaces) — hardcoded in
+  /// the backend binary and always available; its accent comes from
+  /// `tui_accent` below. Any other value refers to an on-disk theme under
+  /// `<exe-dir>/themes/` (`"nippon-dark"` / `"nippon-light"` ship today).
+  /// New installs default to `"tui"` (paired with the OpenCode Grey
+  /// terminal palette); the avatar still defaults to the animated
   /// `impSprites` mascot independently. Distinct from `terminal.theme`,
   /// which governs the xterm.js terminal palette inside each tab.
   theme: string;
+  /// Accent color of the built-in `"tui"` theme (`#rrggbb`). Injected as
+  /// the `--tui-accent` CSS variable (see lib/themes/accent.ts); the theme
+  /// CSS derives the whole accent family from it. Only meaningful — and
+  /// only editable in Settings — while the `"tui"` theme is active.
+  tui_accent: string;
   /// Arrangement of the bottom status bar's movable left cluster.
   status_bar: StatusBarLayout;
   /// Show the reserved Tool Activity tab (unified graph-call + offload
@@ -1516,7 +1522,8 @@ export function defaultSettings(): Settings {
     layout: null,
     layout_presets: [],
     ui: {
-      theme: 'tui-blue',
+      theme: 'tui',
+      tui_accent: '#7aa2f7',
       status_bar: {
         items: [
           { component: 'usage', gap: 0 },
@@ -1526,8 +1533,8 @@ export function defaultSettings(): Settings {
       tool_activity_tab: true,
     },
     // Default terminal palette is paired with the default UI theme
-    // (tui-blue → OpenCode Grey); the pairing comes from each theme's
-    // `palette` metadata (theme.json), applied by SettingsApp on theme switch.
+    // (tui → OpenCode Grey); the pairing comes from each theme's
+    // `palette` metadata, applied by SettingsApp on theme switch.
     terminal: {
       theme: { name: 'OpenCode Grey', custom: null },
       background: {

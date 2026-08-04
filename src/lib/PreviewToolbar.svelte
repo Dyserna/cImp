@@ -290,12 +290,12 @@
     gap: 0.375rem;
     padding: 0.375rem 0.5rem;
     background: var(--surface-1, #1a1a1a);
-    border-bottom: 1px solid var(--border, #333);
+    border-bottom: 1px solid var(--border-subtle, #333);
     flex: 0 0 auto;
   }
   .tb-btn {
     background: transparent;
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     border-radius: 4px;
     color: inherit;
     padding: 0.25rem 0.5rem;
@@ -318,7 +318,7 @@
     flex: 1 1 auto;
     min-width: 6rem;
     background: var(--surface-0, #111);
-    border: 1px solid var(--border, #444);
+    border: 1px solid var(--border-default, #444);
     border-radius: 4px;
     color: inherit;
     padding: 0.25rem 0.5rem;

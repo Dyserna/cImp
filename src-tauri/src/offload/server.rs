@@ -286,8 +286,10 @@ impl LlamaServer {
 
     /// Build a Local backend with an explicit name/tier/tool-scope (one
     /// pool entry). Parses the command (host/port/`-np`/`--jinja`) and
-    /// warns if `--jinja` is absent. Does not contact the server — call
-    /// [`Self::poll_until_ready`] after the tab's PTY has been spawned.
+    /// logs a note if `--jinja` is absent (informational only — recent
+    /// llama.cpp builds enable it by default). Does not contact the
+    /// server — call [`Self::poll_until_ready`] after the tab's PTY has
+    /// been spawned.
     pub fn with_config(
         name: &str,
         command: &str,
@@ -296,10 +298,11 @@ impl LlamaServer {
     ) -> AppResult<Self> {
         let cmd = ServerCommand::parse(command)?;
         if !cmd.has_jinja {
-            warn!(
+            debug!(
                 backend = name,
-                "offload: server_command is missing `--jinja`; llama-server tool-calling \
-                 will not work without it"
+                "offload: server_command has no explicit `--jinja`; recent llama.cpp builds \
+                 enable it by default, so this only matters on older builds — if tool-calling \
+                 doesn't work, add `--jinja` explicitly"
             );
         }
         let client = reqwest::Client::builder()

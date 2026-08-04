@@ -190,3 +190,74 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::capture_to_png;
+
+/// Lock-resolution tripwire for this module's load-bearing dependency pin
+/// (2026-08-04 maintenance run, batch B-2).
+///
+/// `capture_to_png` casts the `ICoreWebView2Controller` that **wry** hands
+/// back through `PlatformWebview::controller()` against **this** crate's own
+/// `webview2-com` types. That only works while both resolve to the same
+/// semver-compatible `webview2-com`, and the same holds for the `windows`
+/// crate shared between `webview2-com` and our direct `SHCreateStreamOnFileW`
+/// call. Cargo.lock is the only place that contract is actually settled — the
+/// manifests just say `"0.38"` / `"0.61"`.
+///
+/// A drift usually surfaces as a confusing type-mismatch error deep in this
+/// module (or, worse, a second `webview2-com` silently in the tree); this
+/// test names the cause instead. If a Tauri/wry bump legitimately moves these
+/// series, update the constants here **and** the pin rationale in
+/// `Cargo.toml` in the same change.
+#[cfg(test)]
+mod lock_pins {
+    /// Semver-compatible series (not exact patch): patch bumps are
+    /// type-identical, so pinning the patch would fail spuriously.
+    const WEBVIEW2_COM_SERIES: &str = "0.38.";
+    const WINDOWS_SERIES: &str = "0.61.";
+
+    /// Every `version` resolved for `pkg` in Cargo.lock, in file order.
+    fn resolved_versions(lock: &str, pkg: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current: Option<&str> = None;
+        for line in lock.lines() {
+            if let Some(rest) = line.strip_prefix("name = \"") {
+                current = rest.strip_suffix('"');
+            } else if let Some(rest) = line.strip_prefix("version = \"") {
+                if current == Some(pkg) {
+                    if let Some(v) = rest.strip_suffix('"') {
+                        out.push(v.to_string());
+                    }
+                }
+                current = None;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn webview2_com_and_windows_stay_on_the_pinned_series() {
+        let lock = include_str!("../../Cargo.lock");
+
+        let webview2 = resolved_versions(lock, "webview2-com");
+        assert_eq!(
+            webview2.len(),
+            1,
+            "expected exactly one webview2-com in Cargo.lock (two would make \
+             wry's ICoreWebView2Controller a different nominal type than \
+             preview::capture's), found {webview2:?}"
+        );
+        assert!(
+            webview2[0].starts_with(WEBVIEW2_COM_SERIES),
+            "webview2-com resolved to {} but preview::capture is written \
+             against {WEBVIEW2_COM_SERIES}x",
+            webview2[0]
+        );
+
+        let windows = resolved_versions(lock, "windows");
+        assert!(
+            windows.iter().any(|v| v.starts_with(WINDOWS_SERIES)),
+            "no windows {WINDOWS_SERIES}x in Cargo.lock — preview::capture \
+             shares IStream/PCWSTR with webview2-com {WEBVIEW2_COM_SERIES}x, \
+             which depends on that series; found {windows:?}"
+        );
+    }
+}

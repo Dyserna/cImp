@@ -1145,6 +1145,10 @@
 
   // Open/collapsed state of the Overview usage cards — native <details>
   // elements, so a remount would otherwise snap them back to collapsed.
+  // Effectiveness was an always-open <section> until V28 — open stays the
+  // default so the counters remain the at-a-glance readout they were.
+  let effCardOpen = $state(loadCardOpen('code-intelligence', 'usage-effectiveness', true));
+  $effect(() => saveCardOpen('code-intelligence', 'usage-effectiveness', effCardOpen));
   let sessionCardOpen = $state(loadCardOpen('code-intelligence', 'usage-this-session'));
   let advisorCardOpen = $state(loadCardOpen('code-intelligence', 'usage-advisor'));
   let sessionsCardOpen = $state(loadCardOpen('code-intelligence', 'usage-sessions'));
@@ -1462,8 +1466,8 @@
     </details>
 
     <!-- Effectiveness: measured counters, never fabricated savings. -->
-    <section class="card">
-      <div class="history-head">Effectiveness</div>
+    <details class="card" bind:open={effCardOpen}>
+      <summary class="history-head">Effectiveness</summary>
       {#if usage}
         <div class="eff-counters">
           <div>
@@ -1507,7 +1511,7 @@
           </div>
         </div>
       {/if}
-    </section>
+    </details>
 
     <!-- This session: per-turn stacked bars + top consumers. The segment
          colors flow from settings (via the legend's color pickers) into CSS

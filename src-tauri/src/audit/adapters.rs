@@ -696,6 +696,65 @@ mod tests {
         }
     }
 
+    /// **D-4 tripwire (maintenance run 2026-08-04) — the advisory-database
+    /// source must not silently disappear.**
+    ///
+    /// V23 dropped `cargo-audit` on purpose ("redundant — RustSec exports to
+    /// OSV in real time"), leaving `osv-scanner` as the registry's *only* tool
+    /// that queries a vulnerability database. That substitution is only safe
+    /// because osv.dev is a strict superset of RustSec: it also ingests GitHub
+    /// advisories. The superset is load-bearing, not incidental —
+    /// CVE-2026-42184 (tauri ≤ 2.11.0, origin confusion → local IPC) is absent
+    /// from RustSec but present in osv.dev's `crates.io` ecosystem as
+    /// GHSA-7gmj-67g7-phm9, so a RustSec-only pipeline would have missed a real
+    /// Tauri CVE while osv-scanner flags it.
+    ///
+    /// Consequence of losing this tool: a Security scan keeps succeeding and
+    /// still prints "No findings", because nothing else in the registry looks
+    /// at dependencies at all. Fail here instead of shipping that silence.
+    #[test]
+    fn osv_dev_remains_the_dependency_advisory_source() {
+        let a = adapter(AuditToolId::OsvScanner);
+
+        // It must run under `security_audit`, ungated by the census — a Rust
+        // repo, a lone `package-lock.json`, or a polyglot tree all need it.
+        assert_eq!(a.category, Category::Security);
+        assert_eq!(a.applicability, Applicability::ALWAYS);
+        assert!(a.applicable(&Census::default()));
+
+        // And it must reach osv.dev: no baked-in flag may cut the lookup down
+        // to a local/offline database. A user can still opt into `--offline`
+        // via `extra_args`; the built-in argv may not choose it for them.
+        let argv = a.resolve_argv(&root(), None, true);
+        for flag in ["--offline", "--offline-vulnerabilities", "--no-resolve"] {
+            assert!(
+                !argv.iter().any(|s| s == flag),
+                "built-in osv-scanner argv must not carry {flag}: {argv:?}"
+            );
+        }
+
+        // Seeded enabled on a fresh install — a default-disabled advisory
+        // source is the same blind spot with an extra click in front of it.
+        let seeded = crate::settings::default_audit_tools();
+        let osv = seeded
+            .iter()
+            .find(|t| t.id == AuditToolId::OsvScanner)
+            .expect("osv-scanner must be seeded in the default tool set");
+        assert!(osv.enabled, "osv-scanner must be enabled by default");
+
+        // No other registry tool queries an advisory DB, so this one is the
+        // whole of the app's dependency-CVE coverage. If a second source is
+        // ever added (cargo-audit, trivy, grype), relax this to "at least one".
+        assert_eq!(
+            seeded
+                .iter()
+                .filter(|t| adapter(t.id).category == Category::Security)
+                .filter(|t| t.id == AuditToolId::OsvScanner)
+                .count(),
+            1
+        );
+    }
+
     /// The applicability logic (extension gate OR marker gate) via constructed
     /// adapters — Phase B's real quality tools reuse this exact predicate.
     #[test]

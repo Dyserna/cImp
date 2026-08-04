@@ -161,7 +161,7 @@ version edit — `cargo update` will not move them.
 | `sysinfo` | `0.36` | System-monitor panel | `default-features = false` + `system,network`. Fast-moving pre-1.0; API churns — re-verify the monitor on bump. |
 | `nvml-wrapper` | `0.12` | NVIDIA GPU stats | Loads `nvml.dll` at runtime; degrades to n/a without driver. |
 | `misaki-rs` | `0.3` | TTS G2P phonemizer | **Pulls espeak-ng → binary is GPLv3** (see `NOTICE`); needs libclang to build. |
-| `ort` | `=2.0.0-rc.11` | ONNX Runtime bindings (Kokoro TTS) | **Exact-pinned.** Features `download-binaries` + `webgpu` (the shipped TTS GPU path). `cuda`+`webgpu` share no prebuilt — enabling both silently falls back to CPU. Wraps ORT 1.23.2; see the deep `ort` section. |
+| `ort` | `=2.0.0-rc.11` | ONNX Runtime bindings (Kokoro TTS) | **Exact-pinned.** The dep carries only `download-binaries` — **no EP feature**; EPs come from cImp's own mutually-exclusive `tts-webgpu`/`tts-cuda` features (`ort/webgpu` / `ort/cuda`, re-gated 2026-08-04, D-5). `cuda`+`webgpu` share no prebuilt — that combo makes ort-sys warn and silently link the CPU-only dist. Wraps ORT 1.23.2; see the deep `ort` section. |
 | `bytemuck` | `1` | Zero-copy casts | — |
 | `cpal` / `rodio` | `0.15` / `0.20` | Audio output | Pre-1.0; device-enumeration behavior changes across versions. |
 | `whisper-rs` | `0.16` | STT (whisper.cpp bindings) | → `whisper-rs-sys 0.15`. See the deep `whisper-rs` section + build toolchain. |

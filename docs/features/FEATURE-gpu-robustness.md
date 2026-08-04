@@ -12,7 +12,7 @@ See `FUTURE-FEATURES.md` § "Auto-detect Blackwell..." for the full rationale; t
 
 This is a single-item feature; no group. It's listed standalone in `FUTURE-FEATURES.md` and lives in this group of feature docs because it's discrete enough to handle separately from the larger UX features.
 
-The underlying ORT 1.20 + Blackwell mismatch is also tracked in `docs/MAINTENANCE.md` under "ort / ONNX Runtime." This feature complements that maintenance entry — the maintenance entry tracks the upstream upgrade; this feature improves cImp's behavior *until* the upstream upgrade lands and *after* it lands for any next-gen-GPU regression class.
+The underlying ORT + Blackwell mismatch (no sm_120 support through rc.13) is also tracked in `docs/MAINTENANCE.md` under "ort / ONNX Runtime." This feature complements that maintenance entry — the maintenance entry tracks the upstream upgrade; this feature improves cImp's behavior *until* the upstream upgrade lands and *after* it lands for any next-gen-GPU regression class.
 
 ## Two viable approaches
 

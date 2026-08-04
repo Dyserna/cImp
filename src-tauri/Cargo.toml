@@ -42,11 +42,14 @@ stt-cuda = ["whisper-rs/cuda"]
 # Unlike `stt-vulkan` it needs NO Vulkan SDK / Ninja at build time (prebuilt).
 tts-webgpu = ["ort/webgpu"]
 
-# Optional NVIDIA-only TTS GPU path. Works on Pascal..Ada but is broken on
-# Blackwell (sm_120) with ORT 1.20's prebuilt, and is NOT portable (imports
-# CUDA DLLs). MUTUALLY EXCLUSIVE with `tts-webgpu`: `ort` has no prebuilt that
-# combines `cuda`+`webgpu`, so enabling both downloads a CPU-only ORT and
-# silently disables the GPU. Pick exactly one. Build with `--features tts-cuda`.
+# Optional NVIDIA-only TTS GPU path. Works on Pascal..Ada but NOT on Blackwell
+# (sm_120): pyke's prebuilts carry no sm_120 cubins and no PTX to JIT from —
+# still true at ORT 1.23.2 / rc.13, see docs/MAINTENANCE.md. NOT portable
+# (imports CUDA DLLs). MUTUALLY EXCLUSIVE with `tts-webgpu`: pyke ships no
+# prebuilt combining `cuda`+`webgpu`, and ort-sys does NOT fail on that combo —
+# it prints a `cargo:warning` and silently downloads the CPU-only prebuilt, so
+# you get a GPU-less build that still *looks* like it built fine. Pick exactly
+# one. Build with `--features tts-cuda`.
 tts-cuda = ["ort/cuda"]
 
 [build-dependencies]
@@ -107,10 +110,18 @@ nvml-wrapper = "0.12"
 # TTS (Kokoro via ONNX Runtime). misaki-rs default features include espeak-ng
 # fallback for OOV words; the resulting binary is GPLv3 (see NOTICE).
 misaki-rs = "0.3"
-# SPIKE (Phase 0, tts-webgpu): swapped `cuda` -> `webgpu`. cuda+webgpu can't
-# share a prebuilt (falls back to CPU-only), so the spike drops cuda to test the
-# WebGPU EP for real. Revert to `cuda` if the spike fails.
-ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "webgpu"] }
+# ONNX Runtime bindings. rc.11 wraps ONNX Runtime 1.23.2 (see ort-sys'
+# build/download/dist.txt).
+#
+# NO execution-provider feature belongs here — the EP is selected by cImp's own
+# mutually-exclusive `tts-webgpu` / `tts-cuda` features above, which map to
+# `ort/webgpu` / `ort/cuda`. `webgpu` used to be pinned on unconditionally, and
+# that was wrong twice over: plain CPU builds (the default, incl. `cargo test`
+# and rust-analyzer) downloaded the WebGPU prebuilt they never use, and
+# `--features tts-cuda` resolved to `webgpu`+`cuda` — a combination pyke ships
+# no prebuilt for, so ort-sys warned and silently linked the CPU-only prebuilt
+# instead, producing a "CUDA" build with no GPU at all.
+ort = { version = "=2.0.0-rc.11", features = ["download-binaries"] }
 bytemuck = "1"
 
 # Audio output

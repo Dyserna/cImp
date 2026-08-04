@@ -25,7 +25,7 @@ whisper.cpp/ggml-Vulkan; only TTS moves.
 
 ## Why this and not DirectML / CUDA
 
-- **CUDA** (today's opt-in): NVIDIA-only, and the bundled ORT 1.20 prebuilt has
+- **CUDA** (today's opt-in): NVIDIA-only, and the bundled ORT prebuilt (no sm_120 cubins through rc.13) has
   no sm_120 cubin so it's silently broken on Blackwell (RTX 5090). See
   `MAINTENANCE.md` "ort / ONNX Runtime".
 - **DirectML**: vendor-agnostic but **Windows-only** (D3D12) — a dead end for

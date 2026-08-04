@@ -5,11 +5,13 @@
 
 use std::path::Path;
 
+// `ort::ep` is rc.11's module for execution providers; the old
+// `ort::execution_providers::*ExecutionProvider` aliases are `#[deprecated]`.
 #[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
-use ort::execution_providers::CUDAExecutionProvider;
+use ort::ep::CUDA;
 #[cfg(feature = "tts-webgpu")]
-use ort::execution_providers::WebGPUExecutionProvider;
-use ort::execution_providers::{CPUExecutionProvider, ExecutionProvider};
+use ort::ep::WebGPU;
+use ort::ep::{ExecutionProvider, CPU};
 use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
 use ort::value::Tensor;
 
@@ -35,11 +37,11 @@ fn register_gpu_ep(builder: &mut SessionBuilder) -> AppResult<()> {
     let result = {
         #[cfg(feature = "tts-webgpu")]
         {
-            WebGPUExecutionProvider::default().register(builder)
+            WebGPU::default().register(builder)
         }
         #[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
         {
-            CUDAExecutionProvider::default().register(builder)
+            CUDA::default().register(builder)
         }
     };
     result.map_err(|e| AppError::Tts(format!("GPU EP register: {e}")))
@@ -134,7 +136,7 @@ impl TtsEngine {
     }
 
     fn register_cpu(builder: &mut SessionBuilder) -> AppResult<()> {
-        CPUExecutionProvider::default()
+        CPU::default()
             .register(builder)
             .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))
     }

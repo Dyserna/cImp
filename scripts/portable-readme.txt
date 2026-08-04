@@ -36,7 +36,7 @@ What is bundled
 ---------------
 
   bin\cimp.exe                      the app
-  bin\onnxruntime.dll                CPU TTS inference (ORT 1.20)
+  bin\onnxruntime.dll                CPU TTS inference (ORT 1.23)
   bin\onnxruntime_providers_shared.dll
   bin\patterns.json                  editable prompt-detection patterns
                                      (see "Customizing prompt detection")

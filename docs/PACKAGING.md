@@ -144,7 +144,7 @@ GPU TTS via CUDA is now an **optional, non-default compile-time feature**
 (`--features tts-cuda`), mutually exclusive with `tts-webgpu` (`ort` has no
 prebuilt combining both). It is **not shipped** — the release uses `tts-webgpu`,
 which already covers NVIDIA. Kept only for local NVIDIA experiments. A `tts-cuda`
-binary dynamically links the CUDA runtime: `ort = 2.0.0-rc.11` (ORT 1.20.x)'s
+binary dynamically links the CUDA runtime: `ort = 2.0.0-rc.11` (ORT 1.23.2)'s
 providers DLL references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`,
 `cufft64_11.dll`, and `cudnn64_9.dll`, so such a build would need a CUDA 12.x +
 cuDNN 9 install (and is broken on Blackwell — see MAINTENANCE.md). This is exactly

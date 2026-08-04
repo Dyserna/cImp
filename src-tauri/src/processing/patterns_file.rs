@@ -33,7 +33,10 @@ fn default_file() -> PatternsFile {
         doc: Some(
             "Edit this file to add or refine prompt-detection substrings. \
              Each pattern's `all_of` is a list of substrings that must ALL be \
-             present in the rendered terminal tail for the pattern to match. \
+             present in the rendered terminal tail for the pattern to match; \
+             the optional `none_of` list vetoes the match when ANY of its \
+             substrings is present (that is how the permission patterns stay \
+             off Claude's select menus). \
              `kind` is `permission` or `question`. Set `disabled: true` to \
              keep an entry in the file without enabling it. Capture live \
              chrome with RUST_LOG=perm_capture=debug. Patterns are tested in \
@@ -130,10 +133,14 @@ mod tests {
         assert_eq!(parsed.patterns[0].name, "claude_permission");
         assert_eq!(parsed.patterns[0].kind, PatternKind::Permission);
         assert!(!parsed.patterns[0].disabled);
-        // Second pattern: a second permission entry shipped disabled,
-        // there as a multi-pattern declaration example.
+        // Second pattern: the OR'd permission alternative covering the
+        // cancel-only footer shape. Its `none_of` vetoes must survive the
+        // round-trip — they are what keeps it off Claude's select menus.
+        assert_eq!(parsed.patterns[1].name, "claude_permission_bare");
         assert_eq!(parsed.patterns[1].kind, PatternKind::Permission);
-        assert!(parsed.patterns[1].disabled);
+        assert!(!parsed.patterns[1].disabled);
+        assert_eq!(parsed.patterns[1].none_of, body.patterns[1].none_of);
+        assert!(!parsed.patterns[1].none_of.is_empty());
         // Third is the active AskUserQuestion pattern.
         assert_eq!(parsed.patterns[2].kind, PatternKind::Question);
         assert_eq!(parsed.patterns[2].name, "claude_question");

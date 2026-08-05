@@ -243,12 +243,14 @@ pub fn list_models() -> AppResult<Vec<String>> {
 /// default" sentinel is the empty-string `input_device` setting; the IPC
 /// command prepends a label for it.
 pub fn list_input_devices() -> AppResult<Vec<String>> {
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use cpal::traits::HostTrait;
     let host = cpal::default_host();
     let mut out = Vec::new();
     if let Ok(devices) = host.input_devices() {
         for d in devices {
-            if let Ok(name) = d.name() {
+            // Same strings the deprecated `Device::name()` produced — see
+            // `capture::device_name`.
+            if let Some(name) = crate::stt::capture::device_name(&d) {
                 out.push(name);
             }
         }

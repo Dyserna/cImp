@@ -306,6 +306,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v27,
         transform: migrate_v27_to_v28_step,
     },
+    MigrationStep {
+        from_version: "v28",
+        detect: looks_v28,
+        transform: migrate_v28_to_v29_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2163,8 +2168,7 @@ fn migrate_v25_to_v26(value: &mut Value) {
 
     if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
         tabs.retain(|t| {
-            t.get("id").and_then(Value::as_str)
-                != Some(crate::settings::schema::GRAPH_VIEW_TAB_ID)
+            t.get("id").and_then(Value::as_str) != Some(crate::settings::schema::GRAPH_VIEW_TAB_ID)
         });
     }
 
@@ -2209,8 +2213,7 @@ fn migrate_v26_to_v27(value: &mut Value) {
 
     if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
         tabs.retain(|t| {
-            t.get("id").and_then(Value::as_str)
-                != Some(crate::settings::schema::CODE_AUDIT_TAB_ID)
+            t.get("id").and_then(Value::as_str) != Some(crate::settings::schema::CODE_AUDIT_TAB_ID)
         });
     }
 
@@ -2260,31 +2263,63 @@ fn migrate_v27_to_v28(value: &mut Value) {
     ];
 
     if let Some(ui) = root.get_mut("ui").and_then(Value::as_object_mut) {
-        let legacy_accent = ui
-            .get("theme")
-            .and_then(Value::as_str)
-            .and_then(|theme| {
-                LEGACY_TUI_ACCENTS
-                    .iter()
-                    .find(|(id, _)| *id == theme)
-                    .map(|(_, accent)| *accent)
-            });
+        let legacy_accent = ui.get("theme").and_then(Value::as_str).and_then(|theme| {
+            LEGACY_TUI_ACCENTS
+                .iter()
+                .find(|(id, _)| *id == theme)
+                .map(|(_, accent)| *accent)
+        });
         if let Some(accent) = legacy_accent {
             ui.insert(
                 "theme".to_string(),
                 Value::String(crate::theming::TUI_THEME_ID.to_string()),
             );
-            ui.insert(
-                "tui_accent".to_string(),
-                Value::String(accent.to_string()),
-            );
+            ui.insert("tui_accent".to_string(), Value::String(accent.to_string()));
         }
     }
 
-    // Final cascade step ⇒ stamp CURRENT (28).
+    // Stamps a *literal* 28 (not `CURRENT_SCHEMA_VERSION`): the v28 → v29
+    // step runs next in the same cascade pass and gates on
+    // `schema_version == 28`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(28u8)),
+    );
+}
+
+fn looks_v28(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 28)
+}
+
+fn migrate_v28_to_v29_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v28_to_v29(value)
+}
+
+/// V28 → V29: pure version stamp for the V30 `offload.session_push` gate.
+///
+/// V30 Phase A added one additive bool to `OffloadSettings`
+/// (`session_push`, `#[serde(default)]` → **false**). An existing v28 file that
+/// lacks it round-trips with the flag off (see the schema test
+/// `offload_v28_json_without_session_push_loads_false`), which is exactly the
+/// behaviour we want — an upgrading user must not silently acquire a
+/// research-preview channel registration — so no data transform is needed.
+/// This step exists purely to advance the version marker so the cascade's
+/// fixpoint guard (`migrate_if_needed`) doesn't flag a v28 file as
+/// under-migrated.
+///
+/// Idempotent: a second pass finds `schema_version == 29` so `looks_v28` is
+/// false.
+fn migrate_v28_to_v29(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    // Final cascade step ⇒ stamp CURRENT (29).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(29u8)),
     );
 }
 
@@ -3099,6 +3134,66 @@ mod tests {
         let once = v.clone();
         migrate_v27_to_v28(&mut v);
         assert_eq!(v, once);
+    }
+
+    #[test]
+    fn looks_v28_detects_v28_and_not_others() {
+        assert!(looks_v28(&json!({ "schema_version": 28 })));
+        assert!(!looks_v28(&json!({ "schema_version": 27 })));
+        assert!(!looks_v28(&json!({ "schema_version": 29 })));
+        assert!(!looks_v28(&json!({})));
+    }
+
+    /// v28 → v29 (V30 Phase A) is a pure version stamp: `offload.session_push`
+    /// is an additive `#[serde(default)] = false` bool, so an existing offload
+    /// block must survive byte-for-byte and the flag must stay OFF (nobody
+    /// acquires a research-preview channel registration by upgrading).
+    #[test]
+    fn v28_to_v29_stamps_version_without_touching_offload() {
+        let mut v = json!({
+            "schema_version": 28,
+            "offload": { "enabled": true, "inject_guidance": true, "escalate_partial": true },
+            "ui": { "theme": "tui", "tui_accent": "#d77757" }
+        });
+        let before = v["offload"].clone();
+        migrate_v28_to_v29(&mut v);
+        assert_eq!(v["schema_version"], json!(29));
+        assert_eq!(v["offload"], before, "the offload block is not rewritten");
+        assert!(
+            v["offload"].get("session_push").is_none(),
+            "no field is synthesized — serde's struct default supplies `false`"
+        );
+        assert_eq!(v["ui"]["theme"], json!("tui"));
+    }
+
+    /// Running the step twice is a no-op, and the cascade's version gate stops
+    /// re-entry.
+    #[test]
+    fn v28_to_v29_is_idempotent() {
+        let mut v = json!({ "schema_version": 28, "offload": {} });
+        migrate_v28_to_v29(&mut v);
+        let once = v.clone();
+        migrate_v28_to_v29(&mut v);
+        assert_eq!(v, once);
+        assert!(!looks_v28(&v));
+    }
+
+    /// The cascade's last step must land exactly on `CURRENT_SCHEMA_VERSION` —
+    /// a schema bump that forgets its `MIGRATION_STEPS` entry trips the
+    /// `migrate_if_needed` fixpoint guard in production, and this test here.
+    #[test]
+    fn cascade_from_v28_reaches_the_current_schema_version() {
+        let shell = fake_default_shell();
+        let mut v = json!({ "schema_version": 28, "offload": {}, "tabs": [] });
+        for step in MIGRATION_STEPS {
+            if (step.detect)(&v) {
+                (step.transform)(&mut v, &shell);
+            }
+        }
+        assert_eq!(
+            v["schema_version"],
+            json!(crate::settings::schema::CURRENT_SCHEMA_VERSION),
+        );
     }
 
     /// Altitude tripwire: if `schema::LOCAL_DATA_TOOLS` ever gains a member,

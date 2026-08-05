@@ -264,6 +264,9 @@ fn navigation_handler(
 /// live pass — this function only establishes that the multi-webview API
 /// call itself compiles and (per Tauri's own doctest) is the documented
 /// shape; it does not simulate a drag or a focus fight.
+// Tauri command: parameters are the `invoke` payload fields, plus the managed
+// state handles Tauri injects.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn preview_open(
     app: AppHandle,

@@ -21,6 +21,7 @@
 //! Dispatched in `main()` before Tauri init, exactly like `--statusline`,
 //! so it stays GUI-free and fast to spawn.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,7 +45,7 @@ fn proxy_base() -> Option<(String, String)> {
 
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};
 use crate::offload::router::{self, BackendView, RouteError, TierHint};
-use crate::offload::server::ServerCommand;
+use crate::offload::server::{per_slot_n_ctx, ServerCommand};
 use crate::offload::tools::{self, ToolCtx};
 use crate::settings::{
     BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, ToolScope,
@@ -58,18 +59,223 @@ const SERVER_NAME: &str = "cimp-offload";
 /// the right per-consumer MCP-server tool set. Set once at startup.
 static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// V28 (issue #13): the cImp TAB this child was spawned for (from
+/// `--tab <tab-id>`). One `--offload-mcp` child runs per tab and its argv is
+/// composed entirely by cImp, so the tab identity can be baked in at spawn —
+/// which is what lets the app resolve *which* session of this agent the
+/// `context_*` memory tools should scope to. Unset for a child spawned by hand
+/// (or by a pre-V28 cImp), which fails open to the old behavior.
+static TAB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The configured consumer name, lowercased; `"claude"` when unset.
 fn consumer() -> &'static str {
     CONSUMER.get().map(String::as_str).unwrap_or("claude")
 }
 
-/// Entry point for `cimp --offload-mcp [--consumer <name>]`. Builds a
-/// current-thread tokio runtime and serves the stdio loop until stdin closes.
-/// `consumer` selects which MCP-server set the app proxies to this child
-/// (`claude` default, or `opencode`). Never panics — a crash here would garble
-/// the host agent's MCP session.
-pub fn run(consumer: &str) {
+/// The tab id this child serves, or `None` when it was spawned without `--tab`.
+fn tab() -> Option<&'static str> {
+    TAB.get().map(String::as_str)
+}
+
+/// V30 Phase A: what the MCP client told us about itself at `initialize`.
+///
+/// Its one consumer is the stderr handshake line in [`record_client_init`] —
+/// the line one looks for in the host's MCP server log when a push goes
+/// missing. The client's declared `capabilities` are deliberately NOT stored:
+/// the review of Phase B found the stated rationale ("Phase B reads it to
+/// decide whether a push has anywhere to land") to be false — the child gates
+/// pushes on [`CHANNEL_DECLARED`], its own server-side declaration, because
+/// Claude Code never advertises channel support on the client side at all.
+#[derive(Debug, Clone)]
+struct ClientInit {
+    /// The client's `clientInfo` object verbatim (`{name, version, …}`), or
+    /// `Value::Null` when the client sent none.
+    client_info: Value,
+}
+
+impl ClientInit {
+    /// `clientInfo.name`, when the client sent one.
+    fn name(&self) -> Option<&str> {
+        self.client_info.get("name").and_then(Value::as_str)
+    }
+
+    /// `clientInfo.version`, when the client sent one.
+    fn version(&self) -> Option<&str> {
+        self.client_info.get("version").and_then(Value::as_str)
+    }
+}
+
+/// The client's `initialize` params, recorded once. `OnceLock` (like [`CONSUMER`]
+/// / [`TAB`]) because MCP allows exactly one `initialize` per connection: a
+/// second one is a protocol violation and must not be able to rewrite what the
+/// session was established with.
+static CLIENT_INIT: std::sync::OnceLock<ClientInit> = std::sync::OnceLock::new();
+
+/// Record the client's `initialize` params. Idempotent — a duplicate
+/// `initialize` (protocol violation) leaves the first record standing.
+fn record_client_init(params: &Value) {
+    let init = ClientInit {
+        client_info: params.get("clientInfo").cloned().unwrap_or(Value::Null),
+    };
+    let name = init.name().unwrap_or("<unknown>").to_string();
+    let version = init.version().unwrap_or("<unknown>").to_string();
+    let protocol = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("<unset>")
+        .to_string();
+    if CLIENT_INIT.set(init).is_ok() {
+        // `eprintln!`, not `tracing!`: `main` dispatches `--offload-mcp` BEFORE
+        // `logging::init`, so this process has no subscriber and a `tracing`
+        // event would go nowhere. stderr is where the child's diagnostics
+        // actually land — the host agent captures it in its MCP server log,
+        // which is exactly where one looks when a channel registration
+        // misbehaves. (stdout is the JSON-RPC pipe and must never be written
+        // to directly.)
+        eprintln!(
+            "cimp-offload: MCP client initialized — {name} {version} \
+             (protocol {protocol}, consumer {})",
+            consumer()
+        );
+    }
+}
+
+/// What the client sent at `initialize`, or `None` before the handshake.
+/// Test-only: the production consumer of [`CLIENT_INIT`] is the one-shot
+/// stderr line inside [`record_client_init`], and this accessor exists so the
+/// write-once contract (a duplicate `initialize` must not rewrite the record)
+/// stays pinned by a test rather than by prose.
+#[cfg(test)]
+fn client_init() -> Option<&'static ClientInit> {
+    CLIENT_INIT.get()
+}
+
+// ── V30 Phase B: handshake facts the `/events` relay needs ─────────────────
+
+/// Whether this child ACTUALLY put `capabilities.experimental["claude/channel"]`
+/// on the wire at `initialize`.
+///
+/// Recorded from the handshake itself rather than re-derived at use time: the
+/// half that matters is what the *client* was told. A push to a host that never
+/// negotiated channels is silently dropped client-side (Phase 0, T6), so this
+/// flag is what stops the child manufacturing a notification into the void.
+static CHANNEL_DECLARED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the `initialize` handler has run at all. Also the write-once claim
+/// token for [`record_channel_declaration`] (`compare_exchange`, not
+/// load-then-store: two interleaved `initialize` frames must not be able to
+/// both pass the check and let the loser's decision win).
+static INITIALIZE_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the `initialize` RESPONSE has been written to stdout. Distinct from
+/// [`INITIALIZE_SEEN`] on purpose — see [`release_initialize_relay`].
+static INITIALIZE_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// Wake-up for [`await_initialize`], signalled once the handshake reply is out.
+fn initialize_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Record the handshake outcome. Write-once: MCP allows exactly one
+/// `initialize` per connection, and a second one must not be able to flip the
+/// capability the session was actually established with — the relay bakes that
+/// answer into its `channels=` subscription.
+///
+/// The claim is a `compare_exchange` on [`INITIALIZE_SEEN`] because
+/// `mcp_stdio::serve` spawns every request on its own task: two `initialize`
+/// frames in flight together would both clear a plain load-then-store check,
+/// and the second writer's decision would silently overwrite the first's.
+/// [`CHANNEL_DECLARED`] is stored after the claim succeeds, which is safe
+/// because nothing reads it before [`release_initialize_relay`] runs — strictly
+/// after this function returns, on the same task.
+fn record_channel_declaration(declared: bool) {
+    if INITIALIZE_SEEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return; // a handshake is already on record
+    }
+    CHANNEL_DECLARED.store(declared, Ordering::Release);
+}
+
+/// Release the `/events` relay — called from `mcp_stdio::serve`'s
+/// post-response hook once the `initialize` REPLY is on the wire.
+///
+/// Separate from [`record_channel_declaration`] to keep JSON-RPC ordering: the
+/// handler returns strictly before its response is serialized, so releasing the
+/// relay there opened a window in which an unsolicited
+/// `notifications/claude/channel` could precede the handshake reply on the same
+/// pipe. Idempotent, and safe to call for a failed write too (the relay would
+/// otherwise idle for the full [`await_initialize`] bound on a dead pipe).
+fn release_initialize_relay() {
+    INITIALIZE_ANSWERED.store(true, Ordering::Release);
+    initialize_notify().notify_waiters();
+}
+
+/// Whether a `claude/channel` notification from this child would be honoured.
+fn channel_declared() -> bool {
+    CHANNEL_DECLARED.load(Ordering::Acquire)
+}
+
+/// Block until the `initialize` response has been written (bounded).
+///
+/// The relay is spawned at [`serve`] start, *before* the client's `initialize`
+/// arrives, so connecting immediately would register this child with
+/// `channels=0` for the life of that connection — and the app would never push
+/// to a tab that is in fact channel-capable. Waiting costs nothing: the
+/// handshake is the first frame a client sends, typically within milliseconds.
+///
+/// Each wake re-checks the flag rather than trusting the wake-up, which closes
+/// the race where the release lands between the load and the `notified()`
+/// registration (`notify_waiters` only reaches waiters already registered). The
+/// bound means a client that never handshakes (or a hand-run child) still gets
+/// its `tools/list_changed` relay — just with no channel identity.
+async fn await_initialize() {
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    const POLL: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + MAX_WAIT;
+    while !INITIALIZE_ANSWERED.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "cimp-offload: no `initialize` within {}s — subscribing to /events without \
+                 channel identity",
+                MAX_WAIT.as_secs()
+            );
+            return;
+        }
+        let _ = tokio::time::timeout(POLL, initialize_notify().notified()).await;
+    }
+}
+
+/// V30 (M5): whether this child was spawned with `--channel-push`, i.e. cImp
+/// decided AT TAB SPAWN that session push is armed for this tab.
+///
+/// Argv, not a settings read: the client half of the gate (Claude's
+/// `--dangerously-load-development-channels`) is composed in the very same
+/// overlay at the very same moment, so baking both into argv is what makes them
+/// one decision. A fresh settings read at `initialize` would drift — the MCP
+/// child can crash-restart at any time and re-handshake against a settings file
+/// the running Claude process never saw.
+static CHANNEL_PUSH_ARG: AtomicBool = AtomicBool::new(false);
+
+/// Entry point for
+/// `cimp --offload-mcp [--consumer <name>] [--tab <tab-id>] [--channel-push]`.
+/// Builds a current-thread tokio runtime and serves the stdio loop until stdin
+/// closes. `consumer` selects which MCP-server set the app proxies to this child
+/// (`claude` default, or `opencode`); `tab` is the cImp tab id this child was
+/// spawned for (V28 — forwarded on `/graph_run` so the app can scope the
+/// `context_*` memory tools to THIS tab's session); `channel_push` is the V30
+/// session-push gate baked in at spawn (see [`CHANNEL_PUSH_ARG`]). Never panics
+/// — a crash here would garble the host agent's MCP session.
+pub fn run(consumer: &str, tab: Option<&str>, channel_push: bool) {
     let _ = CONSUMER.set(consumer.trim().to_ascii_lowercase());
+    // Tab ids are case-sensitive settings keys — store verbatim (trimmed), never
+    // lowercased like the consumer name.
+    if let Some(t) = tab.map(str::trim).filter(|t| !t.is_empty()) {
+        let _ = TAB.set(t.to_string());
+    }
+    CHANNEL_PUSH_ARG.store(channel_push, Ordering::Release);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -98,7 +304,23 @@ async fn serve() {
     // `offload_task`s must occupy both llama-server slots at once), captures
     // handler panics as JSON-RPC errors, and stops accepting work once a
     // response write fails (Claude closed the pipe).
-    crate::mcp_stdio::serve(stdout, "offload", handle_owned).await;
+    //
+    // `after_response` releases the `/events` relay once the `initialize`
+    // RESPONSE is on the wire (see [`release_initialize_relay`]) — the relay's
+    // first act may be a `notifications/claude/channel`, which must never
+    // precede the handshake reply on the same pipe.
+    crate::mcp_stdio::serve(stdout, "offload", handle_owned, after_response).await;
+}
+
+/// Called by [`crate::mcp_stdio::serve`] once a request's response frame has
+/// been written (or its write failed and the pipe is gone). The only method
+/// that needs the hook is `initialize`: JSON-RPC ordering says nothing may be
+/// written on this connection before the handshake reply, and the `/events`
+/// relay's very next write can be an unsolicited notification.
+fn after_response(method: &str) {
+    if method == "initialize" {
+        release_initialize_relay();
+    }
 }
 
 /// Owned-argument wrapper around [`handle`] so it can run on its own
@@ -111,11 +333,42 @@ async fn handle_owned(method: String, params: Value) -> Result<Value, (i64, Stri
 /// `Err((code, message))` for a JSON-RPC error object.
 async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
     match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": true } },
-            "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
-        })),
+        "initialize" => {
+            // V30 Phase A: the client's `clientInfo` is recorded (it used to be
+            // discarded) so the handshake is reported exactly once on stderr —
+            // the line one looks for when a push goes missing.
+            record_client_init(&params);
+            let mut result = json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": { "listChanged": true } },
+                "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
+            });
+            // Declare the Claude Code channel capability + system-prompt
+            // `instructions` when session push is armed for THIS child (a pure
+            // argv read — see `session_push_enabled`).
+            let declared = if session_push_enabled() {
+                decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
+                true
+            } else {
+                false
+            };
+            if declared {
+                // Stderr, for the same reason as `record_client_init` — and
+                // the one line that tells a user debugging a missing push
+                // whether the SERVER half of the handshake happened at all.
+                eprintln!(
+                    "cimp-offload: declared the claude/channel capability \
+                     (session push armed for consumer {})",
+                    consumer()
+                );
+            }
+            // V30 Phase B: publish the handshake outcome — it is both this
+            // child's push gate and the `channels=` identity it registers with
+            // on `/events` (whose relay is parked in `await_initialize` until
+            // exactly this point).
+            record_channel_declaration(declared);
+            Ok(result)
+        }
         "ping" => Ok(json!({})),
         "tools/list" => {
             let mut tools = Vec::new();
@@ -677,7 +930,14 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
         .timeout(Duration::from_secs(30))
         .build()
         .ok()?;
-    let body = json!({ "cwd": cwd, "name": name, "args": args, "consumer": consumer() });
+    // V28: `tab` rides along ONLY here (`/graph_run`) — `/mcp/call` proxies to
+    // external servers, which hold no cImp memory scope. Omitted entirely when
+    // this child has no tab identity, so the body stays byte-identical to the
+    // pre-V28 shape on that path.
+    let mut body = json!({ "cwd": cwd, "name": name, "args": args, "consumer": consumer() });
+    if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
+        map.insert("tab".to_string(), Value::String(t.to_string()));
+    }
     let resp = client
         .post(format!("{base}/graph_run"))
         .bearer_auth(&token)
@@ -786,8 +1046,13 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
 }
 
 /// Long-lived task: while the app's loopback endpoint is reachable, hold a
-/// `GET /events` SSE connection and relay each `change` event to Claude as a
-/// `notifications/tools/list_changed`. Reconnects when the app comes/goes.
+/// `GET /events` SSE connection and dispatch its frames —
+///
+/// - `change` → `notifications/tools/list_changed` (the pre-V30 pulse);
+/// - `push` → `notifications/claude/channel` (V30 Phase B), built from the
+///   semantic payload the app addressed at THIS child's tab.
+///
+/// Reconnects when the app comes/goes.
 async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
     // Build the client once and reuse it across reconnects — the old code
     // rebuilt a fresh reqwest::Client on every 2s retry (~1800/hr while the app
@@ -795,40 +1060,39 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
     let Ok(client) = reqwest::Client::builder().build() else {
         return;
     };
+    // V30 Phase B: the subscription carries this child's identity, and the
+    // `channels` half of it only exists once the handshake has happened. This
+    // task is spawned before the client's `initialize` arrives, so park here
+    // until it has (bounded — see `await_initialize`).
+    await_initialize().await;
+    let query = events_query(tab(), consumer(), channel_declared());
     loop {
         if let Some((base, token)) = proxy_base() {
             {
                 if let Ok(mut resp) = client
-                    .get(format!("{base}/events"))
+                    .get(format!("{base}/events{query}"))
                     .bearer_auth(&token)
                     .send()
                     .await
                 {
-                    // Read the SSE byte stream chunk by chunk; emit a
-                    // notification each time a `change` event arrives. Keep a
-                    // small carry of the previous chunk's tail so a marker
-                    // split across a chunk boundary (TCP can break anywhere) is
-                    // still detected — otherwise a capability change would be
-                    // silently dropped.
+                    // Parse the SSE byte stream frame by frame. The parser owns
+                    // the chunk-boundary problem end to end (TCP can split
+                    // anywhere, including mid-line and mid-frame), which the
+                    // pre-V30 byte-marker sniffing only approximated with a
+                    // carry buffer.
                     // Bound each read: the app sends an SSE keep-alive every
                     // 20s, so a 60s gap means the connection went half-open
                     // (e.g. the app was hard-killed without a FIN). Break to
                     // reconnect rather than hang here forever — otherwise
                     // list_changed notifications would stop reaching Claude.
                     const READ_IDLE: Duration = Duration::from_secs(60);
-                    let mut carry: Vec<u8> = Vec::new();
+                    let mut parser = SseParser::default();
                     while let Ok(Ok(Some(chunk))) =
                         tokio::time::timeout(READ_IDLE, resp.chunk()).await
                     {
-                        let mut buf = std::mem::take(&mut carry);
-                        buf.extend_from_slice(&chunk);
-                        if buf.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
-                            emit_list_changed(&stdout).await;
+                        for frame in parser.feed(&chunk) {
+                            dispatch_sse_frame(&stdout, &frame).await;
                         }
-                        // Retain only the bytes that could be a marker prefix
-                        // straddling into the next chunk (at most len-1).
-                        let keep = SSE_CHANGE.len().saturating_sub(1).min(buf.len());
-                        carry = buf[buf.len() - keep..].to_vec();
                     }
                 }
             }
@@ -838,20 +1102,265 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
     }
 }
 
-/// The SSE marker the app emits for a capability change.
-const SSE_CHANGE: &[u8] = b"event: change";
+/// The `?tab=&consumer=&channels=` query this child subscribes to `/events`
+/// with. `channels` is `1` only when the capability was really declared, so the
+/// app's registry reflects the handshake and not the settings file. Pure, so
+/// the exact identity string is unit-testable.
+fn events_query(tab: Option<&str>, consumer: &str, channels: bool) -> String {
+    let mut q = String::from("?");
+    if let Some(t) = tab {
+        // No escaping: tab ids are cImp-generated (`[a-z0-9-]`) and the app
+        // parses this query without percent-decoding.
+        q.push_str("tab=");
+        q.push_str(t);
+        q.push('&');
+    }
+    q.push_str("consumer=");
+    q.push_str(consumer);
+    q.push_str(if channels {
+        "&channels=1"
+    } else {
+        "&channels=0"
+    });
+    q
+}
 
-/// Write a `tools/list_changed` notification on the shared stdout pipe.
-async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
-    let frame = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/tools/list_changed"
-    })
-    .to_string();
+/// One dispatched SSE frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SseFrame {
+    /// The `event:` field, or SSE's default `message` when the frame carried
+    /// none.
+    event: String,
+    /// The accumulated `data:` payload (multiple `data:` lines joined with
+    /// `\n`, per the SSE spec).
+    data: String,
+}
+
+/// A minimal SSE frame parser, fed arbitrary byte chunks.
+///
+/// Grammar implemented (the subset the app emits, plus what any conformant
+/// producer may legally send):
+///
+/// ```text
+/// stream    := line*
+/// line      := field CR? LF
+/// field     := ':' comment          -- ignored (the app's ": keep-alive")
+///            | name ':' ' '? value  -- one optional leading space is stripped
+///            | name                 -- a nameless-value field, value = ""
+///            | ''                   -- a blank line DISPATCHES the frame
+/// ```
+///
+/// `event` sets the frame's name (last one wins), `data` appends (joined with
+/// `\n`), any other field (`id`, `retry`, …) is ignored. A frame is emitted on
+/// the blank line only if at least one of `event`/`data` was seen, so runs of
+/// blank lines and leading keep-alives produce nothing. Pure and socket-free —
+/// the reason it is a struct rather than inline stream handling.
+#[derive(Default)]
+struct SseParser {
+    /// Bytes of the line currently being accumulated.
+    line: Vec<u8>,
+    event: Option<String>,
+    data: Option<String>,
+}
+
+impl SseParser {
+    /// Hard cap on a single line. The app's frames are tiny; a line beyond this
+    /// means a broken or hostile producer, and truncating (rather than growing
+    /// without bound) keeps this child's memory bounded. The truncated line
+    /// simply fails to parse into a usable push.
+    const MAX_LINE: usize = 1 << 20;
+
+    /// Feed one chunk, returning every frame it completed.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
+        let mut out = Vec::new();
+        for &b in chunk {
+            if b == b'\n' {
+                let raw = std::mem::take(&mut self.line);
+                if let Some(frame) = self.end_line(&raw) {
+                    out.push(frame);
+                }
+            } else if self.line.len() < Self::MAX_LINE {
+                self.line.push(b);
+            }
+        }
+        out
+    }
+
+    /// Consume one complete line; `Some` when it terminated a frame.
+    fn end_line(&mut self, raw: &[u8]) -> Option<SseFrame> {
+        // Lossy: a mangled byte must not kill an otherwise-healthy stream (the
+        // same reasoning as `mcp_stdio::serve`'s invalid-UTF-8 handling).
+        let line = String::from_utf8_lossy(raw);
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+
+        if line.is_empty() {
+            // Blank line: dispatch whatever has accumulated.
+            let (event, data) = (self.event.take(), self.data.take());
+            if event.is_none() && data.is_none() {
+                return None;
+            }
+            return Some(SseFrame {
+                event: event.unwrap_or_else(|| "message".to_string()),
+                data: data.unwrap_or_default(),
+            });
+        }
+        if line.starts_with(':') {
+            return None; // comment / keep-alive
+        }
+        let (name, value) = match line.split_once(':') {
+            Some((n, v)) => (n, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+        match name {
+            "event" => self.event = Some(value.to_string()),
+            "data" => match &mut self.data {
+                Some(existing) => {
+                    existing.push('\n');
+                    existing.push_str(value);
+                }
+                None => self.data = Some(value.to_string()),
+            },
+            _ => {}
+        }
+        None
+    }
+}
+
+/// Turn a `push` frame's `data` payload into `notifications/claude/channel`
+/// params, or `None` when it is unusable.
+///
+/// Re-validates the meta keys the app already checked at the write boundary:
+/// the two halves are different processes and can be different builds (a child
+/// outlives a settings change, and an old exe can be talking to a new app), and
+/// an invalid key would be dropped *silently* by the client. Empty content is
+/// rejected outright — an empty `<channel>` message would cost the session a
+/// turn and say nothing ("empty is not absent").
+fn channel_params(data: &str) -> Option<Value> {
+    let notice: crate::offload::service::PushNotice = serde_json::from_str(data).ok()?;
+    if notice.content.trim().is_empty() {
+        return None;
+    }
+    let meta: serde_json::Map<String, Value> = notice
+        .meta
+        .into_iter()
+        .filter(|(k, _)| crate::offload::service::valid_meta_key(k))
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+    Some(json!({ "content": notice.content, "meta": Value::Object(meta) }))
+}
+
+/// Relay one parsed SSE frame to the host agent. Unknown event names are
+/// ignored (forward compatibility: a newer app may emit frames this child
+/// predates).
+async fn dispatch_sse_frame(stdout: &Arc<TokioMutex<tokio::io::Stdout>>, frame: &SseFrame) {
+    match frame.event.as_str() {
+        "change" => emit_list_changed(stdout).await,
+        "push" => {
+            if !channel_declared() {
+                // The app addressed us, but this session never negotiated
+                // channels — the client would drop the notification silently,
+                // so say so where a user debugging a missing push will see it.
+                eprintln!(
+                    "cimp-offload: dropped a session push — this connection never declared \
+                     the claude/channel capability (enable offload.session_push and restart \
+                     the tab)"
+                );
+                return;
+            }
+            match channel_params(&frame.data) {
+                Some(params) => {
+                    emit_notification(stdout, "notifications/claude/channel", Some(params)).await
+                }
+                None => eprintln!(
+                    "cimp-offload: dropped an unusable session push payload ({} bytes)",
+                    frame.data.len()
+                ),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build one JSON-RPC **notification** frame (no `id`, so no response is ever
+/// expected). Pure — separated from the write so the exact wire shape is
+/// unit-testable; `params` is omitted entirely when `None`, which is what a
+/// bare `tools/list_changed` needs.
+fn notification_frame(method: &str, params: Option<Value>) -> Value {
+    let mut frame = json!({ "jsonrpc": "2.0", "method": method });
+    if let (Some(p), Some(map)) = (params, frame.as_object_mut()) {
+        map.insert("params".to_string(), p);
+    }
+    frame
+}
+
+/// Write one unsolicited JSON-RPC notification on the shared stdout pipe.
+///
+/// This is the child's single out-of-band write path (see the `mcp_stdio`
+/// module docs): the caller holds its own clone of the shared stdout mutex, so
+/// a notification can never interleave with a response frame. Best-effort — a
+/// failed write means the host closed the pipe, which the request loop's own
+/// shutdown guard detects.
+async fn emit_notification(
+    stdout: &Arc<TokioMutex<tokio::io::Stdout>>,
+    method: &str,
+    params: Option<Value>,
+) {
+    let frame = notification_frame(method, params).to_string();
     let mut out = stdout.lock().await;
     let _ = out.write_all(frame.as_bytes()).await;
     let _ = out.write_all(b"\n").await;
     let _ = out.flush().await;
+}
+
+/// Write a `tools/list_changed` notification on the shared stdout pipe.
+async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
+    emit_notification(stdout, "notifications/tools/list_changed", None).await;
+}
+
+// ── V30 Phase A: session-push capability declaration ───────────────────────
+
+/// The system-prompt `instructions` block injected alongside the channel
+/// capability when `offload.session_push` is on.
+///
+/// It tells the model what a `<channel source="cimp-offload">` message is and
+/// how to treat one. The "do not invent" clause is deliberate: a channel
+/// message is a plain user-role message from the model's point of view, so
+/// without it the pattern is trivially imitable in the model's own output.
+const CHANNEL_INSTRUCTIONS: &str = "cimp-offload may push out-of-band notices into this session as <channel source=\"cimp-offload\"> messages — completion notices from the local toolchain (offloaded tasks, code audits, graph indexing). When one arrives, take it into account: act on it if it is relevant to the current task, otherwise acknowledge it briefly. Do not invent channel messages; only react to ones actually delivered.";
+
+/// Add `capabilities.experimental["claude/channel"]` + the top-level
+/// `instructions` string to an otherwise-unchanged `initialize` result.
+///
+/// Pure, so a test can pin both the addition and the untouched base — notably
+/// `protocolVersion`, which MUST stay on the legacy `2025-06-18` era where the
+/// client honours channels (milestone invariant 1), and `tools.listChanged`.
+fn decorate_initialize_channel(result: &mut Value, instructions: &str) {
+    result["capabilities"]["experimental"] = json!({ "claude/channel": {} });
+    result["instructions"] = Value::String(instructions.to_string());
+}
+
+/// Whether this child should declare the channel capability.
+///
+/// Two gates:
+///   * **consumer** — channels are a Claude Code mechanism; an OpenCode child
+///     (`--consumer opencode`) has no inbound MCP path at all (see the
+///     milestone's Phase D), so it must never declare one.
+///   * **argv** — `--channel-push`, baked in at tab spawn (see
+///     [`CHANNEL_PUSH_ARG`]).
+///
+/// It reads NO settings, deliberately. `offload.session_push` is evaluated once
+/// per tab spawn, in `tabs/config.rs::build_pre_args`, where the very same
+/// predicate also decides whether Claude gets
+/// `--dangerously-load-development-channels`. Both halves of the gate therefore
+/// come from one read of one snapshot and can only change together, on a tab
+/// restart (which `spawn_inject_sig`'s `"channels"` entry raises a hint for).
+/// The pre-fix code re-read the settings files here instead, so a child
+/// crash-restart after a settings toggle desynced the halves: the child
+/// declared the capability and subscribed `channels=1` while the running Claude
+/// process had never registered it — every push then silently dropped
+/// client-side but counted as delivered app-side.
+fn session_push_enabled() -> bool {
+    consumer() == "claude" && CHANNEL_PUSH_ARG.load(Ordering::Acquire)
 }
 
 /// A backend resolved from config to a connectable endpoint, before the
@@ -867,6 +1376,10 @@ struct ResolvedBackend {
     tool_scope: ToolScope,
     slots: u32,
     declared_context: Option<u32>,
+    /// Local backend launched with `--kv-unified`: `/props` then reports the
+    /// FULL shared window instead of the per-slot one, so the probe divides
+    /// it by `slots` (see [`crate::offload::server::per_slot_n_ctx`]).
+    kv_unified: bool,
 }
 
 impl ResolvedBackend {
@@ -891,6 +1404,7 @@ impl ResolvedBackend {
                     tool_scope: b.tool_scope.clone(),
                     slots: cmd.parallel.max(1),
                     declared_context: b.declared_context,
+                    kv_unified: cmd.kv_unified,
                 })
             }
             OffloadBackendKind::Remote {
@@ -918,6 +1432,9 @@ impl ResolvedBackend {
                     // slot (the user sizes real parallelism on the box).
                     slots: 1,
                     declared_context: b.declared_context,
+                    // No parsed command for a remote endpoint — and with one
+                    // assumed slot there'd be nothing to divide anyway.
+                    kv_unified: false,
                 })
             }
         }
@@ -977,7 +1494,9 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
                 .and_then(|x| x.as_u64())
                 .or_else(|| v.get("n_ctx").and_then(|x| x.as_u64()))
         })
-        .map(|n| n as u32)
+        // Under `--kv-unified` the reported window is the shared one; the
+        // router budgets one slot. A declared fallback is already per-slot.
+        .map(|n| per_slot_n_ctx(n as u32, b.slots, b.kv_unified))
         .or(b.declared_context);
     let slots = body
         .as_ref()
@@ -1038,6 +1557,7 @@ async fn run_offload(
         let is_cloud = b.is_cloud;
         let declared = b.declared_context;
         let slots = b.slots;
+        let kv_unified = b.kv_unified;
         handles.push(tauri::async_runtime::spawn(async move {
             let rb = ResolvedBackend {
                 name: String::new(),
@@ -1049,6 +1569,7 @@ async fn run_offload(
                 tool_scope: ToolScope::All,
                 slots,
                 declared_context: declared,
+                kv_unified,
             };
             (i, probe(&client, &rb).await)
         }));
@@ -1331,6 +1852,283 @@ mod tests {
         assert_eq!(schemas[0], Some(json!({ "type": "object" })));
         assert_eq!(schemas[1], None);
         assert_eq!(schemas[2], Some(json!({ "type": "array" })));
+    }
+
+    /// The `emit_list_changed` → `emit_notification` refactor must not have
+    /// changed one byte on the wire: a params-less notification carries NO
+    /// `params` key at all.
+    #[test]
+    fn notification_frame_matches_the_pre_refactor_wire_shape() {
+        assert_eq!(
+            notification_frame("notifications/tools/list_changed", None).to_string(),
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#
+        );
+        let with_params =
+            notification_frame("notifications/progress", Some(json!({ "progress": 1 })));
+        assert_eq!(with_params["params"]["progress"], json!(1));
+        assert_eq!(with_params["jsonrpc"], "2.0");
+    }
+
+    // ── V30 Phase A: session push ────────────────────────────────────────
+
+    /// A base `initialize` result, exactly as the handler builds it.
+    fn base_initialize() -> Value {
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": { "tools": { "listChanged": true } },
+            "serverInfo": { "name": SERVER_NAME, "version": "test" }
+        })
+    }
+
+    /// The production decoration adds the experimental channel capability and
+    /// the `instructions` block WITHOUT disturbing the rest of the handshake.
+    /// `protocolVersion` is the load-bearing one (milestone invariant 1): the
+    /// client skips channel registration entirely on the modern MCP era, so a
+    /// bump here would silently kill session push.
+    #[test]
+    fn channel_decoration_preserves_the_legacy_handshake() {
+        let mut result = base_initialize();
+        decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
+        assert_eq!(result["protocolVersion"], "2025-06-18");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(true));
+        assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
+        assert!(result["capabilities"]["experimental"]["claude/channel"].is_object());
+        assert_eq!(result["instructions"], json!(CHANNEL_INSTRUCTIONS));
+    }
+
+    /// An undecorated handshake carries neither key — the default-off setting
+    /// must be a byte-identical, pre-V30 `initialize` result.
+    #[test]
+    fn undecorated_initialize_declares_no_channel() {
+        let result = base_initialize();
+        assert!(result["capabilities"].get("experimental").is_none());
+        assert!(result.get("instructions").is_none());
+    }
+
+    /// The production `instructions` text must name the exact wire form the
+    /// model will see, describe what to do with a notice, and forbid inventing
+    /// them (a channel message is an ordinary user-role message, so the shape
+    /// is trivially imitable).
+    #[test]
+    fn channel_instructions_cover_the_delivery_contract() {
+        assert!(CHANNEL_INSTRUCTIONS.contains("<channel source=\"cimp-offload\">"));
+        assert!(CHANNEL_INSTRUCTIONS.contains("Do not invent channel messages"));
+    }
+
+    /// V30 Phase A: the client's `clientInfo` is no longer discarded — it is
+    /// what the one-shot stderr handshake line reports. `record_client_init`
+    /// runs against a process-wide `OnceLock`, so this test exercises the
+    /// *parse*.
+    #[test]
+    fn client_init_parses_client_info() {
+        let params = json!({
+            "protocolVersion": "2025-06-18",
+            "clientInfo": { "name": "claude-code", "version": "2.1.222" },
+            "capabilities": { "roots": { "listChanged": true } }
+        });
+        let init = ClientInit {
+            client_info: params.get("clientInfo").cloned().unwrap_or(Value::Null),
+        };
+        assert_eq!(init.name(), Some("claude-code"));
+        assert_eq!(init.version(), Some("2.1.222"));
+
+        // A client that sends none must not panic or fabricate values.
+        let bare = ClientInit {
+            client_info: Value::Null,
+        };
+        assert_eq!(bare.name(), None);
+        assert_eq!(bare.version(), None);
+    }
+
+    /// `record_client_init` must never rewrite a recorded handshake: MCP
+    /// permits exactly one `initialize` per connection, and a second one is a
+    /// protocol violation, not a re-negotiation.
+    #[test]
+    fn record_client_init_is_write_once() {
+        record_client_init(&json!({ "clientInfo": { "name": "first" } }));
+        record_client_init(&json!({ "clientInfo": { "name": "second" } }));
+        assert_eq!(client_init().and_then(ClientInit::name), Some("first"));
+    }
+
+    // ── V30 Phase B: /events identity + the SSE frame parser ─────────────
+
+    /// The subscription identity the app's registry keys on. `channels`
+    /// reflects the HANDSHAKE, so it is always present and explicit — a `0` is
+    /// meaningfully different from the pre-V30 child's absent param.
+    #[test]
+    fn events_query_carries_tab_consumer_and_channels() {
+        assert_eq!(
+            events_query(Some("claude-2"), "claude", true),
+            "?tab=claude-2&consumer=claude&channels=1"
+        );
+        assert_eq!(
+            events_query(None, "opencode", false),
+            "?consumer=opencode&channels=0"
+        );
+    }
+
+    /// The handshake fact the relay subscribes with is recorded once and never
+    /// re-negotiated — a duplicate `initialize` (a protocol violation) must not
+    /// flip the capability after the relay has baked it into its `channels=`
+    /// subscription. The claim is a `compare_exchange`, so two frames racing
+    /// through `mcp_stdio::serve`'s per-request spawn can't both win. This is
+    /// the only test that touches these process-wide statics.
+    #[test]
+    fn channel_declaration_is_write_once() {
+        record_channel_declaration(true);
+        record_channel_declaration(false);
+        assert!(channel_declared());
+        assert!(INITIALIZE_SEEN.load(Ordering::Acquire));
+
+        // The relay stays parked until the initialize RESPONSE is on the wire —
+        // recording the decision alone must not release it (JSON-RPC ordering:
+        // nothing precedes the handshake reply on this pipe).
+        assert!(
+            !INITIALIZE_ANSWERED.load(Ordering::Acquire),
+            "recording the handshake must not release the /events relay"
+        );
+        release_initialize_relay();
+        assert!(INITIALIZE_ANSWERED.load(Ordering::Acquire));
+    }
+
+    /// The gate the child declares on is pure argv (`--channel-push`), never a
+    /// settings read: the client half (`--dangerously-load-development-channels`)
+    /// is composed from the same snapshot at the same moment, so a child
+    /// crash-restart after a settings toggle cannot desync the two halves.
+    #[test]
+    fn session_push_gate_is_argv_only() {
+        // Same process-wide statics as above; `consumer()` defaults to "claude"
+        // when `run` never set it, which is the case in tests.
+        CHANNEL_PUSH_ARG.store(false, Ordering::Release);
+        assert!(!session_push_enabled(), "no --channel-push ⇒ no declaration");
+        CHANNEL_PUSH_ARG.store(true, Ordering::Release);
+        assert!(session_push_enabled());
+        CHANNEL_PUSH_ARG.store(false, Ordering::Release);
+    }
+
+    /// Feed the parser one byte at a time: no frame may be lost or duplicated
+    /// when TCP splits mid-line, mid-frame, or between `\r` and `\n`.
+    #[test]
+    fn sse_parser_survives_arbitrary_chunk_boundaries() {
+        let stream = "event: change\ndata: {}\n\nevent: push\ndata: {\"content\":\"hi\"}\n\n";
+        let mut whole = SseParser::default();
+        let whole_frames = whole.feed(stream.as_bytes());
+
+        let mut split = SseParser::default();
+        let mut split_frames = Vec::new();
+        for b in stream.as_bytes() {
+            split_frames.extend(split.feed(&[*b]));
+        }
+        assert_eq!(whole_frames, split_frames);
+        assert_eq!(whole_frames.len(), 2);
+        assert_eq!(whole_frames[0].event, "change");
+        assert_eq!(whole_frames[0].data, "{}");
+        assert_eq!(whole_frames[1].event, "push");
+        assert_eq!(whole_frames[1].data, "{\"content\":\"hi\"}");
+    }
+
+    /// Comments (the app's `: connected` prime and its 20 s `: keep-alive`s)
+    /// and stray blank lines must produce no frames at all — a keep-alive that
+    /// dispatched an empty frame would spam `tools/list_changed`.
+    #[test]
+    fn sse_parser_ignores_comments_and_keepalives() {
+        let mut p = SseParser::default();
+        assert!(p.feed(b": connected\n\n").is_empty());
+        assert!(p.feed(b": keep-alive\n\n").is_empty());
+        assert!(p.feed(b"\n\n\n").is_empty());
+        // …and a real frame still lands after them.
+        let frames = p.feed(b": keep-alive\n\nevent: change\ndata: {}\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event, "change");
+    }
+
+    /// The rest of the grammar: CRLF terminators, multiple `data:` lines joined
+    /// with `\n`, ignored fields (`id`/`retry`), a value-less field, an absent
+    /// `event:` defaulting to `message`, and only ONE optional space stripped.
+    #[test]
+    fn sse_parser_grammar_details() {
+        let mut p = SseParser::default();
+        let frames = p.feed(
+            b"id: 7\r\nretry: 3000\r\nevent: push\r\ndata: one\r\ndata:  two\r\ndata\r\n\r\n",
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event, "push");
+        assert_eq!(frames[0].data, "one\n two\n");
+
+        let mut p = SseParser::default();
+        let frames = p.feed(b"data: bare\n\n");
+        assert_eq!(frames[0].event, "message", "SSE's default event name");
+        assert_eq!(frames[0].data, "bare");
+    }
+
+    /// The child owns the JSON-RPC framing: the app sends only the semantic
+    /// payload, and this is where it becomes `notifications/claude/channel`
+    /// params.
+    #[test]
+    fn channel_params_builds_the_notification_payload() {
+        let params = channel_params(r#"{"content":"audit done","meta":{"kind":"audit"}}"#).unwrap();
+        assert_eq!(params["content"], "audit done");
+        assert_eq!(params["meta"]["kind"], "audit");
+        let frame = notification_frame("notifications/claude/channel", Some(params));
+        assert_eq!(frame["method"], "notifications/claude/channel");
+        assert_eq!(frame["params"]["content"], "audit done");
+
+        // A push with no meta still carries an (empty) meta object.
+        let bare = channel_params(r#"{"content":"hi"}"#).unwrap();
+        assert!(bare["meta"].as_object().is_some_and(|m| m.is_empty()));
+    }
+
+    /// Re-validation at the child's parse boundary: keys the client would drop
+    /// silently are dropped here (visibly), and a content-less push is refused
+    /// rather than costing the session a turn to say nothing.
+    #[test]
+    fn channel_params_rejects_unusable_payloads() {
+        let filtered =
+            channel_params(r#"{"content":"x","meta":{"ok_1":"a","bad-key":"b","2nd":"c"}}"#)
+                .unwrap();
+        let meta = filtered["meta"].as_object().unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta["ok_1"], "a");
+
+        assert!(channel_params(r#"{"content":"   "}"#).is_none());
+        assert!(channel_params(r#"{"content":""}"#).is_none());
+        assert!(channel_params("not json").is_none());
+        assert!(channel_params(r#"{"meta":{"kind":"x"}}"#).is_none());
+    }
+
+    /// The two halves of the wire format must agree byte for byte: what the app
+    /// writes into an `event: push` frame is what this child parses out of it.
+    #[test]
+    fn app_push_frame_round_trips_through_the_parser() {
+        let notice = crate::offload::service::PushNotice::new(
+            "multi\nline\ncontent",
+            [("kind", "audit_done"), ("seq", "3")],
+        );
+        let bytes = crate::offload::loopback::push_frame(&notice);
+        let mut p = SseParser::default();
+        let frames = p.feed(&bytes);
+        assert_eq!(frames.len(), 1, "one frame, whatever the content contains");
+        assert_eq!(frames[0].event, "push");
+        let params = channel_params(&frames[0].data).unwrap();
+        assert_eq!(params["content"], "multi\nline\ncontent");
+        assert_eq!(params["meta"]["kind"], "audit_done");
+        assert_eq!(params["meta"]["seq"], "3");
+
+        // …and the frame the child finally writes satisfies the client's meta
+        // contract: keys `^[a-zA-Z_][a-zA-Z0-9_]*$` (others silently dropped)
+        // with STRING values. Pinned end to end from a real producer notice —
+        // this is what the Phase 0 spike rig used to verify by hand.
+        let frame = notification_frame("notifications/claude/channel", Some(params));
+        assert_eq!(frame["method"], "notifications/claude/channel");
+        let meta = frame["params"]["meta"].as_object().unwrap();
+        assert!(!meta.is_empty());
+        for (k, v) in meta {
+            assert!(
+                crate::offload::service::valid_meta_key(k),
+                "meta key `{k}` would be dropped by the client"
+            );
+            assert!(v.is_string(), "meta value for `{k}` must be a string");
+        }
     }
 
     #[test]

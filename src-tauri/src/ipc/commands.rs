@@ -564,13 +564,14 @@ pub async fn stt_list_input_devices() -> AppResult<Vec<String>> {
     crate::stt::list_input_devices()
 }
 
-/// Fetch the current Claude Code usage snapshot (session 5h + weekly 7d) for
-/// the bottom-bar usage tracker. Returns `None` when usage can't be obtained
-/// (not logged in, endpoint unreachable) — the frontend hides the widget in
-/// that case. Polled by the frontend on `usage.poll_interval_secs`.
+/// Read the current Claude Code usage snapshot (session 5h + weekly 7d) for
+/// the bottom-bar usage tracker: a local read of the status-line push file
+/// (see `crate::usage`) — no network. `snapshot` is `None` when no Claude tab
+/// has pushed data (or the last push expired) — the frontend hides the widget
+/// in that case. Polled by the frontend on `usage.poll_interval_secs`.
 #[tauri::command]
 pub async fn get_claude_usage() -> AppResult<crate::usage::UsageResult> {
-    Ok(crate::usage::fetch_usage().await)
+    Ok(crate::usage::pushed_usage())
 }
 
 /// Sample the system-monitor stats (CPU / memory / GPU / network) for the
@@ -866,7 +867,8 @@ pub async fn settings_update(
     // but not synced (or vice versa) — the miss used to surface as "the tab
     // only appears after a restart". The integrity pass that normally owns
     // these tabs only runs at load.
-    const RESERVED_TAB_FLAGS: &[(TabId, fn(&Settings) -> bool)] = &[
+    type ReservedTabFlag = (TabId, fn(&Settings) -> bool);
+    const RESERVED_TAB_FLAGS: &[ReservedTabFlag] = &[
         (TabId::GraphMonitor, |s| s.graph.enabled),
         (TabId::Workbench, |s| s.workbench.enabled),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
@@ -1330,7 +1332,9 @@ pub async fn graph_rebuild(
         Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
         _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
     };
-    service.spawn_rebuild(root);
+    // A user clicked Rebuild — the one graph path allowed to announce itself on
+    // the V30 session-push bus (and only if it also runs long enough to matter).
+    service.spawn_rebuild(root, crate::graph::RebuildOrigin::User);
     Ok(())
 }
 
@@ -2199,7 +2203,7 @@ pub async fn graph_usage_advice(
         Some((pairs, sessions)) if sessions > 0 => (Some(pairs as f64 / sessions as f64), sessions),
         _ => (None, 0),
     };
-    let e1_pass = hv.e1_status.trim().to_ascii_lowercase() == "pass";
+    let e1_pass = hv.e1_status.trim().eq_ignore_ascii_case("pass");
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -2777,7 +2781,8 @@ pub async fn graph_set_language_enabled(
         }
     });
     let root = resolve_graph_root(root)?;
-    service.spawn_rebuild(root);
+    // A Settings language toggle is a user action, like Rebuild.
+    service.spawn_rebuild(root, crate::graph::RebuildOrigin::User);
     Ok(())
 }
 
@@ -3064,18 +3069,20 @@ mod tests {
     // the live templates or the seeded flag.
     #[test]
     fn settings_update_preserves_out_of_band_prompt_templates() {
-        let mut cur = Settings::default();
-        cur.prompt_templates = vec![
-            PromptTemplate {
-                name: "review-this-diff".to_string(),
-                body: "R".to_string(),
-            },
-            PromptTemplate {
-                name: "my-new-template".to_string(),
-                body: "N".to_string(),
-            },
-        ];
-        cur.templates_seeded = true;
+        let mut cur = Settings {
+            prompt_templates: vec![
+                PromptTemplate {
+                    name: "review-this-diff".to_string(),
+                    body: "R".to_string(),
+                },
+                PromptTemplate {
+                    name: "my-new-template".to_string(),
+                    body: "N".to_string(),
+                },
+            ],
+            templates_seeded: true,
+            ..Settings::default()
+        };
 
         // The incoming snapshot represents an unrelated Settings-window save
         // (e.g. a theme flip) whose local copy of the template library is
@@ -3103,16 +3110,18 @@ mod tests {
     // Settings-window save must not revert live price edits.
     #[test]
     fn settings_update_preserves_out_of_band_llm_pricing() {
-        let mut cur = Settings::default();
-        cur.llm_pricing = vec![crate::settings::LlmPricingModel {
-            provider: "Custom".to_string(),
-            model: "my-model".to_string(),
-            model_prefix: String::new(),
-            input: 1.0,
-            cache_write: 2.0,
-            cache_read: 0.5,
-            output: 4.0,
-        }];
+        let mut cur = Settings {
+            llm_pricing: vec![crate::settings::LlmPricingModel {
+                provider: "Custom".to_string(),
+                model: "my-model".to_string(),
+                model_prefix: String::new(),
+                input: 1.0,
+                cache_write: 2.0,
+                cache_read: 0.5,
+                output: 4.0,
+            }],
+            ..Settings::default()
+        };
 
         let mut incoming = Settings::default();
         incoming.ui.theme = "future-light".to_string();

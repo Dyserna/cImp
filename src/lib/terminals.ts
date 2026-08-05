@@ -15,10 +15,17 @@
 //   destroy(tabId)  — invoked from the tab-closed handler. Runs every
 //                      teardown step the v1.2 Terminal.svelte's
 //                      onDestroy did, in the same order.
-//   attach(tabId, slot) — appendChild the host into a slot. Fits xterm
-//                      to the slot's pixel size and focuses on the next
-//                      animation frame.
-//   detach(tabId)   — moves the host back to the offscreen container.
+//   attach(tabId, slot) — appendChild the host into a slot. Acquires the
+//                      WebGL context (M17), fits xterm to the slot's pixel
+//                      size, and focuses on the next animation frame.
+//   detach(tabId)   — releases the WebGL context (M17), then moves the host
+//                      back to the offscreen container.
+//
+// M17 renderer policy: a WebGL2 context is a scarce per-process resource
+// (WebView2 caps them at ~16 and evicts the LRU past that), so it is bound
+// to VISIBILITY, not to a terminal's lifetime — attach loads the addon,
+// detach disposes it, everything stashed offscreen paints via xterm's
+// in-core DOM renderer. See `shouldHoldWebgl` in terminal/background.ts.
 //
 // xterm.js survives parent changes because the Terminal object holds
 // a reference to its `term.open(host)` element regardless of where
@@ -29,7 +36,7 @@
 
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { CanvasAddon } from '@xterm/addon-canvas';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import './terminals.css';
@@ -64,6 +71,7 @@ import {
   composeTheme,
   effectiveBackgroundMode,
   recreateDebounceDelay,
+  shouldHoldWebgl,
 } from './terminal/background';
 import { setTerminalFocuser } from './terminalFocus';
 import { perTabClosedState } from './avatarState';
@@ -126,7 +134,7 @@ interface TerminalEntry {
   /// `createTerminal`.
   selectionListener: { dispose: () => void } | null;
   /// Renderer category currently active on this Terminal — `'fast'`
-  /// for the canvas-with-no-image path (mode 'none' or 'color') and
+  /// for the WebGL-with-no-image path (mode 'none' or 'color') and
   /// `'image'` for the DOM-with-image path. The settings subscriber
   /// compares the next mode's category against this to decide between
   /// in-place update and full recreate.
@@ -153,6 +161,26 @@ interface TerminalEntry {
   /// to a fresh Channel because the Tauri bridge can only target one
   /// receiver per channel.
   bytesChannel: BytesChannel;
+  /// V29/M17: the live WebGL renderer addon, or `null` when this Terminal
+  /// is on xterm's in-core DOM renderer. Non-null only while the terminal
+  /// is visible AND eligible — see `syncWebglRenderer` / `shouldHoldWebgl`.
+  /// (Pre-M17 this handle lived in a closure because it was never unloaded;
+  /// the visibility policy makes load/dispose a per-attach operation, so the
+  /// entry has to own it.)
+  webglAddon: WebglAddon | null;
+  /// M17: sticky "WebGL2 is not usable on this Terminal" flag. Set when
+  /// `loadAddon` throws (no WebGL2 context: GPU blocklist, RDP, headless)
+  /// or when the one permitted context-loss retry also lost its context.
+  /// Deliberately survives stash→show cycles: without it, every tab switch
+  /// would re-probe a machine that already proved it has no usable WebGL,
+  /// re-emitting the DOM-fallback warning forever. Cleared only by a full
+  /// Terminal recreate (renderer flip) or a tab restart.
+  webglFailed: boolean;
+  /// One-shot context-loss retry latch for the current *visible* session.
+  /// Reset on detach, so a terminal that recovers after being stashed gets
+  /// a fresh retry budget the next time it comes on screen; never reset by
+  /// the retry itself (that would loop against a resetting driver).
+  webglRetried: boolean;
 }
 
 const entries = new Map<TabId, TerminalEntry>();
@@ -413,6 +441,116 @@ function wheelSequence(
   )}${String.fromCharCode(32 + Math.min(row, 223))}`;
 }
 
+/**
+ * V29/M17: bring this terminal's renderer in line with the WebGL policy —
+ * **only visible terminals hold a WebGL2 context** (rationale + the
+ * context-cap arithmetic live on `shouldHoldWebgl` in
+ * `terminal/background.ts`; decision D-7b in
+ * `docs/MILESTONE-V29-xterm6-renderer.md` records the policy).
+ *
+ * Idempotent, so every attach/detach can just call it. The two transitions
+ * are driven from `attachTerminal` / `detachTerminal` — the single seam
+ * where a host moves between a pane slot and the offscreen stash — and from
+ * the context-loss handler.
+ */
+function syncWebglRenderer(entry: TerminalEntry): void {
+  const want = shouldHoldWebgl(entry);
+  if (want === (entry.webglAddon !== null)) return;
+  if (want) loadWebglRenderer(entry);
+  else unloadWebglRenderer(entry);
+}
+
+/**
+ * V29: loads the WebGL renderer addon onto an already-opened Terminal.
+ *
+ * Must run AFTER `term.open(host)` — but not because open() could fail:
+ * xterm 6's `open()` wraps the `onWillOpen` fire in a swallowing try/catch,
+ * so a pre-open addon whose deferred `activate` throws is silently eaten and
+ * the terminal quietly ends up on the DOM renderer. That silence is exactly
+ * the problem. Post-open `loadAddon` activates *synchronously*, so the throw
+ * ("WebGL2 not supported" — GPU blocklist, RDP, headless) surfaces to the
+ * try/catch below, which is what lets us (a) latch `webglFailed` so we stop
+ * re-probing and (b) emit the DOM-fallback `console.warn` — the only signal
+ * that a machine is running without GPU acceleration.
+ *
+ * Context-loss policy: dispose the lost addon (xterm reverts to the DOM
+ * renderer on its own; buffer, PTY, and listeners survive) and attempt
+ * exactly ONE fresh load per visible session. If that retry loses its
+ * context too, this Terminal latches `webglFailed` and stays on DOM — no
+ * retry loop against a resetting driver, and no re-probe on every tab
+ * switch. `webglFailed` is per-`TerminalEntry`, so anything that builds a new
+ * Terminal — a renderer-flip recreate (`queueRecreate`) or closing and
+ * reopening the tab — re-attempts. A PTY restart does not: it reuses the same
+ * Terminal, and re-probing a driver that just refused us buys nothing.
+ */
+function loadWebglRenderer(entry: TerminalEntry): void {
+  const { term, tabId } = entry;
+  const addon = new WebglAddon();
+  // Registered before loadAddon: activation is what wires the renderer's
+  // context-loss event through, and a load that throws must still leave a
+  // consistent (disposed) addon behind.
+  addon.onContextLoss(() => {
+    // The loss fires 3 s after the browser drops the context, so by now the
+    // tab may have been closed, recreated (V1.4-03 renderer flip), or
+    // stashed offscreen (which disposed this addon already).
+    try {
+      addon.dispose();
+    } catch {
+      /* already torn down with the Terminal — nothing to do */
+    }
+    const live = entries.get(tabId);
+    if (!live || live.term !== term) return;
+    if (live.webglAddon !== addon) return;
+    live.webglAddon = null;
+    if (live.webglRetried) {
+      live.webglFailed = true;
+      console.warn(
+        `WebGL context lost twice for tab ${tabId}; ` +
+          'terminal falls back to the DOM renderer.',
+      );
+      return;
+    }
+    live.webglRetried = true;
+    // Re-checks the policy: a tab stashed during the 3 s loss timer stays on
+    // DOM until it is shown again.
+    syncWebglRenderer(live);
+  });
+  try {
+    term.loadAddon(addon);
+    entry.webglAddon = addon;
+  } catch (e) {
+    // Leaves the addon registered-but-inert in xterm's AddonManager
+    // otherwise: loadAddon pushes before it calls activate().
+    addon.dispose();
+    entry.webglAddon = null;
+    entry.webglFailed = true;
+    console.warn(
+      `WebGL renderer unavailable for tab ${tabId}; ` +
+        'terminal falls back to the DOM renderer:',
+      e,
+    );
+  }
+}
+
+/**
+ * M17: release this terminal's WebGL2 context. `WebglAddon.dispose()` hands
+ * the RenderService a fresh in-core DOM renderer and removes the WebGL
+ * canvas, so the terminal keeps painting — buffer, PTY, listeners, and
+ * scrollback are untouched (this is the same path the context-loss fallback
+ * already used). Never fires `onContextLoss`: that event comes from the
+ * canvas's `webglcontextlost` listener, which disposal removes.
+ */
+function unloadWebglRenderer(entry: TerminalEntry): void {
+  const addon = entry.webglAddon;
+  if (!addon) return;
+  entry.webglAddon = null;
+  try {
+    addon.dispose();
+  } catch (e) {
+    console.warn(`WebGL addon dispose for ${entry.tabId} threw:`, e);
+  }
+}
+
 function fitAndResize(entry: TerminalEntry): void {
   if (!hostIsFittable(entry)) return;
   entry.fitAddon.fit();
@@ -565,7 +703,7 @@ export function createTerminal(
     theme: initialTheme,
     // V1.4-02: image mode requires transparency so the CSS image
     // beneath the cells layer is visible. Color-only and 'none' modes
-    // skip this so the canvas renderer paints opaque cells (faster).
+    // skip this so the WebGL renderer paints opaque cells (faster).
     ...(initialCategory === 'image' ? { allowTransparency: true } : {}),
     // V1.4-03: on a renderer recreate, construct at the previous
     // terminal's geometry so the replayed scrollback's cursor positions
@@ -588,13 +726,14 @@ export function createTerminal(
   // ever happens.
   const serializeAddon = new SerializeAddon();
   term.loadAddon(serializeAddon);
-  // V1.4-02: canvas renderer for the fast path (no image). Image mode
-  // stays on the in-core DOM renderer — the canvas addon is a single
-  // opaque surface and would obscure the CSS image beneath.
-  if (initialCategory !== 'image') {
-    term.loadAddon(new CanvasAddon());
-  }
   term.open(host);
+  // V1.4-02 / V29 / M17 renderer policy: the WebGL addon is NOT loaded here.
+  // A fresh terminal is born in the offscreen stash (`attached: false`), and
+  // only VISIBLE terminals hold a WebGL2 context — `attachTerminal` loads it,
+  // `detachTerminal` disposes it. Loading at construction gave every kept-
+  // alive tab its own context and blew past WebView2's ~16-context cap; see
+  // `shouldHoldWebgl`. Image-background terminals never take the fast path at
+  // all (the opaque WebGL canvas would hide the CSS image beneath).
 
   // V1.4-03: replay the captured scrollback before binding the PTY
   // channel. xterm processes its write queue FIFO, so the snapshot
@@ -625,6 +764,9 @@ export function createTerminal(
     resizeObserver: null,
     attached: false,
     bytesChannel: placeholderChannel,
+    webglAddon: null,
+    webglFailed: false,
+    webglRetried: false,
   };
   entries.set(tabId, entry);
   // Idempotent: only the first call actually registers. Run it from
@@ -659,8 +801,8 @@ export function createTerminal(
   //     CSS variable updates on the host. xterm.js diffs colors
   //     internally so identical themes are a no-op.
   //   - When the renderer category flips (fast↔image), the Terminal
-  //     must be recreated — the canvas addon is loaded once at
-  //     construction and `allowTransparency` is constructor-only.
+  //     must be recreated — `allowTransparency` is constructor-only, and
+  //     `bgCategory` is baked into this Terminal's WebGL eligibility.
   //     `queueRecreate` debounces so live slider drags during a global
   //     edit don't thrash. V1.4-03: the recreate path captures
   //     scrollback via the serialize addon, then uses pty_rebind
@@ -827,8 +969,11 @@ export function createTerminal(
 
 /// V1.4-02 recreate-on-toggle debounce. A category flip
 /// (fast ↔ image) requires a full Terminal recreation because the
-/// canvas addon and `allowTransparency` are construction-time
-/// decisions. Live slider drags during a global edit can fire many
+/// `allowTransparency` option is a construction-time decision (the M17
+/// renderer policy makes the WebGL addon itself load/unload dynamically,
+/// but `bgCategory` is still baked in at construction — and the recreate
+/// conveniently clears the `webglFailed` latch too).
+/// Live slider drags during a global edit can fire many
 /// settings updates per second; debouncing collapses them into a
 /// single recreate after the user pauses.
 const recreateTimers = new Map<TabId, ReturnType<typeof setTimeout>>();
@@ -974,6 +1119,16 @@ export function attachTerminal(
     slot.appendChild(entry.host);
   }
   entry.attached = true;
+  // M17: acquire the WebGL2 context now that this terminal is on screen.
+  // Synchronous and in the same task as the DOM move on purpose — the
+  // renderer swap (DomRenderer out, WebGL canvas in, `RenderService
+  // .setRenderer` → `_fullRefresh`) is queued before the browser paints this
+  // frame, so the user never sees an intermediate state. Deferring it to the
+  // rAF below would expose one frame of bare host background. The addon
+  // measures via CharSizeService (already measured at `term.open`), not host
+  // layout, so it does not need the post-attach fit to have run — the fit
+  // right below resizes the fresh renderer exactly as it did pre-M17.
+  syncWebglRenderer(entry);
   const wantFocus = options.focus ?? false;
   requestAnimationFrame(() => {
     if (entries.get(tabId) !== entry) return;
@@ -994,6 +1149,16 @@ export function detachTerminal(tabId: TabId, fromSlot?: HTMLElement): void {
   if (!entry) return;
   if (fromSlot && entry.host.parentElement !== fromSlot) return;
   entry.attached = false;
+  // M17: release the WebGL2 context before the host leaves the slot, while it
+  // still has real layout for the replacement DOM renderer to size against.
+  // The repaint that `setRenderer` queues lands on the next frame — by then
+  // the host is already offscreen, so the outgoing tab shows no flicker.
+  // Reset the one-shot context-loss retry budget: the next time this terminal
+  // is shown it starts a new visible session. The sticky `webglFailed` latch
+  // is deliberately NOT reset — a machine without usable WebGL must not be
+  // re-probed (and re-warned about) on every tab switch.
+  entry.webglRetried = false;
+  syncWebglRenderer(entry);
   const offscreen = ensureOffscreen();
   if (entry.host.parentElement !== offscreen) {
     offscreen.appendChild(entry.host);

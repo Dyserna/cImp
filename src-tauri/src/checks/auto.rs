@@ -167,10 +167,14 @@ pub fn spawn_failure_line(name: &str, err: &str) -> String {
 /// result instead of re-running. Diffing that shared result against each
 /// caller's own (per-session) baseline is the caller's job (`GraphService`),
 /// not this runner's. Shared across every session on `GraphService`.
+/// One root's cached run: when it finished, its reports, and the per-check
+/// error strings.
+type CachedRun = (Instant, Vec<CheckReport>, Vec<String>);
+
 #[derive(Default)]
 pub struct RootRunner {
     locks: StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
-    last: StdMutex<HashMap<PathBuf, (Instant, Vec<CheckReport>, Vec<String>)>>,
+    last: StdMutex<HashMap<PathBuf, CachedRun>>,
 }
 
 impl RootRunner {
@@ -342,8 +346,10 @@ mod tests {
 
     #[test]
     fn pending_block_drains_exactly_once() {
-        let mut state = AutoCheckState::default();
-        state.pending = Some("new diagnostics".to_string());
+        let mut state = AutoCheckState {
+            pending: Some("new diagnostics".to_string()),
+            ..AutoCheckState::default()
+        };
         assert_eq!(state.pending.take().as_deref(), Some("new diagnostics"));
         assert_eq!(state.pending, None, "a second drain must see nothing");
     }

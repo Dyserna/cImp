@@ -505,7 +505,10 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
         Err(msg) => return Ok(tool_error(&msg)),
     };
 
-    let result = dispatch_recorded(&root, &idx, &settings, source, name, &args).await;
+    // V28: the headless fallback path (the app is down, so the child opened
+    // graph.db directly) has no live-session registry to resolve a tab against —
+    // `None` keeps the pre-V28 most-recent-session scoping.
+    let result = dispatch_recorded(&root, &idx, &settings, source, name, &args, None).await;
 
     match result {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
@@ -520,6 +523,13 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
 /// (a tab agent) or `"offload"` (the local worker); it drives both the ring's
 /// source badge and the `context_*` tools' per-agent session scoping. Shared by
 /// the cloud (warm + fallback) and worker paths so each call is captured once.
+///
+/// V28 (issue #13): `session` is the EXPLICIT session id resolved from the
+/// calling tab (`/graph_run`'s `tab` field → the live-session registry). When
+/// present, the session-scoped tools use it verbatim; `None` falls back to
+/// exactly the pre-V28 `mem_current_session_for(agent)` behavior, so a missing,
+/// unknown or TTL-stale tab degrades instead of erroring.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_recorded(
     root: &Path,
     idx: &GraphIndex,
@@ -527,6 +537,7 @@ pub(crate) async fn dispatch_recorded(
     source: &str,
     name: &str,
     args: &Value,
+    session: Option<&str>,
 ) -> Result<String, String> {
     let (max_rows, max_snippet) = limits(settings);
     let started = crate::activity::now_ms();
@@ -563,7 +574,7 @@ pub(crate) async fn dispatch_recorded(
             settings.graph.max_body_bytes as usize,
         )
     } else if name == "graph_repo_map" {
-        run_repo_map(idx, settings, args, mem_agent(source))
+        run_repo_map(idx, settings, args, mem_agent(source), session)
     } else if name == "graph_impact" {
         run_impact(root, idx, args, max_rows)
     } else if name == "graph_tests_for" {
@@ -573,7 +584,15 @@ pub(crate) async fn dispatch_recorded(
     } else if name == "graph_architecture" {
         run_architecture(idx, settings, args, max_rows)
     } else {
-        run_tool(idx, name, args, max_rows, max_snippet, mem_agent(source))
+        run_tool(
+            idx,
+            name,
+            args,
+            max_rows,
+            max_snippet,
+            mem_agent(source),
+            session,
+        )
     };
     crate::activity::record_bg(crate::activity::ActivityRecord {
         entry: crate::activity::ActivityEntry::new(
@@ -652,6 +671,28 @@ fn require_str(args: &Value, tool: &str, key: &str) -> Result<String, String> {
     }
 }
 
+/// V28 (issue #13): the session id a session-scoped tool operates on. Prefers
+/// the EXPLICIT session the caller resolved from its tab id (the live-session
+/// registry), and falls back to exactly the pre-V28 behavior — the
+/// most-recently-active session for `agent` — when the caller has no tab
+/// identity (offload worker, headless MCP child, pre-upgrade child with no
+/// `--tab`, unknown/TTL-stale tab key).
+///
+/// A blank explicit session counts as absent: an empty string is not a session
+/// id, and letting it through would scope every memory read to a sentinel row.
+fn scoped_session(
+    idx: &GraphIndex,
+    agent: Option<&str>,
+    session: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(sid) = session.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(sid.to_string()));
+    }
+    idx.mem_current_session_for(agent)
+        .map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_tool(
     idx: &GraphIndex,
     name: &str,
@@ -662,6 +703,10 @@ pub fn run_tool(
     // caller's own session (`Some("claude")`/`Some("opencode")`), or `None` for
     // the project-wide most-recent session (the offload worker's sub-tasks).
     agent: Option<&str>,
+    // V28: the caller tab's CURRENT session id, when the live-session registry
+    // could prove one. Overrides the `agent` most-recent lookup so two tabs of
+    // the same agent don't share a memory scope; `None` = pre-V28 behavior.
+    session: Option<&str>,
 ) -> Result<String, String> {
     let arg = |key: &str| -> String {
         args.get(key)
@@ -756,10 +801,7 @@ pub fn run_tool(
                 .map_err(|e| e.to_string())
         }
         "context_recall" => {
-            let Some(sid) = idx
-                .mem_current_session_for(agent)
-                .map_err(|e| e.to_string())?
-            else {
+            let Some(sid) = scoped_session(idx, agent, session)? else {
                 return Ok("No session activity recorded yet.".to_string());
             };
             let ws = idx
@@ -779,10 +821,7 @@ pub fn run_tool(
             Ok(out)
         }
         "context_notes" => {
-            let sid = idx
-                .mem_current_session_for(agent)
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default();
+            let sid = scoped_session(idx, agent, session)?.unwrap_or_default();
             idx.mem_notes(&sid)
                 .map(|v| fmt_notes(&v, max_rows))
                 .map_err(|e| e.to_string())
@@ -795,10 +834,7 @@ pub fn run_tool(
             // working set the model reloads, yet the old code still said "Noted."
             // A PINNED note is global (surfaces regardless of session), so accept
             // it; otherwise refuse honestly instead of silently orphaning it.
-            let sid = match idx
-                .mem_current_session_for(agent)
-                .map_err(|e| e.to_string())?
-            {
+            let sid = match scoped_session(idx, agent, session)? {
                 Some(s) => s,
                 None if pin => String::new(),
                 None => {
@@ -1202,7 +1238,10 @@ pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Resul
     for root in roots {
         match open_project_index_confined(root, &sub) {
             Ok((resolved, idx)) => {
-                return dispatch_recorded(&resolved, &idx, &settings, "offload", name, args).await;
+                // V28: the offload worker has no tab (invariant: the `offload`
+                // consumer keeps its agent-`None`, project-wide scope).
+                return dispatch_recorded(&resolved, &idx, &settings, "offload", name, args, None)
+                    .await;
             }
             Err(e) => last_err = e,
         }
@@ -1676,6 +1715,10 @@ fn run_repo_map(
     settings: &crate::settings::Settings,
     args: &Value,
     agent: Option<&str>,
+    // V28: same explicit-session identity the `context_*` tools take — the
+    // repo-map boost is a session-scoped READ too, so without it a second
+    // same-agent tab's map is ranked by the other tab's working set.
+    session: Option<&str>,
 ) -> Result<String, String> {
     let budget = args
         .get("budget_chars")
@@ -1686,7 +1729,7 @@ fn run_repo_map(
         // degenerate empty map with no error.
         .map(|n| (n as usize).clamp(500, 200_000))
         .unwrap_or(settings.graph.repo_map_budget_chars as usize);
-    let boost = repo_map_session_boost(idx, agent);
+    let boost = repo_map_session_boost(idx, agent, session);
     let map = super::context::repo_map(idx, budget, &boost);
     if map.is_empty() {
         Ok("No project map yet — the graph has no call edges to rank files by.".to_string())
@@ -1889,9 +1932,11 @@ fn parse_edge_kinds(s: Option<&str>) -> Result<Vec<EdgeKind>, String> {
             "call" | "calls" => out.push(EdgeKind::Call),
             "import" | "imports" => out.push(EdgeKind::Import),
             "contains" | "containment" => out.push(EdgeKind::Contains),
-            other => return Err(format!(
+            other => {
+                return Err(format!(
                 "graph_path `kinds` has unknown edge kind `{other}` (use call, import, contains)"
-            )),
+            ))
+            }
         }
     }
     Ok(if out.is_empty() { all() } else { out })
@@ -2119,8 +2164,12 @@ fn fmt_affected_tests(tests: &[SymbolHit], max_rows: usize) -> String {
 
 /// The caller's session working set as `(path, weight)` for repo-map ranking,
 /// or empty when there's no scoped session (the offload worker) or no activity.
-fn repo_map_session_boost(idx: &GraphIndex, agent: Option<&str>) -> Vec<(String, f64)> {
-    let Ok(Some(sid)) = idx.mem_current_session_for(agent) else {
+fn repo_map_session_boost(
+    idx: &GraphIndex,
+    agent: Option<&str>,
+    session: Option<&str>,
+) -> Vec<(String, f64)> {
+    let Ok(Some(sid)) = scoped_session(idx, agent, session) else {
         return Vec::new();
     };
     let Ok(ws) = idx.mem_working_set(&sid, 20) else {
@@ -2210,8 +2259,10 @@ mod run_check_tests {
 
     #[tokio::test]
     async fn unknown_name_lists_configured_checks() {
-        let mut settings = Settings::default();
-        settings.checks = vec![def("cargo", "cargo check")];
+        let settings = Settings {
+            checks: vec![def("cargo", "cargo check")],
+            ..Settings::default()
+        };
         let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({ "name": "nope" }))
             .await
             .expect_err("unknown name should error");
@@ -2221,8 +2272,10 @@ mod run_check_tests {
 
     #[tokio::test]
     async fn ambiguous_without_name_lists_configured_checks() {
-        let mut settings = Settings::default();
-        settings.checks = vec![def("cargo", "cargo check"), def("tsc", "tsc --noEmit")];
+        let settings = Settings {
+            checks: vec![def("cargo", "cargo check"), def("tsc", "tsc --noEmit")],
+            ..Settings::default()
+        };
         let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
             .await
             .expect_err("multiple configured checks with no name should error");
@@ -2233,8 +2286,10 @@ mod run_check_tests {
     #[tokio::test]
     async fn sole_configured_check_runs_without_a_name() {
         let cargo = which::which("cargo").expect("cargo on PATH");
-        let mut settings = Settings::default();
-        settings.checks = vec![def("only", &format!("\"{}\" --version", cargo.display()))];
+        let settings = Settings {
+            checks: vec![def("only", &format!("\"{}\" --version", cargo.display()))],
+            ..Settings::default()
+        };
         let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
             .await
             .expect("ok result");
@@ -2636,8 +2691,16 @@ mod recall_facts_tests {
         idx.add_project_fact("f2", "the retry cap is 30s by design", "s1", 60, false)
             .unwrap();
 
-        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude"))
-            .expect("run_tool");
+        let out = run_tool(
+            &idx,
+            "context_recall",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            None,
+        )
+        .expect("run_tool");
         assert!(out.contains("## Project facts"), "{out}");
         assert!(out.contains("we chose FNV hashing for stability"), "{out}");
         assert!(out.contains("the retry cap is 30s by design"), "{out}");
@@ -2657,11 +2720,211 @@ mod recall_facts_tests {
         idx.record_mem_event("s1", "claude", "read", "a.rs", None, None, 100, None)
             .unwrap();
 
-        let out = run_tool(&idx, "context_recall", &json!({}), 50, 200, Some("claude"))
-            .expect("run_tool");
+        let out = run_tool(
+            &idx,
+            "context_recall",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            None,
+        )
+        .expect("run_tool");
         assert!(!out.contains("## Project facts"), "{out}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// V28 (issue #13): the `context_*` tools honor an EXPLICIT session id (resolved
+/// from the calling tab) and fall back to exactly the pre-V28
+/// most-recent-session-for-this-agent behavior when they get none.
+#[cfg(test)]
+mod session_scope_tests {
+    use super::{run_tool, GraphIndex};
+    use serde_json::json;
+
+    struct Tmp(std::path::PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Two Claude sessions on one project — the two-same-agent-tabs case. `s_b`
+    /// is the more recent one, so it is what the pre-V28 fallback resolves to.
+    fn two_session_index(tag: &str) -> (Tmp, GraphIndex) {
+        let dir = std::env::temp_dir().join(format!("v28-{tag}-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.record_mem_event("ses_a", "claude", "read", "alpha.rs", None, None, 100, None)
+            .unwrap();
+        idx.record_mem_event("ses_b", "claude", "read", "beta.rs", None, None, 200, None)
+            .unwrap();
+        (Tmp(dir), idx)
+    }
+
+    fn notes(idx: &GraphIndex, session: Option<&str>) -> String {
+        run_tool(
+            idx,
+            "context_notes",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            session,
+        )
+        .expect("context_notes")
+    }
+
+    #[test]
+    fn a_note_written_under_one_session_is_invisible_to_the_other() {
+        let (_tmp, idx) = two_session_index("isolation");
+
+        // Tab A writes a note with its own session explicitly resolved.
+        let ack = run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "A's working theory" }),
+            50,
+            200,
+            Some("claude"),
+            Some("ses_a"),
+        )
+        .expect("context_note");
+        assert!(ack.starts_with("Noted"), "{ack}");
+
+        // Tab B — same agent, same project, MORE RECENT session — must not see
+        // it. Before V28 both tabs resolved to `ses_b`, so A's note landed in
+        // B's scope and B read it back.
+        let b = notes(&idx, Some("ses_b"));
+        assert!(
+            !b.contains("A's working theory"),
+            "tab B must not read tab A's note: {b}"
+        );
+        assert_eq!(b, "No notes recorded for this session.");
+
+        // ...and A still round-trips its own.
+        let a = notes(&idx, Some("ses_a"));
+        assert!(a.contains("A's working theory"), "{a}");
+    }
+
+    #[test]
+    fn recall_is_scoped_to_the_explicit_session() {
+        let (_tmp, idx) = two_session_index("recall");
+        let a = run_tool(
+            &idx,
+            "context_recall",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            Some("ses_a"),
+        )
+        .expect("recall");
+        assert!(a.contains("alpha.rs"), "{a}");
+        assert!(!a.contains("beta.rs"), "{a}");
+
+        let b = run_tool(
+            &idx,
+            "context_recall",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            Some("ses_b"),
+        )
+        .expect("recall");
+        assert!(b.contains("beta.rs"), "{b}");
+        assert!(!b.contains("alpha.rs"), "{b}");
+    }
+
+    #[test]
+    fn no_explicit_session_reproduces_the_pre_v28_fallback() {
+        // The fail-open contract: a child with no `--tab`, an unknown tab key,
+        // or a TTL-stale registry entry all arrive here as `None`, and must
+        // behave byte-identically to today — most-recent session for the agent.
+        let (_tmp, idx) = two_session_index("fallback");
+        run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "fallback note" }),
+            50,
+            200,
+            Some("claude"),
+            None,
+        )
+        .expect("context_note");
+
+        // `ses_b` is the most recent session, so that is where it landed.
+        assert!(notes(&idx, Some("ses_b")).contains("fallback note"));
+        assert!(!notes(&idx, Some("ses_a")).contains("fallback note"));
+        // ...and reading with no session resolves the same way.
+        assert!(notes(&idx, None).contains("fallback note"));
+
+        let recall = run_tool(
+            &idx,
+            "context_recall",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            None,
+        )
+        .expect("recall");
+        assert!(recall.contains("beta.rs"), "{recall}");
+        assert!(!recall.contains("alpha.rs"), "{recall}");
+    }
+
+    #[test]
+    fn a_blank_explicit_session_is_treated_as_absent() {
+        // Defence in depth at the parse boundary: `--tab ""` / a whitespace tab
+        // id must not scope every memory read to a sentinel "" session.
+        let (_tmp, idx) = two_session_index("blank");
+        for blank in ["", "   "] {
+            assert_eq!(
+                notes(&idx, Some(blank)),
+                notes(&idx, None),
+                "blank session {blank:?} must fall back, not scope to \"\""
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_explicit_session_is_empty_not_an_error() {
+        // A session id the registry knows but the graph has no rows for (e.g. a
+        // brand-new session whose first event hasn't been recorded yet) reads as
+        // empty — never as another tab's data, and never as a tool error.
+        let (_tmp, idx) = two_session_index("unknown");
+        assert_eq!(
+            notes(&idx, Some("ses_never_seen")),
+            "No notes recorded for this session."
+        );
+        let recall = run_tool(
+            &idx,
+            "context_recall",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            Some("ses_never_seen"),
+        )
+        .expect("recall must not error");
+        assert!(!recall.contains("alpha.rs"), "{recall}");
+        assert!(!recall.contains("beta.rs"), "{recall}");
+    }
+
+    #[test]
+    fn the_offload_worker_keeps_its_agent_none_project_wide_scope() {
+        // Invariant: workers have no tab, so they resolve project-wide latest —
+        // unchanged by V28.
+        let (_tmp, idx) = two_session_index("offload");
+        idx.record_mem_event(
+            "ses_oc", "opencode", "read", "gamma.rs", None, None, 300, None,
+        )
+        .unwrap();
+        let out =
+            run_tool(&idx, "context_recall", &json!({}), 50, 200, None, None).expect("recall");
+        assert!(out.contains("gamma.rs"), "{out}");
     }
 }
 
@@ -2757,6 +3020,7 @@ mod surface_tests {
             &serde_json::json!({}),
             50,
             200,
+            None,
             None,
         )
         .expect("hidden tool still dispatches");

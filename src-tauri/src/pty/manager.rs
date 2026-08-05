@@ -31,6 +31,17 @@ pub struct PtyLaunchSpec {
     /// environment. Empty for AI builtins; user Shell tabs may set per-tab
     /// vars (the M2 dialog leaves env empty — schema reserved, UI deferred).
     pub env: std::collections::HashMap<String, String>,
+    /// V30 (review M9): inherited variables to STRIP before `env` is applied.
+    ///
+    /// The child otherwise inherits cImp's whole environment, which is wrong for
+    /// the harness markers of a Claude Code session cImp itself was launched
+    /// from: `CLAUDE_CODE_CHILD_SESSION=1` makes a spawned Claude run with no
+    /// transcript, no history and no session records, which silently blinds the
+    /// out-of-band tap (no TTS, no usage, no live-session registry entry, no V28
+    /// scoping) — spike-documented in `docs/MILESTONE-V30-mcp-channels.md`.
+    /// Resolved by `tabs::config::ai_env_removals`; empty for Shell tabs, whose
+    /// whole point is the environment the user actually has.
+    pub env_remove: Vec<String>,
     /// V20: the out-of-band TTS source to attach once the child is up (Claude
     /// transcript tail / OpenCode event stream). `None` for shell tabs and any
     /// AI tab whose source can't be resolved. The source rides the tab's PTY
@@ -40,6 +51,28 @@ pub struct PtyLaunchSpec {
 
 pub struct PtyManager {
     inner: Arc<TokioMutex<Option<PtyHandle>>>,
+}
+
+/// Shape the child's environment: strip first, then add.
+///
+/// `CommandBuilder::new` seeds itself with a snapshot of THIS process's
+/// environment, so `env_remove` genuinely un-inherits a variable (portable-pty
+/// 0.9's `CommandBuilder::env_remove`, verified against the pinned source).
+/// Removals run BEFORE the additions so an explicit per-tab `env` entry always
+/// wins — a user who deliberately sets one of the scrubbed vars keeps it (the
+/// resolver in `tabs::config` also declines to list such a key, so this is the
+/// second of two guards).
+fn apply_env(
+    cmd: &mut CommandBuilder,
+    env: &std::collections::HashMap<String, String>,
+    env_remove: &[String],
+) {
+    for key in env_remove {
+        cmd.env_remove(key);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
 }
 
 /// Control messages routed to the per-PTY processor task. Currently used to
@@ -57,6 +90,20 @@ pub enum ProcessorControl {
     /// burst fallback is suppressed; the `claude_working` marker path stays
     /// live, so real activity during/after a resize is still detected.
     Resized,
+    /// M11 (2026-08-05 review): drop the permission detector's LATCHED pattern
+    /// name for this tab without emitting anything, so the next scan tick can
+    /// re-`Detected` a prompt that is still on screen.
+    ///
+    /// Sent by the NC-2 hook path (`offload::loopback::handle_permission_event`)
+    /// whenever a `PermissionDenied` clears `awaiting_permission`. That clear is
+    /// deliberately eager — an auto-denied call can land while a genuine
+    /// approval prompt is visible — and the regex detector is edge-triggered:
+    /// while the same pattern keeps matching, `(Some, Some)` with the same name
+    /// emits NOTHING, so without this the badge/TTS stayed cleared until the
+    /// user typed. The processor answers it with
+    /// `PermissionDetector::force_clear(Permission)`, the same primitive the
+    /// Working-kind stale path already uses.
+    ClearPermissionLatch,
 }
 
 struct PtyHandle {
@@ -147,9 +194,7 @@ impl PtyManager {
             cmd.arg(arg);
         }
         cmd.cwd(&spec.working_dir);
-        for (key, value) in &spec.env {
-            cmd.env(key, value);
-        }
+        apply_env(&mut cmd, &spec.env, &spec.env_remove);
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
@@ -214,6 +259,14 @@ impl PtyManager {
         let mem = app
             .try_state::<Arc<crate::graph::GraphService>>()
             .map(|s| s.inner().clone());
+        // V30 Phase D: the session-push bus, so the OpenCode tap can subscribe
+        // its tab in-process and forward notices over OpenCode's HTTP API. Only
+        // the send half's registry travels (not the service), exactly like the
+        // Phase C producers in `main.rs` — no Arc cycle. Absent in
+        // headless/test builds ⇒ `None` ⇒ no fanout.
+        let pushes = app
+            .try_state::<Arc<crate::offload::OffloadService>>()
+            .map(|s| s.push_registry());
         let oob_ctx = spec.oob.clone().map(|oob_spec| {
             (
                 oob_spec,
@@ -224,6 +277,7 @@ impl PtyManager {
                     settings: settings.clone(),
                     cancel: cancel.clone(),
                     mem: mem.clone(),
+                    pushes: pushes.clone(),
                 },
             )
         });
@@ -252,6 +306,17 @@ impl PtyManager {
         );
         tasks::spawn_waiter(tab.clone(), child, app, cancel.clone(), state_signals);
 
+        // H1-R3 (2026-08-05 review): KEEP THIS IN THE SAME SYNCHRONOUS STRETCH
+        // as the `spawn_command` above — do not insert an `.await` (or any
+        // fallible/slow step that could park) between the child spawn and this
+        // call. The V28 ambiguity predicate only counts tabs whose tap has
+        // declared its transcript root, so between "child running" and "tap
+        // registered" a second Claude tab is invisible as a co-tenant and a
+        // sibling tap can bind confidently to the wrong session
+        // (docs/MILESTONE-V28-session-identity.md § "Launch-order window").
+        // Today the gap is ~15 sync statements — sub-millisecond, against
+        // Claude's multi-second boot before it writes a transcript — but that
+        // is a property of THIS code order, not an enforced invariant.
         if let Some((oob_spec, ctx)) = oob_ctx {
             crate::oob::spawn(oob_spec, ctx);
         }
@@ -387,6 +452,28 @@ impl PtyManager {
         Ok(())
     }
 
+    /// M11: drop the permission detector's latched pattern for this tab so a
+    /// prompt still on screen is re-detected on the next scan tick. Best-effort
+    /// and non-blocking by design — this rides the hook path, which must never
+    /// stall on a busy processor, and a dropped message only costs the
+    /// re-detection this call was trying to enable (the regex path is the
+    /// fallback, not the primary). No-op when this tab has no running PTY.
+    pub async fn clear_permission_latch(&self) {
+        let control_tx = {
+            let guard = self.inner.lock().await;
+            match guard.as_ref() {
+                Some(handle) => handle.control_tx.clone(),
+                None => return,
+            }
+        };
+        if control_tx
+            .try_send(ProcessorControl::ClearPermissionLatch)
+            .is_err()
+        {
+            debug!("permission latch clear dropped (processor busy or gone)");
+        }
+    }
+
     /// V1.4-04 D: snapshot the current scrollback ring as a flat
     /// `Vec<u8>`. Used by the graceful-exit persistence path and the
     /// `pty_get_scrollback` Tauri command. Returns `NotStarted` if no
@@ -504,6 +591,40 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    /// V30 (review M9): the spawn path must be able to UN-inherit a variable,
+    /// not just add one — and an explicit per-tab value must still win.
+    #[test]
+    fn env_removals_strip_inherited_vars_but_lose_to_explicit_values() {
+        // A var this process really has, so the removal has something to bite.
+        std::env::set_var("CIMP_TEST_INHERITED", "1");
+        std::env::set_var("CIMP_TEST_OVERRIDDEN", "parent");
+        let mut cmd = CommandBuilder::new("cmd");
+        let mut env = std::collections::HashMap::new();
+        env.insert("CIMP_TEST_OVERRIDDEN".to_string(), "child".to_string());
+        apply_env(
+            &mut cmd,
+            &env,
+            &[
+                "CIMP_TEST_INHERITED".to_string(),
+                "CIMP_TEST_OVERRIDDEN".to_string(),
+                "CIMP_TEST_NEVER_SET".to_string(), // removing an absent var is a no-op
+            ],
+        );
+        assert_eq!(
+            cmd.get_env("CIMP_TEST_INHERITED"),
+            None,
+            "an inherited var on the strip list must not reach the child"
+        );
+        assert_eq!(
+            cmd.get_env("CIMP_TEST_OVERRIDDEN")
+                .and_then(|v| v.to_str()),
+            Some("child"),
+            "a per-tab env entry outranks the strip list"
+        );
+        std::env::remove_var("CIMP_TEST_INHERITED");
+        std::env::remove_var("CIMP_TEST_OVERRIDDEN");
+    }
 
     /// V1.4-03: rebind on an empty manager errors with NotStarted. The
     /// frontend's `attemptSpawn(entry, 'rebind')` catch block treats this

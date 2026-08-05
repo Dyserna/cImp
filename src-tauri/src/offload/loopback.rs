@@ -7,8 +7,10 @@
 //!
 //! - `POST /run` — run one `offload_task` against the warm app-side pool.
 //! - `GET  /describe` — the live capability description for the tool.
-//! - `GET  /events` — an SSE stream of capability-change pulses the child
-//!   relays to Claude as `notifications/tools/list_changed`.
+//! - `GET  /events` — an SSE stream the child relays to Claude: capability
+//!   pulses (`event: change` → `notifications/tools/list_changed`) and, since
+//!   V30 Phase B, addressed session pushes (`event: push` →
+//!   `notifications/claude/channel`).
 //!
 //! The `{port, token, pid}` are advertised in a discovery file written next
 //! to the exe (the portable root — never `~/.claude`), created when offload
@@ -37,7 +39,7 @@ use crate::error::{AppError, AppResult};
 use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
 use super::router::TierHint;
-use super::service::OffloadService;
+use super::service::{OffloadService, PushNotice};
 
 /// Discovery-file name under the portable root (next to `settings.json`).
 /// Legacy single-instance location, still written for anything that only
@@ -139,7 +141,10 @@ fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
         return false;
     }
     rc.iter().zip(hc.iter()).all(|(a, b)| {
-        let (a, b) = (a.as_os_str().to_string_lossy(), b.as_os_str().to_string_lossy());
+        let (a, b) = (
+            a.as_os_str().to_string_lossy(),
+            b.as_os_str().to_string_lossy(),
+        );
         if cfg!(windows) {
             a.eq_ignore_ascii_case(&b)
         } else {
@@ -223,7 +228,11 @@ async fn sweep_stale_discoveries(own_pid: u32) {
                     debug!(error = %e, pid = d.pid, "offload loopback: stale discovery cleanup failed");
                 }
             } else if d.pid != own_pid {
-                info!(pid = d.pid, port = d.port, "offload loopback: swept stale discovery entry");
+                info!(
+                    pid = d.pid,
+                    port = d.port,
+                    "offload loopback: swept stale discovery entry"
+                );
             }
         }
     }
@@ -620,6 +629,7 @@ async fn handle_conn(
         ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
+        ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
         ("GET", "/describe") => {
@@ -632,7 +642,7 @@ async fn handle_conn(
             )
             .await
         }
-        ("GET", "/events") => handle_events(stream, service).await,
+        ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
         _ => write_simple(&mut stream, 404, "text/plain", b"not found").await,
     }
@@ -772,6 +782,14 @@ struct GraphRunBody {
     /// Claude when absent.
     #[serde(default)]
     consumer: Option<String>,
+    /// V28 (issue #13): the cImp TAB id the calling MCP child was spawned for
+    /// (`cimp --offload-mcp --tab <id>`), used to resolve *which* session of
+    /// this agent the `context_*` memory tools should scope to. Optional by
+    /// design — a child spawned before the upgrade sends no `tab`, and an
+    /// unknown/stale one resolves to `None`; both fall back to the pre-V28
+    /// most-recent-session behavior rather than erroring the call.
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 /// A `POST /mcp/call` request body (a Claude-exposed MCP tool invocation).
@@ -816,8 +834,22 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let consumer = body.consumer.as_deref().unwrap_or("claude");
+    // V28: resolve the calling TAB to the session it currently reports, so the
+    // `context_*` memory tools scope to this tab's own session instead of "the
+    // most recent session for this agent" (two same-agent tabs used to share —
+    // and steal — one memory scope). Fail-open: no `tab`, an unknown key, a
+    // different agent's entry, or a TTL-stale one all yield `None`, which is
+    // exactly the pre-V28 behavior.
+    let session = body
+        .tab
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|tab| {
+            graph.live_session_for_tab(tab, crate::graph::source_for_consumer(consumer))
+        });
     let r = match graph
-        .run_graph_tool(&cwd, &body.name, &body.args, consumer)
+        .run_graph_tool(&cwd, &body.name, &body.args, consumer, session.as_deref())
         .await
     {
         Ok(text) => RunResult {
@@ -1316,6 +1348,344 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
     write_json(stream, 200, &ok).await
 }
 
+// ── NC-2 (issue #5): hook-driven permission detection ────────────────────────
+
+/// A `POST /permission/event` request body — the Claude `--notify-hook` shim
+/// forwarding a `Notification` or `PermissionDenied` hook payload.
+#[derive(Deserialize, Default)]
+struct PermissionEventBody {
+    /// The hook payload's `cwd` (already resolved by the shim).
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// `~/.claude/projects/<slug>/<session_id>.jsonl` — the second mapping key.
+    #[serde(default)]
+    transcript_path: Option<String>,
+    /// The payload's `hook_event_name` (`"Notification"` / `"PermissionDenied"`).
+    #[serde(default)]
+    event: String,
+    /// The notification's type when the payload carries one (`permission_prompt`,
+    /// `idle_prompt`, …).
+    #[serde(default)]
+    notification_type: Option<String>,
+    /// The notification's prose, used to classify when no type field arrived.
+    #[serde(default)]
+    message: Option<String>,
+    /// Present on `PermissionDenied`; logged, not branched on.
+    #[serde(default)]
+    tool_name: Option<String>,
+}
+
+/// Which edge of the existing `awaiting_permission` flag a hook payload maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionEdge {
+    /// A permission prompt is now on screen ⇒ `PermissionPromptDetected`.
+    Detected,
+    /// The pending call was denied ⇒ `PermissionPromptResolved`.
+    Resolved,
+}
+
+/// Substrings that identify a permission notification when the payload carries
+/// no notification-type field. Claude Code's permission notification reads
+/// "Claude needs your permission to use <tool>", so both fragments are checked
+/// (either wording survives a small rephrasing). Deliberately narrower than a
+/// bare `"permission"` test, which a "permission denied" filesystem-error
+/// notification would trip.
+const PERMISSION_MESSAGE_MARKERS: [&str; 2] = ["your permission", "permission to use"];
+
+/// The notification type that means "a permission prompt is on screen" — the
+/// value Claude Code's `Notification` matcher filters on.
+const PERMISSION_NOTIFICATION_TYPE: &str = "permission_prompt";
+
+/// Notification types we KNOW about and deliberately ignore (Claude Code hooks
+/// guide, same list the `Notification` matcher accepts, minus
+/// `permission_prompt`). Recognizing them by name is what lets an
+/// *unrecognized* type fall through to the prose check without idle/auth
+/// notifications riding along — see [`classify_permission_event`].
+const IGNORED_NOTIFICATION_TYPES: [&str; 7] = [
+    "idle_prompt",
+    "auth_success",
+    "elicitation_dialog",
+    "elicitation_complete",
+    "elicitation_response",
+    "agent_needs_input",
+    "agent_completed",
+];
+
+/// NC-2: map a hook payload to a permission edge, or `None` to ignore it.
+///
+///   * `PermissionDenied` (auto-classifier blocked the call) resolves the
+///     prompt. Note the docs describe this as the auto-mode classifier's own
+///     denial, NOT necessarily the user pressing "No" — treating it as a
+///     resolution is still right (nothing is awaiting the user afterwards).
+///     M11 fix (2026-08-05 review): the eager clear is paired with a
+///     force-clear of that tab's regex latch in `handle_permission_event`, so a
+///     prompt that is genuinely still on screen is re-raised on the detector's
+///     next scan instead of staying invisible until the next keystroke.
+///   * `Notification` is classified by its TYPE when the payload carries a
+///     RECOGNIZED one (the field the matcher filters on), else by its prose.
+///
+/// **Type dispatch, in order (M12 fix, 2026-08-05 review):**
+///   1. `permission_prompt` ⇒ `Detected`.
+///   2. A type in [`IGNORED_NOTIFICATION_TYPES`] ⇒ ignored, prose NOT
+///      consulted. Deliberate: see the idle note below.
+///   3. Anything else — including an empty/absent type — falls through to the
+///      prose check. This is the drift path the shim's payload-shape note calls
+///      UNVERIFIED: a renamed type or a nested/renamed field must degrade to
+///      "we read the message instead", never to silence. Returning early on
+///      every unrecognized non-empty type inverted the contract precisely for
+///      the permission case, where "ignored" IS silence.
+///
+/// **Idle notifications are deliberately dropped** — and, per rule 2, dropped
+/// even when their prose would match. `idle_prompt` ("waiting for your input")
+/// is semantically close to the `awaiting_question` pipe, but that pipe's
+/// meaning today is "an AskUserQuestion-style menu is on screen" and the regex
+/// detector owns it; wiring idle there would flip the badge/TTS on every turn
+/// boundary. Revisit only with a separate signal.
+fn classify_permission_event(
+    event: &str,
+    notification_type: &str,
+    message: &str,
+) -> Option<PermissionEdge> {
+    match event {
+        "PermissionDenied" => Some(PermissionEdge::Resolved),
+        "Notification" => {
+            let kind = notification_type.trim();
+            if kind.eq_ignore_ascii_case(PERMISSION_NOTIFICATION_TYPE) {
+                return Some(PermissionEdge::Detected);
+            }
+            if IGNORED_NOTIFICATION_TYPES
+                .iter()
+                .any(|t| kind.eq_ignore_ascii_case(t))
+            {
+                return None;
+            }
+            // Unrecognized (or absent) type ⇒ the prose is all we have.
+            let msg = message.to_ascii_lowercase();
+            PERMISSION_MESSAGE_MARKERS
+                .iter()
+                .any(|m| msg.contains(m))
+                .then_some(PermissionEdge::Detected)
+        }
+        _ => None,
+    }
+}
+
+/// One tab a permission event could belong to: its id, the Claude session id it
+/// is currently running (from the graph's live-session registry — `None` for a
+/// configured-but-not-running tab), and the directory it launches in.
+#[derive(Debug, Clone)]
+struct PermissionTabCandidate {
+    tab: String,
+    session_id: Option<String>,
+    cwd: PathBuf,
+}
+
+/// NC-2: resolve a hook payload to exactly one tab, or `None` to DROP the event.
+///
+/// Fallback order — `session_id` → `transcript_path` → unique `cwd`:
+///
+///   1. **session id.** The live-session registry maps a Claude tab id to the
+///      session its transcript tail last saw; a hook payload names that same id.
+///   2. **transcript path.** The transcript filename stem IS the session id
+///      (`<slug>/<session_id>.jsonl`), so this recovers the match when the
+///      `session_id` field itself goes missing/renamed.
+///   3. **cwd**, and only when it identifies exactly ONE Claude tab. Tabs
+///      normally all inherit the app's launch dir, so this usually resolves only
+///      for a single-Claude-tab setup (or a worktree tab with its own cwd).
+///
+/// Never guesses: an ambiguous or unmatched payload returns `None` and the event
+/// is dropped, leaving detection to the TUI-regex fallback. Guessing would flip
+/// the badge/TTS/avatar for the WRONG tab, which is worse than a missed hook.
+///
+/// H1 fix (2026-08-05 review): the `session_id` on a candidate is already
+/// ambiguity-filtered upstream — with two RUNNING Claude tabs on one project the
+/// registry withholds BOTH bindings (`graph::service::live_claude_tab_sessions`),
+/// because the taps cannot tell those tabs' transcripts apart. Passes 1 and 2
+/// then find nothing and pass 3 sees the shared cwd on ≥2 tabs, so the event is
+/// dropped rather than attributed to whichever tab wrote last.
+fn resolve_permission_tab(
+    candidates: &[PermissionTabCandidate],
+    session_id: &str,
+    transcript_path: &str,
+    cwd: &str,
+) -> Option<String> {
+    let by_session = |sid: &str| -> Option<String> {
+        if sid.is_empty() {
+            return None;
+        }
+        let mut hits = candidates
+            .iter()
+            .filter(|c| c.session_id.as_deref() == Some(sid));
+        let first = hits.next()?;
+        // A session id belongs to one tab; if two tabs somehow claim it, refuse
+        // rather than pick.
+        hits.next().is_none().then(|| first.tab.clone())
+    };
+
+    if let Some(tab) = by_session(session_id) {
+        return Some(tab);
+    }
+    if let Some(tab) = transcript_session_id(transcript_path).and_then(|s| by_session(&s)) {
+        return Some(tab);
+    }
+    let target = norm_dir(cwd)?;
+    let mut hits = candidates
+        .iter()
+        .filter(|c| norm_dir(&c.cwd.to_string_lossy()).as_deref() == Some(target.as_str()));
+    let first = hits.next()?;
+    hits.next().is_none().then(|| first.tab.clone())
+}
+
+/// The session id encoded in a Claude transcript path
+/// (`…/projects/<slug>/<session_id>.jsonl`), or `None` for an empty/odd path.
+fn transcript_session_id(transcript_path: &str) -> Option<String> {
+    let stem = Path::new(transcript_path.trim()).file_stem()?;
+    let stem = stem.to_string_lossy().into_owned();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// A directory string normalized for comparison: separators unified, trailing
+/// separators dropped, and — on Windows, whose paths are case-insensitive —
+/// case-folded. `None` for an empty/whitespace path.
+///
+/// H1-R5 fix: delegates to [`crate::fsutil::norm_dir_key`], which the H1
+/// ambiguity predicate's transcript-root key also goes through — the two seams
+/// compare "same project dir?" and must not drift apart.
+fn norm_dir(dir: &str) -> Option<String> {
+    crate::fsutil::norm_dir_key(dir)
+}
+
+/// `POST /permission/event` (NC-2): the hook-driven half of permission
+/// detection. Maps the payload to a tab and emits the SAME `StateSignal`s the
+/// TUI-regex detector emits, so the whole downstream pipeline
+/// (`awaiting_permission` → TTS enqueue, per-tab badge, avatar) is untouched.
+/// Both producers are idempotent at the state manager, so a hook and a regex
+/// match for the same prompt collapse to one edge.
+///
+/// Always answers 200 `{ok:true}` (with a `mapped` field for diagnosis): the
+/// shim ignores the response and must never be given a reason to retry.
+async fn handle_permission_event(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: PermissionEventBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let session_id = body.session_id.unwrap_or_default();
+    let transcript_path = body.transcript_path.unwrap_or_default();
+    let cwd = body.cwd.unwrap_or_default();
+    let Some(edge) = classify_permission_event(
+        &body.event,
+        body.notification_type.as_deref().unwrap_or(""),
+        body.message.as_deref().unwrap_or(""),
+    ) else {
+        debug!(
+            event = %body.event,
+            kind = body.notification_type.as_deref().unwrap_or(""),
+            "permission hook: ignored (not a permission edge)"
+        );
+        return write_json(
+            stream,
+            200,
+            &serde_json::json!({ "ok": true, "mapped": false, "reason": "ignored" }),
+        )
+        .await;
+    };
+
+    // Snapshot everything we need from managed state, then drop the guards —
+    // nothing borrowed from `AppHandle` is held across the response write.
+    let resolved = app.try_state::<crate::ipc::AppState>().map(|state| {
+        let sessions: Vec<(String, String)> = app
+            .try_state::<Arc<crate::graph::GraphService>>()
+            .map(|g| g.live_claude_sessions())
+            .unwrap_or_default();
+        let candidates: Vec<PermissionTabCandidate> =
+            crate::tabs::claude_tab_dirs(&state.settings.current(), &state.launch.cwd)
+                .into_iter()
+                .map(|(tab, dir)| PermissionTabCandidate {
+                    session_id: sessions
+                        .iter()
+                        .find(|(k, _)| *k == tab)
+                        .map(|(_, s)| s.clone()),
+                    tab,
+                    cwd: dir,
+                })
+                .collect();
+        (
+            resolve_permission_tab(&candidates, &session_id, &transcript_path, &cwd),
+            state.state_signals.clone(),
+            state.tabs.clone(),
+        )
+    });
+    let Some((Some(tab), signals, registry)) = resolved else {
+        debug!(
+            event = %body.event,
+            session = %session_id,
+            cwd = %cwd,
+            "permission hook: no unambiguous tab — dropped (regex fallback still covers it)"
+        );
+        return write_json(
+            stream,
+            200,
+            &serde_json::json!({ "ok": true, "mapped": false, "reason": "no tab" }),
+        )
+        .await;
+    };
+
+    let tab_id = crate::state::TabId::from_str(&tab);
+    let signal = match edge {
+        PermissionEdge::Detected => {
+            crate::state::StateSignal::PermissionPromptDetected {
+                tab: tab_id.clone(),
+            }
+        }
+        PermissionEdge::Resolved => {
+            crate::state::StateSignal::PermissionPromptResolved {
+                tab: tab_id.clone(),
+            }
+        }
+    };
+    // Edge-triggered and best-effort, exactly like the PTY processor's
+    // `try_send`: a full channel means the state manager is saturated, and the
+    // regex detector's next scan re-raises the edge anyway.
+    let _ = signals.try_send(signal);
+    // M11 (2026-08-05 review): a hook-driven Resolved clears the flag eagerly —
+    // a `PermissionDenied` from the auto-classifier can land while a genuine
+    // approval prompt is still on screen. The regex fallback cannot recover on
+    // its own: `PermissionDetector::check` is edge-triggered on a latched
+    // per-kind pattern name, so while that same pattern keeps matching it emits
+    // NOTHING. Drop the latch (and re-scan) in the tab's PTY processor so a
+    // prompt that is genuinely still up is re-raised immediately. Sent AFTER
+    // the Resolved signal so the two land on the state manager in that order.
+    if matches!(edge, PermissionEdge::Resolved) {
+        registry.lock().await.clear_permission_latch(&tab_id).await;
+    }
+    info!(
+        event = %body.event,
+        tool = body.tool_name.as_deref().unwrap_or(""),
+        ?edge,
+        %tab,
+        "permission hook: state signal sent"
+    );
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "mapped": true, "tab": tab }),
+    )
+    .await
+}
+
 /// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or
 /// the OpenCode plugin's `tool.execute.after` hook).
 #[derive(Deserialize)]
@@ -1662,20 +2032,64 @@ async fn handle_mcp_call(
     write_json(stream, 200, &r).await
 }
 
+/// Read one `?key=value` query parameter off a request path.
+///
+/// Deliberately no percent-decoding: every value on these routes is composed by
+/// cImp itself (consumer names, tab ids — `[a-z0-9-]`), never by a user or a
+/// browser. Matches the pre-V30 behaviour of [`consumer_of`], which this now
+/// backs.
+fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    let (_, query) = path.split_once('?')?;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
 /// Parse the `?consumer=<name>` query value off a request path into a
 /// [`Consumer`]. Absent / unknown ⇒ Claude (the original default).
 fn consumer_of(req: &Request) -> Consumer {
-    let raw = req
-        .path
-        .split_once('?')
-        .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("consumer=")))
-        .unwrap_or("claude");
-    Consumer::parse(raw)
+    Consumer::parse(query_param(&req.path, "consumer").unwrap_or("claude"))
 }
 
-/// `GET /events`: an SSE stream emitting a `change` event per capability
-/// pulse, with periodic keep-alive comments so idle proxies don't drop it.
-async fn handle_events(mut stream: TcpStream, service: Arc<OffloadService>) -> AppResult<()> {
+/// Render one `event: push` SSE frame from a [`PushNotice`].
+///
+/// The frame grammar is the SSE minimum the child's parser understands:
+/// `event: push\ndata: <one-line JSON>\n\n`. `serde_json` escapes every control
+/// character, so the payload is *guaranteed* to be a single line however
+/// multi-line the pushed content is — the one-line invariant the wire format
+/// depends on is enforced by the encoder, not by the caller. Pure, so the shape
+/// is unit-testable without a socket — including from the child's side of the
+/// wire (`mcp::tests`), which pins encoder and decoder against each other.
+pub(super) fn push_frame(notice: &PushNotice) -> Vec<u8> {
+    let data =
+        serde_json::to_string(notice).unwrap_or_else(|_| r#"{"content":"","meta":{}}"#.to_string());
+    format!("event: push\ndata: {data}\n\n").into_bytes()
+}
+
+/// `GET /events`: an SSE stream carrying two event types to one per-tab
+/// `--offload-mcp` child —
+///
+/// - `event: change` — the pre-V30 capability pulse, sent to EVERY subscriber
+///   (semantics unchanged; the child relays it as `tools/list_changed`);
+/// - `event: push` — V30 Phase B, sent only to subscribers a push is addressed
+///   to, carrying the semantic [`PushNotice`] payload the child wraps into
+///   `notifications/claude/channel`.
+///
+/// Periodic keep-alive comments (every 20 s) keep idle intermediaries — and the
+/// child's own 60 s read-idle watchdog — from dropping the connection.
+///
+/// The subscriber's identity comes from the child's query params
+/// (`?tab=&consumer=&channels=`); `channels=1` means the child ACTUALLY declared
+/// the capability on its handshake, not that the setting is on. Registration
+/// happens after auth (the caller's job) and is undone by
+/// [`PushGuard`](super::service::PushGuard)'s `Drop` when this loop exits — for
+/// any reason at all.
+async fn handle_events(
+    mut stream: TcpStream,
+    service: Arc<OffloadService>,
+    req: &Request,
+) -> AppResult<()> {
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Cache-Control: no-cache\r\n\
@@ -1688,10 +2102,48 @@ async fn handle_events(mut stream: TcpStream, service: Arc<OffloadService>) -> A
     let _ = stream.write_all(b": connected\n\n").await;
     let _ = stream.flush().await;
 
+    // V30 Phase B: register this child in the instance's push registry. The
+    // guard is bound for the whole loop — dropping it (on ANY exit below, or on
+    // task cancellation) is the sole deregistration path.
+    let tab = query_param(&req.path, "tab")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let consumer = query_param(&req.path, "consumer")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude")
+        .to_string();
+    // Anything but an explicit affirmative means "no channels" — a pre-V30
+    // child sends no `channels` param at all and must never be pushed to.
+    let channels = matches!(query_param(&req.path, "channels"), Some("1") | Some("true"));
+    debug!(
+        tab = ?tab,
+        consumer = %consumer,
+        channels,
+        "offload loopback: /events subscriber connected"
+    );
+    let (_push_guard, mut push_rx) = service.register_push_subscriber(tab, consumer, channels);
+
     let mut rx = service.subscribe_changes();
     loop {
         let tick = tokio::time::sleep(Duration::from_secs(20));
         tokio::select! {
+            // V30 Phase B: an addressed push for THIS child.
+            notice = push_rx.recv() => {
+                match notice {
+                    Some(n) => {
+                        if stream.write_all(&push_frame(&n)).await.is_err() {
+                            break;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                    // Unreachable while `_push_guard` lives (it owns the only
+                    // path that removes our sender), but a closed queue can
+                    // never yield another notice — stop selecting on it.
+                    None => break,
+                }
+            }
             recv = rx.recv() => {
                 match recv {
                     Ok(()) => {
@@ -1790,12 +2242,289 @@ mod tests {
         assert!(!authorized(&none, "abc123"));
     }
 
+    // ── V30 Phase B: /events subscriber identity + the push frame ─────────
+
+    #[test]
+    fn query_param_reads_the_events_identity() {
+        let path = "/events?tab=claude-2&consumer=claude&channels=1";
+        assert_eq!(query_param(path, "tab"), Some("claude-2"));
+        assert_eq!(query_param(path, "consumer"), Some("claude"));
+        assert_eq!(query_param(path, "channels"), Some("1"));
+        assert_eq!(query_param(path, "nope"), None);
+        // A prefix must not match a different key, and a bare path has none.
+        assert_eq!(query_param("/events?consumer=opencode", "consume"), None);
+        assert_eq!(query_param("/events", "tab"), None);
+        // The pre-V30 child sends no query at all: it must still parse as the
+        // default consumer, with no tab and no channels.
+        let legacy = Request {
+            method: "GET".into(),
+            path: "/events".into(),
+            auth: None,
+            body: Vec::new(),
+        };
+        assert_eq!(consumer_of(&legacy), Consumer::Claude);
+        assert!(!matches!(
+            query_param(&legacy.path, "channels"),
+            Some("1") | Some("true")
+        ));
+    }
+
+    /// The wire contract the child's SSE parser depends on: one `event:` line,
+    /// one single-line `data:` line, blank-line terminated — even when the
+    /// pushed content itself contains newlines (serde escapes them).
+    #[test]
+    fn push_frame_is_a_single_line_sse_data_payload() {
+        let notice = PushNotice::new(
+            "line one\nline two\r\nline three",
+            [("kind", "audit_done"), ("seq", "3")],
+        );
+        let frame = String::from_utf8(push_frame(&notice)).unwrap();
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(lines[0], "event: push");
+        assert!(lines[1].starts_with("data: "));
+        // event / data / "" / "" — exactly one data line, blank-line terminated.
+        assert_eq!(lines.len(), 4, "frame was: {frame:?}");
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "");
+        let round: PushNotice = serde_json::from_str(&lines[1]["data: ".len()..]).unwrap();
+        assert_eq!(round, notice);
+    }
+
     #[test]
     fn token_is_long_and_random() {
         let a = make_token();
         let b = make_token();
         assert_ne!(a, b);
         assert!(a.len() >= 32);
+    }
+
+    // ── NC-2: permission-hook classification + tab mapping ─────────────────
+
+    #[test]
+    fn permission_denied_resolves_and_unknown_events_are_ignored() {
+        assert_eq!(
+            classify_permission_event("PermissionDenied", "", ""),
+            Some(PermissionEdge::Resolved)
+        );
+        // Events we never registered (and the PermissionRequest we chose NOT to
+        // adopt) must not move the flag even if one somehow reaches the route.
+        for event in ["PermissionRequest", "PreToolUse", "", "Stop"] {
+            assert_eq!(
+                classify_permission_event(event, "permission_prompt", ""),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn notification_type_drives_classification_when_present() {
+        assert_eq!(
+            classify_permission_event("Notification", "permission_prompt", ""),
+            Some(PermissionEdge::Detected)
+        );
+        // Case/whitespace tolerance — the value is echoed from the payload.
+        assert_eq!(
+            classify_permission_event("Notification", " Permission_Prompt ", ""),
+            Some(PermissionEdge::Detected)
+        );
+        // Every other RECOGNIZED type is ignored, including idle (which is NOT
+        // wired to the question pipe — see the classifier's doc comment) …
+        for kind in IGNORED_NOTIFICATION_TYPES {
+            assert_eq!(classify_permission_event("Notification", kind, ""), None);
+        }
+        // … and a recognized type WINS over the prose fallback, so a future
+        // permission-flavoured message under a non-permission type can't leak
+        // in. Deliberate and pinned: idle notifications stay out of the
+        // permission pipe whatever their wording says.
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "idle_prompt",
+                "Claude needs your permission to use Bash"
+            ),
+            None
+        );
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "Agent_Completed",
+                "Claude needs your permission to use Bash"
+            ),
+            None,
+            "recognized types are matched case-insensitively too"
+        );
+    }
+
+    /// M12 (2026-08-05 review): an UNRECOGNIZED non-empty type must fall
+    /// through to the prose check instead of short-circuiting to "ignored".
+    /// The `Notification` payload shape is explicitly UNVERIFIED
+    /// (`notify_hook.rs` module doc), so a renamed type — or a nested field the
+    /// shim reads into `notification_type` — is the expected drift, and for the
+    /// permission case "ignored" is silence: the badge/TTS never fire and
+    /// nothing logs above debug.
+    #[test]
+    fn unrecognized_notification_type_falls_through_to_the_prose_check() {
+        // Renamed/unknown type + permission prose ⇒ still detected.
+        for kind in ["tool_permission", "permission-prompt", "something_new"] {
+            assert_eq!(
+                classify_permission_event(
+                    "Notification",
+                    kind,
+                    "Claude needs your permission to use Bash"
+                ),
+                Some(PermissionEdge::Detected),
+                "{kind}"
+            );
+        }
+        // Unknown type + unrelated prose ⇒ ignored, as before.
+        for msg in [
+            "Claude is waiting for your input",
+            "Error: permission denied while reading /etc/shadow",
+            "",
+        ] {
+            assert_eq!(
+                classify_permission_event("Notification", "something_new", msg),
+                None,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_message_classifies_when_type_field_is_absent() {
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "",
+                "Claude needs your permission to use Bash"
+            ),
+            Some(PermissionEdge::Detected)
+        );
+        assert_eq!(
+            classify_permission_event("Notification", "", "Permission to use Edit is required"),
+            Some(PermissionEdge::Detected)
+        );
+        // Idle prose, and a "permission denied" error that must NOT be read as
+        // a prompt (why the marker is narrower than a bare "permission").
+        for msg in [
+            "Claude is waiting for your input",
+            "Error: permission denied while reading /etc/shadow",
+            "",
+        ] {
+            assert_eq!(
+                classify_permission_event("Notification", "", msg),
+                None,
+                "{msg}"
+            );
+        }
+    }
+
+    fn cand(tab: &str, session: Option<&str>, cwd: &str) -> PermissionTabCandidate {
+        PermissionTabCandidate {
+            tab: tab.to_string(),
+            session_id: session.map(str::to_string),
+            cwd: PathBuf::from(cwd),
+        }
+    }
+
+    #[test]
+    fn tab_mapping_prefers_session_id_then_transcript_then_unique_cwd() {
+        let tabs = [
+            cand("claude", Some("sess-a"), "C:/proj"),
+            cand("ai-2", Some("sess-b"), "C:/proj/wt"),
+            cand("claude-local", None, "C:/proj"),
+        ];
+        // 1. session id.
+        assert_eq!(
+            resolve_permission_tab(&tabs, "sess-b", "", ""),
+            Some("ai-2".to_string())
+        );
+        // 2. transcript stem, when the session field went missing.
+        assert_eq!(
+            resolve_permission_tab(
+                &tabs,
+                "",
+                "C:/Users/x/.claude/projects/slug/sess-a.jsonl",
+                ""
+            ),
+            Some("claude".to_string())
+        );
+        // 3. cwd, but only where it names exactly one tab: `C:/proj` is shared
+        // by two tabs (ambiguous ⇒ drop), the worktree dir is unique.
+        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
+        assert_eq!(
+            resolve_permission_tab(&tabs, "", "", "C:/proj/wt"),
+            Some("ai-2".to_string())
+        );
+        // Separator/trailing-slash normalization (and, on Windows, case).
+        assert_eq!(
+            resolve_permission_tab(&tabs, "", "", "C:\\proj\\wt\\"),
+            Some("ai-2".to_string())
+        );
+        // Nothing matches ⇒ dropped, never guessed.
+        assert_eq!(
+            resolve_permission_tab(&tabs, "sess-zz", "", "D:/elsewhere"),
+            None
+        );
+        assert_eq!(resolve_permission_tab(&tabs, "", "", ""), None);
+        assert_eq!(resolve_permission_tab(&[], "sess-a", "", "C:/proj"), None);
+    }
+
+    #[test]
+    fn tab_mapping_refuses_a_session_claimed_by_two_tabs() {
+        let tabs = [
+            cand("claude", Some("dup"), "C:/a"),
+            cand("claude-local", Some("dup"), "C:/b"),
+        ];
+        assert_eq!(resolve_permission_tab(&tabs, "dup", "", ""), None);
+    }
+
+    /// H1 (2026-08-05 review): two RUNNING Claude tabs on one project make every
+    /// tab-keyed identity claim unprovable, so `live_claude_sessions` (the sole
+    /// source of `session_id` here) hands both candidates `None` — see
+    /// `graph::service::live_claude_tab_sessions`. This pins the resulting
+    /// contract on THIS side of the seam: refuse, never guess.
+    #[test]
+    fn tab_mapping_refuses_when_the_registry_withholds_ambiguous_bindings() {
+        // Both same-root tabs, session bindings withheld at the registry.
+        let tabs = [
+            cand("claude", None, "C:/proj"),
+            cand("claude-local", None, "C:/proj"),
+        ];
+        // The hook payload names a real live session — but nothing claims it.
+        assert_eq!(resolve_permission_tab(&tabs, "sess-b", "", "C:/proj"), None);
+        assert_eq!(
+            resolve_permission_tab(
+                &tabs,
+                "",
+                "C:/Users/x/.claude/projects/slug/sess-b.jsonl",
+                "C:/proj"
+            ),
+            None
+        );
+        // ...and the cwd fallback declines too: the shared root is, by
+        // construction, shared by ≥2 tabs.
+        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
+        // A single running tab per root keeps its binding and still resolves.
+        let solo = [
+            cand("claude", Some("sess-a"), "C:/proj"),
+            cand("ai-2", None, "C:/other"),
+        ];
+        assert_eq!(
+            resolve_permission_tab(&solo, "sess-a", "", ""),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn permission_event_body_tolerates_a_minimal_payload() {
+        // Only the event name — every other field defaults, so a drifted
+        // payload still deserializes and is simply unmappable (dropped).
+        let body: PermissionEventBody =
+            serde_json::from_value(serde_json::json!({ "event": "Notification" }))
+                .expect("minimal body deserializes");
+        assert_eq!(body.event, "Notification");
+        assert!(body.session_id.is_none() && body.cwd.is_none());
     }
 
     // ── V24 Phase F: OpenCode usage-event arm ──────────────────────────────
@@ -1970,8 +2699,7 @@ mod tests {
         assert_eq!(back.token, "tok");
         assert_eq!(back.pid, 42);
         // Legacy files (pre-root) still parse: `root` defaults empty.
-        let legacy: Discovery =
-            serde_json::from_str(r#"{"port":1,"token":"t","pid":9}"#).unwrap();
+        let legacy: Discovery = serde_json::from_str(r#"{"port":1,"token":"t","pid":9}"#).unwrap();
         assert_eq!(legacy.root, "");
     }
 
@@ -1989,8 +2717,7 @@ mod tests {
         // Two instances off one install: a child whose cwd is inside project
         // B must reach B's instance, never last-writer-wins.
         let entries = vec![disc(1, 1001, "P:\\proj\\a"), disc(2, 1002, "P:\\proj\\b")];
-        let picked =
-            select_discovery(entries, Some(Path::new("P:\\proj\\b\\src"))).expect("match");
+        let picked = select_discovery(entries, Some(Path::new("P:\\proj\\b\\src"))).expect("match");
         assert_eq!(picked.pid, 2);
     }
 
@@ -2003,8 +2730,7 @@ mod tests {
         assert_eq!(picked.pid, 2);
         // A hint outside the nested root resolves to the outer instance.
         let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
-        let picked =
-            select_discovery(entries, Some(Path::new("P:\\proj\\other"))).expect("match");
+        let picked = select_discovery(entries, Some(Path::new("P:\\proj\\other"))).expect("match");
         assert_eq!(picked.pid, 1);
     }
 
@@ -2055,10 +2781,50 @@ mod tests {
         assert_eq!(sec.consumer.as_deref(), Some("claude"));
         let qual: AuditRunBody = serde_json::from_slice(br#"{"category":"quality"}"#).unwrap();
         assert_eq!(qual.category, Category::Quality);
-        assert!(qual.consumer.is_none(), "consumer defaults to None when absent");
+        assert!(
+            qual.consumer.is_none(),
+            "consumer defaults to None when absent"
+        );
         // A bad category word (or a missing `category`) is a clean parse error →
         // the route answers 400.
         assert!(serde_json::from_slice::<AuditRunBody>(br#"{"category":"bogus"}"#).is_err());
         assert!(serde_json::from_slice::<AuditRunBody>(br#"{"consumer":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn graph_run_body_round_trips_the_v28_tab_field() {
+        // V28: the per-tab MCP child tags `/graph_run` with the tab it serves.
+        let tagged: GraphRunBody = serde_json::from_slice(
+            br#"{"cwd":"P:\\proj","name":"context_recall","args":{},"consumer":"opencode","tab":"opencode"}"#,
+        )
+        .expect("tagged body parses");
+        assert_eq!(tagged.tab.as_deref(), Some("opencode"));
+        assert_eq!(tagged.consumer.as_deref(), Some("opencode"));
+        assert_eq!(tagged.name, "context_recall");
+    }
+
+    #[test]
+    fn graph_run_body_still_accepts_pre_v28_bodies() {
+        // Fail-open on the wire: a child spawned before the upgrade (or by hand)
+        // sends no `tab` at all, and an explicit `null` must read the same. Both
+        // resolve to `None`, i.e. the pre-V28 most-recent-session scoping — never
+        // a 400 that would break the tool call.
+        let absent: GraphRunBody =
+            serde_json::from_slice(br#"{"name":"context_notes","args":{},"consumer":"claude"}"#)
+                .expect("pre-V28 body still parses");
+        assert!(absent.tab.is_none());
+        assert!(absent.cwd.is_none());
+
+        let null: GraphRunBody =
+            serde_json::from_slice(br#"{"name":"context_notes","args":{},"tab":null}"#)
+                .expect("explicit null parses");
+        assert!(null.tab.is_none());
+
+        // An unknown extra field (a NEWER child talking to an older app) is
+        // likewise tolerated rather than rejected.
+        let extra: GraphRunBody =
+            serde_json::from_slice(br#"{"name":"context_notes","args":{},"future_field":1}"#)
+                .expect("unknown fields ignored");
+        assert!(extra.tab.is_none());
     }
 }

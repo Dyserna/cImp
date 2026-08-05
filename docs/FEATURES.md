@@ -217,7 +217,7 @@ dependency/component breadth) — this is the *capability* breadth.
 - Claude usage meter hides (and stops polling) when the Claude tab is disabled
 
 ## Integration, Monitoring & Build
-- Claude Code permission detection (matches the Esc/Tab footer)
+- Claude Code permission detection, hook-primary: `Notification` + `PermissionDenied` hooks (`cimp --notify-hook` → `POST /permission/event`) flip the awaiting-permission badge/announcement, injected whenever the loopback runs (offload / graph / Code Audit MCP — a feature-less install stays regex-only), with the TUI footer matcher kept as the fallback for anything the hook drops (unmappable session, older CLI)
 - Statusline subcommand (`cimp --statusline`) with context-window bar + `--settings` overlay injection
 - System monitor panel (CPU/mem/GPU via sysinfo + nvml) with graceful degradation
 - Anonymous usage tracking with retry/backoff

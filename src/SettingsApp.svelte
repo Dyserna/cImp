@@ -2506,8 +2506,11 @@
           <h2>Claude session usage</h2>
           <small class="hint top">
             Shows your Claude Code session (5h) and weekly (7d) quota in the
-            bottom bar, next to Layouts. Data comes from Claude's usage
-            endpoint; the widget hides when you're not logged into Claude.
+            bottom bar, next to Layouts. The numbers are reported by the Claude
+            tab's status line, so they need the context statusline (below) left
+            on and a Claude tab that has sent at least one message; the widget
+            hides until then, and dims when the last report gets old (Claude
+            tab closed or idle too long).
           </small>
           <label class="checkbox">
             <input
@@ -2562,6 +2565,22 @@
             />
             <span>Reset clock (local time)</span>
           </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.usage.show_context}
+              disabled={!snapshot.usage.enabled}
+              onchange={(e) =>
+                patch((s) => (s.usage.show_context = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Context window + cache (live)</span>
+          </label>
+          <small class="hint">
+            The context row shows the running session's context-window usage and
+            the last turn's prompt-cache split, reported by the same status
+            line. It appears only once a Claude tab reports one; anything the
+            report leaves out shows as "—" rather than as zero.
+          </small>
           <label>
             <span>Poll interval (seconds)</span>
             <input
@@ -2576,8 +2595,9 @@
             />
           </label>
           <small class="hint">
-            How often the usage figures refresh. Minimum 15s; the countdown
-            ticks every second locally between refreshes.
+            How often the widget re-reads the status line's latest report (a
+            local read — no network). Minimum 15s; the countdown ticks every
+            second locally between refreshes.
           </small>
         </section>
 
@@ -2703,7 +2723,8 @@
             inside each Claude tab — e.g. <code>Opus ▓▓▓▓▓░░░░░ 50% (100k/200k)</code>,
             themed to your terminal palette. cImp wires this up only for the
             Claude tabs it launches; your global Claude Code configuration is
-            left untouched.
+            left untouched. The status line also feeds the session-usage meter
+            above — turning it off leaves that meter with no data.
           </small>
           <label class="checkbox">
             <input
@@ -3428,6 +3449,36 @@
             The <code>offload_task</code> tool and its guidance are injected
             when an AI tab starts — restart the Claude/OpenCode tab
             (Tabs → Restart) after changing either toggle.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.session_push}
+              onchange={(e) =>
+                patch((s) => (s.offload.session_push = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Session push (experimental)</span>
+          </label>
+          <small class="hint">
+            Lets cImp push notices — offload results, audit and graph-index
+            completions — straight into a live AI tab.
+            <strong>Claude tabs</strong> receive them as
+            <code>&lt;channel source="cimp-offload"&gt;</code> messages at the
+            next turn boundary, which <em>starts a turn</em> when the tab is
+            idle; that half is baked in at launch, so restart the tab after
+            toggling — cImp shows the restart hint automatically. It also needs
+            the <code>cimp-offload</code> MCP server to be injected, i.e.
+            offload or the code graph enabled.
+            <strong>OpenCode tabs</strong> receive the same envelope as silently
+            injected context (<code>noReply</code>): nothing starts, the model
+            picks it up on its next turn. That half is read live — no tab
+            restart needed.
+            <strong>Experimental:</strong> the Claude half rides a Claude Code
+            research-preview flag that may change or disappear, Claude paints a
+            persistent "Channels (experimental)" banner (plus a harmless
+            "no MCP server configured with that name" warning) in every tab it
+            registers, and a push that can't be delivered is silently dropped.
+            Off by default.
           </small>
 
           <hr class="card-divider lg" />

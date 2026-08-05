@@ -1,0 +1,119 @@
+name: Clippy
+
+# Lint gate for the Rust backend (#27). Windows because that is the primary
+# target and the only host the release job builds first.
+#
+# FEATURES: default set PLUS `tts-webgpu`. Default alone was a blind spot —
+# the only first-party code behind an attribute `#[cfg(feature = ...)]` is
+# `tts/engine.rs` (the `ort::ep` imports + `register_gpu_ep`), which is exactly
+# what the release ships (`release.yml` builds `stt-vulkan,tts-webgpu`), so an
+# `ort::ep` API break used to surface first in the 40-min tag-triggered release
+# job. `tts-webgpu` is safe to add here because it needs NO Vulkan SDK / MSVC
+# dev-env / Ninja — ort downloads a prebuilt (see Cargo.toml's [features]).
+# `stt-vulkan` is deliberately NOT added: it would need the Vulkan SDK + Ninja
+# for ggml's shader-gen sub-build, and it gates no attribute-cfg code anyway
+# (`stt/engine.rs` uses the `cfg!()` macro form, so both branches compile and
+# get linted under any feature set). `tts-cuda` is unlintable here by design —
+# it is mutually exclusive with `tts-webgpu` (compile_error! in tts/engine.rs)
+# and needs the CUDA toolkit; it stays hand-verified.
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'src-tauri/**'
+      - '.github/workflows/clippy.yml'
+      # The job runs `npm install` + `npm run build` before cargo, because
+      # tauri-build resolves `frontendDist` (../dist) at compile time. A
+      # frontend change that breaks the bundle therefore breaks THIS job, so
+      # the frontend inputs belong in the trigger.
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'index.html'
+      - 'settings.html'
+  pull_request:
+    paths:
+      - 'src-tauri/**'
+      - '.github/workflows/clippy.yml'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'index.html'
+      - 'settings.html'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same branch/PR supersedes the run in flight; the build is
+# ~15 min, so queueing stale runs only delays the useful one.
+concurrency:
+  group: clippy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Node 24 actions runtime (see release.yml).
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # `npm install`, not `npm ci` — see the release job's note on the
+      # lockfile/npm-version mismatch.
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      # tauri-build resolves `frontendDist` (../dist) at compile time, so the
+      # frontend must exist before cargo runs — even for a lint-only pass.
+      - name: Build frontend
+        run: npm run build
+
+      # Deliberately FLOATING stable, not a pinned toolchain: catching the new
+      # lints a rustc/clippy bump introduces is the point of this job (#27), so
+      # a red run after a toolchain release is expected, not a regression.
+      #
+      # Corollary: the declared MSRV (`Cargo.toml rust-version = "1.88"`) is
+      # NOT verified by CI — nothing here ever compiles on 1.88. Accepted gap,
+      # 2026-08-05; an MSRV break only surfaces on a machine pinned to 1.88.
+      - name: Setup Rust (floating stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07-15
+        with:
+          # Explicit because the action otherwise infers the toolchain from the
+          # ref, and this one is pinned to a SHA rather than the `stable` branch.
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          # Same key family as tests.yml so the two Windows jobs share one
+          # cargo cache instead of each paying a cold dependency build.
+          shared-key: cimp-win-src-tauri
+          # A failed lint run still built the whole dependency graph; without
+          # this the cache is discarded and the next run pays for it again.
+          cache-on-failure: true
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        env:
+          # bindgen / clang-sys for whisper-rs-sys + misaki-rs -> espeak-ng-sys.
+          # The runner image ships LLVM here.
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        # `--locked` so CI lints the committed Cargo.lock — a resolution the
+        # dev machine never chose is not the thing we want to lint (and it
+        # makes an out-of-date lockfile a loud failure, not a silent update).
+        run: cargo clippy --locked --all-targets --features tts-webgpu -- -D warnings

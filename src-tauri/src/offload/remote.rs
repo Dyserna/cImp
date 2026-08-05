@@ -265,7 +265,10 @@ impl RemoteBackend {
     /// Per-request working token budget: `n_ctx * high_water/100`. A remote
     /// `llama-server`'s `/props` n_ctx is already per-slot (and `declared_context`
     /// is a single endpoint's usable window), so — like the Local backend — we
-    /// don't divide by `slots` again.
+    /// don't divide by `slots` again. cImp doesn't launch a remote server, so
+    /// it can't see a `--kv-unified` there (the Local backend corrects for that
+    /// from its parsed command); a remote unified-KV server should be given a
+    /// per-slot `declared_context` instead.
     pub fn per_slot_budget(&self, high_water_pct: u8) -> Option<u32> {
         let n = self.n_ctx()?;
         Some(n.saturating_mul(high_water_pct.min(100) as u32) / 100)

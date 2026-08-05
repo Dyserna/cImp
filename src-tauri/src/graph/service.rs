@@ -154,6 +154,18 @@ pub struct EmbedderProbe {
 /// tick, or a still-reporting OpenCode session). The Claude drain polls every
 /// ~200ms, so even an idle-but-open tab refreshes well inside this window; the
 /// generous margin only tolerates a slow drain of a large transcript.
+///
+/// H1-R2 (2026-08-05 review): the margin is NOT self-evident for a busy tab, and
+/// the failure mode is worse than for an idle one. The Claude tap's drain can
+/// park for minutes inside `ctx.speak()` (a bounded TTS channel drained at ONNX
+/// synthesis speed), so "the loop polls every 200ms" describes only the idle
+/// case. A tab whose entries aged out here does not merely go quiet: its
+/// co-tenant stops being detected, [`tab_binding_is_ambiguous`] flips to `false`
+/// for the sibling, and the sibling's tap — which tails the *stalled* tab's
+/// transcript, the newest file — gains a CONFIDENT and WRONG session binding.
+/// The tap therefore refreshes both of its entries from an independent heartbeat
+/// task (`oob::claude::TapHeartbeat`) that no drain-side await can starve; this
+/// TTL only has to outlast that heartbeat's cadence by a wide margin.
 const LIVE_SESSION_TTL_MS: i64 = 90_000;
 
 /// V24 Phase B: the recency half of the decided "open tabs + recency"
@@ -169,9 +181,42 @@ const LIVE_SESSION_RECENCY_MS: i64 = 5 * 60_000;
 /// session id itself (no tab binding on the loopback path).
 #[derive(Clone, Debug)]
 struct LiveSession {
-    #[allow(dead_code)] // recorded for future per-agent filtering; not read yet.
+    /// Which agent reported the entry (`"claude"` / `"opencode"`). Read by
+    /// [`GraphService::live_claude_sessions`] — the NC-2 permission-hook's
+    /// session→tab mapping only trusts Claude entries, whose key IS a tab id.
     agent: String,
     session_id: String,
+    last_seen_ms: i64,
+}
+
+/// H1 fix (2026-08-05 review): one RUNNING agent tab and the transcript source
+/// it binds its session identity from — for Claude, the
+/// `~/.claude/projects/<slug>/` directory its out-of-band tap tails.
+///
+/// The Claude tap has no per-process discriminator: it binds to the
+/// newest-mtime `*.jsonl` under that directory, so TWO running Claude tabs on
+/// one project (e.g. the built-in `claude` + `claude-local`, both `cwd: None`)
+/// both resolve to whichever session wrote last. Every identity claim keyed by
+/// such a tab is therefore unprovable. This map is what makes that condition
+/// *detectable* at the registry seam: it is written by the tap itself (so it
+/// reflects tabs that are genuinely running, not merely configured), keyed by
+/// the stable tab id, refreshed on every poll tick, TTL-expired like
+/// [`LiveSession`], and cleared by the tap's RAII guard on tab exit.
+#[derive(Clone, Debug)]
+struct LiveTabRoot {
+    /// Which harness runs in this tab (`"claude"`). Only agents whose binding
+    /// is root-derived register here — OpenCode binds per-tab off its own SSE
+    /// stream and is deliberately absent (see [`tab_binding_is_ambiguous`]).
+    agent: String,
+    /// The transcript source directory the tap tails, as a normalized
+    /// COMPARISON KEY ([`crate::fsutil::norm_dir_key_path`]) — not a
+    /// displayable path. H1-R5: normalized once here, at the single write site
+    /// ([`upsert_live_tab_root`]), so every reader compares canonical keys and
+    /// two tabs whose hand-set cwds differ only by case or a trailing separator
+    /// are still recognized as co-tenants. Same normalization posture as the
+    /// permission hook's cwd fallback (`offload::loopback::norm_dir`), which
+    /// routes through the same helper.
+    root: PathBuf,
     last_seen_ms: i64,
 }
 
@@ -285,6 +330,18 @@ pub struct GraphService {
     /// `active_session_ids`. Claude clears its entry on tab cancel; every entry
     /// also expires by [`LIVE_SESSION_TTL_MS`].
     live_sessions: StdMutex<HashMap<String, LiveSession>>,
+    /// H1 fix: the running-tab → transcript-root map behind
+    /// [`tab_binding_is_ambiguous`] — see [`LiveTabRoot`]. Written only by the
+    /// per-tab out-of-band taps; read by every consumer of a tab-keyed identity
+    /// claim ([`Self::live_session_for_tab`], [`Self::live_claude_sessions`]).
+    live_tab_roots: StdMutex<HashMap<String, LiveTabRoot>>,
+    /// V30 Phase C: the session-push bus, when this process has one. `None` for
+    /// tests and any standalone construction without an `OffloadService` — a
+    /// push is best-effort by contract, so its absence is a silent no-op, never
+    /// an error. Only the send half is held (see
+    /// [`OffloadService::push_registry`](crate::offload::OffloadService::push_registry)):
+    /// no back-reference, so no Arc cycle with the offload service.
+    pushes: Option<Arc<crate::offload::service::PushRegistry>>,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -695,6 +752,136 @@ fn compute_active_session_ids(
     out
 }
 
+/// H1 fix (pure): is `tab`'s session binding UNPROVABLE because another RUNNING
+/// tab of the same agent tails the same transcript root?
+///
+/// **The single implementation of the ambiguity predicate.** Every consumer of a
+/// tab-keyed identity claim routes through it, so graph/memory scoping and
+/// permission-hook attribution can never disagree about who is ambiguous.
+///
+/// Semantics:
+///  * `false` when `tab` has no entry — an agent that does NOT bind by root
+///    (OpenCode: per-tab SSE with the session id on the wire) never registers
+///    here, so it is never degraded; likewise a tap that could not resolve a
+///    root (no home dir) never marked a session either.
+///  * `false` when exactly one running tab holds that root — the overwhelmingly
+///    common case, unchanged.
+///  * `true` from the moment a second running tab of the same agent registers
+///    the same root, for as long as both entries are fresh.
+///
+/// TTL-filtered on both sides so a leaked/never-cleared entry cannot disable
+/// scoping forever, and self-comparison is excluded by key. Free-standing so it
+/// is unit-testable without an `AppHandle`.
+fn tab_binding_is_ambiguous(
+    roots: &HashMap<String, LiveTabRoot>,
+    tab: &str,
+    agent: &str,
+    now: i64,
+) -> bool {
+    let fresh = |e: &LiveTabRoot| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS;
+    let Some(mine) = roots.get(tab).filter(|e| e.agent == agent).filter(|e| fresh(e)) else {
+        return false;
+    };
+    roots
+        .iter()
+        .any(|(k, e)| k != tab && e.agent == agent && e.root == mine.root && fresh(e))
+}
+
+/// V28: the live session id reported by `tab`, or `None`. Pure half of
+/// [`GraphService::live_session_for_tab`] so it can be unit-tested without an
+/// `AppHandle`.
+///
+/// Deliberately strict, matching NC-2's resolver discipline: an EXACT key match
+/// (no prefix/fuzzy tab matching), the entry's `agent` must equal the calling
+/// agent (a tab id could in principle be reused across harnesses), and the entry
+/// must still be inside [`LIVE_SESSION_TTL_MS`]. Anything else returns `None` —
+/// the caller then falls back to today's most-recent-session behavior rather
+/// than attributing a call to a session it can't prove.
+///
+/// H1 fix: also `None` when [`tab_binding_is_ambiguous`] holds — with two
+/// running Claude tabs on one project the registry's answer is whichever session
+/// wrote last, for BOTH tabs, so honoring it would put tab A's memory writes in
+/// tab B's scope. Degrading to unscoped (V28 decision 4's documented fail-open)
+/// is strictly better than a confidently wrong scope.
+fn lookup_live_session_for_tab(
+    live: &HashMap<String, LiveSession>,
+    roots: &HashMap<String, LiveTabRoot>,
+    tab: &str,
+    agent: &str,
+    now: i64,
+) -> Option<String> {
+    if tab_binding_is_ambiguous(roots, tab, agent, now) {
+        return None;
+    }
+    live.get(tab)
+        .filter(|e| e.agent == agent)
+        .filter(|e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS)
+        .map(|e| e.session_id.clone())
+}
+
+/// NC-2 + H1 fix (pure): the `(tab_id, session_id)` pairs the permission-hook
+/// resolver may trust — every fresh CLAUDE registry entry MINUS the tabs whose
+/// binding is ambiguous ([`tab_binding_is_ambiguous`]).
+///
+/// Dropping the pair (rather than the whole candidate) is what makes
+/// `resolve_permission_tab` REFUSE instead of guess: with no session to match
+/// on, its session/transcript passes find nothing, and its last-resort `cwd`
+/// pass sees the ≥2 same-root tabs and declines too. That also closes the
+/// launch-order window in which the registry held tab A → tab B's *fresh*
+/// session **uniquely** (A's tap rotates onto B's new file and marks it live
+/// before B's own tap confirms) — during that window both tabs are running on
+/// one root, so the predicate is already true.
+///
+/// Pure half of [`GraphService::live_claude_sessions`].
+fn live_claude_tab_sessions(
+    live: &HashMap<String, LiveSession>,
+    roots: &HashMap<String, LiveTabRoot>,
+    now: i64,
+) -> Vec<(String, String)> {
+    live.iter()
+        .filter(|(_, e)| {
+            e.agent == "claude" && now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS
+        })
+        .filter(|(k, _)| !tab_binding_is_ambiguous(roots, k, "claude", now))
+        .map(|(k, e)| (k.clone(), e.session_id.clone()))
+        .collect()
+}
+
+/// H1 fix (pure): upsert the `tab` → transcript-root claim and stamp it fresh at
+/// `now`, then evict entries whose last refresh has aged past
+/// [`LIVE_SESSION_TTL_MS`] (a tap that died without running its RAII guard must
+/// not leave a phantom co-tenant suppressing scoping forever).
+///
+/// **The single write site for [`LiveTabRoot`]**, and therefore the one place
+/// the root is normalized (H1-R5): stored as a comparison key via
+/// [`crate::fsutil::norm_dir_key_path`], so [`tab_binding_is_ambiguous`]'s
+/// equality test — and any future reader — can never be defeated by two spellings
+/// of one directory. Free-standing so it's unit-testable without an `AppHandle`.
+fn upsert_live_tab_root(
+    roots: &mut HashMap<String, LiveTabRoot>,
+    tab: &str,
+    agent: &str,
+    root: &Path,
+    now: i64,
+) {
+    let key = crate::fsutil::norm_dir_key_path(root);
+    // Entry API so the steady-state refresh (drain tick + heartbeat) only
+    // stamps `last_seen_ms` in place.
+    roots
+        .entry(tab.to_string())
+        .and_modify(|e| {
+            e.last_seen_ms = now;
+            e.agent = agent.to_string();
+            e.root = key.clone();
+        })
+        .or_insert_with(|| LiveTabRoot {
+            agent: agent.to_string(),
+            root: key,
+            last_seen_ms: now,
+        });
+    roots.retain(|_, e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS);
+}
+
 /// V24 Phase B: drop live-session registry entries older than
 /// [`LIVE_SESSION_TTL_MS`] — the registry half's cutoff. Called opportunistically
 /// from [`GraphService::mark_live_session`] so the map doesn't grow without bound
@@ -756,10 +943,20 @@ impl Drop for BackfillGuard {
 }
 
 impl GraphService {
-    pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
+    /// `pushes` is the V30 session-push bus
+    /// ([`OffloadService::push_registry`](crate::offload::OffloadService::push_registry)).
+    /// `None` disables the index-completion push entirely — the service is
+    /// otherwise unchanged, so tests and standalone paths can construct it
+    /// without an offload service.
+    pub fn new(
+        app: AppHandle,
+        settings: SettingsHandle,
+        pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             app,
             settings,
+            pushes,
             indices: StdMutex::new(HashMap::new()),
             status: StdMutex::new(HashMap::new()),
             watchers: StdMutex::new(HashMap::new()),
@@ -779,6 +976,7 @@ impl GraphService {
             auto_check_runner: crate::checks::auto::RootRunner::new(),
             distilling: StdMutex::new(HashSet::new()),
             live_sessions: StdMutex::new(HashMap::new()),
+            live_tab_roots: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -876,12 +1074,18 @@ impl GraphService {
     /// Resolves the project root from the caller's `cwd` (the same ancestor walk
     /// the MCP child uses) and records the call in the monitor's activity ring.
     /// Backs the loopback `/graph_run` route.
+    ///
+    /// V28: `session` is the EXPLICIT session id the caller's tab resolved to
+    /// (see [`Self::live_session_for_tab`]); the `context_*` memory tools scope
+    /// to it instead of "the most recent session for this agent". `None` keeps
+    /// exactly the pre-V28 behavior.
     pub async fn run_graph_tool(
         &self,
         cwd: &Path,
         name: &str,
         args: &serde_json::Value,
         consumer: &str,
+        session: Option<&str>,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
@@ -901,7 +1105,7 @@ impl GraphService {
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args).await
+        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session).await
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).
@@ -937,7 +1141,10 @@ impl GraphService {
             // query or the memory tap doesn't stay silently empty.
             if let Some(svc) = self.app.try_state::<Arc<GraphService>>() {
                 tracing::info!(root = %root.display(), "graph: schema migrated — rebuilding");
-                svc.inner().clone().spawn_rebuild(root);
+                // Repair work nobody asked for — never announces itself.
+                svc.inner()
+                    .clone()
+                    .spawn_rebuild(root, RebuildOrigin::Automatic);
             }
         }
         Ok(idx)
@@ -1335,10 +1542,84 @@ impl GraphService {
     /// tap calls this on tab cancel so a closed tab stops being reported active
     /// before its TTL lapses. OpenCode has no tab binding on the loopback path,
     /// so its entries rely on TTL expiry alone.
+    ///
+    /// H1 fix: also drops the tab's [`LiveTabRoot`] — the two facts have exactly
+    /// one lifetime (this tab's tap is running), and clearing them together is
+    /// what lets a *closed* second tab stop suppressing the survivor's scoping
+    /// immediately rather than after the TTL. A no-op for keys that never
+    /// registered a root (every OpenCode key).
     pub fn clear_live_session(&self, key: &str) {
         if let Ok(mut m) = self.live_sessions.lock() {
             m.remove(key);
         }
+        if let Ok(mut m) = self.live_tab_roots.lock() {
+            m.remove(key);
+        }
+    }
+
+    /// H1 fix: record that the tab keyed `tab` is RUNNING `agent` and binds its
+    /// session identity from the transcript source `root` — see [`LiveTabRoot`]
+    /// and [`tab_binding_is_ambiguous`]. Called from the tab's out-of-band tap
+    /// on every poll tick (cheap, idempotent, keeps the entry inside
+    /// [`LIVE_SESSION_TTL_MS`]); cleared by the tap's RAII guard via
+    /// [`Self::clear_live_session`].
+    ///
+    /// Only agents whose binding is root-derived call this: registering an entry
+    /// is what makes a tab *eligible* to be found ambiguous, so an agent that
+    /// binds correctly per-tab (OpenCode) must stay absent.
+    ///
+    /// H1-R2: also called on a fixed cadence by the tap's heartbeat, so a drain
+    /// loop parked in TTS backpressure can't let the claim age out (see
+    /// [`LIVE_SESSION_TTL_MS`]). Idempotent and cheap either way; the decision
+    /// (including the H1-R5 key normalization) lives in [`upsert_live_tab_root`].
+    pub fn mark_live_tab_root(&self, tab: &str, agent: &str, root: &Path) {
+        let now = crate::activity::now_ms() as i64;
+        if let Ok(mut m) = self.live_tab_roots.lock() {
+            upsert_live_tab_root(&mut m, tab, agent, root, now);
+        }
+    }
+
+    /// NC-2 (issue #5): the live-session registry entries reported by CLAUDE
+    /// tabs — `(tab_id, session_id)` per entry still inside
+    /// [`LIVE_SESSION_TTL_MS`]. This is the session→tab mapping the
+    /// `/permission/event` route resolves a hook payload with: a Claude entry
+    /// is keyed by its stable TAB ID (see [`Self::mark_live_session`]) and
+    /// carries the session id the tab's transcript tail last saw, which is
+    /// exactly the `session_id` a Claude Code hook payload names.
+    ///
+    /// Stale (TTL-lapsed) entries are filtered out rather than returned, so a
+    /// closed tab whose entry hasn't been reclaimed yet can never be credited
+    /// with a live session's permission prompt. H1 fix: tabs whose binding is
+    /// ambiguous are filtered out too — see [`live_claude_tab_sessions`].
+    pub fn live_claude_sessions(&self) -> Vec<(String, String)> {
+        let now = crate::activity::now_ms() as i64;
+        let Ok(live) = self.live_sessions.lock() else {
+            return Vec::new();
+        };
+        let Ok(roots) = self.live_tab_roots.lock() else {
+            return Vec::new();
+        };
+        live_claude_tab_sessions(&live, &roots, now)
+    }
+
+    /// V28 (issue #13): the session id the tab keyed `tab` currently reports,
+    /// for `agent` (`"claude"` / `"opencode"`) — the read-side identity the
+    /// `context_*` memory tools scope to, so two same-agent tabs on one project
+    /// stop sharing a memory scope.
+    ///
+    /// This is the generalization of [`Self::live_claude_sessions`] (which stays
+    /// as-is — the `/permission/event` route needs the whole Claude mapping, not
+    /// one tab). `None` means "no proof": no entry under that key, an entry left
+    /// by a different agent, or a TTL-stale one. Every caller fails OPEN on
+    /// `None` — back to `mem_current_session_for(agent)` — so a missing/unknown/
+    /// stale tab can never error a tool call. H1 fix: an AMBIGUOUS tab (two
+    /// running same-agent tabs on one transcript root) is `None` as well — same
+    /// fail-open, see [`tab_binding_is_ambiguous`].
+    pub fn live_session_for_tab(&self, tab: &str, agent: &str) -> Option<String> {
+        let now = crate::activity::now_ms() as i64;
+        let live = self.live_sessions.lock().ok()?;
+        let roots = self.live_tab_roots.lock().ok()?;
+        lookup_live_session_for_tab(&live, &roots, tab, agent, now)
     }
 
     /// V24 Phase B: the "open tabs + recency" active set for `sessions` at
@@ -3028,11 +3309,89 @@ impl GraphService {
         }
     }
 
+    /// V30 Phase C producer: announce a finished **full** index build into every
+    /// channel-armed session of this instance.
+    ///
+    /// **Pull twin (milestone invariant 2): the `graph_*` tools themselves.**
+    /// The pushed fact IS queryable state — everything this notice claims is
+    /// re-derivable with `graph_stats` / any `graph_*` query, and the Code
+    /// Intelligence tab renders the same numbers from `graph-status`. A dropped
+    /// push therefore costs timeliness, never information; no new tool needed.
+    ///
+    /// Gated hard, deliberately. Delivering a push to an IDLE Claude tab
+    /// **starts a model turn**, so every notice has a token price:
+    ///
+    /// - **Settings.** `offload.session_push` is read LIVE here, not cached, so
+    ///   turning the feature off stops app-side pushes on the next producer run
+    ///   with no restart. (The child-side latch is per-tab-until-restart; this
+    ///   is the half that can react immediately.)
+    /// - **User-initiated full builds only.** [`Self::spawn_rebuild`] is the
+    ///   only call site, and it is reached by four AUTOMATIC paths too — the
+    ///   startup build and the settings-enable watcher (`main.rs`), the
+    ///   watcher's channel-overflow recovery (`watcher.rs`), the schema-migration
+    ///   repair in [`Self::index_for`], and [`Self::reindex_paths`]'
+    ///   `DirWalk::TooBig` escalation. None of those is news anybody asked for
+    ///   (app launch on a big repo, a large `git checkout`), so only
+    ///   [`RebuildOrigin::User`] is push-eligible — the graph twin of the audit
+    ///   runner's `Initiator::Gui` gate.
+    /// - **`>= GRAPH_PUSH_MIN_BUILD_MS` wall clock.** A fast rebuild is not
+    ///   news; the notice exists for builds long enough that an agent gave up
+    ///   waiting on the index.
+    ///
+    /// Best-effort and non-blocking (`try_send` under the hood): no bus, no
+    /// subscribers, no channel-armed child, or a full queue all mean "not
+    /// delivered" and the rebuild neither retries nor fails.
+    fn announce_index_complete(
+        &self,
+        root: &Path,
+        stats: &GraphStats,
+        elapsed_ms: u64,
+        origin: RebuildOrigin,
+    ) {
+        let Some(pushes) = self.pushes.as_ref() else {
+            return;
+        };
+        // "Off means off": the gate is read LIVE here, so the producer stops the
+        // moment the user unticks it — the child-side latch cannot.
+        let session_push = self.settings.current().offload.session_push;
+        if !index_push_worthy(session_push, origin, elapsed_ms) {
+            return;
+        }
+        let project = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let notice = crate::offload::service::PushNotice::new(
+            format!(
+                "cImp finished a full code-graph index of {project} ({}): {} files, {} symbols, {} edges in {}s. The index is live — the graph_* tools now see the current tree.",
+                root.display(),
+                stats.files,
+                stats.symbols,
+                stats.edges,
+                elapsed_ms / 1000,
+            ),
+            [("kind", "graph_index")],
+        );
+        let delivered = pushes.push_broadcast(notice);
+        debug!(
+            root = %root.display(),
+            ms = elapsed_ms,
+            delivered,
+            "graph: pushed index-complete notice"
+        );
+    }
+
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
     /// immediately; progress lands on the `graph-status` event and via
     /// [`status`](Self::status). A no-op (logged) when a build for this root is
     /// already in flight.
-    pub fn spawn_rebuild(self: &Arc<Self>, root: PathBuf) {
+    ///
+    /// `origin` says who asked (V30 / review M2). It changes nothing about the
+    /// build itself — its only consumer is [`Self::announce_index_complete`],
+    /// which pushes a completion notice into every channel-armed session and
+    /// must not do so for a rebuild nobody requested. Pass
+    /// [`RebuildOrigin::User`] only from a real user action.
+    pub fn spawn_rebuild(self: &Arc<Self>, root: PathBuf, origin: RebuildOrigin) {
         // Build the status under the lock but emit AFTER dropping it: `emit`
         // dispatches synchronously on this thread, and a same-thread listener
         // that read `self.statuses()` during delivery would re-lock the
@@ -3068,12 +3427,13 @@ impl GraphService {
                 let started = std::time::Instant::now();
                 match this.rebuild_blocking(&root) {
                     Ok(stats) => {
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
                         info!(
                             root = %root.display(),
                             files = stats.files,
                             symbols = stats.symbols,
                             edges = stats.edges,
-                            ms = started.elapsed().as_millis() as u64,
+                            ms = elapsed_ms,
                             "graph: rebuild complete"
                         );
                         this.patch_status(&root, |s| {
@@ -3102,6 +3462,12 @@ impl GraphService {
                         // is on and `checks` is empty). Inline like the analyses
                         // trigger above — bounded fs + PATH work.
                         this.checks_auto_configure_trigger(&root);
+                        // V30 Phase C: announce an EXPENSIVE, USER-REQUESTED
+                        // index build into every channel-armed session (last, so
+                        // the push says "done" only once the post-build triggers
+                        // above have also run). Gated — see
+                        // `announce_index_complete`.
+                        this.announce_index_complete(&root, &stats, elapsed_ms, origin);
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
@@ -3314,7 +3680,11 @@ impl GraphService {
                         debug!(root = %root.display(), dir = %rel,
                             "graph: moved-in directory exceeds incremental walk cap; full rebuild");
                         drop(_w);
-                        self.spawn_rebuild(root.to_path_buf());
+                        // Escalated out of the incremental watcher path — an
+                        // automatic rebuild, so it must not push (this is one of
+                        // the two paths that used to reach the producer despite
+                        // its doc comment claiming the watcher never can).
+                        self.spawn_rebuild(root.to_path_buf(), RebuildOrigin::Automatic);
                         return;
                     }
                 }
@@ -3780,6 +4150,49 @@ impl GraphService {
 /// first successful pass this project has ever run IS new information.
 fn analyses_changed(prev: Option<&str>, cur: &str) -> bool {
     prev != Some(cur)
+}
+
+/// V30 (review M2): who asked for a full rebuild
+/// ([`GraphService::spawn_rebuild`]). The graph twin of the audit runner's
+/// `Initiator` (`audit/runner.rs`): only a rebuild a human actually
+/// requested may announce itself on the session-push bus, because delivering a
+/// notice to an idle Claude tab **starts a model turn**. Everything automatic —
+/// the startup build, the settings-enable watcher, the watcher's
+/// channel-overflow recovery, the schema-migration repair, the moved-in-directory
+/// escalation out of the incremental path — happens without anyone waiting, and
+/// would otherwise start a turn in every armed tab on app launch or after a
+/// large `git checkout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildOrigin {
+    /// A user action: the Code Intelligence tab's Rebuild button
+    /// (`graph_rebuild`) or a Settings language toggle
+    /// (`graph_set_language_enabled`).
+    User,
+    /// Machinery: startup, runtime enable, watcher recovery, schema migration,
+    /// incremental-walk escalation. Never pushes.
+    Automatic,
+}
+
+/// V30 Phase C: the wall-clock floor for the index-completion push. Below this
+/// the build was cheap enough that nobody was waiting on it, and the notice
+/// would cost more (an idle Claude tab starts a model turn on delivery) than the
+/// information is worth.
+const GRAPH_PUSH_MIN_BUILD_MS: u64 = 30_000;
+
+/// V30 Phase C: the complete gate for
+/// [`GraphService::announce_index_complete`] — pure so "only expensive builds a
+/// user asked for, and only while the feature is on, announce themselves" is
+/// testable without an `AppHandle`, a store, or a push bus. The
+/// full-vs-incremental half is structural (only `spawn_rebuild` calls the
+/// producer at all).
+///
+/// `session_push` comes from a LIVE settings read at fire time (review M6): the
+/// child-side declaration is latched per tab until restart, so the producer is
+/// the half that can make "off" mean off immediately.
+fn index_push_worthy(session_push: bool, origin: RebuildOrigin, elapsed_ms: u64) -> bool {
+    session_push
+        && matches!(origin, RebuildOrigin::User)
+        && elapsed_ms >= GRAPH_PUSH_MIN_BUILD_MS
 }
 
 /// Make a `&str` `path` project-relative to `root` with `/` separators (empty in
@@ -4651,8 +5064,10 @@ mod tests {
 
         // index_docs off: markdown is skipped (the file row is gone after a
         // clean rebuild), so the doc search no longer matches.
-        let mut snap_off = GraphSettings::default();
-        snap_off.index_docs = false;
+        let snap_off = GraphSettings {
+            index_docs: false,
+            ..GraphSettings::default()
+        };
         build_tree(&idx, &dir, &snap_off, sub).expect("rebuild2");
         assert!(idx.search_docs("frobnicator", 10, 200).unwrap().is_empty());
 
@@ -4679,8 +5094,10 @@ mod tests {
         .unwrap();
 
         let sub = ".ckg-test";
-        let mut snap = GraphSettings::default();
-        snap.semantic_code_max_chunks = 1;
+        let snap = GraphSettings {
+            semantic_code_max_chunks: 1,
+            ..GraphSettings::default()
+        };
         let idx = GraphIndex::open(&dir, sub).expect("open");
         build_tree(&idx, &dir, &snap, sub).expect("rebuild");
 
@@ -4733,6 +5150,62 @@ mod tests {
         assert!(
             analyses_changed(Some("3,1"), "3,0"),
             "cycle count shrank — still a change"
+        );
+    }
+
+    // ── V30 Phase C: index-completion push gate ─────────────────────────────
+
+    /// The duration half of `announce_index_complete`'s gate. Delivering a push
+    /// to an idle Claude tab starts a model turn, so only builds expensive
+    /// enough to have been worth waiting on may announce themselves.
+    #[test]
+    fn index_push_worthy_only_past_the_duration_floor() {
+        let user = |ms| index_push_worthy(true, RebuildOrigin::User, ms);
+        assert!(!user(0), "an instant rebuild is not news");
+        assert!(
+            !user(GRAPH_PUSH_MIN_BUILD_MS - 1),
+            "just under the floor must stay silent"
+        );
+        assert!(user(GRAPH_PUSH_MIN_BUILD_MS), "the floor itself qualifies");
+        assert!(
+            user(GRAPH_PUSH_MIN_BUILD_MS * 10),
+            "a five-minute build definitely qualifies"
+        );
+        assert_eq!(
+            GRAPH_PUSH_MIN_BUILD_MS, 30_000,
+            "the milestone fixes this floor at 30s — changing it is a spec decision"
+        );
+    }
+
+    /// The ORIGIN half (review M2): an automatic rebuild never announces itself,
+    /// however long it took. Four automatic paths reach `spawn_rebuild` —
+    /// startup, the settings-enable watcher, watcher-overflow recovery, the
+    /// schema-migration repair, and the incremental walk's `DirWalk::TooBig`
+    /// escalation — so without this gate an app launch on a big repo (or a large
+    /// `git checkout`) started a model turn in every channel-armed tab.
+    #[test]
+    fn index_push_worthy_rejects_automatic_rebuilds() {
+        for ms in [0, GRAPH_PUSH_MIN_BUILD_MS, GRAPH_PUSH_MIN_BUILD_MS * 100] {
+            assert!(
+                !index_push_worthy(true, RebuildOrigin::Automatic, ms),
+                "an automatic rebuild must never push (elapsed {ms}ms)"
+            );
+        }
+        assert!(
+            index_push_worthy(true, RebuildOrigin::User, GRAPH_PUSH_MIN_BUILD_MS),
+            "…while the same build a user asked for still does"
+        );
+    }
+
+    /// Review M6: "off means off" app-side. `offload.session_push` is read live
+    /// at fire time and dominates every other input — the child-side capability
+    /// declaration is latched until the tab restarts, so without this a
+    /// toggled-off feature kept pushing into running tabs.
+    #[test]
+    fn index_push_worthy_honours_a_live_settings_toggle() {
+        assert!(
+            !index_push_worthy(false, RebuildOrigin::User, GRAPH_PUSH_MIN_BUILD_MS * 10),
+            "session_push off ⇒ no push, however expensive or user-requested"
         );
     }
 
@@ -5204,6 +5677,355 @@ mod tests {
         let mut past = HashMap::new();
         past.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS - 1));
         assert!(compute_active_session_ids(&past, &sessions, now).is_empty());
+    }
+
+    // ── V28 (issue #13): tab → session resolution ─────────────────────────
+
+    /// A registry entry for an arbitrary agent (the `live` helper pins Claude).
+    fn live_for(agent: &str, session_id: &str, last_seen_ms: i64) -> LiveSession {
+        LiveSession {
+            agent: agent.to_string(),
+            session_id: session_id.to_string(),
+            last_seen_ms,
+        }
+    }
+
+    fn v28_registry(now: i64) -> HashMap<String, LiveSession> {
+        let mut reg = HashMap::new();
+        reg.insert(
+            "claude".to_string(),
+            live_for("claude", "ses_a", now - 1_000),
+        );
+        reg.insert(
+            "claude-local".to_string(),
+            live_for("claude", "ses_b", now - 1_000),
+        );
+        reg.insert(
+            "opencode".to_string(),
+            live_for("opencode", "ses_oc", now - 1_000),
+        );
+        reg.insert(
+            "claude-stale".to_string(),
+            live_for("claude", "ses_old", now - LIVE_SESSION_TTL_MS - 1),
+        );
+        reg
+    }
+
+    /// No running-tab roots registered: every V28 lookup behaves exactly as it
+    /// did before the H1 fix (the pre-existing tests all use this).
+    fn no_roots() -> HashMap<String, LiveTabRoot> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn live_session_for_tab_returns_that_tabs_own_session() {
+        // The whole point of V28: two tabs of the SAME agent resolve to their
+        // OWN sessions, not to whichever was most recently active.
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "claude", "claude", now),
+            Some("ses_a".to_string())
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "claude-local", "claude", now),
+            Some("ses_b".to_string())
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "opencode", "opencode", now),
+            Some("ses_oc".to_string())
+        );
+    }
+
+    #[test]
+    fn live_session_for_tab_rejects_an_agent_mismatch() {
+        // The key exists but was stamped by the other harness — resolving it
+        // would hand a Claude call an OpenCode session. Fail open instead.
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "opencode", "claude", now),
+            None
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "claude", "opencode", now),
+            None
+        );
+    }
+
+    #[test]
+    fn live_session_for_tab_rejects_a_ttl_stale_entry() {
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &no_roots(), "claude-stale", "claude", now),
+            None,
+            "past the TTL the tab's reported session is no longer proof"
+        );
+        // Exactly at the TTL edge still counts (same boundary as the registry
+        // half of `compute_active_session_ids` and the eviction sweep).
+        let mut edge = HashMap::new();
+        edge.insert(
+            "claude".to_string(),
+            live_for("claude", "ses_edge", now - LIVE_SESSION_TTL_MS),
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&edge, &no_roots(), "claude", "claude", now),
+            Some("ses_edge".to_string())
+        );
+    }
+
+    #[test]
+    fn live_session_for_tab_never_guesses_on_an_unknown_key() {
+        // No prefix/fuzzy matching, no "only one Claude entry, must be it".
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        for tab in ["", "claude2", "clau", "claude ", "CLAUDE"] {
+            assert_eq!(
+                lookup_live_session_for_tab(&reg, &no_roots(), tab, "claude", now),
+                None,
+                "tab key {tab:?} must not resolve"
+            );
+        }
+        assert!(
+            lookup_live_session_for_tab(&HashMap::new(), &no_roots(), "claude", "claude", now)
+                .is_none()
+        );
+    }
+
+    // ── H1 (2026-08-05 review): same-root ambiguity degrades to unscoped ──
+
+    fn root_at(agent: &str, root: &str, last_seen_ms: i64) -> LiveTabRoot {
+        LiveTabRoot {
+            agent: agent.to_string(),
+            root: PathBuf::from(root),
+            last_seen_ms,
+        }
+    }
+
+    /// `n` running Claude tabs, all tailing the SAME transcript root.
+    fn roots_sharing(tabs: &[&str], now: i64) -> HashMap<String, LiveTabRoot> {
+        tabs.iter()
+            .map(|t| {
+                (
+                    (*t).to_string(),
+                    root_at("claude", "/home/u/.claude/projects/P--proj", now - 100),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ambiguity_predicate_counts_running_tabs_sharing_a_root() {
+        let now = 10_000_000i64;
+        // 0 running tabs registered → nothing to conflate.
+        assert!(!tab_binding_is_ambiguous(&no_roots(), "claude", "claude", now));
+        // 1 running tab on the root → the common case, NOT ambiguous.
+        let one = roots_sharing(&["claude"], now);
+        assert!(!tab_binding_is_ambiguous(&one, "claude", "claude", now));
+        // 2 running tabs on the SAME root → both are ambiguous.
+        let two = roots_sharing(&["claude", "claude-local"], now);
+        assert!(tab_binding_is_ambiguous(&two, "claude", "claude", now));
+        assert!(tab_binding_is_ambiguous(&two, "claude-local", "claude", now));
+        // 2 running tabs on DIFFERENT roots → each keeps its own identity.
+        let mut split = HashMap::new();
+        split.insert(
+            "claude".to_string(),
+            root_at("claude", "/home/u/.claude/projects/P--one", now),
+        );
+        split.insert(
+            "claude-local".to_string(),
+            root_at("claude", "/home/u/.claude/projects/P--two", now),
+        );
+        assert!(!tab_binding_is_ambiguous(&split, "claude", "claude", now));
+        assert!(!tab_binding_is_ambiguous(
+            &split,
+            "claude-local",
+            "claude",
+            now
+        ));
+    }
+
+    #[test]
+    fn ambiguity_predicate_ignores_other_agents_and_stale_co_tenants() {
+        let now = 10_000_000i64;
+        let shared = "/home/u/.claude/projects/P--proj";
+        let mut reg = HashMap::new();
+        reg.insert("claude".to_string(), root_at("claude", shared, now));
+        // A different agent on the same root is not a co-tenant: OpenCode binds
+        // per-tab off its own stream (and never registers here anyway).
+        reg.insert("opencode".to_string(), root_at("opencode", shared, now));
+        assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
+        // A CLOSED tab whose entry outlived the TTL is not a co-tenant either —
+        // otherwise a leaked entry would disable scoping forever.
+        reg.insert(
+            "claude-local".to_string(),
+            root_at("claude", shared, now - LIVE_SESSION_TTL_MS - 1),
+        );
+        assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
+        // Refresh it (the tab is running again) and ambiguity returns.
+        reg.insert("claude-local".to_string(), root_at("claude", shared, now));
+        assert!(tab_binding_is_ambiguous(&reg, "claude", "claude", now));
+        // A tab with no root entry at all is never degraded (OpenCode's path).
+        assert!(!tab_binding_is_ambiguous(&reg, "opencode-2", "opencode", now));
+    }
+
+    #[test]
+    fn live_session_for_tab_is_unscoped_under_same_root_ambiguity() {
+        // The H1 case: two Claude tabs on one project. The registry answers
+        // "whichever session wrote last" for BOTH keys, so honoring it would
+        // put tab A's memory notes in tab B's scope. Fail open to unscoped.
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        let two = roots_sharing(&["claude", "claude-local"], now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &two, "claude", "claude", now),
+            None
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &two, "claude-local", "claude", now),
+            None
+        );
+        // The single-running-tab case is untouched.
+        let one = roots_sharing(&["claude"], now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &one, "claude", "claude", now),
+            Some("ses_a".to_string())
+        );
+        // ...and an OpenCode tab never registers a root, so it never degrades.
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, &two, "opencode", "opencode", now),
+            Some("ses_oc".to_string())
+        );
+    }
+
+    #[test]
+    fn live_claude_tab_sessions_drops_ambiguous_tabs_only() {
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        // Single running tab per root: the permission resolver still gets the
+        // mapping it needs (TTL-stale entries filtered as before).
+        let one = roots_sharing(&["claude"], now);
+        let mut got = live_claude_tab_sessions(&reg, &one, now);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("claude".to_string(), "ses_a".to_string()),
+                ("claude-local".to_string(), "ses_b".to_string()),
+            ],
+            "only `claude` is registered as running, so nothing is ambiguous"
+        );
+        // Both tabs running on one root — including the launch-order window in
+        // which A's tap already rotated onto B's fresh session and marked it
+        // live UNIQUELY: no pair survives, so the resolver has nothing to
+        // attribute with and refuses.
+        let two = roots_sharing(&["claude", "claude-local"], now);
+        assert!(live_claude_tab_sessions(&reg, &two, now).is_empty());
+        let mut window = HashMap::new();
+        window.insert(
+            "claude".to_string(),
+            live_for("claude", "ses_b", now - 10), // A's tap, B's session
+        );
+        assert!(live_claude_tab_sessions(&window, &two, now).is_empty());
+        // Two tabs on DIFFERENT roots keep their pairs.
+        let mut split = HashMap::new();
+        split.insert(
+            "claude".to_string(),
+            root_at("claude", "/home/u/.claude/projects/P--one", now),
+        );
+        split.insert(
+            "claude-local".to_string(),
+            root_at("claude", "/home/u/.claude/projects/P--two", now),
+        );
+        assert_eq!(live_claude_tab_sessions(&reg, &split, now).len(), 2);
+    }
+
+    /// H1-R5: the root is a normalized comparison key, so two tabs whose cwds
+    /// were typed with different separators/trailing slashes (and, on Windows,
+    /// different case) are still recognized as co-tenants. Before the fix these
+    /// produced different `PathBuf` keys and the predicate silently answered
+    /// "not ambiguous" — i.e. confident-wrong scoping for both tabs.
+    #[test]
+    fn tab_root_keys_are_normalized_at_the_mark_site() {
+        let now = 10_000_000i64;
+        let mut reg = HashMap::new();
+        upsert_live_tab_root(
+            &mut reg,
+            "claude",
+            "claude",
+            Path::new(r"C:\Users\u\.claude\projects\P--proj"),
+            now,
+        );
+        upsert_live_tab_root(
+            &mut reg,
+            "claude-local",
+            "claude",
+            Path::new("C:/Users/u/.claude/projects/P--proj/"),
+            now,
+        );
+        assert!(
+            tab_binding_is_ambiguous(&reg, "claude", "claude", now),
+            "separator/trailing-slash variants of one dir must conflate"
+        );
+        assert!(tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
+        // Windows paths are case-insensitive, so a case variant is the SAME dir.
+        if cfg!(windows) {
+            let mut cased = HashMap::new();
+            upsert_live_tab_root(
+                &mut cased,
+                "claude",
+                "claude",
+                Path::new(r"C:\Users\u\.claude\projects\P--Proj"),
+                now,
+            );
+            upsert_live_tab_root(
+                &mut cased,
+                "claude-local",
+                "claude",
+                Path::new(r"c:\users\u\.claude\projects\p--proj"),
+                now,
+            );
+            assert!(
+                tab_binding_is_ambiguous(&cased, "claude", "claude", now),
+                "case variants of one Windows dir must conflate"
+            );
+        }
+        // Genuinely different dirs still don't conflate.
+        let mut split = HashMap::new();
+        upsert_live_tab_root(&mut split, "claude", "claude", Path::new("/u/p/one"), now);
+        upsert_live_tab_root(&mut split, "claude-local", "claude", Path::new("/u/p/two"), now);
+        assert!(!tab_binding_is_ambiguous(&split, "claude", "claude", now));
+    }
+
+    /// H1-R2: the property the tap's heartbeat depends on — a refresh restores a
+    /// claim that had aged past the TTL, so a tab stalled inside TTS
+    /// backpressure keeps counting as a co-tenant instead of letting its sibling
+    /// become "unique" (and confidently bind to the stalled tab's transcript).
+    #[test]
+    fn refreshing_a_tab_root_restores_a_ttl_stale_claim() {
+        let now = 10_000_000i64;
+        let shared = Path::new("/home/u/.claude/projects/P--proj");
+        let mut reg = HashMap::new();
+        // Tab A marked long ago (its drain loop is parked in `speak`), tab B
+        // ticking normally.
+        upsert_live_tab_root(
+            &mut reg,
+            "claude",
+            "claude",
+            shared,
+            now - LIVE_SESSION_TTL_MS - 1,
+        );
+        upsert_live_tab_root(&mut reg, "claude-local", "claude", shared, now);
+        // The starvation symptom: A aged out, so B looks unique and would get a
+        // confident (wrong) binding.
+        assert!(!reg.contains_key("claude"), "stale claim is evicted");
+        assert!(!tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
+        // A heartbeat tick re-marks A — independent of A's drain loop — and the
+        // co-tenancy is visible again for BOTH tabs.
+        upsert_live_tab_root(&mut reg, "claude", "claude", shared, now);
+        assert!(tab_binding_is_ambiguous(&reg, "claude", "claude", now));
+        assert!(tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
     }
 
     #[test]

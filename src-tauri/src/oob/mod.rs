@@ -62,6 +62,14 @@ pub struct OobContext {
     /// session/action memory in-process. `None` when the graph feature isn't
     /// wired (tests, or a build without a GraphService in managed state).
     pub mem: Option<Arc<GraphService>>,
+    /// V30 Phase D: the session-push bus, so a tap can subscribe its tab to
+    /// `push_to_tab`/`push_broadcast` **in-process** and deliver the notice over
+    /// its agent's own transport. Only [`opencode`] uses it today — Claude tabs
+    /// are served by the stdio child's `/events` SSE relay, which registers on
+    /// the same registry from the loopback side. `None` when the offload service
+    /// isn't in managed state (tests, headless builds) ⇒ feature absent, zero
+    /// behaviour change.
+    pub pushes: Option<Arc<crate::offload::service::PushRegistry>>,
 }
 
 /// Spawn the adapter described by `spec`, tied to `ctx.cancel`. Non-blocking:
@@ -198,6 +206,23 @@ impl OobContext {
         }
     }
 
+    /// H1 fix (2026-08-05 review): declare that this tab is RUNNING `agent` and
+    /// derives its session identity from the transcript source `root`, so the
+    /// registry can detect when two running tabs share one root and its
+    /// tab-keyed answers stop being provable
+    /// (`GraphService::mark_live_tab_root`). Called on every poll tick of a
+    /// root-binding tap; cleared together with the live-session entry by
+    /// [`Self::clear_live_session`]. A no-op when memory isn't wired.
+    ///
+    /// Only root-binding taps call this. The OpenCode tap must NOT: it reads the
+    /// session id off its own per-tab SSE stream, so two OpenCode tabs on one
+    /// project are genuinely distinguishable and must keep their scoping.
+    pub fn mark_live_tab_root(&self, agent: &str, root: &std::path::Path) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.mark_live_tab_root(self.tab.as_str(), agent, root);
+        }
+    }
+
     /// V24 Phase B: drop this tab's live-session registry entry — the Claude
     /// tap calls this when its transcript tail exits (tab cancel / source end),
     /// so a closed tab stops being reported active before its TTL lapses. A
@@ -206,6 +231,45 @@ impl OobContext {
         if let Some(mem) = self.mem.as_ref() {
             mem.clear_live_session(self.tab.as_str());
         }
+    }
+
+    /// V30 Phase D: subscribe this tab to the session-push bus as `consumer`,
+    /// returning the RAII deregistration guard and the notice queue — or `None`
+    /// when the bus isn't wired (mirrors [`Self::record_mem`]'s `mem: None`
+    /// degradation).
+    ///
+    /// `channels: true` is reported because a subscription only EXISTS while
+    /// `offload.session_push` is on: the OpenCode tap registers and deregisters
+    /// as the setting flips (`opencode::sync_subscription`, driven off the
+    /// settings broadcast), so no tab restart is needed and
+    /// `PushRegistry::deliver`'s count stays honest — it never counts a tab that
+    /// is about to drop the notice at the gate. (For an in-process subscriber
+    /// the field's Claude-side meaning — "this child declared the
+    /// `claude/channel` capability at handshake time" — has no analogue: nothing
+    /// is negotiated, so nothing can go stale.) The gate is re-read once more at
+    /// DELIVERY time (`opencode::forward_target`), which closes the sub-millisecond
+    /// window between a producer's live read and the tap's.
+    pub fn register_pushes(
+        &self,
+        consumer: &str,
+    ) -> Option<(
+        crate::offload::service::PushGuard,
+        tokio::sync::mpsc::Receiver<crate::offload::service::PushNotice>,
+    )> {
+        self.pushes.as_ref().map(|reg| {
+            reg.register(
+                Some(self.tab.as_str().to_string()),
+                consumer.to_string(),
+                true,
+            )
+        })
+    }
+
+    /// V30 Phase D: whether session push is enabled **right now**. Read live
+    /// (never cached at spawn) so the OpenCode fanout is togglable without a tab
+    /// restart — see the asymmetry note on `opencode::forward_target`.
+    pub fn session_push_enabled(&self) -> bool {
+        self.settings.current().offload.session_push
     }
 
     /// V14 Phase C: record one usage/cost event via the graph service — a
@@ -242,6 +306,7 @@ mod tests {
             settings,
             cancel: CancellationToken::new(),
             mem: None,
+            pushes: None,
         }
     }
 

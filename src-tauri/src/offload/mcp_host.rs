@@ -44,6 +44,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 /// Tighter bound on the handshake so a wedged server doesn't stall warm-up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// JSON-RPC error code a **modern-only** MCP server answers a legacy client
+/// with. The 2026-07-28 spec revision removed `Mcp-Session-Id` and made
+/// `Mcp-Method` / `Mcp-Name` required on client POSTs; a server that dropped
+/// the compatibility path replies HTTP 400 + this code and does *not* fall
+/// forward. cImp still speaks [`PROTOCOL_VERSION`], so the only useful
+/// response is to name the cause instead of surfacing a bare `400`.
+const ERR_UNSUPPORTED_REVISION: i64 = -32022;
+
+/// User-facing explanation for [`ERR_UNSUPPORTED_REVISION`]. Phrased as a
+/// clause so it composes into both the JSON-RPC and the HTTP-status message.
+const UNSUPPORTED_REVISION_MSG: &str =
+    "server requires a newer MCP revision than this cImp speaks (2025-06-18)";
+
 /// Write/destructive leading verbs. A tool whose leading verb is in this
 /// set is filtered out — the offload worker stays read-only even when a
 /// server advertises mutating tools (`filesystem` write, `git` commit).
@@ -400,10 +413,19 @@ enum Conn {
     /// later response (or rotates it mid-session) refreshes the stored value
     /// instead of wedging subsequent calls with a stale `400`. No warm channel
     /// is kept.
+    ///
+    /// A **missing** session id is normal, not a fault: a stateless server
+    /// (and every server on the 2026-07-28 revision, which removed the header
+    /// outright) never assigns one. `None` simply means the header is omitted
+    /// on later requests — no warning, no error, no degraded mode.
     Http {
         url: String,
         client: reqwest::Client,
         session_id: StdMutex<Option<String>>,
+        /// Revision the server settled on at `initialize` (see
+        /// [`negotiated_version`]), echoed as `MCP-Protocol-Version` on every
+        /// post-handshake request.
+        protocol_version: String,
     },
 }
 
@@ -520,6 +542,7 @@ impl McpServer {
                 url,
                 client,
                 session_id,
+                protocol_version,
             }) => {
                 let current = session_id.lock().unwrap().clone();
                 match http_request(
@@ -528,6 +551,7 @@ impl McpServer {
                     "tools/call",
                     params,
                     current.as_deref(),
+                    Some(protocol_version.as_str()),
                     REQUEST_TIMEOUT,
                 )
                 .await
@@ -938,35 +962,27 @@ async fn connect_stdio(
         let conn = conn.clone();
         tauri::async_runtime::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let Ok(v) = serde_json::from_str::<Value>(line) else {
-                            continue;
-                        };
-                        if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
-                            if let Some(tx) = conn.pending.lock().unwrap().remove(&id) {
-                                let res = if let Some(err) = v.get("error") {
-                                    Err(err
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("server error")
-                                        .to_string())
-                                } else {
-                                    Ok(v.get("result").cloned().unwrap_or(Value::Null))
-                                };
-                                let _ = tx.send(res);
-                            }
-                        }
-                        // Notifications (no id) are ignored here; the host
-                        // re-derives capabilities on reconcile.
-                    }
-                    _ => break, // EOF or read error
+            // Loop ends on EOF or a read error.
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
                 }
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+                    if let Some(tx) = conn.pending.lock().unwrap().remove(&id) {
+                        let res = if let Some(err) = v.get("error") {
+                            Err(jsonrpc_error_text(err))
+                        } else {
+                            Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                        };
+                        let _ = tx.send(res);
+                    }
+                }
+                // Notifications (no id) are ignored here; the host re-derives
+                // capabilities on reconcile.
             }
             // Connection ended: fail every pending request and mark dead.
             // Flip `alive` and drain under the same lock the request path
@@ -989,7 +1005,20 @@ async fn connect_stdio(
         "capabilities": {},
         "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") }
     });
-    conn.request("initialize", init, CONNECT_TIMEOUT).await?;
+    let init_result = conn.request("initialize", init, CONNECT_TIMEOUT).await?;
+    // Record the revision the server settled on. stdio frames carry no
+    // headers, so there is nothing to echo back — but a server answering with
+    // a different revision than we asked for is exactly the signal that
+    // explains a later behavioral surprise, so it must not be swallowed.
+    let negotiated = negotiated_version(&init_result);
+    if negotiated != PROTOCOL_VERSION {
+        info!(
+            server = %cfg.name,
+            requested = PROTOCOL_VERSION,
+            negotiated = %negotiated,
+            "offload mcp host: server answered with a different protocol revision"
+        );
+    }
     conn.notify("notifications/initialized", json!({})).await;
 
     let list = conn
@@ -1021,8 +1050,31 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
     // The session id is assigned on the initialize response and must be echoed
     // back on every subsequent request (some servers — e.g. ddg-search —
     // hard-reject a session-less `tools/list` with 400 "Missing session ID").
-    let (mut session_id, _init) =
-        http_request(&client, &url, "initialize", init, None, CONNECT_TIMEOUT).await?;
+    // A server that assigns none is fine: `None` just omits the header.
+    let (mut session_id, init_result) = http_request(
+        &client,
+        &url,
+        "initialize",
+        init,
+        None,
+        // The handshake itself predates the negotiation, so it carries no
+        // `MCP-Protocol-Version` header — the body's `protocolVersion` is the
+        // request.
+        None,
+        CONNECT_TIMEOUT,
+    )
+    .await?;
+    // Adopt whatever revision the server answered with (see
+    // [`negotiated_version`]) and speak that from here on.
+    let protocol_version = negotiated_version(&init_result);
+    if protocol_version != PROTOCOL_VERSION {
+        info!(
+            server = %cfg.name,
+            requested = PROTOCOL_VERSION,
+            negotiated = %protocol_version,
+            "offload mcp host: adopting the server's protocol revision"
+        );
+    }
     // The transport requires the client to confirm initialization before
     // issuing further requests; send it (best-effort) carrying the session id.
     http_notify(
@@ -1031,6 +1083,7 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         "notifications/initialized",
         json!({}),
         session_id.as_deref(),
+        Some(protocol_version.as_str()),
     )
     .await;
     let (list_session, list) = http_request(
@@ -1039,6 +1092,7 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         "tools/list",
         json!({}),
         session_id.as_deref(),
+        Some(protocol_version.as_str()),
         CONNECT_TIMEOUT,
     )
     .await?;
@@ -1053,22 +1107,89 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
             url,
             client,
             session_id: StdMutex::new(session_id),
+            protocol_version,
         },
         tools,
     ))
+}
+
+/// The protocol revision to speak after `initialize`. The spec makes the
+/// server's echoed `protocolVersion` authoritative: a server may answer with a
+/// revision other than the one the client asked for, and the client must then
+/// use that one (or disconnect) rather than assume its request was honored.
+/// This adopts it — the HTTP transport echoes the result back as
+/// `MCP-Protocol-Version` on every later request.
+///
+/// A missing/blank field means a server that predates the field; fall back to
+/// what we requested ([`PROTOCOL_VERSION`]) rather than failing the connect.
+fn negotiated_version(init_result: &Value) -> String {
+    init_result
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(PROTOCOL_VERSION)
+        .to_string()
+}
+
+/// Render a JSON-RPC `error` object into the message the host surfaces (health
+/// row + tool-call failure). Codes are otherwise opaque, but
+/// [`ERR_UNSUPPORTED_REVISION`] is the one a user can act on, so it gets named.
+fn jsonrpc_error_text(err: &Value) -> String {
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("server error");
+    match err.get("code").and_then(|c| c.as_i64()) {
+        Some(ERR_UNSUPPORTED_REVISION) => {
+            format!("{UNSUPPORTED_REVISION_MSG} — JSON-RPC error -32022: {msg}")
+        }
+        _ => msg.to_string(),
+    }
+}
+
+/// Render a non-2xx response from an MCP endpoint. A modern-only server
+/// rejects a legacy handshake with HTTP 400 carrying JSON-RPC
+/// [`ERR_UNSUPPORTED_REVISION`]; recognize that shape explicitly, and treat a
+/// bare `400` on `initialize` as *possibly* the same cause (some servers send
+/// a plain-text 400) instead of leaking an unexplained status code.
+fn http_error_text(status: u16, method: &str, body: &str) -> String {
+    let excerpt: String = body.chars().take(300).collect();
+    let code = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error")?.get("code")?.as_i64());
+    if code == Some(ERR_UNSUPPORTED_REVISION) {
+        return format!("{UNSUPPORTED_REVISION_MSG} — HTTP {status}, JSON-RPC error -32022");
+    }
+    if status == 400 && method == "initialize" {
+        return format!(
+            "MCP handshake rejected with HTTP {status} — possibly the {UNSUPPORTED_REVISION_MSG}; response: {excerpt}"
+        );
+    }
+    format!("http status {status}: {excerpt}")
 }
 
 /// Core Streamable-HTTP request: POST one JSON-RPC frame and return the
 /// `Mcp-Session-Id` the server assigned (if any) plus the JSON-RPC `result`.
 /// Sends the dual `Accept` the 2025 transport mandates (a server rejects a
 /// client that doesn't accept `text/event-stream` with 406), resends a prior
-/// `session_id`, and decodes an SSE-framed response body back to JSON.
+/// `session_id` (when the server assigned one) and the negotiated
+/// `MCP-Protocol-Version`, and decodes an SSE-framed response body back to
+/// JSON.
+///
+/// NOTE (2026-07-28 revision, not implemented): that revision drops
+/// `Mcp-Session-Id` and requires `Mcp-Method` and `Mcp-Name` headers on every
+/// client POST. They would be added right beside the `Accept` header below,
+/// gated on the negotiated `protocol_version` — cImp still requests
+/// [`PROTOCOL_VERSION`], so a modern-only server is *detected*
+/// ([`ERR_UNSUPPORTED_REVISION`]) rather than spoken to.
 async fn http_request(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: Value,
     session_id: Option<&str>,
+    protocol_version: Option<&str>,
     timeout: Duration,
 ) -> Result<(Option<String>, Value), String> {
     // Unique per-call id (JSON-RPC ids must be unique within a session; some
@@ -1081,8 +1202,13 @@ async fn http_request(
         .timeout(timeout)
         .header("Accept", "application/json, text/event-stream")
         .json(&body);
+    // Omitted entirely when the server never assigned one — a stateless server
+    // is a normal server, not a degraded one.
     if let Some(s) = session_id {
         req = req.header("Mcp-Session-Id", s);
+    }
+    if let Some(v) = protocol_version {
+        req = req.header("MCP-Protocol-Version", v);
     }
     let mut resp = req
         .send()
@@ -1102,10 +1228,7 @@ async fn http_request(
         .to_string();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "http status {status}: {}",
-            body.chars().take(300).collect::<String>()
-        ));
+        return Err(http_error_text(status.as_u16(), method, &body));
     }
     // For an SSE-framed body, read incrementally and return on the first frame
     // carrying a JSON-RPC result/error — a server that streams progress events
@@ -1121,11 +1244,7 @@ async fn http_request(
         serde_json::from_str::<Value>(&text).map_err(|e| format!("http parse failed: {e}"))?
     };
     if let Some(err) = v.get("error") {
-        return Err(err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("server error")
-            .to_string());
+        return Err(jsonrpc_error_text(err));
     }
     Ok((new_session, v.get("result").cloned().unwrap_or(Value::Null)))
 }
@@ -1138,6 +1257,7 @@ async fn http_notify(
     method: &str,
     params: Value,
     session_id: Option<&str>,
+    protocol_version: Option<&str>,
 ) {
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
     let mut req = client
@@ -1147,6 +1267,9 @@ async fn http_notify(
         .json(&body);
     if let Some(s) = session_id {
         req = req.header("Mcp-Session-Id", s);
+    }
+    if let Some(v) = protocol_version {
+        req = req.header("MCP-Protocol-Version", v);
     }
     let _ = req.send().await;
 }
@@ -1709,6 +1832,107 @@ mod tests {
             }
         }
         assert_eq!(got.unwrap()["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn negotiated_version_adopts_the_servers_answer() {
+        // The server's echoed revision is authoritative — even when it differs
+        // from (or predates) the one we requested.
+        let older = json!({ "protocolVersion": "2025-03-26", "capabilities": {} });
+        assert_eq!(negotiated_version(&older), "2025-03-26");
+        let newer = json!({ "protocolVersion": "2026-07-28" });
+        assert_eq!(negotiated_version(&newer), "2026-07-28");
+        // Same-as-requested round-trips unchanged.
+        let same = json!({ "protocolVersion": PROTOCOL_VERSION });
+        assert_eq!(negotiated_version(&same), PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn negotiated_version_falls_back_when_absent_or_blank() {
+        // A server that omits the field (or sends junk) must not fail the
+        // connect — we keep speaking what we asked for.
+        assert_eq!(negotiated_version(&json!({})), PROTOCOL_VERSION);
+        assert_eq!(
+            negotiated_version(&json!({ "protocolVersion": "  " })),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(
+            negotiated_version(&json!({ "protocolVersion": 7 })),
+            PROTOCOL_VERSION
+        );
+        assert_eq!(negotiated_version(&Value::Null), PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn jsonrpc_error_names_the_unsupported_revision() {
+        let err =
+            json!({ "code": ERR_UNSUPPORTED_REVISION, "message": "unsupported protocol version" });
+        let text = jsonrpc_error_text(&err);
+        assert!(text.contains("newer MCP revision"), "got: {text}");
+        assert!(text.contains("-32022"), "got: {text}");
+        // The server's own wording is preserved alongside the explanation.
+        assert!(text.contains("unsupported protocol version"), "got: {text}");
+    }
+
+    #[test]
+    fn jsonrpc_error_passes_other_codes_through() {
+        // Ordinary tool-level errors must keep their plain message — the
+        // revision hint would be actively misleading there.
+        let err = json!({ "code": -32602, "message": "invalid params" });
+        assert_eq!(jsonrpc_error_text(&err), "invalid params");
+        let bare = json!({ "code": -1 });
+        assert_eq!(jsonrpc_error_text(&bare), "server error");
+    }
+
+    #[test]
+    fn http_error_names_the_unsupported_revision() {
+        // The modern-only shape: HTTP 400 + JSON-RPC -32022, no fall-forward.
+        let body =
+            r#"{"jsonrpc":"2.0","error":{"code":-32022,"message":"protocol revision retired"}}"#;
+        let text = http_error_text(400, "initialize", body);
+        assert!(text.contains("newer MCP revision"), "got: {text}");
+        assert!(text.contains("-32022"), "got: {text}");
+        // Recognized by code, not by status — a server using another status
+        // for the same refusal is still explained.
+        let other = http_error_text(426, "tools/list", body);
+        assert!(other.contains("newer MCP revision"), "got: {other}");
+    }
+
+    #[test]
+    fn http_error_hints_on_bare_handshake_400_only() {
+        // A plain-text 400 on `initialize` gets the "possibly" hint...
+        let at_handshake = http_error_text(400, "initialize", "Bad Request");
+        assert!(at_handshake.contains("handshake"), "got: {at_handshake}");
+        assert!(
+            at_handshake.contains("newer MCP revision"),
+            "got: {at_handshake}"
+        );
+        assert!(at_handshake.contains("Bad Request"), "got: {at_handshake}");
+        // ...but a 400 on a later call, or any other status, stays generic —
+        // a missing session id and a bad argument both land here.
+        let later = http_error_text(400, "tools/call", "Missing session ID");
+        assert!(!later.contains("newer MCP revision"), "got: {later}");
+        assert!(later.contains("http status 400"), "got: {later}");
+        let five_oh_three = http_error_text(503, "initialize", "upstream down");
+        assert!(
+            !five_oh_three.contains("newer MCP revision"),
+            "got: {five_oh_three}"
+        );
+        assert!(
+            five_oh_three.contains("http status 503"),
+            "got: {five_oh_three}"
+        );
+    }
+
+    #[test]
+    fn http_error_truncates_long_bodies() {
+        let body = "x".repeat(1000);
+        let text = http_error_text(500, "tools/call", &body);
+        assert!(
+            text.len() < 400,
+            "body should be excerpted, got {}",
+            text.len()
+        );
     }
 
     #[test]

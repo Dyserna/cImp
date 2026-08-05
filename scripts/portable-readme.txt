@@ -35,9 +35,12 @@ Prerequisites
 What is bundled
 ---------------
 
-  bin\cimp.exe                      the app
-  bin\onnxruntime.dll                CPU TTS inference (ORT 1.20)
-  bin\onnxruntime_providers_shared.dll
+  bin\cimp.exe                      the app (ONNX Runtime 1.23 for TTS is
+                                     STATIC-LINKED into the exe — there is no
+                                     onnxruntime.dll to look for)
+  bin\webgpu_dawn.dll                WebGPU (Dawn) runtime for GPU TTS, with
+  bin\dxcompiler.dll                 its two shader-compiler DLLs
+  bin\dxil.dll
   bin\patterns.json                  editable prompt-detection patterns
                                      (see "Customizing prompt detection")
   bin\themes\<id>\                   UI chrome themes (theme.json + theme.css);

@@ -175,8 +175,11 @@ export interface UsageSettings {
   show_countdown: boolean;
   /// Show the local reset clock time.
   show_reset_clock: boolean;
-  /// Poll cadence for the usage endpoint, in seconds. Clamped to a sane
-  /// minimum in the UI so the undocumented endpoint isn't hammered.
+  /// Show the live context-window row (used %, tokens, cache read/creation
+  /// split). Also data-gated: nothing shows until a Claude tab pushes one.
+  show_context: boolean;
+  /// Poll cadence for the usage push file, in seconds. Clamped to a sane
+  /// minimum in the UI as busy-poll hygiene.
   poll_interval_secs: number;
 }
 
@@ -1305,6 +1308,12 @@ export interface OffloadSettings {
   /// (re-derived at launch + on save when it changed). Disabled server ⇒
   /// no-op.
   opencode_provider_auto: boolean;
+  /// V30 Phase A: register the `cimp-offload` MCP child as a Claude Code
+  /// *channel*, so it can push out-of-band notices (offload/audit/graph
+  /// completion) straight into a live Claude tab. Claude-only, spawn-baked
+  /// (flips raise the AI-tab restart hint), default off — the registration
+  /// flag is a research preview and pushes are fire-and-forget.
+  session_push: boolean;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1426,6 +1435,7 @@ export function defaultSettings(): Settings {
       show_percentage: true,
       show_countdown: true,
       show_reset_clock: true,
+      show_context: true,
       poll_interval_secs: 60,
     },
     system_stats: {
@@ -1618,6 +1628,7 @@ export function defaultSettings(): Settings {
       escalate_partial: true,
       opencode_provider: null,
       opencode_provider_auto: false,
+      session_push: false,
     },
     graph: {
       enabled: false,

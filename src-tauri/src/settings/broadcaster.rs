@@ -291,7 +291,7 @@ mod tests {
         let last = last.expect("at least one broadcast was delivered");
         assert_eq!(
             serde_json::to_value(&last).unwrap(),
-            serde_json::to_value(&handle.current()).unwrap(),
+            serde_json::to_value(handle.current()).unwrap(),
             "the final broadcast must reflect the final store state"
         );
 

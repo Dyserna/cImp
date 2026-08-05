@@ -85,13 +85,9 @@ pub fn start(
     std::thread::Builder::new()
         .name("cimp-graph-watch".into())
         .spawn(move || {
-            loop {
-                // Block for the first event of a batch. `Err` means every
-                // sender dropped (the watcher was torn down) — exit the thread.
-                let first = match rx.recv() {
-                    Ok(ev) => ev,
-                    Err(_) => break,
-                };
+            // Block for the first event of a batch. `Err` means every sender
+            // dropped (the watcher was torn down) — exit the thread.
+            while let Ok(first) = rx.recv() {
                 let batch_start = Instant::now();
                 let mut paths: HashSet<PathBuf> = HashSet::new();
                 collect(first, &mut paths);
@@ -119,7 +115,11 @@ pub fn start(
                 // the incremental batch is redundant this round.
                 if overflow.swap(false, Ordering::Relaxed) {
                     info!(root = %root.display(), "graph: watch channel overflowed — full rebuild to recover");
-                    service.spawn_rebuild(root.clone());
+                    // Recovery, not a user request: no session-push notice.
+                    service.spawn_rebuild(
+                        root.clone(),
+                        super::service::RebuildOrigin::Automatic,
+                    );
                 } else if !paths.is_empty() {
                     service.reindex_paths(&root, paths.into_iter().collect());
                 }

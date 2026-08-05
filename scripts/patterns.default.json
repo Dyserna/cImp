@@ -1,21 +1,30 @@
 {
-  "_doc": "Edit this file to add or refine prompt-detection substrings. Each pattern's `all_of` is a list of substrings that must ALL be present in the rendered terminal tail for the pattern to match. `kind` is `permission` or `question`. Set `disabled: true` to keep an entry in the file without enabling it. Capture live chrome with RUST_LOG=perm_capture=debug. Patterns are tested in declaration order; first match per kind wins.",
+  "_doc": "Edit this file to add or refine prompt-detection substrings. Each pattern's `all_of` is a list of substrings that must ALL be present in the rendered terminal tail for the pattern to match; the optional `none_of` list vetoes the match when ANY of its substrings is present (that is how the permission patterns stay off Claude's select menus). `kind` is `permission` or `question`. Set `disabled: true` to keep an entry in the file without enabling it. Capture live chrome with RUST_LOG=perm_capture=debug. Patterns are tested in declaration order; first match per kind wins.",
   "patterns": [
     {
       "name": "claude_permission",
       "kind": "permission",
       "all_of": [
-        "Esc to cancel · Tab to amend"
+        "to cancel ·"
+      ],
+      "none_of": [
+        "to select",
+        "to navigate"
       ],
       "disabled": false
     },
     {
-      "name": "claude_permission_alt_example",
+      "name": "claude_permission_bare",
       "kind": "permission",
       "all_of": [
-        "<replace with a substring unique to this prompt shape>"
+        "to cancel",
+        "1. Yes 2."
       ],
-      "disabled": true
+      "none_of": [
+        "to select",
+        "to navigate"
+      ],
+      "disabled": false
     },
     {
       "name": "claude_question",

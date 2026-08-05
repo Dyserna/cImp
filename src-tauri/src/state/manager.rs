@@ -137,10 +137,9 @@ impl TabId {
             // purposes (they never run a PTY, so this is inert), keeping them
             // off the per-kind match explosion. Their read-only behavior is
             // keyed off the reserved id, not the kind.
-            TabId::Shell(_)
-            | TabId::GraphMonitor
-            | TabId::Workbench
-            | TabId::ToolActivity => TabKind::Shell,
+            TabId::Shell(_) | TabId::GraphMonitor | TabId::Workbench | TabId::ToolActivity => {
+                TabKind::Shell
+            }
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than

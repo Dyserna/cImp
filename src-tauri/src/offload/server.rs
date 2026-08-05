@@ -46,6 +46,36 @@ pub struct ServerCommand {
     /// Whether `--jinja` is present. Tool-calling silently won't work
     /// without it — cImp warns rather than failing obscurely.
     pub has_jinja: bool,
+    /// Whether `-kvu`/`--kv-unified` is in effect (the explicit
+    /// `-no-kvu`/`--no-kv-unified` turns it back off; last occurrence wins,
+    /// as in llama.cpp's own parser). It changes what `/props` `n_ctx`
+    /// *means* — see [`ServerCommand::per_slot_n_ctx`].
+    pub kv_unified: bool,
+}
+
+/// Translate a `/props`-reported `n_ctx` into the window **one slot** can
+/// actually hold.
+///
+/// llama-server reports `n_ctx` differently depending on the KV layout
+/// (confirmed on build 10088 with `-c 8192 -np 2`):
+///
+/// - split KV (the default with an explicit `-np`): `n_ctx` is already the
+///   per-slot window (`4096`) — return it unchanged.
+/// - `--kv-unified`: `n_ctx` is the **full shared** window (`8192`), and
+///   `/slots` echoes that same number for every slot — divide by the slot
+///   count to get what a single request may occupy (`4096`).
+///
+/// With `parallel <= 1` the two are identical, so nothing is divided.
+pub fn per_slot_n_ctx(reported: u32, parallel: u32, kv_unified: bool) -> u32 {
+    if !kv_unified {
+        return reported;
+    }
+    match parallel.max(1) {
+        1 => reported,
+        // `.max(1)` mirrors the other offload numerics: never hand a 0-token
+        // window downstream (only reachable with an absurd `-np`).
+        np => (reported / np).max(1),
+    }
 }
 
 /// Split `--flag=value` into `("--flag", Some("value"))`; a bare
@@ -92,6 +122,7 @@ impl ServerCommand {
         let mut port = DEFAULT_PORT;
         let mut parallel = 1u32;
         let mut has_jinja = false;
+        let mut kv_unified = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -117,6 +148,10 @@ impl ServerCommand {
                     }
                 }
                 "--jinja" => has_jinja = true,
+                // Both spellings exist in llama.cpp (`-kvu, --kv-unified,
+                // -no-kvu, --no-kv-unified`); later flags win.
+                "-kvu" | "--kv-unified" => kv_unified = true,
+                "-no-kvu" | "--no-kv-unified" => kv_unified = false,
                 _ => {}
             }
             i += 1;
@@ -129,12 +164,19 @@ impl ServerCommand {
             port,
             parallel,
             has_jinja,
+            kv_unified,
         })
     }
 
     /// HTTP origin to reach the server (no trailing slash).
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
+    }
+
+    /// This command's per-slot reading of a `/props` `n_ctx` — see the
+    /// free [`per_slot_n_ctx`].
+    pub fn per_slot_n_ctx(&self, reported: u32) -> u32 {
+        per_slot_n_ctx(reported, self.parallel, self.kv_unified)
     }
 }
 
@@ -286,8 +328,10 @@ impl LlamaServer {
 
     /// Build a Local backend with an explicit name/tier/tool-scope (one
     /// pool entry). Parses the command (host/port/`-np`/`--jinja`) and
-    /// warns if `--jinja` is absent. Does not contact the server — call
-    /// [`Self::poll_until_ready`] after the tab's PTY has been spawned.
+    /// logs a note if `--jinja` is absent (informational only — recent
+    /// llama.cpp builds enable it by default). Does not contact the
+    /// server — call [`Self::poll_until_ready`] after the tab's PTY has
+    /// been spawned.
     pub fn with_config(
         name: &str,
         command: &str,
@@ -296,10 +340,11 @@ impl LlamaServer {
     ) -> AppResult<Self> {
         let cmd = ServerCommand::parse(command)?;
         if !cmd.has_jinja {
-            warn!(
+            debug!(
                 backend = name,
-                "offload: server_command is missing `--jinja`; llama-server tool-calling \
-                 will not work without it"
+                "offload: server_command has no explicit `--jinja`; recent llama.cpp builds \
+                 enable it by default, so this only matters on older builds — if tool-calling \
+                 doesn't work, add `--jinja` explicitly"
             );
         }
         let client = reqwest::Client::builder()
@@ -364,6 +409,9 @@ impl LlamaServer {
     /// `-np`), confirmed empirically (`--ctx-size 150000 -np 2` → `/props`
     /// n_ctx = 75008). So the discovered value *is* each slot's window — do
     /// **not** divide by `parallel` again (the V8-01 risk-c note resolved).
+    /// The one exception is `--kv-unified`, where `/props` reports the full
+    /// shared window instead; [`n_ctx`](Backend::n_ctx) already normalizes
+    /// that back to per-slot, so this stays a plain percentage.
     pub fn per_slot_budget(&self, high_water_pct: u8) -> Option<u32> {
         let n = self.n_ctx()?;
         Some(n.saturating_mul(high_water_pct.min(100) as u32) / 100)
@@ -467,6 +515,8 @@ impl LlamaServer {
                 debug!(
                     n_ctx = n,
                     slots = self.cmd.parallel,
+                    kv_unified = self.cmd.kv_unified,
+                    per_slot = self.cmd.per_slot_n_ctx(n as u32),
                     "offload: discovered context window"
                 );
                 Ok(())
@@ -510,10 +560,14 @@ impl Backend for LlamaServer {
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
+    /// The window **one slot** can hold. The cached `/props` value stays raw;
+    /// the `--kv-unified` correction is applied here, at the read, so every
+    /// consumer (router budget, agent `max_tokens`/compaction, dashboards)
+    /// sees the same per-slot number in both KV modes.
     fn n_ctx(&self) -> Option<u32> {
         match self.n_ctx.load(Ordering::Relaxed) {
             0 => None,
-            n => Some(n),
+            n => Some(self.cmd.per_slot_n_ctx(n)),
         }
     }
     fn slots(&self) -> u32 {
@@ -600,6 +654,77 @@ mod tests {
         // 40000 * 80% = 32000.
         s.n_ctx.store(40_000, Ordering::Relaxed);
         assert_eq!(s.per_slot_budget(80), Some(32_000));
+    }
+
+    #[test]
+    fn parses_kv_unified_flags() {
+        let plain = ServerCommand::parse("llama-server -np 2").unwrap();
+        assert!(!plain.kv_unified, "off unless asked for");
+        for cmd in [
+            "llama-server -np 2 --kv-unified",
+            "llama-server -np 2 -kvu",
+            // An explicit off, then on: the last occurrence wins.
+            "llama-server -np 2 --no-kv-unified -kvu",
+        ] {
+            assert!(
+                ServerCommand::parse(cmd).unwrap().kv_unified,
+                "expected kv_unified for: {cmd}"
+            );
+        }
+        for cmd in [
+            "llama-server -np 2 --no-kv-unified",
+            "llama-server -np 2 -no-kvu",
+            "llama-server -np 2 --kv-unified --no-kv-unified",
+        ] {
+            assert!(
+                !ServerCommand::parse(cmd).unwrap().kv_unified,
+                "expected kv_unified off for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_unified_budget_divides_by_parallel() {
+        // Build 10088, `-c 8192 -np 2 --kv-unified`: /props reports the FULL
+        // shared window (8192), so one slot only gets 4096 → 80% = 3276.
+        let s = LlamaServer::new("llama-server --jinja -np 2 --kv-unified").unwrap();
+        s.n_ctx.store(8_192, Ordering::Relaxed);
+        assert_eq!(s.n_ctx(), Some(4_096));
+        assert_eq!(s.per_slot_budget(80), Some(3_276));
+
+        // Same command in split-KV mode: /props already reports 4096 and it
+        // must pass through untouched.
+        let split = LlamaServer::new("llama-server --jinja -np 2").unwrap();
+        split.n_ctx.store(4_096, Ordering::Relaxed);
+        assert_eq!(split.n_ctx(), Some(4_096));
+        assert_eq!(split.per_slot_budget(80), Some(3_276));
+    }
+
+    #[test]
+    fn kv_unified_without_parallel_does_not_divide() {
+        // `-np` absent (llama.cpp's auto-slots default, which is where
+        // kv_unified turns itself on) — one slot owns the whole window.
+        let s = LlamaServer::new("llama-server --jinja --kv-unified").unwrap();
+        s.n_ctx.store(8_192, Ordering::Relaxed);
+        assert_eq!(s.n_ctx(), Some(8_192));
+        assert_eq!(s.per_slot_budget(80), Some(6_553));
+
+        // Explicit `-np 1` behaves the same.
+        let one = LlamaServer::new("llama-server --jinja -np 1 -kvu").unwrap();
+        one.n_ctx.store(8_192, Ordering::Relaxed);
+        assert_eq!(one.n_ctx(), Some(8_192));
+    }
+
+    #[test]
+    fn per_slot_n_ctx_edges() {
+        // Split KV passes anything through verbatim, including the
+        // not-yet-known `0` sentinel (the accessor maps that to `None` first).
+        assert_eq!(per_slot_n_ctx(0, 4, false), 0);
+        assert_eq!(per_slot_n_ctx(75_008, 2, false), 75_008);
+        // Absurd `-np` can't produce a 0-token window.
+        assert_eq!(per_slot_n_ctx(3, 8, true), 1);
+        // `parallel` of 0 is treated as 1 (parse floors it anyway).
+        assert_eq!(per_slot_n_ctx(8_192, 0, true), 8_192);
     }
 
     #[test]

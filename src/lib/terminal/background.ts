@@ -8,14 +8,14 @@
 //        background_override === { ...cfg }   → use this config
 //
 //   2. Four-cell matrix on the resolved config:
-//        image: None, color: None  → mode 'none'   (canvas, theme bg)
-//        image: None, color: Some  → mode 'color'  (canvas, theme bg = color)
+//        image: None, color: None  → mode 'none'   (WebGL, theme bg)
+//        image: None, color: Some  → mode 'color'  (WebGL, theme bg = color)
 //        image: Some, color: None  → mode 'image'  (DOM, theme bg = rgba(black, opacity))
 //        image: Some, color: Some  → mode 'image'  (DOM, theme bg = rgba(color, opacity))
 //
 // `effectiveBackgroundMode` is the single entry point. The discriminated
 // `RenderingMode` it returns drives every downstream decision:
-//   - canvas vs DOM renderer at construction (terminals.ts Step 5)
+//   - V29: WebGL vs DOM renderer at construction (terminals.ts Step 5)
 //   - theme background override for the xterm.js theme (composeTheme)
 //   - CSS image / blur / size / position on the host element
 //     (applyHostBackgroundCss)
@@ -62,7 +62,7 @@ export function effectiveBackgroundMode(
     tab.background_override ?? global;
 
   // Four-cell matrix. Image presence dominates; color-only is the
-  // canvas-fast-path branch.
+  // WebGL-fast-path branch.
   if (cfg.image) return { kind: 'image', cfg, tint: cfg.color };
   if (cfg.color) return { kind: 'color', color: cfg.color };
   return { kind: 'none' };
@@ -70,9 +70,46 @@ export function effectiveBackgroundMode(
 
 /// Renderer category: drives the recreate-vs-update decision in the
 /// settings subscriber. Image mode forces DOM; everything else stays
-/// on the canvas fast path.
+/// on the WebGL fast path (falling back to DOM if WebGL2 is
+/// unavailable — see `loadWebglRenderer`).
 export function categoryOf(mode: RenderingMode): 'fast' | 'image' {
   return mode.kind === 'image' ? 'image' : 'fast';
+}
+
+/// The per-terminal state the WebGL policy reads. Structural so
+/// `TerminalEntry` satisfies it without this module knowing about the
+/// registry (and so the policy is unit-testable without xterm/WebGL).
+export interface WebglPolicyState {
+  /// Host is portaled into a real pane slot (i.e. on screen). Panes can
+  /// be split, so several terminals are `attached` at once — every one
+  /// of them is "visible" for policy purposes.
+  attached: boolean;
+  /// Renderer category of this Terminal (constant for its lifetime; a
+  /// category flip recreates the Terminal).
+  bgCategory: 'fast' | 'image';
+  /// Sticky "WebGL2 is not usable on this Terminal" flag — set when the
+  /// addon failed to load or lost its context twice.
+  webglFailed: boolean;
+}
+
+/// M17 renderer policy: **only currently visible terminals hold a WebGL2
+/// context.**
+///
+/// Chromium/WebView2 caps live WebGL contexts at ~16 per process and evicts
+/// the least-recently-used one past that. Every tab is created at startup
+/// and kept alive offscreen forever (the keep-alive registry), so loading
+/// the addon at construction meant N contexts for N tabs: at 17+ terminals
+/// the cap starts force-losing contexts, each loss costs a 3 s freeze (the
+/// webgl addon's context-restoration timeout) and its retry evicts the next
+/// victim — a self-sustaining wave of freezes. Binding the context to
+/// visibility bounds the count by the number of panes on screen (single
+/// digits), which no cap can reach.
+///
+/// Image-background terminals never get WebGL (the opaque canvas would hide
+/// the CSS image), and a terminal that genuinely failed WebGL stays on the
+/// DOM renderer instead of being re-probed on every tab switch.
+export function shouldHoldWebgl(state: WebglPolicyState): boolean {
+  return state.attached && state.bgCategory !== 'image' && !state.webglFailed;
 }
 
 /// V1.4-04 A.3: per-tab debounce stagger for `queueRecreate`. With 6+

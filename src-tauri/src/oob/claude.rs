@@ -22,31 +22,187 @@
 //! parent session's spend; its reads, prompts, and text are not the parent's
 //! working set, turn clocks, or TTS). `drift_tick` is the canary that fires
 //! when this contract moves again.
+//!
+//! ## Format tolerance (the transcript is an UNSTABLE contract)
+//!
+//! Claude Code declares the transcript JSONL format unstable — it can change on
+//! any release (2.1.212 added `effort` to assistant messages; 2.x renamed the
+//! sub-agent launcher `Task` → `Agent`). Every reader in this module therefore
+//! walks an untyped [`serde_json::Value`] with `get`/`as_str`, never a typed
+//! serde struct or enum:
+//!
+//!  * **Unknown fields** are ignored by construction (no struct to reject them,
+//!    and nothing here uses `deny_unknown_fields`).
+//!  * **Unknown enum-ish values** — a new `type`, a new tool `name`, a new
+//!    `source` variant — fall through the `match`/`==` arms as "not one of the
+//!    shapes we act on", leaving the rest of the line's taps untouched instead
+//!    of failing the whole line.
+//!  * **Unparseable lines** are skipped and logged ([`parse_transcript_line`]);
+//!    the tail keeps draining the lines after them.
+//!
+//! Keep new readers to that discipline: a typed struct here would turn an
+//! upstream field addition into a dead tap.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::time::sleep;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::OobContext;
 use crate::state::StateSignal;
 
 const POLL: Duration = Duration::from_millis(200);
 
+/// H1-R2 (2026-08-05 review): how often [`TapHeartbeat`] re-stamps this tab's
+/// registry entries. Comfortably inside `graph::service::LIVE_SESSION_TTL_MS`
+/// (90 s) with room for several missed ticks — the heartbeat's only job is that
+/// a drain loop parked in TTS backpressure can never let a claim age out.
+const HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// H1-R2: keeps a Claude tab's live-registry claims fresh **independently of the
+/// drain loop**, and retires them in an order that cannot resurrect a cleared
+/// entry.
+///
+/// *Why it exists.* The tap re-marks its `LiveTabRoot` (and its live session)
+/// only at the top of [`run`]'s loop, but the loop can park for far longer than
+/// the registry TTL inside `drain_new_lines` → [`OobContext::speak`], which
+/// awaits a bounded TTS channel drained at synthesis speed. If tab A's claims
+/// aged out, tab B would stop seeing a co-tenant, `tab_binding_is_ambiguous`
+/// would answer `false`, and B's tap — tailing A's transcript, the newest file
+/// under the shared root — would gain a CONFIDENT and WRONG session binding:
+/// exactly the H1 symptom the ambiguity predicate exists to remove. A separate
+/// task with no dependency on the drain's awaits is what makes the claim's
+/// liveness a function of the TAB being open rather than of TTS throughput.
+///
+/// *Why the mutex is held across the marks.* `retire()` and the guard's
+/// `clear_live_session()` must be totally ordered against a tick: see
+/// [`Self::tick`].
+#[derive(Default)]
+struct TapHeartbeat {
+    state: StdMutex<HeartbeatState>,
+}
+
+#[derive(Default)]
+struct HeartbeatState {
+    /// Set by [`TapHeartbeat::retire`] when the tap is going away. Once set, no
+    /// tick may touch the registry again.
+    retired: bool,
+    /// The session id the drain loop last CONFIRMED live for this tab, if any
+    /// (`None` until confirmation — the first transcript a tap attaches to is
+    /// usually a finished session, and marking it live would report the wrong
+    /// one; see `live_confirmed` in [`run`]).
+    session: Option<String>,
+}
+
+impl TapHeartbeat {
+    /// Record the session the drain loop just marked live, so subsequent ticks
+    /// refresh `live_sessions` too — not only the root claim. Called from the
+    /// same place (and under the same condition) as the loop's own
+    /// `mark_live_session`, so the heartbeat can never invent a session the
+    /// drain hasn't confirmed.
+    fn note_session(&self, session_id: &str) {
+        if let Ok(mut st) = self.state.lock() {
+            if st.session.as_deref() != Some(session_id) {
+                st.session = Some(session_id.to_string());
+            }
+        }
+    }
+
+    /// One heartbeat tick: re-stamp this tab's registry claims. Returns whether
+    /// the heartbeat is still live — `false` means retired, and the caller must
+    /// stop.
+    ///
+    /// **Ordering contract (load-bearing).** The marks run while holding
+    /// `state`, and [`Self::retire`] takes the same lock to set `retired`. So a
+    /// concurrent teardown either (a) wins the lock first, in which case this
+    /// tick observes `retired` and marks nothing, or (b) waits until this tick's
+    /// marks have completed, and only then does the guard's
+    /// `clear_live_session()` run — removing whatever this tick just wrote. In
+    /// neither interleaving can a tick land AFTER the clear and resurrect a
+    /// dropped entry. (Aborting the task instead would not be enough: `abort`
+    /// only takes effect at the next await point, so a tick already inside a
+    /// mark could still finish after the clear.)
+    ///
+    /// No lock-order hazard: this path takes `state` → registry, while `retire`
+    /// releases `state` before the guard touches the registry, so the two are
+    /// never nested in opposite orders.
+    fn tick(&self, ctx: &OobContext, root: &Path) -> bool {
+        let Ok(st) = self.state.lock() else {
+            return false; // poisoned ⇒ treat as retired; never mark blind.
+        };
+        if st.retired {
+            return false;
+        }
+        ctx.mark_live_tab_root("claude", root);
+        if let Some(sid) = st.session.as_deref() {
+            ctx.mark_live_session(sid, "claude");
+        }
+        true
+    }
+
+    /// Stop all future ticks, and wait out any tick already in flight (the lock
+    /// is the barrier). Must be called BEFORE the registry entries are cleared —
+    /// see [`Self::tick`].
+    fn retire(&self) {
+        match self.state.lock() {
+            Ok(mut st) => st.retired = true,
+            // Poisoned by a panicking tick: `tick` treats poisoning as retired
+            // too, so the invariant still holds.
+            Err(mut e) => e.get_mut().retired = true,
+        }
+    }
+}
+
 /// V24 Phase B: RAII cleanup of a Claude tab's live-session registry entry.
 /// Created once at the top of [`run`], it clears the entry (keyed by the stable
 /// tab id, via [`OobContext::clear_live_session`]) on `Drop` — i.e. on every one
 /// of `run`'s cancel/return paths — so a closed tab stops being reported active
 /// without waiting for its TTL. Mirrors `service`'s other RAII guards.
-struct LiveSessionGuard<'a>(&'a OobContext);
+///
+/// H1 fix: the same call also drops this tab's `LiveTabRoot` claim, so closing
+/// one of two same-project Claude tabs restores the survivor's session scoping
+/// immediately instead of after the registry TTL.
+///
+/// H1-R2: it also owns the retirement of the tap's [`TapHeartbeat`]. The order
+/// inside `drop` is load-bearing — retire FIRST, clear SECOND — so the last
+/// possible heartbeat write happens before the clear that must outlive it.
+struct LiveSessionGuard<'a> {
+    ctx: &'a OobContext,
+    hb: Arc<TapHeartbeat>,
+}
 
 impl Drop for LiveSessionGuard<'_> {
     fn drop(&mut self) {
-        self.0.clear_live_session();
+        // ORDER IS LOAD-BEARING (H1-R2): retiring the heartbeat both stops
+        // future ticks and blocks until any in-flight tick's marks are done, so
+        // nothing can re-mark this tab after the clear below and resurrect a
+        // claim the closed tab no longer owns (a phantom co-tenant would
+        // suppress the survivor's scoping for a full TTL). Never reorder these.
+        self.hb.retire();
+        self.ctx.clear_live_session();
     }
+}
+
+/// H1-R2: run `hb`'s ticks on their own task, tied to the same cancel token as
+/// the tap, so no `await` on the drain path can starve the registry refresh.
+/// The task holds only a clone of the tap's context (tab id + registry handle +
+/// cancel token) and the root; it never reads the transcript.
+fn spawn_heartbeat(ctx: OobContext, root: PathBuf, hb: Arc<TapHeartbeat>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = ctx.cancel.cancelled() => return,
+                _ = sleep(HEARTBEAT) => {}
+            }
+            if !hb.tick(&ctx, &root) {
+                return; // retired: the tap's guard has run (or is running).
+            }
+        }
+    });
 }
 
 /// Tail the active transcript for `project_dir`, speaking new assistant text
@@ -66,7 +222,16 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // tail runs, and clear it (via the guard's `Drop`) on any exit path — tab
     // cancel or the source ending — so a closed tab drops out of the "active
     // now" set before its TTL lapses.
-    let _live_guard = LiveSessionGuard(&ctx);
+    //
+    // H1-R2: the guard also owns the heartbeat that keeps those entries fresh
+    // while this loop is blocked (see `TapHeartbeat`). Constructed BEFORE the
+    // task is spawned so no tick can run without a guard that will retire it.
+    let hb = Arc::new(TapHeartbeat::default());
+    let _live_guard = LiveSessionGuard {
+        ctx: &ctx,
+        hb: hb.clone(),
+    };
+    spawn_heartbeat(ctx.clone(), root.clone(), hb.clone());
 
     let mut seen: HashSet<String> = HashSet::new();
     // Tool-use IDs of `Task` sub-agents launched but not yet resolved. Non-
@@ -108,6 +273,18 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
         if ctx.cancel.is_cancelled() {
             return;
         }
+
+        // H1 fix (2026-08-05 review): declare this tab's transcript ROOT while
+        // the tap runs. `newest_jsonl(&root)` below has no per-process
+        // discriminator, so a second running Claude tab on the same project
+        // binds to the same file and every tab-keyed identity claim from either
+        // tab becomes unprovable; the registry uses this map to detect exactly
+        // that and degrade to unscoped/unattributed instead of guessing (see
+        // `graph::service::tab_binding_is_ambiguous`). Marked BEFORE the first
+        // `newest_jsonl` so a tab is a known co-tenant from its tap's first
+        // instruction, not from its first confirmed session — that is what
+        // closes the launch-order window. Cleared by `_live_guard` on exit.
+        ctx.mark_live_tab_root("claude", &root);
 
         match newest_jsonl(&root) {
             Some(path) if Some(&path) != cur.as_ref() => {
@@ -186,6 +363,11 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
             }
             if live_confirmed {
                 ctx.mark_live_session(&session_id, "claude");
+                // H1-R2: hand the confirmed session to the heartbeat so it
+                // refreshes `live_sessions` too while this loop is parked in
+                // TTS backpressure — a live root claim with a lapsed session
+                // entry would still lose the tab its permission attribution.
+                hb.note_session(&session_id);
             }
             // Sub-agent transcripts (2.x contract): drain usage/commits from
             // `<sid>/subagents/*.jsonl`, then tick the drift canary. Both are
@@ -227,7 +409,7 @@ async fn drain_new_lines(
         if line.is_empty() {
             continue;
         }
-        if let Ok(obj) = serde_json::from_str::<Value>(line) {
+        if let Some(obj) = parse_transcript_line(path, line) {
             note_cli_version(&obj, version_noted);
             // Canary fact: an inline sidechain line means the 1.x sub-agent
             // contract is (still) live — see `SubagentState::drift_tick`.
@@ -613,6 +795,18 @@ fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::g
 /// numbers overwrites this one in place rather than leaving a duplicate zero
 /// row. `None` for any non-assistant line or an assistant line with no
 /// `message.id`.
+///
+/// ## Historical-data caveat: usage recorded before Claude Code 2.1.214
+///
+/// Up to and including 2.1.213, Claude Code double-counted tokens and cost for
+/// streamed responses (fixed in 2.1.214). Whatever the transcript's `usage`
+/// block said is what we stored, so `usage_stat` rows written by sessions on a
+/// pre-2.1.214 CLI can be inflated — treat old Usage-tab totals and any
+/// cross-period cost comparison spanning that upgrade as approximate. Live data
+/// is unaffected, and there is deliberately **no** correction/backfill logic:
+/// we cannot tell an inflated row from a genuinely large turn after the fact,
+/// and the CLI version that wrote a session is only known globally (the
+/// `harness_versions` tripwire fed by [`note_cli_version`]), not per row.
 fn parse_usage_line(
     obj: &Value,
     origin: crate::graph::UsageOrigin,
@@ -1106,7 +1300,7 @@ impl SubagentState {
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                if let Some(obj) = parse_transcript_line(&path, line) {
                     // Sub-agent transcript file (2.x contract): every turn here
                     // is Agent spend against the parent session.
                     record_usage(
@@ -1212,6 +1406,70 @@ fn report_subagent_drift(project_dir: &Path, session_id: &str, summary: &str) {
     });
 }
 
+/// Parse one transcript JSONL line, or `None` when it isn't valid JSON.
+///
+/// Claude Code documents the transcript format as unstable ("can break on any
+/// release"), so a line this tap cannot read must never stop the tail: it is
+/// skipped with a log naming the file, and the NEXT line is drained normally.
+/// Both drains ([`drain_new_lines`] and [`SubagentState::scan`]) go through here
+/// so the skip-and-log posture holds for parent and sub-agent transcripts alike.
+/// Partial trailing lines never reach this function — [`read_complete_lines`]
+/// holds them back until their newline lands — so a failure here is a genuinely
+/// malformed line, not a mid-write read.
+///
+/// **Review M10 — the skip contract needs a consumer at the shipped log level.**
+/// The default level is Info (`settings/schema.rs`), so a `debug!` made the one
+/// failure mode this contract exists to detect — a format change that fails
+/// EVERY line — completely silent. The FIRST skip per transcript file now
+/// `warn!`s; later skips carry the running count at debug, so a single malformed
+/// line in a healthy tail can't warn-spam.
+fn parse_transcript_line(path: &Path, line: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let prefix: String = line.chars().take(120).collect();
+            let count = note_skipped_line(path);
+            if count == 1 {
+                warn!(
+                    file = %path.display(),
+                    error = %e,
+                    line = %prefix,
+                    "Claude OOB: unparseable transcript line skipped — transcript format may have \
+                     drifted (further skips in this file log at debug)"
+                );
+            } else {
+                debug!(
+                    file = %path.display(),
+                    error = %e,
+                    line = %prefix,
+                    skipped = count,
+                    "Claude OOB: unparseable transcript line skipped"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// How many lines this process has failed to parse in `path`, including this
+/// one. Process-global (not per-tap) so two taps on the same project can't warn
+/// twice for the same file; the map only ever holds files that actually failed.
+fn note_skipped_line(path: &Path) -> u64 {
+    static SKIPS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, u64>>> =
+        std::sync::OnceLock::new();
+    let map = SKIPS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(|p| p.into_inner());
+    bump_skip(&mut map, path)
+}
+
+/// Pure half of [`note_skipped_line`] — the throttle's whole decision is "is
+/// this the first failure for this file?", so it is pinned without the static.
+fn bump_skip(map: &mut HashMap<PathBuf, u64>, path: &Path) -> u64 {
+    let entry = map.entry(path.to_path_buf()).or_insert(0);
+    *entry += 1;
+    *entry
+}
+
 /// Read complete new lines from `path` starting at `offset`: the chunk up to
 /// (and including) the last newline, plus the advanced offset. `None` when
 /// nothing new/complete is readable — a trailing partial line waits for the
@@ -1272,7 +1530,7 @@ fn newest_jsonl(root: &Path) -> Option<PathBuf> {
             Ok(t) => t,
             Err(_) => continue,
         };
-        if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
             newest = Some((mtime, path));
         }
     }
@@ -1290,6 +1548,87 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── H1-R2: the tap heartbeat's decision logic ──
+    //
+    // The spawned task itself isn't unit-testable here (marking needs a live
+    // `GraphService`, which needs a Tauri `AppHandle`), so the retire/tick
+    // ordering decision is factored into `TapHeartbeat` and tested directly;
+    // the registry-side property it relies on ("refresh restores a TTL-stale
+    // claim") is pinned in `graph::service`'s
+    // `refreshing_a_tab_root_restores_a_ttl_stale_claim`.
+
+    fn hb_ctx() -> OobContext {
+        let (tts_tx, _tts_rx) = tokio::sync::mpsc::channel(4);
+        let (sig_tx, _sig_rx) = tokio::sync::mpsc::channel(4);
+        let defaults = crate::settings::Settings::default();
+        OobContext {
+            tab: crate::state::TabId::from_str("claude"),
+            tts: tts_tx,
+            state_signals: sig_tx,
+            settings: crate::settings::SettingsHandle::new(
+                defaults.clone(),
+                defaults,
+                std::env::temp_dir(),
+            ),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            mem: None,
+            pushes: None,
+        }
+    }
+
+    #[test]
+    fn heartbeat_ticks_until_it_is_retired() {
+        let ctx = hb_ctx();
+        let root = Path::new("/home/u/.claude/projects/P--proj");
+        let hb = TapHeartbeat::default();
+        assert!(hb.tick(&ctx, root), "a live heartbeat refreshes the claim");
+        hb.note_session("ses_a");
+        assert!(hb.tick(&ctx, root));
+        // The guard's `Drop` retires BEFORE it clears the registry; from that
+        // moment no tick may write, or a closed tab's claim would be
+        // resurrected and keep suppressing the survivor's scoping for a TTL.
+        hb.retire();
+        assert!(!hb.tick(&ctx, root), "a retired heartbeat must not re-mark");
+        assert!(!hb.tick(&ctx, root), "and stays retired");
+    }
+
+    #[test]
+    fn heartbeat_only_reports_a_confirmed_session() {
+        // Until the drain loop confirms one, the heartbeat refreshes the ROOT
+        // claim only — it must never invent a `live_sessions` entry for the
+        // stale transcript a fresh tap first attaches to.
+        let hb = TapHeartbeat::default();
+        assert!(hb.state.lock().unwrap().session.is_none());
+        hb.note_session("ses_a");
+        assert_eq!(hb.state.lock().unwrap().session.as_deref(), Some("ses_a"));
+        // Session rotation (`/clear`, a new file) is carried through.
+        hb.note_session("ses_b");
+        assert_eq!(hb.state.lock().unwrap().session.as_deref(), Some("ses_b"));
+    }
+
+    #[test]
+    fn the_skip_log_warns_once_per_file_then_counts() {
+        // Review M10: the drift signal must be visible at the shipped Info
+        // level, but one bad line in a healthy tail must not warn-spam. The
+        // throttle's whole decision is "first failure for this file?".
+        let mut seen = HashMap::new();
+        let a = Path::new("a.jsonl");
+        let b = Path::new("b.jsonl");
+        assert_eq!(bump_skip(&mut seen, a), 1, "first skip in a warns");
+        assert_eq!(bump_skip(&mut seen, a), 2, "later skips count at debug");
+        assert_eq!(bump_skip(&mut seen, a), 3);
+        assert_eq!(bump_skip(&mut seen, b), 1, "a different file warns once too");
+    }
+
+    #[test]
+    fn an_unparseable_line_is_skipped_not_fatal() {
+        // The parse boundary itself: a malformed line yields None and the tail
+        // carries on with the next one.
+        let path = Path::new("drifted.jsonl");
+        assert!(parse_transcript_line(path, "{not json").is_none());
+        assert!(parse_transcript_line(path, r#"{"type":"user"}"#).is_some());
+    }
 
     #[test]
     fn slug_replaces_separators_and_colon() {
@@ -1441,6 +1780,7 @@ mod tests {
             settings,
             cancel: CancellationToken::new(),
             mem: None,
+            pushes: None,
         };
         (ctx, sig_rx)
     }
@@ -1978,8 +2318,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent-a.jsonl"), "{\"type\":\"assistant\"}\n").unwrap();
 
-        let mut subs = SubagentState::default();
-        subs.completion_seen = true; // even with a completed agent…
+        let mut subs = SubagentState {
+            completion_seen: true, // even with a completed agent…
+            ..SubagentState::default()
+        };
         subs.scan(&root, "s1", &root, &ctx);
         assert!(
             subs.files.is_empty(),
@@ -2041,15 +2383,177 @@ mod tests {
 
     #[test]
     fn subagent_reset_clears_state_and_keeps_backlog_flag() {
-        let mut subs = SubagentState::default();
-        subs.launch_seen = true;
-        subs.completion_seen = true;
-        subs.drift_ticks = 2;
+        let mut subs = SubagentState {
+            launch_seen: true,
+            completion_seen: true,
+            drift_ticks: 2,
+            ..SubagentState::default()
+        };
         subs.files
             .insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
         subs.reset(true);
         assert!(subs.skip_backlog);
         assert!(subs.files.is_empty());
         assert!(!subs.launch_seen && !subs.completion_seen && subs.drift_ticks == 0);
+    }
+
+    // ── Format tolerance: the transcript is an UNSTABLE upstream contract ──
+
+    #[test]
+    fn assistant_line_with_effort_and_unknown_fields_is_read_normally() {
+        // CLI 2.1.212 added `message.effort`; assume more fields will follow.
+        // Every reader here walks an untyped Value, so unknown keys — at the
+        // top level, inside `message`, and inside a content block — must be
+        // ignored rather than failing the line.
+        let line = obj(
+            r#"{"type":"assistant","uuid":"u1","parentUuid":"u0","brandNewTopLevel":{"x":1},
+                "message":{"id":"m1","model":"claude-x","effort":"high",
+                  "stop_reason":null,"brandNewInner":[1,2],
+                  "content":[
+                    {"type":"thinking","thinking":"hmm","signature":"sig"},
+                    {"type":"text","text":"Hello there.","brandNewBlockField":true},
+                    {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.rs"}}],
+                  "usage":{"input_tokens":100,"output_tokens":20,
+                    "cache_read_input_tokens":50,"cache_creation_input_tokens":5,
+                    "brandNewUsageField":7}}}"#,
+        );
+
+        // TTS tap: the text block is still found.
+        let spoken = assistant_texts(&line);
+        assert_eq!(spoken.len(), 1);
+        assert_eq!(spoken[0].1, "Hello there.");
+
+        // Usage tap: `effort` and the unknown usage key don't disturb the counts.
+        let ev = parse_usage_line(&line, crate::graph::UsageOrigin::Session)
+            .expect("an `effort`-carrying assistant line still yields a Turn");
+        assert_eq!(
+            ev,
+            crate::graph::UsageEvent::Turn {
+                msg_id: "m1".to_string(),
+                model: Some("claude-x".to_string()),
+                in_tok: 100,
+                out_tok: 20,
+                cache_read: 50,
+                cache_make: 5,
+                origin: crate::graph::UsageOrigin::Session,
+            }
+        );
+
+        // Agent tracking: a non-agent tool on such a line is still ignored.
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        let delta = update_agents(&line, &mut agents, &ctx);
+        assert!(!delta.launched && !delta.completed);
+        assert!(sig.try_recv().is_err());
+    }
+
+    #[test]
+    fn unknown_line_types_and_new_source_variants_are_inert() {
+        // `SessionStart.source` gained a `"fork"` variant (CLI 2.1.x). cImp
+        // registers no SessionStart hook and deserializes no enum from the
+        // transcript, so such a line simply matches none of the taps: no
+        // panic, no state change, and — critically — the lines around it are
+        // unaffected. This test pins that "unknown variant ⇒ inert" posture.
+        let fork = obj(
+            r#"{"type":"system","subtype":"session_start","source":"fork",
+                "sessionId":"abc","cwd":"P:\\repo","brandNewField":42}"#,
+        );
+        assert!(assistant_texts(&fork).is_empty());
+        assert!(parse_usage_line(&fork, crate::graph::UsageOrigin::Session).is_none());
+        assert!(extract_tool_results(&fork).is_empty());
+        assert!(!is_user_prompt(&fork), "not a turn boundary");
+
+        let (ctx, mut sig) = agent_ctx();
+        let mut agents = HashSet::new();
+        agents.insert("toolu_live".to_string());
+        let delta = update_agents(&fork, &mut agents, &ctx);
+        assert!(!delta.launched && !delta.completed);
+        assert!(
+            agents.contains("toolu_live"),
+            "an unrecognized line must not disturb tracked agents"
+        );
+        assert!(sig.try_recv().is_err());
+
+        // A wholly unknown top-level `type` behaves the same way.
+        let alien = obj(r#"{"type":"some-future-record","payload":{"anything":true}}"#);
+        assert!(assistant_texts(&alien).is_empty());
+        assert!(parse_usage_line(&alien, crate::graph::UsageOrigin::Session).is_none());
+        assert!(!is_user_prompt(&alien));
+    }
+
+    #[test]
+    fn parse_transcript_line_skips_corrupt_lines_only() {
+        let path = Path::new("transcript.jsonl");
+        assert!(parse_transcript_line(path, r#"{"type":"assistant"}"#).is_some());
+        // Truncated / garbage / non-object lines are all skipped, not fatal.
+        assert!(parse_transcript_line(path, r#"{"type":"assist"#).is_none());
+        assert!(parse_transcript_line(path, "\u{0}\u{1}not json at all").is_none());
+        assert!(parse_transcript_line(path, "{,}").is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_skips_a_corrupt_line_and_keeps_processing_later_lines() {
+        // Regression guard for the unstable-format contract: one unreadable
+        // line (a truncated write, an unknown binary blob, a future framing)
+        // must not abort the tail. The launch on line 1 is only cleared by the
+        // tool_result on line 4 — if the corrupt line 2 killed the drain, the
+        // agent would stay outstanding and no inactive edge would arrive.
+        let dir = std::env::temp_dir().join(format!("oob-corrupt-line-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.jsonl");
+        // No `version` key anywhere: `note_cli_version` must stay out of the
+        // global harness-version file during tests.
+        let content = concat!(
+            r#"{"type":"assistant","message":{"id":"m1","effort":"high","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{}}]}}"#,
+            "\n",
+            "{\"type\":\"assistant\",\"message\":{ TRUNCATED MID-WRITE",
+            "\n",
+            r#"{"type":"system","subtype":"session_start","source":"fork"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let (ctx, mut sig) = agent_ctx();
+        let mut seen = HashSet::new();
+        let mut agents = HashSet::new();
+        let mut tool_names = ToolNameRing::default();
+        let mut commit_calls = IdRing::default();
+        let mut version_noted = false;
+        let mut subs = SubagentState::default();
+        let offset = drain_new_lines(
+            &path,
+            0,
+            &mut seen,
+            &mut agents,
+            &mut tool_names,
+            &mut commit_calls,
+            &mut version_noted,
+            &mut subs,
+            &dir,
+            "session-1",
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            offset,
+            content.len() as u64,
+            "the whole chunk is consumed despite the corrupt line"
+        );
+        assert!(
+            agents.is_empty(),
+            "the tool_result AFTER the corrupt line still cleared the agent"
+        );
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: true, .. })
+        ));
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::AgentsActiveChanged { active: false, .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

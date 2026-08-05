@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rodio::{OutputStream, Sink, Source};
+use rodio::{ChannelCount, DeviceSinkBuilder, Player, SampleRate, Source};
 use tokio::sync::{mpsc as tokio_mpsc, Notify};
 use tracing::{debug, info, warn};
 
@@ -267,20 +267,23 @@ fn run_audio_thread(
     active: ActiveTab,
 ) {
     // Open the device on this thread so the cpal::Stream stays bound here.
-    let (stream, handle) = match OutputStream::try_default() {
-        Ok(pair) => pair,
+    // rodio 0.22 renamed `OutputStream` -> `MixerDeviceSink` and folded the
+    // old `(stream, handle)` pair into one value that owns the cpal stream and
+    // hands out `&Mixer`; `Sink` is now `Player`. Ownership is unchanged: this
+    // `stream` must outlive every `Player` connected to it, which it does — both
+    // are dropped together at the bottom of this function.
+    let mut stream = match DeviceSinkBuilder::open_default_sink() {
+        Ok(s) => s,
         Err(e) => {
             let _ = init_tx.send(Err(AppError::Audio(format!("default output stream: {e}"))));
             return;
         }
     };
-    let sink = match Sink::try_new(&handle) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = init_tx.send(Err(AppError::Audio(format!("sink: {e}"))));
-            return;
-        }
-    };
+    // Suppress rodio's Drop-time "audio playing through this sink will stop"
+    // notice: dropping it here IS the shutdown path, and without the (unused)
+    // `rodio/tracing` feature that notice goes to raw stderr.
+    stream.log_on_drop(false);
+    let sink = Player::connect_new(stream.mixer());
     sink.set_volume(initial_volume);
 
     info!("audio thread ready");
@@ -605,16 +608,21 @@ impl Iterator for TappedSource {
 }
 
 impl Source for TappedSource {
-    fn current_frame_len(&self) -> Option<usize> {
+    // rodio 0.22: `current_frame_len` -> `current_span_len`, and
+    // `channels`/`sample_rate` return `NonZero` newtypes instead of raw ints.
+    fn current_span_len(&self) -> Option<usize> {
         Some(self.remaining)
     }
 
-    fn channels(&self) -> u16 {
-        1
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::MIN // 1 — TTS output is mono
     }
 
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
+    fn sample_rate(&self) -> SampleRate {
+        // Zero rates are rejected upstream in `enqueue_inner`, so the fallback
+        // is unreachable; it keeps this total without an `unwrap` in the mixer
+        // callback path.
+        SampleRate::new(self.sample_rate).unwrap_or(SampleRate::MIN)
     }
 
     fn total_duration(&self) -> Option<Duration> {

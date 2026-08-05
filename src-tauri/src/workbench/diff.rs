@@ -1437,7 +1437,7 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn parse_numstat_z_plain_and_binary_and_rename() {
         let raw =
-            "0\t1\tadded.txt\0-\t-\tbin.dat\01\t1\tnonewline.txt\02\t0\t\0new.txt\0renamed.txt\0";
+            "0\t1\tadded.txt\0-\t-\tbin.dat\x001\t1\tnonewline.txt\x002\t0\t\0new.txt\0renamed.txt\0";
         let map = parse_numstat_z(raw);
         assert_eq!(map.get("added.txt"), Some(&(Some(0), Some(1))));
         assert_eq!(map.get("bin.dat"), Some(&(None, None)));

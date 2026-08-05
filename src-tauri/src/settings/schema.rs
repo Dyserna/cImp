@@ -85,7 +85,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 28;
+pub const CURRENT_SCHEMA_VERSION: u8 = 29;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -401,8 +401,8 @@ impl HarnessVersions {
     /// a bare `"fail"` literal at a call site. Normalizes (trim +
     /// case-fold) and fails CLOSED: anything that isn't a recognized
     /// non-fail value (`"unverified"`, `"pass"`, or empty/missing) blocks,
-    /// so a hand-typed `"Fail"`/`"failed"` surfaces as the disabled toggle
-    /// + uninstalled hook instead of silently sailing past the gate.
+    /// so a hand-typed `"Fail"`/`"failed"` surfaces as the disabled toggle +
+    /// uninstalled hook instead of silently sailing past the gate.
     /// Mirrored in the frontend as `harnessStatusBlocks`
     /// (src/lib/settings/types.ts) — keep the two in sync.
     pub fn status_blocks(status: &str) -> bool {
@@ -736,6 +736,18 @@ impl Settings {
     /// "cImp is not running" while the app is visibly running (the V26 Code
     /// Audit gap — `offload.mcp_host_needed()` alone misses `graph` and
     /// `code_audit`, which both inject servers on their own).
+    ///
+    /// **The subset rule covers HOOK SHIMS too, not just MCP servers.** Every
+    /// shim in the Claude `--settings` overlay (`--context-hook`,
+    /// `--precompact-hook`, `--read-hook`, `--postedit-hook`, and the NC-2
+    /// `--notify-hook` permission shim) reaches the app only through
+    /// `post_loopback`. The gated ones ride `graph.enabled`, which implies this
+    /// predicate; the NC-2 pair has no feature toggle of its own and is
+    /// therefore gated on `loopback_needed()` directly (H2, 2026-08-05 review)
+    /// — injecting it without the endpoint spawned a shim process per Claude
+    /// notification whose POST was dropped, silently killing the PRIMARY
+    /// permission signal on a default install. Tripwire:
+    /// `tabs::config::tests::every_advertised_mcp_server_gets_a_loopback`.
     pub fn loopback_needed(&self) -> bool {
         self.offload.mcp_host_needed() || self.graph.enabled || self.code_audit.mcp_exposed()
     }
@@ -1499,6 +1511,28 @@ pub struct OffloadSettings {
     /// [`enabled`]: Self::enabled
     /// [`opencode_provider`]: Self::opencode_provider
     pub opencode_provider_auto: bool,
+    /// V30 Phase A: register the `cimp-offload` MCP child as a Claude Code
+    /// **channel** so it can push out-of-band notices straight into a live
+    /// session (`notifications/claude/channel` → a `<channel source="…">`
+    /// message at the next turn boundary — see
+    /// `docs/MILESTONE-V30-mcp-channels.md`).
+    ///
+    /// Two spawn-time effects, both Claude-only (OpenCode has no MCP inbound
+    /// path):
+    ///   * the tab is launched with
+    ///     `--dangerously-load-development-channels server:cimp-offload`
+    ///     ([`crate::tabs`]'s `CHANNEL_REGISTRATION_FLAG`);
+    ///   * the child declares `capabilities.experimental["claude/channel"]` +
+    ///     an `instructions` block at `initialize`.
+    ///
+    /// Default **off**, and marked experimental in the UI: the registration
+    /// flag is a Claude Code *research preview* (it may change or vanish), it
+    /// paints a persistent banner in every tab, and channel delivery is
+    /// fire-and-forget (a misconfigured/policy-blocked push is silently
+    /// dropped — hence invariant 2 in the milestone: every push keeps a pull
+    /// twin). Spawn-baked, so it carries a `spawn_inject_sig` entry and a
+    /// restart hint. Additive `#[serde(default)]` — pre-v29 files load `false`.
+    pub session_push: bool,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1532,6 +1566,7 @@ impl std::fmt::Debug for OffloadSettings {
             // derives Debug.
             .field("opencode_provider", &self.opencode_provider)
             .field("opencode_provider_auto", &self.opencode_provider_auto)
+            .field("session_push", &self.session_push)
             .finish()
     }
 }
@@ -1584,6 +1619,7 @@ impl Default for OffloadSettings {
             escalate_partial: true,
             opencode_provider: None,
             opencode_provider_auto: false,
+            session_push: false,
         }
     }
 }
@@ -2360,22 +2396,17 @@ pub enum BackendTier {
 /// configured MCP-server names). Only allowed tools are placed in the
 /// `tools` array sent to that backend's model — the privacy boundary for
 /// cloud backends.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum ToolScope {
     /// Every tool in the pool (Local + trusted LAN default).
+    #[default]
     All,
     /// Only the named tools.
     Only { tools: Vec<String> },
     /// Every tool except the named ones (cloud default = `AllExcept` the
     /// local-data set).
     AllExcept { tools: Vec<String> },
-}
-
-impl Default for ToolScope {
-    fn default() -> Self {
-        ToolScope::All
-    }
 }
 
 impl ToolScope {
@@ -3360,9 +3391,14 @@ pub struct UsageSettings {
     pub show_countdown: bool,
     /// Show the local reset clock time.
     pub show_reset_clock: bool,
-    /// How often the frontend polls the usage endpoint, in seconds. The UI
-    /// clamps this to a sane minimum so the undocumented endpoint isn't
-    /// hammered.
+    /// NC-3: show the live context-window row (used %, tokens in the window,
+    /// and the turn's cache read/creation split) alongside the quota windows.
+    /// The row is data-gated too — it only appears once a Claude tab pushes a
+    /// `context_window` block.
+    pub show_context: bool,
+    /// How often the frontend re-reads the status-line usage push (a local
+    /// file — see `crate::usage`), in seconds. The UI clamps this to a sane
+    /// minimum as busy-poll hygiene.
     pub poll_interval_secs: u32,
 }
 
@@ -3374,6 +3410,7 @@ impl Default for UsageSettings {
             show_percentage: true,
             show_countdown: true,
             show_reset_clock: true,
+            show_context: true,
             poll_interval_secs: 60,
         }
     }
@@ -4227,6 +4264,28 @@ mod tests {
     }
 
     #[test]
+    fn offload_v28_json_without_session_push_loads_false() {
+        // V30 Phase A: a pre-v29 `offload` block that predates `session_push`
+        // deserializes with the flag OFF — the container-level
+        // `#[serde(default)]` fills the absent field from
+        // `OffloadSettings::default()`. This is why the v28 → v29 migration is
+        // a pure version stamp (no data transform): the additive bool
+        // round-trips for free, and an upgrading user never silently gets a
+        // research-preview channel registration they didn't ask for.
+        let o: OffloadSettings = serde_json::from_value(json!({
+            "enabled": true,
+            "autostart": true,
+            "inject_guidance": true,
+            "server_command": "llama-server --jinja",
+            "escalate_partial": true
+        }))
+        .expect("v28 offload block deserializes");
+        assert!(!o.session_push);
+        // Default-constructed settings agree (the toggle ships off).
+        assert!(!OffloadSettings::default().session_push);
+    }
+
+    #[test]
     fn code_audit_unknown_tool_id_dropped_keeping_known() {
         // A future/typo'd tool id is dropped; the recognized entries survive.
         let ca: CodeAuditSettings = serde_json::from_value(json!({
@@ -4646,8 +4705,10 @@ mod tests {
         // From<&TerminalBackgroundSettings> for BackgroundPresetConfig
         // copies the shared fields; presets has no analogue on the sister
         // struct, so it is dropped.
-        let mut s = TerminalBackgroundSettings::default();
-        s.color = Some("#101010".to_string());
+        let mut s = TerminalBackgroundSettings {
+            color: Some("#101010".to_string()),
+            ..TerminalBackgroundSettings::default()
+        };
         s.presets.push(BackgroundPreset {
             name: "noise".to_string(),
             config: BackgroundPresetConfig::default(),

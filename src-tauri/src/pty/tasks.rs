@@ -279,6 +279,36 @@ pub fn spawn_processor(
                             // Open the grace window. See RESIZE_BURST_GRACE.
                             last_resize = Some(tokio::time::Instant::now());
                         }
+                        Some(ProcessorControl::ClearPermissionLatch) => {
+                            // M11: the hook path just cleared this tab's
+                            // `awaiting_permission` on a `PermissionDenied`.
+                            // The detector is edge-triggered, so a prompt that
+                            // is genuinely still on screen would never re-emit
+                            // Detected (same kind, same pattern name ⇒ no
+                            // transition). Dropping the latch makes the very
+                            // next scan re-raise it. The scan is run right here
+                            // rather than left to the tick loop: scans only run
+                            // on ticks that saw fresh terminal bytes, and a
+                            // prompt sitting on screen waiting for the user
+                            // produces none — the badge would stay cleared
+                            // until something else painted. Ordering is safe:
+                            // the Resolved signal was queued on the
+                            // state-signal channel before this message was
+                            // sent, and the re-Detected can only be queued
+                            // after — FIFO keeps the state manager's view
+                            // consistent.
+                            debug!(?tab, "permission latch cleared by hook (Resolved)");
+                            detector.force_clear(PatternKind::Permission);
+                            if !is_shell {
+                                run_permission_check(
+                                    &tab,
+                                    &mut detector,
+                                    &layer,
+                                    &state_signals,
+                                    &mut working_active,
+                                );
+                            }
+                        }
                         None => {
                             // Sender dropped — only happens if PtyHandle
                             // is freed without going through `shutdown`,

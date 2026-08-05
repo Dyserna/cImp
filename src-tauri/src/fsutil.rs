@@ -28,6 +28,49 @@
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
+// Shared directory-key normalization.
+//
+// Several seams compare two directory paths for *identity* — "is this the same
+// project dir?" — rather than resolving them on disk: the permission hook's
+// cwd fallback (`offload::loopback::norm_dir`) and the H1 ambiguity predicate's
+// transcript-root key (`graph::service::LiveTabRoot`). They must agree, or one
+// of them silently stops matching hand-typed cwds that differ only by case or a
+// trailing separator. One implementation, used by both.
+// ---------------------------------------------------------------------------
+
+/// A directory string normalized for EQUALITY COMPARISON: separators unified to
+/// `/`, trailing separators dropped, and — on Windows, whose filesystem paths
+/// are case-insensitive — case-folded. `None` for an empty/whitespace path.
+///
+/// Purely lexical: no `canonicalize`, no filesystem access, no `..` resolution.
+/// That is deliberate — callers key live in-memory maps by it on hot paths and
+/// must not touch the disk (nor fail when the dir has since been deleted). The
+/// result is a comparison KEY, not a displayable path.
+pub fn norm_dir_key(dir: &str) -> Option<String> {
+    let s = dir.trim().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if s.is_empty() {
+        return None;
+    }
+    Some(if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_string()
+    })
+}
+
+/// [`norm_dir_key`] for a `Path`, keeping the `PathBuf` type so callers can
+/// store the canonical key where a path already lives. A path that normalizes
+/// to nothing (empty) is returned unchanged — an unusable key is still better
+/// than silently collapsing distinct roots to one.
+pub fn norm_dir_key_path(dir: &Path) -> PathBuf {
+    match norm_dir_key(&dir.to_string_lossy()) {
+        Some(s) => PathBuf::from(s),
+        None => dir.to_path_buf(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared "directories a recursive walk should not descend into" name sets.
 //
 // Several subsystems do a plain recursive `read_dir` walk and want to avoid

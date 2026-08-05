@@ -190,6 +190,9 @@ fn notifications_from_dialog(error: String, exited: String) -> ShellNotification
 /// Create a new user-managed Shell tab. Validates the inputs, registers it
 /// in the registry, appends a `TabConfig::Shell` to settings, and emits
 /// `TabAdded` so the frontend mirrors the addition into its tabs store.
+// Tauri command: each parameter is a field of the frontend's `invoke` payload,
+// so collapsing them into a struct changes the IPC contract.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn create_shell_tab(
     app: AppHandle,
@@ -846,6 +849,9 @@ pub async fn rename_tab(
 /// Update a Shell tab's spawn config. Does NOT respawn — the new config
 /// takes effect on next restart (manual via the closed-overlay Enter
 /// affordance, or automatic on subprocess exit).
+// Tauri command: parameters are the `invoke` payload fields (see
+// `create_shell_tab`).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn reconfigure_shell_tab(
     state: State<'_, AppState>,

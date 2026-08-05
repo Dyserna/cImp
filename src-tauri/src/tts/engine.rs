@@ -5,11 +5,28 @@
 
 use std::path::Path;
 
-#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
-use ort::execution_providers::CUDAExecutionProvider;
+// The two TTS GPU features are mutually exclusive at the *dependency* level,
+// and the failure mode is silent: pyke ships no prebuilt combining `cuda` +
+// `webgpu`, and `ort-sys` does not error on that combo — it prints a
+// `cargo:warning` and downloads the CPU-only dist instead. Without this guard
+// the build succeeds, `register_gpu_ep` below registers an EP, and the app
+// logs "GPU (WebGPU)" while every op runs on CPU. Fail the compile instead.
+// (Mirrored in `Cargo.toml`'s `[features]` block — keep both in step.)
+#[cfg(all(feature = "tts-webgpu", feature = "tts-cuda"))]
+compile_error!(
+    "tts-webgpu and tts-cuda are mutually exclusive: ort-sys silently falls back to the \
+     CPU-only prebuilt when both ort features are enabled — pick one"
+);
+
+// `ort::ep` is rc.11's module for execution providers; the old
+// `ort::execution_providers::*ExecutionProvider` aliases are `#[deprecated]`.
+// The `compile_error!` above makes `tts-webgpu` and `tts-cuda` disjoint, so
+// each of the cfgs below selects exactly one EP with no precedence rule.
 #[cfg(feature = "tts-webgpu")]
-use ort::execution_providers::WebGPUExecutionProvider;
-use ort::execution_providers::{CPUExecutionProvider, ExecutionProvider};
+use ort::ep::WebGPU;
+#[cfg(feature = "tts-cuda")]
+use ort::ep::CUDA;
+use ort::ep::{ExecutionProvider, CPU};
 use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
 use ort::value::Tensor;
 
@@ -22,24 +39,26 @@ pub const SAMPLE_RATE: u32 = 24_000;
 
 /// Label for the compiled GPU backend, used when a GPU EP registers. The
 /// backend is a compile-time choice (mutually-exclusive `tts-webgpu` /
-/// `tts-cuda` Cargo features); only one of these consts exists per build.
+/// `tts-cuda` Cargo features, enforced by the `compile_error!` above); only
+/// one of these consts exists per build.
 #[cfg(feature = "tts-webgpu")]
 const GPU_BACKEND: &str = "GPU (WebGPU)";
-#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+#[cfg(feature = "tts-cuda")]
 const GPU_BACKEND: &str = "GPU (CUDA)";
 
 /// Register the compiled GPU execution provider. Exactly one EP is selected at
-/// compile time; `tts-webgpu` wins if both features are (mis)configured on.
+/// compile time — the both-features-on case is a compile error (see the top of
+/// this file), so no precedence rule is needed or possible here.
 #[cfg(any(feature = "tts-webgpu", feature = "tts-cuda"))]
 fn register_gpu_ep(builder: &mut SessionBuilder) -> AppResult<()> {
     let result = {
         #[cfg(feature = "tts-webgpu")]
         {
-            WebGPUExecutionProvider::default().register(builder)
+            WebGPU::default().register(builder)
         }
-        #[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+        #[cfg(feature = "tts-cuda")]
         {
-            CUDAExecutionProvider::default().register(builder)
+            CUDA::default().register(builder)
         }
     };
     result.map_err(|e| AppError::Tts(format!("GPU EP register: {e}")))
@@ -134,7 +153,7 @@ impl TtsEngine {
     }
 
     fn register_cpu(builder: &mut SessionBuilder) -> AppResult<()> {
-        CPUExecutionProvider::default()
+        CPU::default()
             .register(builder)
             .map_err(|e| AppError::Tts(format!("CPU EP register: {e}")))
     }

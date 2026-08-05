@@ -51,8 +51,9 @@ pub use memory::{classify_tool, MemArg, MemorySnapshot, ProjectFact, UsageEvent,
 // `ModelUsage`/`OriginSplit` stay structural.
 pub use mcp::{
     handle_call as handle_mcp_call, lean_filter, offload_query, offload_run_check, run_check_spec,
-    semantic_code_spec, semantic_spec, surface_stats, tool_specs, tools as mcp_tools, LEAN_HIDDEN,
+    semantic_code_spec, semantic_spec, source_for_consumer, surface_stats, tool_specs,
+    tools as mcp_tools, LEAN_HIDDEN,
 };
 pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use model::*;
-pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus};
+pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus, RebuildOrigin};

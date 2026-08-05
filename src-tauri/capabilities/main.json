@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-only",
+  "description": "Grants scoped to the MAIN window alone. A Tauri capability's window list applies to every permission in the file, so anything the settings window must not reach needs its own capability — this one. Shared grants stay in default.json. clipboard read-image: the only caller is ComposeOverlay.svelte's paste handler (via compose/attachments.ts::readClipboardImagePng), which lives in the main window; the settings window bundles attachments.ts transitively (settings_main -> SettingsApp -> stt.ts -> composeState.ts) but only ever calls its pure helpers, so it never needs the grant. Narrowed 2026-08-05 per the develop code review (LOW, deps/CI slice).",
+  "windows": ["main"],
+  "permissions": ["clipboard-manager:allow-read-image"]
+}

@@ -16,6 +16,7 @@ mod ipc;
 mod logging;
 mod mcp_stdio;
 mod notifications;
+mod notify_hook;
 mod offload;
 mod oob;
 mod postedit_hook;
@@ -124,7 +125,9 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --precompact-hook                      PreCompact hook shim
   --read-hook                            PreToolUse read-advisor hook shim
   --postedit-hook                        PostToolUse checks hook shim
-  --offload-mcp [--consumer <name>]      stdio MCP server (offload + graph + proxied servers)
+  --notify-hook                          Notification / PermissionDenied hook shim
+  --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
+                                         stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
 
 The MCP servers and hooks proxy to a RUNNING cImp instance launched in the
@@ -234,6 +237,19 @@ fn main() {
         return;
     }
 
+    // NC-2 (issue #5): Claude Code invokes `cimp --notify-hook` for the
+    // `Notification` and `PermissionDenied` events — the PRIMARY signal that a
+    // tab is (or is no longer) awaiting a permission decision, with the
+    // TUI-regex detector demoted to fallback. It POSTs the payload to the app's
+    // loopback `/permission/event`, which maps it to a tab and flips
+    // `awaiting_permission`. Observe-only: GUI-free like the other shims, never
+    // prints to stdout, and always exits 0 so a dead app can never delay
+    // Claude's permission flow.
+    if std::env::args().skip(1).any(|a| a == "--notify-hook") {
+        notify_hook::run();
+        return;
+    }
+
     // V8-01 offload MCP server: a host agent invokes `cimp --offload-mcp`
     // (Claude via `--mcp-config`; OpenCode via the injected `mcp` block) and
     // speaks newline-delimited JSON-RPC over stdio. Handle it before any
@@ -254,7 +270,24 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str)
             .unwrap_or("claude");
-        offload::mcp::run(consumer);
+        // V28: `--tab <tab-id>` names the cImp tab this per-tab child serves, so
+        // the app can resolve the tab's CURRENT session for the `context_*`
+        // memory tools. Absent (hand-run child, or one spawned before the
+        // upgrade) simply falls back to the pre-V28 scoping.
+        let tab = args
+            .iter()
+            .position(|a| a == "--tab")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        // V30 (M5): `--channel-push` is the session-push gate, decided ONCE per
+        // tab spawn in `tabs/config.rs::build_pre_args` — the same read of the
+        // same settings snapshot that decides whether Claude itself gets
+        // `--dangerously-load-development-channels`. Baking it into argv (rather
+        // than having the child re-read settings at `initialize`) is what keeps
+        // the two halves of the gate from desyncing across a child restart.
+        // Absent on a hand-run child ⇒ no channel declaration.
+        let channel_push = args.iter().any(|a| a == "--channel-push");
+        offload::mcp::run(consumer, tab, channel_push);
         return;
     }
 
@@ -590,7 +623,14 @@ fn main() {
             // the user starts it from Settings (or it's lazy on first
             // offload). Fail-soft: a bad command surfaces as an Error
             // status, never blocks launch.
-            {
+            //
+            // V30 Phase C: the block yields the session-push bus
+            // (`OffloadService::push_registry`) so the producers constructed
+            // further down — the graph service and the audit runner — can
+            // announce their long-running completions into channel-armed
+            // sessions. Only the send half travels; nothing holds the service
+            // itself, so no Arc cycle.
+            let push_registry = {
                 let supervisor = crate::offload::OffloadSupervisor::new(
                     app.handle().clone(),
                     settings_for_offload.clone(),
@@ -624,14 +664,14 @@ fn main() {
                 // (`cimp --code-audit-mcp` proxies to `/audit/run`). Gating on
                 // offload alone stranded audit-only/graph-only projects with
                 // "cImp is not running" tool errors.
-                if settings_for_offload.current().loopback_needed() {
-                    if !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        start_offload_runtime(
-                            app.handle().clone(),
-                            service.clone(),
-                            supervisor.clone(),
-                        );
-                    }
+                if settings_for_offload.current().loopback_needed()
+                    && !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    start_offload_runtime(
+                        app.handle().clone(),
+                        service.clone(),
+                        supervisor.clone(),
+                    );
                 }
                 // V8: a user who launches with offload disabled and enables it
                 // later in Settings must still get the loopback discovery
@@ -650,26 +690,47 @@ fn main() {
                     tauri::async_runtime::spawn(async move {
                         let mut rx = watch.subscribe();
                         loop {
-                            match rx.recv().await {
-                                Ok(s) => {
-                                    if s.loopback_needed()
-                                        && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
-                                    {
-                                        info!("offload: MCP host needed at runtime — starting offload runtime");
-                                        start_offload_runtime(
-                                            app_handle.clone(),
-                                            svc.clone(),
-                                            sup.clone(),
-                                        );
-                                    }
+                            // H2-R1 (2026-08-05 review): a LAGGED receiver has
+                            // DROPPED frames, and one of them can be the very
+                            // false→true `loopback_needed` edge this task
+                            // exists to catch — leaving the runtime unstarted
+                            // while newly-spawned tabs inject hooks against
+                            // `current()`, self-healing only on the next
+                            // settings save. So Lagged is treated as "changed,
+                            // re-check" and re-reads the authoritative current
+                            // settings (the standard tokio broadcast pattern),
+                            // instead of `continue`-ing past the edge.
+                            let s = match rx.recv().await {
+                                Ok(s) => s,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!(
+                                        dropped = n,
+                                        "offload: settings broadcast lagged — re-checking current settings"
+                                    );
+                                    watch.current()
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            // Start-once / never-stop stays monotonic: the
+                            // atomic swap is the only gate, so a replayed or
+                            // re-read `true` after a start is a no-op, and a
+                            // `false` never tears the runtime down.
+                            if s.loopback_needed()
+                                && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                info!("offload: MCP host needed at runtime — starting offload runtime");
+                                start_offload_runtime(
+                                    app_handle.clone(),
+                                    svc.clone(),
+                                    sup.clone(),
+                                );
                             }
                         }
                     });
                 }
-            }
+                // V30 Phase C: hand the push bus to the producers below.
+                service.push_registry()
+            };
 
             // V13 Phase A: the Workbench service (fs-batch broadcast today;
             // checkpoint scheduling and worktree bookkeeping in later phases).
@@ -705,6 +766,8 @@ fn main() {
                 let graph_service = crate::graph::GraphService::new(
                     app.handle().clone(),
                     settings_for_graph.clone(),
+                    // V30 Phase C: announce expensive full index builds.
+                    Some(push_registry.clone()),
                 );
                 app.manage(graph_service.clone());
 
@@ -719,6 +782,8 @@ fn main() {
                         app.handle().clone(),
                         settings_for_graph.clone(),
                         audit_root,
+                        // V30 Phase C: announce GUI-initiated scan completions.
+                        Some(push_registry.clone()),
                     );
                     // V26: publish the runner as the process global BEFORE
                     // `manage` moves it — this is how the offload worker's native
@@ -735,7 +800,9 @@ fn main() {
                 // settings watcher below.
                 if settings_for_graph.current().graph.enabled {
                     if let Ok(root) = std::env::current_dir() {
-                        graph_service.spawn_rebuild(root.clone());
+                        // Startup housekeeping — never a session push.
+                        graph_service
+                            .spawn_rebuild(root.clone(), crate::graph::RebuildOrigin::Automatic);
                         // Phase D: keep the index live as files change.
                         graph_service.start_watch(root);
                     }
@@ -753,7 +820,12 @@ fn main() {
                                     if now && !was_enabled {
                                         if let Ok(root) = std::env::current_dir() {
                                             info!("graph: enabled at runtime — building index");
-                                            svc.spawn_rebuild(root.clone());
+                                            // Side effect of a settings save, not
+                                            // a rebuild request — no push.
+                                            svc.spawn_rebuild(
+                                                root.clone(),
+                                                crate::graph::RebuildOrigin::Automatic,
+                                            );
                                             svc.start_watch(root);
                                         }
                                     }
@@ -1164,6 +1236,9 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
         .collect()
 }
 
+// Wiring function called once from setup: every argument is a distinct handle
+// or channel end the pipeline owns, with no natural grouping.
+#[allow(clippy::too_many_arguments)]
 fn init_tts_pipeline(
     app: AppHandle,
     tts_rx: mpsc::Receiver<TtsRequest>,

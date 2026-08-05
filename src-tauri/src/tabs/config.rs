@@ -67,6 +67,9 @@ pub fn build_launch_spec(
                 extra_args: cfg.args.clone(),
                 working_dir,
                 env: cfg.env.clone(),
+                // A Shell tab exists to give the user the environment they
+                // actually have — cImp does not edit it (see `HARNESS_ENV_VARS`).
+                env_remove: Vec::new(),
                 // Shell tabs have no AI assistant output to speak.
                 oob: None,
             })
@@ -82,9 +85,9 @@ fn build_ai_tool_spec(
     invocation_args: &[String],
 ) -> AppResult<PtyLaunchSpec> {
     let binary = resolve_command(&cfg.command)?;
-    let pre_args = build_pre_args(cfg, settings);
+    let pre_args = build_pre_args(cfg, settings, tab.as_str());
     let mut extra_args = build_extra_args(cfg, settings, invocation_args);
-    let working_dir = cfg.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf());
+    let working_dir = ai_working_dir(cfg, launch_cwd);
     // V19: OpenCode reads its guidance from a file referenced in the injected
     // config (`instructions`), so write that managed file at launch — kept off
     // the pure `compose_ai_env` path so the config builder stays test-safe.
@@ -100,7 +103,8 @@ fn build_ai_tool_spec(
     // (which the adapter taps). Mutates `extra_args`, so it runs on the real
     // launch path only — the pure `build_extra_args` stays test-stable.
     let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args);
-    let env = compose_ai_env(cfg, settings);
+    let env = compose_ai_env(cfg, settings, tab.as_str());
+    let env_remove = ai_env_removals(cfg);
     Ok(PtyLaunchSpec {
         tab,
         binary,
@@ -108,8 +112,44 @@ fn build_ai_tool_spec(
         extra_args,
         working_dir,
         env,
+        env_remove,
         oob,
     })
+}
+
+/// V30 (review M9): environment markers of the Claude Code session cImp was
+/// launched from, stripped from every AI tab's child.
+///
+/// Launching cImp from inside a Claude Code session is routine during
+/// development, and the child then inherits that session's harness markers. The
+/// load-bearing one is `CLAUDE_CODE_CHILD_SESSION`: a Claude spawned with it set
+/// runs with **no transcript, no history, no session records** (spike-documented
+/// in `docs/MILESTONE-V30-mcp-channels.md`), which silently blinds the
+/// out-of-band tap — no TTS, no usage, no live-session registry entry, no V28
+/// per-tab scoping, and no log anywhere saying why. The other two are the
+/// generic "you are running inside Claude Code" markers a fresh, user-facing tab
+/// must not claim to be under; leaving them set has a tool infer a parent
+/// session that has nothing to do with this tab.
+///
+/// Deliberately NOT a settings knob and deliberately not `env_clear`: this is a
+/// fixed, minimal list of harness markers, so it needs no `spawn_inject_sig`
+/// entry (nothing about it can change between spawns) and it cannot strip
+/// anything the user's own environment legitimately carries.
+const HARNESS_ENV_VARS: [&str; 3] = [
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
+/// The strip list for one AI tab: [`HARNESS_ENV_VARS`] minus anything the user
+/// set explicitly on the tab — a per-tab `env` entry is an instruction, not an
+/// accident, and `PtyManager` applies additions after removals anyway.
+fn ai_env_removals(cfg: &AiToolTabConfig) -> Vec<String> {
+    HARNESS_ENV_VARS
+        .iter()
+        .filter(|k| !cfg.env.contains_key(**k))
+        .map(|k| (*k).to_string())
+        .collect()
 }
 
 /// V20: pick the out-of-band TTS source for an AI tab, and for OpenCode inject
@@ -146,6 +186,48 @@ fn resolve_oob_source(
         return Some(crate::oob::OobSpec::OpenCodeEvent { port });
     }
     None
+}
+
+/// The directory an AI tab launches in: its per-tab `cwd` override, else the
+/// app's launch dir. THE one definition — [`build_ai_tool_spec`] (which hands it
+/// to [`resolve_oob_source`], so it also becomes the Claude transcript root
+/// behind the H1 same-root ambiguity predicate) and [`claude_tab_dirs`] (the
+/// permission-hook cwd fallback) both call it, so the tab-identity seam and the
+/// hook-attribution seam can never disagree about where a tab runs.
+fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBuf {
+    cfg.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf())
+}
+
+/// NC-2 (issue #5): every configured Claude AI tab and the working directory it
+/// launches in — `(tab_id, working_dir)`. Resolution is [`ai_working_dir`], the
+/// same call [`build_ai_tool_spec`] makes, so the permission-hook route can
+/// compare a hook payload's `cwd` against the directory the tab was actually
+/// spawned in.
+///
+/// Note the usual case is that NO tab sets `cwd`, so every Claude tab shares the
+/// launch dir — which is why the route's cwd match is only used as a
+/// last-resort tie-break and only when it resolves to exactly one tab.
+///
+/// This lists CONFIGURED tabs (running or not) by design: it is the cwd
+/// tie-break's candidate set, where an extra candidate can only make the route
+/// refuse. The H1 ambiguity predicate needs the opposite posture — a
+/// configured-but-closed tab must not degrade a running one — so it is fed by
+/// the running taps themselves (`GraphService::mark_live_tab_root`), not by this
+/// list.
+pub(crate) fn claude_tab_dirs(
+    settings: &Settings,
+    launch_cwd: &Path,
+) -> Vec<(String, std::path::PathBuf)> {
+    settings
+        .tabs
+        .iter()
+        .filter_map(|t| match t {
+            TabConfig::AiTool(c) if command_is(&c.command, "claude") => {
+                Some((c.id.clone(), ai_working_dir(c, launch_cwd)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// V16 Feature 1: run `opencode --version` once per tab spawn and record the
@@ -203,18 +285,6 @@ fn command_is(command: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Pre-args injected ahead of the tab's own `args` and the wrapper's
-/// invocation args. Claude-only — these injections target Claude Code's CLI
-/// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
-/// `build_opencode_config`), so non-Claude tabs get empty pre-args:
-///
-///   * `--append-system-prompt <instructions>` — TTS markup convention,
-///     gated on the per-tab `tts_injection` toggle.
-///   * `--settings <json>` — a session-scoped overlay pointing Claude
-///     Code's `statusLine` at our `cimp --statusline` renderer, gated on
-///     the global `statusline.enabled`. The overlay merges with the
-///     user's own Claude settings (only `statusLine` is set), so it
-///     scopes the context bar to cImp without touching `~/.claude`.
 /// The four "is this MCP server advertised to this consumer" gates, factored
 /// out so the injection sites below and the restart-hint edge detector in
 /// `ipc::commands::settings_update` can never drift apart. Servers are
@@ -286,7 +356,30 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
             read_hook && s.graph.read_advisor_shell,
             post_edit,
         ],
+        // NC-2 + H2 fix: the `Notification` / `PermissionDenied` pair. Injected
+        // whenever the loopback they POST into actually runs, so the value is
+        // Settings-derived (offload / graph / Code Audit MCP) even though there
+        // is no permission-detection toggle of its own. Flipping any of those
+        // features changes how a FRESH Claude tab launches — hook-primary vs.
+        // regex-only permission detection — so a running tab is owed a restart
+        // hint. Kept as its own key rather than a sixth `hooks` slot so the
+        // array above keeps mapping 1:1 to the gated `build_pre_args` entries.
+        "notify_hooks": s.loopback_needed(),
         "local_env": local_env,
+        // V30 Phase A: the session-push flag pair — Claude's
+        // `--dangerously-load-development-channels` and the `cimp-offload`
+        // child's own `--channel-push`. Claude-only (OpenCode has no MCP inbound
+        // path) and baked at spawn, so it is exactly the kind of Settings-gated
+        // injection the rule at the top of this object demands an entry for:
+        // without it, toggling `session_push` mid-session leaves every running
+        // tab silently unregistered (or registered) with no restart hint.
+        //
+        // The EFFECTIVE value, not the raw toggle: neither flag is emitted
+        // unless the `cimp-offload` server is injected at all
+        // (`build_pre_args`), so with offload+graph+Claude-exposed MCP all off a
+        // `session_push` flip changes no argv and must not nag every tab to
+        // restart for nothing.
+        "channels": s.offload.session_push && advertises_offload_to_claude(s),
     });
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
@@ -307,7 +400,26 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
     [claude, opencode]
 }
 
-fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
+/// Pre-args injected ahead of the tab's own `args` and the wrapper's
+/// invocation args. Claude-only — these injections target Claude Code's CLI
+/// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
+/// `build_opencode_config`), so non-Claude tabs get empty pre-args:
+///
+///   * `--append-system-prompt <instructions>` — TTS markup convention,
+///     gated on the per-tab `tts_injection` toggle.
+///   * `--settings <json>` — a session-scoped overlay pointing Claude
+///     Code's `statusLine` at our `cimp --statusline` renderer, gated on
+///     the global `statusline.enabled`. The overlay merges with the
+///     user's own Claude settings (only `statusLine` is set), so it
+///     scopes the context bar to cImp without touching `~/.claude`.
+///   * `--dangerously-load-development-channels server:cimp-offload` —
+///     V30 Phase A session-push registration, gated on the default-off
+///     `offload.session_push` (see [`CHANNEL_REGISTRATION_FLAG`]).
+///
+/// V28: `tab` is the launching tab's id, baked into the `cimp-offload` MCP
+/// child's argv (`--tab <id>`) so the app can resolve which of this agent's
+/// sessions a `context_*` call belongs to.
+fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<String> {
     if !command_is(&cfg.command, "claude") {
         return Vec::new();
     }
@@ -334,9 +446,19 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         let mut overlay = serde_json::Map::new();
         if settings.statusline.enabled {
             if let Some(command) = crate::statusline::launch_command() {
+                // `refreshInterval` (seconds) re-runs the command on a timer in
+                // addition to event-driven updates, so the `rate_limits` usage
+                // push (see `crate::usage`) keeps flowing — and the bottom-bar
+                // widget stays fresh — while the tab sits idle. 30s beats the
+                // widget's 90s stale threshold with margin; the render itself
+                // is a local subprocess, so the cost is negligible.
                 overlay.insert(
                     "statusLine".to_string(),
-                    serde_json::json!({ "type": "command", "command": command }),
+                    serde_json::json!({
+                        "type": "command",
+                        "command": command,
+                        "refreshInterval": 30,
+                    }),
                 );
             }
         }
@@ -427,6 +549,67 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                     );
                 }
             }
+            // NC-2 (issue #5): `Notification` + `PermissionDenied` — the
+            // PRIMARY "this tab is awaiting a permission decision" detector,
+            // demoting the TUI-regex matcher (`processing::permission`) to
+            // fallback. Both point at the SAME `--notify-hook` shim, which
+            // dispatches on the payload's `hook_event_name`.
+            //
+            // H2 fix (2026-08-05 review): GATED on `loopback_needed()`. The
+            // shim's ONLY delivery path is `post_loopback` →
+            // `read_discovery_for` (`context_hook.rs`), and the loopback server
+            // starts only under that predicate (`main.rs`). Injecting the hooks
+            // without it spawned a `cimp --notify-hook` process per Claude
+            // notification whose POST had nowhere to land — the primary signal
+            // dead, silently (the shim is silent by design, and the
+            // `contract_drift` report rides the same dead channel). The schema's
+            // invariant — every spawn-time advertisement must be a subset of
+            // `loopback_needed` — now covers hooks, not just `--mcp-config`; the
+            // tripwire is `every_advertised_mcp_server_gets_a_loopback`.
+            //
+            // ACCEPTED TRADEOFF: on a DEFAULT install (offload + graph +
+            // code_audit all off) permission detection is regex-only. That is
+            // the status quo ante for such installs — the hook never worked
+            // there — and it is strictly better than burning a process spawn per
+            // notification to feed a closed socket. Hook-primary detection
+            // requires one of offload / graph / Code-Audit-MCP to be on. Do NOT
+            // "fix" this by making the loopback always run: keeping it off for
+            // feature-less installs was a deliberate v0.48.0 decision.
+            //
+            // Because the injection is now Settings-DEPENDENT and baked at spawn,
+            // it carries a `spawn_inject_sig` entry (`"notify_hooks"`) so
+            // toggling one of those features raises the restart hint — a running
+            // tab launched without the hooks would otherwise stay hook-blind
+            // with no indication. The shim itself is fail-open and only spawns
+            // when Claude actually surfaces a notification or the
+            // auto-classifier denies a call — both rare.
+            //
+            // `"matcher": ""` on BOTH entries — the docs' explicit "fires on
+            // all notification types" form (and, for `PermissionDenied`, all
+            // tool names). Deliberately NOT a narrowing `permission_prompt`
+            // matcher: the matcher filters on the notification TYPE, and a
+            // renamed/removed type would silently stop the hook firing. We take
+            // every notification and classify app-side in
+            // `offload::loopback::classify_permission_event` instead, so an
+            // unrecognized type degrades to "ignored", never to silence. An
+            // *absent* matcher key is documented only for events that don't
+            // support matchers at all, so the empty string is the safe spelling
+            // here. Idle/`idle_prompt` notifications are deliberately NOT wired
+            // to the `awaiting_question` pipe — see that classifier's doc.
+            if let Some(command) = settings
+                .loopback_needed()
+                .then(|| crate::statusline::hook_command("--notify-hook"))
+                .flatten()
+            {
+                for event in ["Notification", "PermissionDenied"] {
+                    hooks.insert(
+                        event.to_string(),
+                        serde_json::json!([ { "matcher": "", "hooks": [
+                            { "type": "command", "command": command.clone(), "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
             if !hooks.is_empty() {
                 overlay.insert("hooks".to_string(), serde_json::Value::Object(hooks));
             }
@@ -458,12 +641,32 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
         let exe = exe.to_string_lossy().to_string();
         let mut servers = serde_json::Map::new();
         if advertises_offload_to_claude(settings) {
+            // V28 (issue #13): `--tab <id>` binds this per-tab child to the tab
+            // that spawned it. The child forwards it on `/graph_run`, where the
+            // app resolves it against the live-session registry — that is what
+            // stops two Claude tabs on one project from sharing (and stealing)
+            // a memory scope. Unconditional and NOT Settings-derived, so it
+            // needs no `spawn_inject_sig` entry / restart hint (same reasoning
+            // as the `Notification` hook above).
+            let mut child_args = vec![
+                "--offload-mcp".to_string(),
+                "--tab".to_string(),
+                tab.to_string(),
+            ];
+            // V30 (M5): the CHILD half of the session-push gate, baked into the
+            // child's own argv from THIS settings snapshot — the same one that
+            // decides the client half (`CHANNEL_REGISTRATION_FLAG`) a few lines
+            // below. One read, one decision, two flags: a child that
+            // crash-restarts mid-session re-declares exactly what the running
+            // Claude process registered, instead of re-reading a settings file
+            // that may have been toggled since (which would leave the app
+            // pushing into a session that never registered the channel).
+            if settings.offload.session_push {
+                child_args.push(CHANNEL_PUSH_FLAG.to_string());
+            }
             servers.insert(
                 "cimp-offload".to_string(),
-                serde_json::json!({
-                    "command": exe,
-                    "args": ["--offload-mcp"]
-                }),
+                serde_json::json!({ "command": exe, "args": child_args }),
             );
         }
         if advertises_audit_to_claude(settings) {
@@ -480,6 +683,21 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
             args.push("--mcp-config".to_string());
             args.push(mcp.to_string());
         }
+    }
+
+    // V30 Phase A: register the `cimp-offload` child as a session channel so it
+    // can push out-of-band notices into this tab. Gated on the default-off
+    // `offload.session_push` (research preview — see
+    // [`CHANNEL_REGISTRATION_FLAG`]) AND on the same predicate that writes the
+    // `cimp-offload` entry into the `--mcp-config` overlay above — a channel
+    // registration for a server that is never injected would be pure banner
+    // noise. Both inputs are carried in `spawn_inject_sig`'s `claude` object
+    // (`"channels"` + the `"mcp"` pair), so any mid-session change to the
+    // effective value raises the restart hint. Claude-only, like every other
+    // pre-arg here.
+    if settings.offload.session_push && advertises_offload_to_claude(settings) {
+        args.push(CHANNEL_REGISTRATION_FLAG.to_string());
+        args.push(CHANNEL_REGISTRATION_TARGET.to_string());
     }
 
     args
@@ -561,7 +779,7 @@ fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
     // pinned-only filter above could in principle be fed a differently-sorted
     // source later — sort explicitly here so "newest-pinned first" holds
     // regardless.
-    pinned.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    pinned.sort_by_key(|f| std::cmp::Reverse(f.ts_ms));
     let mut out = String::from("## cImp project facts\n");
     for f in &pinned {
         let line = format!("- {}\n", f.text);
@@ -572,6 +790,38 @@ fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
     }
     Some(out)
 }
+
+/// V30 Phase A: the Claude Code flag that registers our stdio MCP child as a
+/// **session channel**, letting it push `notifications/claude/channel` frames
+/// straight into the live session (they surface as `<channel source="…">`
+/// messages at the next turn boundary). The argument is
+/// `server:<mcpServers key>` — `cimp-offload`, the key `build_pre_args` writes
+/// into the `--mcp-config` overlay below; the two MUST stay in lockstep.
+///
+/// ⚠ **Research-preview contract — this flag may be renamed or removed.**
+/// Verified against Claude Code 2.1.222 (V30 Phase 0 spike, 2026-08-05): the
+/// flag is hidden from `--help`, registration is silent (no consent dialog),
+/// and it paints a persistent "Channels (experimental)" banner plus a cosmetic
+/// "no MCP server configured with that name" warning (the dev-flag validation
+/// runs before `--mcp-config` files load; function is unaffected). The proper
+/// `--channels` flag is allowlisted to `plugin:@marketplace` entries only, so
+/// this is the only registration path for a bare `mcpServers` server. See
+/// `docs/MILESTONE-V30-mcp-channels.md` for the full contract + drift notes.
+const CHANNEL_REGISTRATION_FLAG: &str = "--dangerously-load-development-channels";
+
+/// The channel target passed to [`CHANNEL_REGISTRATION_FLAG`]: our offload MCP
+/// child, addressed by its `mcpServers` key.
+const CHANNEL_REGISTRATION_TARGET: &str = "server:cimp-offload";
+
+/// V30 (M5): the SERVER half of the same gate — our own flag on the
+/// `cimp-offload` child's argv, telling it to declare
+/// `capabilities.experimental["claude/channel"]` at `initialize`.
+///
+/// Emitted from the same `settings.offload.session_push` read as
+/// [`CHANNEL_REGISTRATION_FLAG`], one line apart, so the two halves cannot
+/// disagree — see `offload/mcp.rs::session_push_enabled` for why the child must
+/// not decide this from settings on its own.
+const CHANNEL_PUSH_FLAG: &str = "--channel-push";
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
 /// `offload_task`. Without this nudge the model rarely offloads. Gated by
@@ -625,7 +875,33 @@ fn build_extra_args(
     // reduced palette hid commands like `/connect`; cImp now drives every AI tab
     // fullscreen and sources TTS out-of-band (OpenCode's `GET /event` stream),
     // not by scraping the linear terminal stream. See MILESTONE-V20.
-    out.extend(cfg.args.iter().filter(|s| !s.is_empty()).cloned());
+    //
+    // D-8 (maintenance 2026-08-04): cImp does not merely decline to inject
+    // `--mini` — it must actively strip a user-supplied one from an OpenCode
+    // tab's stored `args`. `resolve_oob_source` unconditionally appends
+    // `--port <N> --hostname 127.0.0.1` to every OpenCode launch (that port is
+    // the TTS event tap), and `opencode --mini --port N` HARD-FAILS: the two
+    // flags are mutually exclusive. So the combination is reachable — the
+    // v19→v20 migration stripped `--mini` from stored args once, but nothing
+    // stops it coming back via a hand-edited settings file, a `.cimp.custom.
+    // config.json` overlay, or a settings file carried over from another
+    // machine. Dropping it keeps the tab launchable (the flag is inert under
+    // V20 anyway) instead of handing the user an opaque OpenCode usage error;
+    // the launch log records the correction.
+    let mini_guard = command_is(&cfg.command, "opencode");
+    for arg in cfg.args.iter().filter(|s| !s.is_empty()) {
+        if mini_guard && is_mini_flag(arg) {
+            tracing::warn!(
+                tab = %cfg.id,
+                arg = %arg,
+                "opencode tab: dropping `--mini` from args — cImp launches OpenCode \
+                 fullscreen with `--port` for the TTS event tap, and OpenCode rejects \
+                 `--mini` combined with `--port`. Remove it from the tab's args.",
+            );
+            continue;
+        }
+        out.push(arg.clone());
+    }
 
     // cimp is documented as a drop-in replacement for `claude`, so
     // invocation args (`cimp --resume <id>`, etc.) flow into every
@@ -640,6 +916,13 @@ fn build_extra_args(
         }
     }
     out
+}
+
+/// D-8: does `arg` set OpenCode's `--mini` flag? Matches the bare flag and the
+/// `--mini=<value>` form (clap accepts both for a bool flag), so neither
+/// spelling can survive into a launch that also carries `--port`.
+fn is_mini_flag(arg: &str) -> bool {
+    arg == "--mini" || arg.starts_with("--mini=")
 }
 
 /// Deterministic path of the managed OpenCode instructions file for `cfg`.
@@ -893,6 +1176,8 @@ fn git_exclude_opencode(working_dir: &Path) {
 /// `--mcp-config` / `--settings` / `--append-system-prompt`):
 ///
 /// - `$schema` marker.
+/// - `subagent_depth: 2` (D-8) — pins nested-subagent behavior across the
+///   OpenCode 1.18.2 default change (see the injection site).
 /// - `mcp.cimp-offload` → `cimp --offload-mcp --consumer opencode`, injected
 ///   whenever offload, the graph, or an OpenCode-exposed MCP server is in play
 ///   (mirrors the Claude `--mcp-config` gate in `build_pre_args`).
@@ -911,12 +1196,41 @@ fn git_exclude_opencode(working_dir: &Path) {
 ///
 /// Additive by default — cimp does not set `OPENCODE_DISABLE_PROJECT_CONFIG`,
 /// so a user's project config still merges underneath. Pure: no filesystem I/O.
-fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_json::Value {
+///
+/// V28: `tab` is the launching tab's id, appended to the `cimp-offload` child's
+/// argv as `--tab <id>` (the OpenCode-side mirror of the Claude `--mcp-config`
+/// injection) so `context_*` calls resolve to THIS tab's session.
+fn build_opencode_config(
+    cfg: &AiToolTabConfig,
+    settings: &Settings,
+    tab: &str,
+) -> serde_json::Value {
     let mut config = serde_json::Map::new();
     config.insert(
         "$schema".to_string(),
         serde_json::Value::String("https://opencode.ai/config.json".to_string()),
     );
+
+    // D-8 (maintenance 2026-08-04): pin `subagent_depth`. OpenCode 1.18.2
+    // introduced this key with a default of **1**, which lets a primary agent
+    // launch subagents but blocks those subagents from launching their own —
+    // a silent behavior change for any workflow that nested before. cImp's
+    // installed OpenCode predates it, so upgrading would quietly break nesting
+    // unless the injected config states an intent. `2` restores one level of
+    // nesting (the pre-1.18.2 shape) without going unbounded.
+    //
+    // Deliberately a CONSTANT, not a setting: `spawn_inject_sig` only needs an
+    // entry for Settings-derived spawn injections, and a constant can never
+    // differ between a running tab and a fresh one.
+    //
+    // Key verified 2026-08-04 against both https://opencode.ai/docs/config/
+    // ("You can control how deeply subagents can invoke other subagents using
+    // the `subagent_depth` option… The default is 1") and the live schema at
+    // https://opencode.ai/config.json (top-level integer, minimum 0,
+    // "Maximum subagent nesting depth. Defaults to 1, which prevents subagents
+    // from launching subagents."). Additive, so a user's own project config
+    // still merges underneath and can override it.
+    config.insert("subagent_depth".to_string(), serde_json::Value::from(2u64));
 
     // Build the `mcp` object from up to two stdio children, each under its own
     // gate (mirrors the two-server `--mcp-config` map in `build_pre_args`):
@@ -935,7 +1249,8 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
                 "cimp-offload".to_string(),
                 serde_json::json!({
                     "type": "local",
-                    "command": [exe, "--offload-mcp", "--consumer", "opencode"]
+                    // V28: see the Claude-side `--tab` note in `build_pre_args`.
+                    "command": [exe, "--offload-mcp", "--consumer", "opencode", "--tab", tab]
                 }),
             );
         }
@@ -1030,7 +1345,14 @@ fn build_opencode_config(cfg: &AiToolTabConfig, settings: &Settings) -> serde_js
 ///   as a `provider` block (see `build_opencode_config`), not as env.
 /// - Anything else (cloud Claude, `use_local_provider` off): no synthesized
 ///   provider env — the user's existing configuration is in charge.
-fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String, String> {
+///
+/// V28: `tab` is passed straight through to [`build_opencode_config`], which
+/// bakes it into the `cimp-offload` child's argv.
+fn compose_ai_env(
+    cfg: &AiToolTabConfig,
+    settings: &Settings,
+    tab: &str,
+) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
     // V20: Claude Code runs in its native fullscreen (alternate-screen) TUI —
@@ -1048,7 +1370,7 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
     // handling. Set before the per-tab `env` merge below so a user can override
     // any of these per tab.
     if command_is(&cfg.command, "opencode") {
-        let config = build_opencode_config(cfg, settings);
+        let config = build_opencode_config(cfg, settings, tab);
         env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string());
         env.insert(
             "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT".to_string(),
@@ -1066,6 +1388,30 @@ fn compose_ai_env(cfg: &AiToolTabConfig, settings: &Settings) -> HashMap<String,
             }
         }
     }
+
+    // ── `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` is DELIBERATELY NOT SET ────────
+    //
+    // Do not re-add it. Maintenance D-2 (2026-08-04) pinned it to `0` for every
+    // Claude tab to disable Claude Code's ~2-minute MCP auto-backgrounding,
+    // because cImp's loopback proxy and offload/audit result handling were
+    // assumed to require a *synchronous* MCP return and several `cimp-offload`
+    // tools (offload_task, offload_batch, security_audit, quality_audit, graph
+    // indexing) routinely run past it.
+    //
+    // V30 Phase 0 test T4 (2026-08-05, Claude Code 2.1.222 — see
+    // `docs/MILESTONE-V30-mcp-channels.md`) live-verified that assumption is
+    // wrong: a backgrounded MCP call's **complete result text** arrives in a
+    // `<task-notification>` message, losing nothing, and the child's
+    // synchronous NDJSON pipeline is unaffected because backgrounding is purely
+    // client-side. Blocking the harness for minutes per call was the more
+    // expensive half of that trade, so V30 Phase C removed the kill switch and
+    // Claude tabs now use native auto-backgrounding (spike decision 2). The
+    // keepalive alternative is not available either — T5 proved
+    // `notifications/progress` does NOT reset the stall timer.
+    //
+    // The var was unconditional (never a user setting), so its removal needs no
+    // `spawn_inject_sig` change. A user who wants the old behaviour can still
+    // set it per tab; the per-tab `env` merge below passes it straight through.
 
     // Claude against a local provider: synthesize `ANTHROPIC_*` env. OpenCode's
     // local provider arrives inside `OPENCODE_CONFIG_CONTENT` (a `provider`
@@ -1124,10 +1470,13 @@ mod tests {
     fn injects_statusline_overlay_for_claude_when_enabled() {
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         let overlay = settings_overlay(&args).expect("statusLine overlay present");
         assert_eq!(overlay["statusLine"]["type"], "command");
+        // Idle-refresh timer that keeps the usage push (and the bottom-bar
+        // widget) alive between turns; must stay under usage::STALE_AFTER.
+        assert_eq!(overlay["statusLine"]["refreshInterval"], 30);
         let cmd = overlay["statusLine"]["command"]
             .as_str()
             .expect("command is a string");
@@ -1140,8 +1489,18 @@ mod tests {
     fn no_statusline_overlay_when_disabled() {
         let mut settings = Settings::default();
         settings.statusline.enabled = false;
-        let args = build_pre_args(&claude_cfg(), &settings);
-        assert!(settings_overlay(&args).is_none());
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        // With the statusline off and no loopback (H2 gated the NC-2 permission
+        // hooks on it), the overlay has nothing to carry and no `--settings`
+        // flag is emitted at all.
+        assert!(settings_overlay(&args).is_none(), "got: {args:?}");
+        // With a loopback running the overlay reappears — carrying the hooks,
+        // still no statusLine.
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay.get("statusLine").is_none());
+        assert!(overlay["hooks"].get("Notification").is_some());
     }
 
     #[test]
@@ -1149,7 +1508,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
@@ -1164,10 +1523,13 @@ mod tests {
         settings.statusline.enabled = false;
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         // Graph on but injection off + statusline off + checkpoints off →
-        // no --settings overlay.
-        assert!(settings_overlay(&args).is_none());
+        // no UserPromptSubmit hook (the overlay itself still carries the
+        // unconditional NC-2 permission hooks).
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay["hooks"].get("UserPromptSubmit").is_none());
+        assert!(overlay.get("statusLine").is_none());
     }
 
     /// V16 Feature 0: the read-advisor PreToolUse hook installs when the
@@ -1180,7 +1542,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
         settings.graph.read_advisor = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         let cmd = overlay["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
             .as_str()
@@ -1190,33 +1552,33 @@ mod tests {
 
         // E1 recorded as failed ⇒ no PreToolUse hook even with the toggle on.
         settings.harness_versions.e1_status = "fail".to_string();
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args);
         assert!(
-            overlay.map_or(true, |o| o["hooks"].get("PreToolUse").is_none()),
+            overlay.is_none_or(|o| o["hooks"].get("PreToolUse").is_none()),
             "e1_status=fail must block the read hook"
         );
 
         // Unverified (the default) does NOT block — Feature 0's posture is
         // opt-in-until-proven-broken, not blocked-until-proven-working.
         settings.harness_versions.e1_status = "unverified".to_string();
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
 
         // The statuses are hand-editable strings; anything unrecognized
         // fails CLOSED (a typo'd failure record must not install the hook).
         for status in ["Fail", " fail ", "failed", "faill"] {
             settings.harness_versions.e1_status = status.to_string();
-            let args = build_pre_args(&claude_cfg(), &settings);
+            let args = build_pre_args(&claude_cfg(), &settings, "claude");
             let overlay = settings_overlay(&args);
             assert!(
-                overlay.map_or(true, |o| o["hooks"].get("PreToolUse").is_none()),
+                overlay.is_none_or(|o| o["hooks"].get("PreToolUse").is_none()),
                 "unrecognized e1_status {status:?} must fail closed"
             );
         }
         // Recognized non-fail spellings still pass, case-folded.
         settings.harness_versions.e1_status = "Pass".to_string();
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
     }
 
@@ -1235,7 +1597,7 @@ mod tests {
             settings.graph.read_advisor = read_advisor;
             settings.graph.read_advisor_shell = shell;
             settings.harness_versions.e1_status = e1.to_string();
-            let args = build_pre_args(&claude_cfg(), &settings);
+            let args = build_pre_args(&claude_cfg(), &settings, "claude");
             settings_overlay(&args)
                 .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
                 .is_some_and(|arr| arr.iter().any(|e| e["matcher"] == matcher))
@@ -1272,7 +1634,7 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
         settings.workbench.checkpoints = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
@@ -1292,8 +1654,17 @@ mod tests {
         settings.statusline.enabled = false;
         settings.graph.enabled = false;
         settings.workbench.checkpoints = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
-        assert!(settings_overlay(&args).is_none());
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        // Graph off ⇒ no loopback either, so the overlay is empty and omitted
+        // entirely (H2). Assert through the option so the test keeps meaning
+        // "no UserPromptSubmit hook" in both shapes.
+        let hooks = settings_overlay(&args).map(|o| o["hooks"].clone());
+        assert!(
+            hooks
+                .as_ref()
+                .is_none_or(|h| h.get("UserPromptSubmit").is_none()),
+            "got: {hooks:?}"
+        );
     }
 
     #[test]
@@ -1306,7 +1677,7 @@ mod tests {
             cmd: "cargo check".to_string(),
             ..Default::default()
         }];
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         let hook = &overlay["hooks"]["PostToolUse"][0];
         assert_eq!(hook["matcher"], "Edit|Write|MultiEdit");
@@ -1323,17 +1694,181 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.auto_check = false;
         settings.checks = vec![crate::checks::CheckDef::default()];
-        let args = build_pre_args(&claude_cfg(), &settings);
-        // auto_check off → no --settings overlay at all (nothing else is on).
-        assert!(settings_overlay(&args).is_none());
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        // auto_check off → no PostToolUse hook (nothing else is on either, so
+        // the overlay carries only the unconditional NC-2 permission hooks).
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay["hooks"].get("PostToolUse").is_none());
 
         let mut settings2 = Settings::default();
         settings2.statusline.enabled = false;
         settings2.graph.enabled = true;
         settings2.graph.auto_check = true;
         settings2.checks = Vec::new();
-        let args2 = build_pre_args(&claude_cfg(), &settings2);
-        assert!(settings_overlay(&args2).is_none());
+        let args2 = build_pre_args(&claude_cfg(), &settings2, "claude");
+        let overlay2 = settings_overlay(&args2).expect("overlay present");
+        assert!(overlay2["hooks"].get("PostToolUse").is_none());
+    }
+
+    /// NC-2 (issue #5) + H2 (2026-08-05 review): the `Notification` +
+    /// `PermissionDenied` hooks are injected for a Claude tab exactly when the
+    /// loopback they POST into runs — from the barest settings that flip
+    /// `loopback_needed()` and nothing else. Both point at the one
+    /// `--notify-hook` shim with the documented match-everything
+    /// `"matcher": ""` (a narrowing matcher filters on notification TYPE; we
+    /// classify app-side so a renamed type degrades to "ignored", not silence).
+    #[test]
+    fn permission_hooks_injected_for_claude_when_the_loopback_runs() {
+        // Barest settings that start the loopback: graph on, everything else
+        // (statusline, injection, advisors, auto-check) off.
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = false;
+        settings.workbench.checkpoints = false;
+        settings.graph.read_advisor = false;
+        settings.graph.auto_check = false;
+        assert!(settings.loopback_needed());
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        // The Claude Code `--settings` contract: ONE flag, one merged overlay —
+        // the hooks must ride the same object as everything else, never a
+        // second flag (Claude does not concatenate repeated `--settings`).
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        for event in ["Notification", "PermissionDenied"] {
+            let entry = &overlay["hooks"][event][0];
+            assert_eq!(
+                entry["matcher"], "",
+                "{event} must match every type/tool: {entry}"
+            );
+            let cmd = entry["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event} hook command is a string"));
+            assert!(cmd.ends_with(" --notify-hook"), "got: {cmd}");
+            assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+        }
+
+        // Non-Claude tabs get no pre-args at all (OpenCode is configured via
+        // OPENCODE_CONFIG_CONTENT), so nothing leaks there.
+        assert!(build_pre_args(&opencode_cfg(), &settings, "opencode").is_empty());
+    }
+
+    /// H2: on a DEFAULT install nothing dials back into the app, so the hooks
+    /// must NOT be injected — a shim spawn per notification whose POST is
+    /// dropped is worse than no hook at all (the regex fallback still runs).
+    #[test]
+    fn no_permission_hooks_when_the_loopback_does_not_run() {
+        let settings = Settings::default(); // offload + graph + audit all off
+        assert!(!settings.loopback_needed());
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        // Statusline defaults on, so the overlay exists — it just must carry no
+        // hooks at all (and if a future default drops the statusline too, the
+        // absent overlay satisfies the same claim).
+        if let Some(overlay) = settings_overlay(&args) {
+            assert!(
+                overlay.get("hooks").is_none(),
+                "no loopback ⇒ no hook entries: {overlay}"
+            );
+        }
+    }
+
+    /// H2: the hooks are Settings-DEPENDENT and baked at spawn, so
+    /// `spawn_inject_sig` must carry them — otherwise enabling graph/offload
+    /// mid-session leaves every running Claude tab permanently hook-blind with
+    /// no restart hint.
+    #[test]
+    fn permission_hooks_have_a_spawn_inject_sig_entry() {
+        let settings = Settings::default();
+        let sig = spawn_inject_sig(&settings);
+        let hooks = sig[0]["hooks"].as_array().expect("claude hooks sig array");
+        // The five GATED hook entries, unchanged by NC-2 — all off by default.
+        assert_eq!(hooks.len(), 5, "unexpected hook-gate count: {hooks:?}");
+        assert!(hooks.iter().all(|g| g == &serde_json::Value::Bool(false)));
+        // The NC-2 pair rides its own key and tracks `loopback_needed()`.
+        assert_eq!(sig[0]["notify_hooks"], serde_json::json!(false));
+        let mut with_graph = Settings::default();
+        with_graph.graph.enabled = true;
+        let sig2 = spawn_inject_sig(&with_graph);
+        assert_eq!(sig2[0]["notify_hooks"], serde_json::json!(true));
+        assert_ne!(sig[0], sig2[0], "the flip must change the signature");
+    }
+
+    /// NC-2: the cwd-fallback input — every Claude tab with the directory it
+    /// actually launches in (per-tab `cwd` override, else the app launch dir),
+    /// resolved exactly as `build_ai_tool_spec` does. OpenCode/Shell tabs are
+    /// excluded: the hook only fires for Claude.
+    #[test]
+    fn claude_tab_dirs_lists_claude_tabs_with_their_launch_dirs() {
+        let mut settings = Settings {
+            tabs: vec![
+                TabConfig::AiTool(claude_cfg()),
+                TabConfig::AiTool(opencode_cfg()),
+            ],
+            ..Settings::default()
+        };
+        let launch = Path::new("C:/proj");
+        let dirs = claude_tab_dirs(&settings, launch);
+        assert_eq!(dirs.len(), 1, "only the Claude tab: {dirs:?}");
+        assert!(
+            dirs.iter().all(|(_, d)| d == launch),
+            "no per-tab cwd ⇒ every tab inherits the launch dir: {dirs:?}"
+        );
+        assert!(
+            !dirs.iter().any(|(id, _)| id == "opencode"),
+            "non-Claude tabs must not appear: {dirs:?}"
+        );
+
+        // A worktree tab (the one flow that sets `cwd`) reports its own dir.
+        let mut wt = claude_cfg();
+        wt.id = "ai-worktree".to_string();
+        wt.cwd = Some(std::path::PathBuf::from("C:/proj/wt"));
+        settings.tabs.push(TabConfig::AiTool(wt));
+        let dirs = claude_tab_dirs(&settings, launch);
+        assert_eq!(
+            dirs.iter()
+                .find(|(id, _)| id == "ai-worktree")
+                .map(|(_, d)| d.clone()),
+            Some(std::path::PathBuf::from("C:/proj/wt"))
+        );
+    }
+
+    /// H1 (2026-08-05 review) cross-module invariant: the directory a Claude
+    /// tab's out-of-band tap derives its transcript root from (and therefore the
+    /// key the same-root ambiguity predicate groups tabs by) is the SAME
+    /// directory `claude_tab_dirs` reports to the permission-hook cwd fallback.
+    /// If these ever diverge, one seam would call two tabs co-tenants while the
+    /// other treats them as distinct — the failure mode H1 exists to remove.
+    #[test]
+    fn claude_oob_root_and_permission_cwd_resolve_to_the_same_dir() {
+        let launch = Path::new("C:/proj");
+        let mut wt = claude_cfg();
+        wt.id = "ai-worktree".to_string();
+        wt.cwd = Some(std::path::PathBuf::from("C:/proj/wt"));
+        let settings = Settings {
+            tabs: vec![
+                TabConfig::AiTool(claude_cfg()),
+                TabConfig::AiTool(wt.clone()),
+            ],
+            ..Settings::default()
+        };
+        let dirs = claude_tab_dirs(&settings, launch);
+        for (cfg, id) in [(claude_cfg(), "claude"), (wt, "ai-worktree")] {
+            let mut extra: Vec<String> = Vec::new();
+            // Exactly what `build_ai_tool_spec` hands the oob resolver.
+            let source = resolve_oob_source(&cfg, &ai_working_dir(&cfg, launch), &mut extra);
+            let Some(crate::oob::OobSpec::ClaudeTranscript { project_dir }) = source else {
+                panic!("a Claude tab must resolve a transcript source");
+            };
+            let hook_dir = dirs
+                .iter()
+                .find(|(t, _)| t == id)
+                .map(|(_, d)| d.clone())
+                .expect("tab listed for the hook fallback");
+            assert_eq!(
+                project_dir, hook_dir,
+                "tab {id}: transcript root dir and permission cwd must agree"
+            );
+        }
     }
 
     #[test]
@@ -1342,12 +1877,103 @@ mod tests {
         settings.statusline.enabled = true;
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         // Exactly one `--settings` flag carrying both keys.
         assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
         let overlay = settings_overlay(&args).expect("overlay present");
         assert!(overlay.get("statusLine").is_some());
         assert!(overlay.get("hooks").is_some());
+    }
+
+    /// CD-4 (maintenance 2026-08-04) — the Claude Code `--settings` contract.
+    /// Two guarantees, asserted against the largest overlay we can emit:
+    ///
+    ///   * **No permission rules, no plugins.** Claude Code 2.1.214 narrowed
+    ///     single-segment permission globs (`Edit(src/**)` now matches only
+    ///     `<cwd>/src` depth) and deprecated the `Write(path)` / `Glob(path)` /
+    ///     `NotebookEdit(path)` rule forms in favor of `Edit(path)` /
+    ///     `Read(path)`; plugins delivered through `--settings` were broken in
+    ///     2.1.181–2.1.214. cImp's overlay carries neither, so none of that
+    ///     applies — pinning the key set makes the negative durable: a future
+    ///     `permissions`/`plugins` key has to come past this note.
+    ///   * **Size.** Settings over 2 MiB hard-fail at startup (2.1.214). The
+    ///     overlay is bounded by construction — fixed-shape JSON whose only
+    ///     variable part is this binary's own path, repeated once per hook
+    ///     command — and no user-supplied JSON is ever merged into it (the
+    ///     `.cimp.custom.config.json` overlay is cImp's *own* settings layer
+    ///     and never reaches Claude). A static ceiling is therefore enough;
+    ///     there is nothing unbounded to re-check at spawn time.
+    #[test]
+    fn settings_overlay_matches_claude_settings_contract() {
+        let mut settings = Settings::default();
+        // Every overlay-producing gate on at once — the biggest overlay
+        // `build_pre_args` can build.
+        settings.statusline.enabled = true;
+        settings.workbench.checkpoints = true;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        settings.graph.compaction_context = true;
+        settings.graph.read_advisor = true;
+        settings.graph.read_advisor_shell = true;
+        settings.graph.auto_check = true;
+        settings.checks = vec![crate::checks::CheckDef {
+            name: "cargo".to_string(),
+            cmd: "cargo check".to_string(),
+            ..Default::default()
+        }];
+
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let i = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("overlay present");
+        let raw = &args[i + 1];
+        let overlay: serde_json::Value =
+            serde_json::from_str(raw).expect("--settings value is valid JSON");
+
+        // Sanity: this really is the maxed-out overlay, not a degenerate one.
+        let hooks = overlay["hooks"].as_object().expect("hooks object");
+        for k in [
+            "UserPromptSubmit",
+            "PreCompact",
+            "PreToolUse",
+            "PostToolUse",
+            // NC-2 — unconditional, so present in every overlay.
+            "Notification",
+            "PermissionDenied",
+        ] {
+            assert!(hooks.contains_key(k), "expected hook {k} in {overlay}");
+        }
+        assert_eq!(
+            overlay["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(2),
+            "Read + Bash read-advisor matchers",
+        );
+
+        // The whole overlay is exactly these two keys.
+        let mut keys: Vec<&str> = overlay
+            .as_object()
+            .expect("overlay is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["hooks", "statusLine"],
+            "unexpected `--settings` key — see the permission-glob / plugin \
+             contract notes on this test before adding one",
+        );
+
+        // Ceiling: ~170x headroom over the real maxed-out overlay (measured
+        // 1135 bytes before NC-2 added two more hook commands) and 8x below
+        // Claude Code's 2 MiB hard-fail.
+        const MAX_OVERLAY_BYTES: usize = 256 * 1024;
+        assert!(
+            raw.len() < MAX_OVERLAY_BYTES,
+            "overlay is {} bytes, ceiling is {MAX_OVERLAY_BYTES}",
+            raw.len(),
+        );
     }
 
     #[test]
@@ -1480,7 +2106,7 @@ mod tests {
         // empty even with the global toggle on.
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let args = build_pre_args(&opencode_cfg(), &settings);
+        let args = build_pre_args(&opencode_cfg(), &settings, "opencode");
         assert!(
             args.is_empty(),
             "opencode must get no pre-args, got: {args:?}"
@@ -1495,7 +2121,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         assert!(args.iter().any(|a| a == "--append-system-prompt"));
         assert!(args.iter().any(|a| a == "--settings"));
@@ -1505,7 +2131,7 @@ mod tests {
     fn injects_offload_mcp_config_for_claude_when_enabled() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         let i = args
             .iter()
@@ -1518,6 +2144,98 @@ mod tests {
         );
     }
 
+    // ── V28 (issue #13): per-tab MCP identity ─────────────────────────────
+
+    /// The `cimp-offload` child's argv, for whichever Claude tab id is given.
+    fn claude_offload_argv(settings: &Settings, tab: &str) -> Vec<String> {
+        let args = build_pre_args(&claude_cfg(), settings, tab);
+        let i = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config present");
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        cfg["mcpServers"]["cimp-offload"]["args"]
+            .as_array()
+            .expect("args array")
+            .iter()
+            .map(|v| v.as_str().expect("string arg").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn claude_mcp_child_carries_its_own_tab_id() {
+        // V28: the per-tab MCP child is told WHICH tab it serves, so the app can
+        // resolve that tab's current session instead of "the most recent Claude
+        // session" — the whole point of the milestone. Two Claude tabs on one
+        // project must bake DIFFERENT ids.
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        for tab in ["claude", "claude-local"] {
+            let argv = claude_offload_argv(&settings, tab);
+            assert!(
+                argv.windows(2).any(|w| w == ["--tab", tab]),
+                "tab {tab} argv: {argv:?}"
+            );
+        }
+        assert_ne!(
+            claude_offload_argv(&settings, "claude"),
+            claude_offload_argv(&settings, "claude-local"),
+            "two Claude tabs must not spawn identical MCP children"
+        );
+    }
+
+    #[test]
+    fn tab_id_rides_every_claude_mcp_gate() {
+        // `--tab` is unconditional on the `cimp-offload` entry: whichever gate
+        // caused the entry to be injected (offload / graph), the identity must
+        // ride along. A gate that shipped it only sometimes would silently fall
+        // back to the shared-scope bug.
+        let with_offload = {
+            let mut s = Settings::default();
+            s.offload.enabled = true;
+            s
+        };
+        let with_graph = {
+            let mut s = Settings::default();
+            s.graph.enabled = true;
+            s
+        };
+        let with_both = {
+            let mut s = Settings::default();
+            s.offload.enabled = true;
+            s.graph.enabled = true;
+            s
+        };
+        for settings in [with_offload, with_graph, with_both] {
+            let argv = claude_offload_argv(&settings, "claude");
+            assert_eq!(argv[0], "--offload-mcp", "{argv:?}");
+            assert!(
+                argv.windows(2).any(|w| w == ["--tab", "claude"]),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_code_audit_child_gets_no_tab_id() {
+        // Scope check: only the `cimp-offload` child proxies `/graph_run`, so
+        // only it needs (and gets) the tab identity. The audit child's argv is
+        // unchanged by V28.
+        let mut settings = Settings::default();
+        settings.code_audit.enabled = true;
+        settings.code_audit.expose_claude = true;
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+        let argv = cfg["mcpServers"]["cimp-code-audit"]["args"]
+            .as_array()
+            .expect("audit args");
+        assert!(
+            !argv.iter().any(|v| v == "--tab"),
+            "audit child needs no tab identity: {argv:?}"
+        );
+    }
+
     #[test]
     fn offload_and_graph_guidance_merge_into_one_flag() {
         // V20: with both offload and graph guidance on, they merge into a
@@ -1526,7 +2244,7 @@ mod tests {
         settings.offload.enabled = true;
         settings.offload.inject_guidance = true;
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         let count = args
             .iter()
@@ -1544,7 +2262,7 @@ mod tests {
     #[test]
     fn no_offload_injection_when_disabled() {
         let settings = Settings::default(); // offload + graph off by default
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         assert!(!args.iter().any(|a| a == "--mcp-config"));
     }
 
@@ -1555,7 +2273,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.offload.enabled = false;
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         let i = args
             .iter()
@@ -1582,7 +2300,7 @@ mod tests {
             offload_access: false,
             ..Default::default()
         }];
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         assert!(
             args.iter().any(|a| a == "--mcp-config"),
             "--mcp-config present when a server is exposed to Claude Code"
@@ -1599,7 +2317,7 @@ mod tests {
         settings.offload.enabled = false;
         settings.graph.enabled = false;
         settings.code_audit.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         let i = args
             .iter()
@@ -1625,7 +2343,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.code_audit.enabled = false;
         assert!(settings.code_audit.expose_claude, "default is opted-in");
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         assert!(!args.iter().any(|a| a == "--mcp-config"));
     }
 
@@ -1637,7 +2355,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
         settings.code_audit.expose_claude = false;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         assert!(
             !args.iter().any(|a| a == "--mcp-config"),
             "no server should be injected when the only enabled feature is opted out"
@@ -1650,12 +2368,15 @@ mod tests {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
         settings.code_audit.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let count = args.iter().filter(|a| *a == "--mcp-config").count();
         assert_eq!(count, 1, "exactly one --mcp-config carries both servers");
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
-        assert_eq!(cfg["mcpServers"]["cimp-offload"]["args"][0], "--offload-mcp");
+        assert_eq!(
+            cfg["mcpServers"]["cimp-offload"]["args"][0],
+            "--offload-mcp"
+        );
         assert_eq!(
             cfg["mcpServers"]["cimp-code-audit"]["args"][0],
             "--code-audit-mcp"
@@ -1669,6 +2390,11 @@ mod tests {
         // flip `Settings::loopback_needed()` — the injected children proxy
         // every call over the loopback, so advertising without serving strands
         // them all with "cImp is not running" while the app is visibly up.
+        //
+        // H2 (2026-08-05 review) widened it to HOOK SHIMS: every shim in the
+        // `--settings` overlay reaches the app the same way (`post_loopback`),
+        // so an injected hook without a loopback is the same defect in a
+        // quieter form — the shim spawns, the POST is dropped, and nothing logs.
         // Sweep each feature axis alone and combined.
         for (offload, graph, audit) in [
             (false, false, false),
@@ -1681,16 +2407,26 @@ mod tests {
             settings.offload.enabled = offload;
             settings.graph.enabled = graph;
             settings.code_audit.enabled = audit;
-            let claude_advertises = build_pre_args(&claude_cfg(), &settings)
-                .iter()
-                .any(|a| a == "--mcp-config");
-            let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings)
+            let claude_args = build_pre_args(&claude_cfg(), &settings, "claude");
+            let claude_advertises = claude_args.iter().any(|a| a == "--mcp-config");
+            let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings, "opencode")
                 .get("mcp")
                 .is_some();
             if claude_advertises || opencode_advertises {
                 assert!(
                     settings.loopback_needed(),
                     "advertised an MCP server without a loopback: \
+                     offload={offload} graph={graph} audit={audit}"
+                );
+            }
+            let hooks_installed = settings_overlay(&claude_args)
+                .and_then(|o| o.get("hooks").cloned())
+                .and_then(|h| h.as_object().map(|m| !m.is_empty()))
+                .unwrap_or(false);
+            if hooks_installed {
+                assert!(
+                    settings.loopback_needed(),
+                    "installed a hook shim without a loopback: \
                      offload={offload} graph={graph} audit={audit}"
                 );
             }
@@ -1701,7 +2437,7 @@ mod tests {
     fn graph_enabled_injects_graph_guidance() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings);
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
 
         let i = args
             .iter()
@@ -1714,7 +2450,7 @@ mod tests {
     fn offload_injection_is_claude_only() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let args = build_pre_args(&opencode_cfg(), &settings);
+        let args = build_pre_args(&opencode_cfg(), &settings, "opencode");
         assert!(
             args.is_empty(),
             "opencode must get no pre-args, got: {args:?}"
@@ -1727,7 +2463,7 @@ mod tests {
         // explicit per-tab override, no `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`
         // is synthesized, so Claude runs in its native fullscreen TUI.
         let settings = Settings::default();
-        let env = compose_ai_env(&claude_cfg(), &settings);
+        let env = compose_ai_env(&claude_cfg(), &settings, "claude");
         assert!(
             !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
             "V20: cImp must not force Claude's inline renderer",
@@ -1739,8 +2475,8 @@ mod tests {
         // V20: neither AI tool gets the alt-screen opt-out; both go fullscreen.
         let settings = Settings::default();
         for env in [
-            compose_ai_env(&claude_cfg(), &settings),
-            compose_ai_env(&opencode_cfg(), &settings),
+            compose_ai_env(&claude_cfg(), &settings, "claude"),
+            compose_ai_env(&opencode_cfg(), &settings, "opencode"),
         ] {
             assert!(
                 !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
@@ -1786,10 +2522,72 @@ mod tests {
         );
     }
 
+    /// D-8 — the `--mini` × `--port` guard. `resolve_oob_source` always
+    /// appends `--port <N> --hostname 127.0.0.1` to an OpenCode launch, and
+    /// OpenCode hard-fails when `--mini` is combined with `--port`. A stored
+    /// `--mini` (hand-edited settings, a carried-over config file) must
+    /// therefore never reach the command line — while every other user arg
+    /// survives untouched.
+    #[test]
+    fn opencode_strips_user_supplied_mini_but_keeps_other_args() {
+        let settings = Settings::default();
+        let mut cfg = opencode_cfg();
+        cfg.args = vec![
+            "--mini".to_string(),
+            "--model".to_string(),
+            "x".to_string(),
+            "--mini=true".to_string(),
+            String::new(),
+            "--continue".to_string(),
+        ];
+        let args = build_extra_args(&cfg, &settings, &[]);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--mini")),
+            "stored --mini must be stripped (it hard-fails with the injected --port), got: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "x".to_string(),
+                "--continue".to_string()
+            ],
+            "only --mini is dropped; every other user arg is preserved in order",
+        );
+    }
+
+    /// The guard is OpenCode-specific: another AI tool's `--mini` (whatever it
+    /// may mean there) is none of cImp's business — no `--port` is injected for
+    /// it, so there is no conflict to resolve.
+    #[test]
+    fn mini_guard_is_opencode_only() {
+        let settings = Settings::default();
+        let mut cfg = claude_cfg();
+        cfg.command = "some-other-tool".to_string();
+        cfg.args = vec!["--mini".to_string()];
+        assert_eq!(
+            build_extra_args(&cfg, &settings, &[]),
+            vec!["--mini".to_string()],
+            "non-opencode tabs keep their own args verbatim",
+        );
+    }
+
+    #[test]
+    fn is_mini_flag_matches_both_spellings() {
+        assert!(is_mini_flag("--mini"));
+        assert!(is_mini_flag("--mini=true"));
+        assert!(is_mini_flag("--mini=false"));
+        // Near misses stay put.
+        assert!(!is_mini_flag("--minimal"));
+        assert!(!is_mini_flag("--mini-mode"));
+        assert!(!is_mini_flag("-m"));
+        assert!(!is_mini_flag("mini"));
+    }
+
     #[test]
     fn opencode_config_content_is_valid_json() {
         let settings = Settings::default();
-        let env = compose_ai_env(&opencode_cfg(), &settings);
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
         let raw = env
             .get("OPENCODE_CONFIG_CONTENT")
             .expect("opencode tab sets OPENCODE_CONFIG_CONTENT");
@@ -1798,11 +2596,36 @@ mod tests {
         assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
     }
 
+    /// D-8 — `subagent_depth` is pinned unconditionally. OpenCode 1.18.2 made
+    /// the default 1 (subagents may not launch subagents); cImp states 2 so an
+    /// upgrade can't silently change nesting behavior. Constant by design: it
+    /// derives from no setting, so it needs no `spawn_inject_sig` entry and
+    /// must be present in the barest possible config.
+    #[test]
+    fn opencode_config_pins_subagent_depth() {
+        for settings in [Settings::default(), {
+            // Every injection gate on — the key survives a maximal config too.
+            let mut s = Settings::default();
+            s.offload.enabled = true;
+            s.graph.enabled = true;
+            s.code_audit.enabled = true;
+            s.code_audit.expose_opencode = true;
+            s
+        }] {
+            let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
+            assert_eq!(
+                cfg["subagent_depth"],
+                serde_json::json!(2),
+                "subagent_depth must be pinned to 2 in every OpenCode config",
+            );
+        }
+    }
+
     #[test]
     fn opencode_config_injects_mcp_when_offload_enabled() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         let cmd = &cfg["mcp"]["cimp-offload"]["command"];
         assert_eq!(cfg["mcp"]["cimp-offload"]["type"], "local");
         // The child is launched with the opencode consumer discriminator.
@@ -1820,9 +2643,46 @@ mod tests {
     }
 
     #[test]
+    fn opencode_mcp_child_carries_its_tab_id() {
+        // V28: the OpenCode-side mirror of `claude_mcp_child_carries_its_own_tab_id`
+        // — the `OPENCODE_CONFIG_CONTENT` mcp block bakes `--tab <id>` alongside
+        // the consumer discriminator, and it reaches the real launch env (not
+        // just the pure config builder).
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
+        let argv: Vec<&str> = cfg["mcp"]["cimp-offload"]["command"]
+            .as_array()
+            .expect("command array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            argv.windows(2).any(|w| w == ["--tab", "opencode"]),
+            "got: {argv:?}"
+        );
+        // The audit child stays identity-free on this side too.
+        let mut audit = Settings::default();
+        audit.code_audit.enabled = true;
+        audit.code_audit.expose_opencode = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &audit, "opencode");
+        let argv = cfg["mcp"]["cimp-code-audit"]["command"]
+            .as_array()
+            .expect("audit command");
+        assert!(!argv.iter().any(|v| v == "--tab"), "got: {argv:?}");
+
+        // End-to-end through the env composer the PTY actually launches with.
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
+        let raw = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("config env present");
+        assert!(raw.contains("\"--tab\",\"opencode\""), "got: {raw}");
+    }
+
+    #[test]
     fn opencode_config_no_mcp_when_all_off() {
         let settings = Settings::default(); // offload + graph off, no servers
-        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             cfg.get("mcp").is_none(),
             "no mcp block when nothing is in play"
@@ -1833,7 +2693,7 @@ mod tests {
     fn opencode_config_injects_mcp_when_graph_enabled() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
-        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             cfg["mcp"]["cimp-offload"].is_object(),
             "graph alone injects the mcp block"
@@ -1847,7 +2707,7 @@ mod tests {
         // opencode consumer discriminator.
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
-        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert_eq!(cfg["mcp"]["cimp-code-audit"]["type"], "local");
         let cmd: Vec<&str> = cfg["mcp"]["cimp-code-audit"]["command"]
             .as_array()
@@ -1872,7 +2732,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
         settings.code_audit.expose_opencode = false;
-        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             cfg.get("mcp").is_none(),
             "no mcp block when the only enabled feature is opted out of OpenCode"
@@ -1885,7 +2745,7 @@ mod tests {
         // referenced only when capability guidance (graph/offload) applies.
         let mut settings = Settings::default();
         settings.graph.enabled = true;
-        let cfg = build_opencode_config(&opencode_cfg(), &settings);
+        let cfg = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         let path = cfg["instructions"][0].as_str().expect("instructions path");
         assert!(path.ends_with(".md"), "got: {path}");
         assert!(path.contains("opencode"), "got: {path}");
@@ -1896,7 +2756,7 @@ mod tests {
         // V20: default settings (offload + graph off) ⇒ no guidance ⇒ no
         // instructions key, regardless of the (now-vestigial) tts_injection.
         let settings = Settings::default();
-        let config = build_opencode_config(&opencode_cfg(), &settings);
+        let config = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert!(
             config.get("instructions").is_none(),
             "no guidance ⇒ no instructions key"
@@ -1911,7 +2771,7 @@ mod tests {
         let settings = Settings::default();
         let mut cfg = opencode_cfg();
         cfg.use_local_provider = true;
-        let config = build_opencode_config(&cfg, &settings);
+        let config = build_opencode_config(&cfg, &settings, "opencode");
         assert!(
             config.get("provider").is_none(),
             "no registration ⇒ no provider block"
@@ -1930,7 +2790,7 @@ mod tests {
             api_key: String::new(),
             source_command: "llama-server -m Qwen3-Q4.gguf --port 8080".to_string(),
         });
-        let config = build_opencode_config(&opencode_cfg(), &settings);
+        let config = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         let prov = &config["provider"]["local-llama"];
         assert_eq!(prov["npm"], "@ai-sdk/openai-compatible");
         assert_eq!(prov["options"]["baseURL"], "http://127.0.0.1:8080/v1");
@@ -1962,7 +2822,7 @@ mod tests {
             },
             ..Default::default()
         }];
-        let config = build_opencode_config(&opencode_cfg(), &settings);
+        let config = build_opencode_config(&opencode_cfg(), &settings, "opencode");
         assert_eq!(
             config["provider"]["local-llama"]["options"]["baseURL"],
             "http://127.0.0.1:9001/v1"
@@ -1973,7 +2833,7 @@ mod tests {
     #[test]
     fn opencode_sets_noise_suppression_env() {
         let settings = Settings::default();
-        let env = compose_ai_env(&opencode_cfg(), &settings);
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
         assert_eq!(
             env.get("OPENCODE_DISABLE_TERMINAL_TITLE")
                 .map(String::as_str),
@@ -1991,7 +2851,7 @@ mod tests {
         let mut cfg = opencode_cfg();
         cfg.env
             .insert("OPENCODE_CONFIG_CONTENT".to_string(), "custom".to_string());
-        let env = compose_ai_env(&cfg, &settings);
+        let env = compose_ai_env(&cfg, &settings, "claude");
         assert_eq!(
             env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             Some("custom"),
@@ -2010,13 +2870,115 @@ mod tests {
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
             "1".to_string(),
         );
-        let env = compose_ai_env(&cfg, &settings);
+        let env = compose_ai_env(&cfg, &settings, "claude");
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN")
                 .map(String::as_str),
             Some("1"),
             "an explicit per-tab value must pass through the env merge",
         );
+    }
+
+    // ── V30 Phase C: MCP auto-backgrounding is left to Claude Code ─────────
+
+    #[test]
+    fn no_tab_gets_a_synthesized_mcp_auto_background_env() {
+        // The inverse of the old Maintenance D-2 assertion: V30 Phase 0 T4
+        // proved a backgrounded MCP call still delivers its full result text,
+        // so cImp must NOT pin `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` any more.
+        // If this fails, the kill switch was re-added — read the comment in
+        // `compose_ai_env` before changing this test.
+        let settings = Settings::default();
+        let mut other = claude_cfg();
+        other.command = "some-other-tool".to_string();
+        for cfg in [claude_cfg(), opencode_cfg(), other] {
+            let env = compose_ai_env(&cfg, &settings, "claude");
+            assert!(
+                !env.contains_key("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"),
+                "cImp must not synthesize the auto-background kill switch (command: {})",
+                cfg.command,
+            );
+        }
+        // Shell tabs never reach `compose_ai_env` at all — `build_launch_spec`
+        // passes their `env` through verbatim.
+    }
+
+    #[test]
+    fn per_tab_env_can_still_set_mcp_auto_background_ms() {
+        // The user-facing escape hatch: cImp synthesizes nothing, but an
+        // explicit per-tab value still reaches the child.
+        let settings = Settings::default();
+        let mut cfg = claude_cfg();
+        cfg.env.insert(
+            "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_string(),
+            "0".to_string(),
+        );
+        let env = compose_ai_env(&cfg, &settings, "claude");
+        assert_eq!(
+            env.get("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")
+                .map(String::as_str),
+            Some("0"),
+            "an explicit per-tab value must pass through the env merge",
+        );
+    }
+
+    // ── V30 (review M9): harness env scrub ────────────────────────────────
+
+    #[test]
+    fn ai_tabs_scrub_the_inherited_claude_harness_markers() {
+        // Pins the LIST. `CLAUDE_CODE_CHILD_SESSION` is the load-bearing one —
+        // inheriting it gives the spawned Claude no transcript at all, which
+        // blinds the oob tap with no log anywhere. Adding to this list is fine;
+        // dropping `CLAUDE_CODE_CHILD_SESSION` re-opens the silent failure.
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            let removals = ai_env_removals(&cfg);
+            assert_eq!(
+                removals,
+                vec![
+                    "CLAUDE_CODE_CHILD_SESSION".to_string(),
+                    "CLAUDECODE".to_string(),
+                    "CLAUDE_CODE_ENTRYPOINT".to_string(),
+                ],
+                "every AI tab strips the same harness markers (command: {})",
+                cfg.command,
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_tab_env_entry_is_never_scrubbed() {
+        // The strip list is cImp's default, not a veto on the user's own
+        // configuration.
+        let mut cfg = claude_cfg();
+        cfg.env
+            .insert("CLAUDECODE".to_string(), "1".to_string());
+        let removals = ai_env_removals(&cfg);
+        assert!(!removals.contains(&"CLAUDECODE".to_string()));
+        assert!(removals.contains(&"CLAUDE_CODE_CHILD_SESSION".to_string()));
+    }
+
+    #[test]
+    fn shell_tabs_keep_their_environment_untouched() {
+        // A Shell tab's whole point is the environment the user actually has.
+        let mut settings = Settings::default();
+        settings.tabs.push(TabConfig::Shell(crate::settings::ShellTabConfig {
+            id: "shell-1".to_string(),
+            name: "Shell".to_string(),
+            command: "cmd".to_string(),
+            ..Default::default()
+        }));
+        let spec = build_launch_spec(
+            TabId::from_str("shell-1"),
+            &settings,
+            &std::env::temp_dir(),
+            &[],
+        );
+        if let Ok(spec) = spec {
+            assert!(
+                spec.env_remove.is_empty(),
+                "shell tabs must not have their environment edited"
+            );
+        }
     }
 
     // ── V12 Phase E: fact promotion block ─────────────────────────────────
@@ -2162,6 +3124,37 @@ mod tests {
         s.tabs.push(TabConfig::AiTool(tab));
         assert_ne!(spawn_inject_sig(&s)[0], base[0]);
 
+        // Claude-only: V30 Phase A session-push registration. This is THE
+        // guard demanded by the rule in `spawn_inject_sig` — the flags are baked
+        // into argv at spawn, so flipping them must nag running tabs to restart.
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        let offload_on = spawn_inject_sig(&s);
+        s.offload.session_push = true;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(
+            sig[0], offload_on[0],
+            "session_push must move the Claude sig"
+        );
+        assert_eq!(
+            sig[1], offload_on[1],
+            "channels are Claude-only — OpenCode has no MCP inbound path"
+        );
+
+        // …but only when it can actually change argv. With nothing that would
+        // inject the `cimp-offload` server, neither flag is emitted, so the
+        // toggle must NOT raise a restart hint (review LOW: spurious nags).
+        let mut bare = Settings::default();
+        bare.offload.enabled = false;
+        bare.graph.enabled = false;
+        let bare_base = spawn_inject_sig(&bare);
+        bare.offload.session_push = true;
+        assert_eq!(
+            spawn_inject_sig(&bare)[0],
+            bare_base[0],
+            "no cimp-offload server ⇒ session_push changes no argv ⇒ no restart hint"
+        );
+
         // Live-applied tuning must NOT nag: the read-advisor thresholds are
         // read per-invocation by the loopback handler, not baked at spawn.
         let mut s = Settings::default();
@@ -2169,5 +3162,79 @@ mod tests {
         s.graph.read_advisor_min_lines += 25;
         s.graph.context_per_file_chars += 100;
         assert_eq!(spawn_inject_sig(&s), with_graph);
+    }
+
+    /// V30 Phase A: the channel registration flag is emitted for a Claude tab
+    /// exactly when `offload.session_push` is on — as an adjacent
+    /// `<flag> server:cimp-offload` pair, addressing the same `mcpServers` key
+    /// `build_pre_args` writes into the `--mcp-config` overlay.
+    #[test]
+    fn session_push_adds_the_channel_registration_flag_for_claude_only() {
+        let cfg = claude_cfg();
+
+        // Default (off): no channel flag anywhere in the pre-args.
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        let off = build_pre_args(&cfg, &s, "claude");
+        assert!(
+            !off.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
+            "session_push defaults off — no channel flag"
+        );
+
+        // …and the CHILD half is absent too: with the gate off the spawned
+        // `cimp-offload` argv carries no `--channel-push`.
+        let off_mcp = off
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .and_then(|j| off.get(j + 1))
+            .expect("offload enabled ⇒ an mcp-config overlay");
+        assert!(!off_mcp.contains(CHANNEL_PUSH_FLAG));
+
+        // On: flag + target, in that order, adjacent.
+        s.offload.session_push = true;
+        let on = build_pre_args(&cfg, &s, "claude");
+        let i = on
+            .iter()
+            .position(|a| a == CHANNEL_REGISTRATION_FLAG)
+            .expect("channel flag is injected when session_push is on");
+        assert_eq!(
+            on.get(i + 1).map(String::as_str),
+            Some("server:cimp-offload")
+        );
+        // The target names the very server the `--mcp-config` overlay defines;
+        // a rename on either side would break registration silently.
+        let mcp = on
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .and_then(|j| on.get(j + 1))
+            .expect("offload enabled ⇒ an mcp-config overlay");
+        assert!(mcp.contains("\"cimp-offload\""));
+        // V30 (M5): BOTH halves of the gate come from this one settings read —
+        // the client flag above and the child's own `--channel-push` on the
+        // `cimp-offload` argv. A child restart must not be able to re-decide.
+        let overlay: serde_json::Value = serde_json::from_str(mcp).unwrap();
+        let child_args = overlay["mcpServers"]["cimp-offload"]["args"]
+            .as_array()
+            .expect("cimp-offload carries an args array");
+        assert!(
+            child_args.iter().any(|a| a == CHANNEL_PUSH_FLAG),
+            "session_push on ⇒ the child is told to declare the channel"
+        );
+
+        // OpenCode (and any non-Claude command) gets no pre-args at all.
+        assert!(build_pre_args(&opencode_cfg(), &s, "opencode").is_empty());
+
+        // session_push without ANY reason to inject the `cimp-offload` server
+        // (offload, graph, and Claude-exposed MCP all off) must emit no flag —
+        // registering a channel for a server that is never defined is noise.
+        let mut bare = Settings::default();
+        bare.offload.session_push = true;
+        bare.offload.enabled = false;
+        bare.graph.enabled = false;
+        let none = build_pre_args(&cfg, &bare, "claude");
+        assert!(
+            !none.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
+            "no cimp-offload server injected ⇒ no channel registration"
+        );
     }
 }

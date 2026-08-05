@@ -415,6 +415,19 @@ impl TabRegistry {
         manager.rebind_channel(new_channel).await
     }
 
+    /// M11 (2026-08-05 review): drop one tab's latched permission pattern so a
+    /// prompt still on screen is re-detected. Called by the NC-2 hook path when
+    /// a `PermissionDenied` clears `awaiting_permission` — see
+    /// [`crate::pty::PtyManager::clear_permission_latch`]. Infallible on
+    /// purpose: an unknown tab id (closed between mapping and delivery) or a
+    /// tab with no running PTY is simply nothing to clear, and the hook path
+    /// must never be given an error to handle.
+    pub async fn clear_permission_latch(&self, tab: &TabId) {
+        if let Some(manager) = self.managers.get(tab) {
+            manager.clear_permission_latch().await;
+        }
+    }
+
     pub async fn write(&self, tab: TabId, bytes: Vec<u8>) -> AppResult<()> {
         let manager = self
             .managers

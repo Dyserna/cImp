@@ -1,0 +1,118 @@
+name: Tests
+
+# Test gate for both halves of the app (code review 2026-08-05, M19b). Before
+# this workflow existed NO CI job ran a test: every tripwire in the suite —
+# `preview::capture::lock_pins`, the osv-source pin, the `--settings` overlay
+# contract, the patterns/default-set snapshots, the offload per-slot budget
+# regression test — fired only when a human happened to run `cargo test` on the
+# dev machine. A tripwire with no automated consumer is a silent failure with
+# extra steps, so this job is that consumer.
+#
+# Scope notes:
+#  * DEFAULT features only. The GPU features are covered by the clippy job
+#    (`tts-webgpu`) and by the release build; the model-backed smoke tests are
+#    `#[ignore]`d and need Kokoro/Whisper blobs the runner does not have, so a
+#    plain `cargo test` is the right surface here.
+#  * `--bin cimp` is REQUIRED, not a preference: the crate has no lib target
+#    (Cargo.toml declares only `[[bin]]`), so `cargo test --lib` fails outright.
+#  * Windows, matching clippy.yml — it is the primary platform, and same-OS
+#    jobs can share one cargo cache.
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'src-tauri/**'
+      - 'src/**'
+      - 'scripts/patterns.default.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'index.html'
+      - 'settings.html'
+      - '.github/workflows/tests.yml'
+  pull_request:
+    paths:
+      - 'src-tauri/**'
+      - 'src/**'
+      - 'scripts/patterns.default.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'index.html'
+      - 'settings.html'
+      - '.github/workflows/tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Same policy as clippy.yml: a newer push on the same ref supersedes the run in
+# flight rather than queueing behind it.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    # Cold cargo build of this dep graph is ~15 min on a Windows runner; test
+    # linking + execution adds several more. 75 covers a fully cold, fully
+    # cache-missed run without letting a hung test burn an hour.
+    timeout-minutes: 75
+    env:
+      # Node 24 actions runtime (see release.yml).
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # `npm install`, not `npm ci`: the committed lockfile was generated under
+      # npm 11.x and the runner ships npm 10.x, which is stricter about
+      # peer-dep resolution and rejects the tree outright (same reason and same
+      # trade-off documented on release.yml's install step and clippy.yml's).
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      # Frontend tests first — they are ~30 s and catch the cheap failures
+      # before the multi-minute cargo build starts.
+      - name: vitest
+        run: npx vitest run
+
+      # tauri-build resolves `frontendDist` (../dist) at compile time, so the
+      # bundle must exist before cargo runs — same as the clippy job.
+      - name: Build frontend
+        run: npm run build
+
+      # Floating stable, matching clippy.yml. The declared MSRV
+      # (`Cargo.toml rust-version = "1.88"`) is NOT verified by CI — nothing
+      # here ever compiles on 1.88. Accepted gap, 2026-08-05.
+      - name: Setup Rust (floating stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07-15
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          # Same key family as clippy.yml so both Windows jobs share one cargo
+          # cache rather than each paying a cold dependency build.
+          shared-key: cimp-win-src-tauri
+          cache-on-failure: true
+
+      - name: cargo test
+        working-directory: src-tauri
+        env:
+          # bindgen / clang-sys for whisper-rs-sys + misaki-rs -> espeak-ng-sys.
+          # The runner image ships LLVM here.
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        # `--bin cimp` because there is no lib target (see the header note).
+        # `--locked` so CI tests the committed Cargo.lock resolution.
+        run: cargo test --locked --bin cimp

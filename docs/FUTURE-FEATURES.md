@@ -244,7 +244,7 @@ These build on the V6-01 offline speech-to-text milestone (`docs/MILESTONE-V6-01
   - Querying CC requires loading the CUDA runtime, which we already do indirectly via ort. Either add a tiny `cudarc` (or similar) dependency to call `cudaDeviceGetAttribute`, or shell out to `nvidia-smi --query-gpu=compute_cap --format=csv` (works but ugly and adds a subprocess).
   - The "supported CC list" needs to be maintained alongside ort bumps — a magic list is fine but easy to forget to update. Could instead do a real probe inference (build session, run a 1-token forward pass, catch failure) which is self-validating but slower at startup.
 - **Trigger to act:** if anyone besides the dev box reports the "registered but no audio" symptom on Blackwell, OR when `ort` upgrades to a version that adds new GPU support and we want the probe to handle the next-gen-GPU regression class generally.
-- **Related:** `MAINTENANCE.md` "ort / ONNX Runtime" entry tracks the underlying ORT 1.20 + Blackwell mismatch.
+- **Related:** `MAINTENANCE.md` "ort / ONNX Runtime" entry tracks the underlying ORT + Blackwell mismatch (no sm_120 support through rc.13).
 
 ## Unify TTS and STT on one inference runtime (ORT + WebGPU) — DECIDED: not now
 

@@ -178,6 +178,11 @@
       </div>
     {/if}
 
+    <!-- `slot.n_ctx` is the backend handle's CORRECTED per-slot window, not
+         the raw `/slots` field (which reports the whole unified KV pool under
+         `--kv-unified`) — see `per_slot_n_ctx` in offload/metrics.rs. That is
+         what makes this bar agree with the `n_ctx_per_slot` figure in the card
+         header above in both KV modes. -->
     <div class="slots">
       {#each metrics.slots as slot (slot.id)}
         <div class="slot" class:active={slot.processing}>

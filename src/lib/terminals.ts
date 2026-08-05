@@ -29,7 +29,7 @@
 
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { CanvasAddon } from '@xterm/addon-canvas';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import './terminals.css';
@@ -126,7 +126,7 @@ interface TerminalEntry {
   /// `createTerminal`.
   selectionListener: { dispose: () => void } | null;
   /// Renderer category currently active on this Terminal — `'fast'`
-  /// for the canvas-with-no-image path (mode 'none' or 'color') and
+  /// for the WebGL-with-no-image path (mode 'none' or 'color') and
   /// `'image'` for the DOM-with-image path. The settings subscriber
   /// compares the next mode's category against this to decide between
   /// in-place update and full recreate.
@@ -413,6 +413,66 @@ function wheelSequence(
   )}${String.fromCharCode(32 + Math.min(row, 223))}`;
 }
 
+/**
+ * V29: loads the WebGL renderer addon onto an already-opened Terminal.
+ *
+ * Must run AFTER `term.open(host)`. `WebglAddon.activate` throws
+ * ("WebGL2 not supported") when `getContext('webgl2')` returns null — GPU
+ * blocklist, RDP, headless. Loaded pre-open the addon defers activation to
+ * `onWillOpen`, which would push that throw into `term.open()`; open() must
+ * never be able to fail because of the renderer. Post-open `loadAddon`
+ * activates synchronously, so the try/catch below actually catches it and
+ * the terminal simply stays on xterm's in-core DOM renderer.
+ *
+ * Context-loss policy: dispose the lost addon (xterm reverts to the DOM
+ * renderer on its own; buffer, PTY, and listeners survive) and attempt
+ * exactly ONE fresh load. If that retry throws or loses its context too,
+ * this Terminal stays on DOM — no retry loop against a resetting driver.
+ * A renderer-flip recreate or a tab restart naturally re-attempts.
+ *
+ * The addon handle deliberately lives in this closure, not on
+ * `TerminalEntry`: `term.dispose()` disposes loaded addons, and the
+ * fast↔image flip recreates the whole Terminal (V1.4-03), so nothing ever
+ * needs to unload it dynamically.
+ */
+function loadWebglRenderer(term: Terminal, tabId: TabId): void {
+  let retried = false;
+
+  const attach = (): void => {
+    const addon = new WebglAddon();
+    // Registered before loadAddon: activation is what wires the renderer's
+    // context-loss event through, and a load that throws must still leave a
+    // consistent (disposed) addon behind.
+    addon.onContextLoss(() => {
+      // The tab may have been closed or recreated (V1.4-03 renderer flip)
+      // by the time the loss fires — this Terminal is then no longer the
+      // live one for the tab, so don't reload onto a dying instance.
+      try {
+        addon.dispose();
+      } catch {
+        /* already torn down with the Terminal — nothing to do */
+      }
+      if (retried || entries.get(tabId)?.term !== term) return;
+      retried = true;
+      attach();
+    });
+    try {
+      term.loadAddon(addon);
+    } catch (e) {
+      // Leaves the addon registered-but-inert in xterm's AddonManager
+      // otherwise: loadAddon pushes before it calls activate().
+      addon.dispose();
+      console.warn(
+        `WebGL renderer unavailable for tab ${tabId}; ` +
+          'terminal falls back to the DOM renderer:',
+        e,
+      );
+    }
+  };
+
+  attach();
+}
+
 function fitAndResize(entry: TerminalEntry): void {
   if (!hostIsFittable(entry)) return;
   entry.fitAddon.fit();
@@ -565,7 +625,7 @@ export function createTerminal(
     theme: initialTheme,
     // V1.4-02: image mode requires transparency so the CSS image
     // beneath the cells layer is visible. Color-only and 'none' modes
-    // skip this so the canvas renderer paints opaque cells (faster).
+    // skip this so the WebGL renderer paints opaque cells (faster).
     ...(initialCategory === 'image' ? { allowTransparency: true } : {}),
     // V1.4-03: on a renderer recreate, construct at the previous
     // terminal's geometry so the replayed scrollback's cursor positions
@@ -588,13 +648,15 @@ export function createTerminal(
   // ever happens.
   const serializeAddon = new SerializeAddon();
   term.loadAddon(serializeAddon);
-  // V1.4-02: canvas renderer for the fast path (no image). Image mode
-  // stays on the in-core DOM renderer — the canvas addon is a single
-  // opaque surface and would obscure the CSS image beneath.
-  if (initialCategory !== 'image') {
-    term.loadAddon(new CanvasAddon());
-  }
   term.open(host);
+  // V1.4-02 / V29: WebGL renderer for the fast path (no image). Image mode
+  // stays on the in-core DOM renderer — the WebGL canvas is a single opaque
+  // surface and would obscure the CSS image beneath. Loaded after
+  // `term.open` so an unavailable WebGL2 context degrades to the DOM
+  // renderer instead of failing open(); see `loadWebglRenderer`.
+  if (initialCategory !== 'image') {
+    loadWebglRenderer(term, tabId);
+  }
 
   // V1.4-03: replay the captured scrollback before binding the PTY
   // channel. xterm processes its write queue FIFO, so the snapshot
@@ -659,8 +721,8 @@ export function createTerminal(
   //     CSS variable updates on the host. xterm.js diffs colors
   //     internally so identical themes are a no-op.
   //   - When the renderer category flips (fast↔image), the Terminal
-  //     must be recreated — the canvas addon is loaded once at
-  //     construction and `allowTransparency` is constructor-only.
+  //     must be recreated — V29: the WebGL addon is loaded once, right
+  //     after `term.open`, and `allowTransparency` is constructor-only.
   //     `queueRecreate` debounces so live slider drags during a global
   //     edit don't thrash. V1.4-03: the recreate path captures
   //     scrollback via the serialize addon, then uses pty_rebind
@@ -827,7 +889,8 @@ export function createTerminal(
 
 /// V1.4-02 recreate-on-toggle debounce. A category flip
 /// (fast ↔ image) requires a full Terminal recreation because the
-/// canvas addon and `allowTransparency` are construction-time
+/// V29 WebGL renderer addon (loaded once at open) and
+/// `allowTransparency` are construction-time
 /// decisions. Live slider drags during a global edit can fire many
 /// settings updates per second; debouncing collapses them into a
 /// single recreate after the user pauses.

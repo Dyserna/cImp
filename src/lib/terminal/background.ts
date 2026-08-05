@@ -8,14 +8,14 @@
 //        background_override === { ...cfg }   → use this config
 //
 //   2. Four-cell matrix on the resolved config:
-//        image: None, color: None  → mode 'none'   (canvas, theme bg)
-//        image: None, color: Some  → mode 'color'  (canvas, theme bg = color)
+//        image: None, color: None  → mode 'none'   (WebGL, theme bg)
+//        image: None, color: Some  → mode 'color'  (WebGL, theme bg = color)
 //        image: Some, color: None  → mode 'image'  (DOM, theme bg = rgba(black, opacity))
 //        image: Some, color: Some  → mode 'image'  (DOM, theme bg = rgba(color, opacity))
 //
 // `effectiveBackgroundMode` is the single entry point. The discriminated
 // `RenderingMode` it returns drives every downstream decision:
-//   - canvas vs DOM renderer at construction (terminals.ts Step 5)
+//   - V29: WebGL vs DOM renderer at construction (terminals.ts Step 5)
 //   - theme background override for the xterm.js theme (composeTheme)
 //   - CSS image / blur / size / position on the host element
 //     (applyHostBackgroundCss)
@@ -62,7 +62,7 @@ export function effectiveBackgroundMode(
     tab.background_override ?? global;
 
   // Four-cell matrix. Image presence dominates; color-only is the
-  // canvas-fast-path branch.
+  // WebGL-fast-path branch.
   if (cfg.image) return { kind: 'image', cfg, tint: cfg.color };
   if (cfg.color) return { kind: 'color', color: cfg.color };
   return { kind: 'none' };
@@ -70,7 +70,8 @@ export function effectiveBackgroundMode(
 
 /// Renderer category: drives the recreate-vs-update decision in the
 /// settings subscriber. Image mode forces DOM; everything else stays
-/// on the canvas fast path.
+/// on the WebGL fast path (falling back to DOM if WebGL2 is
+/// unavailable — see `loadWebglRenderer`).
 export function categoryOf(mode: RenderingMode): 'fast' | 'image' {
   return mode.kind === 'image' ? 'image' : 'fast';
 }

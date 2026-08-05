@@ -110,7 +110,8 @@ export async function beginSelectionTts(
   }
 
   // Clear xterm's own selection so it doesn't render on top of our
-  // decorations (the canvas renderer always draws selection above decorations).
+  // decorations (the accelerated renderer always draws selection above
+  // decorations).
   terminal.clearSelection();
 
   const chunks = parsed.map((c) => c.text);

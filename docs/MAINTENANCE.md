@@ -185,10 +185,10 @@ version edit — `cargo update` will not move them.
 | `@tauri-apps/plugin-clipboard-manager` | `^2.3.2` | Clipboard plugin (JS half) — the only working clipboard read in AI tabs |
 | `@tauri-apps/plugin-dialog` | `^2.0.0` | Dialog plugin (JS half) |
 | `tauri-plugin-snap-layout` | `^1.0.9` | Snap Layouts plugin (JS half) — keep in step with the Rust crate |
-| `@xterm/xterm` | `^5.5.0` | Terminal emulator widget |
-| `@xterm/addon-canvas` | `^0.7.0` | xterm canvas renderer |
-| `@xterm/addon-fit` | `^0.10.0` | xterm fit-to-container |
-| `@xterm/addon-serialize` | `^0.13.0` | xterm scrollback serialization |
+| `@xterm/xterm` | `^6.0.0` | Terminal emulator widget |
+| `@xterm/addon-webgl` | `^0.19.0` | xterm WebGL renderer (V29; canvas addon deleted upstream in 6.0) |
+| `@xterm/addon-fit` | `^0.11.0` | xterm fit-to-container |
+| `@xterm/addon-serialize` | `^0.14.0` | xterm scrollback serialization |
 | `@sveltejs/vite-plugin-svelte` *(dev)* | `^7.2.0` | Svelte + Vite glue (v7 is the Vite 8-compatible line) |
 | `@tauri-apps/cli` *(dev)* | `^2.1.0` | `tauri` build/dev CLI |
 | `@tsconfig/svelte` *(dev)* | `^5.0.4` | TS base config |

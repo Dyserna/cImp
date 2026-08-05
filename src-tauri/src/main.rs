@@ -126,7 +126,8 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --read-hook                            PreToolUse read-advisor hook shim
   --postedit-hook                        PostToolUse checks hook shim
   --notify-hook                          Notification / PermissionDenied hook shim
-  --offload-mcp [--consumer <name>]      stdio MCP server (offload + graph + proxied servers)
+  --offload-mcp [--consumer <name>] [--tab <id>]
+                                         stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
 
 The MCP servers and hooks proxy to a RUNNING cImp instance launched in the
@@ -269,7 +270,16 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str)
             .unwrap_or("claude");
-        offload::mcp::run(consumer);
+        // V28: `--tab <tab-id>` names the cImp tab this per-tab child serves, so
+        // the app can resolve the tab's CURRENT session for the `context_*`
+        // memory tools. Absent (hand-run child, or one spawned before the
+        // upgrade) simply falls back to the pre-V28 scoping.
+        let tab = args
+            .iter()
+            .position(|a| a == "--tab")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        offload::mcp::run(consumer, tab);
         return;
     }
 

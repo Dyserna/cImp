@@ -21,8 +21,15 @@
 //! This SSE stream carries no token fields: `message.updated`'s
 //! `properties.info` on the OOB stream shows only `{id, role, time}` (captured
 //! exhaustively live in spike 0a — the vocabulary above is the complete shape),
-//! so this consumer, which anyway has neither a `cwd`/session nor a tool name
-//! to record against, adds no usage tap of its own.
+//! so this consumer, which anyway has neither a `cwd` nor a tool name to record
+//! against, adds no usage tap of its own.
+//!
+//! **V28 correction:** the stream *does* carry the SESSION id — every
+//! session-scoped event has `properties.sessionID` (see the spike-0a capture in
+//! `docs/spikes/v20/ev.ndjson`); what it lacks is tokens/cwd/tool. That is why
+//! [`Tracker::track_live_session`] can bind this tab to its current OpenCode
+//! session in the live-session registry, giving OpenCode tabs the same
+//! per-tab memory scoping Claude tabs get.
 //!
 //! The real token path lives elsewhere. **V24 Phase F** (spike-confirmed on
 //! OpenCode 1.18.1): the injected plugin's `event` hook forwards each COMPLETED
@@ -51,11 +58,26 @@ use crate::state::StateSignal;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
+/// V28 (issue #13): how often this tap refreshes its live-session registry
+/// entry. Every session-scoped SSE event carries `properties.sessionID`, and a
+/// streaming turn emits token-level deltas by the dozen — re-stamping the
+/// registry on each one is pure lock churn. 5 s is far inside the registry's
+/// 90 s TTL, and a turn ALWAYS opens with low-frequency events
+/// (`session.status` busy / the user `message.updated`) before the assistant can
+/// issue an MCP call, so the entry is refreshed well before it could matter.
+const LIVE_MARK_INTERVAL_MS: i64 = 5_000;
+
 /// Subscribe to the OpenCode event stream on `port` and drive TTS + avatar
 /// state until the tab's cancel token fires. Reconnects on stream errors (the
 /// TUI may not have bound the port yet at launch, or may restart its server).
 pub async fn run(port: u16, ctx: OobContext) {
     let url = format!("http://127.0.0.1:{port}/event");
+    // V28: clear this tab's live-session registry entry on every exit path, so a
+    // closed OpenCode tab stops being reported live without waiting out the TTL.
+    // Mirrors `claude::LiveSessionGuard`. Only the TAB-keyed entry is dropped —
+    // the loopback's separate session-keyed entries (which the Usage "live now"
+    // badge reads) are untouched.
+    let _live_guard = LiveSessionGuard(&ctx);
     // No request timeout: this is a long-lived stream. (reqwest's default
     // builder sets none; we read with explicit cancel-aware selects instead.)
     let client = match reqwest::Client::builder().build() {
@@ -86,6 +108,17 @@ pub async fn run(port: u16, ctx: OobContext) {
             _ = ctx.cancel.cancelled() => return,
             _ = sleep(RECONNECT_DELAY) => {}
         }
+    }
+}
+
+/// V28: RAII cleanup of an OpenCode tab's TAB-keyed live-session registry entry
+/// (the V24 Claude tap's guard, mirrored). Dropped on every one of [`run`]'s
+/// return paths.
+struct LiveSessionGuard<'a>(&'a OobContext);
+
+impl Drop for LiveSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear_live_session();
     }
 }
 
@@ -192,12 +225,25 @@ struct Tracker {
     flushed: HashSet<String>,
     /// Whether we've emitted ClaudeOutputStarted without a matching Stopped.
     working: bool,
+    /// V28: session ids observed to be CHILD (sub-agent / task-tool) sessions —
+    /// `session.created` with a `properties.info.parentID`. Their events ride
+    /// the same stream as the main session's, and binding the tab to one would
+    /// scope the tab's memory tools to a sub-agent instead of the conversation
+    /// (the milestone's "tab resolves to its current MAIN session" invariant).
+    child_sessions: HashSet<String>,
+    /// V28: `(session_id, ts_ms)` of the last live-session mark, for the
+    /// [`LIVE_MARK_INTERVAL_MS`] throttle. A session CHANGE always marks
+    /// immediately (a `/new` rotation must not wait out the interval).
+    last_mark: Option<(String, i64)>,
 }
 
 impl Tracker {
     async fn handle(&mut self, ev: &Value, ctx: &OobContext) {
         let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
         let props = ev.get("properties").unwrap_or(&Value::Null);
+        // V28: bind this TAB to the session it is currently driving, before the
+        // per-event handling below (a `session.idle` still counts as liveness).
+        self.track_live_session(kind, props, ctx);
         match kind {
             "message.updated" => {
                 let info = props.get("info").unwrap_or(&Value::Null);
@@ -266,6 +312,60 @@ impl Tracker {
             }
             _ => {}
         }
+    }
+
+    /// V28 (issue #13) — OpenCode's half of the per-tab session identity.
+    ///
+    /// Spike verdict (evidence: the V20 spike-0a capture at
+    /// `docs/spikes/v20/ev.ndjson`): **every** session-scoped SSE event carries
+    /// `properties.sessionID` — `session.created`, `session.status`,
+    /// `session.idle`, `message.updated`, `message.part.updated` and
+    /// `message.part.delta` all do. (The module doc's older "no cwd/session"
+    /// note is about the *token* fields the SSE lacks, not the session id.) So
+    /// this per-tab tap can do exactly what `oob/claude.rs:208` does: stamp
+    /// `tab id → session id` into the live-session registry, which is what
+    /// `/graph_run`'s `tab` lookup resolves against.
+    ///
+    /// Sub-agent sessions ride the SAME stream, so binding blindly would point
+    /// the tab at a task-tool session mid-run. `session.created` announces a
+    /// child with `properties.info.parentID` (verified live in the V24 Phase F
+    /// spike), so children are recorded and skipped. A child whose `created`
+    /// event we missed (tap attached mid-run, or a reconnect reset the tracker)
+    /// is marked — a fail-open degradation, never an error.
+    fn track_live_session(&mut self, kind: &str, props: &Value, ctx: &OobContext) {
+        if let Some(sid) = self.live_session_target(kind, props, crate::activity::now_ms() as i64) {
+            ctx.mark_live_session(&sid, "opencode");
+        }
+    }
+
+    /// The decision half of [`Self::track_live_session`], with an explicit clock
+    /// so it is unit-testable: the session id this event should stamp into the
+    /// registry, or `None` (no session id, a child session, or throttled).
+    /// Mutates the child set and the throttle state, so call it once per event.
+    fn live_session_target(&mut self, kind: &str, props: &Value, now: i64) -> Option<String> {
+        let sid = props.get("sessionID").and_then(Value::as_str)?;
+        if kind == "session.created"
+            && props
+                .get("info")
+                .and_then(|i| i.get("parentID"))
+                .and_then(Value::as_str)
+                .is_some_and(|p| !p.is_empty())
+        {
+            self.child_sessions.insert(sid.to_string());
+            return None;
+        }
+        if self.child_sessions.contains(sid) {
+            return None;
+        }
+        // Always mark on a session CHANGE (a `/new` rotation must not wait out
+        // the interval), else once per `LIVE_MARK_INTERVAL_MS`.
+        if let Some((last_sid, at)) = self.last_mark.as_ref() {
+            if last_sid == sid && now.saturating_sub(*at) < LIVE_MARK_INTERVAL_MS {
+                return None;
+            }
+        }
+        self.last_mark = Some((sid.to_string(), now));
+        Some(sid.to_string())
     }
 
     /// Record a part under its message, preserving first-seen order.
@@ -807,5 +907,126 @@ mod tests {
             sig.try_recv(),
             Ok(StateSignal::ClaudeOutputStopped { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod live_session_tests {
+    //! V28 (issue #13): the OpenCode half of per-tab session identity.
+    //!
+    //! Payload shapes below are copied from the real spike-0a capture
+    //! (`docs/spikes/v20/ev.ndjson`) — `properties.sessionID` is present on
+    //! every session-scoped event type, which is what makes this wiring
+    //! possible at all.
+    use super::{Tracker, LIVE_MARK_INTERVAL_MS};
+    use serde_json::Value;
+
+    fn props(s: &str) -> Value {
+        serde_json::from_str::<Value>(s).unwrap()["properties"].clone()
+    }
+
+    #[test]
+    fn every_session_scoped_event_type_yields_the_session_id() {
+        // One event of each shape the tap sees; each must be able to refresh the
+        // tab→session binding on its own (the tracker is reset between them so
+        // the throttle doesn't mask a type that fails to expose the id).
+        for raw in [
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}"#,
+            r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#,
+            r#"{"type":"message.updated","properties":{"sessionID":"ses_1","info":{"id":"msg_1","role":"user","sessionID":"ses_1"}}}"#,
+            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","part":{"type":"text","messageID":"msg_1","id":"prt_1"}}}"#,
+            r#"{"type":"message.part.delta","properties":{"sessionID":"ses_1","messageID":"msg_1","partID":"prt_1","field":"text","delta":"x"}}"#,
+        ] {
+            let ev: Value = serde_json::from_str(raw).unwrap();
+            let kind = ev["type"].as_str().unwrap();
+            let mut t = Tracker::default();
+            assert_eq!(
+                t.live_session_target(kind, &ev["properties"], 0),
+                Some("ses_1".to_string()),
+                "event {kind} must expose the session id"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_without_a_session_id_marks_nothing() {
+        let mut t = Tracker::default();
+        assert_eq!(
+            t.live_session_target("server.connected", &props(r#"{"properties":{}}"#), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_session_rotation_marks_immediately_but_repeats_are_throttled() {
+        let mut t = Tracker::default();
+        let p = props(r#"{"properties":{"sessionID":"ses_1"}}"#);
+        assert_eq!(
+            t.live_session_target("session.idle", &p, 0),
+            Some("ses_1".to_string())
+        );
+        // Same session inside the interval: no repeat work.
+        assert_eq!(
+            t.live_session_target("session.idle", &p, LIVE_MARK_INTERVAL_MS - 1),
+            None
+        );
+        // Past the interval it refreshes again (the registry TTL must not lapse).
+        assert_eq!(
+            t.live_session_target("session.idle", &p, LIVE_MARK_INTERVAL_MS),
+            Some("ses_1".to_string())
+        );
+        // A DIFFERENT session (a `/new` rotation) never waits out the interval —
+        // otherwise the tab would keep reporting the session it just left.
+        let rotated = props(r#"{"properties":{"sessionID":"ses_2"}}"#);
+        assert_eq!(
+            t.live_session_target("session.idle", &rotated, LIVE_MARK_INTERVAL_MS),
+            Some("ses_2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_child_session_never_binds_the_tab() {
+        // Sub-agent (task-tool) sessions ride the SAME stream. Binding the tab to
+        // one would scope the tab's memory tools to a sub-agent mid-run; the
+        // milestone's contract is the tab's current MAIN session.
+        let mut t = Tracker::default();
+        let created = props(
+            r#"{"properties":{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main"}}}"#,
+        );
+        assert_eq!(t.live_session_target("session.created", &created, 0), None);
+        // ...and none of the child's subsequent events bind it either.
+        let child_delta = props(r#"{"properties":{"sessionID":"ses_child"}}"#);
+        assert_eq!(
+            t.live_session_target("message.part.delta", &child_delta, 1_000),
+            None
+        );
+        // The parent still binds normally.
+        let parent = props(r#"{"properties":{"sessionID":"ses_main"}}"#);
+        assert_eq!(
+            t.live_session_target("session.idle", &parent, 2_000),
+            Some("ses_main".to_string())
+        );
+    }
+
+    #[test]
+    fn a_top_level_session_created_binds_the_tab() {
+        // The real capture's `session.created` has an `info` with NO `parentID` —
+        // that is a main session and must bind (a missing/blank parent is not a
+        // reason to skip).
+        let mut t = Tracker::default();
+        let created = props(
+            r#"{"properties":{"sessionID":"ses_top","info":{"id":"ses_top","slug":"quiet-comet"}}}"#,
+        );
+        assert_eq!(
+            t.live_session_target("session.created", &created, 0),
+            Some("ses_top".to_string())
+        );
+        let blank = props(
+            r#"{"properties":{"sessionID":"ses_two","info":{"id":"ses_two","parentID":""}}}"#,
+        );
+        assert_eq!(
+            t.live_session_target("session.created", &blank, 1_000),
+            Some("ses_two".to_string())
+        );
     }
 }

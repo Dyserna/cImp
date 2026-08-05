@@ -232,24 +232,51 @@ session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
 comes from the injection plugin's `tool.execute.after` hook POSTing to
 `/memory/event`. `graph::classify_tool` maps tool names → `(kind, arg)` for both.
 
-**Memory-tool session scoping — per-agent (partial), pending a Claude Code
-feature.** The `context_recall` / `context_note` / `context_notes` MCP tools have
-no session argument (Claude Code does not pass session identity into an MCP
-server's tool-call context), so they resolve a session from `graph.db` by
-recency. To keep a **Claude** tab and an **OpenCode** tab on the same project
-from reading/writing each other's session, the resolution is scoped to the
-*calling agent*: the MCP child's `--consumer` (claude/opencode) flows
+**Memory-tool session scoping — per-agent, then per-tab (V28).** The
+`context_recall` / `context_note` / `context_notes` MCP tools have no session
+argument (no harness passes session identity into an MCP server's tool-call
+context), so they resolve a session from `graph.db`. The first layer scopes to
+the *calling agent*: the MCP child's `--consumer` (claude/opencode) flows
 `offload/mcp.rs::proxy_graph` → `/graph_run` (`GraphRunBody.consumer`) →
 `run_graph_tool` → `dispatch_recorded` `source` → `mem_agent(source)` →
 `GraphIndex::mem_current_session_for(Some(agent))` (and the app-down fallback
 `handle_call(params, consumer)` does the same). `source` is also the activity
-ring's badge, so OpenCode's graph/context calls now read as `opencode`, not
-`claude` (frontend `GraphCall.source` union + `.hsrc.opencode`).
+ring's badge, so OpenCode's graph/context calls read as `opencode`, not `claude`
+(frontend `GraphCall.source` union + `.hsrc.opencode`).
 
-The residual limitation this leaves — two tabs of the *same* agent sharing a
-memory scope, pending a session id inside MCP tool calls — is tracked in
-`MAINTENANCE.md` § Context Engine memory scoping (V10), because it is a
-periodically re-checked upstream gap rather than a design note.
+**V28 (issue #13) closes the per-agent layer's gap** — two tabs of the *same*
+agent sharing (and stealing) one memory scope. Identity rides the **spawn argv**,
+since the `cimp --offload-mcp` child is per-tab and cImp composes its whole
+command line: `tabs/config.rs` bakes `--tab <tab-id>` into both harness configs
+(Claude's `--mcp-config` server entry, OpenCode's
+`OPENCODE_CONFIG_CONTENT.mcp.cimp-offload`). The child forwards it as
+`GraphRunBody.tab` on `/graph_run` **only** — `/mcp/call` proxies to external
+servers, which hold no cImp memory scope. `handle_graph_run` resolves it at call
+time through `GraphService::live_session_for_tab(tab, agent)` (the V24
+live-session registry: exact key match, agent must match, TTL-filtered, never a
+guess — NC-2's resolver discipline), and threads the resulting session id down
+`run_graph_tool` → `dispatch_recorded` → `run_tool`, where the `context_*` tools
+(and `graph_repo_map`'s session boost) use it instead of the recency lookup.
+
+Everything on that path **fails open to the pre-V28 behavior**: no `--tab` (a
+child spawned before the upgrade), an unknown or TTL-stale tab key, or a blank
+value all fall back to `mem_current_session_for(agent)`. A tool call never errors
+for lack of identity, so there is no restart hint owed — and because the tab id
+is not Settings-derived and cannot change while a tab runs, it needs no
+`spawn_inject_sig` entry.
+
+Both harnesses stamp the registry per tab: Claude from its transcript drain tick
+(`oob/claude.rs:208`), OpenCode from its `/event` SSE tap
+(`oob/opencode.rs::Tracker::track_live_session`) — every session-scoped SSE event
+carries `properties.sessionID` (verified against the spike-0a capture in
+`docs/spikes/v20/ev.ndjson`). The loopback `/memory/event` path keeps its
+*separate* session-keyed entries (the Usage "live now" badge reads them);
+tab-keyed and session-keyed entries coexist because tab lookups are exact-match.
+Sub-agent sessions ride the same OpenCode stream and are excluded via
+`session.created`'s `info.parentID`, so a tab always resolves to its current
+**main** session — sub-agent tool calls arrive through the same per-tab child and
+therefore share the tab's scope by design. The offload worker (`offload`
+consumer) has no tab and keeps its project-wide, agent-`None` scope.
 
 **Context injection** (opt-in, `graph.context_injection`). `graph/context.rs`
 ranks files (symbol/reference/doc hits + session working set) and budget-packs

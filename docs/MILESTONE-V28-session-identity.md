@@ -1,6 +1,7 @@
 # V28 — Per-Session MCP Identity (session-scoped memory tools)
 
-**Status:** SPEC (2026-08-05). Closes GitHub issue #13 (NC-1/D-9 from the
+**Status:** IMPLEMENTED (Phases A–D, 2026-08-05) — live verification below still
+pending. Closes GitHub issue #13 (NC-1/D-9 from the
 2026-08-04 maintenance run) and the V10 residual "same-agent tabs share
 memory scope".
 **Builds on:** V10 context engine (`session`/`mem_event` relations,
@@ -69,6 +70,32 @@ reads and writes tab B's working set whenever B was active more recently.
    the gap is documented in ARCHITECTURE.md — Claude-side isolation still
    lands.
 
+   **Spike VERDICT (2026-08-05): POSITIVE — wired, no degradation.** Evidence:
+   the V20 spike-0a capture kept at `docs/spikes/v20/ev.ndjson` shows
+   `properties.sessionID` on **every** session-scoped SSE event —
+   `session.created`, `session.status`, `session.idle`, `message.updated`,
+   `message.part.updated` and `message.part.delta` all carry it. (`oob/opencode.rs`'s
+   module doc claimed the consumer "has neither a `cwd`/session"; that was about
+   the *token* fields the SSE lacks — the session id is there. The doc is
+   corrected.) The tap already owns the `TabId` via `OobContext.tab`, so it now
+   calls `ctx.mark_live_session(sid, "opencode")` exactly like the Claude tap,
+   with two additions the spike surfaced:
+   - **Sub-agent sessions ride the same stream.** `session.created` announces a
+     child with `properties.info.parentID` (V24 Phase F spike, confirmed live).
+     Children are recorded and skipped, so a tab binds to its current **main**
+     session — otherwise decision-6's invariant would hold for Claude but not for
+     OpenCode. A child whose `created` event was missed (tap attached mid-run, or
+     a reconnect reset the tracker) binds: fail-open, never an error.
+   - **A 5 s mark throttle**, because token-level `message.part.delta` events
+     arrive by the dozen per turn (69 in the captured turn) and each carries the
+     session id. Far inside the registry's 90 s TTL, and a turn always opens with
+     low-frequency events before the assistant can issue an MCP call.
+
+   An OpenCode tab's TAB-keyed entry is also RAII-cleared on tab exit (mirroring
+   `claude::LiveSessionGuard`); the loopback's separate session-keyed entries are
+   untouched, since tab lookups are exact-match and a tab id never equals a
+   `ses_*` id.
+
 ## Cross-module invariants
 
 - The write path is already session-correct — this milestone changes the
@@ -98,26 +125,39 @@ reads and writes tab B's working set whenever B was active more recently.
 
 ## Phases
 
-- **A — plumbing (Rust):** `live_session_for_tab`, `GraphRunBody.tab`,
-  explicit-session threading through `run_graph_tool`/`dispatch_recorded`/
-  `run_tool`, mem tools honor it. Tests: explicit-session recall isolation
-  (note in session A invisible to session B), fallback when `tab` absent /
-  unknown / stale.
-- **B — spawn threading:** `--tab` in both harness configs
-  (`tabs/config.rs`); tests: per-tab argv carries the right id; the CD-4
-  single-`--settings` contract test untouched.
-- **C — OpenCode oob spike + wiring:** confirm the per-tab SSE tap sees
-  session ids; mark tab-keyed live sessions; test. If infeasible: document
-  the degradation instead.
-- **D — docs + live verify:** ARCHITECTURE.md identity paragraph; recipes
-  below.
+- **A — plumbing (Rust): DONE.** `GraphService::live_session_for_tab` (+ the
+  pure `lookup_live_session_for_tab`), `GraphRunBody.tab`, explicit-session
+  threading through `run_graph_tool` → `dispatch_recorded` → `run_tool`, mem
+  tools honor it. `main.rs` parses `--tab`; `offload/mcp.rs` stores it and
+  `proxy_graph` forwards it on `/graph_run` only.
+- **B — spawn threading: DONE.** `--tab <id>` on the `cimp-offload` entry in
+  both harness configs; `tab` threaded through `build_pre_args` /
+  `build_opencode_config` / `compose_ai_env` from `build_launch_spec`'s `TabId`.
+  The `cimp-code-audit` child is deliberately left identity-free (it never hits
+  `/graph_run`). The CD-4 single-`--settings` contract test is untouched in
+  meaning — it inspects the `--settings` overlay, not `--mcp-config`.
+- **C — OpenCode oob spike + wiring: DONE, spike POSITIVE** (see decision 5).
+- **D — docs + live verify:** ARCHITECTURE.md § "Memory-tool session scoping"
+  rewritten; MAINTENANCE.md § Context Engine memory scoping flipped from
+  "residual limitation / watch upstream" to "closed, watch this seam instead".
+  Live recipes below still to run.
+
+### Scope taken beyond the letter of the spec
+
+`graph_repo_map`'s session boost (`repo_map_session_boost`) resolved its session
+through the *same* `mem_current_session_for(agent)` call, so a second same-agent
+tab's project map was ranked by the other tab's working set — the identical
+read-side defect. It now takes the same explicit session (same fail-open
+fallback). Three lines; noted here rather than left as a silent inconsistency.
 
 ## Live verification (by hand, after A–C)
 
 1. Two Claude tabs, same project: `context_note` in tab A →
    `context_recall` in tab B must NOT return it; B's own notes round-trip.
-2. Same with two OpenCode tabs (Phase C landed) — else confirm documented
-   degradation.
+2. Same with two OpenCode tabs — Phase C landed, so full isolation is expected
+   (no documented degradation to confirm). Also check an OpenCode `task`
+   fan-out: `context_recall` from inside a sub-agent must return the TAB's main
+   working set, not the sub-session's.
 3. `/clear` in a tab, then `context_note` → lands in the NEW session
    (check `session` relation timestamps).
 4. Offload worker `context_*` tools behave exactly as before.

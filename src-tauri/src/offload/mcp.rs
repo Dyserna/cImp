@@ -58,18 +58,38 @@ const SERVER_NAME: &str = "cimp-offload";
 /// the right per-consumer MCP-server tool set. Set once at startup.
 static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// V28 (issue #13): the cImp TAB this child was spawned for (from
+/// `--tab <tab-id>`). One `--offload-mcp` child runs per tab and its argv is
+/// composed entirely by cImp, so the tab identity can be baked in at spawn —
+/// which is what lets the app resolve *which* session of this agent the
+/// `context_*` memory tools should scope to. Unset for a child spawned by hand
+/// (or by a pre-V28 cImp), which fails open to the old behavior.
+static TAB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The configured consumer name, lowercased; `"claude"` when unset.
 fn consumer() -> &'static str {
     CONSUMER.get().map(String::as_str).unwrap_or("claude")
 }
 
-/// Entry point for `cimp --offload-mcp [--consumer <name>]`. Builds a
-/// current-thread tokio runtime and serves the stdio loop until stdin closes.
-/// `consumer` selects which MCP-server set the app proxies to this child
-/// (`claude` default, or `opencode`). Never panics — a crash here would garble
-/// the host agent's MCP session.
-pub fn run(consumer: &str) {
+/// The tab id this child serves, or `None` when it was spawned without `--tab`.
+fn tab() -> Option<&'static str> {
+    TAB.get().map(String::as_str)
+}
+
+/// Entry point for `cimp --offload-mcp [--consumer <name>] [--tab <tab-id>]`.
+/// Builds a current-thread tokio runtime and serves the stdio loop until stdin
+/// closes. `consumer` selects which MCP-server set the app proxies to this child
+/// (`claude` default, or `opencode`); `tab` is the cImp tab id this child was
+/// spawned for (V28 — forwarded on `/graph_run` so the app can scope the
+/// `context_*` memory tools to THIS tab's session). Never panics — a crash here
+/// would garble the host agent's MCP session.
+pub fn run(consumer: &str, tab: Option<&str>) {
     let _ = CONSUMER.set(consumer.trim().to_ascii_lowercase());
+    // Tab ids are case-sensitive settings keys — store verbatim (trimmed), never
+    // lowercased like the consumer name.
+    if let Some(t) = tab.map(str::trim).filter(|t| !t.is_empty()) {
+        let _ = TAB.set(t.to_string());
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -677,7 +697,14 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
         .timeout(Duration::from_secs(30))
         .build()
         .ok()?;
-    let body = json!({ "cwd": cwd, "name": name, "args": args, "consumer": consumer() });
+    // V28: `tab` rides along ONLY here (`/graph_run`) — `/mcp/call` proxies to
+    // external servers, which hold no cImp memory scope. Omitted entirely when
+    // this child has no tab identity, so the body stays byte-identical to the
+    // pre-V28 shape on that path.
+    let mut body = json!({ "cwd": cwd, "name": name, "args": args, "consumer": consumer() });
+    if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
+        map.insert("tab".to_string(), Value::String(t.to_string()));
+    }
     let resp = client
         .post(format!("{base}/graph_run"))
         .bearer_auth(&token)

@@ -575,39 +575,42 @@ Two independent version numbers; don't conflate them.
   `RETIRED_TAB_IDS` entry for the integrity check — without the latter a stale
   layout overlay resurrects the tab.
 
-### Context Engine memory scoping (V10) — residual limitation
+### Context Engine memory scoping (V10 → V28) — CLOSED, with a fail-open seam
 
-*Architecture: see `ARCHITECTURE.md` § Code Intelligence — Context Engine (V10).*
+*Architecture: see `ARCHITECTURE.md` § Code Intelligence — Context Engine (V10),
+"Memory-tool session scoping".*
 
 The `context_recall` / `context_note` / `context_notes` MCP tools resolve a
-session by recency, scoped to the calling agent (claude/opencode).
+session scoped to the calling agent (claude/opencode) **and** to the calling
+**tab** (V28, issue #13). The long-standing residual — two tabs of the *same*
+agent sharing one memory scope — is closed **without** the upstream feature it
+was waiting on.
 
-*Residual limitation (periodically re-check):* two tabs of the **same** agent
-(e.g. two Claude tabs) on one project still share the same agent scope, so a
-`context_note` from one can attach to the other's session, and `context_recall`
-can return the other's working set. Full per-tab isolation needs a session
-identifier available *inside the MCP tool call* so the tool knows which of
-several same-agent sessions is calling.
+**Why the upstream watch item is now moot.** No harness passes a session id into
+an MCP server's tool-call context (Claude Code gives hooks a `session_id` but
+gives its MCP children no arg, no env var, and no `tools/call` field). V28
+sidesteps that: the `--offload-mcp` child is per **tab** and cImp composes its
+argv, so `--tab <tab-id>` is baked at spawn and the *app* — which does know each
+tab's live session — resolves tab→session at call time from the V24 live-session
+registry. Stop watching for "session id inside MCP tool calls"; it is no longer
+load-bearing.
 
-- **What's missing:** Claude Code exposes a session id to **hooks** (the
-  `UserPromptSubmit` payload carries `session_id` — that's how the transcript tap
-  and `cimp --context-hook` get it) but **not** to the MCP servers it launches:
-  the `cimp --offload-mcp` child is spawned per Claude session yet receives no
-  session UUID (no arg, no env var, and no field on the JSON-RPC `tools/call`
-  params). So the child literally cannot tell which session is invoking a tool.
-- **What to watch for** (any of these closes the gap): a session id / session
-  metadata field on the MCP `tools/call` request; a per-session env var set on
-  the MCP server process at spawn (like the hook `session_id`); or an MCP
-  "elicitation"/context mechanism that carries session identity. Check the MCP
-  server docs + the Claude Code hooks/MCP release notes.
-- **When it lands:** thread that id into `dispatch_recorded` alongside `source`,
-  add `mem_event`/`session` writes keyed by it, and switch the tools from
-  `mem_current_session_for(agent)` to an exact session lookup. The recording side
-  already stores a real per-session id (`session.session_id`), so only the read
-  path's "which session am I" resolution needs to change.
+**What to re-check instead** (the seam this design leaves):
 
-This is the same gap the maintenance procedure's harness-watch step calls the
-"session id inside MCP tool calls" item.
+- **The tab→session registry must stay fed.** Claude stamps it from the
+  transcript drain tick (`oob/claude.rs`), OpenCode from the `/event` SSE tap
+  (`oob/opencode.rs::Tracker::track_live_session`, keyed off
+  `properties.sessionID`). If either harness changes its event shape, resolution
+  silently degrades to the pre-V28 recency behavior — **no error, no log**. The
+  tell is per-tab isolation quietly stopping; verify with the two-tab recipe
+  (a `context_note` in tab A must not appear in tab B's `context_recall`).
+- **OpenCode sub-agent sessions** are excluded via `session.created`'s
+  `info.parentID`. If OpenCode stops announcing children that way, a tab can bind
+  to a sub-agent session mid-run (scope narrows; still isolated per tab, still
+  never an error).
+- **Fail-open is deliberate and total:** missing `--tab`, unknown key, TTL-stale
+  entry, blank value → `mem_current_session_for(agent)`. Never turn any of these
+  into a tool error; a memory read is not worth breaking a turn over.
 
 ### Check parsers & fixtures (V12 / V22)
 

@@ -697,6 +697,28 @@ fn compute_active_session_ids(
     out
 }
 
+/// V28: the live session id reported by `tab`, or `None`. Pure half of
+/// [`GraphService::live_session_for_tab`] so it can be unit-tested without an
+/// `AppHandle`.
+///
+/// Deliberately strict, matching NC-2's resolver discipline: an EXACT key match
+/// (no prefix/fuzzy tab matching), the entry's `agent` must equal the calling
+/// agent (a tab id could in principle be reused across harnesses), and the entry
+/// must still be inside [`LIVE_SESSION_TTL_MS`]. Anything else returns `None` —
+/// the caller then falls back to today's most-recent-session behavior rather
+/// than attributing a call to a session it can't prove.
+fn lookup_live_session_for_tab(
+    live: &HashMap<String, LiveSession>,
+    tab: &str,
+    agent: &str,
+    now: i64,
+) -> Option<String> {
+    live.get(tab)
+        .filter(|e| e.agent == agent)
+        .filter(|e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS)
+        .map(|e| e.session_id.clone())
+}
+
 /// V24 Phase B: drop live-session registry entries older than
 /// [`LIVE_SESSION_TTL_MS`] — the registry half's cutoff. Called opportunistically
 /// from [`GraphService::mark_live_session`] so the map doesn't grow without bound
@@ -878,12 +900,18 @@ impl GraphService {
     /// Resolves the project root from the caller's `cwd` (the same ancestor walk
     /// the MCP child uses) and records the call in the monitor's activity ring.
     /// Backs the loopback `/graph_run` route.
+    ///
+    /// V28: `session` is the EXPLICIT session id the caller's tab resolved to
+    /// (see [`Self::live_session_for_tab`]); the `context_*` memory tools scope
+    /// to it instead of "the most recent session for this agent". `None` keeps
+    /// exactly the pre-V28 behavior.
     pub async fn run_graph_tool(
         &self,
         cwd: &Path,
         name: &str,
         args: &serde_json::Value,
         consumer: &str,
+        session: Option<&str>,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
@@ -903,7 +931,7 @@ impl GraphService {
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args).await
+        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session).await
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).
@@ -1365,6 +1393,25 @@ impl GraphService {
                 .map(|(k, e)| (k.clone(), e.session_id.clone()))
                 .collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// V28 (issue #13): the session id the tab keyed `tab` currently reports,
+    /// for `agent` (`"claude"` / `"opencode"`) — the read-side identity the
+    /// `context_*` memory tools scope to, so two same-agent tabs on one project
+    /// stop sharing a memory scope.
+    ///
+    /// This is the generalization of [`Self::live_claude_sessions`] (which stays
+    /// as-is — the `/permission/event` route needs the whole Claude mapping, not
+    /// one tab). `None` means "no proof": no entry under that key, an entry left
+    /// by a different agent, or a TTL-stale one. Every caller fails OPEN on
+    /// `None` — back to `mem_current_session_for(agent)` — so a missing/unknown/
+    /// stale tab can never error a tool call.
+    pub fn live_session_for_tab(&self, tab: &str, agent: &str) -> Option<String> {
+        let now = crate::activity::now_ms() as i64;
+        match self.live_sessions.lock() {
+            Ok(m) => lookup_live_session_for_tab(&m, tab, agent, now),
+            Err(_) => None,
         }
     }
 
@@ -5231,6 +5278,111 @@ mod tests {
         let mut past = HashMap::new();
         past.insert("t".to_string(), live("s", now - LIVE_SESSION_TTL_MS - 1));
         assert!(compute_active_session_ids(&past, &sessions, now).is_empty());
+    }
+
+    // ── V28 (issue #13): tab → session resolution ─────────────────────────
+
+    /// A registry entry for an arbitrary agent (the `live` helper pins Claude).
+    fn live_for(agent: &str, session_id: &str, last_seen_ms: i64) -> LiveSession {
+        LiveSession {
+            agent: agent.to_string(),
+            session_id: session_id.to_string(),
+            last_seen_ms,
+        }
+    }
+
+    fn v28_registry(now: i64) -> HashMap<String, LiveSession> {
+        let mut reg = HashMap::new();
+        reg.insert(
+            "claude".to_string(),
+            live_for("claude", "ses_a", now - 1_000),
+        );
+        reg.insert(
+            "claude-local".to_string(),
+            live_for("claude", "ses_b", now - 1_000),
+        );
+        reg.insert(
+            "opencode".to_string(),
+            live_for("opencode", "ses_oc", now - 1_000),
+        );
+        reg.insert(
+            "claude-stale".to_string(),
+            live_for("claude", "ses_old", now - LIVE_SESSION_TTL_MS - 1),
+        );
+        reg
+    }
+
+    #[test]
+    fn live_session_for_tab_returns_that_tabs_own_session() {
+        // The whole point of V28: two tabs of the SAME agent resolve to their
+        // OWN sessions, not to whichever was most recently active.
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, "claude", "claude", now),
+            Some("ses_a".to_string())
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, "claude-local", "claude", now),
+            Some("ses_b".to_string())
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, "opencode", "opencode", now),
+            Some("ses_oc".to_string())
+        );
+    }
+
+    #[test]
+    fn live_session_for_tab_rejects_an_agent_mismatch() {
+        // The key exists but was stamped by the other harness — resolving it
+        // would hand a Claude call an OpenCode session. Fail open instead.
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, "opencode", "claude", now),
+            None
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, "claude", "opencode", now),
+            None
+        );
+    }
+
+    #[test]
+    fn live_session_for_tab_rejects_a_ttl_stale_entry() {
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        assert_eq!(
+            lookup_live_session_for_tab(&reg, "claude-stale", "claude", now),
+            None,
+            "past the TTL the tab's reported session is no longer proof"
+        );
+        // Exactly at the TTL edge still counts (same boundary as the registry
+        // half of `compute_active_session_ids` and the eviction sweep).
+        let mut edge = HashMap::new();
+        edge.insert(
+            "claude".to_string(),
+            live_for("claude", "ses_edge", now - LIVE_SESSION_TTL_MS),
+        );
+        assert_eq!(
+            lookup_live_session_for_tab(&edge, "claude", "claude", now),
+            Some("ses_edge".to_string())
+        );
+    }
+
+    #[test]
+    fn live_session_for_tab_never_guesses_on_an_unknown_key() {
+        // No prefix/fuzzy matching, no "only one Claude entry, must be it".
+        let now = 10_000_000i64;
+        let reg = v28_registry(now);
+        for tab in ["", "claude2", "clau", "claude ", "CLAUDE"] {
+            assert_eq!(
+                lookup_live_session_for_tab(&reg, tab, "claude", now),
+                None,
+                "tab key {tab:?} must not resolve"
+            );
+        }
+        assert!(lookup_live_session_for_tab(&HashMap::new(), "claude", "claude", now).is_none());
     }
 
     #[test]

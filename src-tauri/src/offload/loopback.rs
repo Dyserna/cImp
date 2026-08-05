@@ -780,6 +780,14 @@ struct GraphRunBody {
     /// Claude when absent.
     #[serde(default)]
     consumer: Option<String>,
+    /// V28 (issue #13): the cImp TAB id the calling MCP child was spawned for
+    /// (`cimp --offload-mcp --tab <id>`), used to resolve *which* session of
+    /// this agent the `context_*` memory tools should scope to. Optional by
+    /// design — a child spawned before the upgrade sends no `tab`, and an
+    /// unknown/stale one resolves to `None`; both fall back to the pre-V28
+    /// most-recent-session behavior rather than erroring the call.
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 /// A `POST /mcp/call` request body (a Claude-exposed MCP tool invocation).
@@ -824,8 +832,22 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let consumer = body.consumer.as_deref().unwrap_or("claude");
+    // V28: resolve the calling TAB to the session it currently reports, so the
+    // `context_*` memory tools scope to this tab's own session instead of "the
+    // most recent session for this agent" (two same-agent tabs used to share —
+    // and steal — one memory scope). Fail-open: no `tab`, an unknown key, a
+    // different agent's entry, or a TTL-stale one all yield `None`, which is
+    // exactly the pre-V28 behavior.
+    let session = body
+        .tab
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|tab| {
+            graph.live_session_for_tab(tab, crate::graph::source_for_consumer(consumer))
+        });
     let r = match graph
-        .run_graph_tool(&cwd, &body.name, &body.args, consumer)
+        .run_graph_tool(&cwd, &body.name, &body.args, consumer, session.as_deref())
         .await
     {
         Ok(text) => RunResult {
@@ -2510,5 +2532,42 @@ mod tests {
         // the route answers 400.
         assert!(serde_json::from_slice::<AuditRunBody>(br#"{"category":"bogus"}"#).is_err());
         assert!(serde_json::from_slice::<AuditRunBody>(br#"{"consumer":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn graph_run_body_round_trips_the_v28_tab_field() {
+        // V28: the per-tab MCP child tags `/graph_run` with the tab it serves.
+        let tagged: GraphRunBody = serde_json::from_slice(
+            br#"{"cwd":"P:\\proj","name":"context_recall","args":{},"consumer":"opencode","tab":"opencode"}"#,
+        )
+        .expect("tagged body parses");
+        assert_eq!(tagged.tab.as_deref(), Some("opencode"));
+        assert_eq!(tagged.consumer.as_deref(), Some("opencode"));
+        assert_eq!(tagged.name, "context_recall");
+    }
+
+    #[test]
+    fn graph_run_body_still_accepts_pre_v28_bodies() {
+        // Fail-open on the wire: a child spawned before the upgrade (or by hand)
+        // sends no `tab` at all, and an explicit `null` must read the same. Both
+        // resolve to `None`, i.e. the pre-V28 most-recent-session scoping — never
+        // a 400 that would break the tool call.
+        let absent: GraphRunBody =
+            serde_json::from_slice(br#"{"name":"context_notes","args":{},"consumer":"claude"}"#)
+                .expect("pre-V28 body still parses");
+        assert!(absent.tab.is_none());
+        assert!(absent.cwd.is_none());
+
+        let null: GraphRunBody =
+            serde_json::from_slice(br#"{"name":"context_notes","args":{},"tab":null}"#)
+                .expect("explicit null parses");
+        assert!(null.tab.is_none());
+
+        // An unknown extra field (a NEWER child talking to an older app) is
+        // likewise tolerated rather than rejected.
+        let extra: GraphRunBody =
+            serde_json::from_slice(br#"{"name":"context_notes","args":{},"future_field":1}"#)
+                .expect("unknown fields ignored");
+        assert!(extra.tab.is_none());
     }
 }

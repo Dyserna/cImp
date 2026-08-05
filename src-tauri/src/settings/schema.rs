@@ -85,7 +85,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 28;
+pub const CURRENT_SCHEMA_VERSION: u8 = 29;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -1499,6 +1499,28 @@ pub struct OffloadSettings {
     /// [`enabled`]: Self::enabled
     /// [`opencode_provider`]: Self::opencode_provider
     pub opencode_provider_auto: bool,
+    /// V30 Phase A: register the `cimp-offload` MCP child as a Claude Code
+    /// **channel** so it can push out-of-band notices straight into a live
+    /// session (`notifications/claude/channel` → a `<channel source="…">`
+    /// message at the next turn boundary — see
+    /// `docs/MILESTONE-V30-mcp-channels.md`).
+    ///
+    /// Two spawn-time effects, both Claude-only (OpenCode has no MCP inbound
+    /// path):
+    ///   * the tab is launched with
+    ///     `--dangerously-load-development-channels server:cimp-offload`
+    ///     ([`crate::tabs`]'s `CHANNEL_REGISTRATION_FLAG`);
+    ///   * the child declares `capabilities.experimental["claude/channel"]` +
+    ///     an `instructions` block at `initialize`.
+    ///
+    /// Default **off**, and marked experimental in the UI: the registration
+    /// flag is a Claude Code *research preview* (it may change or vanish), it
+    /// paints a persistent banner in every tab, and channel delivery is
+    /// fire-and-forget (a misconfigured/policy-blocked push is silently
+    /// dropped — hence invariant 2 in the milestone: every push keeps a pull
+    /// twin). Spawn-baked, so it carries a `spawn_inject_sig` entry and a
+    /// restart hint. Additive `#[serde(default)]` — pre-v29 files load `false`.
+    pub session_push: bool,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1532,6 +1554,7 @@ impl std::fmt::Debug for OffloadSettings {
             // derives Debug.
             .field("opencode_provider", &self.opencode_provider)
             .field("opencode_provider_auto", &self.opencode_provider_auto)
+            .field("session_push", &self.session_push)
             .finish()
     }
 }
@@ -1584,6 +1607,7 @@ impl Default for OffloadSettings {
             escalate_partial: true,
             opencode_provider: None,
             opencode_provider_auto: false,
+            session_push: false,
         }
     }
 }
@@ -4225,6 +4249,28 @@ mod tests {
         assert!(ca.expose_claude);
         assert!(ca.expose_opencode);
         assert!(ca.expose_offload);
+    }
+
+    #[test]
+    fn offload_v28_json_without_session_push_loads_false() {
+        // V30 Phase A: a pre-v29 `offload` block that predates `session_push`
+        // deserializes with the flag OFF — the container-level
+        // `#[serde(default)]` fills the absent field from
+        // `OffloadSettings::default()`. This is why the v28 → v29 migration is
+        // a pure version stamp (no data transform): the additive bool
+        // round-trips for free, and an upgrading user never silently gets a
+        // research-preview channel registration they didn't ask for.
+        let o: OffloadSettings = serde_json::from_value(json!({
+            "enabled": true,
+            "autostart": true,
+            "inject_guidance": true,
+            "server_command": "llama-server --jinja",
+            "escalate_partial": true
+        }))
+        .expect("v28 offload block deserializes");
+        assert!(!o.session_push);
+        // Default-constructed settings agree (the toggle ships off).
+        assert!(!OffloadSettings::default().session_push);
     }
 
     #[test]

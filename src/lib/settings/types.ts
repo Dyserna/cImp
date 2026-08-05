@@ -1308,6 +1308,12 @@ export interface OffloadSettings {
   /// (re-derived at launch + on save when it changed). Disabled server ⇒
   /// no-op.
   opencode_provider_auto: boolean;
+  /// V30 Phase A: register the `cimp-offload` MCP child as a Claude Code
+  /// *channel*, so it can push out-of-band notices (offload/audit/graph
+  /// completion) straight into a live Claude tab. Claude-only, spawn-baked
+  /// (flips raise the AI-tab restart hint), default off — the registration
+  /// flag is a research preview and pushes are fire-and-forget.
+  session_push: boolean;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1622,6 +1628,7 @@ export function defaultSettings(): Settings {
       escalate_partial: true,
       opencode_provider: null,
       opencode_provider_auto: false,
+      session_push: false,
     },
     graph: {
       enabled: false,

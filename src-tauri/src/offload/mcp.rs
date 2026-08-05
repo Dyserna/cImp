@@ -76,6 +76,83 @@ fn tab() -> Option<&'static str> {
     TAB.get().map(String::as_str)
 }
 
+/// V30 Phase A: what the MCP client told us about itself at `initialize`.
+///
+/// Pre-V30 these params were parsed and thrown away — the child advertises a
+/// fixed surface, and the channel capability is a *server* declaration, so
+/// nothing needed them. They are kept now because Phase B's push bus does: a
+/// push to a host that never negotiated channels is silently dropped
+/// client-side (Phase 0, T6), so the only way to distinguish "delivered" from
+/// "into the void" is what the client said at the handshake. Nothing branches
+/// on this yet.
+#[derive(Debug, Clone)]
+struct ClientInit {
+    /// The client's `clientInfo` object verbatim (`{name, version, …}`), or
+    /// `Value::Null` when the client sent none.
+    client_info: Value,
+    /// The client's declared `capabilities` object verbatim, or `Value::Null`.
+    /// Stored, not yet consulted — Phase B reads it to decide whether a push
+    /// has anywhere to land. (`allow(dead_code)` until then; removing the
+    /// field instead would mean re-plumbing the handshake later.)
+    #[allow(dead_code)]
+    capabilities: Value,
+}
+
+impl ClientInit {
+    /// `clientInfo.name`, when the client sent one.
+    fn name(&self) -> Option<&str> {
+        self.client_info.get("name").and_then(Value::as_str)
+    }
+
+    /// `clientInfo.version`, when the client sent one.
+    fn version(&self) -> Option<&str> {
+        self.client_info.get("version").and_then(Value::as_str)
+    }
+}
+
+/// The client's `initialize` params, recorded once. `OnceLock` (like [`CONSUMER`]
+/// / [`TAB`]) because MCP allows exactly one `initialize` per connection: a
+/// second one is a protocol violation and must not be able to rewrite what the
+/// session was established with.
+static CLIENT_INIT: std::sync::OnceLock<ClientInit> = std::sync::OnceLock::new();
+
+/// Record the client's `initialize` params. Idempotent — a duplicate
+/// `initialize` (protocol violation) leaves the first record standing.
+fn record_client_init(params: &Value) {
+    let init = ClientInit {
+        client_info: params.get("clientInfo").cloned().unwrap_or(Value::Null),
+        capabilities: params.get("capabilities").cloned().unwrap_or(Value::Null),
+    };
+    let name = init.name().unwrap_or("<unknown>").to_string();
+    let version = init.version().unwrap_or("<unknown>").to_string();
+    let protocol = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("<unset>")
+        .to_string();
+    if CLIENT_INIT.set(init).is_ok() {
+        // `eprintln!`, not `tracing!`: `main` dispatches `--offload-mcp` BEFORE
+        // `logging::init`, so this process has no subscriber and a `tracing`
+        // event would go nowhere. stderr is where the child's diagnostics
+        // actually land — the host agent captures it in its MCP server log,
+        // which is exactly where one looks when a channel registration
+        // misbehaves. (Same channel the spike's messages use; stdout is the
+        // JSON-RPC pipe and must never be written to directly.)
+        eprintln!(
+            "cimp-offload: MCP client initialized — {name} {version} \
+             (protocol {protocol}, consumer {})",
+            consumer()
+        );
+    }
+}
+
+/// What the client declared at `initialize`, or `None` before the handshake.
+/// The Phase B seam — no current caller.
+#[allow(dead_code)]
+fn client_init() -> Option<&'static ClientInit> {
+    CLIENT_INIT.get()
+}
+
 /// Entry point for `cimp --offload-mcp [--consumer <name>] [--tab <tab-id>]`.
 /// Builds a current-thread tokio runtime and serves the stdio loop until stdin
 /// closes. `consumer` selects which MCP-server set the app proxies to this child
@@ -142,18 +219,43 @@ async fn handle_owned(method: String, params: Value) -> Result<Value, (i64, Stri
 async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => {
-            // The client's own `capabilities` (and `clientInfo`) arrive in
-            // `params` and are deliberately discarded — this child advertises a
-            // fixed surface. Channel support is a SERVER declaration, so the
-            // spike needs no client-capability parsing.
+            // V30 Phase A: the client's `clientInfo` + `capabilities` are
+            // recorded (they used to be discarded). Nothing branches on them
+            // yet — this is the seam Phase B needs to tell a channel-capable
+            // host from one that would silently drop pushes.
+            record_client_init(&params);
             let mut result = json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": { "listChanged": true } },
                 "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
             });
-            // V30 Phase 0 channel spike — remove when #15 spike concludes.
-            if spike_enabled() {
+            // Declare the Claude Code channel capability + system-prompt
+            // `instructions` when session push is armed. Two independent
+            // triggers, spike first so its verification-oriented wording wins
+            // while the (env-gated, zero-effect-when-unset) rig is in use.
+            // Evaluated once — `session_push_enabled` reads settings off disk.
+            //
+            // The `spike_enabled()` arm is V30 Phase 0 — remove when #15's
+            // spike rig goes; the `session_push_enabled()` arm is Phase A and
+            // stays.
+            let declared = if spike_enabled() {
                 spike_decorate_initialize(&mut result);
+                true
+            } else if session_push_enabled() {
+                decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
+                true
+            } else {
+                false
+            };
+            if declared {
+                // Stderr, for the same reason as `record_client_init` — and
+                // the one line that tells a user debugging a missing push
+                // whether the SERVER half of the handshake happened at all.
+                eprintln!(
+                    "cimp-offload: declared the claude/channel capability \
+                     (session push armed for consumer {})",
+                    consumer()
+                );
             }
             Ok(result)
         }
@@ -938,6 +1040,46 @@ async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
     emit_notification(stdout, "notifications/tools/list_changed", None).await;
 }
 
+// ── V30 Phase A: session-push capability declaration ───────────────────────
+
+/// The system-prompt `instructions` block injected alongside the channel
+/// capability when `offload.session_push` is on.
+///
+/// It tells the model what a `<channel source="cimp-offload">` message is and
+/// how to treat one. The "do not invent" clause is deliberate: a channel
+/// message is a plain user-role message from the model's point of view, so
+/// without it the pattern is trivially imitable in the model's own output.
+const CHANNEL_INSTRUCTIONS: &str = "cimp-offload may push out-of-band notices into this session as <channel source=\"cimp-offload\"> messages — completion notices from the local toolchain (offloaded tasks, code audits, graph indexing). When one arrives, take it into account: act on it if it is relevant to the current task, otherwise acknowledge it briefly. Do not invent channel messages; only react to ones actually delivered.";
+
+/// Add `capabilities.experimental["claude/channel"]` + the top-level
+/// `instructions` string to an otherwise-unchanged `initialize` result.
+///
+/// Pure, so a test can pin both the addition and the untouched base — notably
+/// `protocolVersion`, which MUST stay on the legacy `2025-06-18` era where the
+/// client honours channels (milestone invariant 1), and `tools.listChanged`.
+fn decorate_initialize_channel(result: &mut Value, instructions: &str) {
+    result["capabilities"]["experimental"] = json!({ "claude/channel": {} });
+    result["instructions"] = Value::String(instructions.to_string());
+}
+
+/// Whether this child should declare the channel capability because the user
+/// turned session push on.
+///
+/// Two gates:
+///   * **consumer** — channels are a Claude Code mechanism; an OpenCode child
+///     (`--consumer opencode`) has no inbound MCP path at all (see the
+///     milestone's Phase D), so it must never declare one.
+///   * **settings** — `offload.session_push`, read through the same
+///     [`current_offload_settings`] mechanism that gates `offload_task` in
+///     `tools/list`. That is a *fresh read of the layered settings files from
+///     this child's cwd*, so it sees whatever is on disk at handshake time; the
+///     matching `--dangerously-load-development-channels` flag is baked into
+///     the tab's argv at spawn either way, so both halves only ever change
+///     together on a tab restart.
+fn session_push_enabled() -> bool {
+    consumer() == "claude" && current_offload_settings().session_push
+}
+
 // ── V30 Phase 0 channel spike ──────────────────────────────────────────────
 //
 // V30 Phase 0 channel spike — remove when #15 spike concludes.
@@ -992,11 +1134,11 @@ fn spike_enabled() -> bool {
 }
 
 /// Add the experimental channel capability + the top-level `instructions`
-/// string to an otherwise-unchanged `initialize` result. Pure, so a test can
-/// pin both the addition and the untouched base (notably `protocolVersion`).
+/// string to an otherwise-unchanged `initialize` result, with the spike's own
+/// verification-oriented wording. Shares the (V30 Phase A) pure decorator so
+/// the rig and the production path can never drift on the wire shape.
 fn spike_decorate_initialize(result: &mut Value) {
-    result["capabilities"]["experimental"] = json!({ "claude/channel": {} });
-    result["instructions"] = Value::String(SPIKE_INSTRUCTIONS.to_string());
+    decorate_initialize_channel(result, SPIKE_INSTRUCTIONS);
 }
 
 /// The two spike tool descriptors, appended to `tools/list` only while the
@@ -1707,6 +1849,92 @@ mod tests {
             notification_frame("notifications/progress", Some(json!({ "progress": 1 })));
         assert_eq!(with_params["params"]["progress"], json!(1));
         assert_eq!(with_params["jsonrpc"], "2.0");
+    }
+
+    // ── V30 Phase A: session push ────────────────────────────────────────
+
+    /// A base `initialize` result, exactly as the handler builds it.
+    fn base_initialize() -> Value {
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": { "tools": { "listChanged": true } },
+            "serverInfo": { "name": SERVER_NAME, "version": "test" }
+        })
+    }
+
+    /// The production decoration adds the experimental channel capability and
+    /// the `instructions` block WITHOUT disturbing the rest of the handshake.
+    /// `protocolVersion` is the load-bearing one (milestone invariant 1): the
+    /// client skips channel registration entirely on the modern MCP era, so a
+    /// bump here would silently kill session push.
+    #[test]
+    fn channel_decoration_preserves_the_legacy_handshake() {
+        let mut result = base_initialize();
+        decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
+        assert_eq!(result["protocolVersion"], "2025-06-18");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(true));
+        assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
+        assert!(result["capabilities"]["experimental"]["claude/channel"].is_object());
+        assert_eq!(result["instructions"], json!(CHANNEL_INSTRUCTIONS));
+    }
+
+    /// An undecorated handshake carries neither key — the default-off setting
+    /// must be a byte-identical, pre-V30 `initialize` result.
+    #[test]
+    fn undecorated_initialize_declares_no_channel() {
+        let result = base_initialize();
+        assert!(result["capabilities"].get("experimental").is_none());
+        assert!(result.get("instructions").is_none());
+    }
+
+    /// The production `instructions` text must name the exact wire form the
+    /// model will see, describe what to do with a notice, and forbid inventing
+    /// them (a channel message is an ordinary user-role message, so the shape
+    /// is trivially imitable).
+    #[test]
+    fn channel_instructions_cover_the_delivery_contract() {
+        assert!(CHANNEL_INSTRUCTIONS.contains("<channel source=\"cimp-offload\">"));
+        assert!(CHANNEL_INSTRUCTIONS.contains("Do not invent channel messages"));
+        // Distinct from the spike's verification wording — the two paths are
+        // deliberately not the same prompt.
+        assert_ne!(CHANNEL_INSTRUCTIONS, SPIKE_INSTRUCTIONS);
+    }
+
+    /// V30 Phase A: the client's `initialize` params are no longer discarded.
+    /// `record_client_init` runs against a process-wide `OnceLock`, so this
+    /// test exercises the *parse*, which is the part Phase B depends on.
+    #[test]
+    fn client_init_parses_info_and_capabilities() {
+        let params = json!({
+            "protocolVersion": "2025-06-18",
+            "clientInfo": { "name": "claude-code", "version": "2.1.222" },
+            "capabilities": { "roots": { "listChanged": true } }
+        });
+        let init = ClientInit {
+            client_info: params.get("clientInfo").cloned().unwrap_or(Value::Null),
+            capabilities: params.get("capabilities").cloned().unwrap_or(Value::Null),
+        };
+        assert_eq!(init.name(), Some("claude-code"));
+        assert_eq!(init.version(), Some("2.1.222"));
+        assert_eq!(init.capabilities["roots"]["listChanged"], json!(true));
+
+        // A client that sends neither must not panic or fabricate values.
+        let bare = ClientInit {
+            client_info: Value::Null,
+            capabilities: Value::Null,
+        };
+        assert_eq!(bare.name(), None);
+        assert_eq!(bare.version(), None);
+    }
+
+    /// `record_client_init` must never rewrite a recorded handshake: MCP
+    /// permits exactly one `initialize` per connection, and a second one is a
+    /// protocol violation, not a re-negotiation.
+    #[test]
+    fn record_client_init_is_write_once() {
+        record_client_init(&json!({ "clientInfo": { "name": "first" } }));
+        record_client_init(&json!({ "clientInfo": { "name": "second" } }));
+        assert_eq!(client_init().and_then(ClientInit::name), Some("first"));
     }
 
     // ── V30 Phase 0 channel spike — remove when #15 spike concludes. ──────

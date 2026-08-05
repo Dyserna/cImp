@@ -3450,6 +3450,31 @@
             when an AI tab starts — restart the Claude/OpenCode tab
             (Tabs → Restart) after changing either toggle.
           </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.session_push}
+              onchange={(e) =>
+                patch((s) => (s.offload.session_push = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Session push (experimental)</span>
+          </label>
+          <small class="hint">
+            Lets cImp push notices — offload results, audit and graph-index
+            completions — straight into a live Claude tab, where they arrive as
+            <code>&lt;channel source="cimp-offload"&gt;</code> messages at the
+            next turn boundary. <strong>Claude only</strong> for now (OpenCode
+            has no equivalent inbound path) and it needs the
+            <code>cimp-offload</code> MCP server to be injected, i.e. offload or
+            the code graph enabled. Baked in at launch, so restart your AI tabs
+            after changing it — cImp shows the restart hint automatically.
+            <strong>Experimental:</strong> it rides a Claude Code
+            research-preview flag that may change or disappear, Claude paints a
+            persistent "Channels (experimental)" banner (plus a harmless
+            "no MCP server configured with that name" warning) in every tab it
+            registers, and a push that can't be delivered is silently dropped.
+            Off by default.
+          </small>
 
           <hr class="card-divider lg" />
           <div class="sub-tabs" role="tablist" aria-label="Offload sub-sections">

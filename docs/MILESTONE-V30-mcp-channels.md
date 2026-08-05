@@ -4,7 +4,13 @@
 GO confirmed, decisions below. Investigation report + go/no-go in the
 [#28 closing comment](https://github.com/Dyserna/cImp/issues/28#issuecomment-5191836292);
 spike results also on #15. Umbrella issue #15, GH milestone 4 (NC-4/CD-1
-from the 2026-08-04 maintenance run). Next: Phases A–D.
+from the 2026-08-04 maintenance run). **Phase A IMPLEMENTED 2026-08-05**
+(settings gate `offload.session_push` default-off, schema v28→v29, spawn flag
++ `spawn_inject_sig` entry, child capability declaration + client-init
+storage, UI toggle; live-verify: enable the toggle with offload/graph on,
+restart a Claude tab, expect the channels banner + `/status` "Listening" +
+the child stderr line "declared the claude/channel capability" in the MCP
+log). Next: Phases B–D.
 **Builds on:** the single-proxy stdio child (`cimp --offload-mcp`, one per
 tab), its existing out-of-band notification spine
 (`offload/mcp.rs::events_relay` → `emit_list_changed`, the one unsolicited

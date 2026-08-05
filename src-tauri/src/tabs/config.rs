@@ -307,6 +307,14 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
             post_edit,
         ],
         "local_env": local_env,
+        // V30 Phase A: the `--dangerously-load-development-channels` flag that
+        // registers the `cimp-offload` child as a session channel. Claude-only
+        // (OpenCode has no MCP inbound path) and baked at spawn, so it is
+        // exactly the kind of Settings-gated injection the rule at the top of
+        // this object demands an entry for: without it, toggling `session_push`
+        // mid-session leaves every running tab silently unregistered (or
+        // registered) with no restart hint.
+        "channels": s.offload.session_push,
     });
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
@@ -339,6 +347,9 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
 ///     the global `statusline.enabled`. The overlay merges with the
 ///     user's own Claude settings (only `statusLine` is set), so it
 ///     scopes the context bar to cImp without touching `~/.claude`.
+///   * `--dangerously-load-development-channels server:cimp-offload` —
+///     V30 Phase A session-push registration, gated on the default-off
+///     `offload.session_push` (see [`CHANNEL_REGISTRATION_FLAG`]).
 ///
 /// V28: `tab` is the launching tab's id, baked into the `cimp-offload` MCP
 /// child's argv (`--tab <id>`) so the app can resolve which of this agent's
@@ -572,6 +583,21 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
         }
     }
 
+    // V30 Phase A: register the `cimp-offload` child as a session channel so it
+    // can push out-of-band notices into this tab. Gated on the default-off
+    // `offload.session_push` (research preview — see
+    // [`CHANNEL_REGISTRATION_FLAG`]) AND on the same predicate that writes the
+    // `cimp-offload` entry into the `--mcp-config` overlay above — a channel
+    // registration for a server that is never injected would be pure banner
+    // noise. Both inputs are carried in `spawn_inject_sig`'s `claude` object
+    // (`"channels"` + the `"mcp"` pair), so any mid-session change to the
+    // effective value raises the restart hint. Claude-only, like every other
+    // pre-arg here.
+    if settings.offload.session_push && advertises_offload_to_claude(settings) {
+        args.push(CHANNEL_REGISTRATION_FLAG.to_string());
+        args.push(CHANNEL_REGISTRATION_TARGET.to_string());
+    }
+
     args
 }
 
@@ -662,6 +688,28 @@ fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
     }
     Some(out)
 }
+
+/// V30 Phase A: the Claude Code flag that registers our stdio MCP child as a
+/// **session channel**, letting it push `notifications/claude/channel` frames
+/// straight into the live session (they surface as `<channel source="…">`
+/// messages at the next turn boundary). The argument is
+/// `server:<mcpServers key>` — `cimp-offload`, the key `build_pre_args` writes
+/// into the `--mcp-config` overlay below; the two MUST stay in lockstep.
+///
+/// ⚠ **Research-preview contract — this flag may be renamed or removed.**
+/// Verified against Claude Code 2.1.222 (V30 Phase 0 spike, 2026-08-05): the
+/// flag is hidden from `--help`, registration is silent (no consent dialog),
+/// and it paints a persistent "Channels (experimental)" banner plus a cosmetic
+/// "no MCP server configured with that name" warning (the dev-flag validation
+/// runs before `--mcp-config` files load; function is unaffected). The proper
+/// `--channels` flag is allowlisted to `plugin:@marketplace` entries only, so
+/// this is the only registration path for a bare `mcpServers` server. See
+/// `docs/MILESTONE-V30-mcp-channels.md` for the full contract + drift notes.
+const CHANNEL_REGISTRATION_FLAG: &str = "--dangerously-load-development-channels";
+
+/// The channel target passed to [`CHANNEL_REGISTRATION_FLAG`]: our offload MCP
+/// child, addressed by its `mcpServers` key.
+const CHANNEL_REGISTRATION_TARGET: &str = "server:cimp-offload";
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
 /// `offload_task`. Without this nudge the model rarely offloads. Gated by
@@ -2819,6 +2867,18 @@ mod tests {
         s.tabs.push(TabConfig::AiTool(tab));
         assert_ne!(spawn_inject_sig(&s)[0], base[0]);
 
+        // Claude-only: V30 Phase A session-push registration. This is THE
+        // guard demanded by the rule in `spawn_inject_sig` — the flag is baked
+        // into argv at spawn, so flipping it must nag running tabs to restart.
+        let mut s = Settings::default();
+        s.offload.session_push = true;
+        let sig = spawn_inject_sig(&s);
+        assert_ne!(sig[0], base[0], "session_push must move the Claude sig");
+        assert_eq!(
+            sig[1], base[1],
+            "channels are Claude-only — OpenCode has no MCP inbound path"
+        );
+
         // Live-applied tuning must NOT nag: the read-advisor thresholds are
         // read per-invocation by the loopback handler, not baked at spawn.
         let mut s = Settings::default();
@@ -2826,5 +2886,59 @@ mod tests {
         s.graph.read_advisor_min_lines += 25;
         s.graph.context_per_file_chars += 100;
         assert_eq!(spawn_inject_sig(&s), with_graph);
+    }
+
+    /// V30 Phase A: the channel registration flag is emitted for a Claude tab
+    /// exactly when `offload.session_push` is on — as an adjacent
+    /// `<flag> server:cimp-offload` pair, addressing the same `mcpServers` key
+    /// `build_pre_args` writes into the `--mcp-config` overlay.
+    #[test]
+    fn session_push_adds_the_channel_registration_flag_for_claude_only() {
+        let cfg = claude_cfg();
+
+        // Default (off): no channel flag anywhere in the pre-args.
+        let mut s = Settings::default();
+        s.offload.enabled = true;
+        let off = build_pre_args(&cfg, &s, "claude");
+        assert!(
+            !off.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
+            "session_push defaults off — no channel flag"
+        );
+
+        // On: flag + target, in that order, adjacent.
+        s.offload.session_push = true;
+        let on = build_pre_args(&cfg, &s, "claude");
+        let i = on
+            .iter()
+            .position(|a| a == CHANNEL_REGISTRATION_FLAG)
+            .expect("channel flag is injected when session_push is on");
+        assert_eq!(
+            on.get(i + 1).map(String::as_str),
+            Some("server:cimp-offload")
+        );
+        // The target names the very server the `--mcp-config` overlay defines;
+        // a rename on either side would break registration silently.
+        let mcp = on
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .and_then(|j| on.get(j + 1))
+            .expect("offload enabled ⇒ an mcp-config overlay");
+        assert!(mcp.contains("\"cimp-offload\""));
+
+        // OpenCode (and any non-Claude command) gets no pre-args at all.
+        assert!(build_pre_args(&opencode_cfg(), &s, "opencode").is_empty());
+
+        // session_push without ANY reason to inject the `cimp-offload` server
+        // (offload, graph, and Claude-exposed MCP all off) must emit no flag —
+        // registering a channel for a server that is never defined is noise.
+        let mut bare = Settings::default();
+        bare.offload.session_push = true;
+        bare.offload.enabled = false;
+        bare.graph.enabled = false;
+        let none = build_pre_args(&cfg, &bare, "claude");
+        assert!(
+            !none.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
+            "no cimp-offload server injected ⇒ no channel registration"
+        );
     }
 }

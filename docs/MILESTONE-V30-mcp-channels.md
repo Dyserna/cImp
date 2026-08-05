@@ -1,10 +1,10 @@
 # V30 — MCP channels (session push)
 
-**Status:** Phase 0 spike IN PROGRESS (2026-08-05). Investigation done — full
-contract report + go/no-go in the
-[#28 closing comment](https://github.com/Dyserna/cImp/issues/28#issuecomment-5191836292)
-(qualified GO). Umbrella issue #15, GH milestone 4 (NC-4/CD-1 from the
-2026-08-04 maintenance run).
+**Status:** Phase 0 spike COMPLETE (2026-08-05) — all six tests run live,
+GO confirmed, decisions below. Investigation report + go/no-go in the
+[#28 closing comment](https://github.com/Dyserna/cImp/issues/28#issuecomment-5191836292);
+spike results also on #15. Umbrella issue #15, GH milestone 4 (NC-4/CD-1
+from the 2026-08-04 maintenance run). Next: Phases A–D.
 **Builds on:** the single-proxy stdio child (`cimp --offload-mcp`, one per
 tab), its existing out-of-band notification spine
 (`offload/mcp.rs::events_relay` → `emit_list_changed`, the one unsolicited
@@ -77,27 +77,46 @@ $trig = "$env:TEMP\v30-push.txt"
 claude --mcp-config $cfg --strict-mcp-config --dangerously-load-development-channels server:cimp-offload
 ```
 
-Record per test (kill criteria in **bold**):
+Results (ALL RUN 2026-08-05, Claude Code 2.1.222, Windows 11, Max account,
+session 70576d64; findings also posted to #15):
 
-- [ ] **T1 dialog:** exact consent-dialog text/options/keystrokes; whether it
-      precedes the TUI; the startup notice line; whether anything persists a
-      choice. → feeds the dialog-policy decision (manual ack vs opt-in PTY
-      auto-ack).
-- [ ] **T2 idle push (kill: #45563):** stay idle ≥20 s → auto-push must
-      arrive, **start a turn**, and Claude must repeat content + meta
-      verbatim (its `instructions` say to). Note the `←` TUI line.
-- [ ] **T3 mid-turn push:** ask Claude to `sleep 40` in Bash; meanwhile from
-      another terminal `Set-Content $env:TEMP\v30-push.txt "midturn-<nonce>"`
-      → delivery batched at the next turn boundary, not lost.
-- [ ] **T4 auto-backgrounding (CD-1):** "call spike_slow with seconds=150"
-      (this standalone session has no `…AUTO_BACKGROUND_MS=0`, default
-      120 s applies) → expect task-id handoff at ~2 min + result via task
-      notification. Record the notification shape and whether the result text
-      reaches the model end-to-end.
-- [ ] **T5 progress keepalive:** "call spike_slow_progress with seconds=180"
-      → if a progressToken was sent (result text says), the call should stay
-      foregrounded past 2 min. If no token: finding — stall-reset lever is
-      unavailable to MCP servers, note it on #15.
+- [x] **T1 dialog: THERE IS NO CONSENT DIALOG in 2.1.222.** Registration is
+      silent (MCP log `Channel notifications registered` ~4 s after spawn,
+      before any interaction). The only UX: a persistent banner ("Channels
+      (experimental) messages from server:cimp-offload inject directly in
+      this session · restart without --dangerously-load-development-channels
+      to stop") plus a **cosmetic bogus warning** "server:cimp-offload · no
+      MCP server configured with that name" (dev-flag validation runs before
+      `--mcp-config` files load; function unaffected). `/status` shows
+      "Channels: Listening for messages from server:cimp-offload". → Dialog
+      policy is moot today; add a drift tripwire for when the documented
+      dialog materializes.
+- [x] **T2 idle push: PASS, #45563 does not reproduce.** Push delivered at
+      T+24 s, **started a turn from idle** with zero user input; landed as an
+      `isMeta` user message `<channel source="cimp-offload" kind="spike_auto"
+      seq="0">…</channel>`; Claude echoed content + meta per the injected
+      `instructions`.
+- [x] **T3 mid-turn push: PASS.** Trigger-file push during an in-flight
+      `spike_slow` queued and delivered at the next turn boundary as
+      `kind="spike_file" seq="1"`; nothing lost.
+- [x] **T4 auto-backgrounding (CD-1): PASS end-to-end.** At exactly 120 s the
+      call moved to background ("moved to the background as task k653fxpb4 …
+      does not survive exiting this session"); Claude kept working; at 150 s
+      the **complete tool-result text arrived** in a `<task-notification>`
+      user message. Backgrounding loses nothing (for text results).
+- [x] **T5 progress keepalive: FAILS — docs claim is wrong.** Claude Code
+      DOES send a `progressToken`; the child emitted 11
+      `notifications/progress` (every 15 s); the call was **backgrounded at
+      120 s anyway**. MCP progress notifications do NOT reset the
+      auto-background stall timer in 2.1.222. The keepalive lever is dead;
+      the real choices are `AUTO_BACKGROUND_MS=0` (blocking) vs native
+      backgrounding (verified safe).
+
+**Spike gotcha for future harness tests:** a claude spawned from within a
+Claude Code session inherits `CLAUDE_CODE_CHILD_SESSION=1` and runs with
+**no transcript, no history, no session records** (turns still execute).
+Strip the harness env vars when spawning test sessions. (cImp's GUI-spawned
+tabs are unaffected.)
 - [x] **T6 `-p` probe** — RUN 2026-08-05 (Sonnet, stream-json, spike_slow(30)
       kept the session alive to T+30): tool ran fine over MCP, but **no
       channel message was delivered and nothing warned** — in `-p` the
@@ -106,14 +125,25 @@ Record per test (kill criteria in **bold**):
       real and observable. (Bonus finding: bare Bash `sleep` is blocked by
       the 2.1.222 harness in `-p`.)
 
-### Decisions owed at spike close
+### Decisions (made at spike close, 2026-08-05)
 
-- Dialog policy: per-tab manual ack vs explicit opt-in PTY auto-ack vs shelve.
-- Per use case, the completion path: channel push / native auto-backgrounding
-  / progress keepalive — for `offload_task`, `offload_batch`, audit runs,
-  graph indexing.
-- Whether `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` (`tabs/config.rs:1232`)
-  stays, becomes conditional, or goes.
+1. **Dialog policy: none needed.** No dialog exists in 2.1.222; registration
+   is silent + banner-only. Add a contract-drift tripwire (harness_versions)
+   for a future consent dialog — research preview, it may yet appear.
+2. **Completion paths per use case:**
+   - `offload_task` / `offload_batch` (per-call results): **native
+     auto-backgrounding** — remove `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0`
+     from the Claude spawn env in Phase C (T4 proved the full result text
+     arrives via task-notification; the child's synchronous NDJSON pipeline
+     is unaffected because backgrounding is purely client-side). Progress
+     keepalive is not an option (T5).
+   - Audit runs, graph-index completion, batch stragglers / cross-call
+     notices: **channel push** (Phases B/C) — the only mechanism for results
+     not tied to an open call.
+3. **Adoption confirmed GO**, settings-gated default-off (`offload.
+   session_push`): zero registration friction today, but the banner + bogus
+   warning line are user-visible in every tab, the contract is research
+   preview, and pushes remain silent-drop (invariant 2 stands).
 
 ## Phases A–D (sketch — full text in the #28 comment)
 

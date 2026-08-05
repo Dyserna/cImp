@@ -94,7 +94,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # shutdown. We deliberately do NOT invert it on our side: that compensation
 # would silently break the day upstream fixes theirs.
 portable-pty = "0.9"
-thiserror = "1"
+thiserror = "2"
 # V12 Phase A: `run_check` diagnostic parsers (tsc / generic gcc-style
 # `file:line:col: level: message`). Pure Rust, no C deps.
 regex = "1"
@@ -109,9 +109,14 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-base64 = "0.22"
-which = "6"
-vte = "0.13"
+# 0.23 added a default-on `simd-unsafe` feature (hand-written SIMD behind
+# `unsafe`). Deliberately OPTED OUT: cImp's one call site is
+# `BASE64_STANDARD.encode` on a PTY output chunk in `pty::tasks` — nowhere near
+# hot enough to trade the repo's no-unsafe-surprises posture for. `std` (which
+# implies `alloc`) is all that call site needs.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+which = "8"
+vte = "0.15"
 shlex = "1"
 uuid = { version = "1", features = ["v4"] }
 # V8-01 offload: async methods on the ToolRouter trait (native + MCP-host
@@ -146,8 +151,17 @@ ort = { version = "=2.0.0-rc.11", features = ["download-binaries"] }
 bytemuck = "1"
 
 # Audio output
-cpal = "0.15"
-rodio = "0.20"
+# Held at 0.17 (NOT the newer 0.18) deliberately: `rodio` 0.22 depends on
+# `cpal = "^0.17"`, so a 0.18 here would resolve a SECOND cpal into the tree —
+# two WASAPI hosts, two copies of the `windows` bindings, and no shared types
+# between STT capture (this dep) and TTS playback (rodio's). Bump this only in
+# lockstep with rodio's cpal requirement.
+cpal = "0.17"
+# `playback` only. cImp never decodes a container/codec — TTS hands rodio raw
+# f32 PCM through its own `Source` impl (`TappedSource`) — so 0.22's default
+# feature set (flac/mp3/mp4/vorbis/wav/dither/recording) would compile a full
+# symphonia stack, `rand`/`rand_distr` and `rtrb` for nothing.
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
 
 # STT (Whisper via whisper.cpp bindings). Statically links one C library;
 # needs a C/C++ toolchain + CMake at build time (see MAINTENANCE.md). CUDA is
@@ -206,17 +220,30 @@ ignore = "0.4"
 # Cross-platform fs watcher for incremental graph re-indexing (Phase D). On
 # Windows this is ReadDirectoryChangesW under the hood. Debounce + gitignore
 # filtering are done in `graph::watcher`.
-notify = "6"
+notify = "8"
 # Native file/folder picker for the Settings graph-ignore editor
 # (`graph_ignore_pick`). Win32 IFileDialog on Windows; `xdg-portal` (not gtk3)
-# on Linux so we don't link a second GTK next to Tauri's, with `tokio` as the
-# portal's async backend to match the app runtime.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# on Linux so we don't link a second GTK next to Tauri's.
+#
+# 0.17 DELETED the `tokio` feature: `xdg-portal` now always drives its own
+# executor (`pollster`). That's a non-issue here — `graph_ignore_pick` already
+# runs the sync dialog inside `spawn_blocking`, so nothing ever awaited rfd on
+# the app runtime. `wayland` (also a 0.17 default) is for the Linux build's
+# parent-window handle; every one of its deps — like `pollster`'s — is
+# target-gated to linux/BSD in rfd's manifest, so it costs the Windows build
+# nothing but a few Cargo.lock lines. `default-features = false` is kept
+# deliberately so a future default (e.g. gtk3 returning) can't leak in.
+rfd = { version = "0.17", default-features = false, features = [
+    "xdg-portal",
+    "wayland",
+] }
 # V17 Phase A: line-level unified diffs for the read advisor's diff-substitute
 # branch (a changed-file re-read is answered with a diff against the last-read
 # snapshot, not the whole file). Pure Rust, MIT/Apache; `text` only — we don't
 # use the inline/bytes/serde/unicode features. One call site: `graph::context::unified_diff`.
-similar = { version = "2", default-features = false, features = ["text"] }
+# 3.x split a `std` feature out of the always-on baseline, so it must now be
+# named explicitly alongside `text` (both are in 3.x's default set).
+similar = { version = "3", default-features = false, features = ["std", "text"] }
 
 # V14 Phase F (Preview tab): official Tauri plugin for "open this URL/path in
 # the user's default browser/file manager" — used for external links clicked

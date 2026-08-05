@@ -140,7 +140,8 @@ fn start_capture(
         .default_input_config()
         .map_err(|e| AppError::Stt(format!("default input config: {e}")))?;
     let sample_format = supported.sample_format();
-    let sample_rate = supported.sample_rate().0;
+    // cpal 0.17 turned `SampleRate` from a newtype into a plain `u32` alias.
+    let sample_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     // `data.chunks(channels)` in the callback panics on a zero chunk size, and
     // a 0-channel config is meaningless for capture — reject it up front.
@@ -151,7 +152,9 @@ fn start_capture(
 
     info!(
         target: "stt",
-        device = device.name().unwrap_or_else(|_| "<unknown>".into()),
+        // cpal 0.17 deprecated `Device::name()`; its default impl was exactly
+        // `description().name()`, so this is the same string.
+        device = device_name(&device).unwrap_or_else(|| "<unknown>".into()),
         sample_rate,
         channels,
         format = ?sample_format,
@@ -200,13 +203,21 @@ fn start_capture(
     })
 }
 
+/// Human-readable device name, or `None` if the backend can't report one.
+/// Replaces cpal 0.17's deprecated `Device::name()`, whose default impl was
+/// literally `description().name().to_string()` — so the strings this yields
+/// (and therefore the persisted `stt.input_device` setting) are unchanged.
+pub(crate) fn device_name(device: &cpal::Device) -> Option<String> {
+    device.description().ok().map(|d| d.name().to_string())
+}
+
 /// Resolve `wanted` (empty = system default) to a concrete input device,
 /// falling back to the default device if the named one is gone.
 fn resolve_input_device(host: &cpal::Host, wanted: &str) -> AppResult<cpal::Device> {
     if !wanted.is_empty() {
         if let Ok(devices) = host.input_devices() {
             for d in devices {
-                if d.name().map(|n| n == wanted).unwrap_or(false) {
+                if device_name(&d).as_deref() == Some(wanted) {
                     return Ok(d);
                 }
             }

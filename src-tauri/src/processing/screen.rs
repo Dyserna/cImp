@@ -180,14 +180,15 @@ impl Screen {
         drop
     }
 
-    /// Push raw bytes into the parser. Each byte is mirrored into `raw_buffer`
-    /// before being advanced through `vte::Parser` so the Performer callbacks
-    /// observe a consistent view of "bytes-so-far."
+    /// Push raw bytes into the parser. The whole chunk is mirrored into
+    /// `raw_buffer` before it is advanced through `vte::Parser` (0.15's
+    /// `advance` is slice-at-a-time, not byte-at-a-time). That ordering is
+    /// safe because no `Perform` callback reads `raw_buffer` — it is only ever
+    /// drained by `drain_flushable`/`compact_raw` between feeds — so the
+    /// observable result is identical to the old per-byte interleave.
     pub fn feed(&mut self, parser: &mut vte::Parser, bytes: &[u8]) {
-        for &b in bytes {
-            self.raw_buffer.push(b);
-            parser.advance(self, b);
-        }
+        self.raw_buffer.extend_from_slice(bytes);
+        parser.advance(self, bytes);
     }
 
     /// Ensure row `row` exists, scrolling the oldest rows off the top if `row`

@@ -79,24 +79,18 @@ fn tab() -> Option<&'static str> {
 
 /// V30 Phase A: what the MCP client told us about itself at `initialize`.
 ///
-/// Pre-V30 these params were parsed and thrown away — the child advertises a
-/// fixed surface, and the channel capability is a *server* declaration, so
-/// nothing needed them. They are kept now because Phase B's push bus does: a
-/// push to a host that never negotiated channels is silently dropped
-/// client-side (Phase 0, T6), so the only way to distinguish "delivered" from
-/// "into the void" is what the client said at the handshake. Nothing branches
-/// on this yet.
+/// Its one consumer is the stderr handshake line in [`record_client_init`] —
+/// the line one looks for in the host's MCP server log when a push goes
+/// missing. The client's declared `capabilities` are deliberately NOT stored:
+/// the review of Phase B found the stated rationale ("Phase B reads it to
+/// decide whether a push has anywhere to land") to be false — the child gates
+/// pushes on [`CHANNEL_DECLARED`], its own server-side declaration, because
+/// Claude Code never advertises channel support on the client side at all.
 #[derive(Debug, Clone)]
 struct ClientInit {
     /// The client's `clientInfo` object verbatim (`{name, version, …}`), or
     /// `Value::Null` when the client sent none.
     client_info: Value,
-    /// The client's declared `capabilities` object verbatim, or `Value::Null`.
-    /// Stored, not yet consulted — Phase B reads it to decide whether a push
-    /// has anywhere to land. (`allow(dead_code)` until then; removing the
-    /// field instead would mean re-plumbing the handshake later.)
-    #[allow(dead_code)]
-    capabilities: Value,
 }
 
 impl ClientInit {
@@ -122,7 +116,6 @@ static CLIENT_INIT: std::sync::OnceLock<ClientInit> = std::sync::OnceLock::new()
 fn record_client_init(params: &Value) {
     let init = ClientInit {
         client_info: params.get("clientInfo").cloned().unwrap_or(Value::Null),
-        capabilities: params.get("capabilities").cloned().unwrap_or(Value::Null),
     };
     let name = init.name().unwrap_or("<unknown>").to_string();
     let version = init.version().unwrap_or("<unknown>").to_string();
@@ -137,8 +130,8 @@ fn record_client_init(params: &Value) {
         // event would go nowhere. stderr is where the child's diagnostics
         // actually land — the host agent captures it in its MCP server log,
         // which is exactly where one looks when a channel registration
-        // misbehaves. (Same channel the spike's messages use; stdout is the
-        // JSON-RPC pipe and must never be written to directly.)
+        // misbehaves. (stdout is the JSON-RPC pipe and must never be written
+        // to directly.)
         eprintln!(
             "cimp-offload: MCP client initialized — {name} {version} \
              (protocol {protocol}, consumer {})",
@@ -147,9 +140,12 @@ fn record_client_init(params: &Value) {
     }
 }
 
-/// What the client declared at `initialize`, or `None` before the handshake.
-/// The Phase B seam — no current caller.
-#[allow(dead_code)]
+/// What the client sent at `initialize`, or `None` before the handshake.
+/// Test-only: the production consumer of [`CLIENT_INIT`] is the one-shot
+/// stderr line inside [`record_client_init`], and this accessor exists so the
+/// write-once contract (a duplicate `initialize` must not rewrite the record)
+/// stays pinned by a test rather than by prose.
+#[cfg(test)]
 fn client_init() -> Option<&'static ClientInit> {
     CLIENT_INIT.get()
 }
@@ -159,35 +155,61 @@ fn client_init() -> Option<&'static ClientInit> {
 /// Whether this child ACTUALLY put `capabilities.experimental["claude/channel"]`
 /// on the wire at `initialize`.
 ///
-/// Recorded from the handshake itself rather than re-derived from settings at
-/// use time: `session_push_enabled()` reads the settings files off disk, so a
-/// toggle flipped after the handshake would make the two disagree — and the
+/// Recorded from the handshake itself rather than re-derived at use time: the
 /// half that matters is what the *client* was told. A push to a host that never
 /// negotiated channels is silently dropped client-side (Phase 0, T6), so this
 /// flag is what stops the child manufacturing a notification into the void.
 static CHANNEL_DECLARED: AtomicBool = AtomicBool::new(false);
 
-/// Whether the `initialize` handler has run at all.
+/// Whether the `initialize` handler has run at all. Also the write-once claim
+/// token for [`record_channel_declaration`] (`compare_exchange`, not
+/// load-then-store: two interleaved `initialize` frames must not be able to
+/// both pass the check and let the loser's decision win).
 static INITIALIZE_SEEN: AtomicBool = AtomicBool::new(false);
 
-/// Wake-up for [`await_initialize`], signalled once the handshake is recorded.
+/// Whether the `initialize` RESPONSE has been written to stdout. Distinct from
+/// [`INITIALIZE_SEEN`] on purpose — see [`release_initialize_relay`].
+static INITIALIZE_ANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// Wake-up for [`await_initialize`], signalled once the handshake reply is out.
 fn initialize_notify() -> &'static tokio::sync::Notify {
     static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
     NOTIFY.get_or_init(tokio::sync::Notify::new)
 }
 
-/// Record the handshake outcome and release the `/events` relay.
+/// Record the handshake outcome. Write-once: MCP allows exactly one
+/// `initialize` per connection, and a second one must not be able to flip the
+/// capability the session was actually established with — the relay bakes that
+/// answer into its `channels=` subscription.
 ///
-/// Write-once, like [`record_client_init`]: MCP allows exactly one `initialize`
-/// per connection, and a second one must not be able to flip the capability the
-/// session was actually established with — the relay has already baked that
-/// answer into its `channels=` subscription by then.
+/// The claim is a `compare_exchange` on [`INITIALIZE_SEEN`] because
+/// `mcp_stdio::serve` spawns every request on its own task: two `initialize`
+/// frames in flight together would both clear a plain load-then-store check,
+/// and the second writer's decision would silently overwrite the first's.
+/// [`CHANNEL_DECLARED`] is stored after the claim succeeds, which is safe
+/// because nothing reads it before [`release_initialize_relay`] runs — strictly
+/// after this function returns, on the same task.
 fn record_channel_declaration(declared: bool) {
-    if INITIALIZE_SEEN.load(Ordering::Acquire) {
-        return;
+    if INITIALIZE_SEEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return; // a handshake is already on record
     }
     CHANNEL_DECLARED.store(declared, Ordering::Release);
-    INITIALIZE_SEEN.store(true, Ordering::Release);
+}
+
+/// Release the `/events` relay — called from `mcp_stdio::serve`'s
+/// post-response hook once the `initialize` REPLY is on the wire.
+///
+/// Separate from [`record_channel_declaration`] to keep JSON-RPC ordering: the
+/// handler returns strictly before its response is serialized, so releasing the
+/// relay there opened a window in which an unsolicited
+/// `notifications/claude/channel` could precede the handshake reply on the same
+/// pipe. Idempotent, and safe to call for a failed write too (the relay would
+/// otherwise idle for the full [`await_initialize`] bound on a dead pipe).
+fn release_initialize_relay() {
+    INITIALIZE_ANSWERED.store(true, Ordering::Release);
     initialize_notify().notify_waiters();
 }
 
@@ -196,7 +218,7 @@ fn channel_declared() -> bool {
     CHANNEL_DECLARED.load(Ordering::Acquire)
 }
 
-/// Block until the `initialize` handler has run (bounded).
+/// Block until the `initialize` response has been written (bounded).
 ///
 /// The relay is spawned at [`serve`] start, *before* the client's `initialize`
 /// arrives, so connecting immediately would register this child with
@@ -205,7 +227,7 @@ fn channel_declared() -> bool {
 /// handshake is the first frame a client sends, typically within milliseconds.
 ///
 /// Each wake re-checks the flag rather than trusting the wake-up, which closes
-/// the race where `initialize` lands between the load and the `notified()`
+/// the race where the release lands between the load and the `notified()`
 /// registration (`notify_waiters` only reaches waiters already registered). The
 /// bound means a client that never handshakes (or a hand-run child) still gets
 /// its `tools/list_changed` relay — just with no channel identity.
@@ -213,7 +235,7 @@ async fn await_initialize() {
     const MAX_WAIT: Duration = Duration::from_secs(30);
     const POLL: Duration = Duration::from_millis(100);
     let deadline = Instant::now() + MAX_WAIT;
-    while !INITIALIZE_SEEN.load(Ordering::Acquire) {
+    while !INITIALIZE_ANSWERED.load(Ordering::Acquire) {
         if Instant::now() >= deadline {
             eprintln!(
                 "cimp-offload: no `initialize` within {}s — subscribing to /events without \
@@ -226,20 +248,34 @@ async fn await_initialize() {
     }
 }
 
-/// Entry point for `cimp --offload-mcp [--consumer <name>] [--tab <tab-id>]`.
+/// V30 (M5): whether this child was spawned with `--channel-push`, i.e. cImp
+/// decided AT TAB SPAWN that session push is armed for this tab.
+///
+/// Argv, not a settings read: the client half of the gate (Claude's
+/// `--dangerously-load-development-channels`) is composed in the very same
+/// overlay at the very same moment, so baking both into argv is what makes them
+/// one decision. A fresh settings read at `initialize` would drift — the MCP
+/// child can crash-restart at any time and re-handshake against a settings file
+/// the running Claude process never saw.
+static CHANNEL_PUSH_ARG: AtomicBool = AtomicBool::new(false);
+
+/// Entry point for
+/// `cimp --offload-mcp [--consumer <name>] [--tab <tab-id>] [--channel-push]`.
 /// Builds a current-thread tokio runtime and serves the stdio loop until stdin
 /// closes. `consumer` selects which MCP-server set the app proxies to this child
 /// (`claude` default, or `opencode`); `tab` is the cImp tab id this child was
 /// spawned for (V28 — forwarded on `/graph_run` so the app can scope the
-/// `context_*` memory tools to THIS tab's session). Never panics — a crash here
-/// would garble the host agent's MCP session.
-pub fn run(consumer: &str, tab: Option<&str>) {
+/// `context_*` memory tools to THIS tab's session); `channel_push` is the V30
+/// session-push gate baked in at spawn (see [`CHANNEL_PUSH_ARG`]). Never panics
+/// — a crash here would garble the host agent's MCP session.
+pub fn run(consumer: &str, tab: Option<&str>, channel_push: bool) {
     let _ = CONSUMER.set(consumer.trim().to_ascii_lowercase());
     // Tab ids are case-sensitive settings keys — store verbatim (trimmed), never
     // lowercased like the consumer name.
     if let Some(t) = tab.map(str::trim).filter(|t| !t.is_empty()) {
         let _ = TAB.set(t.to_string());
     }
+    CHANNEL_PUSH_ARG.store(channel_push, Ordering::Release);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -263,22 +299,28 @@ async fn serve() {
         tokio::spawn(async move { events_relay(stdout).await });
     }
 
-    // V30 Phase 0 channel spike — remove when #15 spike concludes.
-    // Inert unless `CIMP_CHANNEL_SPIKE` names a trigger file: publishes the
-    // shared stdout for `spike_slow_progress` and starts the channel pusher,
-    // which holds its own clone exactly like the `/events` relay above.
-    if let Some(trigger) = spike_trigger_path() {
-        let _ = SPIKE_STDOUT.set(stdout.clone());
-        let stdout = stdout.clone();
-        tokio::spawn(async move { spike_push_task(stdout, trigger).await });
-    }
-
     // The shared stdio JSON-RPC loop (`mcp_stdio`): spawns each request so
     // multiple in-flight tool calls run concurrently (two parallel
     // `offload_task`s must occupy both llama-server slots at once), captures
     // handler panics as JSON-RPC errors, and stops accepting work once a
     // response write fails (Claude closed the pipe).
-    crate::mcp_stdio::serve(stdout, "offload", handle_owned).await;
+    //
+    // `after_response` releases the `/events` relay once the `initialize`
+    // RESPONSE is on the wire (see [`release_initialize_relay`]) — the relay's
+    // first act may be a `notifications/claude/channel`, which must never
+    // precede the handshake reply on the same pipe.
+    crate::mcp_stdio::serve(stdout, "offload", handle_owned, after_response).await;
+}
+
+/// Called by [`crate::mcp_stdio::serve`] once a request's response frame has
+/// been written (or its write failed and the pipe is gone). The only method
+/// that needs the hook is `initialize`: JSON-RPC ordering says nothing may be
+/// written on this connection before the handshake reply, and the `/events`
+/// relay's very next write can be an unsolicited notification.
+fn after_response(method: &str) {
+    if method == "initialize" {
+        release_initialize_relay();
+    }
 }
 
 /// Owned-argument wrapper around [`handle`] so it can run on its own
@@ -292,10 +334,9 @@ async fn handle_owned(method: String, params: Value) -> Result<Value, (i64, Stri
 async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => {
-            // V30 Phase A: the client's `clientInfo` + `capabilities` are
-            // recorded (they used to be discarded). Nothing branches on them
-            // yet — this is the seam Phase B needs to tell a channel-capable
-            // host from one that would silently drop pushes.
+            // V30 Phase A: the client's `clientInfo` is recorded (it used to be
+            // discarded) so the handshake is reported exactly once on stderr —
+            // the line one looks for when a push goes missing.
             record_client_init(&params);
             let mut result = json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -303,18 +344,9 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
             });
             // Declare the Claude Code channel capability + system-prompt
-            // `instructions` when session push is armed. Two independent
-            // triggers, spike first so its verification-oriented wording wins
-            // while the (env-gated, zero-effect-when-unset) rig is in use.
-            // Evaluated once — `session_push_enabled` reads settings off disk.
-            //
-            // The `spike_enabled()` arm is V30 Phase 0 — remove when #15's
-            // spike rig goes; the `session_push_enabled()` arm is Phase A and
-            // stays.
-            let declared = if spike_enabled() {
-                spike_decorate_initialize(&mut result);
-                true
-            } else if session_push_enabled() {
+            // `instructions` when session push is armed for THIS child (a pure
+            // argv read — see `session_push_enabled`).
+            let declared = if session_push_enabled() {
                 decorate_initialize_channel(&mut result, CHANNEL_INSTRUCTIONS);
                 true
             } else {
@@ -353,24 +385,11 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             // Claude-Code-exposed MCP servers (those with `claude_access`),
             // proxied through the app's warm host. Empty when the app is down.
             tools.extend(proxy_mcp_list().await);
-            // V30 Phase 0 channel spike — remove when #15 spike concludes.
-            if spike_enabled() {
-                tools.extend(spike_tools());
-            }
             Ok(json!({ "tools": tools }))
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            // V30 Phase 0 channel spike — remove when #15 spike concludes.
-            // Dispatched here (not in `handle_tools_call`) because the progress
-            // probe needs the REQUEST-level `params._meta.progressToken`, which
-            // this is the last place to still hold intact.
-            if spike_enabled() && name.starts_with("spike_") {
-                handle_spike_tool(name, &params).await
-            } else if name.starts_with("graph_")
-                || name.starts_with("context_")
-                || name == "run_check"
-            {
+            if name.starts_with("graph_") || name.starts_with("context_") || name == "run_check" {
                 // Graph + session-memory tools, plus `run_check` (V12 Phase A —
                 // independent of the graph, but shares this dispatch surface).
                 // Warm path: let the app's single index serve it (no second
@@ -1320,287 +1339,28 @@ fn decorate_initialize_channel(result: &mut Value, instructions: &str) {
     result["instructions"] = Value::String(instructions.to_string());
 }
 
-/// Whether this child should declare the channel capability because the user
-/// turned session push on.
+/// Whether this child should declare the channel capability.
 ///
 /// Two gates:
 ///   * **consumer** — channels are a Claude Code mechanism; an OpenCode child
 ///     (`--consumer opencode`) has no inbound MCP path at all (see the
 ///     milestone's Phase D), so it must never declare one.
-///   * **settings** — `offload.session_push`, read through the same
-///     [`current_offload_settings`] mechanism that gates `offload_task` in
-///     `tools/list`. That is a *fresh read of the layered settings files from
-///     this child's cwd*, so it sees whatever is on disk at handshake time; the
-///     matching `--dangerously-load-development-channels` flag is baked into
-///     the tab's argv at spawn either way, so both halves only ever change
-///     together on a tab restart.
+///   * **argv** — `--channel-push`, baked in at tab spawn (see
+///     [`CHANNEL_PUSH_ARG`]).
+///
+/// It reads NO settings, deliberately. `offload.session_push` is evaluated once
+/// per tab spawn, in `tabs/config.rs::build_pre_args`, where the very same
+/// predicate also decides whether Claude gets
+/// `--dangerously-load-development-channels`. Both halves of the gate therefore
+/// come from one read of one snapshot and can only change together, on a tab
+/// restart (which `spawn_inject_sig`'s `"channels"` entry raises a hint for).
+/// The pre-fix code re-read the settings files here instead, so a child
+/// crash-restart after a settings toggle desynced the halves: the child
+/// declared the capability and subscribed `channels=1` while the running Claude
+/// process had never registered it — every push then silently dropped
+/// client-side but counted as delivered app-side.
 fn session_push_enabled() -> bool {
-    consumer() == "claude" && current_offload_settings().session_push
-}
-
-// ── V30 Phase 0 channel spike ──────────────────────────────────────────────
-//
-// V30 Phase 0 channel spike — remove when #15 spike concludes.
-//
-// Everything below is inert unless `CIMP_CHANNEL_SPIKE` is set to a non-empty
-// path: with the var unset the handshake, the tool list, the dispatch, and the
-// spawned tasks are byte-identical to the pre-spike child. The spike answers
-// two questions for issue #15:
-//
-//   1. does Claude Code actually deliver `notifications/claude/channel` pushed
-//      by a stdio MCP child into a live session (declared via
-//      `capabilities.experimental["claude/channel"]` + `instructions` on the
-//      2025-06-18 handshake, which is the era where channels are honoured —
-//      PROTOCOL_VERSION must NOT be bumped);
-//   2. does Claude Code auto-background an MCP tool call past ~2min
-//      (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`), and do `notifications/progress`
-//      frames reset that stall timer (`spike_slow` vs `spike_slow_progress`).
-
-/// Env var gating the whole spike. Its value is the path of the *trigger file*
-/// the push task watches; unset or empty means the spike is off.
-const SPIKE_ENV: &str = "CIMP_CHANNEL_SPIKE";
-
-/// Injected into Claude's system prompt via the top-level `instructions` field
-/// of the `initialize` result, so a delivered channel message is echoed back
-/// verbatim and delivery can be verified from the transcript alone.
-const SPIKE_INSTRUCTIONS: &str = "cimp-offload may push out-of-band notices as <channel source=\"cimp-offload\"> messages (V30 spike). When one arrives, explicitly acknowledge it and repeat its content and meta attributes verbatim so delivery can be verified.";
-
-/// The shared stdout handle, republished for the spike tools.
-///
-/// The shared dispatch (`mcp_stdio::serve`) hands a handler only
-/// `(method, params)` — it has no stdout — so `spike_slow_progress`, which must
-/// emit `notifications/progress` *while* its own `tools/call` is still in
-/// flight, picks the mutex up from here. Set once in [`serve`], and only when
-/// the spike is enabled.
-static SPIKE_STDOUT: std::sync::OnceLock<Arc<TokioMutex<tokio::io::Stdout>>> =
-    std::sync::OnceLock::new();
-
-/// The trigger-file path when the spike is enabled, else `None`. The file need
-/// not exist yet — the push task treats its appearance as the first change.
-fn spike_trigger_path() -> Option<std::path::PathBuf> {
-    let raw = std::env::var(SPIKE_ENV).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(std::path::PathBuf::from(trimmed))
-}
-
-/// Whether the V30 channel spike is armed for this child.
-fn spike_enabled() -> bool {
-    spike_trigger_path().is_some()
-}
-
-/// Add the experimental channel capability + the top-level `instructions`
-/// string to an otherwise-unchanged `initialize` result, with the spike's own
-/// verification-oriented wording. Shares the (V30 Phase A) pure decorator so
-/// the rig and the production path can never drift on the wire shape.
-fn spike_decorate_initialize(result: &mut Value) {
-    decorate_initialize_channel(result, SPIKE_INSTRUCTIONS);
-}
-
-/// The two spike tool descriptors, appended to `tools/list` only while the
-/// spike is armed. Same descriptor shape as `offload_task` / `offload_batch`.
-fn spike_tools() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "spike_slow",
-            "description": "V30 spike probe (temporary): sleeps server-side for `seconds` and returns a confirmation string. It does no work and emits no progress notifications — its only purpose is to exercise this client's long-running MCP tool-call behaviour (auto-backgrounding past ~2 minutes). Safe to call.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "seconds": {
-                        "type": "number",
-                        "description": "How long to sleep before returning. Default 150 (just over the 2-minute auto-background threshold); clamped to 1–600."
-                    }
-                }
-            }
-        }),
-        json!({
-            "name": "spike_slow_progress",
-            "description": "V30 spike probe (temporary): identical to `spike_slow`, but emits a `notifications/progress` frame every `interval` seconds while it sleeps, provided the call carried a `progressToken`. Its purpose is to test whether progress notifications keep a long tool call in the foreground. Safe to call.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "seconds": {
-                        "type": "number",
-                        "description": "How long to sleep before returning. Default 150; clamped to 1–600."
-                    },
-                    "interval": {
-                        "type": "number",
-                        "description": "Seconds between progress notifications. Default 15; clamped to 1–600."
-                    }
-                }
-            }
-        }),
-    ]
-}
-
-/// Read one clamped whole-second argument from a spike tool's `arguments`.
-/// A missing, non-numeric, or out-of-range value degrades to the default /
-/// nearest bound rather than erroring — a spike probe must never fail on input.
-fn spike_secs(args: &Value, key: &str, default: u64, lo: u64, hi: u64) -> u64 {
-    args.get(key)
-        .and_then(|v| v.as_f64())
-        .filter(|f| f.is_finite())
-        .map(|f| f.round().clamp(lo as f64, hi as f64) as u64)
-        .unwrap_or(default)
-        .clamp(lo, hi)
-}
-
-/// Dispatch a `spike_*` tool call. Reached only while the spike is armed.
-async fn handle_spike_tool(name: &str, params: &Value) -> Result<Value, (i64, String)> {
-    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-    let seconds = spike_secs(&args, "seconds", 150, 1, 600);
-    let pid = std::process::id();
-    let text = match name {
-        "spike_slow" => {
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
-            format!("spike_slow completed after {seconds}s (pid {pid})")
-        }
-        "spike_slow_progress" => {
-            let interval = spike_secs(&args, "interval", 15, 1, 600);
-            // MCP puts the progress token on the REQUEST's `params._meta`, and
-            // `mcp_stdio::serve` forwards `params` whole — so it is already
-            // here, no threading needed. Its type is opaque (string or int):
-            // echo it back verbatim.
-            let token = params
-                .get("_meta")
-                .and_then(|m| m.get("progressToken"))
-                .filter(|t| !t.is_null())
-                .cloned();
-            match (token, SPIKE_STDOUT.get()) {
-                (Some(token), Some(stdout)) => {
-                    let mut elapsed = 0u64;
-                    while elapsed + interval < seconds {
-                        tokio::time::sleep(Duration::from_secs(interval)).await;
-                        elapsed += interval;
-                        emit_notification(
-                            stdout,
-                            "notifications/progress",
-                            Some(json!({
-                                "progressToken": token,
-                                "progress": elapsed,
-                                "total": seconds
-                            })),
-                        )
-                        .await;
-                    }
-                    tokio::time::sleep(Duration::from_secs(seconds - elapsed)).await;
-                    let sent = elapsed / interval;
-                    format!(
-                        "spike_slow_progress completed after {seconds}s (pid {pid}) \
-                         — sent {sent} progress notifications, one every {interval}s"
-                    )
-                }
-                (Some(_), None) => {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                    format!(
-                        "spike_slow_progress completed after {seconds}s (pid {pid}) \
-                         (progressToken received but the shared stdout handle was unavailable \
-                         — no notifications were sent)"
-                    )
-                }
-                (None, _) => {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                    format!(
-                        "spike_slow_progress completed after {seconds}s (pid {pid}) \
-                         (no progressToken received — client did not request progress)"
-                    )
-                }
-            }
-        }
-        _ => return Err((-32602, format!("unknown tool: {name}"))),
-    };
-    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
-}
-
-/// Long-lived spike task: push one automatic channel message shortly after
-/// startup, then push the trigger file's contents every time it changes.
-///
-/// Holds its own clone of the shared stdout mutex, exactly like
-/// [`events_relay`] — that is the sanctioned way to write out of band here.
-async fn spike_push_task(stdout: Arc<TokioMutex<tokio::io::Stdout>>, trigger: std::path::PathBuf) {
-    /// Late enough that the session has finished its handshake and the user is
-    /// mid-turn when it lands (the point is an UNSOLICITED push).
-    const AUTO_DELAY: Duration = Duration::from_secs(20);
-    const POLL: Duration = Duration::from_secs(2);
-
-    tokio::time::sleep(AUTO_DELAY).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    spike_push(
-        &stdout,
-        &format!("spike auto push: pid={} t={now}", std::process::id()),
-        "spike_auto",
-        0,
-    )
-    .await;
-
-    // Baseline the trigger's mtime so a file that ALREADY exists at startup is
-    // not mistaken for a change; `None` (absent) is a valid baseline, so the
-    // file simply appearing counts as the first trigger.
-    let mut last = spike_mtime(&trigger).await;
-    let mut seq = 1u64;
-    loop {
-        tokio::time::sleep(POLL).await;
-        let current = spike_mtime(&trigger).await;
-        if current == last {
-            continue;
-        }
-        last = current;
-        if current.is_none() {
-            continue; // the file was deleted — nothing to push
-        }
-        // `tokio::fs` (not `std::fs`): this child runs a CURRENT-THREAD runtime
-        // shared with in-flight tool calls, so the poll must not block it.
-        match tokio::fs::read_to_string(&trigger).await {
-            Ok(body) => {
-                let body = body.trim();
-                if body.is_empty() {
-                    eprintln!(
-                        "cimp-offload channel spike: {} changed but is empty — nothing pushed",
-                        trigger.display()
-                    );
-                    continue;
-                }
-                spike_push(&stdout, body, "spike_file", seq).await;
-                seq += 1;
-            }
-            Err(e) => eprintln!(
-                "cimp-offload channel spike: failed to read {}: {e}",
-                trigger.display()
-            ),
-        }
-    }
-}
-
-/// The trigger file's modification time, or `None` when it is absent or
-/// unreadable (both mean "no change to report" for the poller).
-async fn spike_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    tokio::fs::metadata(path).await.ok()?.modified().ok()
-}
-
-/// Push one `notifications/claude/channel` frame. `meta` keys must match
-/// `^[a-zA-Z_][a-zA-Z0-9_]*$` or the client silently drops them, and values are
-/// sent as strings (hence `seq` is stringified).
-async fn spike_push(
-    stdout: &Arc<TokioMutex<tokio::io::Stdout>>,
-    content: &str,
-    kind: &str,
-    seq: u64,
-) {
-    emit_notification(
-        stdout,
-        "notifications/claude/channel",
-        Some(json!({
-            "content": content,
-            "meta": { "kind": kind, "seq": seq.to_string() }
-        })),
-    )
-    .await;
+    consumer() == "claude" && CHANNEL_PUSH_ARG.load(Ordering::Acquire)
 }
 
 /// A backend resolved from config to a connectable endpoint, before the
@@ -2153,16 +1913,14 @@ mod tests {
     fn channel_instructions_cover_the_delivery_contract() {
         assert!(CHANNEL_INSTRUCTIONS.contains("<channel source=\"cimp-offload\">"));
         assert!(CHANNEL_INSTRUCTIONS.contains("Do not invent channel messages"));
-        // Distinct from the spike's verification wording — the two paths are
-        // deliberately not the same prompt.
-        assert_ne!(CHANNEL_INSTRUCTIONS, SPIKE_INSTRUCTIONS);
     }
 
-    /// V30 Phase A: the client's `initialize` params are no longer discarded.
-    /// `record_client_init` runs against a process-wide `OnceLock`, so this
-    /// test exercises the *parse*, which is the part Phase B depends on.
+    /// V30 Phase A: the client's `clientInfo` is no longer discarded — it is
+    /// what the one-shot stderr handshake line reports. `record_client_init`
+    /// runs against a process-wide `OnceLock`, so this test exercises the
+    /// *parse*.
     #[test]
-    fn client_init_parses_info_and_capabilities() {
+    fn client_init_parses_client_info() {
         let params = json!({
             "protocolVersion": "2025-06-18",
             "clientInfo": { "name": "claude-code", "version": "2.1.222" },
@@ -2170,16 +1928,13 @@ mod tests {
         });
         let init = ClientInit {
             client_info: params.get("clientInfo").cloned().unwrap_or(Value::Null),
-            capabilities: params.get("capabilities").cloned().unwrap_or(Value::Null),
         };
         assert_eq!(init.name(), Some("claude-code"));
         assert_eq!(init.version(), Some("2.1.222"));
-        assert_eq!(init.capabilities["roots"]["listChanged"], json!(true));
 
-        // A client that sends neither must not panic or fabricate values.
+        // A client that sends none must not panic or fabricate values.
         let bare = ClientInit {
             client_info: Value::Null,
-            capabilities: Value::Null,
         };
         assert_eq!(bare.name(), None);
         assert_eq!(bare.version(), None);
@@ -2215,13 +1970,40 @@ mod tests {
     /// The handshake fact the relay subscribes with is recorded once and never
     /// re-negotiated — a duplicate `initialize` (a protocol violation) must not
     /// flip the capability after the relay has baked it into its `channels=`
-    /// subscription. This is the only test that touches these process-wide
-    /// statics.
+    /// subscription. The claim is a `compare_exchange`, so two frames racing
+    /// through `mcp_stdio::serve`'s per-request spawn can't both win. This is
+    /// the only test that touches these process-wide statics.
     #[test]
     fn channel_declaration_is_write_once() {
         record_channel_declaration(true);
         record_channel_declaration(false);
         assert!(channel_declared());
+        assert!(INITIALIZE_SEEN.load(Ordering::Acquire));
+
+        // The relay stays parked until the initialize RESPONSE is on the wire —
+        // recording the decision alone must not release it (JSON-RPC ordering:
+        // nothing precedes the handshake reply on this pipe).
+        assert!(
+            !INITIALIZE_ANSWERED.load(Ordering::Acquire),
+            "recording the handshake must not release the /events relay"
+        );
+        release_initialize_relay();
+        assert!(INITIALIZE_ANSWERED.load(Ordering::Acquire));
+    }
+
+    /// The gate the child declares on is pure argv (`--channel-push`), never a
+    /// settings read: the client half (`--dangerously-load-development-channels`)
+    /// is composed from the same snapshot at the same moment, so a child
+    /// crash-restart after a settings toggle cannot desync the two halves.
+    #[test]
+    fn session_push_gate_is_argv_only() {
+        // Same process-wide statics as above; `consumer()` defaults to "claude"
+        // when `run` never set it, which is the case in tests.
+        CHANNEL_PUSH_ARG.store(false, Ordering::Release);
+        assert!(!session_push_enabled(), "no --channel-push ⇒ no declaration");
+        CHANNEL_PUSH_ARG.store(true, Ordering::Release);
+        assert!(session_push_enabled());
+        CHANNEL_PUSH_ARG.store(false, Ordering::Release);
     }
 
     /// Feed the parser one byte at a time: no frame may be lost or duplicated
@@ -2331,111 +2113,22 @@ mod tests {
         assert_eq!(params["content"], "multi\nline\ncontent");
         assert_eq!(params["meta"]["kind"], "audit_done");
         assert_eq!(params["meta"]["seq"], "3");
-    }
 
-    // ── V30 Phase 0 channel spike — remove when #15 spike concludes. ──────
-
-    /// The spike decoration adds the experimental channel capability and the
-    /// `instructions` string WITHOUT disturbing the rest of the handshake —
-    /// notably `protocolVersion`, which must stay on the legacy era where
-    /// Claude Code honours channels, and `tools.listChanged`.
-    #[test]
-    fn spike_initialize_adds_channel_capability_only() {
-        let mut result = json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": true } },
-            "serverInfo": { "name": SERVER_NAME, "version": "test" }
-        });
-        spike_decorate_initialize(&mut result);
-        assert_eq!(result["protocolVersion"], "2025-06-18");
-        assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(true));
-        assert!(result["capabilities"]["experimental"]["claude/channel"].is_object());
-        assert!(result["instructions"]
-            .as_str()
-            .is_some_and(|s| s.contains("<channel source=\"cimp-offload\">")));
-    }
-
-    /// The channel push frame the spike sends: method, content, and meta keys
-    /// that satisfy the client's `^[a-zA-Z_][a-zA-Z0-9_]*$` filter (others are
-    /// silently dropped) with string values.
-    #[test]
-    fn spike_channel_frame_shape() {
-        let frame = notification_frame(
-            "notifications/claude/channel",
-            Some(json!({
-                "content": "hello",
-                "meta": { "kind": "spike_file", "seq": "3" }
-            })),
-        );
+        // …and the frame the child finally writes satisfies the client's meta
+        // contract: keys `^[a-zA-Z_][a-zA-Z0-9_]*$` (others silently dropped)
+        // with STRING values. Pinned end to end from a real producer notice —
+        // this is what the Phase 0 spike rig used to verify by hand.
+        let frame = notification_frame("notifications/claude/channel", Some(params));
         assert_eq!(frame["method"], "notifications/claude/channel");
-        assert_eq!(frame["params"]["content"], "hello");
         let meta = frame["params"]["meta"].as_object().unwrap();
+        assert!(!meta.is_empty());
         for (k, v) in meta {
             assert!(
-                k.chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                crate::offload::service::valid_meta_key(k),
                 "meta key `{k}` would be dropped by the client"
             );
             assert!(v.is_string(), "meta value for `{k}` must be a string");
         }
-    }
-
-    #[test]
-    fn spike_tools_are_well_formed() {
-        let tools = spike_tools();
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(names, vec!["spike_slow", "spike_slow_progress"]);
-        for t in &tools {
-            // Same descriptor shape as offload_task/offload_batch, and the
-            // `spike_` prefix the dispatch switches on.
-            assert!(t["name"].as_str().unwrap().starts_with("spike_"));
-            assert!(!t["description"].as_str().unwrap_or_default().is_empty());
-            assert_eq!(t["inputSchema"]["type"], "object");
-            assert!(t["inputSchema"]["properties"]["seconds"].is_object());
-        }
-        assert!(tools[1]["inputSchema"]["properties"]["interval"].is_object());
-    }
-
-    #[test]
-    fn spike_secs_defaults_and_clamps() {
-        let d = |v: Value| spike_secs(&v, "seconds", 150, 1, 600);
-        assert_eq!(d(Value::Null), 150);
-        assert_eq!(d(json!({})), 150);
-        assert_eq!(d(json!({ "seconds": "nope" })), 150);
-        assert_eq!(d(json!({ "seconds": 30 })), 30);
-        assert_eq!(d(json!({ "seconds": 30.6 })), 31);
-        assert_eq!(d(json!({ "seconds": 0 })), 1);
-        assert_eq!(d(json!({ "seconds": -5 })), 1);
-        assert_eq!(d(json!({ "seconds": 9999 })), 600);
-        assert_eq!(d(json!({ "seconds": f64::INFINITY })), 150);
-    }
-
-    /// The progress token rides on the REQUEST's `params._meta`, which the
-    /// shared dispatch forwards whole — pin that read so a future change to
-    /// `mcp_stdio::serve`'s params handling is caught here.
-    #[test]
-    fn spike_reads_progress_token_from_request_meta() {
-        let params = json!({
-            "name": "spike_slow_progress",
-            "arguments": { "seconds": 30 },
-            "_meta": { "progressToken": "abc-1" }
-        });
-        let token = params
-            .get("_meta")
-            .and_then(|m| m.get("progressToken"))
-            .filter(|t| !t.is_null())
-            .cloned();
-        assert_eq!(token, Some(json!("abc-1")));
-        let without = json!({ "name": "spike_slow_progress", "arguments": {} });
-        assert!(without
-            .get("_meta")
-            .and_then(|m| m.get("progressToken"))
-            .is_none());
     }
 
     #[test]

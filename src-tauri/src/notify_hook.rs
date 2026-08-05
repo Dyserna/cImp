@@ -23,17 +23,22 @@
 //!     `elicitation_dialog`, `elicitation_complete`, `elicitation_response`,
 //!     `agent_needs_input`, `agent_completed`), and `"matcher": ""` "fires on
 //!     all notification types". We register with `""` and classify app-side
-//!     (see `offload::loopback::classify_permission_event`) so a renamed type
-//!     degrades to "saw a notification we don't recognize, ignored it" rather
-//!     than to silence.
+//!     (see `offload::loopback::classify_permission_event`), which reads an
+//!     UNRECOGNIZED type as "no usable type" and falls through to the prose
+//!     check — so a renamed type degrades to "classified by its message", and
+//!     only a notification that is neither a known type nor permission-flavoured
+//!     prose is ignored. Never to silence (M12, 2026-08-05 review: the earlier
+//!     shape returned early on any unrecognized type, which for the permission
+//!     case IS silence).
 //!   * **UNVERIFIED — read this before changing the parsing below.** The
 //!     reference page could not be retrieved reliably enough to pin the
 //!     `Notification` payload's exact shape: it is either flat
 //!     (`{notification_type, message}`) or nested
 //!     (`{notification: {type, message}}`) depending on which rendering of the
 //!     doc you get. This shim therefore reads BOTH shapes and forwards whatever
-//!     it finds; the app-side classifier falls back to prose matching when no
-//!     type arrives at all. To settle it empirically, register
+//!     it finds; the app-side classifier falls back to prose matching whenever
+//!     no RECOGNIZED type arrives (absent, renamed, or unknown). To settle it
+//!     empirically, register
 //!     `"command": "cat > C:/tmp/notif.json"` as a `Notification` hook and read
 //!     the captured stdin.
 //!   * `PermissionRequest` is NOT adopted: it fires BEFORE the decision — i.e.

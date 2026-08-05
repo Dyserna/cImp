@@ -1332,7 +1332,9 @@ pub async fn graph_rebuild(
         Some(r) if !r.trim().is_empty() => std::path::PathBuf::from(r),
         _ => std::env::current_dir().map_err(|e| AppError::Settings(format!("cwd: {e}")))?,
     };
-    service.spawn_rebuild(root);
+    // A user clicked Rebuild — the one graph path allowed to announce itself on
+    // the V30 session-push bus (and only if it also runs long enough to matter).
+    service.spawn_rebuild(root, crate::graph::RebuildOrigin::User);
     Ok(())
 }
 
@@ -2779,7 +2781,8 @@ pub async fn graph_set_language_enabled(
         }
     });
     let root = resolve_graph_root(root)?;
-    service.spawn_rebuild(root);
+    // A Settings language toggle is a user action, like Rebuild.
+    service.spawn_rebuild(root, crate::graph::RebuildOrigin::User);
     Ok(())
 }
 

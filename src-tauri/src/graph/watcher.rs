@@ -115,7 +115,11 @@ pub fn start(
                 // the incremental batch is redundant this round.
                 if overflow.swap(false, Ordering::Relaxed) {
                     info!(root = %root.display(), "graph: watch channel overflowed — full rebuild to recover");
-                    service.spawn_rebuild(root.clone());
+                    // Recovery, not a user request: no session-push notice.
+                    service.spawn_rebuild(
+                        root.clone(),
+                        super::service::RebuildOrigin::Automatic,
+                    );
                 } else if !paths.is_empty() {
                     service.reindex_paths(&root, paths.into_iter().collect());
                 }

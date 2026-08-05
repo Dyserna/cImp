@@ -67,6 +67,9 @@ pub fn build_launch_spec(
                 extra_args: cfg.args.clone(),
                 working_dir,
                 env: cfg.env.clone(),
+                // A Shell tab exists to give the user the environment they
+                // actually have — cImp does not edit it (see `HARNESS_ENV_VARS`).
+                env_remove: Vec::new(),
                 // Shell tabs have no AI assistant output to speak.
                 oob: None,
             })
@@ -84,7 +87,7 @@ fn build_ai_tool_spec(
     let binary = resolve_command(&cfg.command)?;
     let pre_args = build_pre_args(cfg, settings, tab.as_str());
     let mut extra_args = build_extra_args(cfg, settings, invocation_args);
-    let working_dir = cfg.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf());
+    let working_dir = ai_working_dir(cfg, launch_cwd);
     // V19: OpenCode reads its guidance from a file referenced in the injected
     // config (`instructions`), so write that managed file at launch — kept off
     // the pure `compose_ai_env` path so the config builder stays test-safe.
@@ -101,6 +104,7 @@ fn build_ai_tool_spec(
     // launch path only — the pure `build_extra_args` stays test-stable.
     let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args);
     let env = compose_ai_env(cfg, settings, tab.as_str());
+    let env_remove = ai_env_removals(cfg);
     Ok(PtyLaunchSpec {
         tab,
         binary,
@@ -108,8 +112,44 @@ fn build_ai_tool_spec(
         extra_args,
         working_dir,
         env,
+        env_remove,
         oob,
     })
+}
+
+/// V30 (review M9): environment markers of the Claude Code session cImp was
+/// launched from, stripped from every AI tab's child.
+///
+/// Launching cImp from inside a Claude Code session is routine during
+/// development, and the child then inherits that session's harness markers. The
+/// load-bearing one is `CLAUDE_CODE_CHILD_SESSION`: a Claude spawned with it set
+/// runs with **no transcript, no history, no session records** (spike-documented
+/// in `docs/MILESTONE-V30-mcp-channels.md`), which silently blinds the
+/// out-of-band tap — no TTS, no usage, no live-session registry entry, no V28
+/// per-tab scoping, and no log anywhere saying why. The other two are the
+/// generic "you are running inside Claude Code" markers a fresh, user-facing tab
+/// must not claim to be under; leaving them set has a tool infer a parent
+/// session that has nothing to do with this tab.
+///
+/// Deliberately NOT a settings knob and deliberately not `env_clear`: this is a
+/// fixed, minimal list of harness markers, so it needs no `spawn_inject_sig`
+/// entry (nothing about it can change between spawns) and it cannot strip
+/// anything the user's own environment legitimately carries.
+const HARNESS_ENV_VARS: [&str; 3] = [
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
+/// The strip list for one AI tab: [`HARNESS_ENV_VARS`] minus anything the user
+/// set explicitly on the tab — a per-tab `env` entry is an instruction, not an
+/// accident, and `PtyManager` applies additions after removals anyway.
+fn ai_env_removals(cfg: &AiToolTabConfig) -> Vec<String> {
+    HARNESS_ENV_VARS
+        .iter()
+        .filter(|k| !cfg.env.contains_key(**k))
+        .map(|k| (*k).to_string())
+        .collect()
 }
 
 /// V20: pick the out-of-band TTS source for an AI tab, and for OpenCode inject
@@ -148,15 +188,32 @@ fn resolve_oob_source(
     None
 }
 
+/// The directory an AI tab launches in: its per-tab `cwd` override, else the
+/// app's launch dir. THE one definition — [`build_ai_tool_spec`] (which hands it
+/// to [`resolve_oob_source`], so it also becomes the Claude transcript root
+/// behind the H1 same-root ambiguity predicate) and [`claude_tab_dirs`] (the
+/// permission-hook cwd fallback) both call it, so the tab-identity seam and the
+/// hook-attribution seam can never disagree about where a tab runs.
+fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBuf {
+    cfg.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf())
+}
+
 /// NC-2 (issue #5): every configured Claude AI tab and the working directory it
-/// launches in — `(tab_id, working_dir)`. Resolution mirrors
-/// [`build_ai_tool_spec`] exactly (per-tab `cwd` override, else the app's launch
-/// dir), so the permission-hook route can compare a hook payload's `cwd`
-/// against the directory the tab was actually spawned in.
+/// launches in — `(tab_id, working_dir)`. Resolution is [`ai_working_dir`], the
+/// same call [`build_ai_tool_spec`] makes, so the permission-hook route can
+/// compare a hook payload's `cwd` against the directory the tab was actually
+/// spawned in.
 ///
 /// Note the usual case is that NO tab sets `cwd`, so every Claude tab shares the
 /// launch dir — which is why the route's cwd match is only used as a
 /// last-resort tie-break and only when it resolves to exactly one tab.
+///
+/// This lists CONFIGURED tabs (running or not) by design: it is the cwd
+/// tie-break's candidate set, where an extra candidate can only make the route
+/// refuse. The H1 ambiguity predicate needs the opposite posture — a
+/// configured-but-closed tab must not degrade a running one — so it is fed by
+/// the running taps themselves (`GraphService::mark_live_tab_root`), not by this
+/// list.
 pub(crate) fn claude_tab_dirs(
     settings: &Settings,
     launch_cwd: &Path,
@@ -165,10 +222,9 @@ pub(crate) fn claude_tab_dirs(
         .tabs
         .iter()
         .filter_map(|t| match t {
-            TabConfig::AiTool(c) if command_is(&c.command, "claude") => Some((
-                c.id.clone(),
-                c.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf()),
-            )),
+            TabConfig::AiTool(c) if command_is(&c.command, "claude") => {
+                Some((c.id.clone(), ai_working_dir(c, launch_cwd)))
+            }
             _ => None,
         })
         .collect()
@@ -293,12 +349,6 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // The `--settings` hooks overlay gates, in `build_pre_args` order:
         // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
         // PostToolUse auto-check.
-        //
-        // NC-2: the `Notification` / `PermissionDenied` hooks are NOT listed —
-        // they are injected unconditionally for every Claude tab and derive
-        // from no Settings field, so no save can make a running tab differ from
-        // a fresh one and there is nothing a restart hint could be about. Any
-        // future *gated* hook must add an entry here.
         "hooks": [
             s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
             s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
@@ -306,15 +356,30 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
             read_hook && s.graph.read_advisor_shell,
             post_edit,
         ],
+        // NC-2 + H2 fix: the `Notification` / `PermissionDenied` pair. Injected
+        // whenever the loopback they POST into actually runs, so the value is
+        // Settings-derived (offload / graph / Code Audit MCP) even though there
+        // is no permission-detection toggle of its own. Flipping any of those
+        // features changes how a FRESH Claude tab launches — hook-primary vs.
+        // regex-only permission detection — so a running tab is owed a restart
+        // hint. Kept as its own key rather than a sixth `hooks` slot so the
+        // array above keeps mapping 1:1 to the gated `build_pre_args` entries.
+        "notify_hooks": s.loopback_needed(),
         "local_env": local_env,
-        // V30 Phase A: the `--dangerously-load-development-channels` flag that
-        // registers the `cimp-offload` child as a session channel. Claude-only
-        // (OpenCode has no MCP inbound path) and baked at spawn, so it is
-        // exactly the kind of Settings-gated injection the rule at the top of
-        // this object demands an entry for: without it, toggling `session_push`
-        // mid-session leaves every running tab silently unregistered (or
-        // registered) with no restart hint.
-        "channels": s.offload.session_push,
+        // V30 Phase A: the session-push flag pair — Claude's
+        // `--dangerously-load-development-channels` and the `cimp-offload`
+        // child's own `--channel-push`. Claude-only (OpenCode has no MCP inbound
+        // path) and baked at spawn, so it is exactly the kind of Settings-gated
+        // injection the rule at the top of this object demands an entry for:
+        // without it, toggling `session_push` mid-session leaves every running
+        // tab silently unregistered (or registered) with no restart hint.
+        //
+        // The EFFECTIVE value, not the raw toggle: neither flag is emitted
+        // unless the `cimp-offload` server is injected at all
+        // (`build_pre_args`), so with offload+graph+Claude-exposed MCP all off a
+        // `session_push` flip changes no argv and must not nag every tab to
+        // restart for nothing.
+        "channels": s.offload.session_push && advertises_offload_to_claude(s),
     });
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
@@ -490,12 +555,34 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             // fallback. Both point at the SAME `--notify-hook` shim, which
             // dispatches on the payload's `hook_event_name`.
             //
-            // UNCONDITIONAL for every Claude tab: there is no toggle, so there
-            // is nothing a Settings save could flip — which is exactly why this
-            // needs no `spawn_inject_sig` entry / restart hint (same reasoning
-            // as the pinned OpenCode `subagent_depth`). The
-            // shim is fail-open and only spawns when Claude actually surfaces a
-            // notification or the auto-classifier denies a call — both rare.
+            // H2 fix (2026-08-05 review): GATED on `loopback_needed()`. The
+            // shim's ONLY delivery path is `post_loopback` →
+            // `read_discovery_for` (`context_hook.rs`), and the loopback server
+            // starts only under that predicate (`main.rs`). Injecting the hooks
+            // without it spawned a `cimp --notify-hook` process per Claude
+            // notification whose POST had nowhere to land — the primary signal
+            // dead, silently (the shim is silent by design, and the
+            // `contract_drift` report rides the same dead channel). The schema's
+            // invariant — every spawn-time advertisement must be a subset of
+            // `loopback_needed` — now covers hooks, not just `--mcp-config`; the
+            // tripwire is `every_advertised_mcp_server_gets_a_loopback`.
+            //
+            // ACCEPTED TRADEOFF: on a DEFAULT install (offload + graph +
+            // code_audit all off) permission detection is regex-only. That is
+            // the status quo ante for such installs — the hook never worked
+            // there — and it is strictly better than burning a process spawn per
+            // notification to feed a closed socket. Hook-primary detection
+            // requires one of offload / graph / Code-Audit-MCP to be on. Do NOT
+            // "fix" this by making the loopback always run: keeping it off for
+            // feature-less installs was a deliberate v0.48.0 decision.
+            //
+            // Because the injection is now Settings-DEPENDENT and baked at spawn,
+            // it carries a `spawn_inject_sig` entry (`"notify_hooks"`) so
+            // toggling one of those features raises the restart hint — a running
+            // tab launched without the hooks would otherwise stay hook-blind
+            // with no indication. The shim itself is fail-open and only spawns
+            // when Claude actually surfaces a notification or the
+            // auto-classifier denies a call — both rare.
             //
             // `"matcher": ""` on BOTH entries — the docs' explicit "fires on
             // all notification types" form (and, for `PermissionDenied`, all
@@ -509,7 +596,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             // support matchers at all, so the empty string is the safe spelling
             // here. Idle/`idle_prompt` notifications are deliberately NOT wired
             // to the `awaiting_question` pipe — see that classifier's doc.
-            if let Some(command) = crate::statusline::hook_command("--notify-hook") {
+            if let Some(command) = settings
+                .loopback_needed()
+                .then(|| crate::statusline::hook_command("--notify-hook"))
+                .flatten()
+            {
                 for event in ["Notification", "PermissionDenied"] {
                     hooks.insert(
                         event.to_string(),
@@ -550,20 +641,32 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
         let exe = exe.to_string_lossy().to_string();
         let mut servers = serde_json::Map::new();
         if advertises_offload_to_claude(settings) {
+            // V28 (issue #13): `--tab <id>` binds this per-tab child to the tab
+            // that spawned it. The child forwards it on `/graph_run`, where the
+            // app resolves it against the live-session registry — that is what
+            // stops two Claude tabs on one project from sharing (and stealing)
+            // a memory scope. Unconditional and NOT Settings-derived, so it
+            // needs no `spawn_inject_sig` entry / restart hint (same reasoning
+            // as the `Notification` hook above).
+            let mut child_args = vec![
+                "--offload-mcp".to_string(),
+                "--tab".to_string(),
+                tab.to_string(),
+            ];
+            // V30 (M5): the CHILD half of the session-push gate, baked into the
+            // child's own argv from THIS settings snapshot — the same one that
+            // decides the client half (`CHANNEL_REGISTRATION_FLAG`) a few lines
+            // below. One read, one decision, two flags: a child that
+            // crash-restarts mid-session re-declares exactly what the running
+            // Claude process registered, instead of re-reading a settings file
+            // that may have been toggled since (which would leave the app
+            // pushing into a session that never registered the channel).
+            if settings.offload.session_push {
+                child_args.push(CHANNEL_PUSH_FLAG.to_string());
+            }
             servers.insert(
                 "cimp-offload".to_string(),
-                serde_json::json!({
-                    "command": exe,
-                    // V28 (issue #13): `--tab <id>` binds this per-tab child to
-                    // the tab that spawned it. The child forwards it on
-                    // `/graph_run`, where the app resolves it against the
-                    // live-session registry — that is what stops two Claude tabs
-                    // on one project from sharing (and stealing) a memory scope.
-                    // Unconditional and NOT Settings-derived, so it needs no
-                    // `spawn_inject_sig` entry / restart hint (same reasoning as
-                    // the `Notification` hook above).
-                    "args": ["--offload-mcp", "--tab", tab]
-                }),
+                serde_json::json!({ "command": exe, "args": child_args }),
             );
         }
         if advertises_audit_to_claude(settings) {
@@ -709,6 +812,16 @@ const CHANNEL_REGISTRATION_FLAG: &str = "--dangerously-load-development-channels
 /// The channel target passed to [`CHANNEL_REGISTRATION_FLAG`]: our offload MCP
 /// child, addressed by its `mcpServers` key.
 const CHANNEL_REGISTRATION_TARGET: &str = "server:cimp-offload";
+
+/// V30 (M5): the SERVER half of the same gate — our own flag on the
+/// `cimp-offload` child's argv, telling it to declare
+/// `capabilities.experimental["claude/channel"]` at `initialize`.
+///
+/// Emitted from the same `settings.offload.session_push` read as
+/// [`CHANNEL_REGISTRATION_FLAG`], one line apart, so the two halves cannot
+/// disagree — see `offload/mcp.rs::session_push_enabled` for why the child must
+/// not decide this from settings on its own.
+const CHANNEL_PUSH_FLAG: &str = "--channel-push";
 
 /// V8-01: the system-prompt addendum telling Opus *when* to reach for
 /// `offload_task`. Without this nudge the model rarely offloads. Gated by
@@ -1377,11 +1490,17 @@ mod tests {
         let mut settings = Settings::default();
         settings.statusline.enabled = false;
         let args = build_pre_args(&claude_cfg(), &settings, "claude");
-        // NC-2: an overlay is always emitted for a Claude tab now (the
-        // unconditional permission hooks), so the assertion is about the
-        // statusLine key, not about the overlay's existence.
+        // With the statusline off and no loopback (H2 gated the NC-2 permission
+        // hooks on it), the overlay has nothing to carry and no `--settings`
+        // flag is emitted at all.
+        assert!(settings_overlay(&args).is_none(), "got: {args:?}");
+        // With a loopback running the overlay reappears — carrying the hooks,
+        // still no statusLine.
+        settings.graph.enabled = true;
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         assert!(overlay.get("statusLine").is_none());
+        assert!(overlay["hooks"].get("Notification").is_some());
     }
 
     #[test]
@@ -1536,8 +1655,16 @@ mod tests {
         settings.graph.enabled = false;
         settings.workbench.checkpoints = true;
         let args = build_pre_args(&claude_cfg(), &settings, "claude");
-        let overlay = settings_overlay(&args).expect("overlay present");
-        assert!(overlay["hooks"].get("UserPromptSubmit").is_none());
+        // Graph off ⇒ no loopback either, so the overlay is empty and omitted
+        // entirely (H2). Assert through the option so the test keeps meaning
+        // "no UserPromptSubmit hook" in both shapes.
+        let hooks = settings_overlay(&args).map(|o| o["hooks"].clone());
+        assert!(
+            hooks
+                .as_ref()
+                .is_none_or(|h| h.get("UserPromptSubmit").is_none()),
+            "got: {hooks:?}"
+        );
     }
 
     #[test]
@@ -1583,19 +1710,28 @@ mod tests {
         assert!(overlay2["hooks"].get("PostToolUse").is_none());
     }
 
-    /// NC-2 (issue #5): the `Notification` + `PermissionDenied` hooks are
-    /// injected for EVERY Claude tab, from the barest possible settings, both
-    /// pointing at the one `--notify-hook` shim, both with the documented
-    /// match-everything `"matcher": ""` (a narrowing matcher filters on
-    /// notification TYPE; we classify app-side so a renamed type degrades to
-    /// "ignored", not to silence).
+    /// NC-2 (issue #5) + H2 (2026-08-05 review): the `Notification` +
+    /// `PermissionDenied` hooks are injected for a Claude tab exactly when the
+    /// loopback they POST into runs — from the barest settings that flip
+    /// `loopback_needed()` and nothing else. Both point at the one
+    /// `--notify-hook` shim with the documented match-everything
+    /// `"matcher": ""` (a narrowing matcher filters on notification TYPE; we
+    /// classify app-side so a renamed type degrades to "ignored", not silence).
     #[test]
-    fn permission_hooks_injected_unconditionally_for_claude() {
-        // Barest settings: every gated injection off.
-        let settings = Settings::default();
+    fn permission_hooks_injected_for_claude_when_the_loopback_runs() {
+        // Barest settings that start the loopback: graph on, everything else
+        // (statusline, injection, advisors, auto-check) off.
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = false;
+        settings.workbench.checkpoints = false;
+        settings.graph.read_advisor = false;
+        settings.graph.auto_check = false;
+        assert!(settings.loopback_needed());
         let args = build_pre_args(&claude_cfg(), &settings, "claude");
         // The Claude Code `--settings` contract: ONE flag, one merged overlay —
-        // the new hooks must ride the same object as everything else, never a
+        // the hooks must ride the same object as everything else, never a
         // second flag (Claude does not concatenate repeated `--settings`).
         assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
         let overlay = settings_overlay(&args).expect("overlay present");
@@ -1617,30 +1753,44 @@ mod tests {
         assert!(build_pre_args(&opencode_cfg(), &settings, "opencode").is_empty());
     }
 
-    /// NC-2: because the permission hooks are unconditional and derive from no
-    /// Settings field, they are deliberately absent from `spawn_inject_sig` —
-    /// nothing a user can save may change them, so no restart hint is owed.
-    /// (Same convention as the pinned OpenCode `subagent_depth`.)
+    /// H2: on a DEFAULT install nothing dials back into the app, so the hooks
+    /// must NOT be injected — a shim spawn per notification whose POST is
+    /// dropped is worse than no hook at all (the regex fallback still runs).
     #[test]
-    fn permission_hooks_need_no_spawn_inject_sig_entry() {
+    fn no_permission_hooks_when_the_loopback_does_not_run() {
+        let settings = Settings::default(); // offload + graph + audit all off
+        assert!(!settings.loopback_needed());
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        // Statusline defaults on, so the overlay exists — it just must carry no
+        // hooks at all (and if a future default drops the statusline too, the
+        // absent overlay satisfies the same claim).
+        if let Some(overlay) = settings_overlay(&args) {
+            assert!(
+                overlay.get("hooks").is_none(),
+                "no loopback ⇒ no hook entries: {overlay}"
+            );
+        }
+    }
+
+    /// H2: the hooks are Settings-DEPENDENT and baked at spawn, so
+    /// `spawn_inject_sig` must carry them — otherwise enabling graph/offload
+    /// mid-session leaves every running Claude tab permanently hook-blind with
+    /// no restart hint.
+    #[test]
+    fn permission_hooks_have_a_spawn_inject_sig_entry() {
         let settings = Settings::default();
         let sig = spawn_inject_sig(&settings);
         let hooks = sig[0]["hooks"].as_array().expect("claude hooks sig array");
         // The five GATED hook entries, unchanged by NC-2 — all off by default.
         assert_eq!(hooks.len(), 5, "unexpected hook-gate count: {hooks:?}");
         assert!(hooks.iter().all(|g| g == &serde_json::Value::Bool(false)));
-        // …while the overlay built from those same all-off settings still
-        // carries the two ungated hooks. The gap is the point: a signature
-        // entry exists to detect a Settings-driven difference between a running
-        // tab and a fresh one, and there is no setting here to differ.
-        let overlay = settings_overlay(&build_pre_args(&claude_cfg(), &settings, "claude"))
-            .expect("overlay present");
-        let installed = overlay["hooks"].as_object().expect("hooks object");
-        assert_eq!(
-            installed.len(),
-            2,
-            "all gates off ⇒ only the ungated NC-2 hooks: {installed:?}"
-        );
+        // The NC-2 pair rides its own key and tracks `loopback_needed()`.
+        assert_eq!(sig[0]["notify_hooks"], serde_json::json!(false));
+        let mut with_graph = Settings::default();
+        with_graph.graph.enabled = true;
+        let sig2 = spawn_inject_sig(&with_graph);
+        assert_eq!(sig2[0]["notify_hooks"], serde_json::json!(true));
+        assert_ne!(sig[0], sig2[0], "the flip must change the signature");
     }
 
     /// NC-2: the cwd-fallback input — every Claude tab with the directory it
@@ -1680,6 +1830,45 @@ mod tests {
                 .map(|(_, d)| d.clone()),
             Some(std::path::PathBuf::from("C:/proj/wt"))
         );
+    }
+
+    /// H1 (2026-08-05 review) cross-module invariant: the directory a Claude
+    /// tab's out-of-band tap derives its transcript root from (and therefore the
+    /// key the same-root ambiguity predicate groups tabs by) is the SAME
+    /// directory `claude_tab_dirs` reports to the permission-hook cwd fallback.
+    /// If these ever diverge, one seam would call two tabs co-tenants while the
+    /// other treats them as distinct — the failure mode H1 exists to remove.
+    #[test]
+    fn claude_oob_root_and_permission_cwd_resolve_to_the_same_dir() {
+        let launch = Path::new("C:/proj");
+        let mut wt = claude_cfg();
+        wt.id = "ai-worktree".to_string();
+        wt.cwd = Some(std::path::PathBuf::from("C:/proj/wt"));
+        let settings = Settings {
+            tabs: vec![
+                TabConfig::AiTool(claude_cfg()),
+                TabConfig::AiTool(wt.clone()),
+            ],
+            ..Settings::default()
+        };
+        let dirs = claude_tab_dirs(&settings, launch);
+        for (cfg, id) in [(claude_cfg(), "claude"), (wt, "ai-worktree")] {
+            let mut extra: Vec<String> = Vec::new();
+            // Exactly what `build_ai_tool_spec` hands the oob resolver.
+            let source = resolve_oob_source(&cfg, &ai_working_dir(&cfg, launch), &mut extra);
+            let Some(crate::oob::OobSpec::ClaudeTranscript { project_dir }) = source else {
+                panic!("a Claude tab must resolve a transcript source");
+            };
+            let hook_dir = dirs
+                .iter()
+                .find(|(t, _)| t == id)
+                .map(|(_, d)| d.clone())
+                .expect("tab listed for the hook fallback");
+            assert_eq!(
+                project_dir, hook_dir,
+                "tab {id}: transcript root dir and permission cwd must agree"
+            );
+        }
     }
 
     #[test]
@@ -2201,6 +2390,11 @@ mod tests {
         // flip `Settings::loopback_needed()` — the injected children proxy
         // every call over the loopback, so advertising without serving strands
         // them all with "cImp is not running" while the app is visibly up.
+        //
+        // H2 (2026-08-05 review) widened it to HOOK SHIMS: every shim in the
+        // `--settings` overlay reaches the app the same way (`post_loopback`),
+        // so an injected hook without a loopback is the same defect in a
+        // quieter form — the shim spawns, the POST is dropped, and nothing logs.
         // Sweep each feature axis alone and combined.
         for (offload, graph, audit) in [
             (false, false, false),
@@ -2213,9 +2407,8 @@ mod tests {
             settings.offload.enabled = offload;
             settings.graph.enabled = graph;
             settings.code_audit.enabled = audit;
-            let claude_advertises = build_pre_args(&claude_cfg(), &settings, "claude")
-                .iter()
-                .any(|a| a == "--mcp-config");
+            let claude_args = build_pre_args(&claude_cfg(), &settings, "claude");
+            let claude_advertises = claude_args.iter().any(|a| a == "--mcp-config");
             let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings, "opencode")
                 .get("mcp")
                 .is_some();
@@ -2223,6 +2416,17 @@ mod tests {
                 assert!(
                     settings.loopback_needed(),
                     "advertised an MCP server without a loopback: \
+                     offload={offload} graph={graph} audit={audit}"
+                );
+            }
+            let hooks_installed = settings_overlay(&claude_args)
+                .and_then(|o| o.get("hooks").cloned())
+                .and_then(|h| h.as_object().map(|m| !m.is_empty()))
+                .unwrap_or(false);
+            if hooks_installed {
+                assert!(
+                    settings.loopback_needed(),
+                    "installed a hook shim without a loopback: \
                      offload={offload} graph={graph} audit={audit}"
                 );
             }
@@ -2718,6 +2922,65 @@ mod tests {
         );
     }
 
+    // ── V30 (review M9): harness env scrub ────────────────────────────────
+
+    #[test]
+    fn ai_tabs_scrub_the_inherited_claude_harness_markers() {
+        // Pins the LIST. `CLAUDE_CODE_CHILD_SESSION` is the load-bearing one —
+        // inheriting it gives the spawned Claude no transcript at all, which
+        // blinds the oob tap with no log anywhere. Adding to this list is fine;
+        // dropping `CLAUDE_CODE_CHILD_SESSION` re-opens the silent failure.
+        for cfg in [claude_cfg(), opencode_cfg()] {
+            let removals = ai_env_removals(&cfg);
+            assert_eq!(
+                removals,
+                vec![
+                    "CLAUDE_CODE_CHILD_SESSION".to_string(),
+                    "CLAUDECODE".to_string(),
+                    "CLAUDE_CODE_ENTRYPOINT".to_string(),
+                ],
+                "every AI tab strips the same harness markers (command: {})",
+                cfg.command,
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_tab_env_entry_is_never_scrubbed() {
+        // The strip list is cImp's default, not a veto on the user's own
+        // configuration.
+        let mut cfg = claude_cfg();
+        cfg.env
+            .insert("CLAUDECODE".to_string(), "1".to_string());
+        let removals = ai_env_removals(&cfg);
+        assert!(!removals.contains(&"CLAUDECODE".to_string()));
+        assert!(removals.contains(&"CLAUDE_CODE_CHILD_SESSION".to_string()));
+    }
+
+    #[test]
+    fn shell_tabs_keep_their_environment_untouched() {
+        // A Shell tab's whole point is the environment the user actually has.
+        let mut settings = Settings::default();
+        settings.tabs.push(TabConfig::Shell(crate::settings::ShellTabConfig {
+            id: "shell-1".to_string(),
+            name: "Shell".to_string(),
+            command: "cmd".to_string(),
+            ..Default::default()
+        }));
+        let spec = build_launch_spec(
+            TabId::from_str("shell-1"),
+            &settings,
+            &std::env::temp_dir(),
+            &[],
+        );
+        if let Ok(spec) = spec {
+            assert!(
+                spec.env_remove.is_empty(),
+                "shell tabs must not have their environment edited"
+            );
+        }
+    }
+
     // ── V12 Phase E: fact promotion block ─────────────────────────────────
 
     #[test]
@@ -2862,15 +3125,34 @@ mod tests {
         assert_ne!(spawn_inject_sig(&s)[0], base[0]);
 
         // Claude-only: V30 Phase A session-push registration. This is THE
-        // guard demanded by the rule in `spawn_inject_sig` — the flag is baked
-        // into argv at spawn, so flipping it must nag running tabs to restart.
+        // guard demanded by the rule in `spawn_inject_sig` — the flags are baked
+        // into argv at spawn, so flipping them must nag running tabs to restart.
         let mut s = Settings::default();
+        s.offload.enabled = true;
+        let offload_on = spawn_inject_sig(&s);
         s.offload.session_push = true;
         let sig = spawn_inject_sig(&s);
-        assert_ne!(sig[0], base[0], "session_push must move the Claude sig");
+        assert_ne!(
+            sig[0], offload_on[0],
+            "session_push must move the Claude sig"
+        );
         assert_eq!(
-            sig[1], base[1],
+            sig[1], offload_on[1],
             "channels are Claude-only — OpenCode has no MCP inbound path"
+        );
+
+        // …but only when it can actually change argv. With nothing that would
+        // inject the `cimp-offload` server, neither flag is emitted, so the
+        // toggle must NOT raise a restart hint (review LOW: spurious nags).
+        let mut bare = Settings::default();
+        bare.offload.enabled = false;
+        bare.graph.enabled = false;
+        let bare_base = spawn_inject_sig(&bare);
+        bare.offload.session_push = true;
+        assert_eq!(
+            spawn_inject_sig(&bare)[0],
+            bare_base[0],
+            "no cimp-offload server ⇒ session_push changes no argv ⇒ no restart hint"
         );
 
         // Live-applied tuning must NOT nag: the read-advisor thresholds are
@@ -2899,6 +3181,15 @@ mod tests {
             "session_push defaults off — no channel flag"
         );
 
+        // …and the CHILD half is absent too: with the gate off the spawned
+        // `cimp-offload` argv carries no `--channel-push`.
+        let off_mcp = off
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .and_then(|j| off.get(j + 1))
+            .expect("offload enabled ⇒ an mcp-config overlay");
+        assert!(!off_mcp.contains(CHANNEL_PUSH_FLAG));
+
         // On: flag + target, in that order, adjacent.
         s.offload.session_push = true;
         let on = build_pre_args(&cfg, &s, "claude");
@@ -2918,6 +3209,17 @@ mod tests {
             .and_then(|j| on.get(j + 1))
             .expect("offload enabled ⇒ an mcp-config overlay");
         assert!(mcp.contains("\"cimp-offload\""));
+        // V30 (M5): BOTH halves of the gate come from this one settings read —
+        // the client flag above and the child's own `--channel-push` on the
+        // `cimp-offload` argv. A child restart must not be able to re-decide.
+        let overlay: serde_json::Value = serde_json::from_str(mcp).unwrap();
+        let child_args = overlay["mcpServers"]["cimp-offload"]["args"]
+            .as_array()
+            .expect("cimp-offload carries an args array");
+        assert!(
+            child_args.iter().any(|a| a == CHANNEL_PUSH_FLAG),
+            "session_push on ⇒ the child is told to declare the channel"
+        );
 
         // OpenCode (and any non-Claude command) gets no pre-args at all.
         assert!(build_pre_args(&opencode_cfg(), &s, "opencode").is_empty());

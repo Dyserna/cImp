@@ -126,7 +126,7 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --read-hook                            PreToolUse read-advisor hook shim
   --postedit-hook                        PostToolUse checks hook shim
   --notify-hook                          Notification / PermissionDenied hook shim
-  --offload-mcp [--consumer <name>] [--tab <id>]
+  --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
 
@@ -279,7 +279,15 @@ fn main() {
             .position(|a| a == "--tab")
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
-        offload::mcp::run(consumer, tab);
+        // V30 (M5): `--channel-push` is the session-push gate, decided ONCE per
+        // tab spawn in `tabs/config.rs::build_pre_args` — the same read of the
+        // same settings snapshot that decides whether Claude itself gets
+        // `--dangerously-load-development-channels`. Baking it into argv (rather
+        // than having the child re-read settings at `initialize`) is what keeps
+        // the two halves of the gate from desyncing across a child restart.
+        // Absent on a hand-run child ⇒ no channel declaration.
+        let channel_push = args.iter().any(|a| a == "--channel-push");
+        offload::mcp::run(consumer, tab, channel_push);
         return;
     }
 
@@ -682,21 +690,40 @@ fn main() {
                     tauri::async_runtime::spawn(async move {
                         let mut rx = watch.subscribe();
                         loop {
-                            match rx.recv().await {
-                                Ok(s) => {
-                                    if s.loopback_needed()
-                                        && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
-                                    {
-                                        info!("offload: MCP host needed at runtime — starting offload runtime");
-                                        start_offload_runtime(
-                                            app_handle.clone(),
-                                            svc.clone(),
-                                            sup.clone(),
-                                        );
-                                    }
+                            // H2-R1 (2026-08-05 review): a LAGGED receiver has
+                            // DROPPED frames, and one of them can be the very
+                            // false→true `loopback_needed` edge this task
+                            // exists to catch — leaving the runtime unstarted
+                            // while newly-spawned tabs inject hooks against
+                            // `current()`, self-healing only on the next
+                            // settings save. So Lagged is treated as "changed,
+                            // re-check" and re-reads the authoritative current
+                            // settings (the standard tokio broadcast pattern),
+                            // instead of `continue`-ing past the edge.
+                            let s = match rx.recv().await {
+                                Ok(s) => s,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!(
+                                        dropped = n,
+                                        "offload: settings broadcast lagged — re-checking current settings"
+                                    );
+                                    watch.current()
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            // Start-once / never-stop stays monotonic: the
+                            // atomic swap is the only gate, so a replayed or
+                            // re-read `true` after a start is a no-op, and a
+                            // `false` never tears the runtime down.
+                            if s.loopback_needed()
+                                && !started.swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                info!("offload: MCP host needed at runtime — starting offload runtime");
+                                start_offload_runtime(
+                                    app_handle.clone(),
+                                    svc.clone(),
+                                    sup.clone(),
+                                );
                             }
                         }
                     });
@@ -773,7 +800,9 @@ fn main() {
                 // settings watcher below.
                 if settings_for_graph.current().graph.enabled {
                     if let Ok(root) = std::env::current_dir() {
-                        graph_service.spawn_rebuild(root.clone());
+                        // Startup housekeeping — never a session push.
+                        graph_service
+                            .spawn_rebuild(root.clone(), crate::graph::RebuildOrigin::Automatic);
                         // Phase D: keep the index live as files change.
                         graph_service.start_watch(root);
                     }
@@ -791,7 +820,12 @@ fn main() {
                                     if now && !was_enabled {
                                         if let Ok(root) = std::env::current_dir() {
                                             info!("graph: enabled at runtime — building index");
-                                            svc.spawn_rebuild(root.clone());
+                                            // Side effect of a settings save, not
+                                            // a rebuild request — no push.
+                                            svc.spawn_rebuild(
+                                                root.clone(),
+                                                crate::graph::RebuildOrigin::Automatic,
+                                            );
                                             svc.start_watch(root);
                                         }
                                     }

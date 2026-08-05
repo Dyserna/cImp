@@ -265,6 +265,23 @@ for lack of identity, so there is no restart hint owed — and because the tab i
 is not Settings-derived and cannot change while a tab runs, it needs no
 `spawn_inject_sig` entry.
 
+**One case is not isolatable, and degrades to unscoped rather than guessing (H1,
+2026-08-05 review).** Claude's tap has no per-process discriminator: it tails the
+newest `*.jsonl` under `~/.claude/projects/<slug(cwd)>`, a root derived from the
+project dir alone. Two Claude tabs on the SAME project dir (the built-in `claude`
++ `claude-local`, both `cwd: None`) therefore follow whichever session wrote
+last, so neither tab's registry entry proves anything. Each running Claude tap
+declares its root (`GraphService::mark_live_tab_root`, refreshed per poll tick,
+RAII-cleared on tab exit), and the single predicate
+`graph::service::tab_binding_is_ambiguous` — running tabs only, never merely
+configured ones — makes the registry withhold both answers while ≥2 tabs share a
+root: `live_session_for_tab` → `None` (⇒ fail-open to the pre-V28 recency lookup,
+never a tool error) and `live_claude_sessions` drops the pair, so NC-2's
+permission resolver refuses instead of flipping a badge/TTS on the wrong tab.
+Claude tabs on different dirs, and OpenCode tabs anywhere, are unaffected. The
+spawn dir feeding both the transcript root and the hook's cwd fallback has one
+definition (`tabs::config::ai_working_dir`).
+
 Both harnesses stamp the registry per tab: Claude from its transcript drain tick
 (`oob/claude.rs:208`), OpenCode from its `/event` SSE tap
 (`oob/opencode.rs::Tracker::track_live_session`) — every session-scoped SSE event
@@ -333,19 +350,31 @@ whenever `context_injection && read_advisor` (independent toggles — a project
 can run compaction survival without the read advisor).
 
 **Permission detection is hook-primary, regex-fallback (NC-2).** The
-`Notification` / `PermissionDenied` pair is the only *unconditional* overlay
-injection (no toggle, no schema entry, and therefore no `spawn_inject_sig`
-entry — nothing a Settings save could change). `--notify-hook` forwards the
-payload to `POST /permission/event`, which classifies it
-(`notification_type == "permission_prompt"`, or permission-flavoured prose when
-no type field arrives; `PermissionDenied` ⇒ resolved; every other notification
-type, including `idle_prompt`, is ignored), maps it to a tab
+`Notification` / `PermissionDenied` pair has no toggle and no schema entry of
+its own; it is injected whenever `Settings::loopback_needed()` holds — i.e.
+whenever the loopback the shim POSTs into actually runs (offload / graph / Code
+Audit MCP). That gate is load-bearing (H2, 2026-08-05 review): without it a
+default install spawned a `cimp --notify-hook` process per Claude notification
+whose POST had nowhere to land, so the *primary* signal was dead and silent.
+The consequence is deliberate — **a feature-less install runs regex-only
+permission detection** — and the injection carries a `spawn_inject_sig` entry
+(`notify_hooks`) so enabling one of those features raises the restart hint.
+`--notify-hook` forwards the payload to `POST /permission/event`, which
+classifies it (`notification_type == "permission_prompt"` ⇒ detected; the other
+documented types, `idle_prompt` included, are ignored *without* consulting the
+prose; an absent **or unrecognized** type falls through to permission-flavoured
+prose matching, so payload-shape drift degrades to "read the message" rather
+than to silence — M12; `PermissionDenied` ⇒ resolved), maps it to a tab
 (`session_id` → `transcript_path` → unique `cwd`, else DROP — never a guess),
 and emits the same `PermissionPromptDetected` / `PermissionPromptResolved`
 signals the TUI-regex detector (`processing::permission`) emits. Both producers
 feed the one idempotent `awaiting_permission` flag, so the hook simply usually
 wins the race; the regex path is untouched and still covers a dropped or
-missed event.
+missed event. A hook-driven *resolve* additionally force-clears that tab's
+regex latch (`ProcessorControl::ClearPermissionLatch` → `PermissionDetector::
+force_clear`) and re-scans, because the detector is edge-triggered: an
+auto-denial landing while a real approval prompt is still on screen would
+otherwise clear the badge with nothing able to re-raise it (M11).
 
 **Compaction route's side effects are unconditional.** `GraphService::
 compaction_context` (`graph/service.rs`) always clears the session's

@@ -255,6 +255,36 @@ fn initiator_pushes(initiator: Initiator) -> bool {
     matches!(initiator, Initiator::Gui)
 }
 
+/// V30 (review LOW): the wall-clock floor for the scan-completion push, the
+/// twin of the graph producer's `GRAPH_PUSH_MIN_BUILD_MS`. A 200 ms scan is not
+/// news, and a notice delivered to an idle Claude tab **starts a model turn**.
+const AUDIT_PUSH_MIN_SCAN_MS: u64 = 30_000;
+
+/// V30: the complete decision for "does this finished scan announce itself?" —
+/// pure, so every arm is testable without a runner, an `AppHandle`, or a bus.
+///
+/// - **Settings** (review M6): `offload.session_push`, passed in from a LIVE
+///   read at fire time. The child-side gate is latched per tab until restart,
+///   so this is the half that makes "off" mean off without one.
+/// - **Initiator** (see [`initiator_pushes`]): an agent-initiated run already
+///   returns this report through its own open call.
+/// - **Cancelled** (review M3): the user aborted the scan. The notice would say
+///   "cImp finished a … audit … Call `security_audit` for the full report (it
+///   re-runs the same scan)" — i.e. invite every armed agent to re-run the very
+///   scan the user just stopped. A cancelled run's counts are partial anyway.
+/// - **Duration**: below [`AUDIT_PUSH_MIN_SCAN_MS`] nobody walked away waiting.
+fn scan_push_worthy(
+    session_push: bool,
+    initiator: Initiator,
+    cancelled: bool,
+    elapsed_ms: u64,
+) -> bool {
+    session_push
+        && initiator_pushes(initiator)
+        && !cancelled
+        && elapsed_ms >= AUDIT_PUSH_MIN_SCAN_MS
+}
+
 /// The managed audit runner. Constructed once in the Tauri setup hook and
 /// `app.manage`d as `Arc<AuditState>`.
 pub struct AuditState {
@@ -600,6 +630,10 @@ impl AuditState {
         cancel: CancellationToken,
         initiator: Initiator,
     ) -> AuditSnapshot {
+        // V30: wall clock for the completion push's duration floor. Started
+        // here (not in `begin_scan`) so it measures the scan itself, not the
+        // census walk and settings sync that precede it.
+        let started = Instant::now();
         let git_repo = root.join(".git").exists();
         let mut handles = Vec::new();
 
@@ -666,7 +700,17 @@ impl AuditState {
             inner.snapshot(None)
         };
         self.emit_event();
-        self.announce_scan_complete(&snap, category, initiator);
+        // V30 (review M3): `cancel` is this scan's own token — read it BEFORE
+        // announcing, because `run` is reached on every exit path including the
+        // cancelled one (`Outcome::Cancelled` classifies as `Failed`, so the
+        // snapshot alone cannot tell the two apart).
+        self.announce_scan_complete(
+            &snap,
+            category,
+            initiator,
+            cancel.is_cancelled(),
+            started.elapsed().as_millis() as u64,
+        );
         snap
     }
 
@@ -679,10 +723,11 @@ impl AuditState {
     /// already rendered in the Code audit tab and the `audit_snapshot` IPC. A
     /// dropped push costs timeliness, never information; no new tool is added.
     ///
-    /// Gated on [`Initiator::Gui`] (see [`initiator_pushes`]): an agent-initiated
-    /// run returns this exact report through its own open call, so pushing would
-    /// duplicate it — and a push into an IDLE tab starts a model turn, so the
-    /// duplicate is not free.
+    /// Gated on [`scan_push_worthy`] — GUI-initiated, not cancelled, and long
+    /// enough to have been worth waiting for — plus a LIVE read of
+    /// `offload.session_push`, so turning the feature off stops app-side pushes
+    /// immediately (the child-side latch is per-tab-until-restart; this is the
+    /// half that can react at once).
     ///
     /// Best-effort and non-blocking (`try_send` under the hood): no bus, no
     /// channel-armed child, or a full queue all mean "not delivered", and the
@@ -692,11 +737,16 @@ impl AuditState {
         snap: &AuditSnapshot,
         category: Category,
         initiator: Initiator,
+        cancelled: bool,
+        elapsed_ms: u64,
     ) {
         let Some(pushes) = self.pushes.as_ref() else {
             return;
         };
-        if !initiator_pushes(initiator) {
+        // "Off means off": the gate is read LIVE here, so the producer stops the
+        // moment the user unticks it — the child-side latch cannot.
+        let session_push = self.settings.current().offload.session_push;
+        if !scan_push_worthy(session_push, initiator, cancelled, elapsed_ms) {
             return;
         }
         let notice = crate::offload::service::PushNotice::new(
@@ -2078,6 +2128,61 @@ mod tests {
         assert!(
             !initiator_pushes(Initiator::Agent),
             "an MCP/offload-initiated run already returns its report"
+        );
+    }
+
+    /// The full gate. `run` is reached on EVERY exit path, so the producer —
+    /// not the caller — is where cancellation and triviality are filtered out.
+    #[test]
+    fn scan_push_worthy_filters_cancelled_agent_and_trivial_scans() {
+        let long = AUDIT_PUSH_MIN_SCAN_MS;
+        assert!(
+            scan_push_worthy(true, Initiator::Gui, false, long),
+            "a real GUI scan announces itself"
+        );
+
+        // Review M6: "off means off" app-side. The child-side declaration is
+        // latched until the tab restarts, so this is the half that can react to
+        // the toggle at once — and it dominates everything else.
+        assert!(
+            !scan_push_worthy(false, Initiator::Gui, false, long),
+            "offload.session_push off ⇒ no producer fires, restart or not"
+        );
+
+        // Review M3: cancelling must not broadcast "cImp finished a … audit …
+        // Call security_audit for the full report (it re-runs the same scan)" —
+        // that invites every armed agent to re-run what the user just aborted.
+        // `Outcome::Cancelled` classifies as `Failed`, so the snapshot alone
+        // cannot distinguish the two: the cancel token is the only signal.
+        assert!(
+            !scan_push_worthy(true, Initiator::Gui, true, long),
+            "a cancelled scan must never push"
+        );
+
+        // Review LOW: the duration floor the graph twin already had.
+        assert!(
+            !scan_push_worthy(true, Initiator::Gui, false, 200),
+            "a 200ms scan is not worth a model turn in every armed session"
+        );
+        assert!(
+            !scan_push_worthy(true, Initiator::Gui, false, AUDIT_PUSH_MIN_SCAN_MS - 1),
+            "just under the floor stays silent"
+        );
+
+        // The echo guard still dominates every other input.
+        for cancelled in [false, true] {
+            for ms in [0, long, long * 10] {
+                assert!(
+                    !scan_push_worthy(true, Initiator::Agent, cancelled, ms),
+                    "an agent-initiated run never pushes (cancelled={cancelled}, {ms}ms)"
+                );
+            }
+        }
+
+        assert_eq!(
+            AUDIT_PUSH_MIN_SCAN_MS, 30_000,
+            "same floor as the graph twin's GRAPH_PUSH_MIN_BUILD_MS by design — \
+             the two producers cost the same model turn"
         );
     }
 

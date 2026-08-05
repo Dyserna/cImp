@@ -1,7 +1,8 @@
 # V28 — Per-Session MCP Identity (session-scoped memory tools)
 
-**Status:** IMPLEMENTED (Phases A–D, 2026-08-05) — live verification below still
-pending. Closes GitHub issue #13 (NC-1/D-9 from the
+**Status:** IMPLEMENTED (Phases A–D, 2026-08-05; H1 review fix 2026-08-05 —
+decision 4a: same-root multi-tab Claude degrades to unscoped) — live
+verification below still pending. Closes GitHub issue #13 (NC-1/D-9 from the
 2026-08-04 maintenance run) and the V10 residual "same-agent tabs share
 memory scope".
 **Builds on:** V10 context engine (`session`/`mem_event` relations,
@@ -58,6 +59,33 @@ reads and writes tab B's working set whenever B was active more recently.
    call must NEVER error for lack of identity. No settings, no schema bump,
    no `spawn_inject_sig` entry (a tab's id is not Settings-derived and never
    changes while it runs).
+
+   **4a. Ambiguous binding degrades to unscoped (H1 fix, 2026-08-05 review).**
+   The Claude registry entry is only as good as the tap that writes it, and the
+   tap binds by tailing the newest `*.jsonl` under `~/.claude/projects/<slug>` —
+   a *project*-derived root with no per-process discriminator. So when **two or
+   more Claude tabs run on one project** (the built-in `claude` + `claude-local`
+   both have `cwd: None` ⇒ identical root), both taps follow whichever session
+   wrote last and neither tab's registry entry is proof of anything. The
+   registry therefore detects that condition and withholds the answer:
+   `live_session_for_tab` returns `None` (⇒ unscoped, decision 4's fallback) and
+   `live_claude_sessions` drops the pair (⇒ the NC-2 permission resolver refuses
+   rather than attributing a badge/TTS edge to the wrong tab). One predicate,
+   `graph::service::tab_binding_is_ambiguous`, serves both consumers.
+
+   Inputs are the tabs that are **actually running**, not the configured ones: a
+   Claude tap declares `(tab_id → transcript root)` via
+   `GraphService::mark_live_tab_root` on every 200 ms poll tick and its RAII
+   guard clears the claim on tab exit, so a configured-but-closed `claude-local`
+   never degrades the running `claude`, and closing one of two open tabs restores
+   the survivor's scoping immediately. OpenCode never registers a root (it binds
+   per-tab off its own SSE stream, decision 5) and is never degraded. The spawn
+   dir both seams key off is one function, `tabs::config::ai_working_dir`, so the
+   ambiguity key and the hook's cwd fallback cannot drift apart.
+
+   Wrong-scope is worse than unscoped: an ambiguous tab silently writing into
+   another tab's memory is exactly the defect V28 exists to remove, whereas
+   unscoped is the documented pre-V28 behavior and still answers every tool call.
 5. **OpenCode tab binding (the one open question — Phase C spike).** The
    registry's OpenCode entries are currently keyed by *session id* (the
    loopback `/memory/event` path has no tab binding), so tab→session
@@ -106,7 +134,15 @@ reads and writes tab B's working set whenever B was active more recently.
 - The `offload` consumer (worker-native context tools) keeps its current
   (agent-`None`) scope — workers have no tab.
 - Registry discipline matches NC-2: TTL-filtered, exact-match, never guess;
-  ambiguity/absence = fallback, not attribution.
+  ambiguity/absence = fallback, not attribution. Enforced at ONE seam (the
+  registry) by ONE predicate, so graph/memory scoping and permission
+  attribution can never disagree about which tabs are ambiguous.
+- A tab's spawn dir has one definition (`tabs::config::ai_working_dir`), read by
+  both the out-of-band tap (⇒ the transcript root the ambiguity predicate groups
+  by) and `claude_tab_dirs` (⇒ the permission hook's cwd fallback). Pinned by
+  `claude_oob_root_and_permission_cwd_resolve_to_the_same_dir`.
+- "Running" means a live tap (PTY-scoped), never "configured": a closed tab must
+  never suppress a running tab's scoping.
 - Loopback trust model unchanged: `tab` is bearer-token-authed like every
   other body field; same-user forgery is out of scope.
 
@@ -119,7 +155,71 @@ reads and writes tab B's working set whenever B was active more recently.
 - **`/clear` rotates the session id:** registry updates on the next drain
   tick; a call in the ≤200 ms window attaches to the old session — harmless
   (that session was the live one moments before).
-- **Two same-agent tabs, same project:** the target case — now isolated.
+- **Two same-agent tabs, same project (the target case) — outcome differs by
+  agent, and by root:**
+  - *OpenCode:* isolated. The tap reads `properties.sessionID` off its own
+    per-tab SSE stream, so two tabs on one project are genuinely distinguishable
+    (decision 5).
+  - *Claude, tabs on DIFFERENT project dirs:* isolated. Different `cwd` ⇒
+    different `~/.claude/projects/<slug>` root ⇒ each tap tails its own file.
+  - *Claude, tabs on the SAME project dir:* **not** isolated and not
+    isolatable — the transcript tap has no per-process discriminator (both tabs
+    tail the newest file under one root). This degrades to **unscoped**
+    (decision 4a): the memory tools fall back to
+    `mem_current_session_for(agent)` — the documented pre-V28 behavior, tool
+    calls unaffected — and the permission hook refuses to attribute rather than
+    guess. Isolating this case would need a per-process discriminator Claude
+    Code does not expose (the transcript filename is the session id, and the
+    session id is not knowable at spawn); revisit if upstream ever puts the
+    session id in the child's environment.
+- **Launch-order window (H1):** tab A's tap can rotate onto tab B's *fresh*
+  transcript and mark it live before B's own tap confirms, so the registry could
+  hold `A → ses_B` **uniquely** and send a permission edge to the wrong tab.
+  Narrowed to a sub-millisecond gap by the same predicate: B's tap declares its
+  root as its first instruction (before any file read), so from that instant on
+  both tabs are registered co-tenants and the window is covered.
+  *Honest bound, not an invariant (H1-R3):* `PtyManager::start` spawns the child
+  and then the tap, ~15 straight-line statements and one scheduling hop apart,
+  so B's transcript **can** in principle exist before B's tap registers. In
+  practice Claude Code takes seconds to boot and write its first transcript line
+  against a sub-ms gap, so the window has no realistic content — but nothing
+  *enforces* the ordering. It is held by a load-bearing comment at the spawn site
+  (`pty/manager.rs`, between the two spawns): no `.await` may be introduced
+  between the child spawn and `crate::oob::spawn`.
+- **Residual: closing one of two same-root tabs.** The survivor's scoping is
+  restored at once (RAII clear), but its tap may still be pointed at the closed
+  tab's transcript — the newest file until the survivor writes again — so for
+  ≤ one poll tick (200 ms) into its next turn it can report that session. The
+  turn's own user prompt lands in the survivor's transcript first, which rotates
+  the tap before the assistant can issue a tool call; and fail-open means the
+  worst case is a note filed against a session that was live moments earlier
+  (the same shape as the `/clear` rotation window above). Not closed by design.
+- **Residual (H1-R3): the predicate only sees cImp's own taps — external
+  `claude` processes are a structural blind spot.** The ambiguity registry is
+  written exclusively by out-of-band taps, i.e. by Claude processes cImp itself
+  launched in an AI tab. A `claude` run started anywhere else against the same
+  project — a Shell tab, an external terminal, an editor plugin, or a `claude`
+  invoked by an agent — writes into the very same `~/.claude/projects/<slug>`
+  directory and registers nothing. The AI tab's tap can then rotate onto that
+  foreign transcript (it tails the newest file under the root) and, being the
+  only registered tab, bind to it **confidently**: the memory tools scope to
+  another process's session and the permission hook attributes to this tab.
+  Same hole for an AI tab whose configured command file-stem isn't `claude`
+  (no `ClaudeTranscript` oob spec ⇒ no tap ⇒ no claim). Severity is **higher**
+  than the two-tab case it superficially resembles: that one degrades to
+  unscoped (safe), this one is confident-and-wrong, and it is reachable with a
+  single AI tab open. Not fixable at this seam — distinguishing "my child" from
+  "some other `claude`" needs a per-process discriminator on the transcript
+  (process-level attribution) that Claude Code does not expose; the same
+  upstream dependency as decision 4a. **Mitigation:** if per-tab memory scoping
+  or permission attribution matters to you, don't run external `claude` sessions
+  against a project that has an open cImp AI tab.
+- **Conservative over-refusal (accepted).** A running Claude tab that can never
+  actually conflate still counts as a co-tenant: notably one launched with
+  `CLAUDE_CODE_CHILD_SESSION=1` (writes no transcript at all), which V30's
+  `env_remove` strips by default but a per-tab `env` entry can re-introduce.
+  Cost is unscoped memory tools on the sibling — the pre-V28 behavior — which is
+  the correct direction for a trust predicate.
 - **Stale child (pre-upgrade spawn):** no `--tab` → fail-open until the tab
   is restarted; no restart hint owed (see decision 4).
 
@@ -152,8 +252,28 @@ fallback). Three lines; noted here rather than left as a silent inconsistency.
 
 ## Live verification (by hand, after A–C)
 
-1. Two Claude tabs, same project: `context_note` in tab A →
-   `context_recall` in tab B must NOT return it; B's own notes round-trip.
+1. **Claude scoping — three cases (decision 4a).** Run them in order; each is a
+   separate contract.
+   a. *Single tab per root (the common case, scoping ON).* One Claude tab open.
+      `context_note` a distinctive fact, then `/clear` (new session) and
+      `context_recall`: the note must NOT come back as the current session's own
+      working set. Cross-check `RUST_LOG=cimp=debug` shows the `/graph_run` body
+      carrying `tab`, and the note lands under the session id the tab's
+      transcript filename names.
+   b. *Two tabs, SAME project dir (ambiguous ⇒ unscoped, fail-open).* Open
+      `claude` and `claude-local` with no `cwd` override. `context_note` in A and
+      `context_recall` in B: the call must SUCCEED (never a tool error) and both
+      tabs behave as pre-V28 — most-recently-active session, i.e. B may well see
+      A's note. That is the *expected* result now, not a failure; the failure
+      mode to watch for is a tool error, or scoping that confidently attributes
+      A's writes to B's session. While both are open, permission prompts should
+      also fall back to the TUI-regex detector (no hook attribution) — a badge on
+      the WRONG tab is the regression.
+   c. *Two tabs, DIFFERENT project dirs (isolated).* Give one tab a `cwd`
+      override (a worktree). `context_note` in A → `context_recall` in B must NOT
+      return it; B's own notes round-trip. Then close one tab and re-run (b)'s
+      recipe on the survivor: scoping must come back immediately (the RAII guard
+      drops the closed tab's root claim), not after the 90 s TTL.
 2. Same with two OpenCode tabs — Phase C landed, so full isolation is expected
    (no documented degradation to confirm). Also check an OpenCode `task`
    fan-out: `context_recall` from inside a sub-agent must return the TAB's main

@@ -31,9 +31,18 @@
 //! 1. `claude_permission` — `to cancel ·`: the cancel hint is followed by
 //!    another footer segment, which only happens when cancel comes FIRST.
 //!    Chord-rebind proof and amend/explain agnostic.
-//! 2. `claude_permission_bare` — `to cancel` + `1. Yes`: covers the footer
+//! 2. `claude_permission_bare` — `to cancel` + `1. Yes 2.`: covers the footer
 //!    shape where cancel is the only segment, using the prompt's numbered
-//!    Yes/No option list as the corroborating anchor.
+//!    Yes/No option list as the corroborating anchor. The anchor spans the
+//!    first TWO option lines (they are adjacent after whitespace
+//!    normalization), which is structure Claude's own prose does not have — a
+//!    plain `1. Yes` also appears in a numbered list the model writes, and
+//!    such a list can easily mention "to cancel" too.
+//!
+//! Veto (`none_of`) terms are evaluated only from the start of the pattern's
+//! own earliest `all_of` marker onward, not over the whole tail: the tail is a
+//! scrollback window, so stale menu chrome scrolled ABOVE a live approval
+//! prompt must not suppress it.
 //!
 //! Pattern characterization tip: enable `RUST_LOG=perm_capture=debug` to dump
 //! the rendered tail the detector matches against; pick distinctive substrings
@@ -129,12 +138,29 @@ pub fn default_patterns() -> Vec<PermissionPattern> {
         // explain), where there is no trailing `·` to anchor on. Bare
         // `to cancel` would also fire on assistant prose ("…press Ctrl+C to
         // cancel…"), so it is paired with the prompt's numbered option list.
+        //
+        // The option marker is `1. Yes 2.` — the FIRST TWO OPTION LINES, not a
+        // bare `1. Yes` (2026-08-05 review, LOW). The tail is whitespace-
+        // normalized before matching (`normalize_ws`), so consecutive option
+        // rows join with a single space and this reads "option 1 is `Yes` and
+        // option 2 starts immediately after". Claude's approval prompt always
+        // renders ≥2 bare options (`1. Yes` / `2. Yes, and don't ask again` /
+        // `3. No`), and the selector caret sits BEFORE `1.`, so every real
+        // footer variant still matches. Assistant prose cannot: a numbered list
+        // item reading "1. Yes, …" continues with its own text before the next
+        // number, which breaks the adjacency — and prose carrying both
+        // "1. Yes" and "to cancel" was the documented false-positive shape.
+        // If a future release adds per-option description lines to the approval
+        // prompt (as the AskUserQuestion box has), this marker stops matching —
+        // re-capture with RUST_LOG=perm_capture=debug; the primary
+        // `claude_permission` pattern covers every multi-segment footer meanwhile.
+        //
         // Also the worked example for declaring extra prompt shapes: copy the
         // entry, change `name`, and edit `all_of`/`none_of`.
         PermissionPattern {
             name: "claude_permission_bare".to_string(),
             kind: PatternKind::Permission,
-            all_of: vec!["to cancel".to_string(), "1. Yes".to_string()],
+            all_of: vec!["to cancel".to_string(), "1. Yes 2.".to_string()],
             none_of: vec!["to select".to_string(), "to navigate".to_string()],
             disabled: false,
         },
@@ -313,10 +339,24 @@ impl PermissionDetector {
                 continue;
             }
             let needles = &self.norm_all_of[idx];
-            if !needles
-                .iter()
-                .all(|s| !s.is_empty() && haystack.contains(s.as_str()))
-            {
+            // Position of each `all_of` hit, so the veto below can be scoped to
+            // the region this pattern actually matched. `None` from any needle
+            // (absent or empty) fails the pattern outright.
+            let mut match_start = usize::MAX;
+            let mut all_present = true;
+            for s in needles {
+                match (!s.is_empty())
+                    .then(|| haystack.find(s.as_str()))
+                    .flatten()
+                {
+                    Some(at) => match_start = match_start.min(at),
+                    None => {
+                        all_present = false;
+                        break;
+                    }
+                }
+            }
+            if !all_present {
                 continue;
             }
             // Vetoes are checked after `all_of` so an empty `none_of` (the
@@ -324,10 +364,23 @@ impl PermissionDetector {
             // rather than treated as "always present" — otherwise a stray
             // `""` in a hand-edited patterns.json would silently disable the
             // pattern, the same defense `all_of` already has.
+            //
+            // SCOPE (2026-08-05 review, LOW): a veto only counts from the start
+            // of this pattern's own earliest marker onward, not across the whole
+            // ~10-row tail. The tail is a scrollback window: an approval prompt
+            // is routinely painted UNDER the leftovers of a model picker whose
+            // footer still reads "↑/↓ to navigate · Esc to cancel", and a
+            // whole-tail veto let that dead chrome suppress a live prompt (no
+            // badge, no TTS). Chrome that belongs to the matched prompt sits at
+            // or after where its markers begin — the option list comes first,
+            // the footer under it — so this keeps every real
+            // menu-must-not-fire-Permission case vetoed (the menu's own verbs
+            // are inside its own region) while ignoring strictly-older rows.
+            let region = &haystack[match_start..];
             let vetoes = &self.norm_none_of[idx];
             if vetoes
                 .iter()
-                .any(|s| !s.is_empty() && haystack.contains(s.as_str()))
+                .any(|s| !s.is_empty() && region.contains(s.as_str()))
             {
                 continue;
             }
@@ -542,6 +595,33 @@ mod tests {
         let _ = d.check("Do you want to proceed?");
         d.force_clear(PatternKind::Permission);
         assert!(d.check("done").is_empty());
+    }
+
+    /// M11 (2026-08-05 review): the other half of `force_clear` — with the
+    /// prompt STILL on screen, dropping the latch must make the next scan
+    /// re-emit `Detected`. This is what stops a hook-driven `PermissionDenied`
+    /// (which clears `awaiting_permission` eagerly, possibly while a genuine
+    /// approval prompt is up) from stranding the badge/TTS: the detector is
+    /// edge-triggered, so without the clear a still-matching screen emits
+    /// nothing at all, forever.
+    #[test]
+    fn force_clear_lets_a_still_visible_prompt_be_redetected() {
+        let mut d = PermissionDetector::new(default_patterns());
+        let out = d.check(PERMISSION_TAIL);
+        assert!(detected_permission(&out), "first detection: {out:?}");
+        // Same screen again ⇒ latched, nothing emitted (this is the trap).
+        assert!(
+            d.check(PERMISSION_TAIL).is_empty(),
+            "a latched pattern must stay silent while it keeps matching"
+        );
+        // The hook path clears the latch …
+        d.force_clear(PatternKind::Permission);
+        // … and the very next scan of the unchanged screen re-raises it.
+        let again = d.check(PERMISSION_TAIL);
+        assert!(
+            detected_permission(&again),
+            "prompt still on screen must be re-detected after force_clear: {again:?}"
+        );
     }
 
     #[test]
@@ -830,6 +910,75 @@ mod tests {
                 "prose tail {tail:?} must not fire Permission: {out:?}"
             );
         }
+    }
+
+    /// 2026-08-05 review (LOW): the combination the prose tests above omitted —
+    /// Claude's own answer carrying BOTH a numbered "1. Yes" item AND the
+    /// phrase "to cancel" inside the same ~1000-char tail. With
+    /// `claude_permission_bare` anchored on a bare "1. Yes" this fired a
+    /// permission badge + announcement on ordinary output; the option-line
+    /// adjacency marker ("1. Yes 2.") is what tells prompt chrome from prose.
+    #[test]
+    fn prose_with_a_numbered_yes_and_a_cancel_mention_does_not_fire_permission() {
+        for tail in [
+            // A model answering two questions in a numbered list.
+            "Two answers:\n  1. Yes, the abort controller is wired — call it to cancel the \
+             in-flight request.\n  2. No, the retry budget is unchanged.\n\n> \n  ? for shortcuts\n",
+            // Same shape with the cancel mention below the list.
+            "Plan:\n  1. Yes/No prompt for the destructive branch\n  2. Wire the abort signal\n\n\
+             Press Ctrl+C to cancel at any point.\n\n> \n  ? for shortcuts\n",
+        ] {
+            let mut d = PermissionDetector::new(default_patterns());
+            let out = d.check(tail);
+            assert!(
+                !detected_permission(&out),
+                "prose tail {tail:?} must not fire Permission: {out:?}"
+            );
+        }
+        // …while the real cancel-only-footer prompt the pattern exists for
+        // still fires (the option lines are adjacent).
+        let mut d = PermissionDetector::new(default_patterns());
+        let out = d.check(&permission_tail("Esc to cancel"));
+        assert!(detected_permission(&out), "real bare prompt: {out:?}");
+        assert!(
+            matches!(&out[0], PatternTransition::Detected { pattern_name, .. }
+                if pattern_name == "claude_permission_bare"),
+            "the bare pattern is the one that must carry it: {out:?}"
+        );
+    }
+
+    /// 2026-08-05 review (LOW): `none_of` used to be evaluated against the
+    /// whole rendered tail, so a picker's footer still visible ABOVE a freshly
+    /// painted approval prompt suppressed it — no badge, no announcement. The
+    /// veto is now scoped to the region from the pattern's own earliest marker
+    /// onward.
+    #[test]
+    fn stale_menu_chrome_above_a_prompt_does_not_veto_it() {
+        // A model picker's leftovers, then the approval prompt under them.
+        let picker = "  ❯ 1. Sonnet\n    2. Opus\n\n  Enter to select · ↑/↓ to navigate · \
+                      Esc to cancel\n\n";
+        for footer in ["Esc to cancel · Tab to amend", "Esc to cancel"] {
+            let tail = format!("{picker}{}", permission_tail(footer));
+            let mut d = PermissionDetector::new(default_patterns());
+            let out = d.check(&tail);
+            assert!(
+                detected_permission(&out),
+                "menu chrome above the prompt must not veto it (footer {footer:?}): {out:?}"
+            );
+        }
+        // The veto itself is intact: the same picker chrome ALONE still fires
+        // nothing (its own verbs sit inside its own match region).
+        let mut d = PermissionDetector::new(default_patterns());
+        assert!(
+            d.check(picker).is_empty(),
+            "picker alone must still be vetoed"
+        );
+        // And a picker whose footer leads with the cancel segment stays vetoed
+        // too — the trailing menu verb is after the marker, so in region.
+        let mut d2 = PermissionDetector::new(default_patterns());
+        assert!(d2
+            .check("  ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Enter to select\n")
+            .is_empty());
     }
 
     // Working-state footer while Claude is generating. Note lowercase "esc",

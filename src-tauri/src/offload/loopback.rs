@@ -21,7 +21,7 @@
 //! observe task text — the same localhost-dev-server trust assumption,
 //! documented in MAINTENANCE.md.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -644,11 +644,6 @@ async fn handle_conn(
         }
         ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
-        // V30 Phase B test rig — remove with the Phase 0 spike (#15). The route
-        // does not exist at all unless `CIMP_CHANNEL_SPIKE` is armed.
-        ("POST", "/push_test") if channel_spike_armed() => {
-            handle_push_test(&mut stream, &service, &req).await
-        }
         _ => write_simple(&mut stream, 404, "text/plain", b"not found").await,
     }
 }
@@ -1403,24 +1398,51 @@ const PERMISSION_MESSAGE_MARKERS: [&str; 2] = ["your permission", "permission to
 /// value Claude Code's `Notification` matcher filters on.
 const PERMISSION_NOTIFICATION_TYPE: &str = "permission_prompt";
 
+/// Notification types we KNOW about and deliberately ignore (Claude Code hooks
+/// guide, same list the `Notification` matcher accepts, minus
+/// `permission_prompt`). Recognizing them by name is what lets an
+/// *unrecognized* type fall through to the prose check without idle/auth
+/// notifications riding along — see [`classify_permission_event`].
+const IGNORED_NOTIFICATION_TYPES: [&str; 7] = [
+    "idle_prompt",
+    "auth_success",
+    "elicitation_dialog",
+    "elicitation_complete",
+    "elicitation_response",
+    "agent_needs_input",
+    "agent_completed",
+];
+
 /// NC-2: map a hook payload to a permission edge, or `None` to ignore it.
 ///
 ///   * `PermissionDenied` (auto-classifier blocked the call) resolves the
 ///     prompt. Note the docs describe this as the auto-mode classifier's own
 ///     denial, NOT necessarily the user pressing "No" — treating it as a
-///     resolution is still right (nothing is awaiting the user afterwards), and
-///     an over-eager clear is harmless: the regex fallback re-detects a prompt
-///     that is genuinely still on screen.
-///   * `Notification` is classified by its TYPE when the payload carries one
-///     (the field the matcher filters on), else by its prose. Every other
-///     notification type — `idle_prompt`, `auth_success`, `elicitation_*`,
-///     `agent_*` — is IGNORED.
+///     resolution is still right (nothing is awaiting the user afterwards).
+///     M11 fix (2026-08-05 review): the eager clear is paired with a
+///     force-clear of that tab's regex latch in `handle_permission_event`, so a
+///     prompt that is genuinely still on screen is re-raised on the detector's
+///     next scan instead of staying invisible until the next keystroke.
+///   * `Notification` is classified by its TYPE when the payload carries a
+///     RECOGNIZED one (the field the matcher filters on), else by its prose.
 ///
-/// **Idle notifications are deliberately dropped.** `idle_prompt` ("waiting for
-/// your input") is semantically close to the `awaiting_question` pipe, but that
-/// pipe's meaning today is "an AskUserQuestion-style menu is on screen" and the
-/// regex detector owns it; wiring idle there would flip the badge/TTS on every
-/// turn boundary. Revisit only with a separate signal.
+/// **Type dispatch, in order (M12 fix, 2026-08-05 review):**
+///   1. `permission_prompt` ⇒ `Detected`.
+///   2. A type in [`IGNORED_NOTIFICATION_TYPES`] ⇒ ignored, prose NOT
+///      consulted. Deliberate: see the idle note below.
+///   3. Anything else — including an empty/absent type — falls through to the
+///      prose check. This is the drift path the shim's payload-shape note calls
+///      UNVERIFIED: a renamed type or a nested/renamed field must degrade to
+///      "we read the message instead", never to silence. Returning early on
+///      every unrecognized non-empty type inverted the contract precisely for
+///      the permission case, where "ignored" IS silence.
+///
+/// **Idle notifications are deliberately dropped** — and, per rule 2, dropped
+/// even when their prose would match. `idle_prompt` ("waiting for your input")
+/// is semantically close to the `awaiting_question` pipe, but that pipe's
+/// meaning today is "an AskUserQuestion-style menu is on screen" and the regex
+/// detector owns it; wiring idle there would flip the badge/TTS on every turn
+/// boundary. Revisit only with a separate signal.
 fn classify_permission_event(
     event: &str,
     notification_type: &str,
@@ -1430,10 +1452,16 @@ fn classify_permission_event(
         "PermissionDenied" => Some(PermissionEdge::Resolved),
         "Notification" => {
             let kind = notification_type.trim();
-            if !kind.is_empty() {
-                return (kind.eq_ignore_ascii_case(PERMISSION_NOTIFICATION_TYPE))
-                    .then_some(PermissionEdge::Detected);
+            if kind.eq_ignore_ascii_case(PERMISSION_NOTIFICATION_TYPE) {
+                return Some(PermissionEdge::Detected);
             }
+            if IGNORED_NOTIFICATION_TYPES
+                .iter()
+                .any(|t| kind.eq_ignore_ascii_case(t))
+            {
+                return None;
+            }
+            // Unrecognized (or absent) type ⇒ the prose is all we have.
             let msg = message.to_ascii_lowercase();
             PERMISSION_MESSAGE_MARKERS
                 .iter()
@@ -1470,6 +1498,13 @@ struct PermissionTabCandidate {
 /// Never guesses: an ambiguous or unmatched payload returns `None` and the event
 /// is dropped, leaving detection to the TUI-regex fallback. Guessing would flip
 /// the badge/TTS/avatar for the WRONG tab, which is worse than a missed hook.
+///
+/// H1 fix (2026-08-05 review): the `session_id` on a candidate is already
+/// ambiguity-filtered upstream — with two RUNNING Claude tabs on one project the
+/// registry withholds BOTH bindings (`graph::service::live_claude_tab_sessions`),
+/// because the taps cannot tell those tabs' transcripts apart. Passes 1 and 2
+/// then find nothing and pass 3 sees the shared cwd on ≥2 tabs, so the event is
+/// dropped rather than attributed to whichever tab wrote last.
 fn resolve_permission_tab(
     candidates: &[PermissionTabCandidate],
     session_id: &str,
@@ -1514,17 +1549,12 @@ fn transcript_session_id(transcript_path: &str) -> Option<String> {
 /// A directory string normalized for comparison: separators unified, trailing
 /// separators dropped, and — on Windows, whose paths are case-insensitive —
 /// case-folded. `None` for an empty/whitespace path.
+///
+/// H1-R5 fix: delegates to [`crate::fsutil::norm_dir_key`], which the H1
+/// ambiguity predicate's transcript-root key also goes through — the two seams
+/// compare "same project dir?" and must not drift apart.
 fn norm_dir(dir: &str) -> Option<String> {
-    let s = dir.trim().replace('\\', "/");
-    let s = s.trim_end_matches('/');
-    if s.is_empty() {
-        return None;
-    }
-    Some(if cfg!(windows) {
-        s.to_ascii_lowercase()
-    } else {
-        s.to_string()
-    })
+    crate::fsutil::norm_dir_key(dir)
 }
 
 /// `POST /permission/event` (NC-2): the hook-driven half of permission
@@ -1595,9 +1625,10 @@ async fn handle_permission_event(
         (
             resolve_permission_tab(&candidates, &session_id, &transcript_path, &cwd),
             state.state_signals.clone(),
+            state.tabs.clone(),
         )
     });
-    let Some((Some(tab), signals)) = resolved else {
+    let Some((Some(tab), signals, registry)) = resolved else {
         debug!(
             event = %body.event,
             session = %session_id,
@@ -1615,16 +1646,31 @@ async fn handle_permission_event(
     let tab_id = crate::state::TabId::from_str(&tab);
     let signal = match edge {
         PermissionEdge::Detected => {
-            crate::state::StateSignal::PermissionPromptDetected { tab: tab_id }
+            crate::state::StateSignal::PermissionPromptDetected {
+                tab: tab_id.clone(),
+            }
         }
         PermissionEdge::Resolved => {
-            crate::state::StateSignal::PermissionPromptResolved { tab: tab_id }
+            crate::state::StateSignal::PermissionPromptResolved {
+                tab: tab_id.clone(),
+            }
         }
     };
     // Edge-triggered and best-effort, exactly like the PTY processor's
     // `try_send`: a full channel means the state manager is saturated, and the
     // regex detector's next scan re-raises the edge anyway.
     let _ = signals.try_send(signal);
+    // M11 (2026-08-05 review): a hook-driven Resolved clears the flag eagerly —
+    // a `PermissionDenied` from the auto-classifier can land while a genuine
+    // approval prompt is still on screen. The regex fallback cannot recover on
+    // its own: `PermissionDetector::check` is edge-triggered on a latched
+    // per-kind pattern name, so while that same pattern keeps matching it emits
+    // NOTHING. Drop the latch (and re-scan) in the tab's PTY processor so a
+    // prompt that is genuinely still up is re-raised immediately. Sent AFTER
+    // the Resolved signal so the two land on the state manager in that order.
+    if matches!(edge, PermissionEdge::Resolved) {
+        registry.lock().await.clear_permission_latch(&tab_id).await;
+    }
     info!(
         event = %body.event,
         tool = body.tool_name.as_deref().unwrap_or(""),
@@ -2127,89 +2173,6 @@ async fn handle_events(
     Ok(())
 }
 
-// ── V30 Phase B test rig — remove with the Phase 0 spike (#15) ───────────────
-//
-// Lets the push bus be driven end-to-end with `curl` before Phase C has any
-// real producers: with the app running and a Claude tab open,
-//
-//   curl -s -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
-//        -d '{"tab":"claude","content":"hello","meta":{"kind":"manual"}}' \
-//        http://127.0.0.1:<port>/push_test
-//
-// should surface a `<channel source="cimp-offload" kind="manual">hello</channel>`
-// in that tab. Inert (and 404) unless `CIMP_CHANNEL_SPIKE` is armed — the same
-// env gate the child-side spike rig uses, so one variable arms both halves.
-
-/// Whether the V30 channel spike rig is armed for this process.
-fn channel_spike_armed() -> bool {
-    std::env::var("CIMP_CHANNEL_SPIKE")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-}
-
-/// A `POST /push_test` request body.
-#[derive(Deserialize)]
-struct PushTestBody {
-    /// Target tab; absent ⇒ broadcast to every channel-capable child.
-    #[serde(default)]
-    tab: Option<String>,
-    content: String,
-    #[serde(default)]
-    meta: BTreeMap<String, String>,
-}
-
-/// `POST /push_test`: drive [`OffloadService::push_to_tab`] /
-/// [`OffloadService::push_broadcast`] by hand and report the delivery count.
-async fn handle_push_test(
-    stream: &mut TcpStream,
-    service: &Arc<OffloadService>,
-    req: &Request,
-) -> AppResult<()> {
-    let body: PushTestBody = match serde_json::from_slice(&req.body) {
-        Ok(b) => b,
-        Err(e) => {
-            return write_json(
-                stream,
-                400,
-                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
-            )
-            .await;
-        }
-    };
-    if body.content.trim().is_empty() {
-        return write_json(
-            stream,
-            400,
-            &serde_json::json!({ "ok": false, "error": "`content` must be non-empty" }),
-        )
-        .await;
-    }
-    let notice = PushNotice::new(body.content, body.meta);
-    let (delivered, target) = match body.tab.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        Some(tab) => (
-            usize::from(service.push_to_tab(tab, notice)),
-            tab.to_string(),
-        ),
-        None => (service.push_broadcast(notice), "*".to_string()),
-    };
-    info!(
-        target = %target,
-        delivered,
-        subscribers = service.push_subscriber_count(),
-        "offload loopback: /push_test (V30 spike rig)"
-    );
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({
-            "delivered": delivered,
-            "target": target,
-            "subscribers": service.push_subscriber_count(),
-        }),
-    )
-    .await
-}
-
 /// Write a one-shot response with a JSON-serializable body.
 async fn write_json<T: Serialize>(stream: &mut TcpStream, status: u16, body: &T) -> AppResult<()> {
     let json = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
@@ -2364,22 +2327,15 @@ mod tests {
             classify_permission_event("Notification", " Permission_Prompt ", ""),
             Some(PermissionEdge::Detected)
         );
-        // Every other documented type is ignored, including idle (which is NOT
+        // Every other RECOGNIZED type is ignored, including idle (which is NOT
         // wired to the question pipe — see the classifier's doc comment) …
-        for kind in [
-            "idle_prompt",
-            "auth_success",
-            "elicitation_dialog",
-            "elicitation_complete",
-            "elicitation_response",
-            "agent_needs_input",
-            "agent_completed",
-            "something_new",
-        ] {
+        for kind in IGNORED_NOTIFICATION_TYPES {
             assert_eq!(classify_permission_event("Notification", kind, ""), None);
         }
-        // … and a present type WINS over the prose fallback, so a future
-        // permission-flavoured message under a non-permission type can't leak in.
+        // … and a recognized type WINS over the prose fallback, so a future
+        // permission-flavoured message under a non-permission type can't leak
+        // in. Deliberate and pinned: idle notifications stay out of the
+        // permission pipe whatever their wording says.
         assert_eq!(
             classify_permission_event(
                 "Notification",
@@ -2388,6 +2344,50 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            classify_permission_event(
+                "Notification",
+                "Agent_Completed",
+                "Claude needs your permission to use Bash"
+            ),
+            None,
+            "recognized types are matched case-insensitively too"
+        );
+    }
+
+    /// M12 (2026-08-05 review): an UNRECOGNIZED non-empty type must fall
+    /// through to the prose check instead of short-circuiting to "ignored".
+    /// The `Notification` payload shape is explicitly UNVERIFIED
+    /// (`notify_hook.rs` module doc), so a renamed type — or a nested field the
+    /// shim reads into `notification_type` — is the expected drift, and for the
+    /// permission case "ignored" is silence: the badge/TTS never fire and
+    /// nothing logs above debug.
+    #[test]
+    fn unrecognized_notification_type_falls_through_to_the_prose_check() {
+        // Renamed/unknown type + permission prose ⇒ still detected.
+        for kind in ["tool_permission", "permission-prompt", "something_new"] {
+            assert_eq!(
+                classify_permission_event(
+                    "Notification",
+                    kind,
+                    "Claude needs your permission to use Bash"
+                ),
+                Some(PermissionEdge::Detected),
+                "{kind}"
+            );
+        }
+        // Unknown type + unrelated prose ⇒ ignored, as before.
+        for msg in [
+            "Claude is waiting for your input",
+            "Error: permission denied while reading /etc/shadow",
+            "",
+        ] {
+            assert_eq!(
+                classify_permission_event("Notification", "something_new", msg),
+                None,
+                "{msg}"
+            );
+        }
     }
 
     #[test]
@@ -2477,6 +2477,43 @@ mod tests {
             cand("claude-local", Some("dup"), "C:/b"),
         ];
         assert_eq!(resolve_permission_tab(&tabs, "dup", "", ""), None);
+    }
+
+    /// H1 (2026-08-05 review): two RUNNING Claude tabs on one project make every
+    /// tab-keyed identity claim unprovable, so `live_claude_sessions` (the sole
+    /// source of `session_id` here) hands both candidates `None` — see
+    /// `graph::service::live_claude_tab_sessions`. This pins the resulting
+    /// contract on THIS side of the seam: refuse, never guess.
+    #[test]
+    fn tab_mapping_refuses_when_the_registry_withholds_ambiguous_bindings() {
+        // Both same-root tabs, session bindings withheld at the registry.
+        let tabs = [
+            cand("claude", None, "C:/proj"),
+            cand("claude-local", None, "C:/proj"),
+        ];
+        // The hook payload names a real live session — but nothing claims it.
+        assert_eq!(resolve_permission_tab(&tabs, "sess-b", "", "C:/proj"), None);
+        assert_eq!(
+            resolve_permission_tab(
+                &tabs,
+                "",
+                "C:/Users/x/.claude/projects/slug/sess-b.jsonl",
+                "C:/proj"
+            ),
+            None
+        );
+        // ...and the cwd fallback declines too: the shared root is, by
+        // construction, shared by ≥2 tabs.
+        assert_eq!(resolve_permission_tab(&tabs, "", "", "C:/proj"), None);
+        // A single running tab per root keeps its binding and still resolves.
+        let solo = [
+            cand("claude", Some("sess-a"), "C:/proj"),
+            cand("ai-2", None, "C:/other"),
+        ];
+        assert_eq!(
+            resolve_permission_tab(&solo, "sess-a", "", ""),
+            Some("claude".to_string())
+        );
     }
 
     #[test]

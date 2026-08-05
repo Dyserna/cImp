@@ -18,7 +18,7 @@
       "kind": "permission",
       "all_of": [
         "to cancel",
-        "1. Yes"
+        "1. Yes 2."
       ],
       "none_of": [
         "to select",

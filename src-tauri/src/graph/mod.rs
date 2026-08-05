@@ -56,4 +56,4 @@ pub use mcp::{
 };
 pub use memory::{SessionUsageDetail, UsageSnapshot};
 pub use model::*;
-pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus};
+pub use service::{EmbedderProbe, GraphService, GraphStatus, LangCensus, RebuildOrigin};

@@ -86,6 +86,17 @@ fn legacy_pattern(
 /// with the current defaults. The list is append-only: whenever
 /// [`default_file`]'s patterns change, the outgoing set is added here.
 ///
+/// **The append rule is enforced** (M13, 2026-08-05 review) by
+/// `current_defaults_match_the_frozen_snapshot`, which holds a literal copy of
+/// the current set: changing `default_patterns()` turns that test red and its
+/// message spells out the two-step fix. Forgetting the append used to be
+/// silent, and its cost is delayed: installs that took the interim release end
+/// up holding a set matching no snapshot, so they are treated as hand-edited
+/// forever and never receive any future default fix (the 199221b bug).
+/// Only sets that actually SHIPPED belong here — a default set changed twice
+/// within one unreleased development range never reached a user's disk, so it
+/// is not a snapshot anyone can hold.
+///
 /// Provenance (see also `scripts/patterns.default.json`, which mirrored these
 /// from the v0.7.0 era onward):
 /// * `v0.4.0` — 7128de7, 2026-05-08. First shipped set.
@@ -253,6 +264,29 @@ fn load_or_seed_at(path: &Path) -> Vec<PermissionPattern> {
     }
 
     match read_file(path) {
+        Ok(file) if file.patterns.is_empty() => {
+            // "Empty is not absent" (2026-08-05 review, LOW): a parsed file
+            // whose pattern LIST is empty is a non-substantive artifact, not a
+            // configuration. It silently disabled the whole fallback detector
+            // AND the `claude_working` marker that drives the avatar's Thinking
+            // state — with one info-level line as the only trace. Treat it as
+            // absent: load the defaults and say so loudly.
+            //
+            // The file is deliberately NOT rewritten. It is the user's (they
+            // may be mid-edit, or mid-`{}` scaffold), and the loader's standing
+            // rule is that anything not provably pristine belongs to them. A
+            // user who genuinely wants detection off keeps every entry and sets
+            // `"disabled": true` — that stays honored, because the list is then
+            // non-empty and is loaded verbatim.
+            tracing::warn!(
+                path = %path.display(),
+                "patterns: file parsed but its pattern list is EMPTY — prompt detection and the \
+                 avatar's working-state marker would both be dead. Using the built-in defaults \
+                 for this run; the file is left untouched (add entries, or set \
+                 \"disabled\": true on them, to make the choice explicit)"
+            );
+            default_patterns()
+        }
         Ok(file) => {
             // Replace-if-pristine: a file that still reproduces an older
             // release's defaults exactly was never customized, so the user is
@@ -287,10 +321,17 @@ fn load_or_seed_at(path: &Path) -> Vec<PermissionPattern> {
             file.patterns
         }
         Err(e) => {
+            // Unreadable, 0-byte, or malformed. Defaults apply in memory and
+            // the file stays exactly as it is: re-seeding would clobber a
+            // hand-edit that happens to be mid-save or momentarily truncated,
+            // and the loader never rewrites a file it cannot prove pristine.
+            // WARN (not info) because from here on detection runs on something
+            // other than what the file says.
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "patterns: parse failed; using built-in defaults"
+                "patterns: file could not be read/parsed (0-byte, truncated or malformed JSON) — \
+                 using the built-in defaults for this run and leaving the file untouched"
             );
             default_patterns()
         }
@@ -433,6 +474,55 @@ mod tests {
         }
     }
 
+    /// M13 (2026-08-05 review): the enforcement half of the append-only rule in
+    /// [`legacy_default_sets`]. `current_defaults_are_not_a_legacy_set` below
+    /// only catches the reverse mistake (adding the CURRENT set to the legacy
+    /// list); nothing caught the one that actually costs users — changing the
+    /// shipped defaults and forgetting to append the outgoing set, which leaves
+    /// every install that took the interim release stranded on patterns no
+    /// snapshot recognizes.
+    ///
+    /// The literal below is the frozen copy of the current defaults. When it
+    /// fails, read the message: it names both edits.
+    #[test]
+    fn current_defaults_match_the_frozen_snapshot() {
+        // Serialized form of `default_patterns()`, frozen. `none_of` is omitted
+        // where empty exactly as the serializer omits it, and absent keys parse
+        // back to their defaults — so this round-trips to the same structs.
+        const FROZEN: &str = r#"[
+          { "name": "claude_permission", "kind": "permission",
+            "all_of": ["to cancel ·"],
+            "none_of": ["to select", "to navigate"], "disabled": false },
+          { "name": "claude_permission_bare", "kind": "permission",
+            "all_of": ["to cancel", "1. Yes 2."],
+            "none_of": ["to select", "to navigate"], "disabled": false },
+          { "name": "claude_question", "kind": "question",
+            "all_of": ["Enter to select", "Type something"], "disabled": false },
+          { "name": "claude_working", "kind": "working",
+            "all_of": ["esc to interrupt"], "disabled": false },
+          { "name": "opencode_permission", "kind": "permission",
+            "all_of": ["<replace with a substring unique to opencode --mini's permission prompt>"],
+            "disabled": true },
+          { "name": "opencode_working", "kind": "working",
+            "all_of": ["<replace with a substring unique to opencode --mini's working footer>"],
+            "disabled": true }
+        ]"#;
+        let frozen: Vec<PermissionPattern> =
+            serde_json::from_str(FROZEN).expect("frozen snapshot parses");
+        assert_eq!(
+            frozen,
+            default_patterns(),
+            "\nThe shipped default patterns changed. Two edits are required, in order:\n\
+             1. If the OUTGOING set (the FROZEN literal in this test) was ever RELEASED, append \
+             it to legacy_default_sets() with its era label — otherwise every install that took \
+             that release is treated as hand-edited forever and never gets another default fix. \
+             A set that only existed on an unreleased branch reached no user and must NOT be \
+             appended (it would just add a snapshot nobody holds).\n\
+             2. Update the FROZEN literal here to the new defaults, and regenerate \
+             scripts/patterns.default.json (see shipped_default_file_matches_code_defaults).\n"
+        );
+    }
+
     #[test]
     fn current_defaults_are_not_a_legacy_set() {
         // If the current defaults ever appeared in the legacy list, every load
@@ -573,13 +663,74 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// "Empty is not absent" (2026-08-05 review, LOW). Parsing an empty list is
+    /// still correct at the serde layer — it is the LOADER that must refuse to
+    /// run on it: zero patterns kills the fallback permission detector and the
+    /// `claude_working` avatar marker with it, and used to do so with an
+    /// info-level "loaded" line as the only evidence.
     #[test]
-    fn empty_object_yields_empty_pattern_list() {
-        // A user who deletes everything ends up with no patterns —
-        // detection effectively off. That's a valid choice; we don't
-        // re-seed in that case.
+    fn empty_pattern_list_is_non_substantive_and_loads_defaults() {
+        // Serde layer: `{}` and an explicit empty array both parse to no
+        // patterns (this is what the loader has to catch).
         let parsed: PatternsFile = serde_json::from_str("{}").unwrap();
         assert!(parsed.patterns.is_empty());
         assert!(parsed.doc.is_none());
+
+        for body in ["{}", r#"{"patterns": []}"#, r#"{"_doc":"x","patterns":[]}"#] {
+            let (dir, path) = temp_patterns_path("empty");
+            fs::write(&path, body).unwrap();
+            let before = fs::read(&path).unwrap();
+            // Defaults in memory …
+            assert_eq!(load_or_seed_at(&path), default_patterns(), "body {body}");
+            // … and the user's file is left exactly as they wrote it.
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "body {body}: file must not be rewritten"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The same discipline for a 0-byte / truncated / malformed file: defaults
+    /// in memory, WARN, and the file left alone (it may be a hand-edit caught
+    /// mid-save — re-seeding would destroy it).
+    #[test]
+    fn unparseable_file_loads_defaults_without_touching_the_file() {
+        for body in ["", "   ", "{ not valid json", "\u{feff}"] {
+            let (dir, path) = temp_patterns_path("unparseable");
+            fs::write(&path, body).unwrap();
+            let before = fs::read(&path).unwrap();
+            assert_eq!(load_or_seed_at(&path), default_patterns(), "body {body:?}");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "body {body:?}: file must not be rewritten"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A file that keeps its entries but disables them stays the user's
+    /// explicit choice — non-empty, so it loads verbatim (detection off).
+    #[test]
+    fn all_entries_disabled_is_honored_not_replaced() {
+        let (dir, path) = temp_patterns_path("disabled");
+        let mut set = default_patterns();
+        for p in &mut set {
+            p.disabled = true;
+        }
+        write_file(
+            &path,
+            &PatternsFile {
+                doc: None,
+                patterns: set.clone(),
+            },
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(load_or_seed_at(&path), set);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

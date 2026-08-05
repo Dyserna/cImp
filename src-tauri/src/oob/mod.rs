@@ -206,6 +206,23 @@ impl OobContext {
         }
     }
 
+    /// H1 fix (2026-08-05 review): declare that this tab is RUNNING `agent` and
+    /// derives its session identity from the transcript source `root`, so the
+    /// registry can detect when two running tabs share one root and its
+    /// tab-keyed answers stop being provable
+    /// (`GraphService::mark_live_tab_root`). Called on every poll tick of a
+    /// root-binding tap; cleared together with the live-session entry by
+    /// [`Self::clear_live_session`]. A no-op when memory isn't wired.
+    ///
+    /// Only root-binding taps call this. The OpenCode tap must NOT: it reads the
+    /// session id off its own per-tab SSE stream, so two OpenCode tabs on one
+    /// project are genuinely distinguishable and must keep their scoping.
+    pub fn mark_live_tab_root(&self, agent: &str, root: &std::path::Path) {
+        if let Some(mem) = self.mem.as_ref() {
+            mem.mark_live_tab_root(self.tab.as_str(), agent, root);
+        }
+    }
+
     /// V24 Phase B: drop this tab's live-session registry entry — the Claude
     /// tap calls this when its transcript tail exits (tab cancel / source end),
     /// so a closed tab stops being reported active before its TTL lapses. A
@@ -221,12 +238,17 @@ impl OobContext {
     /// when the bus isn't wired (mirrors [`Self::record_mem`]'s `mem: None`
     /// degradation).
     ///
-    /// `channels: true` is reported unconditionally, because for an in-process
-    /// subscriber the field's Claude-side meaning ("this child declared the
-    /// `claude/channel` capability at handshake time") has no analogue: nothing
-    /// was negotiated, so there is nothing that could have gone stale. The
-    /// `offload.session_push` gate is therefore checked at DELIVERY time by the
-    /// tap instead — see `opencode::forward_target`.
+    /// `channels: true` is reported because a subscription only EXISTS while
+    /// `offload.session_push` is on: the OpenCode tap registers and deregisters
+    /// as the setting flips (`opencode::sync_subscription`, driven off the
+    /// settings broadcast), so no tab restart is needed and
+    /// `PushRegistry::deliver`'s count stays honest — it never counts a tab that
+    /// is about to drop the notice at the gate. (For an in-process subscriber
+    /// the field's Claude-side meaning — "this child declared the
+    /// `claude/channel` capability at handshake time" — has no analogue: nothing
+    /// is negotiated, so nothing can go stale.) The gate is re-read once more at
+    /// DELIVERY time (`opencode::forward_target`), which closes the sub-millisecond
+    /// window between a producer's live read and the tap's.
     pub fn register_pushes(
         &self,
         consumer: &str,

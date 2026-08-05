@@ -41,10 +41,20 @@ pub fn tool_error(message: &str) -> Value {
 /// - an invalid-UTF-8 frame on stdin is skipped rather than treated as EOF —
 ///   one stray byte must not kill an otherwise-healthy server mid-session.
 ///   Only a real I/O error or EOF ends the loop.
+///
+/// `after_response` runs once a request's response frame has left this process
+/// (or its write failed and the pipe is gone), with the request's method name.
+/// It exists for the one ordering rule this loop cannot express otherwise:
+/// nothing may be written on the connection before the `initialize` reply, yet
+/// a child's out-of-band writer (the offload child's `/events` relay) is armed
+/// by the `initialize` HANDLER — which returns strictly before its response is
+/// serialized. A plain `fn` pointer, so a child that needs no hook passes
+/// `|_| {}` at zero cost.
 pub async fn serve<F, Fut>(
     stdout: Arc<TokioMutex<tokio::io::Stdout>>,
     panic_label: &'static str,
     handler: F,
+    after_response: fn(&str),
 ) where
     F: Fn(String, Value) -> Fut,
     Fut: std::future::Future<Output = RpcResult> + Send + 'static,
@@ -87,7 +97,7 @@ pub async fn serve<F, Fut>(
             .to_string();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-        let fut = handler(method, params);
+        let fut = handler(method.clone(), params);
         let stdout = stdout.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -107,12 +117,16 @@ pub async fn serve<F, Fut>(
             };
             let mut bytes = frame.to_string();
             bytes.push('\n');
-            let mut out = stdout.lock().await;
-            if out.write_all(bytes.as_bytes()).await.is_err() || out.flush().await.is_err() {
-                // stdout is gone (the host closed the pipe): signal the read
-                // loop to stop spawning handlers.
-                shutdown.store(true, Ordering::Relaxed);
-            }
+            {
+                let mut out = stdout.lock().await;
+                if out.write_all(bytes.as_bytes()).await.is_err() || out.flush().await.is_err() {
+                    // stdout is gone (the host closed the pipe): signal the read
+                    // loop to stop spawning handlers.
+                    shutdown.store(true, Ordering::Relaxed);
+                }
+            } // release the write lock BEFORE the hook — whatever it unblocks
+              // may want to write on this same pipe.
+            after_response(&method);
         });
     }
 }

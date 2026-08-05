@@ -417,7 +417,9 @@ pub fn run(consumer: &str) {
     };
     rt.block_on(async {
         let stdout = Arc::new(TokioMutex::new(tokio::io::stdout()));
-        crate::mcp_stdio::serve(stdout, "code-audit", handle_owned).await;
+        // No post-response hook: this child has no out-of-band writer, so
+        // nothing needs releasing once the `initialize` reply is on the wire.
+        crate::mcp_stdio::serve(stdout, "code-audit", handle_owned, |_| {}).await;
     });
 }
 

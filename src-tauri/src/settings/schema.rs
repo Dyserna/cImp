@@ -736,6 +736,18 @@ impl Settings {
     /// "cImp is not running" while the app is visibly running (the V26 Code
     /// Audit gap — `offload.mcp_host_needed()` alone misses `graph` and
     /// `code_audit`, which both inject servers on their own).
+    ///
+    /// **The subset rule covers HOOK SHIMS too, not just MCP servers.** Every
+    /// shim in the Claude `--settings` overlay (`--context-hook`,
+    /// `--precompact-hook`, `--read-hook`, `--postedit-hook`, and the NC-2
+    /// `--notify-hook` permission shim) reaches the app only through
+    /// `post_loopback`. The gated ones ride `graph.enabled`, which implies this
+    /// predicate; the NC-2 pair has no feature toggle of its own and is
+    /// therefore gated on `loopback_needed()` directly (H2, 2026-08-05 review)
+    /// — injecting it without the endpoint spawned a shim process per Claude
+    /// notification whose POST was dropped, silently killing the PRIMARY
+    /// permission signal on a default install. Tripwire:
+    /// `tabs::config::tests::every_advertised_mcp_server_gets_a_loopback`.
     pub fn loopback_needed(&self) -> bool {
         self.offload.mcp_host_needed() || self.graph.enabled || self.code_audit.mcp_exposed()
     }

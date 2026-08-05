@@ -195,8 +195,9 @@ impl Drop for QueueGuard<'_> {
 // ── V30 Phase B — the tab-addressed push bus ─────────────────────────────────
 //
 // One app-side registry of the live `--offload-mcp` children (one per tab), so
-// backend code can call [`OffloadService::push_to_tab`] and have a `<channel>`
-// message appear in THAT tab's session. The wire ride is the existing
+// backend code can address a `<channel>` message at every armed session
+// ([`PushRegistry::push_broadcast`]) or at one tab
+// ([`PushRegistry::push_to_tab`]). The wire ride is the existing
 // `GET /events` SSE stream (`loopback::handle_events`), which gains an
 // `event: push` frame beside the unchanged `event: change` capability pulse;
 // the app sends the SEMANTIC payload and the child owns the JSON-RPC framing.
@@ -352,7 +353,10 @@ impl PushRegistry {
             .remove(&id);
     }
 
-    /// Live subscriber count (diagnostics + tests).
+    /// Live subscriber count. Test-only: the diagnostic wrapper on
+    /// `OffloadService` went away with the Phase 0 `/push_test` rig, and the
+    /// registry's real consumers count deliveries, not subscribers.
+    #[cfg(test)]
     pub fn subscriber_count(&self) -> usize {
         self.subs.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
@@ -384,6 +388,24 @@ impl PushRegistry {
     }
 
     /// Push to the child serving `tab`.
+    ///
+    /// **No production caller today** — deliberately, and this is the honest
+    /// note the review asked for. The milestone's Phase C sketch pairs this with
+    /// "origin-tab on `RunBody`/`/audit/run`", i.e. addressing a completion
+    /// notice back at the agent tab that started the work; but the two producers
+    /// that shipped are both GUI-initiated (nobody's tab), and the per-call
+    /// completion notices that WOULD have used it (offload-task stragglers) were
+    /// dropped at spike close in favour of Claude Code's native
+    /// auto-backgrounding (decision 2). The audit runner's echo guard makes the
+    /// remaining candidate a non-starter: an agent-initiated scan must not push
+    /// at all, so there is no origin tab left to address.
+    ///
+    /// Kept — rather than deleted — because it is the addressing half of the
+    /// bus's contract (`tab=` on `/events`, `PushSubscriber.tab`) and is pinned
+    /// by tests; the next producer that is agent-initiated needs exactly this.
+    /// `cfg(test)` so it costs nothing shipped: drop the attribute the moment a
+    /// real caller exists.
+    #[cfg(test)]
     pub fn push_to_tab(&self, tab: &str, notice: PushNotice) -> bool {
         self.deliver(notice, |s| s.tab.as_deref() == Some(tab)) > 0
     }
@@ -498,27 +520,10 @@ impl OffloadService {
         self.pushes.register(tab, consumer, channels)
     }
 
-    /// Push one notice into the session of `tab`, returning whether any live,
-    /// channel-capable child accepted it. Best-effort by contract: `false` means
-    /// nothing was queued (no such tab, the tab's child never declared channels,
-    /// or its queue was full) — producers must have a pull twin for the payload
-    /// (milestone invariant 2), never treat this as delivery confirmation.
-    pub fn push_to_tab(&self, tab: &str, notice: PushNotice) -> bool {
-        self.pushes.push_to_tab(tab, notice)
-    }
-
-    /// Push one notice to every channel-capable child of this instance,
-    /// returning the number queued. Same best-effort contract as
-    /// [`Self::push_to_tab`].
-    pub fn push_broadcast(&self, notice: PushNotice) -> usize {
-        self.pushes.push_broadcast(notice)
-    }
-
-    /// Live push-subscriber count (diagnostics; also the Phase C readiness
-    /// check "is anyone listening at all").
-    pub fn push_subscriber_count(&self) -> usize {
-        self.pushes.subscriber_count()
-    }
+    // The `push_to_tab` / `push_broadcast` / `push_subscriber_count` wrappers
+    // that used to sit here were pure indirection for the Phase 0 `/push_test`
+    // rig and went with it. Producers take the registry itself (see
+    // `push_registry` below), which is the only send half they need.
 
     /// A handle on the push bus for **producers that are not the offload
     /// service** (V30 Phase C: the graph indexer, the audit runner). Handing out

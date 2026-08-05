@@ -12,6 +12,7 @@ import {
   effectiveBackgroundMode,
   recreateDebounceDelay,
   rgbaFrom,
+  shouldHoldWebgl,
   type RenderingMode,
   type TabWithBackgroundOverride,
 } from './background';
@@ -117,6 +118,41 @@ describe('categoryOf', () => {
   });
   test('none → fast', () => {
     expect(categoryOf({ kind: 'none' })).toBe('fast');
+  });
+});
+
+describe('shouldHoldWebgl (M17 renderer policy)', () => {
+  const state = (over: Partial<Parameters<typeof shouldHoldWebgl>[0]> = {}) => ({
+    attached: true,
+    bgCategory: 'fast' as const,
+    webglFailed: false,
+    ...over,
+  });
+
+  test('visible + fast + healthy → holds a context', () => {
+    expect(shouldHoldWebgl(state())).toBe(true);
+  });
+
+  test('stashed offscreen → no context (this is the whole point of M17)', () => {
+    expect(shouldHoldWebgl(state({ attached: false }))).toBe(false);
+  });
+
+  test('image background → never WebGL, visible or not', () => {
+    expect(shouldHoldWebgl(state({ bgCategory: 'image' }))).toBe(false);
+    expect(shouldHoldWebgl(state({ bgCategory: 'image', attached: false }))).toBe(false);
+  });
+
+  test('a terminal that failed WebGL is not re-probed when shown again', () => {
+    expect(shouldHoldWebgl(state({ webglFailed: true }))).toBe(false);
+    // …and stays false across a stash→show cycle (the flag is what survives).
+    expect(shouldHoldWebgl(state({ webglFailed: true, attached: false }))).toBe(false);
+  });
+
+  test('split view: policy is per-terminal, so every attached pane qualifies', () => {
+    const panes = [state(), state(), state()];
+    expect(panes.every(shouldHoldWebgl)).toBe(true);
+    // Only the ones off screen drop their context.
+    expect([...panes, state({ attached: false })].filter(shouldHoldWebgl)).toHaveLength(3);
   });
 });
 

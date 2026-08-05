@@ -7,7 +7,9 @@
 //! - `GET /slots` — per-slot `is_processing` + `n_decoded` (tokens generated) +
 //!   `n_ctx`. Always available. We **compute tokens/sec ourselves** from the
 //!   `n_decoded` delta between polls, and derive request **history** from
-//!   slots flipping busy→idle.
+//!   slots flipping busy→idle. Its `n_ctx` is *not* trusted for the per-slot
+//!   window — under `--kv-unified` it reports the unified pool, so the
+//!   backend handle's corrected figure wins (see [`per_slot_n_ctx`]).
 //! - `GET /metrics` — Prometheus gauges (only when the server was launched
 //!   with `--metrics`): true context fill (`kv_cache_usage_ratio`), the
 //!   server-side queue (`requests_deferred`), busy count
@@ -268,12 +270,10 @@ impl MetricsPoller {
                     .get("is_processing")
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false);
-                let slot_n_ctx = s
-                    .get("n_ctx")
-                    .and_then(|x| x.as_u64())
-                    .map(|n| n as u32)
-                    .or(n_ctx)
-                    .unwrap_or(0);
+                let slot_n_ctx = per_slot_n_ctx(
+                    n_ctx,
+                    s.get("n_ctx").and_then(|x| x.as_u64()).map(|n| n as u32),
+                );
                 let n_decoded = slot_decoded(s);
                 let n_prompt = s
                     .get("n_prompt_tokens")
@@ -440,6 +440,27 @@ fn slot_decoded(s: &Value) -> u32 {
         .unwrap_or(0) as u32
 }
 
+/// The per-slot context window to show on the dashboard row.
+///
+/// `corrected` is the backend handle's [`Backend::n_ctx`](super::Backend::n_ctx),
+/// which applies the `--kv-unified` correction *at the read* precisely so that
+/// "every consumer sees the same per-slot number in both KV modes"
+/// ([`LlamaServer::n_ctx`](super::server::LlamaServer) documents this
+/// invariant). The raw `/slots` `n_ctx` field does **not** honour it: under
+/// `--kv-unified` llama.cpp reports the whole unified KV pool there, so a slot
+/// sitting at 100 % of its real budget rendered as ~`100/parallel` % on the
+/// per-slot bar while `n_ctx_per_slot` in the same card header showed the
+/// corrected figure — two numbers on one card disagreeing by the parallel
+/// factor.
+///
+/// So: prefer the corrected value; fall back to the raw `/slots` field only
+/// when the handle has none (context not probed yet, or a remote entry whose
+/// `n_ctx` is unknown). Display-only — the router/budget path reads
+/// `Backend::n_ctx` directly and is unaffected.
+fn per_slot_n_ctx(corrected: Option<u32>, raw_slots_n_ctx: Option<u32>) -> u32 {
+    corrected.or(raw_slots_n_ctx).unwrap_or(0)
+}
+
 /// The gauges we surface from `/metrics`. All optional — `--metrics` may be
 /// off, and not every llama.cpp build exposes every gauge (notably
 /// `kv_cache_usage_ratio` is absent in several builds).
@@ -504,6 +525,26 @@ mod tests {
         let top = json!({ "n_decoded": 42 });
         assert_eq!(slot_decoded(&top), 42);
         assert_eq!(slot_decoded(&json!({})), 0);
+    }
+
+    /// Regression pin for the `--kv-unified` display bug: the per-slot bar
+    /// must use the corrected per-slot window from the backend handle, not the
+    /// raw `/slots` `n_ctx` (which reports the whole unified KV pool). Under
+    /// `--kv-unified` with `-c 65536 --parallel 4` the handle says 16384 while
+    /// `/slots` says 65536; preferring the raw value made a full slot render
+    /// at 25 %.
+    #[test]
+    fn per_slot_n_ctx_prefers_the_corrected_value() {
+        // Corrected value wins over the raw /slots field.
+        assert_eq!(per_slot_n_ctx(Some(16384), Some(65536)), 16384);
+        // Split-KV: both agree, so preference is invisible (pure pass-through).
+        assert_eq!(per_slot_n_ctx(Some(16384), Some(16384)), 16384);
+        // No corrected value (context not probed yet) — fall back to /slots.
+        assert_eq!(per_slot_n_ctx(None, Some(65536)), 65536);
+        // Neither source: 0, which the dashboard renders as "no bar".
+        assert_eq!(per_slot_n_ctx(None, None), 0);
+        // Corrected present, /slots field missing.
+        assert_eq!(per_slot_n_ctx(Some(8192), None), 8192);
     }
 
     #[test]

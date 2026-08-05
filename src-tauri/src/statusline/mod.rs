@@ -153,10 +153,10 @@ pub fn run() {
     // Bar first, push second: Claude Code is waiting on our stdout, the
     // usage widget can wait a few ms. A payload with neither `rate_limits`
     // nor context numbers skips the write so a good push is never clobbered;
-    // `store_pushed_usage` additionally protects a fresh quota push from
-    // being evicted by a quota-less one.
+    // `store_pushed_usage` merges what we do have over the file's other slot,
+    // so no tab's push can evict another tab's still-valid data (M14).
     if let Some(snapshot) = extract_push(&input) {
-        crate::usage::store_pushed_usage(&snapshot);
+        crate::usage::store_pushed_usage(&snapshot, &extract_push_meta(&input));
     }
 }
 
@@ -264,6 +264,48 @@ fn extract_push(input: &str) -> Option<crate::usage::UsageSnapshot> {
     snapshot.is_substantive().then_some(snapshot)
 }
 
+/// Everything the push needs about *which* session produced this payload
+/// (M14). Never rendered — it decides which tab owns the shared context slot
+/// (see `crate::usage::merge_push`), so it deliberately stays out of
+/// `ContextSnapshot` and out of the Rust↔TS contract.
+///
+/// What the status-line payload offers, in preference order:
+///   * `session_id` — Claude Code's per-session UUID, the stable key.
+///   * `transcript_path` — one file per session; a fine substitute.
+///   * `session_name` — human-set, optional, not guaranteed unique, but
+///     better than nothing.
+///
+/// As an *activity* discriminator it also takes the `cost` block's
+/// `total_api_duration_ms` / `total_cost_usd`, which move only when the
+/// session actually calls the API. (`total_duration_ms` is deliberately not
+/// used: wall-clock keeps ticking while a session sits idle, which would make
+/// every idle beat look like work.) `None` for anything the payload omits —
+/// the merge degrades to last-writer-wins rather than misattributing.
+fn extract_push_meta(input: &str) -> crate::usage::PushMeta {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+        return crate::usage::PushMeta::default();
+    };
+    let session_key = non_empty_string(v.get("session_id"))
+        .or_else(|| non_empty_string(v.get("transcript_path")))
+        .or_else(|| non_empty_string(v.get("session_name")));
+    let cost = v.get("cost");
+    let activity = cost.and_then(|c| {
+        let api_ms = num_f64(c, "total_api_duration_ms");
+        let usd = num_f64(c, "total_cost_usd");
+        (api_ms.is_some() || usd.is_some()).then(|| {
+            format!(
+                "{}/{}",
+                api_ms.map(|n| n.to_string()).unwrap_or_default(),
+                usd.map(|n| n.to_string()).unwrap_or_default(),
+            )
+        })
+    });
+    crate::usage::PushMeta {
+        session_key,
+        activity,
+    }
+}
+
 /// Pull the subscription quota out of the payload's `rate_limits` object
 /// (documented shape: `used_percentage` 0–100, `resets_at` Unix epoch
 /// seconds; either window independently absent).
@@ -337,9 +379,14 @@ fn extract_context(v: &serde_json::Value) -> Option<crate::usage::ContextSnapsho
         thinking: scalar_string(v.get("thinking")),
         fast_mode: v.get("fast_mode").and_then(|f| f.as_bool()),
     };
-    // `total_input_tokens` also lives at the top level in some payloads; only
-    // consulted when the block itself didn't carry it.
-    if ctx.total_input_tokens.is_none() {
+    // `total_input_tokens` also lives at the top level in some payloads — but
+    // only consult it when there is no `context_window` block at all. It is
+    // the numerator of the "used / window size" pair the UI draws, and the
+    // denominator is block-only: pairing a top-level number (whose semantics
+    // could drift independently) with a block-level window size would silently
+    // mix two populations. With no block there is no denominator to mix with,
+    // so the lone figure is safe (it renders as "25k/?").
+    if ctx.total_input_tokens.is_none() && cw.is_none() {
         ctx.total_input_tokens = num_u64(v, "total_input_tokens");
     }
     let has_metadata = ctx.session_name.is_some()
@@ -763,6 +810,71 @@ mod tests {
         assert!(ctx.session_name.is_none());
         // A non-boolean fast_mode is dropped rather than coerced.
         assert!(ctx.fast_mode.is_none());
+    }
+
+    #[test]
+    fn context_token_numerator_never_mixes_sources() {
+        // A `context_window` block that lost its `total_input_tokens` must NOT
+        // borrow the top-level one: the window size (denominator) comes from
+        // the block, so a top-level numerator would mix populations.
+        let json = r#"{"total_input_tokens":999999,
+            "context_window":{"used_percentage":30.0,"context_window_size":200000}}"#;
+        let ctx = extract_push(json)
+            .expect("snapshot extracted")
+            .context
+            .expect("context block");
+        assert!(ctx.total_input_tokens.is_none());
+        assert_eq!(ctx.context_window_size, Some(200_000));
+
+        // With no block at all there is no denominator to mix with, so the
+        // lone top-level figure is still worth showing.
+        let json = r#"{"total_input_tokens":25004}"#;
+        let ctx = extract_push(json)
+            .expect("snapshot extracted")
+            .context
+            .expect("context block");
+        assert_eq!(ctx.total_input_tokens, Some(25_004));
+        assert!(ctx.context_window_size.is_none());
+    }
+
+    #[test]
+    fn push_meta_prefers_session_id_and_api_activity() {
+        let json = r#"{"session_id":"abc-123","transcript_path":"C:/t/abc.jsonl",
+            "session_name":"refactor",
+            "cost":{"total_cost_usd":0.42,"total_duration_ms":900000,
+                    "total_api_duration_ms":12000},
+            "context_window":{"used_percentage":12.5}}"#;
+        let meta = extract_push_meta(json);
+        assert_eq!(meta.session_key.as_deref(), Some("abc-123"));
+        let activity = meta.activity.expect("activity counters");
+        assert!(activity.contains("12000"), "got: {activity}");
+        assert!(activity.contains("0.42"), "got: {activity}");
+        // Wall-clock session duration must not leak in: it moves while idle.
+        assert!(!activity.contains("900000"), "got: {activity}");
+    }
+
+    #[test]
+    fn push_meta_degrades_field_by_field() {
+        // No session id → transcript path → session name → nothing at all.
+        assert_eq!(
+            extract_push_meta(r#"{"transcript_path":"C:/t/a.jsonl","session_name":"x"}"#)
+                .session_key
+                .as_deref(),
+            Some("C:/t/a.jsonl")
+        );
+        assert_eq!(
+            extract_push_meta(r#"{"session_id":"  ","session_name":"x"}"#)
+                .session_key
+                .as_deref(),
+            Some("x")
+        );
+        let bare = extract_push_meta(r#"{"context_window":{"used_percentage":1.0}}"#);
+        assert!(bare.session_key.is_none() && bare.activity.is_none());
+        // A cost block with nothing numeric in it is absence, not "0/0".
+        assert!(extract_push_meta(r#"{"cost":{"total_lines_added":3}}"#)
+            .activity
+            .is_none());
+        assert!(extract_push_meta("not json").session_key.is_none());
     }
 
     #[test]

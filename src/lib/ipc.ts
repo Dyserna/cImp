@@ -143,18 +143,27 @@ export interface UsageSnapshot {
 /// Outcome of a usage read. Data is pushed by the Claude tab's status line
 /// (`cimp --statusline` persists the payload's `rate_limits`) and read back
 /// from disk — no network involved:
-///   - `snapshot` set, `stale` false → a fresh push from a live Claude tab.
-///   - `snapshot` set, `stale` true → the last push is aging (tab closed or
-///     gone quiet); render dimmed.
+///   - `snapshot` set, `stale` false → something on it is a fresh push from a
+///     live Claude tab.
+///   - `snapshot` set, `stale` true → every part is aging (tabs closed or gone
+///     quiet); render dimmed.
 ///   - all empty → no push data (no Claude tab has reported yet, or the last
 ///     push expired) — hide the widget.
 ///   - `rate_limited` / `retry_after_secs` are legacy fields from the retired
 ///     endpoint-poll path (kept in the shape; always false / null now).
+///
+/// M14: the quota and context halves are written by different Claude tabs and
+/// age on their own clocks, so each carries its own staleness flag; `stale` is
+/// the whole-widget roll-up (true only when nothing on screen is fresh).
 export interface UsageResult {
   snapshot: UsageSnapshot | null;
   rate_limited: boolean;
   retry_after_secs: number | null;
   stale: boolean;
+  /// Quota half present but aging. False when there is no quota data at all.
+  quota_stale: boolean;
+  /// Context half present but aging. False when there is no context data.
+  context_stale: boolean;
 }
 
 /// Fetch the current Claude Code usage. See `UsageResult` for the outcomes.

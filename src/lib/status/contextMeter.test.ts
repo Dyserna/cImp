@@ -3,8 +3,12 @@ import {
   cacheHitPct,
   cacheSplitLabel,
   clampPct,
+  claudePushTabActive,
+  commandIsClaude,
+  contextAttribution,
   contextTitle,
   contextTokensLabel,
+  contextUsedPct,
   hasContextData,
   hasQuotaData,
   humanizeTokens,
@@ -36,6 +40,15 @@ describe('hasContextData', () => {
     expect(hasContextData({ context_window_size: 200_000 })).toBe(true);
     expect(hasContextData({ cache_read_tokens: 0 })).toBe(true);
     expect(hasContextData({ cache_creation_tokens: 0 })).toBe(true);
+  });
+
+  test('mirrors ContextSnapshot::is_substantive field for field', () => {
+    // The three the predicate used to ignore despite claiming to mirror the
+    // backend: a push carrying only one of them was kept by Rust and dropped
+    // by the widget.
+    expect(hasContextData({ remaining_percentage: 87.5 })).toBe(true);
+    expect(hasContextData({ input_tokens: 0 })).toBe(true);
+    expect(hasContextData({ output_tokens: 0 })).toBe(true);
   });
 
   test('metadata alone is not renderable data', () => {
@@ -79,9 +92,13 @@ describe('cacheHitPct', () => {
     expect(cacheHitPct(ctx)).toBeCloseTo(40, 6);
   });
 
-  test('missing halves of the split default to zero tokens, not to absence', () => {
-    expect(cacheHitPct({ cache_read_tokens: 100 })).toBe(100);
-    expect(cacheHitPct({ cache_read_tokens: 50, input_tokens: 50 })).toBe(50);
+  test('an incomplete denominator is unknown, never assumed to be zero', () => {
+    // M16: these used to fabricate the missing terms as 0 — a lone
+    // `cache_read_tokens` (reachable via the hoisted-block drift the backend
+    // tolerates) rendered a confident 100% hit rate.
+    expect(cacheHitPct({ cache_read_tokens: 100 })).toBeNull();
+    expect(cacheHitPct({ cache_read_tokens: 50, input_tokens: 50 })).toBeNull();
+    expect(cacheHitPct({ cache_read_tokens: 50, cache_creation_tokens: 50 })).toBeNull();
   });
 
   test('unreported read and an idle turn are unknown, not 0%', () => {
@@ -95,7 +112,92 @@ describe('cacheHitPct', () => {
   });
 
   test('a reported zero read against real input is a genuine 0%', () => {
-    expect(cacheHitPct({ cache_read_tokens: 0, input_tokens: 1_000 })).toBe(0);
+    expect(
+      cacheHitPct({ cache_read_tokens: 0, cache_creation_tokens: 0, input_tokens: 1_000 }),
+    ).toBe(0);
+  });
+});
+
+describe('contextUsedPct', () => {
+  test('prefers the reported used percentage', () => {
+    expect(contextUsedPct({ used_percentage: 12.5, remaining_percentage: 80 })).toBe(12.5);
+    // A reported zero is a reading, not absence.
+    expect(contextUsedPct({ used_percentage: 0 })).toBe(0);
+  });
+
+  test('falls back to the complement of remaining_percentage', () => {
+    // The field is parsed, shipped and documented; without this it has no
+    // reader at all.
+    expect(contextUsedPct({ remaining_percentage: 87.5 })).toBe(12.5);
+    expect(contextUsedPct({ remaining_percentage: 100 })).toBe(0);
+  });
+
+  test('absent or non-finite stays unknown', () => {
+    expect(contextUsedPct({})).toBeNull();
+    expect(contextUsedPct(null)).toBeNull();
+    expect(contextUsedPct({ used_percentage: NaN })).toBeNull();
+    expect(contextUsedPct({ used_percentage: NaN, remaining_percentage: 90 })).toBe(10);
+  });
+});
+
+describe('contextAttribution', () => {
+  test('names the session the numbers belong to', () => {
+    expect(contextAttribution({ session_name: 'refactor' })).toBe('refactor');
+    expect(contextAttribution({ agent_name: 'reviewer' })).toBe('reviewer');
+    expect(contextAttribution({ session_name: 'a', agent_name: 'b' })).toBe('a · b');
+  });
+
+  test('truncates rather than widening the bottom bar', () => {
+    expect(contextAttribution({ session_name: 'x'.repeat(40) })).toHaveLength(18);
+    expect(contextAttribution({ session_name: 'x'.repeat(40) })?.endsWith('…')).toBe(true);
+  });
+
+  test('nothing to attribute renders nothing', () => {
+    expect(contextAttribution({ used_percentage: 12.5 })).toBeNull();
+    expect(contextAttribution({ session_name: '   ' })).toBeNull();
+    expect(contextAttribution(null)).toBeNull();
+  });
+});
+
+describe('claudePushTabActive', () => {
+  const claude = { kind: 'ai_tool', id: 'claude', command: 'claude' };
+  const claudeLocal = { kind: 'ai_tool', id: 'claude-local', command: 'claude' };
+  const opencode = { kind: 'ai_tool', id: 'opencode', command: 'opencode' };
+  const shell = { kind: 'shell', id: 'shell-default-1', command: 'claude' };
+
+  test('mirrors the backend command_is check', () => {
+    expect(commandIsClaude('claude')).toBe(true);
+    expect(commandIsClaude('CLAUDE.EXE')).toBe(true);
+    expect(commandIsClaude('C:\\Users\\me\\bin\\claude.exe')).toBe(true);
+    expect(commandIsClaude('/usr/local/bin/claude.cmd')).toBe(true);
+    expect(commandIsClaude('  claude  ')).toBe(true);
+    expect(commandIsClaude('opencode')).toBe(false);
+    expect(commandIsClaude('claude-code')).toBe(false);
+    expect(commandIsClaude('')).toBe(false);
+    expect(commandIsClaude(undefined)).toBe(false);
+  });
+
+  test('claude-local counts even with the subscription tab disabled', () => {
+    // M15: statusline injection is per command, so this tab pushes too.
+    expect(claudePushTabActive([claude, claudeLocal, opencode], ['claude-local'])).toBe(true);
+  });
+
+  test('a reserved tab that is switched off does not count', () => {
+    expect(claudePushTabActive([claude, claudeLocal], ['opencode'])).toBe(false);
+    expect(claudePushTabActive([claude, claudeLocal], ['claude'])).toBe(true);
+  });
+
+  test('user-created claude-command tabs count and are never id-gated', () => {
+    const custom = { kind: 'ai_tool', id: 'ai-abc123', command: 'C:\\tools\\claude.exe' };
+    expect(claudePushTabActive([custom], [])).toBe(true);
+  });
+
+  test('non-AI tabs and non-claude commands never count', () => {
+    expect(claudePushTabActive([shell, opencode], ['opencode'])).toBe(false);
+    expect(claudePushTabActive([], ['claude'])).toBe(false);
+    expect(claudePushTabActive(null, ['claude'])).toBe(false);
+    // A Preview tab has no `command` field at all.
+    expect(claudePushTabActive([{ kind: 'preview', id: 'preview-1' }], ['claude'])).toBe(false);
   });
 });
 

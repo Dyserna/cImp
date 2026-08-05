@@ -41,6 +41,18 @@
 //!   - Every part is independently absent-able: either quota window, the
 //!     context block, and each field inside it. Absent must render as
 //!     *unknown*, never as 0%.
+//!
+//! M14 (push-file format 2): several Claude tabs push into the same file, and
+//! they do not carry the same data — the subscription tab has `rate_limits`,
+//! an API-key/local tab has only context. The file therefore holds **two
+//! independently aged slots** (quota and context) rather than one observation:
+//!   - a context write merges over the quota slot instead of replacing it, so
+//!     quota disappears only when it is itself past [`HIDE_AFTER`];
+//!   - the context slot is owned by the session whose reading most recently
+//!     *changed* (see [`merge_push`]), so the tab actually being worked in wins
+//!     over an idle tab that keeps re-pushing the same numbers;
+//!   - each slot carries its own write instant, so the UI dims per section by
+//!     that section's own age instead of one global timestamp.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -184,10 +196,18 @@ pub struct UsageResult {
     pub rate_limited: bool,
     /// Legacy: parsed `Retry-After` from a 429. Always `None` now.
     pub retry_after_secs: Option<u64>,
-    /// True when `snapshot` is aging — the last push is older than
-    /// [`STALE_AFTER`] (the Claude tab likely closed or went quiet). The UI
-    /// dims the numbers to signal they may be out of date.
+    /// True when *every* part of `snapshot` that carries data is aging —
+    /// nothing in the widget is fresh. Kept as the whole-widget signal (the
+    /// tooltip); per-section dimming uses the two flags below, because the
+    /// quota and context slots are written by different tabs and age by their
+    /// own clocks (M14).
     pub stale: bool,
+    /// True when the quota slot is present and older than [`STALE_AFTER`].
+    /// False when there is no quota data at all (nothing to dim).
+    pub quota_stale: bool,
+    /// True when the context slot is present and older than [`STALE_AFTER`].
+    /// False when there is no context data at all.
+    pub context_stale: bool,
 }
 
 // ---- status-line push (live path) ----------------------------------------
@@ -207,18 +227,101 @@ pub const STALE_AFTER: Duration = Duration::from_secs(90);
 /// the last-known numbers; showing them would be misinformation.
 pub const HIDE_AFTER: Duration = Duration::from_secs(30 * 60);
 
-/// On-disk shape of the push file: the snapshot plus the write instant used
-/// for staleness. Flattened so the file reads naturally:
-/// `{"written_at_ms":…,"five_hour":{…},"seven_day":{…},"context":{…}}`.
-/// One instant ages the whole file — parts are never merged across pushes
-/// (see [`should_write`]).
-#[derive(Serialize, Deserialize, Debug)]
+/// How many sessions' change-marks the file keeps (see [`SessionMark`]).
+/// Bounded so a long-lived file can't grow without limit; the oldest-seen
+/// entry is evicted first, and entries older than [`HIDE_AFTER`] are pruned
+/// on every write anyway.
+const MAX_SESSION_MARKS: usize = 8;
+
+/// Current on-disk format of the push file. Written into every push so a
+/// reader can tell the two shapes apart without guessing:
+///   - absent / `0` — the pre-M14 shape: one `written_at_ms` ages everything.
+///   - `2` — per-slot instants (`quota_at_ms` / `context_at_ms`) plus the
+///     context-ownership bookkeeping.
+///
+/// (There is no `1`: the pre-M14 files never carried a version at all, and
+/// `0` is what `#[serde(default)]` yields for them.)
+const PUSH_FORMAT: u32 = 2;
+
+/// One session's context-change bookkeeping, used to decide which tab owns the
+/// context slot. `sig` is a compact digest of the session's last context
+/// reading (plus its activity counters); `changed_at_ms` is when that digest
+/// last differed, `seen_at_ms` when the session last pushed at all.
+///
+/// The slot goes to the session with the most recent `changed_at_ms` — i.e.
+/// the tab actually being worked in — instead of to whichever tab pushed last.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SessionMark {
+    key: String,
+    sig: String,
+    changed_at_ms: u64,
+    seen_at_ms: u64,
+}
+
+/// On-disk shape of the push file. Flattened so it reads naturally:
+/// `{"written_at_ms":…,"format":2,"five_hour":{…},"context":{…},…}`.
+///
+/// Two independently aged slots (M14): the quota windows and the context
+/// block. `quota_at_ms` / `context_at_ms` are each slot's own write instant;
+/// on a pre-M14 file they are absent and both fall back to `written_at_ms`
+/// (see [`PushedUsage::quota_at`] / [`PushedUsage::context_at`]), which is
+/// exactly the old "one instant ages everything" behavior.
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct PushedUsage {
-    /// Unix epoch milliseconds at write time (writer's clock; reader is the
-    /// same machine, so skew is not a concern).
+    /// Unix epoch milliseconds; the *oldest* of the present slot instants
+    /// (writer's clock; reader is the same machine, so skew is not a concern).
+    /// Only a format-0 reader ages by this — deliberately the oldest, so such
+    /// a reader errs towards dimming/hiding rather than presenting a
+    /// carried-over reading as fresh.
     written_at_ms: u64,
+    /// On-disk format (see [`PUSH_FORMAT`]). `0` for pre-M14 files.
+    #[serde(default)]
+    format: u32,
+    /// When the quota slot was last written. `None` on a pre-M14 file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_at_ms: Option<u64>,
+    /// When the context slot was last written. `None` on a pre-M14 file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_at_ms: Option<u64>,
+    /// Session key that currently owns the context slot (diagnostics; the
+    /// merge recomputes the owner from `sessions` on every write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_owner: Option<String>,
+    /// Per-session context-change marks (see [`SessionMark`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionMark>,
     #[serde(flatten)]
     snapshot: UsageSnapshot,
+}
+
+impl PushedUsage {
+    /// Write instant of the quota slot, falling back to the whole-file instant
+    /// on a pre-M14 file.
+    fn quota_at(&self) -> u64 {
+        self.quota_at_ms.unwrap_or(self.written_at_ms)
+    }
+
+    /// Write instant of the context slot, same fallback.
+    fn context_at(&self) -> u64 {
+        self.context_at_ms.unwrap_or(self.written_at_ms)
+    }
+}
+
+/// Everything a push knows about *who* wrote it, beyond the renderable
+/// snapshot. Not persisted as such: it feeds the context-ownership decision in
+/// [`merge_push`] and never reaches the UI, so it is not part of the
+/// Rust↔TS field contract.
+#[derive(Clone, Debug, Default)]
+pub struct PushMeta {
+    /// Stable per-session key from the status-line payload (`session_id`, else
+    /// the transcript path, else the session name). `None` when the payload
+    /// offers none of them — every tab then shares one bucket and the context
+    /// slot degrades to last-writer-wins.
+    pub session_key: Option<String>,
+    /// Monotonic activity counters from the payload's `cost` block, folded
+    /// into the session's signature so a turn that leaves the context numbers
+    /// unchanged still counts as activity. `None` when absent.
+    pub activity: Option<String>,
 }
 
 /// `<exe-dir>/claude-usage-push.json`, or `None` when `current_exe()` can't
@@ -237,27 +340,24 @@ fn now_ms() -> u64 {
 
 /// Persist a snapshot extracted from a status-line payload. Called from the
 /// short-lived `cimp --statusline` child process, so it must never panic or
-/// block: any failure is silently dropped (the next refresh retries within
-/// seconds). The write is atomic (unique temp file + rename) because several
-/// Claude tabs may push concurrently — last writer wins, and the reader never
-/// sees a torn file.
+/// block for long: any failure is silently dropped (the next refresh retries
+/// within seconds). The write is atomic (unique temp file + rename) because
+/// several Claude tabs may push concurrently, so the reader never sees a torn
+/// file.
 ///
-/// Quota-less pushes yield to fresh quota-carrying ones — see [`should_write`].
-pub fn store_pushed_usage(snapshot: &UsageSnapshot) {
+/// The new push is *merged* over what the file already holds rather than
+/// replacing it wholesale — see [`merge_push`] for the two-slot rules. A
+/// read failure that isn't "file missing" aborts the write instead of
+/// merging over a phantom empty file (the TOCTOU that would let a
+/// context-only push evict a live quota reading for one beat).
+pub fn store_pushed_usage(snapshot: &UsageSnapshot, meta: &PushMeta) {
     let Some(path) = push_path() else { return };
-    // Only a quota-less push has to look at what it would overwrite; the
-    // common case stays a single write.
-    if !snapshot.has_rate_limits() {
-        let prev = std::fs::read_to_string(&path).ok();
-        if !should_write(snapshot, prev.as_deref(), now_ms()) {
-            return;
-        }
-    }
-    let pushed = PushedUsage {
-        written_at_ms: now_ms(),
-        snapshot: snapshot.clone(),
+    let Ok(prev) = read_prev(&path) else {
+        debug!("usage: push file unreadable; skipping this push rather than clobbering it");
+        return;
     };
-    let Ok(json) = serde_json::to_string(&pushed) else {
+    let merged = merge_push(prev, snapshot, meta, now_ms());
+    let Ok(json) = serde_json::to_string(&merged) else {
         return;
     };
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -271,30 +371,195 @@ pub fn store_pushed_usage(snapshot: &UsageSnapshot) {
     }
 }
 
-/// Should this push overwrite the file whose current contents are `prev_raw`?
+/// Read the file we are about to merge over.
 ///
-/// The push file holds **one observation**: a single `written_at_ms` ages
-/// everything in it, so parts are never merged across pushes (a carried-over
-/// quota reading stamped with a new write instant would read as fresh when it
-/// is not). The only rule needed on top of "last writer wins" is that a push
-/// *without* quota data must not evict a *fresh* push that has it — otherwise
-/// `claude-local` (API-key auth, no `rate_limits`) pushing context every 30s
-/// would blink the quota widget out between the `claude` tab's pushes.
-///
-/// So: write unless this is a quota-less push and the file already holds a
-/// quota-carrying push younger than [`STALE_AFTER`]. Context data then simply
-/// rides the quota tab's own pushes, which carry it too.
-fn should_write(new: &UsageSnapshot, prev_raw: Option<&str>, now_ms: u64) -> bool {
-    if new.has_rate_limits() {
-        return true;
+/// `Ok(None)` means "there is genuinely nothing there" (no file yet, or its
+/// contents no longer parse — that we do overwrite, otherwise a corrupt file
+/// would wedge the widget forever). `Err(())` means the file exists but could
+/// not be read: on Windows a concurrent reader/writer can hand us a sharing
+/// violation, and treating that as "no previous data" is how a context-only
+/// push would evict a perfectly good quota reading. One bounded retry pair
+/// (2 × 5 ms) covers the sharing window; past that the caller skips the write.
+fn read_prev(path: &std::path::Path) -> Result<Option<PushedUsage>, ()> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => return Ok(serde_json::from_str::<PushedUsage>(&raw).ok()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) if attempt + 1 < ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return Err(()),
+        }
     }
-    let Some(prev) = prev_raw.and_then(|raw| serde_json::from_str::<PushedUsage>(raw).ok()) else {
-        return true;
+    Err(())
+}
+
+/// Fold a fresh push into the file's current contents.
+///
+/// Two slots, aged independently:
+///
+///   * **quota** — replaced when this push carries `rate_limits`, otherwise
+///     carried over with its *own* instant until it is past [`HIDE_AFTER`].
+///     A context-only push therefore never blinks the quota widget out, and
+///     never restamps a quota reading as freshly observed.
+///   * **context** — claimed by the session whose reading most recently
+///     *changed*. Every pushing session gets a [`SessionMark`]; a push whose
+///     signature differs from that session's last one bumps its
+///     `changed_at_ms`. The slot's owner is the live session with the greatest
+///     `changed_at_ms`, so an idle tab re-pushing identical numbers cannot
+///     take the bar away from the tab being worked in. When the pushing
+///     session is not the owner, the slot (content *and* instant) is left
+///     alone; when it is, the content is rewritten and stamped `now` even if
+///     it did not change — the session is alive and the reading really is
+///     current.
+///
+/// With no session key in the payload every tab shares one bucket, which
+/// degrades to plain last-writer-wins on the context slot (still never
+/// evicting quota).
+fn merge_push(
+    prev: Option<PushedUsage>,
+    new: &UsageSnapshot,
+    meta: &PushMeta,
+    now_ms: u64,
+) -> PushedUsage {
+    let age = |at: u64| Duration::from_millis(now_ms.saturating_sub(at));
+
+    // ---- quota slot -------------------------------------------------------
+    let (five_hour, seven_day, quota_at_ms) = if new.has_rate_limits() {
+        (new.five_hour.clone(), new.seven_day.clone(), Some(now_ms))
+    } else {
+        match prev.as_ref().filter(|p| p.snapshot.has_rate_limits()) {
+            Some(p) if age(p.quota_at()) <= HIDE_AFTER => (
+                p.snapshot.five_hour.clone(),
+                p.snapshot.seven_day.clone(),
+                Some(p.quota_at()),
+            ),
+            _ => (None, None, None),
+        }
     };
-    if !prev.snapshot.has_rate_limits() {
-        return true;
+
+    // ---- context slot -----------------------------------------------------
+    // "Empty is not absent": a context block carrying only metadata has
+    // nothing to draw, so it neither claims the slot nor evicts what's there.
+    let new_context = new
+        .context
+        .clone()
+        .filter(ContextSnapshot::is_substantive);
+    let mut sessions: Vec<SessionMark> = prev
+        .as_ref()
+        .map(|p| p.sessions.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| age(m.seen_at_ms) <= HIDE_AFTER)
+        .collect();
+
+    let mut owner: Option<String> = None;
+    if let Some(ctx) = new_context.as_ref() {
+        // No session id in the payload → one shared bucket (last writer wins).
+        let key = meta
+            .session_key
+            .clone()
+            .or_else(|| ctx.session_name.clone())
+            .unwrap_or_default();
+        let sig = context_signature(ctx, meta.activity.as_deref());
+        match sessions.iter_mut().find(|m| m.key == key) {
+            Some(mark) => {
+                if mark.sig != sig {
+                    mark.sig = sig;
+                    mark.changed_at_ms = now_ms;
+                }
+                mark.seen_at_ms = now_ms;
+            }
+            None => sessions.push(SessionMark {
+                key: key.clone(),
+                sig,
+                changed_at_ms: now_ms,
+                seen_at_ms: now_ms,
+            }),
+        }
+        // Keep the map bounded: evict least-recently-seen first.
+        while sessions.len() > MAX_SESSION_MARKS {
+            let Some(victim) = sessions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, m)| m.seen_at_ms)
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            sessions.remove(victim);
+        }
+        // Most recently *changed* session owns the slot; ties (nothing has
+        // changed yet) go to the most recent pusher.
+        let winner = sessions
+            .iter()
+            .max_by_key(|m| (m.changed_at_ms, m.seen_at_ms))
+            .map(|m| m.key.clone());
+        if winner.as_deref() == Some(key.as_str()) {
+            owner = Some(key);
+        }
     }
-    Duration::from_millis(now_ms.saturating_sub(prev.written_at_ms)) > STALE_AFTER
+    let (context, context_at_ms, context_owner) = match owner {
+        Some(key) => (new_context, Some(now_ms), Some(key)),
+        None => match prev
+            .as_ref()
+            .filter(|p| p.snapshot.context.is_some() && age(p.context_at()) <= HIDE_AFTER)
+        {
+            Some(p) => (
+                p.snapshot.context.clone(),
+                Some(p.context_at()),
+                p.context_owner.clone(),
+            ),
+            None => (None, None, None),
+        },
+    };
+
+    // A format-0 reader ages the whole file by `written_at_ms`; give it the
+    // oldest present instant so it can only under-show, never present a
+    // carried-over reading as fresh.
+    let written_at_ms = [quota_at_ms, context_at_ms]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(now_ms);
+
+    PushedUsage {
+        written_at_ms,
+        format: PUSH_FORMAT,
+        quota_at_ms,
+        context_at_ms,
+        context_owner,
+        sessions,
+        snapshot: UsageSnapshot {
+            five_hour,
+            seven_day,
+            context,
+        },
+    }
+}
+
+/// Compact digest of a context reading: every number that can move within a
+/// session, plus the payload's activity counters when it has them. Two pushes
+/// with the same digest are the same observation — the session has done
+/// nothing since. Deliberately readable rather than hashed, so a stuck slot
+/// can be diagnosed by opening the file.
+fn context_signature(ctx: &ContextSnapshot, activity: Option<&str>) -> String {
+    fn n<T: std::fmt::Display>(v: Option<T>) -> String {
+        v.map(|x| x.to_string()).unwrap_or_default()
+    }
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        n(ctx.used_percentage),
+        n(ctx.remaining_percentage),
+        n(ctx.total_input_tokens),
+        n(ctx.context_window_size),
+        n(ctx.cache_read_tokens),
+        n(ctx.cache_creation_tokens),
+        n(ctx.input_tokens),
+        n(ctx.output_tokens),
+        activity.unwrap_or_default(),
+    )
 }
 
 /// Read the current usage for the widget: the freshest status-line push,
@@ -321,26 +586,48 @@ fn interpret_push(raw: &str, now_ms: u64) -> UsageResult {
             return UsageResult::default();
         }
     };
+    // A write instant in the future (clock adjustment) counts as fresh.
+    let age = |at: u64| Duration::from_millis(now_ms.saturating_sub(at));
+    let quota_age = age(pushed.quota_at());
+    let context_age = age(pushed.context_at());
+
+    // Each slot expires on its own clock (M14): a context slot that kept
+    // refreshing does not keep a half-hour-old quota reading on screen, and a
+    // quota tab that is still pushing does not hold up an expired context one.
+    let mut snapshot = pushed.snapshot;
+    if quota_age > HIDE_AFTER {
+        snapshot.five_hour = None;
+        snapshot.seven_day = None;
+    }
+    if context_age > HIDE_AFTER {
+        snapshot.context = None;
+    }
     // An empty snapshot is absence with extra steps — never render it. A push
     // carrying *only* context numbers (API-key auth has no `rate_limits`) is
     // not empty: it renders the context bar alone.
-    if !pushed.snapshot.is_substantive() {
-        return UsageResult::default();
-    }
-    // A write instant in the future (clock adjustment) counts as fresh.
-    let age = Duration::from_millis(now_ms.saturating_sub(pushed.written_at_ms));
-    if age > HIDE_AFTER {
+    if !snapshot.is_substantive() {
         debug!(
-            age_secs = age.as_secs(),
-            "usage: push data expired; widget hides"
+            quota_age_secs = quota_age.as_secs(),
+            context_age_secs = context_age.as_secs(),
+            "usage: no live push data; widget hides"
         );
         return UsageResult::default();
     }
+    let has_quota = snapshot.has_rate_limits();
+    let has_context = snapshot
+        .context
+        .as_ref()
+        .is_some_and(ContextSnapshot::is_substantive);
+    let quota_stale = has_quota && quota_age > STALE_AFTER;
+    let context_stale = has_context && context_age > STALE_AFTER;
     UsageResult {
-        snapshot: Some(pushed.snapshot),
+        snapshot: Some(snapshot),
         rate_limited: false,
         retry_after_secs: None,
-        stale: age > STALE_AFTER,
+        // Whole-widget flag: only when nothing on screen is fresh.
+        stale: (!has_quota || quota_stale) && (!has_context || context_stale),
+        quota_stale,
+        context_stale,
     }
 }
 
@@ -464,6 +751,10 @@ mod endpoint_poll {
             rate_limited,
             retry_after_secs,
             stale,
+            // This path never carried context data, so only the quota half can
+            // be aging — mirror `stale` there and leave context untouched.
+            quota_stale: stale,
+            context_stale: false,
         }
     }
 
@@ -580,6 +871,8 @@ mod endpoint_poll {
                     rate_limited: false,
                     retry_after_secs: None,
                     stale: false,
+                    quota_stale: false,
+                    context_stale: false,
                 }
             }
             Err(e) => {
@@ -675,59 +968,211 @@ mod tests {
         assert!(interpret_push(raw, 1_000_000_000).snapshot.is_none());
     }
 
-    /// A snapshot with only context numbers (no quota windows).
-    fn context_only() -> UsageSnapshot {
+    /// A snapshot with only context numbers (no quota windows), tagged with a
+    /// distinguishable `used_percentage` so ownership tests can tell the
+    /// writers apart.
+    fn context_only(used: f64) -> UsageSnapshot {
         UsageSnapshot {
             context: Some(ContextSnapshot {
-                used_percentage: Some(10.0),
+                used_percentage: Some(used),
                 ..Default::default()
             }),
             ..Default::default()
         }
     }
 
-    #[test]
-    fn quota_push_always_writes() {
-        let with_quota = UsageSnapshot {
+    fn quota_only(util: f64) -> UsageSnapshot {
+        UsageSnapshot {
             five_hour: Some(UsageWindow {
-                utilization: 5.0,
+                utilization: util,
                 resets_at: None,
             }),
             ..Default::default()
+        }
+    }
+
+    fn meta(session: &str) -> PushMeta {
+        PushMeta {
+            session_key: Some(session.to_string()),
+            activity: None,
+        }
+    }
+
+    fn parse(raw: &str) -> PushedUsage {
+        serde_json::from_str(raw).expect("push file parses")
+    }
+
+    #[test]
+    fn quota_push_replaces_quota_and_stamps_it_now() {
+        let now = 1_000_000_000;
+        let prev = parse(&push_json(now - 60_000));
+        let merged = merge_push(Some(prev), &quota_only(5.0), &meta("s1"), now);
+        assert_eq!(merged.snapshot.five_hour.unwrap().utilization, 5.0);
+        assert_eq!(merged.quota_at_ms, Some(now));
+        assert_eq!(merged.format, PUSH_FORMAT);
+    }
+
+    #[test]
+    fn context_push_carries_quota_forward_with_its_own_instant() {
+        // M14: claude-local (no rate_limits) pushing context must neither
+        // evict the quota reading nor restamp it as freshly observed.
+        let now = 1_000_000_000;
+        let quota_at = now - 10_000;
+        let prev = parse(&push_json(quota_at));
+        let merged = merge_push(Some(prev), &context_only(10.0), &meta("local"), now);
+        assert_eq!(merged.snapshot.five_hour.expect("quota kept").utilization, 23.5);
+        assert_eq!(merged.quota_at_ms, Some(quota_at));
+        assert_eq!(merged.context_at_ms, Some(now));
+        // The legacy whole-file instant is the oldest slot, so a format-0
+        // reader can only under-show.
+        assert_eq!(merged.written_at_ms, quota_at);
+    }
+
+    #[test]
+    fn context_push_after_stale_after_still_keeps_quota() {
+        // The old rule evicted quota wholesale once it passed STALE_AFTER,
+        // bypassing the documented 30-minute HIDE_AFTER window.
+        let now = 1_000_000_000;
+        let quota_at = now - (STALE_AFTER.as_millis() as u64 + 60_000);
+        let merged = merge_push(
+            Some(parse(&push_json(quota_at))),
+            &context_only(10.0),
+            &meta("local"),
+            now,
+        );
+        assert!(merged.snapshot.five_hour.is_some());
+        assert_eq!(merged.quota_at_ms, Some(quota_at));
+        // …and it does expire once past HIDE_AFTER.
+        let expired_at = now - (HIDE_AFTER.as_millis() as u64 + 1_000);
+        let merged = merge_push(
+            Some(parse(&push_json(expired_at))),
+            &context_only(10.0),
+            &meta("local"),
+            now,
+        );
+        assert!(merged.snapshot.five_hour.is_none());
+        assert_eq!(merged.quota_at_ms, None);
+    }
+
+    #[test]
+    fn the_session_that_keeps_changing_owns_the_context_slot() {
+        // M14: an idle `claude` tab re-pushing identical numbers must not take
+        // the context bar away from the `claude-local` tab being worked in.
+        let mut file = merge_push(None, &context_only(10.0), &meta("idle"), 1_000);
+        // The working tab arrives and changes on every beat.
+        file = merge_push(Some(file), &context_only(50.0), &meta("work"), 2_000);
+        assert_eq!(file.context_owner.as_deref(), Some("work"));
+        // The idle tab pushes the same reading it had before: no claim.
+        file = merge_push(Some(file), &context_only(10.0), &meta("idle"), 3_000);
+        assert_eq!(file.context_owner.as_deref(), Some("work"));
+        assert_eq!(
+            file.snapshot.context.as_ref().unwrap().used_percentage,
+            Some(50.0)
+        );
+        // The context instant belongs to the owner's last write, not to the
+        // idle tab's beat.
+        assert_eq!(file.context_at_ms, Some(2_000));
+        // The working tab moves again and re-stamps its own slot.
+        file = merge_push(Some(file), &context_only(51.0), &meta("work"), 4_000);
+        assert_eq!(file.context_at_ms, Some(4_000));
+        assert_eq!(
+            file.snapshot.context.unwrap().used_percentage,
+            Some(51.0)
+        );
+    }
+
+    #[test]
+    fn an_owner_that_stops_pushing_hands_the_slot_over() {
+        // Known-idle tab first, so its later beats are "unchanged" rather than
+        // first observations.
+        let mut file = merge_push(None, &context_only(10.0), &meta("idle"), 1_000);
+        file = merge_push(Some(file), &context_only(50.0), &meta("work"), 2_000);
+        assert_eq!(file.context_owner.as_deref(), Some("work"));
+        // Idle keeps beating with the same reading — no takeover.
+        file = merge_push(Some(file), &context_only(10.0), &meta("idle"), 3_000);
+        assert_eq!(file.context_owner.as_deref(), Some("work"));
+        // The working tab goes away; once its mark ages past HIDE_AFTER the
+        // remaining session takes the slot.
+        let t = 2_000 + HIDE_AFTER.as_millis() as u64 + 1;
+        file = merge_push(Some(file), &context_only(10.0), &meta("idle"), t);
+        assert_eq!(file.context_owner.as_deref(), Some("idle"));
+        assert_eq!(file.snapshot.context.unwrap().used_percentage, Some(10.0));
+    }
+
+    #[test]
+    fn activity_counters_count_as_change_even_when_numbers_repeat() {
+        let idle = PushMeta {
+            session_key: Some("work".into()),
+            activity: Some("1000/0.5".into()),
         };
-        // Even over a fresh existing quota push.
-        assert!(should_write(
-            &with_quota,
-            Some(&push_json(1_000_000_000)),
-            1_000_000_000
-        ));
+        let busy = PushMeta {
+            session_key: Some("work".into()),
+            activity: Some("2000/0.9".into()),
+        };
+        let mut file = merge_push(None, &context_only(50.0), &meta("other"), 1_000);
+        file = merge_push(Some(file), &context_only(10.0), &idle, 2_000);
+        // Same context numbers, but the cost block moved: still a change, so
+        // "work" reclaims the slot over an idle competitor.
+        file = merge_push(Some(file), &context_only(60.0), &meta("other"), 3_000);
+        file = merge_push(Some(file), &context_only(10.0), &busy, 4_000);
+        assert_eq!(file.context_owner.as_deref(), Some("work"));
     }
 
     #[test]
-    fn context_only_push_yields_to_a_fresh_quota_push() {
-        // claude-local (no rate_limits) must not blink the quota widget out
-        // between the claude tab's pushes.
-        let now = 1_000_000_000;
-        assert!(!should_write(
-            &context_only(),
-            Some(&push_json(now - 10_000)),
-            now
-        ));
+    fn metadata_only_context_neither_claims_nor_evicts() {
+        let mut file = merge_push(None, &context_only(50.0), &meta("work"), 1_000);
+        let metadata_only = UsageSnapshot {
+            context: Some(ContextSnapshot {
+                session_name: Some("other".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        file = merge_push(Some(file), &metadata_only, &meta("other"), 2_000);
+        assert_eq!(file.context_owner.as_deref(), Some("work"));
+        assert_eq!(
+            file.snapshot.context.unwrap().used_percentage,
+            Some(50.0)
+        );
     }
 
     #[test]
-    fn context_only_push_writes_when_nothing_fresh_to_protect() {
+    fn session_marks_stay_bounded() {
+        let mut file = merge_push(None, &context_only(1.0), &meta("s0"), 1_000);
+        for i in 1..(MAX_SESSION_MARKS + 4) {
+            file = merge_push(
+                Some(file),
+                &context_only(i as f64),
+                &meta(&format!("s{i}")),
+                1_000 + i as u64,
+            );
+        }
+        assert_eq!(file.sessions.len(), MAX_SESSION_MARKS);
+    }
+
+    #[test]
+    fn merging_over_a_pre_m14_file_upgrades_the_format() {
+        // A file written before the two-slot split has no per-slot instants:
+        // both fall back to `written_at_ms`, and the merge writes format 2.
         let now = 1_000_000_000;
-        // No file yet.
-        assert!(should_write(&context_only(), None, now));
-        // Unparseable file.
-        assert!(should_write(&context_only(), Some("not json"), now));
-        // Existing push has no quota data of its own.
-        let quota_less = r#"{"written_at_ms":999999500,"context":{"used_percentage":1.0}}"#;
-        assert!(should_write(&context_only(), Some(quota_less), now));
-        // Existing quota push has gone stale.
-        let stale = push_json(now - STALE_AFTER.as_millis() as u64 - 1_000);
-        assert!(should_write(&context_only(), Some(&stale), now));
+        let legacy = parse(&push_json(now - 20_000));
+        assert_eq!(legacy.format, 0);
+        assert_eq!(legacy.quota_at(), legacy.written_at_ms);
+        assert_eq!(legacy.context_at(), legacy.written_at_ms);
+        let merged = merge_push(Some(legacy), &context_only(10.0), &meta("local"), now);
+        assert_eq!(merged.format, PUSH_FORMAT);
+        assert_eq!(merged.quota_at_ms, Some(now - 20_000));
+    }
+
+    #[test]
+    fn no_session_key_degrades_to_last_writer_wins() {
+        let anon = PushMeta::default();
+        let mut file = merge_push(None, &context_only(10.0), &anon, 1_000);
+        file = merge_push(Some(file), &context_only(50.0), &anon, 2_000);
+        assert_eq!(
+            file.snapshot.context.unwrap().used_percentage,
+            Some(50.0)
+        );
     }
 
     #[test]
@@ -755,6 +1200,16 @@ mod tests {
     fn push_file_roundtrip() {
         let pushed = PushedUsage {
             written_at_ms: 42,
+            format: PUSH_FORMAT,
+            quota_at_ms: Some(42),
+            context_at_ms: Some(42),
+            context_owner: Some("sess-1".into()),
+            sessions: vec![SessionMark {
+                key: "sess-1".into(),
+                sig: "12.5||||20000||||".into(),
+                changed_at_ms: 42,
+                seen_at_ms: 42,
+            }],
             snapshot: UsageSnapshot {
                 five_hour: Some(UsageWindow {
                     utilization: 7.0,
@@ -774,6 +1229,11 @@ mod tests {
         assert!(json.contains("\"written_at_ms\":42"));
         assert!(json.contains("\"five_hour\":{"));
         assert!(json.contains("\"context\":{"));
+        // Self-describing: a reader can tell the two-slot shape from the
+        // pre-M14 one without guessing.
+        assert!(json.contains("\"format\":2"));
+        assert!(json.contains("\"quota_at_ms\":42"));
+        assert!(json.contains("\"context_at_ms\":42"));
         // Absent context fields are omitted rather than written as nulls.
         assert!(!json.contains("\"fast_mode\""));
         let back: PushedUsage = serde_json::from_str(&json).unwrap();
@@ -791,6 +1251,49 @@ mod tests {
         let raw = r#"{"written_at_ms":42,"five_hour":{"utilization":7.0,"resets_at":null},"seven_day":null}"#;
         let back: PushedUsage = serde_json::from_str(raw).unwrap();
         assert!(back.snapshot.context.is_none());
-        assert_eq!(back.snapshot.five_hour.unwrap().utilization, 7.0);
+        assert_eq!(back.snapshot.five_hour.as_ref().unwrap().utilization, 7.0);
+        // …and pre-M14 files (no per-slot instants, no format) age exactly as
+        // they used to: one instant for the whole file.
+        assert_eq!(back.format, 0);
+        assert_eq!(back.quota_at(), 42);
+        assert_eq!(back.context_at(), 42);
+        assert!(back.sessions.is_empty());
+        let r = interpret_push(raw, 42 + STALE_AFTER.as_millis() as u64 + 1_000);
+        assert!(r.snapshot.is_some());
+        assert!(r.stale && r.quota_stale && !r.context_stale);
+    }
+
+    #[test]
+    fn slots_age_and_expire_independently() {
+        let now = 10_000_000_000;
+        let fresh = now - 5_000;
+        let old = now - (STALE_AFTER.as_millis() as u64 + 10_000);
+        // Fresh context over an aging quota reading: only the quota dims, and
+        // the widget as a whole is not "stale" (something on it is live).
+        let raw = format!(
+            r#"{{"written_at_ms":{old},"format":2,"quota_at_ms":{old},"context_at_ms":{fresh},
+                "five_hour":{{"utilization":23.5,"resets_at":null}},
+                "context":{{"used_percentage":12.5}}}}"#
+        );
+        let r = interpret_push(&raw, now);
+        let snap = r.snapshot.expect("both slots present");
+        assert!(snap.five_hour.is_some() && snap.context.is_some());
+        assert!(r.quota_stale);
+        assert!(!r.context_stale);
+        assert!(!r.stale);
+
+        // Once the quota slot passes HIDE_AFTER it drops out on its own,
+        // leaving the live context bar alone.
+        let expired = now - (HIDE_AFTER.as_millis() as u64 + 1_000);
+        let raw = format!(
+            r#"{{"written_at_ms":{expired},"format":2,"quota_at_ms":{expired},"context_at_ms":{fresh},
+                "five_hour":{{"utilization":23.5,"resets_at":null}},
+                "context":{{"used_percentage":12.5}}}}"#
+        );
+        let r = interpret_push(&raw, now);
+        let snap = r.snapshot.expect("context survives the quota expiry");
+        assert!(snap.five_hour.is_none());
+        assert_eq!(snap.context.unwrap().used_percentage, Some(12.5));
+        assert!(!r.quota_stale && !r.context_stale && !r.stale);
     }
 }

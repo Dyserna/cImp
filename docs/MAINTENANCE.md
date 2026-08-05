@@ -39,11 +39,15 @@ apply / defer / watch decision before anything is changed.
    `src-tauri/.cargo/audit.toml` (each entry has a rationale + revisit
    trigger — re-evaluate every entry as part of this step, and run it from
    `src-tauri/` or the baseline won't load).
-3. **Deep-dep changelogs.** For the hairy deps with their own sections (`ort`,
-   `whisper-rs`, tauri, tree-sitter grammars, cozo), read release notes for
-   anything newer than the pin — looking for: fixes we're waiting on, breaking
-   API changes, and smoke tests the
-   dep's section says to re-run on bump.
+3. **Deep-dep changelogs.** For the hairy deps with their own *Dependencies to
+   track* sections (`ort`, `whisper-rs`, `cozo`/SQLite, the Claude Code /
+   OpenCode CLI contracts), read release notes for anything newer than the pin —
+   looking for: fixes we're waiting on, breaking API changes, and smoke tests
+   the dep's section says to re-run on bump. Two hairy deps deliberately have
+   no deep section: tree-sitter grammars (covered by the *Code graph grammars
+   (V9-02)* feature-area note + the `every_vendored_query_compiles` tripwire)
+   and tauri (covered by its inventory row's lockstep rule — bump the Rust
+   crates + JS packages + plugins together, same major).
 4. **External components.** llama.cpp releases (offload + embedding server),
    newer offload/embedding model releases (Qwen line), Kokoro/whisper model
    cards, the ddg/context7 MCP servers, toolchain cadence (Vulkan SDK, LLVM,
@@ -78,9 +82,16 @@ apply / defer / watch decision before anything is changed.
    - `feature-idea` — new capability worth a milestone/spec;
    - `watch` — nothing to do yet, re-check next run.
    Every `bump-with-care` / `contract-drift` finding gets an explicit
-   close-or-defer decision recorded with the report.
+   close-or-defer decision recorded with the report. **File every actionable
+   finding as a GitHub issue on a dated milestone** (`Maintenance run
+   YYYY-MM-DD`) — that is what gives each finding an owner and a close state;
+   the report alone has neither. (The 2026-08-04 run worked this way: ~22
+   issues, and the milestone's open tail is exactly the unfinished work.)
 8. **Record.** Append a line to the run log below; fold table updates into this
-   doc; update memory if a locked decision changed.
+   doc; update memory if a locked decision changed. When the milestone's
+   remaining live-verifies land later, **amend the run-log line to say so** — an
+   entry without a closing amendment is a run whose verification tail is still
+   open, and the log should show that at a glance.
 
 Delegation note: steps 3–5 are independent research — fan them out (release
 notes + changelog reading), keep step 7's synthesis and decisions in the
@@ -90,7 +101,10 @@ orchestrating session.
 
 | Date | App version | Claude / OpenCode | Outcome |
 |---|---|---|---|
-| 2026-08-04 | v0.49.1 (develop) | 2.1.221 / 1.18.1 | First formalized run. Report: `docs/reviews/maintenance-run-2026-08-04.md` (10 contract-drift items, 8 adoption candidates, bump batches, 9 decisions). Doc split → `ARCHITECTURE.md`; inventory refreshed; ort/MSRV/schema facts corrected. |
+| 2026-08-04 | v0.49.1 (develop) | 2.1.221 / 1.18.1 | First formalized run. Report: `docs/reviews/maintenance-run-2026-08-04.md` (10 contract-drift items, 8 adoption candidates, bump batches, 9 decisions). Doc split → `ARCHITECTURE.md`; inventory refreshed; ort/MSRV/schema facts corrected. *Verification tail open:* milestone 2 issues #4/#5/#9/#13/#14 (live-verifies) — amend this line when they land. |
+
+Next run due **~2026-09-04** (monthly cadence), or sooner after any visible
+Claude Code / OpenCode update.
 
 ---
 
@@ -181,7 +195,7 @@ version edit — `cargo update` will not move them.
 | `rubato` | `0.16` | Mic resample → 16 kHz mono | — |
 | `tree-sitter` | `0.26.9` | Code-graph parsing core | Grammar crates ride the `tree-sitter-language` shim, so they need not match this exactly — only the parser ABI must. |
 | `tree-sitter-*` grammars (28 crates) | `0.1`–`1.3`, per crate | Per-language parsers for the code graph (V9-02 fan-out) | Individual pins live in `Cargo.toml` — not duplicated here. Each exposes `LANGUAGE*` as a version-independent `LanguageFn` (`tree-sitter-language` shim), so **grammar versions need not track `tree-sitter`'s 0.26** — only the parser ABI must match. Bump grammars individually; a grammar that fails to build against the core is an ABI break, not a semver one. Tier 1 (full call graph): rust, typescript, javascript, python, go, java, c, cpp, c-sharp, php, bash, scala, ocaml, ruby, haskell. Tier 2/3 (struct-search + anchors only): html, css, json, kotlin-ng, swift, sequel, yaml, xml, erlang, r, perl, ada, asm. |
-| `cozo` | `0.7.6` | Embedded graph DB (code-knowledge graph) | `default-features = false` + `storage-sqlite,rayon`. **Deliberately omits** `graph-algo` (broken `graph_builder` vs rayon) and `storage-rocksdb` (heavy C++). |
+| `cozo` | `0.7.6` | Embedded graph DB (code-knowledge graph) | `default-features = false` + `storage-sqlite,rayon`. **Deliberately omits** `graph-algo` (broken `graph_builder` vs rayon) and `storage-rocksdb` (heavy C++). Bumps are format-risk — see the deep `cozo`/SQLite section. |
 | `ignore` | `0.4` | Gitignore-aware tree walk (indexer) | ripgrep's walker. |
 | `notify` | `8` | FS watcher (incremental re-index) | `ReadDirectoryChangesW` on Windows. Bumped 6 → 8 in the 2026-08-04 run. |
 | `rfd` | `0.17` | Native file/folder picker (`graph_ignore_pick` in Settings) | `default-features = false` + `xdg-portal,wayland` — **not** gtk3, so the Linux build doesn't link a second GTK next to Tauri's. 0.17 DELETED the `tokio` feature (xdg-portal now always drives `pollster`; a non-issue — `graph_ignore_pick` already runs the sync dialog in `spawn_blocking`). `wayland` supplies the Linux parent-window handle and is the source of the two accepted quick-xml advisories in `.cargo/audit.toml` (RUSTSEC-2026-0194/0195 — Linux-only build-time codegen via `wayland-scanner`, no runtime exposure). |
@@ -230,7 +244,7 @@ upstream cadence worth watching.
 | Dawn / WebGPU EP dylibs | `ort/webgpu` prebuilt | tracks the `ort` rc | `webgpu_dawn.dll` + `dxcompiler.dll` + `dxil.dll`; update `release.yml` staging if the set changes. |
 | whisper.cpp | `whisper-rs-sys 0.15` (from `whisper-rs 0.16`) | tracks the sys crate | Compiled from source via `cc`/`cmake`; bindgen #599 pitfall (build from PowerShell). |
 | espeak-ng | `espeak-rs-sys` (via `misaki-rs 0.3`) | tracks misaki | **GPLv3 source** → propagates to the binary license. Needs libclang. |
-| SQLite | `cozo` `storage-sqlite` | bundled by cozo | The code-graph on-disk backend. |
+| SQLite | `cozo` `storage-sqlite` | bundled by cozo | The code-graph on-disk backend; no independent pin to track. See the deep `cozo`/SQLite section. |
 
 ## Build toolchain (host machine + CI)
 
@@ -320,8 +334,8 @@ cargo/npm — check their sources manually.
 
 | Component | What / where | Update check |
 |---|---|---|
-| Kokoro TTS model | `kokoro-v1.0.onnx` + `voices/*.bin` voicepacks (Apache 2.0) — fetched from the `models-v1` GitHub release by `scripts/fetch-models.ps1`, verified vs `models/CHECKSUMS.txt` | HF model card; publish updated blobs with `scripts/publish-models-release.ps1` (bump the tag on changes). |
-| Whisper STT model | `ggml-small.bin` (~466 MB, MIT) — fetched from the `models-v1` GitHub release, verified vs `models/CHECKSUMS.txt` | whisper.cpp ggml model releases. |
+| Kokoro TTS model | `kokoro-v1.0.onnx` + `voices/*.bin` voicepacks (Apache 2.0) — fetched from the `models-v1` GitHub release by `scripts/fetch-models.ps1`, verified vs `models/CHECKSUMS.txt` | HF model card; publish updated blobs with `scripts/publish-models-release.ps1` (bump the tag on changes). **Policy (issue #16, closed 2026-08-05): stays unless a NEW capability (e.g. voice cloning) motivates a swap — do not re-suggest incremental model upgrades in a run report.** |
+| Whisper STT model | `ggml-small.bin` (~466 MB, MIT) — fetched from the `models-v1` GitHub release, verified vs `models/CHECKSUMS.txt` | whisper.cpp ggml model releases. **Same policy as the TTS model (issue #16): no swap without a new capability — don't re-suggest incremental upgrades.** |
 | `llama-server` (llama.cpp) | offload backend **and** embedding server; user-run, not bundled | <https://github.com/ggml-org/llama.cpp/releases> — rebuild/redownload periodically. |
 | Offload model | Qwen3.6-35B-A3B (GGUF, quantized) on the local llama-server | newer Qwen / quant releases. |
 | Embedding model | Qwen3-Embedding-4B Q8_0, 2560-dim, on `mcp1:8085` (RTX 3070) | re-embed the graph if you change model/dims (auto-probed). |
@@ -442,6 +456,61 @@ cargo/npm — check their sources manually.
   0.15.0 vendors whisper.cpp **v1.8.3** (upstream is at 1.9.x — v1.9.0 added
   NVIDIA Parakeet support via the same ggml model workflow).
 
+### `cozo` / SQLite — the code-graph store (`graph.db`)
+
+- **Current pin:** `cozo = "0.7.6"`, `default-features = false` +
+  `storage-sqlite,rayon`. There is exactly **one** database technology in the
+  app: cozo over its **bundled** SQLite, one file per project at
+  `<root>/<db_subdir>/graph.db` (default `.ckg/`). SQLite has no pin of its own
+  to track — it rides whatever cozo vendors.
+- **Upstream is near-dormant** (<https://github.com/cozodb/cozo> — 0.7.6 has
+  been the latest for a long time). "No new release" is the **expected**
+  finding on a maintenance run, not a gap in the check. If a release *does*
+  appear, treat it as `bump-with-care` by default — see the next two points.
+- **A cozo bump is an on-disk-format risk, and the usual escape hatch does NOT
+  fully cover it.** The reflex "worst case: delete `graph.db` and rebuild" is
+  true only for the derived `RELATIONS` set. The **memory relations** (V10
+  session/action memory) and **`usage_stat`** are deliberately ensured
+  *outside* `RELATIONS` so `reset()` never wipes them (`graph/index.rs`, the
+  "V10 session / action memory" block) — they are runtime event data, **not
+  re-derivable from source**, and there is **no export/import path**. A cozo
+  version that changes its SQLite storage layout loses them. On-bump check:
+  open a real, populated pre-bump `graph.db` with the bumped build and confirm
+  `context_recall` / the Usage panel still see old data.
+- **`cargo test` covers CozoScript, not storage compat.** The graph tests
+  build **fresh temp DBs**, so a bump that changes CozoScript
+  semantics/syntax surfaces in tests — but a storage-format break does not.
+  The hand-check with a populated pre-bump DB (previous point) is the only
+  coverage for that.
+- **Re-check the omitted features on any bump:** `graph-algo` was dropped
+  because its `graph_builder` dependency was broken against rayon — check
+  whether upstream fixed it (it would unlock cozo's built-in graph
+  algorithms); `storage-rocksdb` stays off deliberately (heavy C++ build, no
+  need at this scale) — that's a standing decision, not an oversight.
+- **Handle discipline (don't regress this):** the app holds **one warm
+  connection per project root** (`graph/service.rs`); the `--offload-mcp`
+  child opens `graph.db` **read-only** and must never take a second writable
+  cross-process handle — two writers on the SQLite backend is a
+  lock-contention/corruption risk, and the service comment at
+  `graph/service.rs:1073` marks the seam.
+- **Succession plan (decided 2026-08-05 — do not re-litigate on a routine
+  run):** staying on cozo is deliberate; dormancy also means no
+  storage-format churn, and cImp is unaffected by cozo's broken graph
+  features (the graph algorithms already run in Rust). If migration is ever
+  forced, the successor is **plain SQLite via `rusqlite`** (recursive CTEs
+  for the Datalog recursion; WAL one-writer-many-readers matches the
+  cross-process handle discipline natively; `bundled` keeps single-binary) —
+  alternatives were surveyed 2026-08-05 and rejected (Kuzu archived upstream
+  after the Apple acquisition; redb/sled single-process, which breaks the
+  `--offload-mcp` read-only child; SurrealDB/Oxigraph poor fit). The
+  migration surface is deliberately small: the entire cozo/CozoScript
+  surface lives behind `GraphIndex` in `graph/index.rs` (~44 query call
+  sites) — keep it that way; new CozoScript outside that file grows the
+  eventual migration. **The triggers that should actually start the
+  migration: a security advisory in cozo's frozen dependency tree that
+  can't be accepted, or a cozo dep blocking an MSRV/dependency bump
+  elsewhere.** Until one fires, the rewrite buys nothing.
+
 ### Claude Code / OpenCode CLIs — hook & plugin behavior contracts (V10–V14)
 
 The two agent harnesses are user-installed, auto-updating CLIs that cImp does
@@ -459,8 +528,8 @@ What each feature depends on, and the early-warning signal that it broke:
 | Compaction survival (V11-D) | `PreCompact` hook stdout reaches the compaction prompt — spike **D0**; outcome recorded in `harness_versions.d0_status` (still `unverified` until run — see the V16 spike recipes below) | `compact_hook.rs` | Hard to observe (server-side dedup-clear stays correct regardless); post-compaction re-exploration despite the feature being on |
 | Read advisor (V11-E) | `PreToolUse` deny's `permissionDecisionReason` is surfaced **to the model** — spike **E1**; outcome recorded in `harness_versions.e1_status` (`"fail"` hard-blocks the advisor: Settings toggle disabled + hook never installed) | `read_hook.rs` | `drift.read_reason.v1` fires (~100% remind→immediate full re-read = bare refusals); `drift.read_hook_silent.v1` fires (remind counter flatlines while large unchanged files keep being re-read) |
 | Post-edit checks (V12) | `PostToolUse` hook fires for `Edit`/`Write`/`MultiEdit` with the documented payload shape | `postedit_hook.rs` route `/context/post_edit` | Auto-check diagnostics stop appearing after edit bursts |
-| Permission detection | TUI prompt text matches "Esc to cancel · Tab to amend" | scanner (see memory / V2-03) | Permission notifications stop firing; recharacterize via `RUST_LOG=perm_capture=debug` |
-| Statusline / usage | `--settings` overlay accepted at spawn; transcript JSONL `usage` fields present | `statusline/mod.rs`, OOB tap | Status bar context/usage goes blank; Usage section stops populating |
+| Permission detection (NC-2, issue #5) | PRIMARY: `Notification` + `PermissionDenied` hooks (observe-only; matcher `""` = all notification types, classified app-side by type with prose fallback). Payload shape is read BOTH flat (`notification_type`/`message`) and nested (`notification: {type, message}`) — the docs are ambiguous, see the UNVERIFIED note in `notify_hook.rs`. FALLBACK: TUI prompt text matches "Esc to cancel · Tab to amend" (scanner, V2-03) — both feed the same idempotent flag | `notify_hook.rs` (`cimp --notify-hook`) → loopback `/permission/event` → `offload/loopback.rs::classify_permission_event`; scanner as fallback | `drift.payload.v1` from the `notify_hook` shim (required fields missing); permission notifications stop firing entirely = both paths broke — recharacterize the fallback via `RUST_LOG=perm_capture=debug`, capture a real hook payload via a `cat > file` Notification hook |
+| Statusline / usage | `--settings` overlay accepted at spawn; statusline stdin JSON carries the `rate_limits` object (account quota → written to `<exe-dir>/claude-usage-push.json`, feeds the usage widget — no network poller) and the `context_window` block (`used_percentage` / `total_input_tokens` / `context_window_size` + cache split → context bar, NC-3, issue #14); transcript JSONL `usage` fields present | `statusline/mod.rs` (extract + push), OOB tap | Context bar / quota widget go blank or freeze (a payload with neither `rate_limits` nor `context_window` writes no push); Usage section stops populating |
 | OpenCode injection + memory (V10) | `chat.message` plugin hook + `tool.execute.after`; `OPENCODE_CONFIG_CONTENT` env | generated `.opencode/plugin` | OpenCode sessions stop appearing in Memory; no injection for OpenCode tabs |
 
 **How to check (~10 min):** open a Claude tab with `context_injection` (and,
@@ -751,6 +820,44 @@ wry grows subframe-navigation events**, or reach
 `CoreWebView2Frame::NavigationStarting` directly if this ever needs to be
 airtight.
 
+### Terminal renderer — xterm 6 / WebGL (V29)
+
+*Spec + full rationale: `docs/MILESTONE-V29-xterm6-renderer.md` (its § Live
+verification carries the recipes).*
+
+The canvas renderer is **deleted upstream** at xterm 6.0 — the only fast path
+is `@xterm/addon-webgl`, with the in-core DOM renderer as the fallback (and as
+the permanent renderer for image-background terminals, which never load the
+addon). What to know on any `@xterm/*` bump:
+
+- **Bump all five packages together** (`xterm`, `addon-webgl`, `addon-fit`,
+  `addon-serialize` — plus the lockfile). The 6.0-era addons dropped
+  `peerDependencies`, so npm will happily resolve a mismatched set; nothing
+  but this note stops it.
+- **The WebGL addon loads AFTER `term.open()`, behind try/catch — keep it
+  there.** xterm 6 swallows `onWillOpen` throws, so a pre-open load would make
+  an unavailable-WebGL2 failure unobservable; the post-open load is what keeps
+  it catchable (→ DOM fallback + the once-per-failure `console.warn`, the only
+  signal a machine is running unaccelerated).
+- **Context-count invariant (D-7b):** live WebGL2 contexts == **attached
+  (visible) non-image terminals**, never tab count — policy is the pure
+  predicate `shouldHoldWebgl` (`terminal/background.ts`, unit-tested); the
+  load/dispose seam is `attachTerminal` / `detachTerminal` in `terminals.ts`.
+  WebView2 caps ~16 WebGL contexts per renderer process; before this bound,
+  17+ terminal tabs triggered self-sustaining eviction waves of 3 s freezes.
+  **Any new hide/show path for a terminal host must route through
+  attach/detach** or it silently breaks the bound.
+- **Two latches on `TerminalEntry`:** `webglRetried` (one-shot `onContextLoss`
+  retry, reset on detach) and `webglFailed` (**sticky** across stash/show —
+  set only by a load throw or a real context loss, never by the stash-time
+  dispose; cleared only by building a new `Terminal`). A bump that changes
+  when the addon throws or fires `onContextLoss` changes what these latch on.
+- **On-bump smoke:** open 17+ terminal tabs and switch/stash freely (no freeze
+  waves, no context-loss warnings); flip a background image on/off (DOM ↔
+  WebGL with scrollback replayed); launch with GPU disabled (single DOM-
+  fallback warn, terminals still render); then the milestone doc's § Live
+  verification list.
+
 ---
 
 ## Open spikes & unverified contracts
@@ -772,6 +879,8 @@ spike is run, and record the outcome where the last column says.
 | **Audit SARIF fixtures** (V23) | That the hand-built SARIF 2.1.0 fixtures match what osv-scanner / gitleaks / semgrep really emit. | **constructed, not captured** — replace from a real run during live-verify | *Feature-area maintenance notes* → Code Audit & Code Quality scanners |
 | **Harness version tripwire** | That the currently-installed Claude Code / OpenCode build still honors every contract in the drift table. | **re-armed on every version change** — `drift.harness_version.v1` fires until re-verified | `harness_versions.claude_last_seen` / `claude_last_verified`; the Advisor card's **Mark verified** action (click only after re-running the recipes) |
 | **`tts-webgpu` on non-NVIDIA** | That the shipped WebGPU TTS backend works on an AMD/Intel GPU. | **open** — no such GPU available on the dev box | *Dependencies to track* → `ort` open follow-ups |
+| **`Notification` payload shape** (`notify_hook.rs`) | Whether the Claude Code `Notification` hook payload is flat (`{notification_type, message}`) or nested (`{notification: {type, message}}`) — the reference docs render both ways. The shim reads BOTH spellings; the app-side classifier falls back to prose matching, then the TUI-regex scanner backstops the whole path. | **unverified** — degrades gracefully (never to silence), but the parser carries double-read complexity until settled | Capture recipe in `notify_hook.rs`'s module doc (register `"command": "cat > file"` as a `Notification` hook, read the captured stdin); record the outcome there and simplify the parser once settled. Runs naturally alongside the issue #5 live-verify. |
+| **V30 OpenCode push contracts** *(placeholder — pre-release)* | When V30 (MCP channels / session-push fanout) merges: the OpenCode `noReply` injection behavior (safe only on OpenCode **≥ 1.18.13** — a *minimum-version* fact, the first in this doc) and the format-2 push file with per-slot aging both become harness-drift surfaces. | **pre-release** — at V30 release time, replace this row with real drift-table rows + live-verify recipes | V30 milestone docs (`docs/MILESTONE-V30*`); the drift table in *Claude Code / OpenCode CLIs* above |
 
 ---
 
@@ -805,6 +914,29 @@ carry their deltas:
   Quality are **sub-tabs of the one Code audit view** (Tool Activity → Code
   audit); the corresponding settings live in *Settings → Code Audit* under
   **Security tools** / **Quality tools**. Only one scan runs at a time globally.
+
+### Permission detection — hook-primary + TUI fallback (NC-2, issue #5)
+
+*Contract row: the drift table in *Claude Code / OpenCode CLIs* above.* Extra
+precondition: a Claude tab in a permission mode that actually prompts (no
+blanket allow-rules for the command you'll use).
+
+1. **Hook path (primary).** Ask the agent to run a clearly non-allowlisted
+   command. When the prompt appears, the tab must flag awaiting-permission
+   (notification/TTS) via the hook path — confirm with `RUST_LOG=debug` that
+   `/permission/event` received the forwarded `Notification`/`PermissionDenied`
+   payload. Answer the prompt; the awaiting flag must clear.
+2. **Settle the payload-shape spike while you're here.** Register
+   `"command": "cat > <file>"` as a `Notification` hook, re-trigger a prompt,
+   and read the captured stdin: flat or nested? Record the outcome in
+   `notify_hook.rs`'s module doc (see the *Open spikes* row) — then the
+   double-shape parser can be simplified.
+3. **Fallback path.** Disable/remove the notify-hook registration (or point
+   its command at a dead path — the shim is fail-open) and re-trigger a
+   prompt: the TUI-regex scanner alone must still catch it. If the prompt
+   text itself drifted, recharacterize via `RUST_LOG=perm_capture=debug`.
+4. Both paths feed the same idempotent `awaiting_permission` flag — with both
+   enabled, a double-fire must produce ONE notification, not two.
 
 ### Read advisor & token efficiency (V11 / V17)
 

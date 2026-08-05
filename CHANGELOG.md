@@ -5,6 +5,85 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] — 2026-08-05
+
+### Added
+
+- **V30 — MCP session channels & session push (#15).** The offload MCP
+  child grows an out-of-band session-push pipeline: settings-gated
+  channel registration at the MCP host (Phase A), a tab-addressed
+  session-push bus over the loopback `/events` stream (Phase B),
+  completion producers with native-task auto-backgrounding (Phase C),
+  and OpenCode session-push fanout via `noReply` message injection
+  (Phase D; needs OpenCode ≥ 1.18.13 for the OpenCode leg).
+- **V29 — xterm 6.0 migration (#20).** Terminals move to xterm 6 with
+  the WebGL renderer as the fast path and the in-core DOM renderer as
+  fallback (upstream deleted the canvas renderer at 6.0). WebGL
+  contexts are held only by *visible* terminals, bounding context count
+  by pane count — WebView2's ~16-context cap can no longer trigger
+  eviction freeze waves at 17+ terminal tabs.
+- **V28 — per-session MCP identity (#13).** The `context_recall` /
+  `context_note` / `context_notes` memory tools now resolve the calling
+  **tab**'s live session (`--tab` baked into the MCP child argv + the
+  live-session registry), so two tabs of the same agent no longer share
+  one memory scope. Fail-open by design.
+- **Hook-driven permission detection (#5).** Claude permission prompts
+  are detected primarily via the `Notification` / `PermissionDenied`
+  hooks (`cimp --notify-hook` → loopback `/permission/event`); the
+  TUI-regex scanner is demoted to fallback. Both paths feed the same
+  idempotent awaiting-permission flag.
+- **Context bar + live cache stats from the statusline push (#14).**
+  The Claude context-window bar and cache read/creation split are fed
+  from the statusline JSON's `context_window` block, and the quota
+  widget reads the `rate_limits` push — the throttled network poller is
+  retired.
+- **Rust CI (#27).** First Rust CI: a clippy job linting the shipped
+  `tts-webgpu` feature set, a test job (vitest + `cargo test --bin
+  cimp`), and a compile-time guard turning the `tts-cuda`+`tts-webgpu`
+  feature combo into a hard error instead of a silent CPU-only build.
+- **Security-advisory workflow (#21, #22).** osv-scanner pinned as the
+  primary advisory source (RustSec + GHSA superset); `cargo audit`
+  becomes a cross-check with an accepted-risk baseline at
+  `src-tauri/.cargo/audit.toml`.
+- **OpenCode 1.18.13 upgrade prep (#9)** — MCP SDK v2 smoke,
+  `subagent_depth`, anomalyco URLs, `--mini` guard.
+
+### Changed
+
+- **Dependency batches from the 2026-08-04 maintenance run
+  (#17, #18, #19, #25).** MSRV 1.88 + cargo resolver v3; Tauri 2.11.5 +
+  dialog 2.7.2; rodio 0.22 / cpal 0.17 in lockstep; portable-pty 0.9,
+  vte 0.15, which 8, notify 8, base64 0.23, thiserror 2; npm bump-now
+  batch.
+- **ort WebGPU prebuilt re-gated behind `tts-webgpu` (#23).** A default
+  (CPU) build now downloads the plain CPU ORT dist instead of the
+  WebGPU one.
+- **Claude MCP auto-backgrounding disabled in the spawn env (#3)**; the
+  MCP host adopts protocol-version negotiation and legible `-32022`
+  errors (#8, #12).
+- **Settings window is created hidden** and revealed only after theme
+  registry + settings init settle (white-flash fix).
+- Pristine `patterns.json` installs are reconciled with new shipped
+  defaults (#5).
+
+### Fixed
+
+- **Offload context budget under `--kv-unified` (#26)** — the per-slot
+  budget divides by `-np` only in the unified-KV case, driven by the
+  flag parsed from `server_command`.
+- **Usage push file format 2** with per-slot aging and honest context
+  attribution.
+- **2026-08-05 full-branch review hardening** — V30 push hardening, V28
+  identity guard, and the permission pipeline (2 HIGH / 16 MEDIUM
+  findings, all fixed; report in `docs/reviews/`).
+- **Permission footer matched by grammar** rather than literal TUI
+  chrome (#5).
+- **Clipboard read-image capability** granted for compose image paste.
+- Transcript tap logs skipped lines and pins the format-tolerance
+  contract (#7); the Claude `--settings` overlay is pinned to the
+  2.1.214 contract (#6); the missing `--jinja` warning is demoted to a
+  debug note (#10).
+
 ## [0.49.1] — 2026-08-04
 
 ### Added

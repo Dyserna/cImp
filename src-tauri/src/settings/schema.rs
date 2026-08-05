@@ -3360,6 +3360,11 @@ pub struct UsageSettings {
     pub show_countdown: bool,
     /// Show the local reset clock time.
     pub show_reset_clock: bool,
+    /// NC-3: show the live context-window row (used %, tokens in the window,
+    /// and the turn's cache read/creation split) alongside the quota windows.
+    /// The row is data-gated too — it only appears once a Claude tab pushes a
+    /// `context_window` block.
+    pub show_context: bool,
     /// How often the frontend re-reads the status-line usage push (a local
     /// file — see `crate::usage`), in seconds. The UI clamps this to a sane
     /// minimum as busy-poll hygiene.
@@ -3374,6 +3379,7 @@ impl Default for UsageSettings {
             show_percentage: true,
             show_countdown: true,
             show_reset_clock: true,
+            show_context: true,
             poll_interval_secs: 60,
         }
     }

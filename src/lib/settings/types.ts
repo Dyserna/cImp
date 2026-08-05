@@ -175,8 +175,11 @@ export interface UsageSettings {
   show_countdown: boolean;
   /// Show the local reset clock time.
   show_reset_clock: boolean;
-  /// Poll cadence for the usage endpoint, in seconds. Clamped to a sane
-  /// minimum in the UI so the undocumented endpoint isn't hammered.
+  /// Show the live context-window row (used %, tokens, cache read/creation
+  /// split). Also data-gated: nothing shows until a Claude tab pushes one.
+  show_context: boolean;
+  /// Poll cadence for the usage push file, in seconds. Clamped to a sane
+  /// minimum in the UI as busy-poll hygiene.
   poll_interval_secs: number;
 }
 
@@ -1426,6 +1429,7 @@ export function defaultSettings(): Settings {
       show_percentage: true,
       show_countdown: true,
       show_reset_clock: true,
+      show_context: true,
       poll_interval_secs: 60,
     },
     system_stats: {

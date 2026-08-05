@@ -99,10 +99,45 @@ export interface UsageWindow {
   resets_at: string | null;
 }
 
-/// Session (5h) + weekly (7d) usage snapshot for the bottom-bar tracker.
+/// Live context-window reading (NC-3), pulled from the same status-line push
+/// as the quota windows. Every field is independently optional: `null` means
+/// "not reported" and must render as unknown — never as 0.
+export interface ContextSnapshot {
+  /// Percentage of the context window in use (0–100).
+  used_percentage?: number | null;
+  /// Percentage still free (0–100), as reported (not derived).
+  remaining_percentage?: number | null;
+  /// Tokens occupying the window (input + cache).
+  total_input_tokens?: number | null;
+  /// Window size in tokens (200k, or 1M with extended context).
+  context_window_size?: number | null;
+  /// Latest turn's tokens served from the prompt cache.
+  cache_read_tokens?: number | null;
+  /// Latest turn's tokens written into the prompt cache.
+  cache_creation_tokens?: number | null;
+  /// Latest turn's uncached input tokens.
+  input_tokens?: number | null;
+  /// Latest turn's output tokens.
+  output_tokens?: number | null;
+  /// Session name, when Claude Code names the session.
+  session_name?: string | null;
+  /// Active agent/persona (`agent.name`).
+  agent_name?: string | null;
+  /// Reasoning effort as reported (free-form).
+  effort?: string | null;
+  /// Thinking setting as reported ('on'/'off' for the boolean form).
+  thinking?: string | null;
+  /// Fast-mode flag.
+  fast_mode?: boolean | null;
+}
+
+/// Session (5h) + weekly (7d) quota plus the live context reading for the
+/// bottom-bar tracker. Each part is independently absent-able.
 export interface UsageSnapshot {
   five_hour: UsageWindow | null;
   seven_day: UsageWindow | null;
+  /// NC-3 context reading; absent on older pushes / older Claude Code.
+  context?: ContextSnapshot | null;
 }
 
 /// Outcome of a usage read. Data is pushed by the Claude tab's status line

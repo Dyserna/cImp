@@ -7,13 +7,35 @@
   // exists (no Claude tab has pushed a quota reading yet, or the last one
   // expired).
   //
+  // NC-3: the same push also carries the live context-window reading, shown
+  // as a second group (context used% + tokens, and the turn's cache
+  // read/creation split). Historical per-turn cache stats live on the
+  // transcript/graph path (Code Intelligence) — this group is the live
+  // snapshot only.
+  //
   // Data path: each `cimp --statusline` run inside a Claude tab persists the
-  // payload's `rate_limits` (5h/7d quota) to a push file; the backend
-  // `get_claude_usage` command reads that file — a local read, no network.
-  // We poll it on `usage.poll_interval_secs`; the countdown ticks locally
-  // between polls.
+  // payload's `rate_limits` (5h/7d quota) and `context_window` block to one
+  // push file; the backend `get_claude_usage` command reads that file — a
+  // local read, no network. We poll it on `usage.poll_interval_secs`; the
+  // countdown ticks locally between polls.
+  //
+  // Absence rule (both groups): every part is independently absent-able —
+  // `rate_limits` exists only for subscription auth after the first API
+  // response, the context block only on a new enough Claude Code, and each
+  // field inside either can be missing. Missing renders as "—" / an empty
+  // "unknown" track, NEVER as 0%.
   import { settings } from '../settings/store';
   import { getClaudeUsage, type UsageResult, type UsageSnapshot } from '../ipc';
+  import {
+    cacheHitPct,
+    cacheSplitLabel,
+    clampPct,
+    contextTitle,
+    contextTokensLabel,
+    hasContextData,
+    hasQuotaData,
+    humanizeTokens,
+  } from './contextMeter';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't busy-poll.
   // The read is a local file, so this is UI hygiene rather than protection of
@@ -55,6 +77,10 @@
   );
   const showCountdown = $derived(usage.show_countdown);
   const showResetClock = $derived(usage.show_reset_clock);
+  // `show_context` is additive with a serde default, so a settings file
+  // written before NC-3 has no such key — treat a missing value as on rather
+  // than as off, otherwise the row silently never appears for existing users.
+  const showContextSetting = $derived(usage.show_context !== false);
 
   // Largest backoff between polls when the endpoint is unavailable (not a 429).
   const MAX_BACKOFF_MS = 5 * 60_000;
@@ -174,10 +200,24 @@
     return `${wd} ${time}`;
   }
 
-  // Show the widget when we have data (the rate-limited half of the OR is
-  // legacy and can no longer trigger). Hidden until a Claude tab pushes its
-  // first quota reading, and again once the last push expires.
-  const visible = $derived(!!snapshot || rateLimited);
+  // Live context reading + the derived figures the group renders. All the
+  // absence/ratio logic lives in `contextMeter.ts` so it is unit-tested.
+  const ctx = $derived(snapshot?.context ?? null);
+  const showContext = $derived(showContextSetting && hasContextData(ctx));
+  const cacheHit = $derived(cacheHitPct(ctx));
+  const ctxTokens = $derived(contextTokensLabel(ctx));
+  const cacheSplit = $derived(cacheSplitLabel(ctx));
+  const ctxTitle = $derived(contextTitle(ctx));
+
+  // Quota data can be absent while context data is present (API-key auth
+  // reports no `rate_limits` at all) — then the quota rows are dropped
+  // entirely rather than drawn as a column of placeholders. The rate-limited
+  // half is legacy and can no longer trigger.
+  const showQuota = $derived(hasQuotaData(snapshot) || (rateLimited && !snapshot));
+
+  // Show the widget when either group has something to draw. Hidden until a
+  // Claude tab pushes its first reading, and again once the last push expires.
+  const visible = $derived(showQuota || showContext);
 
   // The two quota windows in display order. `w` is null while we have no
   // data yet (rate-limited at startup) — cells render "—" placeholders so
@@ -210,55 +250,109 @@
         ? 'Claude Code usage — last known (no recent report from a Claude tab)'
         : 'Claude Code usage'}
   >
-    <!-- label column: name + duration in their own tracks so (5h)/(7d)
-         line up across the two rows. -->
-    <div class="ug label">
-      {#each windowsList as r}
-        <span class="name" title={r.full}>{r.name}</span>
-        <span class="dur">{r.dur}</span>
-      {/each}
-    </div>
-    {#if usage.show_bar}
-      <div class="ug">
+    {#if showQuota}
+      <!-- label column: name + duration in their own tracks so (5h)/(7d)
+           line up across the two rows. -->
+      <div class="ug label">
         {#each windowsList as r}
-          <span class="bar">
-            <span
-              class="fill"
-              style="width: {r.w ? Math.min(100, Math.max(0, r.w.utilization)) : 0}%"
-            ></span>
-          </span>
+          <span class="name" title={r.full}>{r.name}</span>
+          <span class="dur">{r.dur}</span>
         {/each}
       </div>
+      {#if usage.show_bar}
+        <div class="ug">
+          {#each windowsList as r}
+            <!-- No window ⇒ an "unknown" track with no fill: a 0%-wide fill
+                 on a normal track would read as a genuine 0%. -->
+            <span class="bar" class:unknown={!r.w} title={r.w ? undefined : 'not reported'}>
+              {#if r.w}
+                <span class="fill" style="width: {clampPct(r.w.utilization)}%"></span>
+              {/if}
+            </span>
+          {/each}
+        </div>
+      {/if}
+      {#if usage.show_percentage}
+        <div class="ug">
+          {#each windowsList as r}
+            <span class="pct">{r.w ? pct(r.w.utilization) + '%' : '—'}</span>
+          {/each}
+        </div>
+      {/if}
+      {#if usage.show_percentage && (usage.show_countdown || usage.show_reset_clock)}
+        <span class="vdiv" aria-hidden="true"></span>
+      {/if}
+      {#if usage.show_countdown}
+        <div class="ug">
+          {#each windowsList as r}
+            <span class="cd"
+              >{r.w?.resets_at ? 'resets in: ' + fmtCountdown(r.w.resets_at, now) : '—'}</span
+            >
+          {/each}
+        </div>
+      {/if}
+      {#if usage.show_countdown && usage.show_reset_clock}
+        <span class="vdiv" aria-hidden="true"></span>
+      {/if}
+      {#if usage.show_reset_clock}
+        <div class="ug">
+          {#each windowsList as r}
+            <span class="clk"
+              >{r.w?.resets_at
+                ? (usage.show_countdown ? '@ ' : 'resets @ ') + fmtResetClock(r.w.resets_at, now)
+                : ''}</span
+            >
+          {/each}
+        </div>
+      {/if}
     {/if}
-    {#if usage.show_percentage}
-      <div class="ug">
-        {#each windowsList as r}
-          <span class="pct">{r.w ? pct(r.w.utilization) + '%' : '—'}</span>
-        {/each}
-      </div>
-    {/if}
-    {#if usage.show_percentage && (usage.show_countdown || usage.show_reset_clock)}
+    {#if showQuota && showContext}
       <span class="vdiv" aria-hidden="true"></span>
     {/if}
-    {#if usage.show_countdown}
-      <div class="ug">
-        {#each windowsList as r}
-          <span class="cd">{r.w?.resets_at ? 'resets in: ' + fmtCountdown(r.w.resets_at, now) : '—'}</span>
-        {/each}
+    {#if showContext}
+      <!-- NC-3 context group: row 1 = context window, row 2 = the latest
+           turn's prompt-cache split. Same 2-row grid as the quota columns. -->
+      <div class="ug label" title={ctxTitle}>
+        <span class="name">context</span>
+        <span class="dur">({humanizeTokens(ctx?.context_window_size)})</span>
+        <span class="name">cache</span>
+        <span class="dur">(turn)</span>
       </div>
-    {/if}
-    {#if usage.show_countdown && usage.show_reset_clock}
-      <span class="vdiv" aria-hidden="true"></span>
-    {/if}
-    {#if usage.show_reset_clock}
-      <div class="ug">
-        {#each windowsList as r}
-          <span class="clk"
-            >{r.w?.resets_at
-              ? (usage.show_countdown ? '@ ' : 'resets @ ') + fmtResetClock(r.w.resets_at, now)
-              : ''}</span
+      {#if usage.show_bar}
+        <div class="ug">
+          <span
+            class="bar"
+            class:unknown={ctx?.used_percentage == null}
+            title={ctx?.used_percentage == null ? 'not reported' : 'context window in use'}
           >
-        {/each}
+            {#if ctx?.used_percentage != null}
+              <span class="fill" style="width: {clampPct(ctx.used_percentage)}%"></span>
+            {/if}
+          </span>
+          <span
+            class="bar"
+            class:unknown={cacheHit == null}
+            title={cacheHit == null
+              ? 'not reported'
+              : 'share of this turn’s input tokens served from cache'}
+          >
+            {#if cacheHit != null}
+              <span class="fill" style="width: {clampPct(cacheHit)}%"></span>
+            {/if}
+          </span>
+        </div>
+      {/if}
+      {#if usage.show_percentage}
+        <div class="ug">
+          <span class="pct"
+            >{ctx?.used_percentage != null ? pct(ctx.used_percentage) + '%' : '—'}</span
+          >
+          <span class="pct">{cacheHit != null ? pct(cacheHit) + '%' : '—'}</span>
+        </div>
+      {/if}
+      <div class="ug">
+        <span class="fig">{ctxTokens ?? '—'}</span>
+        <span class="fig">{cacheSplit ?? '—'}</span>
       </div>
     {/if}
   </div>
@@ -326,6 +420,13 @@
     border-radius: var(--radius-pill);
     overflow: hidden;
   }
+  /* "Not reported" track: hollow and outlined rather than an empty-but-solid
+     bar, so absent data can't be mistaken for a genuine 0%. */
+  .bar.unknown {
+    background: transparent;
+    border: 1px dashed var(--border-subtle);
+    opacity: 0.7;
+  }
   .fill {
     position: absolute;
     left: 0;
@@ -349,5 +450,10 @@
   }
   .clk {
     color: var(--text-secondary);
+  }
+  /* Context/cache token figures ("25k/200k", "read 20k · new 5k"). */
+  .fig {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
   }
 </style>

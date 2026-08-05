@@ -287,6 +287,13 @@ pub struct GraphService {
     /// `active_session_ids`. Claude clears its entry on tab cancel; every entry
     /// also expires by [`LIVE_SESSION_TTL_MS`].
     live_sessions: StdMutex<HashMap<String, LiveSession>>,
+    /// V30 Phase C: the session-push bus, when this process has one. `None` for
+    /// tests and any standalone construction without an `OffloadService` — a
+    /// push is best-effort by contract, so its absence is a silent no-op, never
+    /// an error. Only the send half is held (see
+    /// [`OffloadService::push_registry`](crate::offload::OffloadService::push_registry)):
+    /// no back-reference, so no Arc cycle with the offload service.
+    pushes: Option<Arc<crate::offload::service::PushRegistry>>,
 }
 
 /// RAII removal of a digest in-flight key (V11 Phase F). Runs on `Drop`, so a
@@ -780,10 +787,20 @@ impl Drop for BackfillGuard {
 }
 
 impl GraphService {
-    pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
+    /// `pushes` is the V30 session-push bus
+    /// ([`OffloadService::push_registry`](crate::offload::OffloadService::push_registry)).
+    /// `None` disables the index-completion push entirely — the service is
+    /// otherwise unchanged, so tests and standalone paths can construct it
+    /// without an offload service.
+    pub fn new(
+        app: AppHandle,
+        settings: SettingsHandle,
+        pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             app,
             settings,
+            pushes,
             indices: StdMutex::new(HashMap::new()),
             status: StdMutex::new(HashMap::new()),
             watchers: StdMutex::new(HashMap::new()),
@@ -3102,6 +3119,60 @@ impl GraphService {
         }
     }
 
+    /// V30 Phase C producer: announce a finished **full** index build into every
+    /// channel-armed session of this instance.
+    ///
+    /// **Pull twin (milestone invariant 2): the `graph_*` tools themselves.**
+    /// The pushed fact IS queryable state — everything this notice claims is
+    /// re-derivable with `graph_stats` / any `graph_*` query, and the Code
+    /// Intelligence tab renders the same numbers from `graph-status`. A dropped
+    /// push therefore costs timeliness, never information; no new tool needed.
+    ///
+    /// Gated hard, deliberately. Delivering a push to an IDLE Claude tab
+    /// **starts a model turn**, so every notice has a token price:
+    ///
+    /// - **Full builds only.** The only call site is [`Self::spawn_rebuild`]'s
+    ///   worker thread. The incremental watcher path ([`Self::reindex_paths`])
+    ///   does not call this and must not — a push per file-save would be noise
+    ///   with a price tag.
+    /// - **`>= GRAPH_PUSH_MIN_BUILD_MS` wall clock.** A fast rebuild is not
+    ///   news; the notice exists for builds long enough that an agent gave up
+    ///   waiting on the index.
+    ///
+    /// Best-effort and non-blocking (`try_send` under the hood): no bus, no
+    /// subscribers, no channel-armed child, or a full queue all mean "not
+    /// delivered" and the rebuild neither retries nor fails.
+    fn announce_index_complete(&self, root: &Path, stats: &GraphStats, elapsed_ms: u64) {
+        let Some(pushes) = self.pushes.as_ref() else {
+            return;
+        };
+        if !index_push_worthy(elapsed_ms) {
+            return;
+        }
+        let project = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let notice = crate::offload::service::PushNotice::new(
+            format!(
+                "cImp finished a full code-graph index of {project} ({}): {} files, {} symbols, {} edges in {}s. The index is live — the graph_* tools now see the current tree.",
+                root.display(),
+                stats.files,
+                stats.symbols,
+                stats.edges,
+                elapsed_ms / 1000,
+            ),
+            [("kind", "graph_index")],
+        );
+        let delivered = pushes.push_broadcast(notice);
+        debug!(
+            root = %root.display(),
+            ms = elapsed_ms,
+            delivered,
+            "graph: pushed index-complete notice"
+        );
+    }
+
     /// Kick a non-blocking full rebuild of `root` on a dedicated thread. Returns
     /// immediately; progress lands on the `graph-status` event and via
     /// [`status`](Self::status). A no-op (logged) when a build for this root is
@@ -3142,12 +3213,13 @@ impl GraphService {
                 let started = std::time::Instant::now();
                 match this.rebuild_blocking(&root) {
                     Ok(stats) => {
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
                         info!(
                             root = %root.display(),
                             files = stats.files,
                             symbols = stats.symbols,
                             edges = stats.edges,
-                            ms = started.elapsed().as_millis() as u64,
+                            ms = elapsed_ms,
                             "graph: rebuild complete"
                         );
                         this.patch_status(&root, |s| {
@@ -3176,6 +3248,11 @@ impl GraphService {
                         // is on and `checks` is empty). Inline like the analyses
                         // trigger above — bounded fs + PATH work.
                         this.checks_auto_configure_trigger(&root);
+                        // V30 Phase C: announce an EXPENSIVE index build into
+                        // every channel-armed session (last, so the push says
+                        // "done" only once the post-build triggers above have
+                        // also run). Gated — see `announce_index_complete`.
+                        this.announce_index_complete(&root, &stats, elapsed_ms);
                     }
                     Err(e) => {
                         warn!(root = %root.display(), error = %e, "graph: rebuild failed");
@@ -3854,6 +3931,20 @@ impl GraphService {
 /// first successful pass this project has ever run IS new information.
 fn analyses_changed(prev: Option<&str>, cur: &str) -> bool {
     prev != Some(cur)
+}
+
+/// V30 Phase C: the wall-clock floor for the index-completion push. Below this
+/// the build was cheap enough that nobody was waiting on it, and the notice
+/// would cost more (an idle Claude tab starts a model turn on delivery) than the
+/// information is worth.
+const GRAPH_PUSH_MIN_BUILD_MS: u64 = 30_000;
+
+/// V30 Phase C: the duration half of [`GraphService::announce_index_complete`]'s
+/// gate — pure so "only expensive builds announce themselves" is testable
+/// without an `AppHandle`, a store, or a push bus. The full-vs-incremental half
+/// is structural (only `spawn_rebuild` calls the producer at all).
+fn index_push_worthy(elapsed_ms: u64) -> bool {
+    elapsed_ms >= GRAPH_PUSH_MIN_BUILD_MS
 }
 
 /// Make a `&str` `path` project-relative to `root` with `/` separators (empty in
@@ -4811,6 +4902,32 @@ mod tests {
         assert!(
             analyses_changed(Some("3,1"), "3,0"),
             "cycle count shrank — still a change"
+        );
+    }
+
+    // ── V30 Phase C: index-completion push gate ─────────────────────────────
+
+    /// The duration half of `announce_index_complete`'s gate. Delivering a push
+    /// to an idle Claude tab starts a model turn, so only builds expensive
+    /// enough to have been worth waiting on may announce themselves.
+    #[test]
+    fn index_push_worthy_only_past_the_duration_floor() {
+        assert!(!index_push_worthy(0), "an instant rebuild is not news");
+        assert!(
+            !index_push_worthy(GRAPH_PUSH_MIN_BUILD_MS - 1),
+            "just under the floor must stay silent"
+        );
+        assert!(
+            index_push_worthy(GRAPH_PUSH_MIN_BUILD_MS),
+            "the floor itself qualifies"
+        );
+        assert!(
+            index_push_worthy(GRAPH_PUSH_MIN_BUILD_MS * 10),
+            "a five-minute build definitely qualifies"
+        );
+        assert_eq!(
+            GRAPH_PUSH_MIN_BUILD_MS, 30_000,
+            "the milestone fixes this floor at 30s — changing it is a spec decision"
         );
     }
 

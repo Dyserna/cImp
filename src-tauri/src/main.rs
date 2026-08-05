@@ -615,7 +615,14 @@ fn main() {
             // the user starts it from Settings (or it's lazy on first
             // offload). Fail-soft: a bad command surfaces as an Error
             // status, never blocks launch.
-            {
+            //
+            // V30 Phase C: the block yields the session-push bus
+            // (`OffloadService::push_registry`) so the producers constructed
+            // further down — the graph service and the audit runner — can
+            // announce their long-running completions into channel-armed
+            // sessions. Only the send half travels; nothing holds the service
+            // itself, so no Arc cycle.
+            let push_registry = {
                 let supervisor = crate::offload::OffloadSupervisor::new(
                     app.handle().clone(),
                     settings_for_offload.clone(),
@@ -694,7 +701,9 @@ fn main() {
                         }
                     });
                 }
-            }
+                // V30 Phase C: hand the push bus to the producers below.
+                service.push_registry()
+            };
 
             // V13 Phase A: the Workbench service (fs-batch broadcast today;
             // checkpoint scheduling and worktree bookkeeping in later phases).
@@ -730,6 +739,8 @@ fn main() {
                 let graph_service = crate::graph::GraphService::new(
                     app.handle().clone(),
                     settings_for_graph.clone(),
+                    // V30 Phase C: announce expensive full index builds.
+                    Some(push_registry.clone()),
                 );
                 app.manage(graph_service.clone());
 
@@ -744,6 +755,8 @@ fn main() {
                         app.handle().clone(),
                         settings_for_graph.clone(),
                         audit_root,
+                        // V30 Phase C: announce GUI-initiated scan completions.
+                        Some(push_registry.clone()),
                     );
                     // V26: publish the runner as the process global BEFORE
                     // `manage` moves it — this is how the offload worker's native

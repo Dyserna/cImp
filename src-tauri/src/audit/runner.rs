@@ -227,21 +227,63 @@ impl Inner {
     }
 }
 
+/// V30 Phase C: who asked for this scan. The completion push exists for the
+/// human who clicked Scan and then went back to a Claude tab — an
+/// agent-triggered run is already returning its full report through the open
+/// `tools/call` (the loopback `/audit/run` route, or the offload worker's native
+/// audit tool), and pushing there would duplicate it into the same session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Initiator {
+    /// The Code audit tab's Scan button (`audit_start_scan` →
+    /// [`AuditState::start_scan`]). Nothing is awaiting a return value.
+    Gui,
+    /// An agent, via [`AuditState::run_scan_and_wait`] — i.e. the V26 MCP
+    /// surface (`security_audit` / `quality_audit`), whether it arrived over the
+    /// loopback `/audit/run` route from a stdio child or from the offload
+    /// worker's native tool. The caller holds a call open and gets the report as
+    /// its result.
+    Agent,
+}
+
+/// V30 Phase C: whether a completed scan of this [`Initiator`] announces itself
+/// on the session-push bus. Pure so the gate is unit-testable, and separate from
+/// the send so the *decision* is one named place: an agent-initiated run must
+/// never push, because its result is already being returned synchronously (and
+/// Claude Code's native auto-backgrounding delivers even a long one in full —
+/// V30 Phase 0 T4).
+fn initiator_pushes(initiator: Initiator) -> bool {
+    matches!(initiator, Initiator::Gui)
+}
+
 /// The managed audit runner. Constructed once in the Tauri setup hook and
 /// `app.manage`d as `Arc<AuditState>`.
 pub struct AuditState {
     app: AppHandle,
     settings: SettingsHandle,
     inner: StdMutex<Inner>,
+    /// V30 Phase C: the session-push bus, when this process has one. `None` in
+    /// tests and any standalone construction without an `OffloadService`; a push
+    /// is best-effort by contract, so its absence is a silent no-op. Send half
+    /// only (see
+    /// [`OffloadService::push_registry`](crate::offload::OffloadService::push_registry)),
+    /// so there is no Arc cycle back into the offload service.
+    pushes: Option<Arc<crate::offload::service::PushRegistry>>,
 }
 
 impl AuditState {
     /// `root` is the launch project root (`launch_cwd`) — the directory every
-    /// scan runs against.
-    pub fn new(app: AppHandle, settings: SettingsHandle, root: PathBuf) -> Arc<Self> {
+    /// scan runs against. `pushes` is the V30 session-push bus; `None` disables
+    /// the completion push and changes nothing else.
+    pub fn new(
+        app: AppHandle,
+        settings: SettingsHandle,
+        root: PathBuf,
+        pushes: Option<Arc<crate::offload::service::PushRegistry>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             app,
             settings,
+            pushes,
             inner: StdMutex::new(Inner {
                 root,
                 scanning: false,
@@ -413,7 +455,18 @@ impl AuditState {
         let (to_run, root, global_timeout, cancel) = self.begin_scan(category)?;
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
-            this.run(to_run, root, global_timeout, cancel).await;
+            // V30 Phase C: `Initiator::Gui` — nobody is awaiting this scan, so
+            // its completion is exactly the kind of fact the session-push bus
+            // exists for.
+            this.run(
+                to_run,
+                root,
+                category,
+                global_timeout,
+                cancel,
+                Initiator::Gui,
+            )
+            .await;
         });
         Ok(())
     }
@@ -439,7 +492,20 @@ impl AuditState {
         category: Category,
     ) -> Result<AuditSnapshot, String> {
         let (to_run, root, global_timeout, cancel) = self.begin_scan(category)?;
-        Ok(self.clone().run(to_run, root, global_timeout, cancel).await)
+        // V30 Phase C: `Initiator::Agent` — the snapshot returned below IS the
+        // caller's tool result, so this path never pushes (it would duplicate
+        // the report into the very session that asked for it).
+        Ok(self
+            .clone()
+            .run(
+                to_run,
+                root,
+                category,
+                global_timeout,
+                cancel,
+                Initiator::Agent,
+            )
+            .await)
     }
 
     /// Sync every QUALITY tool's persisted `enabled` flag to `census` when
@@ -529,8 +595,10 @@ impl AuditState {
         self: Arc<Self>,
         tools: Vec<AuditToolConfig>,
         root: PathBuf,
+        category: Category,
         global_timeout: Duration,
         cancel: CancellationToken,
+        initiator: Initiator,
     ) -> AuditSnapshot {
         let git_repo = root.join(".git").exists();
         let mut handles = Vec::new();
@@ -598,7 +666,50 @@ impl AuditState {
             inner.snapshot(None)
         };
         self.emit_event();
+        self.announce_scan_complete(&snap, category, initiator);
         snap
+    }
+
+    /// V30 Phase C producer: announce a finished **GUI-initiated** scan into
+    /// every channel-armed session of this instance.
+    ///
+    /// **Pull twin (milestone invariant 2): the V26 audit tools + the report.**
+    /// Anything this notice states is re-derivable by calling `security_audit` /
+    /// `quality_audit` (which re-runs and formats the same snapshot) and is
+    /// already rendered in the Code audit tab and the `audit_snapshot` IPC. A
+    /// dropped push costs timeliness, never information; no new tool is added.
+    ///
+    /// Gated on [`Initiator::Gui`] (see [`initiator_pushes`]): an agent-initiated
+    /// run returns this exact report through its own open call, so pushing would
+    /// duplicate it — and a push into an IDLE tab starts a model turn, so the
+    /// duplicate is not free.
+    ///
+    /// Best-effort and non-blocking (`try_send` under the hood): no bus, no
+    /// channel-armed child, or a full queue all mean "not delivered", and the
+    /// scan neither retries nor fails because of it.
+    fn announce_scan_complete(
+        &self,
+        snap: &AuditSnapshot,
+        category: Category,
+        initiator: Initiator,
+    ) {
+        let Some(pushes) = self.pushes.as_ref() else {
+            return;
+        };
+        if !initiator_pushes(initiator) {
+            return;
+        }
+        let notice = crate::offload::service::PushNotice::new(
+            audit_push_content(snap, category),
+            [("kind", "audit")],
+        );
+        let delivered = pushes.push_broadcast(notice);
+        tracing::debug!(
+            root = %snap.root,
+            category = ?category,
+            delivered,
+            "audit: pushed scan-complete notice"
+        );
     }
 
     /// Run one resolved tool end to end: spawn, capture, classify, parse SARIF,
@@ -832,6 +943,41 @@ fn effective_tool_timeout(tool_secs: Option<u64>, global: Duration) -> Duration 
     tool_secs
         .map(|s| Duration::from_secs(s.max(1)))
         .unwrap_or(global)
+}
+
+/// V30 Phase C: the one-line `<channel>` body for a finished GUI scan. Pure
+/// (snapshot in, string out) so the wording and the counts are testable without
+/// a runner, an `AppHandle`, or a push bus. Deliberately short and factual —
+/// this text costs a model turn in every armed tab that receives it — and it
+/// names its pull twin so the receiving agent knows where the full report is.
+fn audit_push_content(snap: &AuditSnapshot, category: Category) -> String {
+    let done = snap
+        .tools
+        .iter()
+        .filter(|t| t.status == ToolStatus::Done)
+        .count();
+    let failed = snap
+        .tools
+        .iter()
+        .filter(|t| t.status == ToolStatus::Failed)
+        .count();
+    let tool = match category {
+        Category::Security => "security_audit",
+        Category::Quality => "quality_audit",
+    };
+    let mut line = format!(
+        "cImp finished a {} audit of {} (started from the cImp UI): {} findings from {done} tool(s)",
+        category_label(category),
+        snap.root,
+        snap.total_findings,
+    );
+    if failed > 0 {
+        line.push_str(&format!(", {failed} tool(s) failed"));
+    }
+    line.push_str(&format!(
+        ". Call {tool} for the full report (it re-runs the same scan)."
+    ));
+    line
 }
 
 /// The lowercase category word used in the "no … tools are enabled" error.
@@ -1893,5 +2039,101 @@ mod tests {
         )
         .await;
         assert!(matches!(cap.outcome, Outcome::SpawnError(_)));
+    }
+
+    // ── V30 Phase C: completion-push gate + payload ────────────────────────
+
+    /// A finished snapshot with the given per-tool statuses.
+    fn done_snapshot(
+        statuses: &[(AuditToolId, ToolStatus)],
+        total_findings: usize,
+    ) -> AuditSnapshot {
+        AuditSnapshot {
+            root: "/proj/root".to_string(),
+            scanning: false,
+            last_scan_at: Some(1_700_000_000_000),
+            tools: statuses
+                .iter()
+                .map(|(id, status)| ToolState {
+                    status: *status,
+                    ..ToolState::fresh(*id, adapters::adapter(*id).category)
+                })
+                .collect(),
+            census: CensusBlock::default(),
+            total_findings,
+            truncated: false,
+        }
+    }
+
+    /// The gate itself: only a GUI-initiated scan announces itself. An
+    /// agent-initiated run returns the same report through its own open
+    /// `tools/call`, so pushing would duplicate it into that session — and a
+    /// push into an idle tab costs a model turn.
+    #[test]
+    fn only_gui_initiated_scans_push() {
+        assert!(
+            initiator_pushes(Initiator::Gui),
+            "the Scan button has no other completion path"
+        );
+        assert!(
+            !initiator_pushes(Initiator::Agent),
+            "an MCP/offload-initiated run already returns its report"
+        );
+    }
+
+    /// The pushed line is short, factual, and names its pull twin (milestone
+    /// invariant 2) rather than inlining the report.
+    #[test]
+    fn audit_push_content_states_counts_and_its_pull_twin() {
+        let snap = done_snapshot(
+            &[
+                (AuditToolId::Gitleaks, ToolStatus::Done),
+                (AuditToolId::OsvScanner, ToolStatus::Done),
+            ],
+            7,
+        );
+        let line = audit_push_content(&snap, Category::Security);
+        assert!(line.contains("security"), "names the category: {line}");
+        assert!(line.contains("/proj/root"), "names the scope: {line}");
+        assert!(line.contains("7 findings"), "carries the count: {line}");
+        assert!(line.contains("2 tool(s)"), "counts completed tools: {line}");
+        assert!(
+            line.contains("security_audit"),
+            "names the pull twin, never inlines the report: {line}"
+        );
+        assert!(
+            !line.contains("failed"),
+            "no failure clause when nothing failed: {line}"
+        );
+        assert!(line.len() < 400, "stays a one-liner: {line}");
+    }
+
+    /// A failed tool is surfaced, so "0 findings" from a broken scan can't read
+    /// as a clean bill of health, and a Quality scan points at `quality_audit`.
+    #[test]
+    fn audit_push_content_reports_failures_and_the_quality_twin() {
+        let snap = done_snapshot(
+            &[
+                (AuditToolId::Ruff, ToolStatus::Done),
+                (AuditToolId::Eslint, ToolStatus::Failed),
+                (AuditToolId::Pmd, ToolStatus::NotInstalled),
+            ],
+            0,
+        );
+        let line = audit_push_content(&snap, Category::Quality);
+        assert!(line.contains("quality"), "names the category: {line}");
+        assert!(line.contains("0 findings"), "carries the count: {line}");
+        assert!(
+            line.contains("1 tool(s)"),
+            "only `done` tools count: {line}"
+        );
+        assert!(
+            line.contains("1 tool(s) failed"),
+            "surfaces failure: {line}"
+        );
+        assert!(
+            line.contains("quality_audit"),
+            "names the quality pull twin: {line}"
+        );
     }
 }

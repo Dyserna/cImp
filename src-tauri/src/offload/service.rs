@@ -520,6 +520,16 @@ impl OffloadService {
         self.pushes.subscriber_count()
     }
 
+    /// A handle on the push bus for **producers that are not the offload
+    /// service** (V30 Phase C: the graph indexer, the audit runner). Handing out
+    /// the registry rather than an `Arc<OffloadService>` is deliberate: those
+    /// services need exactly the send half, and holding the whole service would
+    /// make the Arc graph circular (the service reaches the graph service via
+    /// its tools). The registry itself holds no back-reference to anything.
+    pub fn push_registry(&self) -> Arc<PushRegistry> {
+        self.pushes.clone()
+    }
+
     /// Total offloads currently in flight across the app (global gate).
     pub fn global_in_flight(&self) -> u32 {
         self.global_cap

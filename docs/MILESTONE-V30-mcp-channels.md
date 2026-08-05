@@ -10,7 +10,19 @@ from the 2026-08-04 maintenance run). **Phase A IMPLEMENTED 2026-08-05**
 storage, UI toggle; live-verify: enable the toggle with offload/graph on,
 restart a Claude tab, expect the channels banner + `/status` "Listening" +
 the child stderr line "declared the claude/channel capability" in the MCP
-log). Next: Phases B–D.
+log). **Phase B IMPLEMENTED 2026-08-05** (`PushRegistry` + `PushNotice` +
+`/events` `event: push` frames). **Phase C IMPLEMENTED 2026-08-05**: the
+`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` kill switch is REMOVED from the Claude
+spawn env per spike decision 2 (`tabs/config.rs::compose_ai_env` now carries a
+do-not-re-add comment), and two real producers ride the bus —
+`graph/service.rs::announce_index_complete` (full rebuilds only, wall clock
+≥ 30 s, `kind=graph_index`) and `audit/runner.rs::announce_scan_complete`
+(GUI-initiated scans only, `kind=audit`). Both take an
+`Option<Arc<PushRegistry>>` at construction and are best-effort/log-and-continue.
+Live-verify: enable `offload.session_push`, restart a Claude tab, then (a) force
+a full graph rebuild of a big project and (b) click Scan in the Code audit tab —
+each should surface a `← server: …` line and start a turn in the idle tab; an
+MCP-initiated `security_audit` must NOT produce a second push. Next: Phase D.
 **Builds on:** the single-proxy stdio child (`cimp --offload-mcp`, one per
 tab), its existing out-of-band notification spine
 (`offload/mcp.rs::events_relay` → `emit_list_changed`, the one unsolicited

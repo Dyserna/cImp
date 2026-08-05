@@ -4,6 +4,17 @@
 # revisit. Entries with no revisit trigger are not allowed; this file is a
 # decision log, not a mute button. Re-evaluate ALL entries on each maintenance
 # run (docs/MAINTENANCE.md).
+#
+# ENFORCEMENT ASYMMETRY — read this before "fixing" a resurfacing advisory.
+# This file is read ONLY by `cargo audit`, which is the maintenance run's
+# CROSS-CHECK step (and only when run from `src-tauri/`). The PRIMARY advisory
+# source is osv-scanner — `osv-scanner scan source -r .`, and the same scanner
+# behind the app's own `security_audit` MCP tool — and it has NO suppression
+# mechanism wired up: it will keep reporting every advisory listed below on
+# every scan, forever. Those hits are KNOWN-ACCEPTED, not new findings; check
+# this file before re-litigating one. If an entry here is ever removed or its
+# revisit trigger fires, that decision must be made here — the osv output is
+# not evidence that the acceptance lapsed.
 
 [advisories]
 # RUSTSEC-2026-0041 — lz4_flex 0.10 (HIGH 8.2), transitive via cozo -> swapvec.

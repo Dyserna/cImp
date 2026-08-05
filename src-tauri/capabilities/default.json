@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the main and settings windows: core events, IPC, dialog plugin. Asset protocol scope lives in tauri.conf.json (app.security.assetProtocol).",
+  "description": "Capabilities shared by the main and settings windows: core events, IPC, dialog plugin. Main-window-only grants live in main.json. Asset protocol scope lives in tauri.conf.json (app.security.assetProtocol).",
   "windows": ["main", "settings"],
   "permissions": [
     "core:default",
@@ -23,7 +23,6 @@
     "core:window:allow-start-dragging",
     "dialog:default",
     "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-read-image",
     "clipboard-manager:allow-write-text",
     "snap-layout:default",
     "opener:allow-open-url"

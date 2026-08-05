@@ -98,7 +98,9 @@ orchestrating session.
 
 A complete, scannable inventory of everything cImp depends on, for periodic
 "is there a newer version?" passes. Version columns reflect the pins in
-`src-tauri/Cargo.toml` and `package.json` as of **v0.49.1 (2026-08-04)**. The
+`src-tauri/Cargo.toml` and `package.json` on **develop as of 2026-08-05**, i.e.
+*after* the 2026-08-04 run's bump batches (`b6f0883`, `c67adf5`, `3f50a3a`,
+`1ee71e0`) — not the v0.49.1 tag, which predates them. The
 *Dependencies to track* sections below cover the gotchas for the hairy ones
 (`ort`, `whisper-rs`, and the Claude Code / OpenCode CLI contracts); the
 per-feature check-on-change items are in *Feature-area maintenance notes*
@@ -127,6 +129,17 @@ cd src-tauri && cargo audit         # cross-check only; reads the accepted-risk
                                     # (must run from src-tauri/ to pick it up)
 ```
 
+**Accepted advisories will keep showing up in the PRIMARY scan — that is
+expected, not a new finding.** `src-tauri/.cargo/audit.toml` is read *only* by
+`cargo audit`, the cross-check. osv-scanner (and the app's own `security_audit`
+tool, which wraps it) has no suppression mechanism wired up here, so every
+entry in that baseline — currently RUSTSEC-2026-0041 (`lz4_flex` via
+cozo→swapvec) and RUSTSEC-2026-0194/0195 (`quick-xml 0.39.4` via
+`rfd`'s `wayland` → `wayland-scanner`, Linux-only build-time codegen) — reappears
+on every osv run. Read `.cargo/audit.toml` before re-litigating one: each entry
+carries its rationale and its revisit trigger, and *that file* is where the
+accept/withdraw decision lives. Only advisories **not** listed there are new.
+
 Bump policy: move one ecosystem at a time, run `cargo test` + `npm run check` +
 `npm test`, and for `ort` / `whisper-rs` / GPU features re-run the smoke tests
 called out in their sections. Pinned-exact deps (`ort = "=…"`) need a manual
@@ -145,15 +158,15 @@ version edit — `cargo update` will not move them.
 | `serde` / `serde_json` | `1` / `1` | (De)serialization everywhere | Stable; rarely needs attention. |
 | `tokio` | `1` | Async runtime | Feature-rich pin (`rt-multi-thread,macros,sync,io-*,time,fs,process,net`). |
 | `tokio-util` | `0.7` | `rt` helpers | — |
-| `portable-pty` | `0.8` | PTY for the embedded terminals | Pre-1.0; check changelog on bump. |
-| `thiserror` | `1` | Error derives | — |
+| `portable-pty` | `0.9` | PTY for the embedded terminals | Pre-1.0; check changelog on bump. Moved 0.8 → 0.9 in the 2026-08-04 run (`3f50a3a`). |
+| `thiserror` | `2` | Error derives | Major bump in the 2026-08-04 run (`1ee71e0`); derive syntax unchanged for our uses. |
 | `regex` | `1` | `run_check` diagnostic parsers (tsc / gcc-style `file:line:col:`) | Pure Rust, no C deps. |
 | `quick-xml` | `0.41` | Streaming XML reader for the `junit-xml` check parser | Default features; promoted from a transitive dep. Pre-1.0 — check the changelog on bump. |
 | `chrono` | `0.4` | Epoch → ISO-8601 for the usage widget's `rate_limits.resets_at` | `default-features = false` + `std` only (no clock/timezone use — keeps the tz-data churn out of the tree). |
 | `tracing` / `tracing-subscriber` / `tracing-appender` | `0.1` / `0.3` / `0.2` | Logging + rolling file logs | `env-filter` feature; subscriber API shifts across 0.3.x. |
-| `base64` | `0.22` | Asset/data encoding | — |
-| `which` | `6` | Locate `claude` / shells on PATH | — |
-| `vte` | `0.13` | ANSI/terminal parser (processing layer) | Pre-1.0; tag-scanner depends on its escape parsing. |
+| `base64` | `0.23` | Asset/data encoding | `default-features = false` + `std`. Bumped 0.22 → 0.23 in the 2026-08-04 run. |
+| `which` | `8` | Locate `claude` / shells on PATH | Bumped 6 → 8 in the 2026-08-04 run. |
+| `vte` | `0.15` | ANSI/terminal parser (processing layer) | Pre-1.0; tag-scanner depends on its escape parsing. Bumped 0.13 → 0.15 in the 2026-08-04 run — re-verify tag scanning on any further bump. |
 | `shlex` | `1` | Shell-word splitting | — |
 | `uuid` | `1` | IDs (`v4`) | — |
 | `async-trait` | `0.1` | Async `ToolRouter` trait (offload) | — |
@@ -161,18 +174,18 @@ version edit — `cargo update` will not move them.
 | `sysinfo` | `0.36` | System-monitor panel | `default-features = false` + `system,network`. Fast-moving pre-1.0; API churns — re-verify the monitor on bump. |
 | `nvml-wrapper` | `0.12` | NVIDIA GPU stats | Loads `nvml.dll` at runtime; degrades to n/a without driver. |
 | `misaki-rs` | `0.3` | TTS G2P phonemizer | **Pulls espeak-ng → binary is GPLv3** (see `NOTICE`); needs libclang to build. |
-| `ort` | `=2.0.0-rc.11` | ONNX Runtime bindings (Kokoro TTS) | **Exact-pinned.** The dep carries only `download-binaries` — **no EP feature**; EPs come from cImp's own mutually-exclusive `tts-webgpu`/`tts-cuda` features (`ort/webgpu` / `ort/cuda`, re-gated 2026-08-04, D-5). `cuda`+`webgpu` share no prebuilt — that combo makes ort-sys warn and silently link the CPU-only dist. Wraps ORT 1.23.2; see the deep `ort` section. |
+| `ort` | `=2.0.0-rc.11` | ONNX Runtime bindings (Kokoro TTS) | **Exact-pinned.** The dep carries only `download-binaries` — **no EP feature**; EPs come from cImp's own mutually-exclusive `tts-webgpu`/`tts-cuda` features (`ort/webgpu` / `ort/cuda`, re-gated 2026-08-04, D-5). `cuda`+`webgpu` share no prebuilt — that combo makes ort-sys warn and silently link the CPU-only dist, so since 2026-08-05 it is a **`compile_error!`** in `tts/engine.rs` rather than a build that looks fine and runs on CPU. Wraps ORT 1.23.2; see the deep `ort` section. |
 | `bytemuck` | `1` | Zero-copy casts | — |
-| `cpal` / `rodio` | `0.15` / `0.20` | Audio output | Pre-1.0; device-enumeration behavior changes across versions. |
+| `cpal` / `rodio` | `0.17` / `0.22` | Audio output | Pre-1.0; device-enumeration behavior changes across versions. **Bump these two in LOCKSTEP** — `rodio 0.22` depends on `cpal ^0.17`, so a mismatched `cpal` resolves a SECOND cpal into the tree (two WASAPI hosts, two copies of the `windows` bindings, no shared types between STT capture and TTS playback). `rodio` is `default-features = false` + `playback` only (cImp never decodes a container — TTS hands it raw f32 PCM via `TappedSource`). Both moved in the 2026-08-04 run (`1ee71e0`). |
 | `whisper-rs` | `0.16` | STT (whisper.cpp bindings) | → `whisper-rs-sys 0.15`. See the deep `whisper-rs` section + build toolchain. |
 | `rubato` | `0.16` | Mic resample → 16 kHz mono | — |
 | `tree-sitter` | `0.26.9` | Code-graph parsing core | Grammar crates ride the `tree-sitter-language` shim, so they need not match this exactly — only the parser ABI must. |
 | `tree-sitter-*` grammars (28 crates) | `0.1`–`1.3`, per crate | Per-language parsers for the code graph (V9-02 fan-out) | Individual pins live in `Cargo.toml` — not duplicated here. Each exposes `LANGUAGE*` as a version-independent `LanguageFn` (`tree-sitter-language` shim), so **grammar versions need not track `tree-sitter`'s 0.26** — only the parser ABI must match. Bump grammars individually; a grammar that fails to build against the core is an ABI break, not a semver one. Tier 1 (full call graph): rust, typescript, javascript, python, go, java, c, cpp, c-sharp, php, bash, scala, ocaml, ruby, haskell. Tier 2/3 (struct-search + anchors only): html, css, json, kotlin-ng, swift, sequel, yaml, xml, erlang, r, perl, ada, asm. |
 | `cozo` | `0.7.6` | Embedded graph DB (code-knowledge graph) | `default-features = false` + `storage-sqlite,rayon`. **Deliberately omits** `graph-algo` (broken `graph_builder` vs rayon) and `storage-rocksdb` (heavy C++). |
 | `ignore` | `0.4` | Gitignore-aware tree walk (indexer) | ripgrep's walker. |
-| `notify` | `6` | FS watcher (incremental re-index) | `ReadDirectoryChangesW` on Windows. |
-| `rfd` | `0.15` | Native file/folder picker (`graph_ignore_pick` in Settings) | `default-features = false` + `xdg-portal,tokio` — **not** gtk3, so the Linux build doesn't link a second GTK next to Tauri's. |
-| `similar` | `2` | Line-level unified diff for the read advisor's diff-substitute (V17) | `default-features = false`, `features = ["text"]` (pure Rust, no C-FFI). Single call site: `graph::context::unified_diff`. |
+| `notify` | `8` | FS watcher (incremental re-index) | `ReadDirectoryChangesW` on Windows. Bumped 6 → 8 in the 2026-08-04 run. |
+| `rfd` | `0.17` | Native file/folder picker (`graph_ignore_pick` in Settings) | `default-features = false` + `xdg-portal,wayland` — **not** gtk3, so the Linux build doesn't link a second GTK next to Tauri's. 0.17 DELETED the `tokio` feature (xdg-portal now always drives `pollster`; a non-issue — `graph_ignore_pick` already runs the sync dialog in `spawn_blocking`). `wayland` supplies the Linux parent-window handle and is the source of the two accepted quick-xml advisories in `.cargo/audit.toml` (RUSTSEC-2026-0194/0195 — Linux-only build-time codegen via `wayland-scanner`, no runtime exposure). |
+| `similar` | `3` | Line-level unified diff for the read advisor's diff-substitute (V17) | `default-features = false`, `features = ["std", "text"]` (pure Rust, no C-FFI) — 3.x split `std` out of the always-on baseline, so it must now be named explicitly. Single call site: `graph::context::unified_diff`. |
 | `url` | `2` | Parses/classifies Preview-tab navigation targets | Already transitive via reqwest/tauri, so the direct dep adds no tree entries. |
 | Windows-only deps *(`cfg(windows)`)* | see notes | Registry probe, process reaping, WebView2 capture | `winreg 0.52` (Git Bash detection in `shell::detect`); `windows-sys 0.59` (Job Object backstop in `process_guard` — version matched to Tauri's to avoid a duplicate); `webview2-com 0.38` (`ICoreWebView2::CapturePreview`, **pinned to exactly what wry 0.55 resolves to** so the COM type is nominally identical, not just GUID-compatible); `windows 0.61` (`SHCreateStreamOnFileW` + `STGM_*`, pinned to match `webview2-com` 0.38.2's own dep). Drift in the last two is a compile error, not a silent misbehavior. |
 | `filetime` *(dev-dep)* | `0.2` | Backdates a dir mtime in `attach::tests` (exercises `attach::prune`'s age cutoff) | Already transitive; direct pin adds no tree entries. |
@@ -183,7 +196,7 @@ version edit — `cargo update` will not move them.
 |---|---|---|
 | `@tauri-apps/api` | `^2.1.1` | JS ↔ Rust IPC bridge |
 | `@tauri-apps/plugin-clipboard-manager` | `^2.3.2` | Clipboard plugin (JS half) — the only working clipboard read in AI tabs |
-| `@tauri-apps/plugin-dialog` | `^2.0.0` | Dialog plugin (JS half) |
+| `@tauri-apps/plugin-dialog` | `^2.7.2` | Dialog plugin (JS half) |
 | `tauri-plugin-snap-layout` | `^1.0.9` | Snap Layouts plugin (JS half) — keep in step with the Rust crate |
 | `@xterm/xterm` | `^6.0.0` | Terminal emulator widget |
 | `@xterm/addon-webgl` | `^0.19.0` | xterm WebGL renderer (V29; canvas addon deleted upstream in 6.0) |
@@ -192,12 +205,12 @@ version edit — `cargo update` will not move them.
 | `@sveltejs/vite-plugin-svelte` *(dev)* | `^7.2.0` | Svelte + Vite glue (v7 is the Vite 8-compatible line) |
 | `@tauri-apps/cli` *(dev)* | `^2.1.0` | `tauri` build/dev CLI |
 | `@tsconfig/svelte` *(dev)* | `^5.0.4` | TS base config |
-| `svelte` *(dev)* | `^5.56.5` | UI framework (Svelte 5 / runes) |
-| `svelte-check` *(dev)* | `^4.0.5` | Svelte type-check |
+| `svelte` *(dev)* | `^5.56.8` | UI framework (Svelte 5 / runes) |
+| `svelte-check` *(dev)* | `^4.7.4` | Svelte type-check |
 | `tslib` *(dev)* | `^2.8.0` | TS runtime helpers |
-| `typescript` *(dev)* | `^5.6.3` | Type system (caret resolves to 5.9.3 installed — the pin floor is stale, not the tree) |
-| `vite` *(dev)* | `^8.1.4` | Bundler / dev server |
-| `vitest` *(dev)* | `^4.1.5` | Test runner |
+| `typescript` *(dev)* | `^5.6.3` | Type system (caret resolves to 5.9.x installed — the pin floor is stale, not the tree) |
+| `vite` *(dev)* | `^8.2.0` | Bundler / dev server |
+| `vitest` *(dev)* | `^4.1.10` | Test runner |
 
 Keep `@tauri-apps/api` + `@tauri-apps/plugin-dialog` +
 `@tauri-apps/plugin-clipboard-manager` + `@tauri-apps/cli` aligned with the Rust
@@ -223,7 +236,7 @@ upstream cadence worth watching.
 
 | Tool | Version / location | Needed for |
 |---|---|---|
-| Rust | edition 2021, declared MSRV 1.82 (`Cargo.toml rust-version`) — **stale: the real floor is 1.88** (`ort`/`ort-sys` rc.11 and `whisper-rs-sys` 0.15 all declare 1.88); correct the declaration, which also unblocks MSRV-aware resolution (`ignore`, `uuid` are held back by it) | everything |
+| Rust | edition 2021, MSRV **1.88** (`Cargo.toml rust-version`) + `resolver = "3"` — corrected 2026-08-04 (`b6f0883`) from a stale 1.82 declaration; 1.88 is the real floor (`ort`/`ort-sys` rc.11 and `whisper-rs-sys` 0.15 all declare it). Resolver v3 makes `cargo update`/`cargo add` MSRV-aware, so a bump of `rust-version` is now also a dependency-resolution change. **Not verified by CI** — the clippy/test workflows run floating stable (accepted gap, 2026-08-05); an MSRV break surfaces only on a machine running 1.88 exactly. | everything |
 | Node + npm | LTS (CI: `windows-latest`) | frontend build |
 | MSVC | VS 2026, `_MSC_VER` 1950 (`cl.exe`, auto-found by `cc`) | native crates, GPU builds |
 | CMake | VS-bundled 4.2.3, on PATH | whisper.cpp + espeak builds |
@@ -236,6 +249,35 @@ upstream cadence worth watching.
 The default `cargo build` (CPU-only feature set) needs **none** of the GPU/SDK
 rows — only Rust + a C toolchain + CMake + libclang. The Vulkan/CUDA rows apply
 only when building those opt-in features.
+
+### CI coverage — what the workflows do and do not check
+
+Three workflows, all `windows-latest` except the Linux release job. Know the
+gaps before trusting a green tick:
+
+| Workflow | Runs | Covers |
+|---|---|---|
+| `clippy.yml` | `cargo clippy --locked --all-targets --features tts-webgpu -- -D warnings` (after `npm install` + `npm run build`, which tauri-build needs for `frontendDist`) | Lints default **and** the shipped TTS GPU path. Floating stable toolchain by design — a new-lint failure after a rustc release is the point, not a regression. |
+| `tests.yml` | `npx vitest run` then `cargo test --locked --bin cimp` | Both suites, default features. `--bin cimp` is mandatory: the crate has **no lib target**, so `--lib` fails. `#[ignore]`d model-backed smokes are skipped (no Kokoro/Whisper blobs on the runner). |
+| `release.yml` | tag-triggered `tauri build --features stt-vulkan,tts-webgpu` (Windows + Linux) | The only job that compiles `stt-vulkan` or produces a shippable artifact. ~40 min. |
+
+**Not covered by any workflow** — re-verify these by hand:
+
+- **MSRV.** Nothing compiles on 1.88; every job runs floating stable. Accepted
+  gap (2026-08-05); a `rust-version`-breaking dep surfaces only on a 1.88 box.
+- **`tts-cuda` / `stt-cuda`.** Need the CUDA toolkit; `tts-cuda` is also
+  mutually exclusive with the feature clippy lints. Hand-verified only.
+- **`stt-vulkan` lint.** Needs the Vulkan SDK + Ninja, so only `release.yml`
+  builds it. It gates no attribute-`cfg` code (`stt/engine.rs` uses the
+  `cfg!()` macro form, so both branches compile everywhere) — the exposure is
+  the ggml shader-gen sub-build, not Rust code.
+- **`npm ci` / strict lockfile.** All three workflows use `npm install`: the
+  committed lockfile is npm 11.x and the runners ship npm 10.x. The npm
+  lockfile is therefore *not* enforced in CI; `Cargo.lock` **is** (`--locked`
+  on every cargo invocation), so an out-of-date `Cargo.lock` is a loud CI
+  failure.
+- **Anything runtime.** No workflow launches the app; the live-verify recipes
+  at the end of this document remain the only end-to-end check.
 
 ### Linux build (Ubuntu 24.04) — GPU parity
 
@@ -294,15 +336,14 @@ cargo/npm — check their sources manually.
 
 ### `ort` / ONNX Runtime — GPU TTS via the WebGPU EP (shipped); CUDA broken on Blackwell
 
-- **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), with `features = ["download-binaries", "webgpu"]` set **unconditionally on the dependency** — `webgpu` is not behind a cargo feature. cImp's own `tts-webgpu` cargo feature gates only the *runtime* use of the WebGPU EP in `tts/engine.rs`, not the dep's feature list; the optional `tts-cuda` feature is what adds `ort/cuda`. Wraps **ORT 1.23.2** (verified 2026-08-04 via `ort-sys` `ORT_API_VERSION = 23`; rc.12 wraps 1.24.2, rc.13 wraps 1.28.0). The rc.11 `cuda` prebuilt is hard-linked to CUDA major 12 (`onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `cudnn64_9.dll`); CUDA 13.x won't load with this version.
+- **Current pin:** `ort = "=2.0.0-rc.11"` (`src-tauri/Cargo.toml`), with `features = ["download-binaries"]` and **no EP feature on the dependency** — the EP comes from cImp's own mutually-exclusive `tts-webgpu` / `tts-cuda` cargo features (`ort/webgpu` / `ort/cuda`). See the inventory row for `ort` above; `webgpu` was pinned unconditionally on the dep until it was **re-gated 2026-08-04 (decision D-5, commit `c67adf5`)**. Wraps **ORT 1.23.2** (verified 2026-08-04 via `ort-sys` `ORT_API_VERSION = 23`; rc.12 wraps 1.24.2, rc.13 wraps 1.28.0). The rc.11 `cuda` prebuilt is hard-linked to CUDA major 12 (`onnxruntime_providers_cuda.dll` references `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, `cudnn64_9.dll`); CUDA 13.x won't load with this version.
 
 - **IMPLEMENTED — `tts-webgpu` is the shipped GPU TTS backend.** Kokoro runs on ONNX Runtime's native **WebGPU EP** (Dawn-backed → D3D12 on Windows, Vulkan on Linux, Metal on macOS). Validated on the dev box (RTX 5090 / Blackwell) 2026-06-15: correct output matching the CPU reference, genuinely on-GPU (ORT node-placement logs show WebGPU shader programs for every op, incl. the `ConvTranspose2D` that broke DirectML), **~5× faster than CPU** at steady state. Wired in `tts/engine.rs` as GPU-by-default with automatic CPU fallback, selectable GPU/CPU at runtime via the `tts.device` setting (*Settings → Audio → TTS → Process on*) — mirrors `stt/engine.rs`. Runtime deps: three Dawn dylibs (`webgpu_dawn.dll`, `dxcompiler.dll`, `dxil.dll`) staged into the zip by `release.yml`; `download-binaries` static-links core ONNX Runtime into `cimp.exe` (no `onnxruntime.dll`). Full write-up: `docs/features/FEATURE-tts-webgpu.md`.
 
-- **Using the GPU is a compile-time cImp feature; the default build runs Kokoro on CPU.** Kokoro is near-real-time on CPU, so `default = []` selects **no** GPU EP at runtime and routine `cargo build`/test/rust-analyzer need no GPU SDK. Note this is a *runtime* gate only — because `webgpu` sits unconditionally on the `ort` dependency, even a default CPU-only build downloads/links the **WebGPU ORT prebuilt** rather than the plain CPU one. The cImp features:
-  - **`tts-webgpu` (shipped, portable, any vendor)** — declared as `["ort/webgpu"]`, which is now redundant with the dep's own feature list; it is the flag `tts/engine.rs` reads to actually register the WebGPU EP. The release builds `--features stt-vulkan,tts-webgpu`.
-  - **`tts-cuda` (optional, NVIDIA-only, not shipped)** — `["ort/cuda"]`. **Mutually exclusive with `tts-webgpu`**: `ort` has no `cuda`+`webgpu` prebuilt, so enabling both silently downloads a CPU-only ORT. Because `webgpu` is unconditional on the dep, `--features tts-cuda` alone already lands in that both-enabled state — treat `tts-cuda` as untested until the dep feature is re-gated. Broken on Blackwell (below).
+- **Using the GPU is a compile-time cImp feature; the default build runs Kokoro on CPU.** Kokoro is near-real-time on CPU, so `default = []` selects **no** GPU EP — at runtime *or* at the dependency level — and routine `cargo build`/test/rust-analyzer need no GPU SDK. Since the 2026-08-04 re-gate the cImp feature drives the ORT prebuilt too: a default build downloads the plain **CPU** dist (no WebGPU prebuilt, no `cargo:warning`). The cImp features:
+  - **`tts-webgpu` (shipped, portable, any vendor)** — `["ort/webgpu"]`. This one flag does both jobs: it selects the WebGPU ORT prebuilt *and* is what `tts/engine.rs` reads to register the WebGPU EP. The release builds `--features stt-vulkan,tts-webgpu`.
+  - **`tts-cuda` (optional, NVIDIA-only, not shipped)** — `["ort/cuda"]`. **Mutually exclusive with `tts-webgpu`**: `ort` has no `cuda`+`webgpu` prebuilt, so enabling both makes ort-sys warn and silently link a CPU-only ORT. Since 2026-08-05 that combo is a **`compile_error!`** in `tts/engine.rs` (top of file) rather than a silent CPU build — so `--features tts-cuda` alone now resolves to `ort/cuda` only, as intended. Still broken on Blackwell (below), and still not covered by any CI job — a `tts-cuda` build remains hand-verified only.
   - DirectML was evaluated and rejected (Windows-only D3D12, and ORT 1.20's DML EP rejects Kokoro's `ConvTranspose`); the `directml` feature is not enabled.
-  - **Follow-up:** the unconditional `webgpu` dep feature makes default (CPU-only) builds pull the WebGPU ORT prebuilt — decide whether to re-gate it behind the `tts-webgpu` feature.
 
 - **Failure matrix** (investigated 2026-05-02 on RTX 5090, driver 596.21, CUDA toolkits 12.2 & 12.9, cuDNN 9.21):
 

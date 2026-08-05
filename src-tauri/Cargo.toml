@@ -55,8 +55,11 @@ tts-webgpu = ["ort/webgpu"]
 # (imports CUDA DLLs). MUTUALLY EXCLUSIVE with `tts-webgpu`: pyke ships no
 # prebuilt combining `cuda`+`webgpu`, and ort-sys does NOT fail on that combo —
 # it prints a `cargo:warning` and silently downloads the CPU-only prebuilt, so
-# you get a GPU-less build that still *looks* like it built fine. Pick exactly
-# one. Build with `--features tts-cuda`.
+# you get a GPU-less build that still *looks* like it built fine.
+# ENFORCED since 2026-08-05: `tts/engine.rs` carries a
+# `#[cfg(all(feature = "tts-webgpu", feature = "tts-cuda"))] compile_error!`,
+# so the combo is now a build failure rather than a silent CPU build. Pick
+# exactly one. Build with `--features tts-cuda`.
 tts-cuda = ["ort/cuda"]
 
 [build-dependencies]
@@ -231,8 +234,13 @@ notify = "8"
 # the app runtime. `wayland` (also a 0.17 default) is for the Linux build's
 # parent-window handle; every one of its deps — like `pollster`'s — is
 # target-gated to linux/BSD in rfd's manifest, so it costs the Windows build
-# nothing but a few Cargo.lock lines. `default-features = false` is kept
-# deliberately so a future default (e.g. gtk3 returning) can't leak in.
+# nothing but a few Cargo.lock lines — plus, as of the 2026-08-04 run, two
+# accepted advisories: `wayland` pulls `wayland-scanner` -> `quick-xml 0.39.4`
+# (RUSTSEC-2026-0194 / -0195), a Linux-only BUILD-TIME codegen path with no
+# runtime exposure on any shipped platform. Justifications + revisit trigger
+# live in `.cargo/audit.toml`; dropping `wayland` would clear both entries at
+# the cost of the Linux parent-window handle. `default-features = false` is
+# kept deliberately so a future default (e.g. gtk3 returning) can't leak in.
 rfd = { version = "0.17", default-features = false, features = [
     "xdg-portal",
     "wayland",

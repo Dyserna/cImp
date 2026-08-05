@@ -962,31 +962,27 @@ async fn connect_stdio(
         let conn = conn.clone();
         tauri::async_runtime::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let Ok(v) = serde_json::from_str::<Value>(line) else {
-                            continue;
-                        };
-                        if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
-                            if let Some(tx) = conn.pending.lock().unwrap().remove(&id) {
-                                let res = if let Some(err) = v.get("error") {
-                                    Err(jsonrpc_error_text(err))
-                                } else {
-                                    Ok(v.get("result").cloned().unwrap_or(Value::Null))
-                                };
-                                let _ = tx.send(res);
-                            }
-                        }
-                        // Notifications (no id) are ignored here; the host
-                        // re-derives capabilities on reconcile.
-                    }
-                    _ => break, // EOF or read error
+            // Loop ends on EOF or a read error.
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
                 }
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+                    if let Some(tx) = conn.pending.lock().unwrap().remove(&id) {
+                        let res = if let Some(err) = v.get("error") {
+                            Err(jsonrpc_error_text(err))
+                        } else {
+                            Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                        };
+                        let _ = tx.send(res);
+                    }
+                }
+                // Notifications (no id) are ignored here; the host re-derives
+                // capabilities on reconcile.
             }
             // Connection ended: fail every pending request and mark dead.
             // Flip `alive` and drain under the same lock the request path

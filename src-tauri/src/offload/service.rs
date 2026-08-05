@@ -429,6 +429,9 @@ impl OffloadService {
     /// synthesized answer. Acquires the global permit *and* the chosen
     /// backend's slot, so `in_flight` is honest and the global gate queues a
     /// busy pool coherently.
+    // The parameter list is this crate's offload-request contract (each arg is
+    // documented inline); reshaping it touches every caller and the MCP bridge.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         instructions: String,
@@ -1584,8 +1587,10 @@ mod tests {
 
     #[test]
     fn global_cap_sums_slots_and_clamps() {
-        let mut snap = OffloadSettings::default();
-        snap.backends = vec![local_backend("a", 4), local_backend("b", 2)];
+        let mut snap = OffloadSettings {
+            backends: vec![local_backend("a", 4), local_backend("b", 2)],
+            ..OffloadSettings::default()
+        };
         assert_eq!(compute_global_cap(&snap), 6);
 
         snap.global_concurrency = Some(100);

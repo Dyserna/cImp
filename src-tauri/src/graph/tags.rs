@@ -279,6 +279,33 @@ pub(crate) fn parse_with_tags(src: &str, file: &str, spec: &TagSpec, fg: &mut Fi
     }
 }
 
+/// Index of the smallest span in `spans` that contains `[s, e)`, excluding
+/// `exclude` and any span equal to `[s, e)`, and satisfying `accept`.
+fn smallest_container(
+    spans: &[(usize, usize)],
+    s: usize,
+    e: usize,
+    exclude: Option<usize>,
+    accept: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (j, &(ps, pe)) in spans.iter().enumerate() {
+        if Some(j) == exclude || !(ps <= s && e <= pe) || (ps, pe) == (s, e) || !accept(j) {
+            continue;
+        }
+        match best {
+            Some(b) => {
+                let (bs, be) = spans[b];
+                if pe - ps < be - bs {
+                    best = Some(j);
+                }
+            }
+            None => best = Some(j),
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,31 +541,4 @@ class Calculator {
         // A plain source file is not a test.
         assert!(!tags_is_test_path(Lang::Go, "pkg/foo.go"));
     }
-}
-
-/// Index of the smallest span in `spans` that contains `[s, e)`, excluding
-/// `exclude` and any span equal to `[s, e)`, and satisfying `accept`.
-fn smallest_container(
-    spans: &[(usize, usize)],
-    s: usize,
-    e: usize,
-    exclude: Option<usize>,
-    accept: impl Fn(usize) -> bool,
-) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (j, &(ps, pe)) in spans.iter().enumerate() {
-        if Some(j) == exclude || !(ps <= s && e <= pe) || (ps, pe) == (s, e) || !accept(j) {
-            continue;
-        }
-        match best {
-            Some(b) => {
-                let (bs, be) = spans[b];
-                if pe - ps < be - bs {
-                    best = Some(j);
-                }
-            }
-            None => best = Some(j),
-        }
-    }
-    best
 }

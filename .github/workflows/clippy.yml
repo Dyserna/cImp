@@ -1,0 +1,78 @@
+name: Clippy
+
+# Lint gate for the Rust backend (#27). Windows because that is the primary
+# target and the only host the release job builds first; DEFAULT features
+# (CPU-only) so no Vulkan SDK / MSVC dev-env / models are needed — the same
+# command the dev machine runs.
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'src-tauri/**'
+      - '.github/workflows/clippy.yml'
+  pull_request:
+    paths:
+      - 'src-tauri/**'
+      - '.github/workflows/clippy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same branch/PR supersedes the run in flight; the build is
+# ~15 min, so queueing stale runs only delays the useful one.
+concurrency:
+  group: clippy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Node 24 actions runtime (see release.yml).
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # `npm install`, not `npm ci` — see the release job's note on the
+      # lockfile/npm-version mismatch.
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      # tauri-build resolves `frontendDist` (../dist) at compile time, so the
+      # frontend must exist before cargo runs — even for a lint-only pass.
+      - name: Build frontend
+        run: npm run build
+
+      # Deliberately FLOATING stable, not a pinned toolchain: catching the new
+      # lints a rustc/clippy bump introduces is the point of this job (#27), so
+      # a red run after a toolchain release is expected, not a regression.
+      - name: Setup Rust (floating stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07-15
+        with:
+          # Explicit because the action otherwise infers the toolchain from the
+          # ref, and this one is pinned to a SHA rather than the `stable` branch.
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        env:
+          # bindgen / clang-sys for whisper-rs-sys + misaki-rs -> espeak-ng-sys.
+          # The runner image ships LLVM here.
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: cargo clippy --all-targets -- -D warnings

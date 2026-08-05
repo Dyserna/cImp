@@ -341,8 +341,8 @@ mod tests {
             .iter()
             .map(|e| fs::read(e.path()).unwrap())
             .collect();
-        assert!(contents.contains(&b"payload-a".to_vec()));
-        assert!(contents.contains(&b"payload-b".to_vec()));
+        assert!(contents.contains(b"payload-a".as_slice()));
+        assert!(contents.contains(b"payload-b".as_slice()));
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -901,10 +901,8 @@ pub async fn restore(
     if delete_new {
         for (raw, display) in created_raw.iter().zip(&created_since) {
             let abs = root.join(git::bytes_to_path(raw));
-            if abs.is_file() || abs.is_symlink() {
-                if std::fs::remove_file(&abs).is_ok() {
-                    deleted.push(display.clone());
-                }
+            if (abs.is_file() || abs.is_symlink()) && std::fs::remove_file(&abs).is_ok() {
+                deleted.push(display.clone());
             }
         }
     }

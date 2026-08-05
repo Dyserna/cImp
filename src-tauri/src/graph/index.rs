@@ -168,6 +168,11 @@ pub struct VizEdge {
     pub drawn: bool,
 }
 
+/// The uncut file-level rollup behind every Graph View query: nodes keyed by
+/// file path, the deduplicated edge list, and that list's index-aligned
+/// rolled-up weights (see [`GraphIndex::viz_rollup`]).
+type VizRollup = (HashMap<String, VizNode>, Vec<VizEdge>, Vec<u64>);
+
 /// A bounded subgraph for the Graph View tab (V15 Feature 4): the top-degree
 /// hubs and the edges among them, never the whole graph.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2052,7 +2057,7 @@ reach[x] := reach[z], calls[x, z]"#
     /// it, subsystem left empty) plus the deduplicated edge list with its
     /// index-aligned rolled-up weights. No top-N cut and no drawn-edge cap —
     /// each caller applies its own bounds.
-    fn viz_rollup(&self) -> AppResult<(HashMap<String, VizNode>, Vec<VizEdge>, Vec<u64>)> {
+    fn viz_rollup(&self) -> AppResult<VizRollup> {
         // Symbol table — not nodes anymore, just the lookups that resolve a
         // call edge (symbol-id src, callee-NAME dst) to its file endpoints.
         let sym_rows = self.run(
@@ -2991,7 +2996,7 @@ reach[x] := reach[z], calls[x, z]"#
                 .rows
                 .first()
                 .and_then(|r| r.first())
-                .map(|v| dv_i64(v))
+                .map(dv_i64)
                 .unwrap_or(0) as u64)
         };
         Ok(GraphStats {
@@ -3476,6 +3481,9 @@ impl GraphIndex {
             // `origin` is meaningful only for a "turn" row; a "tool_result" row
             // is sized in chars and not per-turn attributed, so it stores the
             // neutral `"session"` (the column is non-nullable).
+            // The ascription IS the `usage_stat` column list — it is what makes
+            // the `None`/`0` arms infer; a named alias would only re-spell it.
+            #[allow(clippy::type_complexity)]
             let (kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, origin): (
                 &str,
                 Option<String>,
@@ -4078,7 +4086,7 @@ impl GraphIndex {
         let mut pairs = 0u64;
         for (key, ts_list) in reads_by_key.iter_mut() {
             // Size filter (est.): only files whose indexed span reaches min_lines.
-            if !max_line.get(&key.1).is_some_and(|&l| l >= min) {
+            if max_line.get(&key.1).is_none_or(|&l| l < min) {
                 continue;
             }
             if ts_list.len() < 2 {
@@ -4275,7 +4283,7 @@ impl GraphIndex {
             .map(|(path, a)| {
                 // Distinct symbols, most recent (highest seq) first, bounded.
                 let mut syms = a.symbols;
-                syms.sort_by(|x, y| y.0.cmp(&x.0));
+                syms.sort_by_key(|s| std::cmp::Reverse(s.0));
                 let mut seen = HashSet::new();
                 let top: Vec<String> = syms
                     .into_iter()
@@ -5292,12 +5300,9 @@ fn resolve_python(from_file: &str, module: &str, known: &HashSet<String>) -> Opt
     if stem.is_empty() {
         return None;
     }
-    for cand in [format!("{stem}.py"), format!("{stem}/__init__.py")] {
-        if known.contains(&cand) {
-            return Some(cand);
-        }
-    }
-    None
+    [format!("{stem}.py"), format!("{stem}/__init__.py")]
+        .into_iter()
+        .find(|cand| known.contains(cand))
 }
 
 /// Rust import resolution for in-crate paths only. `crate::a::b` → `src/a/b.rs`

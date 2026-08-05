@@ -1330,7 +1330,7 @@ fn newest_jsonl(root: &Path) -> Option<PathBuf> {
             Ok(t) => t,
             Err(_) => continue,
         };
-        if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
             newest = Some((mtime, path));
         }
     }
@@ -2036,8 +2036,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent-a.jsonl"), "{\"type\":\"assistant\"}\n").unwrap();
 
-        let mut subs = SubagentState::default();
-        subs.completion_seen = true; // even with a completed agent…
+        let mut subs = SubagentState {
+            completion_seen: true, // even with a completed agent…
+            ..SubagentState::default()
+        };
         subs.scan(&root, "s1", &root, &ctx);
         assert!(
             subs.files.is_empty(),
@@ -2099,10 +2101,12 @@ mod tests {
 
     #[test]
     fn subagent_reset_clears_state_and_keeps_backlog_flag() {
-        let mut subs = SubagentState::default();
-        subs.launch_seen = true;
-        subs.completion_seen = true;
-        subs.drift_ticks = 2;
+        let mut subs = SubagentState {
+            launch_seen: true,
+            completion_seen: true,
+            drift_ticks: 2,
+            ..SubagentState::default()
+        };
         subs.files
             .insert(PathBuf::from("agent-a.jsonl"), SubagentFile::default());
         subs.reset(true);

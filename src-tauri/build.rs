@@ -163,7 +163,7 @@ fn find_espeak_data(build_root: &Path) -> Option<PathBuf> {
         let Some(mtime) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
             continue;
         };
-        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, candidate));
         }
     }

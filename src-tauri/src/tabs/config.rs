@@ -229,18 +229,6 @@ fn command_is(command: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Pre-args injected ahead of the tab's own `args` and the wrapper's
-/// invocation args. Claude-only — these injections target Claude Code's CLI
-/// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
-/// `build_opencode_config`), so non-Claude tabs get empty pre-args:
-///
-///   * `--append-system-prompt <instructions>` — TTS markup convention,
-///     gated on the per-tab `tts_injection` toggle.
-///   * `--settings <json>` — a session-scoped overlay pointing Claude
-///     Code's `statusLine` at our `cimp --statusline` renderer, gated on
-///     the global `statusline.enabled`. The overlay merges with the
-///     user's own Claude settings (only `statusLine` is set), so it
-///     scopes the context bar to cImp without touching `~/.claude`.
 /// The four "is this MCP server advertised to this consumer" gates, factored
 /// out so the injection sites below and the restart-hint edge detector in
 /// `ipc::commands::settings_update` can never drift apart. Servers are
@@ -339,6 +327,19 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
     [claude, opencode]
 }
 
+/// Pre-args injected ahead of the tab's own `args` and the wrapper's
+/// invocation args. Claude-only — these injections target Claude Code's CLI
+/// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
+/// `build_opencode_config`), so non-Claude tabs get empty pre-args:
+///
+///   * `--append-system-prompt <instructions>` — TTS markup convention,
+///     gated on the per-tab `tts_injection` toggle.
+///   * `--settings <json>` — a session-scoped overlay pointing Claude
+///     Code's `statusLine` at our `cimp --statusline` renderer, gated on
+///     the global `statusline.enabled`. The overlay merges with the
+///     user's own Claude settings (only `statusLine` is set), so it
+///     scopes the context bar to cImp without touching `~/.claude`.
+///
 /// V28: `tab` is the launching tab's id, baked into the `cimp-offload` MCP
 /// child's argv (`--tab <id>`) so the app can resolve which of this agent's
 /// sessions a `context_*` call belongs to.
@@ -650,7 +651,7 @@ fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
     // pinned-only filter above could in principle be fed a differently-sorted
     // source later — sort explicitly here so "newest-pinned first" holds
     // regardless.
-    pinned.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    pinned.sort_by_key(|f| std::cmp::Reverse(f.ts_ms));
     let mut out = String::from("## cImp project facts\n");
     for f in &pinned {
         let line = format!("- {}\n", f.text);
@@ -1382,7 +1383,7 @@ mod tests {
         let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args);
         assert!(
-            overlay.map_or(true, |o| o["hooks"].get("PreToolUse").is_none()),
+            overlay.is_none_or(|o| o["hooks"].get("PreToolUse").is_none()),
             "e1_status=fail must block the read hook"
         );
 
@@ -1399,7 +1400,7 @@ mod tests {
             let args = build_pre_args(&claude_cfg(), &settings, "claude");
             let overlay = settings_overlay(&args);
             assert!(
-                overlay.map_or(true, |o| o["hooks"].get("PreToolUse").is_none()),
+                overlay.is_none_or(|o| o["hooks"].get("PreToolUse").is_none()),
                 "unrecognized e1_status {status:?} must fail closed"
             );
         }
@@ -1595,11 +1596,13 @@ mod tests {
     /// excluded: the hook only fires for Claude.
     #[test]
     fn claude_tab_dirs_lists_claude_tabs_with_their_launch_dirs() {
-        let mut settings = Settings::default();
-        settings.tabs = vec![
-            TabConfig::AiTool(claude_cfg()),
-            TabConfig::AiTool(opencode_cfg()),
-        ];
+        let mut settings = Settings {
+            tabs: vec![
+                TabConfig::AiTool(claude_cfg()),
+                TabConfig::AiTool(opencode_cfg()),
+            ],
+            ..Settings::default()
+        };
         let launch = Path::new("C:/proj");
         let dirs = claude_tab_dirs(&settings, launch);
         assert_eq!(dirs.len(), 1, "only the Claude tab: {dirs:?}");

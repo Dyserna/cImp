@@ -56,8 +56,8 @@ pub struct AppState {
     /// while a `settings-deep-link` event covers the hot-open path.
     pub pending_settings_deep_link: Arc<Mutex<Option<String>>>,
     /// System-monitor sampler (CPU / memory / GPU / network) backing the
-    /// bottom-bar stats panel's `get_system_stats` command. Holds the sysinfo
-    /// + NVML handles; interior-locked so the shared `&AppState` can sample it.
+    /// bottom-bar stats panel's `get_system_stats` command. Holds the sysinfo +
+    /// NVML handles; interior-locked so the shared `&AppState` can sample it.
     /// `Arc` so `get_system_stats` can clone it into `spawn_blocking` and keep
     /// the blocking sysinfo/NVML refresh off the async reactor thread.
     pub sysmon: Arc<crate::sysmon::SystemStatsState>,

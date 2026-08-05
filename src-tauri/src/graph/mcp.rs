@@ -2259,8 +2259,10 @@ mod run_check_tests {
 
     #[tokio::test]
     async fn unknown_name_lists_configured_checks() {
-        let mut settings = Settings::default();
-        settings.checks = vec![def("cargo", "cargo check")];
+        let settings = Settings {
+            checks: vec![def("cargo", "cargo check")],
+            ..Settings::default()
+        };
         let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({ "name": "nope" }))
             .await
             .expect_err("unknown name should error");
@@ -2270,8 +2272,10 @@ mod run_check_tests {
 
     #[tokio::test]
     async fn ambiguous_without_name_lists_configured_checks() {
-        let mut settings = Settings::default();
-        settings.checks = vec![def("cargo", "cargo check"), def("tsc", "tsc --noEmit")];
+        let settings = Settings {
+            checks: vec![def("cargo", "cargo check"), def("tsc", "tsc --noEmit")],
+            ..Settings::default()
+        };
         let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
             .await
             .expect_err("multiple configured checks with no name should error");
@@ -2282,8 +2286,10 @@ mod run_check_tests {
     #[tokio::test]
     async fn sole_configured_check_runs_without_a_name() {
         let cargo = which::which("cargo").expect("cargo on PATH");
-        let mut settings = Settings::default();
-        settings.checks = vec![def("only", &format!("\"{}\" --version", cargo.display()))];
+        let settings = Settings {
+            checks: vec![def("only", &format!("\"{}\" --version", cargo.display()))],
+            ..Settings::default()
+        };
         let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
             .await
             .expect("ok result");

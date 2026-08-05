@@ -1281,8 +1281,10 @@ mod tests {
     /// drift floor (15), below the tuning rule's floor (20) — only the
     /// drift rule can speak.
     fn read_reason_signals() -> Signals {
-        let mut graph = GraphSettings::default();
-        graph.read_advisor = true;
+        let graph = GraphSettings {
+            read_advisor: true,
+            ..GraphSettings::default()
+        };
         Signals {
             advisor_reread_rate: Some(0.95),
             advisor_reread_samples: DRIFT_MIN_REMINDS,
@@ -1342,8 +1344,10 @@ mod tests {
 
     #[test]
     fn hook_silent_drift_needs_rereads_sessions_and_exactly_zero_reminds() {
-        let mut graph = GraphSettings::default();
-        graph.read_advisor = true;
+        let graph = GraphSettings {
+            read_advisor: true,
+            ..GraphSettings::default()
+        };
         let base = Signals {
             session_count: DRIFT_SILENT_MIN_SESSIONS,
             large_reread_pairs: DRIFT_SILENT_MIN_REREADS,
@@ -1388,8 +1392,10 @@ mod tests {
 
     #[test]
     fn injection_unseen_drift_fires_only_at_near_zero_follow() {
-        let mut graph = GraphSettings::default();
-        graph.context_injection = true;
+        let graph = GraphSettings {
+            context_injection: true,
+            ..GraphSettings::default()
+        };
         let base = Signals {
             injection_follow_rate: Some(0.0),
             injection_follow_samples: DRIFT_UNSEEN_MIN_INJECTIONS,
@@ -1514,8 +1520,10 @@ mod tests {
 
     #[test]
     fn read_bypass_drift_proposes_disabling_at_the_threshold() {
-        let mut graph = GraphSettings::default();
-        graph.read_advisor = true;
+        let graph = GraphSettings {
+            read_advisor: true,
+            ..GraphSettings::default()
+        };
         let base = Signals {
             bypass_rate: Some(0.5),
             bypass_samples: DRIFT_MIN_BYPASS_REMINDS,
@@ -1557,8 +1565,10 @@ mod tests {
             .unwrap();
         assert_eq!(p.setting, "graph.read_advisor");
         let val: bool = p.proposed.parse().expect("proposed must be a bool string");
-        let mut g = GraphSettings::default();
-        g.read_advisor = true;
+        let mut g = GraphSettings {
+            read_advisor: true,
+            ..GraphSettings::default()
+        };
         g.read_advisor = val;
         assert!(!g.read_advisor);
     }
@@ -1593,8 +1603,10 @@ mod tests {
 
         // Real, assignable bool field (Apply-switch guard).
         let val: bool = p.proposed.parse().expect("bool string");
-        let mut g = GraphSettings::default();
-        g.lean_tools = val;
+        let g = GraphSettings {
+            lean_tools: val,
+            ..GraphSettings::default()
+        };
         assert!(g.lean_tools);
     }
 
@@ -1695,8 +1707,10 @@ mod tests {
         );
         // Real, assignable bool field (Apply-switch guard).
         let val: bool = p.proposed.parse().expect("bool string");
-        let mut g = GraphSettings::default();
-        g.read_advisor = val;
+        let g = GraphSettings {
+            read_advisor: val,
+            ..GraphSettings::default()
+        };
         assert!(g.read_advisor);
     }
 
@@ -1791,8 +1805,10 @@ mod tests {
     /// Signals for `adopt.read_advisor_substitute.v1`: advisor ON in advise
     /// mode, reminders rarely lead to a full re-read, no shell bypass.
     fn adopt_substitute_signals() -> Signals {
-        let mut graph = GraphSettings::default();
-        graph.read_advisor = true; // mode defaults to "advise"
+        let graph = GraphSettings {
+            read_advisor: true, // mode defaults to "advise"
+            ..GraphSettings::default()
+        };
         Signals {
             advisor_reread_rate: Some(0.1),
             advisor_reread_samples: SUBSTITUTE_MIN_SAMPLES,
@@ -1859,8 +1875,10 @@ mod tests {
         // REREAD_HIGH (0.5); RULE_ADOPT_SUBSTITUTE needs ≤ SUBSTITUTE_REREAD_LOW
         // (0.2). Sweep the whole [0,1] range with both rules' other conditions
         // satisfied and assert no single input fires both.
-        let mut graph = GraphSettings::default();
-        graph.read_advisor = true; // mode "advise", so substitute is eligible
+        let graph = GraphSettings {
+            read_advisor: true, // mode "advise", so substitute is eligible
+            ..GraphSettings::default()
+        };
         for i in 0..=20 {
             let rate = i as f64 * 0.05;
             let sig = Signals {

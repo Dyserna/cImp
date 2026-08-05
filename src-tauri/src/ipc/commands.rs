@@ -867,7 +867,8 @@ pub async fn settings_update(
     // but not synced (or vice versa) — the miss used to surface as "the tab
     // only appears after a restart". The integrity pass that normally owns
     // these tabs only runs at load.
-    const RESERVED_TAB_FLAGS: &[(TabId, fn(&Settings) -> bool)] = &[
+    type ReservedTabFlag = (TabId, fn(&Settings) -> bool);
+    const RESERVED_TAB_FLAGS: &[ReservedTabFlag] = &[
         (TabId::GraphMonitor, |s| s.graph.enabled),
         (TabId::Workbench, |s| s.workbench.enabled),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
@@ -2200,7 +2201,7 @@ pub async fn graph_usage_advice(
         Some((pairs, sessions)) if sessions > 0 => (Some(pairs as f64 / sessions as f64), sessions),
         _ => (None, 0),
     };
-    let e1_pass = hv.e1_status.trim().to_ascii_lowercase() == "pass";
+    let e1_pass = hv.e1_status.trim().eq_ignore_ascii_case("pass");
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -3065,18 +3066,20 @@ mod tests {
     // the live templates or the seeded flag.
     #[test]
     fn settings_update_preserves_out_of_band_prompt_templates() {
-        let mut cur = Settings::default();
-        cur.prompt_templates = vec![
-            PromptTemplate {
-                name: "review-this-diff".to_string(),
-                body: "R".to_string(),
-            },
-            PromptTemplate {
-                name: "my-new-template".to_string(),
-                body: "N".to_string(),
-            },
-        ];
-        cur.templates_seeded = true;
+        let mut cur = Settings {
+            prompt_templates: vec![
+                PromptTemplate {
+                    name: "review-this-diff".to_string(),
+                    body: "R".to_string(),
+                },
+                PromptTemplate {
+                    name: "my-new-template".to_string(),
+                    body: "N".to_string(),
+                },
+            ],
+            templates_seeded: true,
+            ..Settings::default()
+        };
 
         // The incoming snapshot represents an unrelated Settings-window save
         // (e.g. a theme flip) whose local copy of the template library is
@@ -3104,16 +3107,18 @@ mod tests {
     // Settings-window save must not revert live price edits.
     #[test]
     fn settings_update_preserves_out_of_band_llm_pricing() {
-        let mut cur = Settings::default();
-        cur.llm_pricing = vec![crate::settings::LlmPricingModel {
-            provider: "Custom".to_string(),
-            model: "my-model".to_string(),
-            model_prefix: String::new(),
-            input: 1.0,
-            cache_write: 2.0,
-            cache_read: 0.5,
-            output: 4.0,
-        }];
+        let mut cur = Settings {
+            llm_pricing: vec![crate::settings::LlmPricingModel {
+                provider: "Custom".to_string(),
+                model: "my-model".to_string(),
+                model_prefix: String::new(),
+                input: 1.0,
+                cache_write: 2.0,
+                cache_read: 0.5,
+                output: 4.0,
+            }],
+            ..Settings::default()
+        };
 
         let mut incoming = Settings::default();
         incoming.ui.theme = "future-light".to_string();

@@ -4725,8 +4725,10 @@ mod tests {
 
         // index_docs off: markdown is skipped (the file row is gone after a
         // clean rebuild), so the doc search no longer matches.
-        let mut snap_off = GraphSettings::default();
-        snap_off.index_docs = false;
+        let snap_off = GraphSettings {
+            index_docs: false,
+            ..GraphSettings::default()
+        };
         build_tree(&idx, &dir, &snap_off, sub).expect("rebuild2");
         assert!(idx.search_docs("frobnicator", 10, 200).unwrap().is_empty());
 
@@ -4753,8 +4755,10 @@ mod tests {
         .unwrap();
 
         let sub = ".ckg-test";
-        let mut snap = GraphSettings::default();
-        snap.semantic_code_max_chunks = 1;
+        let snap = GraphSettings {
+            semantic_code_max_chunks: 1,
+            ..GraphSettings::default()
+        };
         let idx = GraphIndex::open(&dir, sub).expect("open");
         build_tree(&idx, &dir, &snap, sub).expect("rebuild");
 

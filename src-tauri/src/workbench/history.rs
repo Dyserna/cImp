@@ -451,7 +451,7 @@ mod tests {
         // A recorded hash prefix pulls a commit in even OUTSIDE the window,
         // flagged tracked; window-only commits stay untracked.
         let first_short: String = all.commits[1].hash.chars().take(7).collect();
-        let by_hash = session_commits(&dir, 0, 1, &[first_short.clone()])
+        let by_hash = session_commits(&dir, 0, 1, std::slice::from_ref(&first_short))
             .await
             .unwrap();
         assert_eq!(by_hash.commits.len(), 1);

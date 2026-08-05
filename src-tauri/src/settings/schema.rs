@@ -401,8 +401,8 @@ impl HarnessVersions {
     /// a bare `"fail"` literal at a call site. Normalizes (trim +
     /// case-fold) and fails CLOSED: anything that isn't a recognized
     /// non-fail value (`"unverified"`, `"pass"`, or empty/missing) blocks,
-    /// so a hand-typed `"Fail"`/`"failed"` surfaces as the disabled toggle
-    /// + uninstalled hook instead of silently sailing past the gate.
+    /// so a hand-typed `"Fail"`/`"failed"` surfaces as the disabled toggle +
+    /// uninstalled hook instead of silently sailing past the gate.
     /// Mirrored in the frontend as `harnessStatusBlocks`
     /// (src/lib/settings/types.ts) — keep the two in sync.
     pub fn status_blocks(status: &str) -> bool {
@@ -2360,22 +2360,17 @@ pub enum BackendTier {
 /// configured MCP-server names). Only allowed tools are placed in the
 /// `tools` array sent to that backend's model — the privacy boundary for
 /// cloud backends.
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum ToolScope {
     /// Every tool in the pool (Local + trusted LAN default).
+    #[default]
     All,
     /// Only the named tools.
     Only { tools: Vec<String> },
     /// Every tool except the named ones (cloud default = `AllExcept` the
     /// local-data set).
     AllExcept { tools: Vec<String> },
-}
-
-impl Default for ToolScope {
-    fn default() -> Self {
-        ToolScope::All
-    }
 }
 
 impl ToolScope {
@@ -4652,8 +4647,10 @@ mod tests {
         // From<&TerminalBackgroundSettings> for BackgroundPresetConfig
         // copies the shared fields; presets has no analogue on the sister
         // struct, so it is dropped.
-        let mut s = TerminalBackgroundSettings::default();
-        s.color = Some("#101010".to_string());
+        let mut s = TerminalBackgroundSettings {
+            color: Some("#101010".to_string()),
+            ..TerminalBackgroundSettings::default()
+        };
         s.presets.push(BackgroundPreset {
             name: "noise".to_string(),
             config: BackgroundPresetConfig::default(),

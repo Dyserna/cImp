@@ -1466,7 +1466,7 @@ pub async fn run(
         &observed,
         obs_ctx,
         task.schema.as_ref(),
-        trace.as_deref_mut(),
+        trace,
         cancel,
     )
     .await
@@ -1674,7 +1674,7 @@ async fn force_final(
     // V21 F9: `Some` on a schema run — the final turn is grammar-constrained to
     // JSON matching this schema, and the result is validated + returned verbatim.
     schema: Option<&serde_json::Value>,
-    mut trace: Option<&mut RunTrace>,
+    trace: Option<&mut RunTrace>,
     cancel: &CancellationToken,
 ) -> AppResult<String> {
     // V21 F9: for a schema run the grammar (not the wording) guarantees JSON, so
@@ -1728,7 +1728,7 @@ async fn force_final(
         .unwrap_or_default();
     let stripped = strip_think(&content);
     let empty = stripped.is_empty();
-    if let Some(t) = trace.as_deref_mut() {
+    if let Some(t) = trace {
         t.calls.push(CallRecord {
             step,
             kind: call_kind(step, true).into(),

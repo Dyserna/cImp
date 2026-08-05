@@ -283,6 +283,9 @@ fn parse_rust(src: &str, file: &str, fg: &mut FileGraph) {
 /// whatever parsed above it — matching the module's "never panic" contract.
 const MAX_WALK_DEPTH: u32 = 512;
 
+// The parameter list IS the recursive walker's traversal state (position,
+// depth, enclosing scopes); bundling it into a struct only renames the fields.
+#[allow(clippy::too_many_arguments)]
 fn walk_items(
     src: &str,
     file: &str,
@@ -1027,6 +1030,8 @@ fn js_is_test_file(file: &str) -> bool {
 /// references, JSDoc, and class→method containment. `file_is_test` (V12 Phase
 /// C) marks every emitted definition as a test when the file itself is a test
 /// file (see [`js_is_test_file`]).
+// Traversal state as parameters — see `walk_items`.
+#[allow(clippy::too_many_arguments)]
 fn walk_js(
     src: &str,
     file: &str,
@@ -1240,7 +1245,7 @@ fn truncate_code_chunk(s: &str, n: usize) -> String {
     }
 }
 
-fn take_doc(pending: &mut Vec<String>) -> Option<String> {
+fn take_doc(pending: &mut [String]) -> Option<String> {
     if pending.is_empty() {
         None
     } else {
@@ -1420,6 +1425,8 @@ fn py_is_test_file(file: &str) -> bool {
 /// `file_is_test_path` (V12 Phase C) is the file-path half of the pytest
 /// test-detection rule (see [`py_is_test_file`]); combined with a
 /// `test_`-prefixed name at the definition site.
+// Traversal state as parameters — see `walk_items`.
+#[allow(clippy::too_many_arguments)]
 fn walk_py(
     src: &str,
     file: &str,

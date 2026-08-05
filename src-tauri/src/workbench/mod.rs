@@ -106,8 +106,12 @@ pub struct WorkbenchService {
     /// [`COMMIT_TIMES_TTL`](Self::COMMIT_TIMES_TTL) per root regardless of
     /// how many callers ask — same server-side posture as
     /// [`Self::worktree_check_cache`].
-    commit_times_cache: Mutex<HashMap<PathBuf, (Instant, Arc<Vec<(String, i64)>>)>>,
+    commit_times_cache: Mutex<HashMap<PathBuf, CachedCommitTimes>>,
 }
+
+/// One root's cached commit-time walk: when it was taken and the shared
+/// `(hash, ts_ms)` list it produced.
+type CachedCommitTimes = (Instant, Arc<Vec<(String, i64)>>);
 
 /// One project root's rolling burst-trigger accumulator (see
 /// [`WorkbenchService::handle_fs_batch_for_burst`]).

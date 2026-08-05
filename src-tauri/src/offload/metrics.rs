@@ -4,8 +4,8 @@
 //!
 //! Rather than parse the verbose server log, we poll the server's HTTP
 //! endpoints (robust, structured):
-//! - `GET /slots` — per-slot `is_processing` + `n_decoded` (tokens generated)
-//!   + `n_ctx`. Always available. We **compute tokens/sec ourselves** from the
+//! - `GET /slots` — per-slot `is_processing` + `n_decoded` (tokens generated) +
+//!   `n_ctx`. Always available. We **compute tokens/sec ourselves** from the
 //!   `n_decoded` delta between polls, and derive request **history** from
 //!   slots flipping busy→idle.
 //! - `GET /metrics` — Prometheus gauges (only when the server was launched
@@ -329,6 +329,9 @@ impl MetricsPoller {
 
     /// Update one slot's tracking; returns the computed tokens/sec (if any)
     /// and records a history entry on a busy→idle (or task-change) transition.
+    // Arguments mirror the `/slots` fields for one slot plus the poll clock;
+    // a wrapper struct would only re-spell the JSON row.
+    #[allow(clippy::too_many_arguments)]
     fn fold_slot(
         &mut self,
         id: u32,

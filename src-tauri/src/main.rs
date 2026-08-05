@@ -649,14 +649,14 @@ fn main() {
                 // (`cimp --code-audit-mcp` proxies to `/audit/run`). Gating on
                 // offload alone stranded audit-only/graph-only projects with
                 // "cImp is not running" tool errors.
-                if settings_for_offload.current().loopback_needed() {
-                    if !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        start_offload_runtime(
-                            app.handle().clone(),
-                            service.clone(),
-                            supervisor.clone(),
-                        );
-                    }
+                if settings_for_offload.current().loopback_needed()
+                    && !offload_started.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    start_offload_runtime(
+                        app.handle().clone(),
+                        service.clone(),
+                        supervisor.clone(),
+                    );
                 }
                 // V8: a user who launches with offload disabled and enables it
                 // later in Settings must still get the loopback discovery
@@ -1189,6 +1189,9 @@ fn build_tab_metas_from_settings(settings: &Settings) -> Vec<TabMeta> {
         .collect()
 }
 
+// Wiring function called once from setup: every argument is a distinct handle
+// or channel end the pipeline owns, with no natural grouping.
+#[allow(clippy::too_many_arguments)]
 fn init_tts_pipeline(
     app: AppHandle,
     tts_rx: mpsc::Receiver<TtsRequest>,

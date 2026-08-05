@@ -22,6 +22,12 @@ pub fn open_or_focus_settings(app: &AppHandle) -> AppResult<()> {
             .inner_size(970.0, 750.0)
             .min_inner_size(560.0, 480.0)
             .resizable(true)
+            // Created hidden, same as the main window (tauri.conf.json
+            // `visible: false`): the WebView paints white and the TUI themes
+            // strip the OS chrome after load, so revealing early flashes and
+            // blinks. `settings_main.ts` shows the window after its first
+            // decorations pass (with a timeout safety net).
+            .visible(false)
             .build();
 
     if let Err(e) = built {

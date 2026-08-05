@@ -1499,6 +1499,7 @@ mod tests {
             settings,
             cancel: CancellationToken::new(),
             mem: None,
+            pushes: None,
         };
         (ctx, sig_rx)
     }

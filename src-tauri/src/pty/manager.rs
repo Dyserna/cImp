@@ -214,6 +214,14 @@ impl PtyManager {
         let mem = app
             .try_state::<Arc<crate::graph::GraphService>>()
             .map(|s| s.inner().clone());
+        // V30 Phase D: the session-push bus, so the OpenCode tap can subscribe
+        // its tab in-process and forward notices over OpenCode's HTTP API. Only
+        // the send half's registry travels (not the service), exactly like the
+        // Phase C producers in `main.rs` — no Arc cycle. Absent in
+        // headless/test builds ⇒ `None` ⇒ no fanout.
+        let pushes = app
+            .try_state::<Arc<crate::offload::OffloadService>>()
+            .map(|s| s.push_registry());
         let oob_ctx = spec.oob.clone().map(|oob_spec| {
             (
                 oob_spec,
@@ -224,6 +232,7 @@ impl PtyManager {
                     settings: settings.clone(),
                     cancel: cancel.clone(),
                     mem: mem.clone(),
+                    pushes: pushes.clone(),
                 },
             )
         });

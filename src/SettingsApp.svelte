@@ -3461,14 +3461,19 @@
           </label>
           <small class="hint">
             Lets cImp push notices — offload results, audit and graph-index
-            completions — straight into a live Claude tab, where they arrive as
+            completions — straight into a live AI tab.
+            <strong>Claude tabs</strong> receive them as
             <code>&lt;channel source="cimp-offload"&gt;</code> messages at the
-            next turn boundary. <strong>Claude only</strong> for now (OpenCode
-            has no equivalent inbound path) and it needs the
-            <code>cimp-offload</code> MCP server to be injected, i.e. offload or
-            the code graph enabled. Baked in at launch, so restart your AI tabs
-            after changing it — cImp shows the restart hint automatically.
-            <strong>Experimental:</strong> it rides a Claude Code
+            next turn boundary, which <em>starts a turn</em> when the tab is
+            idle; that half is baked in at launch, so restart the tab after
+            toggling — cImp shows the restart hint automatically. It also needs
+            the <code>cimp-offload</code> MCP server to be injected, i.e.
+            offload or the code graph enabled.
+            <strong>OpenCode tabs</strong> receive the same envelope as silently
+            injected context (<code>noReply</code>): nothing starts, the model
+            picks it up on its next turn. That half is read live — no tab
+            restart needed.
+            <strong>Experimental:</strong> the Claude half rides a Claude Code
             research-preview flag that may change or disappear, Claude paints a
             persistent "Channels (experimental)" banner (plus a harmless
             "no MCP server configured with that name" warning) in every tab it

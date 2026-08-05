@@ -22,7 +22,26 @@ do-not-re-add comment), and two real producers ride the bus —
 Live-verify: enable `offload.session_push`, restart a Claude tab, then (a) force
 a full graph rebuild of a big project and (b) click Scan in the Code audit tab —
 each should surface a `← server: …` line and start a turn in the idle tab; an
-MCP-initiated `security_audit` must NOT produce a second push. Next: Phase D.
+MCP-initiated `security_audit` must NOT produce a second push.
+**Phase D IMPLEMENTED 2026-08-05** — OpenCode tabs join the same bus over
+OpenCode's own HTTP API instead of MCP (it has none inbound): the per-tab
+`oob/opencode.rs` event tap registers itself in-process on the `PushRegistry`
+(`OobContext::pushes`, threaded from `pty/manager.rs`; RAII dereg beside its
+`LiveSessionGuard`), gains a `select!` arm on the notice queue, and forwards each
+push as `POST /session/<main session>/message` with
+`{"noReply":true,"parts":[{"type":"text","text":"<channel …>…</channel>"}]}` —
+the SAME envelope Claude renders, built locally. The `offload.session_push` gate
+is read LIVE at delivery (not spawn-baked, so **no** tab restart and no
+`spawn_inject_sig` entry on this side); delivery is best-effort — 5 s timeout,
+log-and-continue, no retries; the target is always the tab's MAIN session (the
+tap's child-session exclusion is reused). Live-verify: with an OpenCode tab open
+and `offload.session_push` ON (no restart), force a full graph rebuild / run a
+GUI audit scan — the notice must appear in the OpenCode transcript as context
+**without starting a turn**, and toggling the setting off must stop the fanout
+immediately. **Also verify the push does NOT start a turn on the INSTALLED
+OpenCode version** (`noReply` is source-verified at 1.18.13; installed here is
+1.18.1 and its introduction version is unconfirmed — if a push starts a turn,
+upgrade OpenCode (CD-7) before enabling the gate).
 **Builds on:** the single-proxy stdio child (`cimp --offload-mcp`, one per
 tab), its existing out-of-band notification spine
 (`offload/mcp.rs::events_relay` → `emit_list_changed`, the one unsolicited
@@ -178,10 +197,18 @@ tabs are unaffected.)
   publishers (audit, graph index, batch stragglers); a pull tool per push
   (invariant 2).
 - **D — OpenCode backend:** same bus, different transport —
-  `POST /session/:id/prompt_async` + `noReply:true` (session id from the live
-  registry; OpenCode has **no** MCP inbound path — SDK v2 was reverted in
-  1.18.9; v2-branch elicitation is instance-global) + `/tui/show-toast` for
-  human-only notices. Watch: v2 `PromptInput` currently lacks `noReply`.
+  `POST /session/:id/message` + `noReply:true` (OpenCode has **no** MCP inbound
+  path — SDK v2 was reverted in 1.18.9; v2-branch elicitation is
+  instance-global). **As built:** the receiver is the existing per-tab
+  `oob/opencode.rs` SSE tap, not a new task — it already holds the connection,
+  the port and the tab's current MAIN session id, so it registers on the push
+  registry in-process and forwards from its own loop. The session id comes from
+  the tap's own tracker (`Tracker::current_session`, backed by the V28
+  `last_mark`, which excludes sub-agent sessions), NOT from the graph live
+  registry. `/tui/show-toast` for human-only notices was not built (no producer
+  needs it). Endpoint path is `/session/:sessionID/message` in 1.18.x, not
+  `prompt_async`. Watch: v2 `PromptInput` lacks `noReply` — irrelevant while v2
+  stays reverted, but it is the field this phase depends on.
 - **Settings:** one gate (e.g. `offload.session_push`), default **off**.
 - **Out of scope:** MCP elicitation; the `claude/channel/permission` relay
   (NC-2 candidate, noted in #28).

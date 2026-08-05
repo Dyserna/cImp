@@ -50,13 +50,25 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
 use super::OobContext;
+use crate::offload::service::{valid_meta_key, PushNotice};
 use crate::state::StateSignal;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
+/// V30 Phase D: the `source` attribute every cImp channel envelope carries —
+/// the same string Claude Code renders for the `cimp-offload` MCP server, so a
+/// notice reads identically in either agent's transcript.
+const PUSH_SOURCE: &str = "cimp-offload";
+
+/// V30 Phase D: per-push HTTP budget. Pushes are best-effort notify-only
+/// (milestone invariant 2), so a wedged OpenCode server must never stall this
+/// tap's event loop for longer than a blink — and there are no retries.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// V28 (issue #13): how often this tap refreshes its live-session registry
 /// entry. Every session-scoped SSE event carries `properties.sessionID`, and a
@@ -71,15 +83,25 @@ const LIVE_MARK_INTERVAL_MS: i64 = 5_000;
 /// state until the tab's cancel token fires. Reconnects on stream errors (the
 /// TUI may not have bound the port yet at launch, or may restart its server).
 pub async fn run(port: u16, ctx: OobContext) {
-    let url = format!("http://127.0.0.1:{port}/event");
     // V28: clear this tab's live-session registry entry on every exit path, so a
     // closed OpenCode tab stops being reported live without waiting out the TTL.
     // Mirrors `claude::LiveSessionGuard`. Only the TAB-keyed entry is dropped —
     // the loopback's separate session-keyed entries (which the Usage "live now"
     // badge reads) are untouched.
     let _live_guard = LiveSessionGuard(&ctx);
+    // V30 Phase D: subscribe this tab to the session-push bus for the task's
+    // whole lifetime — the guard's `Drop` deregisters on every exit path (tab
+    // close, cancel, source end), exactly like `_live_guard` above and like the
+    // Claude side's `PushGuard` in `loopback::handle_events`. The RECEIVER is
+    // held here, across reconnects, so a notice that lands while the SSE stream
+    // is down waits in the bounded queue instead of being lost.
+    let (_push_guard, mut push_rx) = match ctx.register_pushes("opencode") {
+        Some((g, rx)) => (Some(g), Some(rx)),
+        None => (None, None),
+    };
     // No request timeout: this is a long-lived stream. (reqwest's default
     // builder sets none; we read with explicit cancel-aware selects instead.)
+    // Push POSTs set their own per-request `PUSH_TIMEOUT` on the same client.
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
@@ -92,7 +114,7 @@ pub async fn run(port: u16, ctx: OobContext) {
         if ctx.cancel.is_cancelled() {
             return;
         }
-        match consume(&client, &url, &ctx).await {
+        match consume(&client, port, &ctx, &mut push_rx).await {
             Ok(StreamEnd::Cancelled) => return,
             Ok(StreamEnd::Closed) => {
                 // A live SSE stream never ends gracefully in normal operation,
@@ -135,12 +157,14 @@ enum StreamEnd {
 /// ends or the cancel token fires.
 async fn consume(
     client: &reqwest::Client,
-    url: &str,
+    port: u16,
     ctx: &OobContext,
+    push_rx: &mut Option<mpsc::Receiver<PushNotice>>,
 ) -> reqwest::Result<StreamEnd> {
+    let url = format!("http://127.0.0.1:{port}/event");
     let resp = tokio::select! {
         _ = ctx.cancel.cancelled() => return Ok(StreamEnd::Cancelled),
-        r = client.get(url).send() => r?,
+        r = client.get(&url).send() => r?,
     };
     let mut resp = resp.error_for_status()?;
     debug!(tab = ?ctx.tab, "OpenCode OOB: event stream connected");
@@ -154,6 +178,15 @@ async fn consume(
     loop {
         let chunk = tokio::select! {
             _ = ctx.cancel.cancelled() => return Ok(StreamEnd::Cancelled),
+            // V30 Phase D: a session push addressed to this tab (or broadcast).
+            // Forwarding is an HTTP round trip on the same client, awaited
+            // inline — it is bounded by `PUSH_TIMEOUT` and pauses only the SSE
+            // read, which reqwest buffers meanwhile. `recv` is cancel-safe, so
+            // losing this branch to the chunk branch never drops a notice.
+            notice = next_push(push_rx) => {
+                forward_push(client, port, ctx, state.current_session(), &notice).await;
+                continue;
+            }
             c = resp.chunk() => c,
         };
         let chunk = match chunk {
@@ -196,6 +229,191 @@ fn drain_lines(buf: &mut Vec<u8>) -> Vec<String> {
         lines.push(String::from_utf8_lossy(&line).trim_end().to_string());
     }
     lines
+}
+
+// ── V30 Phase D: session push → OpenCode ─────────────────────────────────────
+//
+// Claude tabs receive pushes through their per-tab `cimp --offload-mcp` stdio
+// child: the app queues a `PushNotice`, the child's `/events` SSE relay turns it
+// into a `notifications/claude/channel`, and CLAUDE renders the
+// `<channel source="…">` envelope. OpenCode has no inbound MCP path at all (the
+// SDK v2 that would have carried one was reverted upstream in 1.18.9), so this
+// tap is the delivery mechanism instead: it is already the only thing in the app
+// holding a live connection to the tab's OpenCode server AND tracking the tab's
+// current MAIN session, which is exactly what a push needs. It builds the SAME
+// envelope by hand and POSTs it into the session as a `noReply` message.
+//
+// Because nothing is negotiated at spawn on this side, the `offload.session_push`
+// gate is read LIVE at delivery time (see [`forward_target`]) rather than baked
+// into the tab's argv — which is why, unlike the Claude side, toggling the
+// setting needs no tab restart and no `spawn_inject_sig` entry.
+
+/// Await the next push, or park forever when this tap has no subscription.
+///
+/// `mpsc::Receiver::recv` is cancel-safe, so this is safe to lose repeatedly to
+/// a competing `select!` branch. A closed queue parks too rather than yielding
+/// `None` forever: while the [`PushGuard`](crate::offload::service::PushGuard)
+/// lives nothing can close it, and busy-looping a `select!` on a dead branch
+/// would be worse than the alternative.
+async fn next_push(rx: &mut Option<mpsc::Receiver<PushNotice>>) -> PushNotice {
+    match rx.as_mut() {
+        Some(rx) => match rx.recv().await {
+            Some(notice) => notice,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Why a push wasn't forwarded (the pure half of [`forward_push`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PushSkip {
+    /// `offload.session_push` is off right now.
+    Disabled,
+    /// This tap hasn't observed a main session id yet (tab just launched, or
+    /// the user hasn't started a conversation).
+    NoSession,
+}
+
+/// Decide whether one push should be forwarded, and to which session.
+///
+/// `enabled` is read live per push, never cached at spawn: the OpenCode path
+/// bakes nothing into the tab's launch (no argv flag, no handshake), so the
+/// fanout can be switched on and off mid-session with no tab restart — the
+/// mirror image of the Claude side, where `offload.session_push` gates a
+/// spawn-time `--dangerously-load-development-channels` flag and therefore
+/// carries a `spawn_inject_sig` entry plus a restart hint.
+///
+/// `session` must be the tab's **main** session (never a sub-agent's) — see
+/// [`Tracker::current_session`].
+fn forward_target(enabled: bool, session: Option<&str>) -> Result<&str, PushSkip> {
+    if !enabled {
+        return Err(PushSkip::Disabled);
+    }
+    session.filter(|s| !s.is_empty()).ok_or(PushSkip::NoSession)
+}
+
+/// Escape one channel attribute value for the `<channel …>` tag.
+///
+/// XML attribute rules: `&` first (or the other escapes get double-escaped),
+/// then the delimiters. Control characters (a newline in a `detail` string, say)
+/// collapse to a space so the opening tag stays one line, matching how an XML
+/// parser would normalize them anyway.
+fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the model-visible `<channel>` envelope for one notice — the same
+/// shape Claude Code paints for a `notifications/claude/channel`
+/// (`<channel source="cimp-offload" kind="audit">…</channel>`, verified live in
+/// the Phase 0 spike), so a notice reads identically in both agents.
+///
+/// Meta keys are re-checked against [`valid_meta_key`] even though
+/// [`PushNotice::new`] already enforces it: a notice can also arrive by
+/// `Deserialize` (the SSE wire type), which bypasses the constructor — validate
+/// at the parse boundary anyway. `meta` is a `BTreeMap`, so attribute order is
+/// stable across pushes.
+fn render_channel_envelope(notice: &PushNotice) -> String {
+    let mut out = format!("<channel source=\"{PUSH_SOURCE}\"");
+    for (key, value) in &notice.meta {
+        if !valid_meta_key(key) {
+            continue;
+        }
+        out.push(' ');
+        out.push_str(key);
+        out.push_str("=\"");
+        out.push_str(&escape_attr(value));
+        out.push('"');
+    }
+    out.push_str(">\n");
+    out.push_str(&notice.content);
+    out.push_str("\n</channel>");
+    out
+}
+
+/// The `POST /session/:id/message` body that injects `text` into a session
+/// **without** starting a model turn.
+fn push_message_body(text: &str) -> Value {
+    serde_json::json!({
+        "noReply": true,
+        "parts": [{ "type": "text", "text": text }],
+    })
+}
+
+/// Forward one push into the tab's OpenCode session. Best-effort by contract:
+/// every failure (gate off, no session yet, HTTP error, timeout, non-2xx) is
+/// logged and dropped — never retried, never allowed to break the event loop.
+async fn forward_push(
+    client: &reqwest::Client,
+    port: u16,
+    ctx: &OobContext,
+    session: Option<&str>,
+    notice: &PushNotice,
+) {
+    let session = match forward_target(ctx.session_push_enabled(), session) {
+        Ok(s) => s,
+        Err(PushSkip::Disabled) => {
+            trace!(tab = ?ctx.tab, "OpenCode push: offload.session_push is off — dropping notice");
+            return;
+        }
+        Err(PushSkip::NoSession) => {
+            debug!(
+                tab = ?ctx.tab,
+                "OpenCode push: no live session on this tab yet — dropping notice (pushes are best-effort)"
+            );
+            return;
+        }
+    };
+    // Same client, same host, no auth — mirrors the `/event` GET above, which is
+    // the only other request cImp makes against a tab's OpenCode server (the TUI
+    // binds loopback-only and requires no credentials).
+    //
+    // RISK (V30 Phase D, unresolved by design): `noReply: true` is
+    // source-verified in OpenCode 1.18.13 — it persists the message into the
+    // session WITHOUT starting a turn, the documented plugin context-injection
+    // mechanism. The version that introduced it is unconfirmed and the OpenCode
+    // installed here is 1.18.1. If 1.18.1 predates the field, it is simply
+    // ignored (unknown fields usually are) and this POST becomes a normal
+    // prompt that STARTS A TURN. There is deliberately no version detection:
+    // the milestone's live-verify list carries "confirm a push does not start a
+    // turn on the installed OpenCode; if it does, upgrade OpenCode (CD-7)
+    // before enabling `offload.session_push`".
+    let url = format!("http://127.0.0.1:{port}/session/{session}/message");
+    let body = push_message_body(&render_channel_envelope(notice));
+    match client
+        .post(&url)
+        .timeout(PUSH_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(tab = ?ctx.tab, session, "OpenCode push: injected a channel notice")
+        }
+        Ok(resp) => warn!(
+            tab = ?ctx.tab,
+            session,
+            status = %resp.status(),
+            "OpenCode push: server rejected the notice — dropping (no retry)"
+        ),
+        Err(e) => warn!(
+            tab = ?ctx.tab,
+            session,
+            error = %e,
+            "OpenCode push: delivery failed — dropping (no retry)"
+        ),
+    }
 }
 
 /// Per-connection accumulation of assistant messages and working state.
@@ -368,6 +586,19 @@ impl Tracker {
         Some(sid.to_string())
     }
 
+    /// V30 Phase D: the session a push should be injected into — the last
+    /// session this connection bound the tab to.
+    ///
+    /// This reuses [`Self::last_mark`] rather than tracking a second id, which
+    /// is what keeps the invariant honest: `last_mark` is written only by
+    /// [`Self::live_session_target`], which **excludes child (sub-agent)
+    /// sessions**. So a push landing while a task-tool sub-agent is mid-run
+    /// still goes to the tab's MAIN conversation, never into the sub-agent's
+    /// session. `None` until the tap has seen its first session-scoped event.
+    fn current_session(&self) -> Option<&str> {
+        self.last_mark.as_ref().map(|(sid, _)| sid.as_str())
+    }
+
     /// Record a part under its message, preserving first-seen order.
     fn register_part(&mut self, mid: &str, pid: &str) {
         let parts = self.msg_parts.entry(mid.to_string()).or_default();
@@ -494,6 +725,7 @@ mod tests {
             settings,
             cancel: CancellationToken::new(),
             mem: None,
+            pushes: None,
         };
         (ctx, tts_rx, sig_rx)
     }
@@ -882,7 +1114,7 @@ mod tests {
         let client = reqwest::Client::new();
         let end = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            consume(&client, &format!("http://127.0.0.1:{port}/event"), &ctx),
+            consume(&client, port, &ctx, &mut None),
         )
         .await
         .expect("consume must return when the stream closes")
@@ -1028,5 +1260,287 @@ mod live_session_tests {
             t.live_session_target("session.created", &blank, 1_000),
             Some("ses_two".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    //! V30 Phase D: session push → OpenCode.
+    //!
+    //! The envelope, the request body and the forward/skip decision are pure, so
+    //! they're pinned here without a socket; the one socket test pins the wire
+    //! contract a comment alone can't defend (method, path, `noReply`).
+    use super::*;
+    use crate::settings::{Settings, SettingsHandle};
+    use crate::state::TabId;
+    use tokio_util::sync::CancellationToken;
+
+    fn notice<'a>(content: &str, meta: impl IntoIterator<Item = (&'a str, &'a str)>) -> PushNotice {
+        PushNotice::new(content, meta)
+    }
+
+    /// A tap context whose `offload.session_push` is `enabled`.
+    fn ctx_with_push(enabled: bool) -> OobContext {
+        let (tts_tx, _tts_rx) = mpsc::channel(4);
+        let (sig_tx, _sig_rx) = mpsc::channel(4);
+        let mut defaults = Settings::default();
+        defaults.tabs.push(crate::settings::default_opencode_tab());
+        defaults.offload.session_push = enabled;
+        let settings = SettingsHandle::new(defaults.clone(), defaults, std::env::temp_dir());
+        OobContext {
+            tab: TabId::from_str("opencode"),
+            tts: tts_tx,
+            state_signals: sig_tx,
+            settings,
+            cancel: CancellationToken::new(),
+            mem: None,
+            pushes: None,
+        }
+    }
+
+    // ── envelope ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn envelope_matches_the_claude_side_shape() {
+        // The exact rendering Claude Code paints for a
+        // `notifications/claude/channel` (Phase 0 spike, T2): source attribute
+        // first, meta after, content on its own line.
+        let n = notice("Graph index rebuilt.", [("kind", "graph_index")]);
+        assert_eq!(
+            render_channel_envelope(&n),
+            "<channel source=\"cimp-offload\" kind=\"graph_index\">\nGraph index rebuilt.\n</channel>"
+        );
+    }
+
+    #[test]
+    fn envelope_without_meta_still_carries_the_source() {
+        let n = notice("bare", [] as [(&str, &str); 0]);
+        assert_eq!(
+            render_channel_envelope(&n),
+            "<channel source=\"cimp-offload\">\nbare\n</channel>"
+        );
+    }
+
+    #[test]
+    fn envelope_attribute_order_is_stable() {
+        // `meta` is a BTreeMap so the same notice renders byte-identically
+        // whatever order the producer inserted keys in — a push is user-visible
+        // transcript text; a wobbling attribute order would be diff noise.
+        let a = notice("x", [("zulu", "1"), ("alpha", "2"), ("mike", "3")]);
+        let b = notice("x", [("mike", "3"), ("zulu", "1"), ("alpha", "2")]);
+        assert_eq!(render_channel_envelope(&a), render_channel_envelope(&b));
+        assert_eq!(
+            render_channel_envelope(&a),
+            "<channel source=\"cimp-offload\" alpha=\"2\" mike=\"3\" zulu=\"1\">\nx\n</channel>"
+        );
+    }
+
+    #[test]
+    fn envelope_escapes_attribute_values() {
+        let n = notice("body", [("detail", r#"a & b < c > d "quoted""#)]);
+        assert_eq!(
+            render_channel_envelope(&n),
+            "<channel source=\"cimp-offload\" detail=\"a &amp; b &lt; c &gt; d &quot;quoted&quot;\">\nbody\n</channel>"
+        );
+    }
+
+    #[test]
+    fn envelope_attribute_values_stay_on_one_line() {
+        // A multi-line `detail` must not break the opening tag.
+        let n = notice("body", [("detail", "line one\nline two\ttabbed")]);
+        let rendered = render_channel_envelope(&n);
+        let open = rendered.split_once('\n').unwrap().0;
+        assert_eq!(
+            open,
+            "<channel source=\"cimp-offload\" detail=\"line one line two tabbed\">"
+        );
+    }
+
+    #[test]
+    fn envelope_drops_meta_keys_the_client_would_reject() {
+        // `PushNotice::new` already filters, but a notice can also arrive by
+        // `Deserialize` (the SSE wire type), which bypasses the constructor —
+        // so the renderer re-checks at its own boundary.
+        let deserialized: PushNotice = serde_json::from_str(
+            r#"{"content":"c","meta":{"ok_key":"1","bad-key":"2","9nope":"3"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_channel_envelope(&deserialized),
+            "<channel source=\"cimp-offload\" ok_key=\"1\">\nc\n</channel>"
+        );
+    }
+
+    #[test]
+    fn envelope_content_is_not_escaped() {
+        // Claude renders the content verbatim inside the tag; the OpenCode
+        // envelope must read identically, so content is passed through.
+        let n = notice("see <file.rs> & run", [] as [(&str, &str); 0]);
+        assert!(render_channel_envelope(&n).contains("see <file.rs> & run"));
+    }
+
+    // ── request body ────────────────────────────────────────────────────────
+
+    #[test]
+    fn message_body_is_a_no_reply_text_part() {
+        // `noReply` is the whole point: it persists the message into the session
+        // WITHOUT starting a model turn.
+        let body = push_message_body("hello");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "noReply": true,
+                "parts": [{ "type": "text", "text": "hello" }],
+            })
+        );
+    }
+
+    // ── forward decision ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_disabled_gate_drops_the_push() {
+        assert_eq!(
+            forward_target(false, Some("ses_1")),
+            Err(PushSkip::Disabled)
+        );
+    }
+
+    #[test]
+    fn no_session_yet_drops_the_push() {
+        assert_eq!(forward_target(true, None), Err(PushSkip::NoSession));
+        assert_eq!(forward_target(true, Some("")), Err(PushSkip::NoSession));
+    }
+
+    #[test]
+    fn an_enabled_gate_with_a_session_forwards() {
+        assert_eq!(forward_target(true, Some("ses_1")), Ok("ses_1"));
+    }
+
+    // ── session resolution ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_push_target_is_the_main_session_never_a_sub_agent() {
+        // Sub-agent sessions ride the same SSE stream. A push landing while a
+        // task-tool sub-agent runs must still go to the tab's conversation.
+        let mut t = Tracker::default();
+        assert_eq!(t.current_session(), None, "nothing seen yet");
+        let main: Value =
+            serde_json::from_str(r#"{"sessionID":"ses_main","info":{"id":"ses_main"}}"#).unwrap();
+        t.live_session_target("session.created", &main, 0);
+        assert_eq!(t.current_session(), Some("ses_main"));
+
+        let child: Value = serde_json::from_str(
+            r#"{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main"}}"#,
+        )
+        .unwrap();
+        t.live_session_target("session.created", &child, 1_000);
+        let child_event: Value = serde_json::from_str(r#"{"sessionID":"ses_child"}"#).unwrap();
+        t.live_session_target("message.part.delta", &child_event, 2_000);
+        assert_eq!(
+            t.current_session(),
+            Some("ses_main"),
+            "a sub-agent session must never become the push target"
+        );
+
+        // A `/new` rotation does move it.
+        let rotated: Value = serde_json::from_str(r#"{"sessionID":"ses_two"}"#).unwrap();
+        t.live_session_target("session.idle", &rotated, 3_000);
+        assert_eq!(t.current_session(), Some("ses_two"));
+    }
+
+    // ── wire contract (one socket test) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn forward_push_posts_the_envelope_to_the_session_message_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read head + body (content-length framed).
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            let _ = sock.flush().await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let ctx = ctx_with_push(true);
+        let client = reqwest::Client::new();
+        forward_push(
+            &client,
+            port,
+            &ctx,
+            Some("ses_abc"),
+            &notice("Audit finished: 3 findings.", [("kind", "audit")]),
+        )
+        .await;
+        let raw = server.await.unwrap();
+
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a complete request");
+        assert!(
+            head.starts_with("POST /session/ses_abc/message "),
+            "endpoint drift: {head}"
+        );
+        let json: Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(
+            json["noReply"],
+            serde_json::json!(true),
+            "must not start a turn"
+        );
+        assert_eq!(json["parts"][0]["type"], serde_json::json!("text"));
+        assert_eq!(
+            json["parts"][0]["text"],
+            serde_json::json!(
+                "<channel source=\"cimp-offload\" kind=\"audit\">\nAudit finished: 3 findings.\n</channel>"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_server_is_logged_and_dropped_not_retried() {
+        // Best-effort by contract: an unreachable OpenCode must not hang or
+        // panic the tap. Bind then drop, so the port is (almost certainly) free.
+        let port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let ctx = ctx_with_push(true);
+        let client = reqwest::Client::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            forward_push(
+                &client,
+                port,
+                &ctx,
+                Some("ses_abc"),
+                &notice("x", [] as [(&str, &str); 0]),
+            ),
+        )
+        .await
+        .expect("a failed push must return promptly");
     }
 }

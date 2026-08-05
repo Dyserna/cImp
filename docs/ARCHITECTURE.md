@@ -285,23 +285,40 @@ relation** — it's an in-memory `HashMap<session_id, InjectState>` on
 no schema entry; a restart just re-injects fresh on the next turn, which is
 the intended fail-safe.
 
-**Three Claude hook shims, one shared POST helper.** `context_hook.rs`'s
+**Claude hook shims, one shared POST helper.** `context_hook.rs`'s
 `post_loopback(path, body)` (Bearer auth, `Content-Length`, `Connection:
-close`, 2xx-only, ~600 ms timeout) is now used by all three CLI subcommands
+close`, 2xx-only, ~600 ms timeout) is used by every hook CLI subcommand
 wired in `main.rs`:
 
 | Subcommand | Hook event | Route | Module |
 |---|---|---|---|
 | `cimp --context-hook` | `UserPromptSubmit` | `POST /context/retrieve` | `context_hook.rs` (V10) |
 | `cimp --precompact-hook` | `PreCompact` | `POST /context/compaction` | `compact_hook.rs` (V11 Phase D) |
-| `cimp --read-hook` | `PreToolUse` (matcher `Read`) | `POST /context/should_read` | `read_hook.rs` (V11 Phase E) |
+| `cimp --read-hook` | `PreToolUse` (matchers `Read`, `Bash`) | `POST /context/should_read` | `read_hook.rs` (V11 Phase E) |
+| `cimp --postedit-hook` | `PostToolUse` (matcher `Edit\|Write\|MultiEdit`) | `POST /context/post_edit` | `postedit_hook.rs` (V12 Phase F) |
+| `cimp --notify-hook` | `Notification` + `PermissionDenied` (both `matcher: ""`) | `POST /permission/event` | `notify_hook.rs` (NC-2) |
 
-All three are dependency-light, synchronous, and fail open (print nothing,
+All of them are dependency-light, synchronous, and fail open (print nothing,
 exit 0) on any error — a hook must never block or perturb the agent's turn.
 `tabs/config.rs` adds the `PreCompact` hook to the Claude settings overlay
 whenever `context_injection && compaction_context`, and the `PreToolUse` hook
 whenever `context_injection && read_advisor` (independent toggles — a project
 can run compaction survival without the read advisor).
+
+**Permission detection is hook-primary, regex-fallback (NC-2).** The
+`Notification` / `PermissionDenied` pair is the only *unconditional* overlay
+injection (no toggle, no schema entry, and therefore no `spawn_inject_sig`
+entry — nothing a Settings save could change). `--notify-hook` forwards the
+payload to `POST /permission/event`, which classifies it
+(`notification_type == "permission_prompt"`, or permission-flavoured prose when
+no type field arrives; `PermissionDenied` ⇒ resolved; every other notification
+type, including `idle_prompt`, is ignored), maps it to a tab
+(`session_id` → `transcript_path` → unique `cwd`, else DROP — never a guess),
+and emits the same `PermissionPromptDetected` / `PermissionPromptResolved`
+signals the TUI-regex detector (`processing::permission`) emits. Both producers
+feed the one idempotent `awaiting_permission` flag, so the hook simply usually
+wins the race; the regex path is untouched and still covers a dropped or
+missed event.
 
 **Compaction route's side effects are unconditional.** `GraphService::
 compaction_context` (`graph/service.rs`) always clears the session's

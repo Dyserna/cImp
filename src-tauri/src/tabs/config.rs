@@ -148,6 +148,32 @@ fn resolve_oob_source(
     None
 }
 
+/// NC-2 (issue #5): every configured Claude AI tab and the working directory it
+/// launches in — `(tab_id, working_dir)`. Resolution mirrors
+/// [`build_ai_tool_spec`] exactly (per-tab `cwd` override, else the app's launch
+/// dir), so the permission-hook route can compare a hook payload's `cwd`
+/// against the directory the tab was actually spawned in.
+///
+/// Note the usual case is that NO tab sets `cwd`, so every Claude tab shares the
+/// launch dir — which is why the route's cwd match is only used as a
+/// last-resort tie-break and only when it resolves to exactly one tab.
+pub(crate) fn claude_tab_dirs(
+    settings: &Settings,
+    launch_cwd: &Path,
+) -> Vec<(String, std::path::PathBuf)> {
+    settings
+        .tabs
+        .iter()
+        .filter_map(|t| match t {
+            TabConfig::AiTool(c) if command_is(&c.command, "claude") => Some((
+                c.id.clone(),
+                c.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// V16 Feature 1: run `opencode --version` once per tab spawn and record the
 /// first output line into the global `harness_versions` tripwire state.
 /// Best-effort in every direction: unresolvable binary, spawn failure, or
@@ -279,6 +305,12 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // The `--settings` hooks overlay gates, in `build_pre_args` order:
         // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
         // PostToolUse auto-check.
+        //
+        // NC-2: the `Notification` / `PermissionDenied` hooks are NOT listed —
+        // they are injected unconditionally for every Claude tab and derive
+        // from no Settings field, so no save can make a running tab differ from
+        // a fresh one and there is nothing a restart hint could be about. Any
+        // future *gated* hook must add an entry here.
         "hooks": [
             s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
             s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
@@ -433,6 +465,42 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings) -> Vec<String> {
                         "PostToolUse".to_string(),
                         serde_json::json!([ { "matcher": "Edit|Write|MultiEdit", "hooks": [
                             { "type": "command", "command": command, "timeout": 5 }
+                        ] } ]),
+                    );
+                }
+            }
+            // NC-2 (issue #5): `Notification` + `PermissionDenied` — the
+            // PRIMARY "this tab is awaiting a permission decision" detector,
+            // demoting the TUI-regex matcher (`processing::permission`) to
+            // fallback. Both point at the SAME `--notify-hook` shim, which
+            // dispatches on the payload's `hook_event_name`.
+            //
+            // UNCONDITIONAL for every Claude tab: there is no toggle, so there
+            // is nothing a Settings save could flip — which is exactly why this
+            // needs no `spawn_inject_sig` entry / restart hint (same reasoning
+            // as the unconditional `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` env
+            // injection below and the pinned OpenCode `subagent_depth`). The
+            // shim is fail-open and only spawns when Claude actually surfaces a
+            // notification or the auto-classifier denies a call — both rare.
+            //
+            // `"matcher": ""` on BOTH entries — the docs' explicit "fires on
+            // all notification types" form (and, for `PermissionDenied`, all
+            // tool names). Deliberately NOT a narrowing `permission_prompt`
+            // matcher: the matcher filters on the notification TYPE, and a
+            // renamed/removed type would silently stop the hook firing. We take
+            // every notification and classify app-side in
+            // `offload::loopback::classify_permission_event` instead, so an
+            // unrecognized type degrades to "ignored", never to silence. An
+            // *absent* matcher key is documented only for events that don't
+            // support matchers at all, so the empty string is the safe spelling
+            // here. Idle/`idle_prompt` notifications are deliberately NOT wired
+            // to the `awaiting_question` pipe — see that classifier's doc.
+            if let Some(command) = crate::statusline::hook_command("--notify-hook") {
+                for event in ["Notification", "PermissionDenied"] {
+                    hooks.insert(
+                        event.to_string(),
+                        serde_json::json!([ { "matcher": "", "hooks": [
+                            { "type": "command", "command": command.clone(), "timeout": 5 }
                         ] } ]),
                     );
                 }
@@ -1228,7 +1296,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.statusline.enabled = false;
         let args = build_pre_args(&claude_cfg(), &settings);
-        assert!(settings_overlay(&args).is_none());
+        // NC-2: an overlay is always emitted for a Claude tab now (the
+        // unconditional permission hooks), so the assertion is about the
+        // statusLine key, not about the overlay's existence.
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay.get("statusLine").is_none());
     }
 
     #[test]
@@ -1253,8 +1325,11 @@ mod tests {
         settings.graph.context_injection = false;
         let args = build_pre_args(&claude_cfg(), &settings);
         // Graph on but injection off + statusline off + checkpoints off →
-        // no --settings overlay.
-        assert!(settings_overlay(&args).is_none());
+        // no UserPromptSubmit hook (the overlay itself still carries the
+        // unconditional NC-2 permission hooks).
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay["hooks"].get("UserPromptSubmit").is_none());
+        assert!(overlay.get("statusLine").is_none());
     }
 
     /// V16 Feature 0: the read-advisor PreToolUse hook installs when the
@@ -1380,7 +1455,8 @@ mod tests {
         settings.graph.enabled = false;
         settings.workbench.checkpoints = true;
         let args = build_pre_args(&claude_cfg(), &settings);
-        assert!(settings_overlay(&args).is_none());
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay["hooks"].get("UserPromptSubmit").is_none());
     }
 
     #[test]
@@ -1411,8 +1487,10 @@ mod tests {
         settings.graph.auto_check = false;
         settings.checks = vec![crate::checks::CheckDef::default()];
         let args = build_pre_args(&claude_cfg(), &settings);
-        // auto_check off → no --settings overlay at all (nothing else is on).
-        assert!(settings_overlay(&args).is_none());
+        // auto_check off → no PostToolUse hook (nothing else is on either, so
+        // the overlay carries only the unconditional NC-2 permission hooks).
+        let overlay = settings_overlay(&args).expect("overlay present");
+        assert!(overlay["hooks"].get("PostToolUse").is_none());
 
         let mut settings2 = Settings::default();
         settings2.statusline.enabled = false;
@@ -1420,7 +1498,105 @@ mod tests {
         settings2.graph.auto_check = true;
         settings2.checks = Vec::new();
         let args2 = build_pre_args(&claude_cfg(), &settings2);
-        assert!(settings_overlay(&args2).is_none());
+        let overlay2 = settings_overlay(&args2).expect("overlay present");
+        assert!(overlay2["hooks"].get("PostToolUse").is_none());
+    }
+
+    /// NC-2 (issue #5): the `Notification` + `PermissionDenied` hooks are
+    /// injected for EVERY Claude tab, from the barest possible settings, both
+    /// pointing at the one `--notify-hook` shim, both with the documented
+    /// match-everything `"matcher": ""` (a narrowing matcher filters on
+    /// notification TYPE; we classify app-side so a renamed type degrades to
+    /// "ignored", not to silence).
+    #[test]
+    fn permission_hooks_injected_unconditionally_for_claude() {
+        // Barest settings: every gated injection off.
+        let settings = Settings::default();
+        let args = build_pre_args(&claude_cfg(), &settings);
+        // The Claude Code `--settings` contract: ONE flag, one merged overlay —
+        // the new hooks must ride the same object as everything else, never a
+        // second flag (Claude does not concatenate repeated `--settings`).
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+        let overlay = settings_overlay(&args).expect("overlay present");
+        for event in ["Notification", "PermissionDenied"] {
+            let entry = &overlay["hooks"][event][0];
+            assert_eq!(
+                entry["matcher"], "",
+                "{event} must match every type/tool: {entry}"
+            );
+            let cmd = entry["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event} hook command is a string"));
+            assert!(cmd.ends_with(" --notify-hook"), "got: {cmd}");
+            assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+        }
+
+        // Non-Claude tabs get no pre-args at all (OpenCode is configured via
+        // OPENCODE_CONFIG_CONTENT), so nothing leaks there.
+        assert!(build_pre_args(&opencode_cfg(), &settings).is_empty());
+    }
+
+    /// NC-2: because the permission hooks are unconditional and derive from no
+    /// Settings field, they are deliberately absent from `spawn_inject_sig` —
+    /// nothing a user can save may change them, so no restart hint is owed.
+    /// (Same convention as the pinned OpenCode `subagent_depth`.)
+    #[test]
+    fn permission_hooks_need_no_spawn_inject_sig_entry() {
+        let settings = Settings::default();
+        let sig = spawn_inject_sig(&settings);
+        let hooks = sig[0]["hooks"].as_array().expect("claude hooks sig array");
+        // The five GATED hook entries, unchanged by NC-2 — all off by default.
+        assert_eq!(hooks.len(), 5, "unexpected hook-gate count: {hooks:?}");
+        assert!(hooks.iter().all(|g| g == &serde_json::Value::Bool(false)));
+        // …while the overlay built from those same all-off settings still
+        // carries the two ungated hooks. The gap is the point: a signature
+        // entry exists to detect a Settings-driven difference between a running
+        // tab and a fresh one, and there is no setting here to differ.
+        let overlay =
+            settings_overlay(&build_pre_args(&claude_cfg(), &settings)).expect("overlay present");
+        let installed = overlay["hooks"].as_object().expect("hooks object");
+        assert_eq!(
+            installed.len(),
+            2,
+            "all gates off ⇒ only the ungated NC-2 hooks: {installed:?}"
+        );
+    }
+
+    /// NC-2: the cwd-fallback input — every Claude tab with the directory it
+    /// actually launches in (per-tab `cwd` override, else the app launch dir),
+    /// resolved exactly as `build_ai_tool_spec` does. OpenCode/Shell tabs are
+    /// excluded: the hook only fires for Claude.
+    #[test]
+    fn claude_tab_dirs_lists_claude_tabs_with_their_launch_dirs() {
+        let mut settings = Settings::default();
+        settings.tabs = vec![
+            TabConfig::AiTool(claude_cfg()),
+            TabConfig::AiTool(opencode_cfg()),
+        ];
+        let launch = Path::new("C:/proj");
+        let dirs = claude_tab_dirs(&settings, launch);
+        assert_eq!(dirs.len(), 1, "only the Claude tab: {dirs:?}");
+        assert!(
+            dirs.iter().all(|(_, d)| d == launch),
+            "no per-tab cwd ⇒ every tab inherits the launch dir: {dirs:?}"
+        );
+        assert!(
+            !dirs.iter().any(|(id, _)| id == "opencode"),
+            "non-Claude tabs must not appear: {dirs:?}"
+        );
+
+        // A worktree tab (the one flow that sets `cwd`) reports its own dir.
+        let mut wt = claude_cfg();
+        wt.id = "ai-worktree".to_string();
+        wt.cwd = Some(std::path::PathBuf::from("C:/proj/wt"));
+        settings.tabs.push(TabConfig::AiTool(wt));
+        let dirs = claude_tab_dirs(&settings, launch);
+        assert_eq!(
+            dirs.iter()
+                .find(|(id, _)| id == "ai-worktree")
+                .map(|(_, d)| d.clone()),
+            Some(std::path::PathBuf::from("C:/proj/wt"))
+        );
     }
 
     #[test]
@@ -1485,7 +1661,15 @@ mod tests {
 
         // Sanity: this really is the maxed-out overlay, not a degenerate one.
         let hooks = overlay["hooks"].as_object().expect("hooks object");
-        for k in ["UserPromptSubmit", "PreCompact", "PreToolUse", "PostToolUse"] {
+        for k in [
+            "UserPromptSubmit",
+            "PreCompact",
+            "PreToolUse",
+            "PostToolUse",
+            // NC-2 — unconditional, so present in every overlay.
+            "Notification",
+            "PermissionDenied",
+        ] {
             assert!(hooks.contains_key(k), "expected hook {k} in {overlay}");
         }
         assert_eq!(
@@ -1509,8 +1693,9 @@ mod tests {
              contract notes on this test before adding one",
         );
 
-        // Ceiling: ~230x headroom over the real maxed-out overlay (measured
-        // 1135 bytes) and 8x below Claude Code's 2 MiB hard-fail.
+        // Ceiling: ~170x headroom over the real maxed-out overlay (measured
+        // 1135 bytes before NC-2 added two more hook commands) and 8x below
+        // Claude Code's 2 MiB hard-fail.
         const MAX_OVERLAY_BYTES: usize = 256 * 1024;
         assert!(
             raw.len() < MAX_OVERLAY_BYTES,
@@ -1824,7 +2009,10 @@ mod tests {
         assert_eq!(count, 1, "exactly one --mcp-config carries both servers");
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
-        assert_eq!(cfg["mcpServers"]["cimp-offload"]["args"][0], "--offload-mcp");
+        assert_eq!(
+            cfg["mcpServers"]["cimp-offload"]["args"][0],
+            "--offload-mcp"
+        );
         assert_eq!(
             cfg["mcpServers"]["cimp-code-audit"]["args"][0],
             "--code-audit-mcp"

@@ -16,6 +16,7 @@ mod ipc;
 mod logging;
 mod mcp_stdio;
 mod notifications;
+mod notify_hook;
 mod offload;
 mod oob;
 mod postedit_hook;
@@ -124,6 +125,7 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --precompact-hook                      PreCompact hook shim
   --read-hook                            PreToolUse read-advisor hook shim
   --postedit-hook                        PostToolUse checks hook shim
+  --notify-hook                          Notification / PermissionDenied hook shim
   --offload-mcp [--consumer <name>]      stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
 
@@ -231,6 +233,19 @@ fn main() {
     // any error, so it never blocks or perturbs an edit.
     if std::env::args().skip(1).any(|a| a == "--postedit-hook") {
         postedit_hook::run();
+        return;
+    }
+
+    // NC-2 (issue #5): Claude Code invokes `cimp --notify-hook` for the
+    // `Notification` and `PermissionDenied` events — the PRIMARY signal that a
+    // tab is (or is no longer) awaiting a permission decision, with the
+    // TUI-regex detector demoted to fallback. It POSTs the payload to the app's
+    // loopback `/permission/event`, which maps it to a tab and flips
+    // `awaiting_permission`. Observe-only: GUI-free like the other shims, never
+    // prints to stdout, and always exits 0 so a dead app can never delay
+    // Claude's permission flow.
+    if std::env::args().skip(1).any(|a| a == "--notify-hook") {
+        notify_hook::run();
         return;
     }
 

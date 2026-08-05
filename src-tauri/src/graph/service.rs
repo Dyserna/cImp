@@ -169,7 +169,9 @@ const LIVE_SESSION_RECENCY_MS: i64 = 5 * 60_000;
 /// session id itself (no tab binding on the loopback path).
 #[derive(Clone, Debug)]
 struct LiveSession {
-    #[allow(dead_code)] // recorded for future per-agent filtering; not read yet.
+    /// Which agent reported the entry (`"claude"` / `"opencode"`). Read by
+    /// [`GraphService::live_claude_sessions`] — the NC-2 permission-hook's
+    /// session→tab mapping only trusts Claude entries, whose key IS a tab id.
     agent: String,
     session_id: String,
     last_seen_ms: i64,
@@ -1338,6 +1340,31 @@ impl GraphService {
     pub fn clear_live_session(&self, key: &str) {
         if let Ok(mut m) = self.live_sessions.lock() {
             m.remove(key);
+        }
+    }
+
+    /// NC-2 (issue #5): the live-session registry entries reported by CLAUDE
+    /// tabs — `(tab_id, session_id)` per entry still inside
+    /// [`LIVE_SESSION_TTL_MS`]. This is the session→tab mapping the
+    /// `/permission/event` route resolves a hook payload with: a Claude entry
+    /// is keyed by its stable TAB ID (see [`Self::mark_live_session`]) and
+    /// carries the session id the tab's transcript tail last saw, which is
+    /// exactly the `session_id` a Claude Code hook payload names.
+    ///
+    /// Stale (TTL-lapsed) entries are filtered out rather than returned, so a
+    /// closed tab whose entry hasn't been reclaimed yet can never be credited
+    /// with a live session's permission prompt.
+    pub fn live_claude_sessions(&self) -> Vec<(String, String)> {
+        let now = crate::activity::now_ms() as i64;
+        match self.live_sessions.lock() {
+            Ok(m) => m
+                .iter()
+                .filter(|(_, e)| {
+                    e.agent == "claude" && now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS
+                })
+                .map(|(k, e)| (k.clone(), e.session_id.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
         }
     }
 

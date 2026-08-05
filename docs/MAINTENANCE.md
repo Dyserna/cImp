@@ -521,6 +521,18 @@ MCP host (V8).*
   after a llama.cpp bump that `/props` still reports `n_ctx` **per slot** (the
   double-divide budget bug came from assuming otherwise) and that a LAN
   llama-server still answers `/health` 2xx.
+- **`/props` `n_ctx` depends on the KV mode** (measured on build 10088 with
+  `-c 8192 -np 2`): split KV — the default with an explicit `-np` — reports the
+  **per-slot** window (4096), while `-kvu`/`--kv-unified` reports the **full
+  shared** window (8192). `offload/server.rs::per_slot_n_ctx` divides by `-np`
+  only in the unified case, driven by the flag parsed out of `server_command`
+  (`-kvu`/`--kv-unified`, undone by `-no-kvu`/`--no-kv-unified`). Two
+  consequences to re-check after a llama.cpp bump: (a) if a build ever flips the
+  default to unified **with** an explicit `-np`, the parse-based detection is
+  blind to it — re-run the one-curl check; (b) cImp cannot see
+  `LLAMA_ARG_KV_UNIFIED` set in the environment instead of on the command line.
+  A *remote* unified-KV server has no command to parse — give it a per-slot
+  `declared_context`.
 
 ### Code graph grammars (V9-02)
 

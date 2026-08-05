@@ -44,7 +44,7 @@ fn proxy_base() -> Option<(String, String)> {
 
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};
 use crate::offload::router::{self, BackendView, RouteError, TierHint};
-use crate::offload::server::ServerCommand;
+use crate::offload::server::{per_slot_n_ctx, ServerCommand};
 use crate::offload::tools::{self, ToolCtx};
 use crate::settings::{
     BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, ToolScope,
@@ -867,6 +867,10 @@ struct ResolvedBackend {
     tool_scope: ToolScope,
     slots: u32,
     declared_context: Option<u32>,
+    /// Local backend launched with `--kv-unified`: `/props` then reports the
+    /// FULL shared window instead of the per-slot one, so the probe divides
+    /// it by `slots` (see [`crate::offload::server::per_slot_n_ctx`]).
+    kv_unified: bool,
 }
 
 impl ResolvedBackend {
@@ -891,6 +895,7 @@ impl ResolvedBackend {
                     tool_scope: b.tool_scope.clone(),
                     slots: cmd.parallel.max(1),
                     declared_context: b.declared_context,
+                    kv_unified: cmd.kv_unified,
                 })
             }
             OffloadBackendKind::Remote {
@@ -918,6 +923,9 @@ impl ResolvedBackend {
                     // slot (the user sizes real parallelism on the box).
                     slots: 1,
                     declared_context: b.declared_context,
+                    // No parsed command for a remote endpoint — and with one
+                    // assumed slot there'd be nothing to divide anyway.
+                    kv_unified: false,
                 })
             }
         }
@@ -977,7 +985,9 @@ async fn probe(client: &reqwest::Client, b: &ResolvedBackend) -> (bool, Option<u
                 .and_then(|x| x.as_u64())
                 .or_else(|| v.get("n_ctx").and_then(|x| x.as_u64()))
         })
-        .map(|n| n as u32)
+        // Under `--kv-unified` the reported window is the shared one; the
+        // router budgets one slot. A declared fallback is already per-slot.
+        .map(|n| per_slot_n_ctx(n as u32, b.slots, b.kv_unified))
         .or(b.declared_context);
     let slots = body
         .as_ref()
@@ -1038,6 +1048,7 @@ async fn run_offload(
         let is_cloud = b.is_cloud;
         let declared = b.declared_context;
         let slots = b.slots;
+        let kv_unified = b.kv_unified;
         handles.push(tauri::async_runtime::spawn(async move {
             let rb = ResolvedBackend {
                 name: String::new(),
@@ -1049,6 +1060,7 @@ async fn run_offload(
                 tool_scope: ToolScope::All,
                 slots,
                 declared_context: declared,
+                kv_unified,
             };
             (i, probe(&client, &rb).await)
         }));

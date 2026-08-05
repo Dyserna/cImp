@@ -70,6 +70,12 @@ pub trait Backend: Send + Sync {
     /// The authoritative context window discovered from `/props`
     /// (`n_ctx`), or the configured `declared_context` for endpoints that
     /// don't expose `/props`, or `None` before the first successful probe.
+    ///
+    /// Always **per slot** — what one in-flight request may occupy. Split-KV
+    /// llama-servers report that directly; a `--kv-unified` one reports the
+    /// shared window, which the impl divides by its slot count before
+    /// answering here (see
+    /// [`server::per_slot_n_ctx`](server::per_slot_n_ctx)).
     fn n_ctx(&self) -> Option<u32>;
     /// Parallel slots (`-np`/`--parallel`). The window divides across
     /// these, so each in-flight request gets `n_ctx / slots` tokens.

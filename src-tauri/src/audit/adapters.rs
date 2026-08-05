@@ -654,7 +654,13 @@ mod tests {
     #[test]
     fn semgrep_argv_and_forced_utf8_env() {
         let a = adapter(AuditToolId::Semgrep);
-        let argv = a.full_argv(&root(), None, false, &["--config".into(), "p/ci".into()], "");
+        let argv = a.full_argv(
+            &root(),
+            None,
+            false,
+            &["--config".into(), "p/ci".into()],
+            "",
+        );
         assert_eq!(
             argv,
             vec![
@@ -1001,7 +1007,10 @@ mod tests {
 
     #[test]
     fn default_ruleset_present_only_on_ruleset_tools() {
-        assert_eq!(adapter(AuditToolId::Semgrep).default_ruleset(), Some("auto"));
+        assert_eq!(
+            adapter(AuditToolId::Semgrep).default_ruleset(),
+            Some("auto")
+        );
         assert_eq!(
             adapter(AuditToolId::SemgrepQuality).default_ruleset(),
             Some("p/r2c-best-practices")

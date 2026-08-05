@@ -2163,8 +2163,7 @@ fn migrate_v25_to_v26(value: &mut Value) {
 
     if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
         tabs.retain(|t| {
-            t.get("id").and_then(Value::as_str)
-                != Some(crate::settings::schema::GRAPH_VIEW_TAB_ID)
+            t.get("id").and_then(Value::as_str) != Some(crate::settings::schema::GRAPH_VIEW_TAB_ID)
         });
     }
 
@@ -2209,8 +2208,7 @@ fn migrate_v26_to_v27(value: &mut Value) {
 
     if let Some(Value::Array(tabs)) = root.get_mut("tabs") {
         tabs.retain(|t| {
-            t.get("id").and_then(Value::as_str)
-                != Some(crate::settings::schema::CODE_AUDIT_TAB_ID)
+            t.get("id").and_then(Value::as_str) != Some(crate::settings::schema::CODE_AUDIT_TAB_ID)
         });
     }
 
@@ -2260,24 +2258,18 @@ fn migrate_v27_to_v28(value: &mut Value) {
     ];
 
     if let Some(ui) = root.get_mut("ui").and_then(Value::as_object_mut) {
-        let legacy_accent = ui
-            .get("theme")
-            .and_then(Value::as_str)
-            .and_then(|theme| {
-                LEGACY_TUI_ACCENTS
-                    .iter()
-                    .find(|(id, _)| *id == theme)
-                    .map(|(_, accent)| *accent)
-            });
+        let legacy_accent = ui.get("theme").and_then(Value::as_str).and_then(|theme| {
+            LEGACY_TUI_ACCENTS
+                .iter()
+                .find(|(id, _)| *id == theme)
+                .map(|(_, accent)| *accent)
+        });
         if let Some(accent) = legacy_accent {
             ui.insert(
                 "theme".to_string(),
                 Value::String(crate::theming::TUI_THEME_ID.to_string()),
             );
-            ui.insert(
-                "tui_accent".to_string(),
-                Value::String(accent.to_string()),
-            );
+            ui.insert("tui_accent".to_string(), Value::String(accent.to_string()));
         }
     }
 

@@ -478,7 +478,11 @@ mod tests {
 
         let loaded = load_or_seed_at(&path);
         assert_eq!(loaded, set);
-        assert_eq!(fs::read(&path).unwrap(), before, "file must not be rewritten");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "file must not be rewritten"
+        );
         let _ = fs::remove_dir_all(&dir);
 
         // So is an extra entry appended to an otherwise-pristine set.
@@ -495,7 +499,11 @@ mod tests {
 
         let loaded = load_or_seed_at(&path);
         assert_eq!(loaded, set);
-        assert_eq!(fs::read(&path).unwrap(), before, "file must not be rewritten");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "file must not be rewritten"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -509,7 +517,11 @@ mod tests {
 
         let loaded = load_or_seed_at(&path);
         assert_eq!(loaded, default_patterns());
-        assert_eq!(fs::read(&path).unwrap(), before, "file must not be rewritten");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "file must not be rewritten"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -542,7 +554,10 @@ mod tests {
         let parsed = read_file(&path).unwrap();
         assert!(parsed.patterns.iter().all(|p| p.none_of.is_empty()));
         // …and that raw v0.22.0-era file is recognized as pristine.
-        assert_eq!(pristine_legacy_era(&parsed.patterns), Some("v0.22.0..v0.49.1"));
+        assert_eq!(
+            pristine_legacy_era(&parsed.patterns),
+            Some("v0.22.0..v0.49.1")
+        );
         assert_eq!(load_or_seed_at(&path), default_patterns());
         let _ = fs::remove_dir_all(&dir);
     }

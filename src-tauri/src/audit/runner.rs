@@ -618,8 +618,13 @@ impl AuditState {
             Transport::ReportFile => Some(temp_report_path(tool.id)),
             Transport::Stdout => None,
         };
-        let argv =
-            adapter.full_argv(&root, report_path.as_deref(), git_repo, &tool.extra_args, &tool.ruleset);
+        let argv = adapter.full_argv(
+            &root,
+            report_path.as_deref(),
+            git_repo,
+            &tool.extra_args,
+            &tool.ruleset,
+        );
 
         let cap = spawn_and_capture(&resolved, &argv, adapter.env, &root, timeout, &cancel).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -845,10 +850,7 @@ fn category_label(category: Category) -> &'static str {
 /// never in scope. Returns whether any flag changed. Pure — the settings
 /// write and the auto/manual mode gate live in
 /// [`AuditState::apply_quality_auto_select`].
-pub(crate) fn auto_select_quality(
-    tools: &mut [AuditToolConfig],
-    census: &census::Census,
-) -> bool {
+pub(crate) fn auto_select_quality(tools: &mut [AuditToolConfig], census: &census::Census) -> bool {
     let defaults = crate::settings::default_audit_tools();
     let default_enabled = |id: AuditToolId| {
         defaults
@@ -1560,7 +1562,7 @@ mod tests {
         assert!(enabled(AuditToolId::CargoMachete)); // Cargo.toml
         assert!(enabled(AuditToolId::Knip)); // package.json
         assert!(enabled(AuditToolId::Typos)); // ungated
-        // Default-on but not applicable → deselected.
+                                              // Default-on but not applicable → deselected.
         assert!(!enabled(AuditToolId::Ruff));
         assert!(!enabled(AuditToolId::GolangciLint));
         assert!(!enabled(AuditToolId::Cppcheck));

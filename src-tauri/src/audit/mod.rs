@@ -330,9 +330,7 @@ pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
 /// blocking-task hop. No-op passthrough while the feature is disabled or a
 /// scan is in flight.
 #[tauri::command]
-pub async fn audit_refresh_census(
-    state: State<'_, Arc<AuditState>>,
-) -> AppResult<AuditSnapshot> {
+pub async fn audit_refresh_census(state: State<'_, Arc<AuditState>>) -> AppResult<AuditSnapshot> {
     let audit = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || audit.refresh_census())
         .await

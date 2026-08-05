@@ -1889,9 +1889,11 @@ fn parse_edge_kinds(s: Option<&str>) -> Result<Vec<EdgeKind>, String> {
             "call" | "calls" => out.push(EdgeKind::Call),
             "import" | "imports" => out.push(EdgeKind::Import),
             "contains" | "containment" => out.push(EdgeKind::Contains),
-            other => return Err(format!(
+            other => {
+                return Err(format!(
                 "graph_path `kinds` has unknown edge kind `{other}` (use call, import, contains)"
-            )),
+            ))
+            }
         }
     }
     Ok(if out.is_empty() { all() } else { out })

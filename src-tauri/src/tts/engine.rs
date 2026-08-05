@@ -7,10 +7,10 @@ use std::path::Path;
 
 // `ort::ep` is rc.11's module for execution providers; the old
 // `ort::execution_providers::*ExecutionProvider` aliases are `#[deprecated]`.
-#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
-use ort::ep::CUDA;
 #[cfg(feature = "tts-webgpu")]
 use ort::ep::WebGPU;
+#[cfg(all(feature = "tts-cuda", not(feature = "tts-webgpu")))]
+use ort::ep::CUDA;
 use ort::ep::{ExecutionProvider, CPU};
 use ort::session::{builder::GraphOptimizationLevel, builder::SessionBuilder, Session};
 use ort::value::Tensor;

@@ -178,10 +178,8 @@ pub fn format_result(snapshot: &AuditSnapshot, category: Category) -> String {
 
     // Each tool's wire id, derived once (a serde round-trip) rather than once
     // per rendered finding.
-    let id_strs: HashMap<AuditToolId, String> = tools
-        .iter()
-        .map(|t| (t.id, tool_id_str(&t.id)))
-        .collect();
+    let id_strs: HashMap<AuditToolId, String> =
+        tools.iter().map(|t| (t.id, tool_id_str(&t.id))).collect();
 
     let mut out = String::new();
 
@@ -265,10 +263,7 @@ fn status_line(t: &super::runner::ToolState) -> String {
             plural(t.findings.len()),
             fmt_duration(t.duration_ms)
         ),
-        ToolStatus::Failed => format!(
-            "failed — {}",
-            t.error.as_deref().unwrap_or("unknown error")
-        ),
+        ToolStatus::Failed => format!("failed — {}", t.error.as_deref().unwrap_or("unknown error")),
         ToolStatus::NotInstalled => {
             "not installed (no path configured, not on PATH/ebin)".to_string()
         }
@@ -577,8 +572,8 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checks::{Diag, Severity};
     use crate::audit::runner::{AuditFinding, ToolState};
+    use crate::checks::{Diag, Severity};
 
     // ── descriptor shape ───────────────────────────────────────────────────
 
@@ -586,10 +581,7 @@ mod tests {
     fn descriptors_are_exactly_the_two_zero_arg_tools() {
         let d = tool_descriptors();
         assert_eq!(d.len(), 2, "exactly two audit tools");
-        let names: Vec<&str> = d
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = d.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"security_audit"));
         assert!(names.contains(&"quality_audit"));
         for t in &d {
@@ -611,8 +603,8 @@ mod tests {
     #[test]
     fn descriptions_never_name_an_underlying_tool() {
         const BLACKLIST: &[&str] = &[
-            "gitleaks", "semgrep", "osv", "oxlint", "eslint", "ruff", "cppcheck", "knip",
-            "typos", "pmd", "golangci", "machete", "roslyn", "dotnet",
+            "gitleaks", "semgrep", "osv", "oxlint", "eslint", "ruff", "cppcheck", "knip", "typos",
+            "pmd", "golangci", "machete", "roslyn", "dotnet",
         ];
         for t in tool_descriptors() {
             let desc = t["description"].as_str().unwrap().to_ascii_lowercase();
@@ -629,7 +621,14 @@ mod tests {
 
     // ── format_result ──────────────────────────────────────────────────────
 
-    fn finding(tool: AuditToolId, sev: Severity, code: &str, file: &str, line: u32, msg: &str) -> AuditFinding {
+    fn finding(
+        tool: AuditToolId,
+        sev: Severity,
+        code: &str,
+        file: &str,
+        line: u32,
+        msg: &str,
+    ) -> AuditFinding {
         AuditFinding {
             tool,
             diag: Diag {
@@ -683,10 +682,38 @@ mod tests {
             Category::Security,
             ToolStatus::Done,
             vec![
-                finding(AuditToolId::Semgrep, Severity::Warning, "w1", "b.rs", 2, "warn one"),
-                finding(AuditToolId::Semgrep, Severity::Error, "e1", "a.rs", 1, "err one"),
-                finding(AuditToolId::Semgrep, Severity::Note, "n1", "c.rs", 3, "note one"),
-                finding(AuditToolId::Semgrep, Severity::Error, "e2", "a.rs", 5, "err two"),
+                finding(
+                    AuditToolId::Semgrep,
+                    Severity::Warning,
+                    "w1",
+                    "b.rs",
+                    2,
+                    "warn one",
+                ),
+                finding(
+                    AuditToolId::Semgrep,
+                    Severity::Error,
+                    "e1",
+                    "a.rs",
+                    1,
+                    "err one",
+                ),
+                finding(
+                    AuditToolId::Semgrep,
+                    Severity::Note,
+                    "n1",
+                    "c.rs",
+                    3,
+                    "note one",
+                ),
+                finding(
+                    AuditToolId::Semgrep,
+                    Severity::Error,
+                    "e2",
+                    "a.rs",
+                    5,
+                    "err two",
+                ),
             ],
             1200,
             None,
@@ -694,7 +721,10 @@ mod tests {
         let out = format_result(&snapshot(vec![t]), Category::Security);
 
         // Summary counts.
-        assert!(out.contains("Findings: 4 (2 errors, 1 warning, 1 note)"), "{out}");
+        assert!(
+            out.contains("Findings: 4 (2 errors, 1 warning, 1 note)"),
+            "{out}"
+        );
         // Errors-first: both ERROR lines precede the WARNING, which precedes NOTE.
         let e1 = out.find("err one").unwrap();
         let e2 = out.find("err two").unwrap();
@@ -711,10 +741,38 @@ mod tests {
     #[test]
     fn not_installed_and_skipped_render_as_status_lines() {
         let tools = vec![
-            tool_state(AuditToolId::Gitleaks, Category::Security, ToolStatus::NotInstalled, vec![], 0, None),
-            tool_state(AuditToolId::Semgrep, Category::Security, ToolStatus::SkippedNotApplicable, vec![], 0, None),
-            tool_state(AuditToolId::OsvScanner, Category::Security, ToolStatus::Idle, vec![], 0, None),
-            tool_state(AuditToolId::Semgrep, Category::Security, ToolStatus::Failed, vec![], 0, Some("network unreachable")),
+            tool_state(
+                AuditToolId::Gitleaks,
+                Category::Security,
+                ToolStatus::NotInstalled,
+                vec![],
+                0,
+                None,
+            ),
+            tool_state(
+                AuditToolId::Semgrep,
+                Category::Security,
+                ToolStatus::SkippedNotApplicable,
+                vec![],
+                0,
+                None,
+            ),
+            tool_state(
+                AuditToolId::OsvScanner,
+                Category::Security,
+                ToolStatus::Idle,
+                vec![],
+                0,
+                None,
+            ),
+            tool_state(
+                AuditToolId::Semgrep,
+                Category::Security,
+                ToolStatus::Failed,
+                vec![],
+                0,
+                Some("network unreachable"),
+            ),
         ];
         let out = format_result(&snapshot(tools), Category::Security);
         assert!(out.contains("gitleaks — not installed"), "{out}");
@@ -745,7 +803,9 @@ mod tests {
         )];
         let out = format_result(&snapshot(tools), Category::Security);
         assert!(
-            out.contains("gitleaks — misconfigured — configured path not found: C:\\tools\\gitleaks.exe"),
+            out.contains(
+                "gitleaks — misconfigured — configured path not found: C:\\tools\\gitleaks.exe"
+            ),
             "{out}"
         );
         assert!(out.contains("1 misconfigured"), "{out}");
@@ -753,10 +813,20 @@ mod tests {
 
     #[test]
     fn empty_findings_is_a_clean_summary() {
-        let t = tool_state(AuditToolId::Gitleaks, Category::Security, ToolStatus::Done, vec![], 340, None);
+        let t = tool_state(
+            AuditToolId::Gitleaks,
+            Category::Security,
+            ToolStatus::Done,
+            vec![],
+            340,
+            None,
+        );
         let out = format_result(&snapshot(vec![t]), Category::Security);
         assert!(out.contains("Security audit of /proj/root"), "{out}");
-        assert!(out.contains("Findings: 0 (0 errors, 0 warnings, 0 notes)"), "{out}");
+        assert!(
+            out.contains("Findings: 0 (0 errors, 0 warnings, 0 notes)"),
+            "{out}"
+        );
         assert!(out.contains("No findings."), "{out}");
         assert!(out.contains("done — 0 findings in 340ms"), "{out}");
         // No truncation note on a clean run.
@@ -766,15 +836,35 @@ mod tests {
     #[test]
     fn past_the_cap_a_truncation_note_states_totals() {
         let findings: Vec<AuditFinding> = (0..(MAX_FINDINGS + 100))
-            .map(|i| finding(AuditToolId::Semgrep, Severity::Error, "e", "f.rs", i as u32, "boom"))
+            .map(|i| {
+                finding(
+                    AuditToolId::Semgrep,
+                    Severity::Error,
+                    "e",
+                    "f.rs",
+                    i as u32,
+                    "boom",
+                )
+            })
             .collect();
         let total = findings.len();
-        let t = tool_state(AuditToolId::Semgrep, Category::Security, ToolStatus::Done, findings, 10, None);
+        let t = tool_state(
+            AuditToolId::Semgrep,
+            Category::Security,
+            ToolStatus::Done,
+            findings,
+            10,
+            None,
+        );
         let out = format_result(&snapshot(vec![t]), Category::Security);
         assert!(out.contains("truncated"), "{out}");
         assert!(out.contains(&format!("of {total} findings")), "{out}");
         // The rendered body must not exceed the byte budget (plus the note).
-        assert!(out.len() <= MAX_RESULT_BYTES + 200, "over byte budget: {}", out.len());
+        assert!(
+            out.len() <= MAX_RESULT_BYTES + 200,
+            "over byte budget: {}",
+            out.len()
+        );
     }
 
     // ── loopback line parsing ──────────────────────────────────────────────

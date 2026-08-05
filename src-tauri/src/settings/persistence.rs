@@ -42,13 +42,13 @@ use serde_json::{Map, Value};
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
-    default_ai_tab, default_audit_tools, default_graph_monitor_tab,
-    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab,
-    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
-    PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate, Settings, TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID,
-    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
-    SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
+    default_ai_tab, default_audit_tools, default_graph_monitor_tab, default_shell_1_tab,
+    default_tool_activity_tab, default_workbench_tab, starter_prompt_templates, AiTabId,
+    HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, RemoteBackendTemplate,
+    ServerCommandTemplate, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
+    CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID,
+    OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID,
+    WORKBENCH_TAB_ID,
 };
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
@@ -1407,9 +1407,7 @@ const RETIRED_TAB_IDS: [&str; 4] = [
 /// anything was removed.
 fn drop_retired_tabs(settings: &mut Settings) -> bool {
     let before = settings.tabs.len();
-    settings
-        .tabs
-        .retain(|t| !RETIRED_TAB_IDS.contains(&t.id()));
+    settings.tabs.retain(|t| !RETIRED_TAB_IDS.contains(&t.id()));
     let changed = settings.tabs.len() != before;
     if changed {
         tracing::warn!("integrity: dropped retired reserved tab entry");
@@ -3219,7 +3217,11 @@ mod tests {
         // path lands in the global file via the save() write-through instead.
         let global = base_test_settings();
         let mut current = global.clone();
-        set_tool_path(&mut current, AuditToolId::Gitleaks, "P:\\ebin\\gitleaks.exe");
+        set_tool_path(
+            &mut current,
+            AuditToolId::Gitleaks,
+            "P:\\ebin\\gitleaks.exe",
+        );
 
         let mut cur_v = serde_json::to_value(&current).unwrap();
         let mut base_v = serde_json::to_value(&global).unwrap();
@@ -3245,9 +3247,7 @@ mod tests {
         let delta = diff(&cur2_v, &base_v).expect("enabled flip must diff");
         let tools = delta["code_audit"]["tools"].as_array().unwrap();
         assert!(
-            tools
-                .iter()
-                .all(|t| t["path"].as_str() == Some("")),
+            tools.iter().all(|t| t["path"].as_str() == Some("")),
             "overlay tools entries must carry no path copies: {delta}"
         );
     }
@@ -3332,8 +3332,7 @@ mod tests {
         enforce_global_offload_templates(&mut merged, &global);
         let settings: Settings = serde_json::from_value(merged).unwrap();
         assert_eq!(
-            settings.offload.server_command_templates,
-            global.offload.server_command_templates,
+            settings.offload.server_command_templates, global.offload.server_command_templates,
             "the merged view must take template libraries from the global baseline"
         );
     }

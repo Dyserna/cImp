@@ -1121,30 +1121,33 @@ impl GraphService {
     /// connection no longer in the cache — split writes). Opens are infrequent
     /// and this lock guards nothing on the hot query path, so holding it across
     /// the open is cheap.
+    ///
+    /// The root is CANONICALIZED for both the cache key and the open. Callers
+    /// reach the same project under different spellings — the loopback
+    /// canonicalizes its root to the `\\?\` verbatim form while IPC and the
+    /// taps pass the plain one — and a raw-`PathBuf` key would open a SECOND
+    /// cozo storage over the same SQLite file inside one process, with
+    /// independent locks (the invariant this guards: one file, one handle).
+    /// Same fall-back-to-literal posture as `crate::activity::root_key`.
+    /// Scoped strictly to the `indices` cache: `status`, the watchers and the
+    /// event payloads stay keyed by the caller's original spelling, which is
+    /// what the UI displays.
     fn index_for(&self, root: &Path) -> AppResult<Arc<GraphIndex>> {
-        let root = root.to_path_buf();
-        let (idx, migrated) = {
-            let mut guard = self.indices.lock().unwrap();
-            if let Some(idx) = guard.get(&root).cloned() {
-                return Ok(idx);
-            }
-            let idx = Arc::new(GraphIndex::open(&root, &self.db_subdir())?);
-            // Read (once) whether this open had to reset a stale-schema store.
-            let migrated = idx.take_schema_reset();
-            guard.insert(root.clone(), idx.clone());
-            (idx, migrated)
-        }; // release the indices lock before spawning a rebuild
+        // The caller's spelling is kept for the rebuild hand-off below, which
+        // feeds `status`/watchers/events — those stay caller-keyed.
+        let spelled = root.to_path_buf();
+        let (idx, migrated) = warm_index(&self.indices, root, &self.db_subdir())?;
 
         if migrated {
             // A pre-upgrade store was emptied to fix its shape. Repopulate it now
             // (via the managed service Arc) so a non-launch root touched only by a
             // query or the memory tap doesn't stay silently empty.
             if let Some(svc) = self.app.try_state::<Arc<GraphService>>() {
-                tracing::info!(root = %root.display(), "graph: schema migrated — rebuilding");
+                tracing::info!(root = %spelled.display(), "graph: schema migrated — rebuilding");
                 // Repair work nobody asked for — never announces itself.
                 svc.inner()
                     .clone()
-                    .spawn_rebuild(root, RebuildOrigin::Automatic);
+                    .spawn_rebuild(spelled, RebuildOrigin::Automatic);
             }
         }
         Ok(idx)
@@ -1328,10 +1331,16 @@ impl GraphService {
     /// Every commit hash recorded for `session_id` (git-printed, usually
     /// short — match by prefix), oldest first. Empty on any store error.
     pub fn session_commit_hashes(&self, root: &Path, session_id: &str) -> Vec<String> {
-        let Ok(idx) = self.index_for(root) else {
-            return Vec::new();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: session_commit_hashes open failed");
+                return Vec::new();
+            }
         };
-        idx.session_commit_hashes(session_id).unwrap_or_default()
+        idx.session_commit_hashes(session_id)
+            .inspect_err(|e| debug!(error = %e, "graph: session_commit_hashes failed"))
+            .unwrap_or_default()
     }
 
     /// Recorded commit hashes for every session (session_id → hashes) in one
@@ -1340,20 +1349,31 @@ impl GraphService {
         &self,
         root: &Path,
     ) -> std::collections::HashMap<String, Vec<String>> {
-        let Ok(idx) = self.index_for(root) else {
-            return Default::default();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: session_commit_hashes_all open failed");
+                return Default::default();
+            }
         };
-        idx.session_commit_hashes_all().unwrap_or_default()
+        idx.session_commit_hashes_all()
+            .inspect_err(|e| debug!(error = %e, "graph: session_commit_hashes_all failed"))
+            .unwrap_or_default()
     }
 
     /// The graph's own `(started_ms, last_ms)` window for every session —
     /// the CANONICAL session windows (the `session` relation), fresher than
     /// any frontend snapshot for the live session. Empty on any store error.
     pub fn session_windows(&self, root: &Path) -> std::collections::HashMap<String, (i64, i64)> {
-        let Ok(idx) = self.index_for(root) else {
-            return Default::default();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: session_windows open failed");
+                return Default::default();
+            }
         };
         idx.mem_sessions()
+            .inspect_err(|e| debug!(error = %e, "graph: session_windows failed"))
             .unwrap_or_default()
             .into_iter()
             .map(|s| (s.session_id, (s.started_ms, s.last_ms)))
@@ -1388,38 +1408,60 @@ impl GraphService {
 
     /// Summed token totals for `session_id` ("turn" rows only). Empty
     /// defaults on any store error (graph disabled, session unknown, etc.).
+    /// Best-effort like the wrappers below it, but never SILENT: every
+    /// swallowed store error in this block is traced, so a degraded store is
+    /// diagnosable from the log even where the return type can't carry it.
     pub fn usage_session_totals(&self, root: &Path, session_id: &str) -> UsageTotals {
-        let Ok(idx) = self.index_for(root) else {
-            return UsageTotals::default();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: usage_session_totals open failed");
+                return UsageTotals::default();
+            }
         };
-        idx.usage_session_totals(session_id).unwrap_or_default()
+        idx.usage_session_totals(session_id)
+            .inspect_err(|e| debug!(error = %e, "graph: usage_session_totals failed"))
+            .unwrap_or_default()
     }
 
     /// Per-turn token/tool-char series for `session_id`, oldest → newest.
     pub fn usage_turn_series(&self, root: &Path, session_id: &str) -> Vec<TurnUsage> {
-        let Ok(idx) = self.index_for(root) else {
-            return Vec::new();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: usage_turn_series open failed");
+                return Vec::new();
+            }
         };
-        idx.usage_turn_series(session_id).unwrap_or_default()
+        idx.usage_turn_series(session_id)
+            .inspect_err(|e| debug!(error = %e, "graph: usage_turn_series failed"))
+            .unwrap_or_default()
     }
 
     /// Per-session usage totals + cache-hit ratio + `est_only` for every
-    /// known session under `root` (drives the Usage section's project
-    /// totals table).
-    pub fn usage_all_sessions(&self, root: &Path) -> Vec<SessionUsageRow> {
-        let Ok(idx) = self.index_for(root) else {
-            return Vec::new();
-        };
-        idx.usage_all_sessions().unwrap_or_default()
+    /// known session under `root` (drives the Usage section's project totals
+    /// table). Unlike its sibling wrappers this one PROPAGATES the store
+    /// error instead of defaulting to empty: an open failure and a query
+    /// failure are both `Err`, an empty store is `Ok(vec![])`. That
+    /// distinction is the whole point — a swallowed error renders as
+    /// "0 sessions", which reads as a healthy empty project (see
+    /// `usage_snapshot`'s `store_error`).
+    pub fn usage_all_sessions(&self, root: &Path) -> AppResult<Vec<SessionUsageRow>> {
+        self.index_for(root)?.usage_all_sessions()
     }
 
     /// V14 Phase D: per-tool ranking (est. tokens + call count) for
     /// `session_id`, descending.
     pub fn usage_tool_ranking(&self, root: &Path, session_id: &str) -> Vec<ToolUsage> {
-        let Ok(idx) = self.index_for(root) else {
-            return Vec::new();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: usage_tool_ranking open failed");
+                return Vec::new();
+            }
         };
         idx.usage_tool_ranking(session_id)
+            .inspect_err(|e| debug!(error = %e, "graph: usage_tool_ranking failed"))
             .unwrap_or_default()
             .into_iter()
             .map(|(tool, chars, calls)| ToolUsage {
@@ -1436,17 +1478,30 @@ impl GraphService {
     /// `offload_local_tasks` is left at `0` — the `graph_usage` IPC handler
     /// fills it in from the (separate) `OffloadService`, which this module
     /// has no dependency on.
+    ///
+    /// `store_error` carries the one failure the UI cannot infer from the
+    /// payload: an unopenable/unqueryable store yields the same empty
+    /// `sessions` list as a project that simply has none yet. It is set ONLY
+    /// from the sessions path (open failure or `usage_all_sessions` error) —
+    /// the `current`-session sub-queries stay best-effort defaults (traced,
+    /// not surfaced), because a partial `current` is still a truthful view of
+    /// a working store.
     pub fn usage_snapshot(&self, root: &Path) -> UsageSnapshot {
         let effectiveness = self.effectiveness_totals(root);
-        let Ok(idx) = self.index_for(root) else {
-            return UsageSnapshot {
-                current: None,
-                sessions: Vec::new(),
-                effectiveness,
-                offload_local_tasks: 0,
-                surface: Default::default(),
-                active_session_ids: Vec::new(),
-            };
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: usage_snapshot open failed");
+                return UsageSnapshot {
+                    current: None,
+                    sessions: Vec::new(),
+                    effectiveness,
+                    offload_local_tasks: 0,
+                    surface: Default::default(),
+                    active_session_ids: Vec::new(),
+                    store_error: Some(e.to_string()),
+                };
+            }
         };
         // Reuses the per-root wrapper methods above (not `idx` directly) so
         // this is the one place that consumes them — same "one caller,
@@ -1461,7 +1516,13 @@ impl GraphService {
                 top_tools: self.usage_tool_ranking(root, &sid),
                 session_id: sid,
             });
-        let sessions = self.usage_all_sessions(root);
+        let (sessions, store_error) = match self.usage_all_sessions(root) {
+            Ok(rows) => (rows, None),
+            Err(e) => {
+                debug!(error = %e, "graph: usage_snapshot sessions failed");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
         let active_session_ids =
             self.active_session_ids(&sessions, crate::activity::now_ms() as i64);
         UsageSnapshot {
@@ -1471,6 +1532,7 @@ impl GraphService {
             offload_local_tasks: 0,
             surface: Default::default(),
             active_session_ids,
+            store_error,
         }
     }
 
@@ -1496,17 +1558,28 @@ impl GraphService {
     /// session is unknown (or the graph is off / a store error). Same shape as
     /// one entry of [`Self::usage_all_sessions`].
     pub fn usage_session_row(&self, root: &Path, session_id: &str) -> Option<SessionUsageRow> {
-        let idx = self.index_for(root).ok()?;
-        idx.usage_session_row(session_id).ok().flatten()
+        let idx = self
+            .index_for(root)
+            .inspect_err(|e| debug!(error = %e, "graph: usage_session_row open failed"))
+            .ok()?;
+        idx.usage_session_row(session_id)
+            .inspect_err(|e| debug!(error = %e, "graph: usage_session_row failed"))
+            .ok()
+            .flatten()
     }
 
     /// V24 Phase B: per-model token totals + session/agent origin split for
     /// `session_id`, ordered by tokens desc. Empty on any store error.
     pub fn usage_session_model_totals(&self, root: &Path, session_id: &str) -> Vec<ModelUsage> {
-        let Ok(idx) = self.index_for(root) else {
-            return Vec::new();
+        let idx = match self.index_for(root) {
+            Ok(idx) => idx,
+            Err(e) => {
+                debug!(error = %e, "graph: usage_session_model_totals open failed");
+                return Vec::new();
+            }
         };
         idx.usage_session_model_totals(session_id)
+            .inspect_err(|e| debug!(error = %e, "graph: usage_session_model_totals failed"))
             .unwrap_or_default()
     }
 
@@ -4810,10 +4883,61 @@ fn gitignore_from_globs(root: &Path, globs: &[String]) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
+/// The warm-handle cache core of [`GraphService::index_for`], free of the
+/// `AppHandle` so the keying invariant is directly testable. Returns the
+/// cached-or-freshly-opened handle plus whether THIS open migrated a stale
+/// store. The lock is held across the whole check-open-insert (see
+/// `index_for`'s doc for why), and the canonicalized root is used for both the
+/// key and the open so one SQLite file never backs two cozo storages.
+fn warm_index(
+    indices: &StdMutex<HashMap<PathBuf, Arc<GraphIndex>>>,
+    root: &Path,
+    db_subdir: &str,
+) -> AppResult<(Arc<GraphIndex>, bool)> {
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut guard = indices.lock().unwrap();
+    if let Some(idx) = guard.get(&key).cloned() {
+        return Ok((idx, false));
+    }
+    let idx = Arc::new(GraphIndex::open(&key, db_subdir)?);
+    // Read (once) whether this open had to reset a stale-schema store.
+    let migrated = idx.take_schema_reset();
+    guard.insert(key, idx.clone());
+    Ok((idx, migrated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::GraphSettings;
+
+    /// One project dir reached under two spellings must yield the SAME warm
+    /// handle. The loopback canonicalizes its root (`\\?\P:\…` on Windows)
+    /// while IPC and the taps pass the plain spelling; keying the cache by the
+    /// raw `PathBuf` opened a second cozo storage over the same `graph.db` in
+    /// one process, with independent locks — the flap this guards against.
+    #[test]
+    fn one_root_two_spellings_share_one_warm_handle() {
+        let dir = std::env::temp_dir().join(format!("ckg-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let indices = StdMutex::new(HashMap::new());
+        let sub = ".ckg-test";
+
+        // The plain spelling, then the canonicalized one (which on Windows is
+        // the verbatim `\\?\` form — a different `PathBuf`, same directory).
+        let (plain, _) = warm_index(&indices, &dir, sub).expect("open plain");
+        let canon = std::fs::canonicalize(&dir).expect("canonicalize");
+        assert_ne!(canon, dir, "the two spellings must actually differ");
+        let (verbatim, _) = warm_index(&indices, &canon, sub).expect("open canonical");
+
+        assert!(Arc::ptr_eq(&plain, &verbatim), "one file, one handle");
+        assert_eq!(indices.lock().unwrap().len(), 1, "one cache entry");
+
+        drop(plain);
+        drop(verbatim);
+        indices.lock().unwrap().clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A full rebuild over a tiny on-disk Rust project: the store ends up with
     /// the file's symbols, deleted files don't survive a second build, and the

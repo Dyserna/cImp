@@ -62,6 +62,7 @@
     costRowState,
     costOverrideForIdx,
     isEmptyDetailRow,
+    decideUsageApply,
     costGrandTotal,
     originShareLine,
     FREE_RATES,
@@ -343,21 +344,57 @@
   // next successful apply.
   let advisorError = $state<string | null>(null);
 
+  // A `graph_usage` pass over a LARGE store has been measured at 27–60s —
+  // far longer than the 2s poll below. Without a gate the ticks piled up
+  // unboundedly and landed out of order, so the Sessions list visibly
+  // flapped (loads → clears → loads). `usageInFlight` is the gate: a tick
+  // that fires while the previous fetch is still pending is dropped, not
+  // queued (the interval is a backstop, so the next one is 2s away).
+  let usageInFlight = false;
+  // Belt-and-braces ordering guard. The in-flight gate alone nearly
+  // guarantees it, but `refreshUsage` has other callers than the poll (the
+  // section-switch onclick and `onAppViewShown` below) — a response must
+  // never overwrite state written by a LATER-started request, so stamp each
+  // request and refuse to apply a stamp that's already been superseded.
+  let usageSeq = 0;
+  let usageApplied = 0;
+  // Was the LAST applied tick in the store-error state? Drives the
+  // transition-only notice flash (see `decideUsageApply`).
+  let usageErrored = false;
+
   async function refreshUsage(): Promise<void> {
+    if (usageInFlight) return;
+    usageInFlight = true;
+    const seq = ++usageSeq;
     // Independent fetches — run concurrently so the 2s Overview poll pays
     // one round-trip of wall time, not two. Each keeps its last good value
     // on failure, same as before.
-    const [u, a] = await Promise.all([
-      graphUsage().catch((e) => {
-        console.warn('graph_usage failed', e);
-        return null;
-      }),
-      graphUsageAdvice().catch((e) => {
-        console.warn('graph_usage_advice failed', e);
-        return null;
-      }),
-    ]);
-    if (u) usage = u;
+    let u: UsageSnapshot | null;
+    let a: AdvisorSnapshot | null;
+    try {
+      [u, a] = await Promise.all([
+        graphUsage().catch((e) => {
+          console.warn('graph_usage failed', e);
+          return null;
+        }),
+        graphUsageAdvice().catch((e) => {
+          console.warn('graph_usage_advice failed', e);
+          return null;
+        }),
+      ]);
+    } finally {
+      usageInFlight = false;
+    }
+    if (seq <= usageApplied) return; // superseded by a later-started request
+    usageApplied = seq;
+    // `store_error != null` ⇒ the store couldn't be read this tick, so the
+    // payload (notably its empty `sessions`) is not authoritative: keep the
+    // last-good snapshot on screen and say so once, on entry into the
+    // condition only. A healthy snapshot applies even when empty.
+    const d = decideUsageApply(u, usageErrored);
+    usageErrored = d.errored;
+    if (d.flash) flashSessionNotice('Usage store busy — showing last loaded data.');
+    if (u && d.apply) usage = u;
     if (a) advice = a;
     // V16 Feature 8: the cost view's auto-match price table. Fetched once
     // per view lifetime here (not per poll — prices change rarely); the
@@ -469,6 +506,12 @@
   // Non-reactive key guard = one fetch per advance, and no effect loop when
   // the fetch itself replaces `selectedSession`.
   let selectedFetchKey = '';
+  // Same pile-up hazard as `refreshUsage`: on a slow store the detail fetch
+  // can outlive several `last_ms` advances, and the key guard alone would
+  // start a new one per advance. Skip BEFORE writing the key, so the stale
+  // key survives and the next applied `usage` snapshot re-triggers this
+  // effect and retries — a dropped tick is never a permanently stale card.
+  let selectedFetchInFlight = false;
   $effect(() => {
     const sid = selectedId;
     if (!sid || !selectedSession) return;
@@ -476,11 +519,13 @@
     if (!row) return;
     const key = `${sid}:${row.last_ms}`;
     if (selectedFetchKey === key) return;
+    if (selectedFetchInFlight) return;
     selectedFetchKey = key;
     void refetchSelected(sid);
   });
 
   async function refetchSelected(sid: string): Promise<void> {
+    selectedFetchInFlight = true;
     try {
       const detail = await graphSessionUsage(undefined, sid);
       if (selectedId !== sid) return; // superseded / cleared mid-flight
@@ -489,6 +534,8 @@
       seedCostCustom(detail.per_model);
     } catch (e) {
       console.warn('graph_session_usage (selected refresh) failed', e);
+    } finally {
+      selectedFetchInFlight = false;
     }
   }
 

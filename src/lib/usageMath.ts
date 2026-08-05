@@ -349,6 +349,38 @@ export function isEmptyDetailRow(row: { agent: string; started_ms: number }): bo
   return row.agent === '' && row.started_ms === 0;
 }
 
+/// What the Overview poll should do with an arriving `graph_usage`
+/// snapshot, given whether the PREVIOUS tick was already in the
+/// store-error state. Pure so the "empty is not absent" rule is testable
+/// without mounting `CodeIntelligenceView`.
+export interface UsageApplyDecision {
+  /// Assign the snapshot to `usage` (false ⇒ keep the last-good one).
+  apply: boolean;
+  /// The store-error flag to carry into the next tick.
+  errored: boolean;
+  /// Flash the transient notice NOW — true only on the TRANSITION into the
+  /// error state, so a store that stays broken at the 2s cadence doesn't
+  /// re-flash 30 times a minute.
+  flash: boolean;
+}
+
+/// `snap === null` means the IPC call itself failed (already logged by the
+/// caller): keep the last-good snapshot and leave the error-state machine
+/// untouched — a transport hiccup is not the store-busy condition the
+/// notice describes. `store_error != null` means the backend read the store
+/// and failed, so the payload is non-authoritative (its empty `sessions` is
+/// an artifact, not data) — don't apply it, and flash on entry. Anything
+/// else is authoritative and applies, INCLUDING a `store_error: null`
+/// snapshot with zero sessions (a genuinely empty store must render as 0).
+export function decideUsageApply(
+  snap: { store_error?: string | null } | null,
+  prevErrored: boolean,
+): UsageApplyDecision {
+  if (!snap) return { apply: false, errored: prevErrored, flash: false };
+  if (snap.store_error != null) return { apply: false, errored: true, flash: !prevErrored };
+  return { apply: true, errored: false, flash: false };
+}
+
 /// The Cost card's grand total — the sum of every model row's
 /// `sessionCost(...).total` at that row's chosen rates. `rates(i)` supplies
 /// the i-th model's selected rates. Pure so the footer figure is testable

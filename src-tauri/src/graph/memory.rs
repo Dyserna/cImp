@@ -13,6 +13,13 @@ use serde::Serialize;
 /// Newest-session cap: sessions beyond this (by `last_ms`) are evicted, cascading
 /// their events and unpinned notes.
 pub const MAX_SESSIONS_PER_ROOT: usize = 20;
+
+/// Idle-session retention, in days: a session whose `last_ms` is older than
+/// this is dropped (with its `usage_stat` + `mem_event` rows) on every store
+/// open. A hard constant, NOT a setting — the Sessions list's cost scales with
+/// the rows kept and month-old session history has no consumer. Independent of
+/// [`MAX_SESSIONS_PER_ROOT`]: that cap bounds the count, this bounds the age.
+pub const SESSION_RETENTION_DAYS: u64 = 30;
 /// Per-session event ring cap: only the newest this-many `mem_event`s are kept.
 pub const MAX_EVENTS_PER_SESSION: i64 = 500;
 
@@ -454,6 +461,14 @@ pub struct UsageSnapshot {
     /// this marks EVERY live session (a Claude tab and an OpenCode tab on the
     /// same project both show).
     pub active_session_ids: Vec<String>,
+    /// The store error that made `sessions` empty, or `None` when the list is
+    /// honest. Empty-is-not-absent: a project with no sessions yet and a
+    /// project whose `graph.db` could not be opened/queried both render an
+    /// empty list, and only this field tells them apart — the Overview shows
+    /// "no sessions yet" for `None` and surfaces the failure otherwise, rather
+    /// than reporting a swallowed error as "0 sessions". Wire contract:
+    /// `store_error: string | null` (serde emits the field name as-is).
+    pub store_error: Option<String>,
 }
 
 /// Map an agent tool name/id to a memory event `kind` + the argument key that

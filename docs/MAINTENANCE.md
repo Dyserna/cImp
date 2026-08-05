@@ -492,7 +492,25 @@ cargo/npm — check their sources manually.
   child opens `graph.db` **read-only** and must never take a second writable
   cross-process handle — two writers on the SQLite backend is a
   lock-contention/corruption risk, and the service comment at
-  `graph/service.rs:1073` marks the seam.
+  `graph/service.rs:1073` marks the seam. Two corollaries added 2026-08-06:
+  the warm cache canonicalizes its root key (`warm_index`), because callers
+  reach one project under two spellings (loopback's `\\?\` verbatim form vs
+  the plain IPC/tap one) and a raw-`PathBuf` key silently opened a second
+  in-process cozo storage over the same file; and the 30-day retention sweep
+  (next bullet) runs from `GraphIndex::open` ONLY — `open_existing` is the
+  read-only consumers' path and must never gain a write, so its lack of the
+  sweep is deliberate, not an asymmetry to fix.
+- **Session-detail retention (added 2026-08-06):** sessions idle longer than
+  `SESSION_RETENTION_DAYS` (30, `graph/memory.rs`) are purged at warm open —
+  `session` row plus `usage_stat`/`mem_event`/`mem_note`/`session_distilled`
+  rows; `session_commit` (Workbench provenance) is deliberately kept. So "old
+  sessions missing from the Usage panel" is by design, and the "memory
+  relations are not re-derivable" caveat above now applies to the trailing
+  30-day window, not all history. Query shape note: per-session reads bind
+  the session inline in the relation atom (`*usage_stat{session_id: $sid,…}`)
+  — a cozo prefix seek; the post-filter form (`, session_id == $sid`) full-
+  scans the relation (measured 10× slower, 27.6s→1.4s on a real 166 MB
+  store) and must not come back in new per-session CozoScript.
 - **Succession plan (decided 2026-08-05 — do not re-litigate on a routine
   run):** staying on cozo is deliberate; dormancy also means no
   storage-format churn, and cImp is unaffected by cozo's broken graph
@@ -504,7 +522,7 @@ cargo/npm — check their sources manually.
   after the Apple acquisition; redb/sled single-process, which breaks the
   `--offload-mcp` read-only child; SurrealDB/Oxigraph poor fit). The
   migration surface is deliberately small: the entire cozo/CozoScript
-  surface lives behind `GraphIndex` in `graph/index.rs` (~44 query call
+  surface lives behind `GraphIndex` in `graph/index.rs` (~48 query call
   sites) — keep it that way; new CozoScript outside that file grows the
   eventual migration. **The triggers that should actually start the
   migration: a security advisory in cozo's frozen dependency tree that

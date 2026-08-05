@@ -622,6 +622,12 @@ export interface UsageSnapshot {
   /// Sessions list's active markers. Deduped; marks EVERY live session, not
   /// just the single most-recent `current`.
   active_session_ids: string[];
+  /// Non-null ⇒ the store could not be read this tick, so this snapshot is
+  /// NOT authoritative (`sessions` may be empty purely because the read
+  /// failed). Consumers must keep their last-good snapshot instead of
+  /// applying this one. `null` with an empty `sessions` is a genuine empty
+  /// store and MUST render as 0 — empty is not absent.
+  store_error: string | null;
 }
 
 /// The Usage section's token X-ray for `root` (defaults to the launch

@@ -113,6 +113,16 @@ async fn serve() {
         tokio::spawn(async move { events_relay(stdout).await });
     }
 
+    // V30 Phase 0 channel spike — remove when #15 spike concludes.
+    // Inert unless `CIMP_CHANNEL_SPIKE` names a trigger file: publishes the
+    // shared stdout for `spike_slow_progress` and starts the channel pusher,
+    // which holds its own clone exactly like the `/events` relay above.
+    if let Some(trigger) = spike_trigger_path() {
+        let _ = SPIKE_STDOUT.set(stdout.clone());
+        let stdout = stdout.clone();
+        tokio::spawn(async move { spike_push_task(stdout, trigger).await });
+    }
+
     // The shared stdio JSON-RPC loop (`mcp_stdio`): spawns each request so
     // multiple in-flight tool calls run concurrently (two parallel
     // `offload_task`s must occupy both llama-server slots at once), captures
@@ -131,11 +141,22 @@ async fn handle_owned(method: String, params: Value) -> Result<Value, (i64, Stri
 /// `Err((code, message))` for a JSON-RPC error object.
 async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
     match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": true } },
-            "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
-        })),
+        "initialize" => {
+            // The client's own `capabilities` (and `clientInfo`) arrive in
+            // `params` and are deliberately discarded — this child advertises a
+            // fixed surface. Channel support is a SERVER declaration, so the
+            // spike needs no client-capability parsing.
+            let mut result = json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": { "listChanged": true } },
+                "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
+            });
+            // V30 Phase 0 channel spike — remove when #15 spike concludes.
+            if spike_enabled() {
+                spike_decorate_initialize(&mut result);
+            }
+            Ok(result)
+        }
         "ping" => Ok(json!({})),
         "tools/list" => {
             let mut tools = Vec::new();
@@ -152,11 +173,24 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
             // Claude-Code-exposed MCP servers (those with `claude_access`),
             // proxied through the app's warm host. Empty when the app is down.
             tools.extend(proxy_mcp_list().await);
+            // V30 Phase 0 channel spike — remove when #15 spike concludes.
+            if spike_enabled() {
+                tools.extend(spike_tools());
+            }
             Ok(json!({ "tools": tools }))
         }
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name.starts_with("graph_") || name.starts_with("context_") || name == "run_check" {
+            // V30 Phase 0 channel spike — remove when #15 spike concludes.
+            // Dispatched here (not in `handle_tools_call`) because the progress
+            // probe needs the REQUEST-level `params._meta.progressToken`, which
+            // this is the last place to still hold intact.
+            if spike_enabled() && name.starts_with("spike_") {
+                handle_spike_tool(name, &params).await
+            } else if name.starts_with("graph_")
+                || name.starts_with("context_")
+                || name == "run_check"
+            {
                 // Graph + session-memory tools, plus `run_check` (V12 Phase A —
                 // independent of the graph, but shares this dispatch surface).
                 // Warm path: let the app's single index serve it (no second
@@ -868,17 +902,305 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
 /// The SSE marker the app emits for a capability change.
 const SSE_CHANGE: &[u8] = b"event: change";
 
-/// Write a `tools/list_changed` notification on the shared stdout pipe.
-async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
-    let frame = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/tools/list_changed"
-    })
-    .to_string();
+/// Build one JSON-RPC **notification** frame (no `id`, so no response is ever
+/// expected). Pure — separated from the write so the exact wire shape is
+/// unit-testable; `params` is omitted entirely when `None`, which is what a
+/// bare `tools/list_changed` needs.
+fn notification_frame(method: &str, params: Option<Value>) -> Value {
+    let mut frame = json!({ "jsonrpc": "2.0", "method": method });
+    if let (Some(p), Some(map)) = (params, frame.as_object_mut()) {
+        map.insert("params".to_string(), p);
+    }
+    frame
+}
+
+/// Write one unsolicited JSON-RPC notification on the shared stdout pipe.
+///
+/// This is the child's single out-of-band write path (see the `mcp_stdio`
+/// module docs): the caller holds its own clone of the shared stdout mutex, so
+/// a notification can never interleave with a response frame. Best-effort — a
+/// failed write means the host closed the pipe, which the request loop's own
+/// shutdown guard detects.
+async fn emit_notification(
+    stdout: &Arc<TokioMutex<tokio::io::Stdout>>,
+    method: &str,
+    params: Option<Value>,
+) {
+    let frame = notification_frame(method, params).to_string();
     let mut out = stdout.lock().await;
     let _ = out.write_all(frame.as_bytes()).await;
     let _ = out.write_all(b"\n").await;
     let _ = out.flush().await;
+}
+
+/// Write a `tools/list_changed` notification on the shared stdout pipe.
+async fn emit_list_changed(stdout: &Arc<TokioMutex<tokio::io::Stdout>>) {
+    emit_notification(stdout, "notifications/tools/list_changed", None).await;
+}
+
+// ── V30 Phase 0 channel spike ──────────────────────────────────────────────
+//
+// V30 Phase 0 channel spike — remove when #15 spike concludes.
+//
+// Everything below is inert unless `CIMP_CHANNEL_SPIKE` is set to a non-empty
+// path: with the var unset the handshake, the tool list, the dispatch, and the
+// spawned tasks are byte-identical to the pre-spike child. The spike answers
+// two questions for issue #15:
+//
+//   1. does Claude Code actually deliver `notifications/claude/channel` pushed
+//      by a stdio MCP child into a live session (declared via
+//      `capabilities.experimental["claude/channel"]` + `instructions` on the
+//      2025-06-18 handshake, which is the era where channels are honoured —
+//      PROTOCOL_VERSION must NOT be bumped);
+//   2. does Claude Code auto-background an MCP tool call past ~2min
+//      (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`), and do `notifications/progress`
+//      frames reset that stall timer (`spike_slow` vs `spike_slow_progress`).
+
+/// Env var gating the whole spike. Its value is the path of the *trigger file*
+/// the push task watches; unset or empty means the spike is off.
+const SPIKE_ENV: &str = "CIMP_CHANNEL_SPIKE";
+
+/// Injected into Claude's system prompt via the top-level `instructions` field
+/// of the `initialize` result, so a delivered channel message is echoed back
+/// verbatim and delivery can be verified from the transcript alone.
+const SPIKE_INSTRUCTIONS: &str = "cimp-offload may push out-of-band notices as <channel source=\"cimp-offload\"> messages (V30 spike). When one arrives, explicitly acknowledge it and repeat its content and meta attributes verbatim so delivery can be verified.";
+
+/// The shared stdout handle, republished for the spike tools.
+///
+/// The shared dispatch (`mcp_stdio::serve`) hands a handler only
+/// `(method, params)` — it has no stdout — so `spike_slow_progress`, which must
+/// emit `notifications/progress` *while* its own `tools/call` is still in
+/// flight, picks the mutex up from here. Set once in [`serve`], and only when
+/// the spike is enabled.
+static SPIKE_STDOUT: std::sync::OnceLock<Arc<TokioMutex<tokio::io::Stdout>>> =
+    std::sync::OnceLock::new();
+
+/// The trigger-file path when the spike is enabled, else `None`. The file need
+/// not exist yet — the push task treats its appearance as the first change.
+fn spike_trigger_path() -> Option<std::path::PathBuf> {
+    let raw = std::env::var(SPIKE_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Whether the V30 channel spike is armed for this child.
+fn spike_enabled() -> bool {
+    spike_trigger_path().is_some()
+}
+
+/// Add the experimental channel capability + the top-level `instructions`
+/// string to an otherwise-unchanged `initialize` result. Pure, so a test can
+/// pin both the addition and the untouched base (notably `protocolVersion`).
+fn spike_decorate_initialize(result: &mut Value) {
+    result["capabilities"]["experimental"] = json!({ "claude/channel": {} });
+    result["instructions"] = Value::String(SPIKE_INSTRUCTIONS.to_string());
+}
+
+/// The two spike tool descriptors, appended to `tools/list` only while the
+/// spike is armed. Same descriptor shape as `offload_task` / `offload_batch`.
+fn spike_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "spike_slow",
+            "description": "V30 spike probe (temporary): sleeps server-side for `seconds` and returns a confirmation string. It does no work and emits no progress notifications — its only purpose is to exercise this client's long-running MCP tool-call behaviour (auto-backgrounding past ~2 minutes). Safe to call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "number",
+                        "description": "How long to sleep before returning. Default 150 (just over the 2-minute auto-background threshold); clamped to 1–600."
+                    }
+                }
+            }
+        }),
+        json!({
+            "name": "spike_slow_progress",
+            "description": "V30 spike probe (temporary): identical to `spike_slow`, but emits a `notifications/progress` frame every `interval` seconds while it sleeps, provided the call carried a `progressToken`. Its purpose is to test whether progress notifications keep a long tool call in the foreground. Safe to call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "number",
+                        "description": "How long to sleep before returning. Default 150; clamped to 1–600."
+                    },
+                    "interval": {
+                        "type": "number",
+                        "description": "Seconds between progress notifications. Default 15; clamped to 1–600."
+                    }
+                }
+            }
+        }),
+    ]
+}
+
+/// Read one clamped whole-second argument from a spike tool's `arguments`.
+/// A missing, non-numeric, or out-of-range value degrades to the default /
+/// nearest bound rather than erroring — a spike probe must never fail on input.
+fn spike_secs(args: &Value, key: &str, default: u64, lo: u64, hi: u64) -> u64 {
+    args.get(key)
+        .and_then(|v| v.as_f64())
+        .filter(|f| f.is_finite())
+        .map(|f| f.round().clamp(lo as f64, hi as f64) as u64)
+        .unwrap_or(default)
+        .clamp(lo, hi)
+}
+
+/// Dispatch a `spike_*` tool call. Reached only while the spike is armed.
+async fn handle_spike_tool(name: &str, params: &Value) -> Result<Value, (i64, String)> {
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let seconds = spike_secs(&args, "seconds", 150, 1, 600);
+    let pid = std::process::id();
+    let text = match name {
+        "spike_slow" => {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            format!("spike_slow completed after {seconds}s (pid {pid})")
+        }
+        "spike_slow_progress" => {
+            let interval = spike_secs(&args, "interval", 15, 1, 600);
+            // MCP puts the progress token on the REQUEST's `params._meta`, and
+            // `mcp_stdio::serve` forwards `params` whole — so it is already
+            // here, no threading needed. Its type is opaque (string or int):
+            // echo it back verbatim.
+            let token = params
+                .get("_meta")
+                .and_then(|m| m.get("progressToken"))
+                .filter(|t| !t.is_null())
+                .cloned();
+            match (token, SPIKE_STDOUT.get()) {
+                (Some(token), Some(stdout)) => {
+                    let mut elapsed = 0u64;
+                    while elapsed + interval < seconds {
+                        tokio::time::sleep(Duration::from_secs(interval)).await;
+                        elapsed += interval;
+                        emit_notification(
+                            stdout,
+                            "notifications/progress",
+                            Some(json!({
+                                "progressToken": token,
+                                "progress": elapsed,
+                                "total": seconds
+                            })),
+                        )
+                        .await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(seconds - elapsed)).await;
+                    let sent = elapsed / interval;
+                    format!(
+                        "spike_slow_progress completed after {seconds}s (pid {pid}) \
+                         — sent {sent} progress notifications, one every {interval}s"
+                    )
+                }
+                (Some(_), None) => {
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    format!(
+                        "spike_slow_progress completed after {seconds}s (pid {pid}) \
+                         (progressToken received but the shared stdout handle was unavailable \
+                         — no notifications were sent)"
+                    )
+                }
+                (None, _) => {
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    format!(
+                        "spike_slow_progress completed after {seconds}s (pid {pid}) \
+                         (no progressToken received — client did not request progress)"
+                    )
+                }
+            }
+        }
+        _ => return Err((-32602, format!("unknown tool: {name}"))),
+    };
+    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+}
+
+/// Long-lived spike task: push one automatic channel message shortly after
+/// startup, then push the trigger file's contents every time it changes.
+///
+/// Holds its own clone of the shared stdout mutex, exactly like
+/// [`events_relay`] — that is the sanctioned way to write out of band here.
+async fn spike_push_task(stdout: Arc<TokioMutex<tokio::io::Stdout>>, trigger: std::path::PathBuf) {
+    /// Late enough that the session has finished its handshake and the user is
+    /// mid-turn when it lands (the point is an UNSOLICITED push).
+    const AUTO_DELAY: Duration = Duration::from_secs(20);
+    const POLL: Duration = Duration::from_secs(2);
+
+    tokio::time::sleep(AUTO_DELAY).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    spike_push(
+        &stdout,
+        &format!("spike auto push: pid={} t={now}", std::process::id()),
+        "spike_auto",
+        0,
+    )
+    .await;
+
+    // Baseline the trigger's mtime so a file that ALREADY exists at startup is
+    // not mistaken for a change; `None` (absent) is a valid baseline, so the
+    // file simply appearing counts as the first trigger.
+    let mut last = spike_mtime(&trigger).await;
+    let mut seq = 1u64;
+    loop {
+        tokio::time::sleep(POLL).await;
+        let current = spike_mtime(&trigger).await;
+        if current == last {
+            continue;
+        }
+        last = current;
+        if current.is_none() {
+            continue; // the file was deleted — nothing to push
+        }
+        // `tokio::fs` (not `std::fs`): this child runs a CURRENT-THREAD runtime
+        // shared with in-flight tool calls, so the poll must not block it.
+        match tokio::fs::read_to_string(&trigger).await {
+            Ok(body) => {
+                let body = body.trim();
+                if body.is_empty() {
+                    eprintln!(
+                        "cimp-offload channel spike: {} changed but is empty — nothing pushed",
+                        trigger.display()
+                    );
+                    continue;
+                }
+                spike_push(&stdout, body, "spike_file", seq).await;
+                seq += 1;
+            }
+            Err(e) => eprintln!(
+                "cimp-offload channel spike: failed to read {}: {e}",
+                trigger.display()
+            ),
+        }
+    }
+}
+
+/// The trigger file's modification time, or `None` when it is absent or
+/// unreadable (both mean "no change to report" for the poller).
+async fn spike_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    tokio::fs::metadata(path).await.ok()?.modified().ok()
+}
+
+/// Push one `notifications/claude/channel` frame. `meta` keys must match
+/// `^[a-zA-Z_][a-zA-Z0-9_]*$` or the client silently drops them, and values are
+/// sent as strings (hence `seq` is stringified).
+async fn spike_push(
+    stdout: &Arc<TokioMutex<tokio::io::Stdout>>,
+    content: &str,
+    kind: &str,
+    seq: u64,
+) {
+    emit_notification(
+        stdout,
+        "notifications/claude/channel",
+        Some(json!({
+            "content": content,
+            "meta": { "kind": kind, "seq": seq.to_string() }
+        })),
+    )
+    .await;
 }
 
 /// A backend resolved from config to a connectable endpoint, before the
@@ -1370,6 +1692,126 @@ mod tests {
         assert_eq!(schemas[0], Some(json!({ "type": "object" })));
         assert_eq!(schemas[1], None);
         assert_eq!(schemas[2], Some(json!({ "type": "array" })));
+    }
+
+    /// The `emit_list_changed` → `emit_notification` refactor must not have
+    /// changed one byte on the wire: a params-less notification carries NO
+    /// `params` key at all.
+    #[test]
+    fn notification_frame_matches_the_pre_refactor_wire_shape() {
+        assert_eq!(
+            notification_frame("notifications/tools/list_changed", None).to_string(),
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#
+        );
+        let with_params =
+            notification_frame("notifications/progress", Some(json!({ "progress": 1 })));
+        assert_eq!(with_params["params"]["progress"], json!(1));
+        assert_eq!(with_params["jsonrpc"], "2.0");
+    }
+
+    // ── V30 Phase 0 channel spike — remove when #15 spike concludes. ──────
+
+    /// The spike decoration adds the experimental channel capability and the
+    /// `instructions` string WITHOUT disturbing the rest of the handshake —
+    /// notably `protocolVersion`, which must stay on the legacy era where
+    /// Claude Code honours channels, and `tools.listChanged`.
+    #[test]
+    fn spike_initialize_adds_channel_capability_only() {
+        let mut result = json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": { "tools": { "listChanged": true } },
+            "serverInfo": { "name": SERVER_NAME, "version": "test" }
+        });
+        spike_decorate_initialize(&mut result);
+        assert_eq!(result["protocolVersion"], "2025-06-18");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(true));
+        assert!(result["capabilities"]["experimental"]["claude/channel"].is_object());
+        assert!(result["instructions"]
+            .as_str()
+            .is_some_and(|s| s.contains("<channel source=\"cimp-offload\">")));
+    }
+
+    /// The channel push frame the spike sends: method, content, and meta keys
+    /// that satisfy the client's `^[a-zA-Z_][a-zA-Z0-9_]*$` filter (others are
+    /// silently dropped) with string values.
+    #[test]
+    fn spike_channel_frame_shape() {
+        let frame = notification_frame(
+            "notifications/claude/channel",
+            Some(json!({
+                "content": "hello",
+                "meta": { "kind": "spike_file", "seq": "3" }
+            })),
+        );
+        assert_eq!(frame["method"], "notifications/claude/channel");
+        assert_eq!(frame["params"]["content"], "hello");
+        let meta = frame["params"]["meta"].as_object().unwrap();
+        for (k, v) in meta {
+            assert!(
+                k.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "meta key `{k}` would be dropped by the client"
+            );
+            assert!(v.is_string(), "meta value for `{k}` must be a string");
+        }
+    }
+
+    #[test]
+    fn spike_tools_are_well_formed() {
+        let tools = spike_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(names, vec!["spike_slow", "spike_slow_progress"]);
+        for t in &tools {
+            // Same descriptor shape as offload_task/offload_batch, and the
+            // `spike_` prefix the dispatch switches on.
+            assert!(t["name"].as_str().unwrap().starts_with("spike_"));
+            assert!(!t["description"].as_str().unwrap_or_default().is_empty());
+            assert_eq!(t["inputSchema"]["type"], "object");
+            assert!(t["inputSchema"]["properties"]["seconds"].is_object());
+        }
+        assert!(tools[1]["inputSchema"]["properties"]["interval"].is_object());
+    }
+
+    #[test]
+    fn spike_secs_defaults_and_clamps() {
+        let d = |v: Value| spike_secs(&v, "seconds", 150, 1, 600);
+        assert_eq!(d(Value::Null), 150);
+        assert_eq!(d(json!({})), 150);
+        assert_eq!(d(json!({ "seconds": "nope" })), 150);
+        assert_eq!(d(json!({ "seconds": 30 })), 30);
+        assert_eq!(d(json!({ "seconds": 30.6 })), 31);
+        assert_eq!(d(json!({ "seconds": 0 })), 1);
+        assert_eq!(d(json!({ "seconds": -5 })), 1);
+        assert_eq!(d(json!({ "seconds": 9999 })), 600);
+        assert_eq!(d(json!({ "seconds": f64::INFINITY })), 150);
+    }
+
+    /// The progress token rides on the REQUEST's `params._meta`, which the
+    /// shared dispatch forwards whole — pin that read so a future change to
+    /// `mcp_stdio::serve`'s params handling is caught here.
+    #[test]
+    fn spike_reads_progress_token_from_request_meta() {
+        let params = json!({
+            "name": "spike_slow_progress",
+            "arguments": { "seconds": 30 },
+            "_meta": { "progressToken": "abc-1" }
+        });
+        let token = params
+            .get("_meta")
+            .and_then(|m| m.get("progressToken"))
+            .filter(|t| !t.is_null())
+            .cloned();
+        assert_eq!(token, Some(json!("abc-1")));
+        let without = json!({ "name": "spike_slow_progress", "arguments": {} });
+        assert!(without
+            .get("_meta")
+            .and_then(|m| m.get("progressToken"))
+            .is_none());
     }
 
     #[test]

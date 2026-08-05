@@ -1,8 +1,10 @@
 # V29 — xterm 6.0 renderer migration (canvas → WebGL)
 
-**Status:** IMPLEMENTED (2026-08-05) — live verification below still
-pending. Closes GitHub issue #20 (D-7 from the 2026-08-04 maintenance run;
-GH milestone 3).
+**Status:** LIVE-VERIFIED (2026-08-05) — dev-build session: terminal
+renders on WebGL, shell + AI tabs and renderer behavior user-tested clean
+(the devtools context-loss recipe in §5 remains best-effort/unexercised).
+Closed GitHub issue #20 (D-7 from the 2026-08-04 maintenance run;
+GH milestone 3). Implemented in 1cf4049.
 **Forced by upstream:** xterm 6.0 deleted the canvas renderer entirely —
 `@xterm/addon-canvas` was removed from the monorepo, is peer-locked to 5.x,
 and has been unpublished since 2024. cImp loads `CanvasAddon`

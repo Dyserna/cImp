@@ -21,6 +21,7 @@
 //! Dispatched in `main()` before Tauri init, exactly like `--statusline`,
 //! so it stays GUI-free and fast to spawn.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -153,6 +154,78 @@ fn client_init() -> Option<&'static ClientInit> {
     CLIENT_INIT.get()
 }
 
+// ── V30 Phase B: handshake facts the `/events` relay needs ─────────────────
+
+/// Whether this child ACTUALLY put `capabilities.experimental["claude/channel"]`
+/// on the wire at `initialize`.
+///
+/// Recorded from the handshake itself rather than re-derived from settings at
+/// use time: `session_push_enabled()` reads the settings files off disk, so a
+/// toggle flipped after the handshake would make the two disagree — and the
+/// half that matters is what the *client* was told. A push to a host that never
+/// negotiated channels is silently dropped client-side (Phase 0, T6), so this
+/// flag is what stops the child manufacturing a notification into the void.
+static CHANNEL_DECLARED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the `initialize` handler has run at all.
+static INITIALIZE_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Wake-up for [`await_initialize`], signalled once the handshake is recorded.
+fn initialize_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Record the handshake outcome and release the `/events` relay.
+///
+/// Write-once, like [`record_client_init`]: MCP allows exactly one `initialize`
+/// per connection, and a second one must not be able to flip the capability the
+/// session was actually established with — the relay has already baked that
+/// answer into its `channels=` subscription by then.
+fn record_channel_declaration(declared: bool) {
+    if INITIALIZE_SEEN.load(Ordering::Acquire) {
+        return;
+    }
+    CHANNEL_DECLARED.store(declared, Ordering::Release);
+    INITIALIZE_SEEN.store(true, Ordering::Release);
+    initialize_notify().notify_waiters();
+}
+
+/// Whether a `claude/channel` notification from this child would be honoured.
+fn channel_declared() -> bool {
+    CHANNEL_DECLARED.load(Ordering::Acquire)
+}
+
+/// Block until the `initialize` handler has run (bounded).
+///
+/// The relay is spawned at [`serve`] start, *before* the client's `initialize`
+/// arrives, so connecting immediately would register this child with
+/// `channels=0` for the life of that connection — and the app would never push
+/// to a tab that is in fact channel-capable. Waiting costs nothing: the
+/// handshake is the first frame a client sends, typically within milliseconds.
+///
+/// Each wake re-checks the flag rather than trusting the wake-up, which closes
+/// the race where `initialize` lands between the load and the `notified()`
+/// registration (`notify_waiters` only reaches waiters already registered). The
+/// bound means a client that never handshakes (or a hand-run child) still gets
+/// its `tools/list_changed` relay — just with no channel identity.
+async fn await_initialize() {
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    const POLL: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + MAX_WAIT;
+    while !INITIALIZE_SEEN.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "cimp-offload: no `initialize` within {}s — subscribing to /events without \
+                 channel identity",
+                MAX_WAIT.as_secs()
+            );
+            return;
+        }
+        let _ = tokio::time::timeout(POLL, initialize_notify().notified()).await;
+    }
+}
+
 /// Entry point for `cimp --offload-mcp [--consumer <name>] [--tab <tab-id>]`.
 /// Builds a current-thread tokio runtime and serves the stdio loop until stdin
 /// closes. `consumer` selects which MCP-server set the app proxies to this child
@@ -257,6 +330,11 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                     consumer()
                 );
             }
+            // V30 Phase B: publish the handshake outcome — it is both this
+            // child's push gate and the `channels=` identity it registers with
+            // on `/events` (whose relay is parked in `await_initialize` until
+            // exactly this point).
+            record_channel_declaration(declared);
             Ok(result)
         }
         "ping" => Ok(json!({})),
@@ -949,8 +1027,13 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
 }
 
 /// Long-lived task: while the app's loopback endpoint is reachable, hold a
-/// `GET /events` SSE connection and relay each `change` event to Claude as a
-/// `notifications/tools/list_changed`. Reconnects when the app comes/goes.
+/// `GET /events` SSE connection and dispatch its frames —
+///
+/// - `change` → `notifications/tools/list_changed` (the pre-V30 pulse);
+/// - `push` → `notifications/claude/channel` (V30 Phase B), built from the
+///   semantic payload the app addressed at THIS child's tab.
+///
+/// Reconnects when the app comes/goes.
 async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
     // Build the client once and reuse it across reconnects — the old code
     // rebuilt a fresh reqwest::Client on every 2s retry (~1800/hr while the app
@@ -958,40 +1041,39 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
     let Ok(client) = reqwest::Client::builder().build() else {
         return;
     };
+    // V30 Phase B: the subscription carries this child's identity, and the
+    // `channels` half of it only exists once the handshake has happened. This
+    // task is spawned before the client's `initialize` arrives, so park here
+    // until it has (bounded — see `await_initialize`).
+    await_initialize().await;
+    let query = events_query(tab(), consumer(), channel_declared());
     loop {
         if let Some((base, token)) = proxy_base() {
             {
                 if let Ok(mut resp) = client
-                    .get(format!("{base}/events"))
+                    .get(format!("{base}/events{query}"))
                     .bearer_auth(&token)
                     .send()
                     .await
                 {
-                    // Read the SSE byte stream chunk by chunk; emit a
-                    // notification each time a `change` event arrives. Keep a
-                    // small carry of the previous chunk's tail so a marker
-                    // split across a chunk boundary (TCP can break anywhere) is
-                    // still detected — otherwise a capability change would be
-                    // silently dropped.
+                    // Parse the SSE byte stream frame by frame. The parser owns
+                    // the chunk-boundary problem end to end (TCP can split
+                    // anywhere, including mid-line and mid-frame), which the
+                    // pre-V30 byte-marker sniffing only approximated with a
+                    // carry buffer.
                     // Bound each read: the app sends an SSE keep-alive every
                     // 20s, so a 60s gap means the connection went half-open
                     // (e.g. the app was hard-killed without a FIN). Break to
                     // reconnect rather than hang here forever — otherwise
                     // list_changed notifications would stop reaching Claude.
                     const READ_IDLE: Duration = Duration::from_secs(60);
-                    let mut carry: Vec<u8> = Vec::new();
+                    let mut parser = SseParser::default();
                     while let Ok(Ok(Some(chunk))) =
                         tokio::time::timeout(READ_IDLE, resp.chunk()).await
                     {
-                        let mut buf = std::mem::take(&mut carry);
-                        buf.extend_from_slice(&chunk);
-                        if buf.windows(SSE_CHANGE.len()).any(|w| w == SSE_CHANGE) {
-                            emit_list_changed(&stdout).await;
+                        for frame in parser.feed(&chunk) {
+                            dispatch_sse_frame(&stdout, &frame).await;
                         }
-                        // Retain only the bytes that could be a marker prefix
-                        // straddling into the next chunk (at most len-1).
-                        let keep = SSE_CHANGE.len().saturating_sub(1).min(buf.len());
-                        carry = buf[buf.len() - keep..].to_vec();
                     }
                 }
             }
@@ -1001,8 +1083,184 @@ async fn events_relay(stdout: Arc<TokioMutex<tokio::io::Stdout>>) {
     }
 }
 
-/// The SSE marker the app emits for a capability change.
-const SSE_CHANGE: &[u8] = b"event: change";
+/// The `?tab=&consumer=&channels=` query this child subscribes to `/events`
+/// with. `channels` is `1` only when the capability was really declared, so the
+/// app's registry reflects the handshake and not the settings file. Pure, so
+/// the exact identity string is unit-testable.
+fn events_query(tab: Option<&str>, consumer: &str, channels: bool) -> String {
+    let mut q = String::from("?");
+    if let Some(t) = tab {
+        // No escaping: tab ids are cImp-generated (`[a-z0-9-]`) and the app
+        // parses this query without percent-decoding.
+        q.push_str("tab=");
+        q.push_str(t);
+        q.push('&');
+    }
+    q.push_str("consumer=");
+    q.push_str(consumer);
+    q.push_str(if channels {
+        "&channels=1"
+    } else {
+        "&channels=0"
+    });
+    q
+}
+
+/// One dispatched SSE frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SseFrame {
+    /// The `event:` field, or SSE's default `message` when the frame carried
+    /// none.
+    event: String,
+    /// The accumulated `data:` payload (multiple `data:` lines joined with
+    /// `\n`, per the SSE spec).
+    data: String,
+}
+
+/// A minimal SSE frame parser, fed arbitrary byte chunks.
+///
+/// Grammar implemented (the subset the app emits, plus what any conformant
+/// producer may legally send):
+///
+/// ```text
+/// stream    := line*
+/// line      := field CR? LF
+/// field     := ':' comment          -- ignored (the app's ": keep-alive")
+///            | name ':' ' '? value  -- one optional leading space is stripped
+///            | name                 -- a nameless-value field, value = ""
+///            | ''                   -- a blank line DISPATCHES the frame
+/// ```
+///
+/// `event` sets the frame's name (last one wins), `data` appends (joined with
+/// `\n`), any other field (`id`, `retry`, …) is ignored. A frame is emitted on
+/// the blank line only if at least one of `event`/`data` was seen, so runs of
+/// blank lines and leading keep-alives produce nothing. Pure and socket-free —
+/// the reason it is a struct rather than inline stream handling.
+#[derive(Default)]
+struct SseParser {
+    /// Bytes of the line currently being accumulated.
+    line: Vec<u8>,
+    event: Option<String>,
+    data: Option<String>,
+}
+
+impl SseParser {
+    /// Hard cap on a single line. The app's frames are tiny; a line beyond this
+    /// means a broken or hostile producer, and truncating (rather than growing
+    /// without bound) keeps this child's memory bounded. The truncated line
+    /// simply fails to parse into a usable push.
+    const MAX_LINE: usize = 1 << 20;
+
+    /// Feed one chunk, returning every frame it completed.
+    fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
+        let mut out = Vec::new();
+        for &b in chunk {
+            if b == b'\n' {
+                let raw = std::mem::take(&mut self.line);
+                if let Some(frame) = self.end_line(&raw) {
+                    out.push(frame);
+                }
+            } else if self.line.len() < Self::MAX_LINE {
+                self.line.push(b);
+            }
+        }
+        out
+    }
+
+    /// Consume one complete line; `Some` when it terminated a frame.
+    fn end_line(&mut self, raw: &[u8]) -> Option<SseFrame> {
+        // Lossy: a mangled byte must not kill an otherwise-healthy stream (the
+        // same reasoning as `mcp_stdio::serve`'s invalid-UTF-8 handling).
+        let line = String::from_utf8_lossy(raw);
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+
+        if line.is_empty() {
+            // Blank line: dispatch whatever has accumulated.
+            let (event, data) = (self.event.take(), self.data.take());
+            if event.is_none() && data.is_none() {
+                return None;
+            }
+            return Some(SseFrame {
+                event: event.unwrap_or_else(|| "message".to_string()),
+                data: data.unwrap_or_default(),
+            });
+        }
+        if line.starts_with(':') {
+            return None; // comment / keep-alive
+        }
+        let (name, value) = match line.split_once(':') {
+            Some((n, v)) => (n, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+        match name {
+            "event" => self.event = Some(value.to_string()),
+            "data" => match &mut self.data {
+                Some(existing) => {
+                    existing.push('\n');
+                    existing.push_str(value);
+                }
+                None => self.data = Some(value.to_string()),
+            },
+            _ => {}
+        }
+        None
+    }
+}
+
+/// Turn a `push` frame's `data` payload into `notifications/claude/channel`
+/// params, or `None` when it is unusable.
+///
+/// Re-validates the meta keys the app already checked at the write boundary:
+/// the two halves are different processes and can be different builds (a child
+/// outlives a settings change, and an old exe can be talking to a new app), and
+/// an invalid key would be dropped *silently* by the client. Empty content is
+/// rejected outright — an empty `<channel>` message would cost the session a
+/// turn and say nothing ("empty is not absent").
+fn channel_params(data: &str) -> Option<Value> {
+    let notice: crate::offload::service::PushNotice = serde_json::from_str(data).ok()?;
+    if notice.content.trim().is_empty() {
+        return None;
+    }
+    let meta: serde_json::Map<String, Value> = notice
+        .meta
+        .into_iter()
+        .filter(|(k, _)| crate::offload::service::valid_meta_key(k))
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+    Some(json!({ "content": notice.content, "meta": Value::Object(meta) }))
+}
+
+/// Relay one parsed SSE frame to the host agent. Unknown event names are
+/// ignored (forward compatibility: a newer app may emit frames this child
+/// predates).
+async fn dispatch_sse_frame(stdout: &Arc<TokioMutex<tokio::io::Stdout>>, frame: &SseFrame) {
+    match frame.event.as_str() {
+        "change" => emit_list_changed(stdout).await,
+        "push" => {
+            if !channel_declared() {
+                // The app addressed us, but this session never negotiated
+                // channels — the client would drop the notification silently,
+                // so say so where a user debugging a missing push will see it.
+                eprintln!(
+                    "cimp-offload: dropped a session push — this connection never declared \
+                     the claude/channel capability (enable offload.session_push and restart \
+                     the tab)"
+                );
+                return;
+            }
+            match channel_params(&frame.data) {
+                Some(params) => {
+                    emit_notification(stdout, "notifications/claude/channel", Some(params)).await
+                }
+                None => eprintln!(
+                    "cimp-offload: dropped an unusable session push payload ({} bytes)",
+                    frame.data.len()
+                ),
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Build one JSON-RPC **notification** frame (no `id`, so no response is ever
 /// expected). Pure — separated from the write so the exact wire shape is
@@ -1935,6 +2193,144 @@ mod tests {
         record_client_init(&json!({ "clientInfo": { "name": "first" } }));
         record_client_init(&json!({ "clientInfo": { "name": "second" } }));
         assert_eq!(client_init().and_then(ClientInit::name), Some("first"));
+    }
+
+    // ── V30 Phase B: /events identity + the SSE frame parser ─────────────
+
+    /// The subscription identity the app's registry keys on. `channels`
+    /// reflects the HANDSHAKE, so it is always present and explicit — a `0` is
+    /// meaningfully different from the pre-V30 child's absent param.
+    #[test]
+    fn events_query_carries_tab_consumer_and_channels() {
+        assert_eq!(
+            events_query(Some("claude-2"), "claude", true),
+            "?tab=claude-2&consumer=claude&channels=1"
+        );
+        assert_eq!(
+            events_query(None, "opencode", false),
+            "?consumer=opencode&channels=0"
+        );
+    }
+
+    /// The handshake fact the relay subscribes with is recorded once and never
+    /// re-negotiated — a duplicate `initialize` (a protocol violation) must not
+    /// flip the capability after the relay has baked it into its `channels=`
+    /// subscription. This is the only test that touches these process-wide
+    /// statics.
+    #[test]
+    fn channel_declaration_is_write_once() {
+        record_channel_declaration(true);
+        record_channel_declaration(false);
+        assert!(channel_declared());
+    }
+
+    /// Feed the parser one byte at a time: no frame may be lost or duplicated
+    /// when TCP splits mid-line, mid-frame, or between `\r` and `\n`.
+    #[test]
+    fn sse_parser_survives_arbitrary_chunk_boundaries() {
+        let stream = "event: change\ndata: {}\n\nevent: push\ndata: {\"content\":\"hi\"}\n\n";
+        let mut whole = SseParser::default();
+        let whole_frames = whole.feed(stream.as_bytes());
+
+        let mut split = SseParser::default();
+        let mut split_frames = Vec::new();
+        for b in stream.as_bytes() {
+            split_frames.extend(split.feed(&[*b]));
+        }
+        assert_eq!(whole_frames, split_frames);
+        assert_eq!(whole_frames.len(), 2);
+        assert_eq!(whole_frames[0].event, "change");
+        assert_eq!(whole_frames[0].data, "{}");
+        assert_eq!(whole_frames[1].event, "push");
+        assert_eq!(whole_frames[1].data, "{\"content\":\"hi\"}");
+    }
+
+    /// Comments (the app's `: connected` prime and its 20 s `: keep-alive`s)
+    /// and stray blank lines must produce no frames at all — a keep-alive that
+    /// dispatched an empty frame would spam `tools/list_changed`.
+    #[test]
+    fn sse_parser_ignores_comments_and_keepalives() {
+        let mut p = SseParser::default();
+        assert!(p.feed(b": connected\n\n").is_empty());
+        assert!(p.feed(b": keep-alive\n\n").is_empty());
+        assert!(p.feed(b"\n\n\n").is_empty());
+        // …and a real frame still lands after them.
+        let frames = p.feed(b": keep-alive\n\nevent: change\ndata: {}\n\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event, "change");
+    }
+
+    /// The rest of the grammar: CRLF terminators, multiple `data:` lines joined
+    /// with `\n`, ignored fields (`id`/`retry`), a value-less field, an absent
+    /// `event:` defaulting to `message`, and only ONE optional space stripped.
+    #[test]
+    fn sse_parser_grammar_details() {
+        let mut p = SseParser::default();
+        let frames = p.feed(
+            b"id: 7\r\nretry: 3000\r\nevent: push\r\ndata: one\r\ndata:  two\r\ndata\r\n\r\n",
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event, "push");
+        assert_eq!(frames[0].data, "one\n two\n");
+
+        let mut p = SseParser::default();
+        let frames = p.feed(b"data: bare\n\n");
+        assert_eq!(frames[0].event, "message", "SSE's default event name");
+        assert_eq!(frames[0].data, "bare");
+    }
+
+    /// The child owns the JSON-RPC framing: the app sends only the semantic
+    /// payload, and this is where it becomes `notifications/claude/channel`
+    /// params.
+    #[test]
+    fn channel_params_builds_the_notification_payload() {
+        let params = channel_params(r#"{"content":"audit done","meta":{"kind":"audit"}}"#).unwrap();
+        assert_eq!(params["content"], "audit done");
+        assert_eq!(params["meta"]["kind"], "audit");
+        let frame = notification_frame("notifications/claude/channel", Some(params));
+        assert_eq!(frame["method"], "notifications/claude/channel");
+        assert_eq!(frame["params"]["content"], "audit done");
+
+        // A push with no meta still carries an (empty) meta object.
+        let bare = channel_params(r#"{"content":"hi"}"#).unwrap();
+        assert!(bare["meta"].as_object().is_some_and(|m| m.is_empty()));
+    }
+
+    /// Re-validation at the child's parse boundary: keys the client would drop
+    /// silently are dropped here (visibly), and a content-less push is refused
+    /// rather than costing the session a turn to say nothing.
+    #[test]
+    fn channel_params_rejects_unusable_payloads() {
+        let filtered =
+            channel_params(r#"{"content":"x","meta":{"ok_1":"a","bad-key":"b","2nd":"c"}}"#)
+                .unwrap();
+        let meta = filtered["meta"].as_object().unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta["ok_1"], "a");
+
+        assert!(channel_params(r#"{"content":"   "}"#).is_none());
+        assert!(channel_params(r#"{"content":""}"#).is_none());
+        assert!(channel_params("not json").is_none());
+        assert!(channel_params(r#"{"meta":{"kind":"x"}}"#).is_none());
+    }
+
+    /// The two halves of the wire format must agree byte for byte: what the app
+    /// writes into an `event: push` frame is what this child parses out of it.
+    #[test]
+    fn app_push_frame_round_trips_through_the_parser() {
+        let notice = crate::offload::service::PushNotice::new(
+            "multi\nline\ncontent",
+            [("kind", "audit_done"), ("seq", "3")],
+        );
+        let bytes = crate::offload::loopback::push_frame(&notice);
+        let mut p = SseParser::default();
+        let frames = p.feed(&bytes);
+        assert_eq!(frames.len(), 1, "one frame, whatever the content contains");
+        assert_eq!(frames[0].event, "push");
+        let params = channel_params(&frames[0].data).unwrap();
+        assert_eq!(params["content"], "multi\nline\ncontent");
+        assert_eq!(params["meta"]["kind"], "audit_done");
+        assert_eq!(params["meta"]["seq"], "3");
     }
 
     // ── V30 Phase 0 channel spike — remove when #15 spike concludes. ──────

@@ -7,8 +7,10 @@
 //!
 //! - `POST /run` — run one `offload_task` against the warm app-side pool.
 //! - `GET  /describe` — the live capability description for the tool.
-//! - `GET  /events` — an SSE stream of capability-change pulses the child
-//!   relays to Claude as `notifications/tools/list_changed`.
+//! - `GET  /events` — an SSE stream the child relays to Claude: capability
+//!   pulses (`event: change` → `notifications/tools/list_changed`) and, since
+//!   V30 Phase B, addressed session pushes (`event: push` →
+//!   `notifications/claude/channel`).
 //!
 //! The `{port, token, pid}` are advertised in a discovery file written next
 //! to the exe (the portable root — never `~/.claude`), created when offload
@@ -19,7 +21,7 @@
 //! observe task text — the same localhost-dev-server trust assumption,
 //! documented in MAINTENANCE.md.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +39,7 @@ use crate::error::{AppError, AppResult};
 use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
 use super::router::TierHint;
-use super::service::OffloadService;
+use super::service::{OffloadService, PushNotice};
 
 /// Discovery-file name under the portable root (next to `settings.json`).
 /// Legacy single-instance location, still written for anything that only
@@ -640,8 +642,13 @@ async fn handle_conn(
             )
             .await
         }
-        ("GET", "/events") => handle_events(stream, service).await,
+        ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
+        // V30 Phase B test rig — remove with the Phase 0 spike (#15). The route
+        // does not exist at all unless `CIMP_CHANNEL_SPIKE` is armed.
+        ("POST", "/push_test") if channel_spike_armed() => {
+            handle_push_test(&mut stream, &service, &req).await
+        }
         _ => write_simple(&mut stream, 404, "text/plain", b"not found").await,
     }
 }
@@ -1979,20 +1986,64 @@ async fn handle_mcp_call(
     write_json(stream, 200, &r).await
 }
 
+/// Read one `?key=value` query parameter off a request path.
+///
+/// Deliberately no percent-decoding: every value on these routes is composed by
+/// cImp itself (consumer names, tab ids — `[a-z0-9-]`), never by a user or a
+/// browser. Matches the pre-V30 behaviour of [`consumer_of`], which this now
+/// backs.
+fn query_param<'a>(path: &'a str, key: &str) -> Option<&'a str> {
+    let (_, query) = path.split_once('?')?;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
 /// Parse the `?consumer=<name>` query value off a request path into a
 /// [`Consumer`]. Absent / unknown ⇒ Claude (the original default).
 fn consumer_of(req: &Request) -> Consumer {
-    let raw = req
-        .path
-        .split_once('?')
-        .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("consumer=")))
-        .unwrap_or("claude");
-    Consumer::parse(raw)
+    Consumer::parse(query_param(&req.path, "consumer").unwrap_or("claude"))
 }
 
-/// `GET /events`: an SSE stream emitting a `change` event per capability
-/// pulse, with periodic keep-alive comments so idle proxies don't drop it.
-async fn handle_events(mut stream: TcpStream, service: Arc<OffloadService>) -> AppResult<()> {
+/// Render one `event: push` SSE frame from a [`PushNotice`].
+///
+/// The frame grammar is the SSE minimum the child's parser understands:
+/// `event: push\ndata: <one-line JSON>\n\n`. `serde_json` escapes every control
+/// character, so the payload is *guaranteed* to be a single line however
+/// multi-line the pushed content is — the one-line invariant the wire format
+/// depends on is enforced by the encoder, not by the caller. Pure, so the shape
+/// is unit-testable without a socket — including from the child's side of the
+/// wire (`mcp::tests`), which pins encoder and decoder against each other.
+pub(super) fn push_frame(notice: &PushNotice) -> Vec<u8> {
+    let data =
+        serde_json::to_string(notice).unwrap_or_else(|_| r#"{"content":"","meta":{}}"#.to_string());
+    format!("event: push\ndata: {data}\n\n").into_bytes()
+}
+
+/// `GET /events`: an SSE stream carrying two event types to one per-tab
+/// `--offload-mcp` child —
+///
+/// - `event: change` — the pre-V30 capability pulse, sent to EVERY subscriber
+///   (semantics unchanged; the child relays it as `tools/list_changed`);
+/// - `event: push` — V30 Phase B, sent only to subscribers a push is addressed
+///   to, carrying the semantic [`PushNotice`] payload the child wraps into
+///   `notifications/claude/channel`.
+///
+/// Periodic keep-alive comments (every 20 s) keep idle intermediaries — and the
+/// child's own 60 s read-idle watchdog — from dropping the connection.
+///
+/// The subscriber's identity comes from the child's query params
+/// (`?tab=&consumer=&channels=`); `channels=1` means the child ACTUALLY declared
+/// the capability on its handshake, not that the setting is on. Registration
+/// happens after auth (the caller's job) and is undone by
+/// [`PushGuard`](super::service::PushGuard)'s `Drop` when this loop exits — for
+/// any reason at all.
+async fn handle_events(
+    mut stream: TcpStream,
+    service: Arc<OffloadService>,
+    req: &Request,
+) -> AppResult<()> {
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Cache-Control: no-cache\r\n\
@@ -2005,10 +2056,48 @@ async fn handle_events(mut stream: TcpStream, service: Arc<OffloadService>) -> A
     let _ = stream.write_all(b": connected\n\n").await;
     let _ = stream.flush().await;
 
+    // V30 Phase B: register this child in the instance's push registry. The
+    // guard is bound for the whole loop — dropping it (on ANY exit below, or on
+    // task cancellation) is the sole deregistration path.
+    let tab = query_param(&req.path, "tab")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let consumer = query_param(&req.path, "consumer")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude")
+        .to_string();
+    // Anything but an explicit affirmative means "no channels" — a pre-V30
+    // child sends no `channels` param at all and must never be pushed to.
+    let channels = matches!(query_param(&req.path, "channels"), Some("1") | Some("true"));
+    debug!(
+        tab = ?tab,
+        consumer = %consumer,
+        channels,
+        "offload loopback: /events subscriber connected"
+    );
+    let (_push_guard, mut push_rx) = service.register_push_subscriber(tab, consumer, channels);
+
     let mut rx = service.subscribe_changes();
     loop {
         let tick = tokio::time::sleep(Duration::from_secs(20));
         tokio::select! {
+            // V30 Phase B: an addressed push for THIS child.
+            notice = push_rx.recv() => {
+                match notice {
+                    Some(n) => {
+                        if stream.write_all(&push_frame(&n)).await.is_err() {
+                            break;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                    // Unreachable while `_push_guard` lives (it owns the only
+                    // path that removes our sender), but a closed queue can
+                    // never yield another notice — stop selecting on it.
+                    None => break,
+                }
+            }
             recv = rx.recv() => {
                 match recv {
                     Ok(()) => {
@@ -2036,6 +2125,89 @@ async fn handle_events(mut stream: TcpStream, service: Arc<OffloadService>) -> A
         }
     }
     Ok(())
+}
+
+// ── V30 Phase B test rig — remove with the Phase 0 spike (#15) ───────────────
+//
+// Lets the push bus be driven end-to-end with `curl` before Phase C has any
+// real producers: with the app running and a Claude tab open,
+//
+//   curl -s -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+//        -d '{"tab":"claude","content":"hello","meta":{"kind":"manual"}}' \
+//        http://127.0.0.1:<port>/push_test
+//
+// should surface a `<channel source="cimp-offload" kind="manual">hello</channel>`
+// in that tab. Inert (and 404) unless `CIMP_CHANNEL_SPIKE` is armed — the same
+// env gate the child-side spike rig uses, so one variable arms both halves.
+
+/// Whether the V30 channel spike rig is armed for this process.
+fn channel_spike_armed() -> bool {
+    std::env::var("CIMP_CHANNEL_SPIKE")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// A `POST /push_test` request body.
+#[derive(Deserialize)]
+struct PushTestBody {
+    /// Target tab; absent ⇒ broadcast to every channel-capable child.
+    #[serde(default)]
+    tab: Option<String>,
+    content: String,
+    #[serde(default)]
+    meta: BTreeMap<String, String>,
+}
+
+/// `POST /push_test`: drive [`OffloadService::push_to_tab`] /
+/// [`OffloadService::push_broadcast`] by hand and report the delivery count.
+async fn handle_push_test(
+    stream: &mut TcpStream,
+    service: &Arc<OffloadService>,
+    req: &Request,
+) -> AppResult<()> {
+    let body: PushTestBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    if body.content.trim().is_empty() {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({ "ok": false, "error": "`content` must be non-empty" }),
+        )
+        .await;
+    }
+    let notice = PushNotice::new(body.content, body.meta);
+    let (delivered, target) = match body.tab.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(tab) => (
+            usize::from(service.push_to_tab(tab, notice)),
+            tab.to_string(),
+        ),
+        None => (service.push_broadcast(notice), "*".to_string()),
+    };
+    info!(
+        target = %target,
+        delivered,
+        subscribers = service.push_subscriber_count(),
+        "offload loopback: /push_test (V30 spike rig)"
+    );
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({
+            "delivered": delivered,
+            "target": target,
+            "subscribers": service.push_subscriber_count(),
+        }),
+    )
+    .await
 }
 
 /// Write a one-shot response with a JSON-serializable body.
@@ -2105,6 +2277,54 @@ mod tests {
             body: Vec::new(),
         };
         assert!(!authorized(&none, "abc123"));
+    }
+
+    // ── V30 Phase B: /events subscriber identity + the push frame ─────────
+
+    #[test]
+    fn query_param_reads_the_events_identity() {
+        let path = "/events?tab=claude-2&consumer=claude&channels=1";
+        assert_eq!(query_param(path, "tab"), Some("claude-2"));
+        assert_eq!(query_param(path, "consumer"), Some("claude"));
+        assert_eq!(query_param(path, "channels"), Some("1"));
+        assert_eq!(query_param(path, "nope"), None);
+        // A prefix must not match a different key, and a bare path has none.
+        assert_eq!(query_param("/events?consumer=opencode", "consume"), None);
+        assert_eq!(query_param("/events", "tab"), None);
+        // The pre-V30 child sends no query at all: it must still parse as the
+        // default consumer, with no tab and no channels.
+        let legacy = Request {
+            method: "GET".into(),
+            path: "/events".into(),
+            auth: None,
+            body: Vec::new(),
+        };
+        assert_eq!(consumer_of(&legacy), Consumer::Claude);
+        assert!(!matches!(
+            query_param(&legacy.path, "channels"),
+            Some("1") | Some("true")
+        ));
+    }
+
+    /// The wire contract the child's SSE parser depends on: one `event:` line,
+    /// one single-line `data:` line, blank-line terminated — even when the
+    /// pushed content itself contains newlines (serde escapes them).
+    #[test]
+    fn push_frame_is_a_single_line_sse_data_payload() {
+        let notice = PushNotice::new(
+            "line one\nline two\r\nline three",
+            [("kind", "audit_done"), ("seq", "3")],
+        );
+        let frame = String::from_utf8(push_frame(&notice)).unwrap();
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(lines[0], "event: push");
+        assert!(lines[1].starts_with("data: "));
+        // event / data / "" / "" — exactly one data line, blank-line terminated.
+        assert_eq!(lines.len(), 4, "frame was: {frame:?}");
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "");
+        let round: PushNotice = serde_json::from_str(&lines[1]["data: ".len()..]).unwrap();
+        assert_eq!(round, notice);
     }
 
     #[test]

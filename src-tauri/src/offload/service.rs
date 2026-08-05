@@ -21,14 +21,14 @@
 //! paths share the pure router ([`super::router`]) and the agent loop
 //! ([`super::agent`]) so they can't drift on routing or loop semantics.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{broadcast, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -131,6 +131,10 @@ pub struct OffloadService {
     client: reqwest::Client,
     /// Capability-change pulses relayed to the loopback `/events` stream.
     change_tx: broadcast::Sender<()>,
+    /// V30 Phase B: the live per-tab `--offload-mcp` children, for addressed
+    /// session pushes. Separate from `change_tx` on purpose — that broadcast
+    /// stays the un-addressed capability pulse every subscriber gets.
+    pushes: Arc<PushRegistry>,
     /// For emitting the `offload-server-metrics` dashboard event.
     app: AppHandle,
     /// Latest per-backend dashboard snapshot (initial fill for the IPC; the
@@ -188,6 +192,221 @@ impl Drop for QueueGuard<'_> {
     }
 }
 
+// ── V30 Phase B — the tab-addressed push bus ─────────────────────────────────
+//
+// One app-side registry of the live `--offload-mcp` children (one per tab), so
+// backend code can call [`OffloadService::push_to_tab`] and have a `<channel>`
+// message appear in THAT tab's session. The wire ride is the existing
+// `GET /events` SSE stream (`loopback::handle_events`), which gains an
+// `event: push` frame beside the unchanged `event: change` capability pulse;
+// the app sends the SEMANTIC payload and the child owns the JSON-RPC framing.
+//
+// **Instance scoping is inherent — do NOT add cross-instance logic.** Every
+// running cImp instance binds its own ephemeral loopback port with its own
+// per-launch bearer token, and this registry hangs off *that* instance's
+// `OffloadService`. A child can only appear here by connecting to THIS
+// instance's `/events` with THIS instance's token, so the tab ids in this map
+// are already this-instance-only — which is exactly milestone invariant 3
+// ("pushes are instance-scoped"), satisfied by construction rather than by a
+// pid/root match.
+
+/// Per-subscriber pending-push capacity. Pushes are best-effort notify-only
+/// (milestone invariant 2: every push has a pull twin), so a wedged or slow
+/// child must never back-pressure a producer — a full queue drops the notice
+/// with a warn instead.
+const PUSH_QUEUE_CAP: usize = 32;
+
+/// Whether a channel `meta` key satisfies the client's `^[a-zA-Z_][a-zA-Z0-9_]*$`
+/// filter.
+///
+/// Claude Code **silently drops** keys that don't match (Phase 0 contract
+/// summary), so a typo'd key would vanish with no signal anywhere. We validate
+/// at the write boundary instead and warn — the repo principle "validate at the
+/// parse boundary anyway", applied to the producing side.
+pub fn valid_meta_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// One semantic push payload: the `<channel>` body plus its attributes.
+///
+/// This is the wire type of the SSE `event: push` frame's `data` — serialized
+/// by the app ([`crate::offload::loopback`]) and deserialized by the child
+/// ([`crate::offload::mcp`]), so both halves share one definition and cannot
+/// drift. Construct it with [`PushNotice::new`], which enforces the meta-key
+/// contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PushNotice {
+    /// The message text the model sees inside `<channel source="…">…</channel>`.
+    pub content: String,
+    /// String attributes rendered onto the `<channel>` tag. Keys are guaranteed
+    /// valid by [`PushNotice::new`].
+    #[serde(default)]
+    pub meta: BTreeMap<String, String>,
+}
+
+impl PushNotice {
+    /// Build a notice, dropping (with a warn) any meta key the client would
+    /// silently discard. `BTreeMap` so the rendered attribute order is stable —
+    /// a push is user-visible text, and a wobbling attribute order would make
+    /// transcripts diff-noisy for no reason.
+    pub fn new<I, K, V>(content: impl Into<String>, meta: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        let mut kept = BTreeMap::new();
+        for (k, v) in meta {
+            let k = k.as_ref();
+            if valid_meta_key(k) {
+                kept.insert(k.to_string(), v.into());
+            } else {
+                warn!(
+                    key = %k,
+                    "offload push: dropping channel meta key — must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
+                );
+            }
+        }
+        Self {
+            content: content.into(),
+            meta: kept,
+        }
+    }
+}
+
+/// One live `/events` subscriber — a per-tab `--offload-mcp` child holding an
+/// open SSE stream against this instance.
+#[derive(Debug)]
+pub struct PushSubscriber {
+    /// The cImp tab this child was spawned for (`--tab`), when it has one. A
+    /// hand-spawned or pre-V28 child sends none and is simply not addressable.
+    pub tab: Option<String>,
+    /// `claude` / `opencode` — which agent this child serves.
+    pub consumer: String,
+    /// Whether this child ACTUALLY declared `claude/channel` at `initialize`.
+    /// Reported by the child from what it really put on the wire, not
+    /// re-derived from settings here: the settings could have changed after the
+    /// handshake, and a push to a host that never negotiated channels is
+    /// silently dropped client-side (Phase 0, T6).
+    pub channels: bool,
+    /// Bounded ([`PUSH_QUEUE_CAP`]) queue toward that child's SSE writer.
+    pub tx: mpsc::Sender<PushNotice>,
+}
+
+/// The live-children registry. Split out of [`OffloadService`] only so it can
+/// be exercised without a Tauri `AppHandle`; the service owns exactly one and
+/// re-exports the public API.
+#[derive(Debug, Default)]
+pub struct PushRegistry {
+    subs: StdMutex<HashMap<u64, PushSubscriber>>,
+    /// Monotonic subscriber id (never reused within an app run).
+    seq: AtomicU64,
+}
+
+impl PushRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Register a subscriber, returning its RAII guard and the receiving half
+    /// of its queue. **Deregistration is the guard's `Drop`** — the SSE loop
+    /// holds it for the connection's lifetime, so every exit path (clean close,
+    /// write error, keep-alive failure, task cancellation, panic unwind) removes
+    /// the entry. Mirrors `oob/claude.rs::LiveSessionGuard`.
+    pub fn register(
+        self: &Arc<Self>,
+        tab: Option<String>,
+        consumer: String,
+        channels: bool,
+    ) -> (PushGuard, mpsc::Receiver<PushNotice>) {
+        let (tx, rx) = mpsc::channel(PUSH_QUEUE_CAP);
+        let id = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.subs.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            id,
+            PushSubscriber {
+                tab,
+                consumer,
+                channels,
+                tx,
+            },
+        );
+        (
+            PushGuard {
+                registry: self.clone(),
+                id,
+            },
+            rx,
+        )
+    }
+
+    /// Drop one subscriber (called only by [`PushGuard::drop`]).
+    fn unregister(&self, id: u64) {
+        self.subs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
+
+    /// Live subscriber count (diagnostics + tests).
+    pub fn subscriber_count(&self) -> usize {
+        self.subs.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Deliver to every channel-capable subscriber matching `pick`. Returns how
+    /// many accepted it. `try_send` throughout: a full queue drops the notice
+    /// with a warn rather than blocking the producer.
+    fn deliver(&self, notice: PushNotice, pick: impl Fn(&PushSubscriber) -> bool) -> usize {
+        let subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut delivered = 0usize;
+        for s in subs.values() {
+            if !s.channels || !pick(s) {
+                continue;
+            }
+            match s.tx.try_send(notice.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => warn!(
+                    tab = ?s.tab,
+                    consumer = %s.consumer,
+                    "offload push: subscriber queue full — dropping notice (pushes are best-effort)"
+                ),
+                Err(mpsc::error::TrySendError::Closed(_)) => debug!(
+                    tab = ?s.tab,
+                    "offload push: subscriber closed before its guard ran — dropping notice"
+                ),
+            }
+        }
+        delivered
+    }
+
+    /// Push to the child serving `tab`.
+    pub fn push_to_tab(&self, tab: &str, notice: PushNotice) -> bool {
+        self.deliver(notice, |s| s.tab.as_deref() == Some(tab)) > 0
+    }
+
+    /// Push to every channel-capable child of this instance.
+    pub fn push_broadcast(&self, notice: PushNotice) -> usize {
+        self.deliver(notice, |_| true)
+    }
+}
+
+/// RAII deregistration handle for a [`PushRegistry`] entry. Held by the SSE
+/// loop; dropping it removes the subscriber.
+pub struct PushGuard {
+    registry: Arc<PushRegistry>,
+    id: u64,
+}
+
+impl Drop for PushGuard {
+    fn drop(&mut self) {
+        self.registry.unregister(self.id);
+    }
+}
+
 impl OffloadService {
     /// Construct the service. Sizes the global gate from config (or the
     /// explicit `global_concurrency` override) and wires the MCP host's
@@ -227,6 +446,7 @@ impl OffloadService {
             local_pool: TokioMutex::new(HashMap::new()),
             client,
             change_tx,
+            pushes: PushRegistry::new(),
             app,
             latest_metrics: StdMutex::new(Vec::new()),
             cap_reconcile_lock: TokioMutex::new(()),
@@ -261,6 +481,43 @@ impl OffloadService {
     /// Emit a capability-change pulse.
     fn signal_change(&self) {
         let _ = self.change_tx.send(());
+    }
+
+    // ── V30 Phase B: session push (see the `PushRegistry` section above) ──
+
+    /// Register a `/events` subscriber. Called by
+    /// [`loopback::handle_events`](super::loopback) after auth; the returned
+    /// [`PushGuard`] must be held for the SSE connection's lifetime (its `Drop`
+    /// is the only deregistration path).
+    pub fn register_push_subscriber(
+        &self,
+        tab: Option<String>,
+        consumer: String,
+        channels: bool,
+    ) -> (PushGuard, mpsc::Receiver<PushNotice>) {
+        self.pushes.register(tab, consumer, channels)
+    }
+
+    /// Push one notice into the session of `tab`, returning whether any live,
+    /// channel-capable child accepted it. Best-effort by contract: `false` means
+    /// nothing was queued (no such tab, the tab's child never declared channels,
+    /// or its queue was full) — producers must have a pull twin for the payload
+    /// (milestone invariant 2), never treat this as delivery confirmation.
+    pub fn push_to_tab(&self, tab: &str, notice: PushNotice) -> bool {
+        self.pushes.push_to_tab(tab, notice)
+    }
+
+    /// Push one notice to every channel-capable child of this instance,
+    /// returning the number queued. Same best-effort contract as
+    /// [`Self::push_to_tab`].
+    pub fn push_broadcast(&self, notice: PushNotice) -> usize {
+        self.pushes.push_broadcast(notice)
+    }
+
+    /// Live push-subscriber count (diagnostics; also the Phase C readiness
+    /// check "is anyone listening at all").
+    pub fn push_subscriber_count(&self) -> usize {
+        self.pushes.subscriber_count()
     }
 
     /// Total offloads currently in flight across the app (global gate).
@@ -1613,6 +1870,119 @@ mod tests {
         ));
         assert!(is_connection_error("request timed out"));
         assert!(!is_connection_error("server returned no choices"));
+    }
+
+    // ── V30 Phase B: the push bus ────────────────────────────────────────
+
+    /// The client silently drops meta keys outside `^[a-zA-Z_][a-zA-Z0-9_]*$`,
+    /// so the constructor rejects them at the write boundary instead.
+    #[test]
+    fn push_notice_validates_meta_keys() {
+        for good in ["kind", "_seq", "a1", "Run_id_2", "_"] {
+            assert!(valid_meta_key(good), "`{good}` should be accepted");
+        }
+        for bad in ["", "1kind", "run-id", "run.id", "run id", "kind!", "héllo"] {
+            assert!(!valid_meta_key(bad), "`{bad}` should be rejected");
+        }
+
+        let notice = PushNotice::new(
+            "audit finished",
+            [
+                ("kind", "audit_done"),
+                ("run-id", "7"), // hyphen → dropped
+                ("2nd", "x"),    // leading digit → dropped
+                ("_ok", "yes"),  // leading underscore → kept
+            ],
+        );
+        assert_eq!(notice.content, "audit finished");
+        assert_eq!(
+            notice.meta.keys().collect::<Vec<_>>(),
+            vec!["_ok", "kind"],
+            "only contract-valid keys survive, in stable (BTreeMap) order"
+        );
+    }
+
+    /// Registration is explicit; deregistration is RAII — the entry goes away
+    /// when the guard drops, which is what the SSE loop relies on for every one
+    /// of its exit paths.
+    #[test]
+    fn push_registry_deregisters_on_guard_drop() {
+        let reg = PushRegistry::new();
+        assert_eq!(reg.subscriber_count(), 0);
+        let (g1, _rx1) = reg.register(Some("claude".into()), "claude".into(), true);
+        let (g2, _rx2) = reg.register(Some("claude-2".into()), "claude".into(), true);
+        assert_eq!(reg.subscriber_count(), 2);
+        drop(g1);
+        assert_eq!(reg.subscriber_count(), 1);
+        drop(g2);
+        assert_eq!(reg.subscriber_count(), 0);
+        // Ids are monotonic, so a re-registered tab can never collide with the
+        // stale entry of a connection that is still unwinding.
+        let (g3, _rx3) = reg.register(Some("claude".into()), "claude".into(), true);
+        assert_eq!(g3.id, 2);
+    }
+
+    /// A tab-addressed push reaches exactly the child of that tab — not its
+    /// siblings, not a tab-less child, and not one that never declared the
+    /// capability (a push to such a host is silently dropped client-side).
+    #[tokio::test]
+    async fn push_to_tab_addresses_only_that_tab() {
+        let reg = PushRegistry::new();
+        let (_g_a, mut rx_a) = reg.register(Some("claude".into()), "claude".into(), true);
+        let (_g_b, mut rx_b) = reg.register(Some("claude-2".into()), "claude".into(), true);
+        let (_g_nochan, mut rx_nochan) =
+            reg.register(Some("claude-3".into()), "claude".into(), false);
+        let (_g_anon, mut rx_anon) = reg.register(None, "claude".into(), true);
+
+        assert!(reg.push_to_tab("claude", PushNotice::new("hi", [("kind", "t")])));
+        assert_eq!(rx_a.recv().await.map(|n| n.content), Some("hi".to_string()));
+        assert!(rx_b.try_recv().is_err(), "sibling tab must not receive it");
+        assert!(
+            rx_anon.try_recv().is_err(),
+            "a tab-less child is unaddressed"
+        );
+
+        // The channels flag is respected even when the tab matches.
+        assert!(!reg.push_to_tab("claude-3", PushNotice::new("x", [] as [(&str, &str); 0])));
+        assert!(rx_nochan.try_recv().is_err());
+
+        // An unknown tab delivers to nobody and says so.
+        assert!(!reg.push_to_tab("ghost", PushNotice::new("x", [] as [(&str, &str); 0])));
+    }
+
+    /// Broadcast hits every channel-capable subscriber (tab-less ones included)
+    /// and skips the rest.
+    #[tokio::test]
+    async fn push_broadcast_counts_channel_subscribers() {
+        let reg = PushRegistry::new();
+        let (_g_a, mut rx_a) = reg.register(Some("claude".into()), "claude".into(), true);
+        let (_g_anon, mut rx_anon) = reg.register(None, "claude".into(), true);
+        let (_g_nochan, mut rx_nochan) = reg.register(Some("oc".into()), "opencode".into(), false);
+
+        assert_eq!(
+            reg.push_broadcast(PushNotice::new("all", [] as [(&str, &str); 0])),
+            2
+        );
+        assert!(rx_a.recv().await.is_some());
+        assert!(rx_anon.recv().await.is_some());
+        assert!(rx_nochan.try_recv().is_err());
+    }
+
+    /// A wedged child must never back-pressure a producer: once its bounded
+    /// queue is full the notice is dropped and the push reports non-delivery.
+    #[test]
+    fn push_drops_when_the_subscriber_queue_is_full() {
+        let reg = PushRegistry::new();
+        let (_g, _rx) = reg.register(Some("claude".into()), "claude".into(), true);
+        let notice = || PushNotice::new("x", [] as [(&str, &str); 0]);
+        for i in 0..PUSH_QUEUE_CAP {
+            assert!(reg.push_to_tab("claude", notice()), "push {i} should queue");
+        }
+        assert!(
+            !reg.push_to_tab("claude", notice()),
+            "the {}th push must drop, not block",
+            PUSH_QUEUE_CAP + 1
+        );
     }
 
     #[test]

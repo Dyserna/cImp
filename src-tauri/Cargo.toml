@@ -267,6 +267,41 @@ tauri-plugin-opener = "2"
 # new entries to the tree.
 url = "2"
 
+# V32 Phase C (injection hardening) — the two detection layers.
+#
+# yara-x is VirusTotal's pure-Rust reimplementation of YARA: no C FFI, no
+# libyara to build, so it adds nothing to the Windows/MSVC toolchain
+# requirements. Choosing YARA as the rule FORMAT is the point (locked decision
+# 7) — it lets the C3 updater consume curated community rulesets instead of
+# growing a bespoke regex file.
+#
+# `default-features = false`: the default set pulls in `default-modules`, i.e.
+# the PE/ELF/Mach-O/dotnet/dex/LNK/crypto parsers (rsa, dsa, ecdsa, p256/p384,
+# x509-parser, der-parser, roxmltree, zip …) — an entire malware-analysis
+# stack, for a scanner that only ever looks at UTF-8 text. `constant-folding`
+# and `fast-regexp` are compile/scan-speed options with no dependencies;
+# `linkme` is yara-x's own module-registration mechanism and is kept because
+# turning it off changes how the (empty) module set is wired, not what we ship.
+# Version tracks the MSRV: 1.12 is the newest release whose own `rust-version`
+# is <= this crate's 1.88 (resolver v3 enforces that; see the header comment).
+yara-x = { version = "1.12", default-features = false, features = [
+    "constant-folding",
+    "fast-regexp",
+    "linkme",
+] }
+# HuggingFace tokenizers, for the Prompt Guard 2 classifier's DeBERTa-v3
+# (sentencepiece-unigram) vocabulary, loaded from the model's `tokenizer.json`.
+#
+# `default-features = false` matters for the Windows build: the defaults are
+# `progressbar` (indicatif — a CLI progress bar in a GUI app), `esaxx_fast`
+# (a C++ suffix-array library) and `onig` (oniguruma, a C regex engine). Both
+# C/C++ ones would add compile steps and toolchain surface for nothing.
+# `fancy-regex` is the pure-Rust alternative the crate offers for the same
+# regex role, so this configuration builds with cargo alone.
+tokenizers = { version = "0.23", default-features = false, features = [
+    "fancy-regex",
+] }
+
 # Windows-only: registry probe for Git Bash auto-detection in shell::detect.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

@@ -64,6 +64,22 @@ const CLOSE_PREFIX: &str = "<<<END UNTRUSTED-DATA ";
 /// Both markers' suffix.
 const MARKER_SUFFIX: &str = ">>>";
 
+/// The marker vocabulary, nonce elided, for prose that must *name* the boundary
+/// without emitting a real one — today the V32 Phase D session guidance
+/// (`tabs::config::injection_hygiene_guidance`), which teaches the model what
+/// the markers mean before the first enveloped result arrives.
+///
+/// Derived from the same three consts [`envelope`] builds with, so the standing
+/// instruction and the actual delimiters cannot drift apart. A function rather
+/// than a `const` only because `format!` is not const; it is called once per tab
+/// launch.
+///
+/// The literal `…` in place of the nonce is deliberate: a fixed placeholder that
+/// could be mistaken for a real nonce would hand a page a delimiter to quote.
+pub fn marker_vocabulary() -> String {
+    format!("`{OPEN_PREFIX}…{MARKER_SUFFIX}` / `{CLOSE_PREFIX}…{MARKER_SUFFIX}`")
+}
+
 /// A fresh, unguessable boundary nonce. `uuid::v4` is the RNG already used for
 /// the per-launch loopback bearer token ([`super::loopback`]) — no new
 /// dependency, and 122 bits is far past anything a page could enumerate.
@@ -86,23 +102,24 @@ pub fn envelope(content: &str) -> String {
     )
 }
 
-/// Wrap `text` **iff** `name` classifies as
-/// [`External`](crate::offload::toolclass::ToolClass::External) — the form both
-/// tool-result boundaries call, so "external only" is one decision in one place
-/// rather than a rule each call site re-implements.
+/// Whether a tool's result is untrusted content, i.e. whether it gets the
+/// envelope (and, from Phase C, the detection screens).
 ///
-/// The class comes from [`toolclass::classify`](crate::offload::toolclass::classify),
-/// so an unknown/newly configured server's tool is wrapped by the same
+/// "External only" is one decision in one place rather than a rule each call
+/// site re-implements. The class comes from
+/// [`toolclass::classify`](crate::offload::toolclass::classify), so an
+/// unknown/newly configured server's tool is wrapped by the same
 /// unknown-⇒-EXTERNAL invariant that latches it — a new server can never
 /// silently deliver un-spotlit content. Structural graph output, memory reads
 /// and worker-synthesized `offload_task` answers are TRUSTED and pass through
 /// untouched.
-pub fn envelope_if_external(name: &str, text: String) -> String {
-    if super::toolclass::classify(name) == super::toolclass::ToolClass::External {
-        envelope(&text)
-    } else {
-        text
-    }
+///
+/// Both boundaries reach this through
+/// [`detection::wrap_external_result`](super::detection::wrap_external_result),
+/// which composes detection, this envelope and the warning header in the one
+/// order that is correct (see that module's docs).
+pub fn is_external(name: &str) -> bool {
+    super::toolclass::classify(name) == super::toolclass::ToolClass::External
 }
 
 /// Re-close an envelope a downstream length cap cut open.
@@ -120,19 +137,27 @@ pub fn envelope_if_external(name: &str, text: String) -> String {
 /// marker. Anything looser would let arbitrary content (a source file quoting
 /// this module, say) grow a marker it never had.
 pub fn ensure_closed(text: String) -> String {
-    let Some(rest) = text.strip_prefix(SPOTLIGHT_PREAMBLE) else {
-        return text;
+    // V32 Phase C: a flagged result carries the detection warning header in
+    // FRONT of the preamble (outside the markers, and ahead of the truncation
+    // that would otherwise eat it). Skip it before looking for the envelope —
+    // otherwise the very results most likely to be truncated, and most in need
+    // of a terminated data region, would be the ones this no-ops on.
+    let close = {
+        let body = super::detection::strip_warning_header(&text);
+        let Some(rest) = body.strip_prefix(SPOTLIGHT_PREAMBLE) else {
+            return text;
+        };
+        let Some(open_line) = rest.strip_prefix('\n').and_then(|r| r.lines().next()) else {
+            return text;
+        };
+        let Some(n) = open_line
+            .strip_prefix(OPEN_PREFIX)
+            .and_then(|s| s.strip_suffix(MARKER_SUFFIX))
+        else {
+            return text;
+        };
+        format!("{CLOSE_PREFIX}{n}{MARKER_SUFFIX}")
     };
-    let Some(open_line) = rest.strip_prefix('\n').and_then(|r| r.lines().next()) else {
-        return text;
-    };
-    let Some(n) = open_line
-        .strip_prefix(OPEN_PREFIX)
-        .and_then(|s| s.strip_suffix(MARKER_SUFFIX))
-    else {
-        return text;
-    };
-    let close = format!("{CLOSE_PREFIX}{n}{MARKER_SUFFIX}");
     if text.contains(&close) {
         return text;
     }
@@ -158,6 +183,32 @@ mod tests {
         assert!(SPOTLIGHT_PREAMBLE.contains("UNTRUSTED-DATA"));
         // One line: the whole point is that it is read, not skimmed past.
         assert!(!SPOTLIGHT_PREAMBLE.contains('\n'));
+    }
+
+    /// V32 Phase D: the vocabulary the session guidance quotes must describe
+    /// the delimiters actually emitted. Asserted structurally (prefix/suffix of
+    /// a REAL envelope's marker lines) rather than against a copy of the
+    /// string, so editing a marker const breaks this test instead of silently
+    /// teaching every session a boundary that no longer exists.
+    #[test]
+    fn marker_vocabulary_describes_the_markers_a_real_envelope_emits() {
+        let vocab = marker_vocabulary();
+        let out = envelope("body");
+        let lines: Vec<&str> = out.lines().collect();
+        let open = lines[1];
+        let close = *lines.last().unwrap();
+        for marker in [open, close] {
+            // marker == <prefix><32-hex nonce><suffix>; the vocabulary states
+            // the same thing with the nonce elided.
+            let intro = &marker[..marker.len() - 32 - MARKER_SUFFIX.len()];
+            assert!(
+                vocab.contains(&format!("{intro}…{MARKER_SUFFIX}")),
+                "vocabulary must describe {marker:?} with the nonce elided: {vocab}"
+            );
+        }
+        assert!(vocab.contains('…'), "the nonce must be elided: {vocab}");
+        // A literal nonce placeholder would hand a page a delimiter to quote.
+        assert!(!vocab.contains("00000"), "{vocab}");
     }
 
     #[test]
@@ -212,7 +263,7 @@ mod tests {
     /// the model that our own output is suspect and dilute the marker to "any
     /// tool result".
     #[test]
-    fn envelope_if_external_wraps_only_external_results() {
+    fn is_external_selects_only_proxied_server_results() {
         for external in [
             "ddg__search",
             "ddg__fetch_content",
@@ -220,8 +271,7 @@ mod tests {
             // A future/unknown server rides the unknown-⇒-EXTERNAL invariant.
             "somenewserver__anything",
         ] {
-            let out = envelope_if_external(external, "body".into());
-            assert!(out.starts_with(SPOTLIGHT_PREAMBLE), "{external}: {out}");
+            assert!(is_external(external), "{external} must be enveloped");
         }
         for trusted in [
             "graph_outline",
@@ -236,11 +286,7 @@ mod tests {
             "run_check",
             "security_audit",
         ] {
-            assert_eq!(
-                envelope_if_external(trusted, "body".into()),
-                "body",
-                "{trusted} must not be enveloped"
-            );
+            assert!(!is_external(trusted), "{trusted} must not be enveloped");
         }
     }
 

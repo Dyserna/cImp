@@ -189,6 +189,10 @@ pub struct HostRouter {
     /// V32 Phase C: the SSRF screen's carve-out set (the user's own configured
     /// endpoints), snapshotted for the run alongside the tool surface.
     policy: super::outbound::Policy,
+    /// V32 Phase C: which detection layers screen this run's EXTERNAL results,
+    /// snapshotted from the same settings read as `policy` so a mid-run edit
+    /// cannot change the rules a task is being screened under halfway through.
+    detection: super::detection::Config,
 }
 
 impl HostRouter {
@@ -209,6 +213,7 @@ impl HostRouter {
         allow_audit: bool,
         task_scope: String,
         policy: super::outbound::Policy,
+        detection: super::detection::Config,
     ) -> Self {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
@@ -224,6 +229,7 @@ impl HostRouter {
             allow_audit,
             task_scope,
             policy,
+            detection,
         }
     }
 }
@@ -263,23 +269,45 @@ impl ToolRouter for HostRouter {
         // and a hallucinated call to a server without `offload_access` is
         // refused instead of silently reaching it.
         if name.contains("__") {
-            // V32 Phase B: this is the worker's EXTERNAL tool-result boundary —
-            // the one place a proxied server's bytes enter the worker's
-            // conversation — so the spotlighting envelope goes on here (locked
-            // decision 6). Only the success path: an `Err` is a cImp-composed
-            // refusal/transport message, not untrusted content, and enveloping
-            // it would teach the model that our own strings are suspect.
-            self.host
+            // V32 Phase B/C: this is the worker's EXTERNAL tool-result boundary
+            // — the one place a proxied server's bytes enter the worker's
+            // conversation — so detection, the spotlighting envelope and the
+            // warning header all compose here, in `wrap_external_result`'s one
+            // definition of the order (locked decisions 5 and 6). Only the
+            // success path: an `Err` is a cImp-composed refusal/transport
+            // message, not untrusted content, and screening or enveloping it
+            // would teach the model that our own strings are suspect.
+            //
+            // The origin is read from the arguments *before* they are moved
+            // into the call: a flagged row's first useful fact is which page
+            // the content came from, and the result alone cannot say.
+            let (url, host) = super::detection::origin_of(&args);
+            let root = self.ctx.allowed_roots.first().map(|p| p.as_path());
+            let root_key = root.map(crate::activity::root_key).unwrap_or_default();
+            let text = self
+                .host
                 .call_recorded(
                     super::mcp_host::Consumer::Offload,
-                    self.ctx.allowed_roots.first().map(|p| p.as_path()),
+                    root,
                     name,
                     args,
                     &self.task_scope,
                     &self.policy,
                 )
-                .await
-                .map(|text| super::spotlight::envelope_if_external(name, text))
+                .await?;
+            Ok(super::detection::wrap_external_result(
+                name,
+                text,
+                super::detection::ResultCtx {
+                    consumer: "offload",
+                    scope: &self.task_scope,
+                    root: root_key,
+                    url,
+                    host,
+                    cfg: self.detection,
+                },
+            )
+            .await)
         } else {
             tools::dispatch(name, args, &self.ctx).await
         }

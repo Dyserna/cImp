@@ -1559,6 +1559,36 @@ pub struct OffloadSettings {
     ///
     /// [`external_fetch_max_calls`]: Self::external_fetch_max_calls
     pub external_fetch_max_bytes: u64,
+    /// V32 (locked decision 7): run the YARA **signature** screen over every
+    /// EXTERNAL tool result. Rules are data files under
+    /// `<exe-dir>/detection/rules.d/` (plus the user's own `local/` overlay).
+    ///
+    /// On by default. It is surface-only (locked decision 5) — a match adds a
+    /// warning header and a Tool Activity row and changes nothing else — so
+    /// there is no correctness risk in leaving it on, and the layer is a cheap
+    /// automaton scan over a capped prefix.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_signature_enabled: bool,
+    /// V32 (locked decision 7): run the Llama Prompt Guard 2 **classifier**
+    /// screen over every EXTERNAL tool result.
+    ///
+    /// On by default *and inert without weights*: the model files are not
+    /// shipped yet, so with them absent the screen skips and Settings says so.
+    /// Defaulting to on means installing the weights is the only step needed to
+    /// activate it — a default-off flag would leave the layer silently unused
+    /// on every machine that fetched them.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_classifier_enabled: bool,
+    /// V32: the probability at or above which the classifier's verdict counts
+    /// as a flag. Prompt Guard 2's positive class is "malicious"; 0.9 is the
+    /// conservative default, chosen because a false positive costs a warning
+    /// header on legitimate research and header fatigue is the failure mode
+    /// that would make the whole surface worthless.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_classifier_threshold: f32,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1595,6 +1625,18 @@ impl std::fmt::Debug for OffloadSettings {
             .field("session_push", &self.session_push)
             .field("external_fetch_max_calls", &self.external_fetch_max_calls)
             .field("external_fetch_max_bytes", &self.external_fetch_max_bytes)
+            .field(
+                "detection_signature_enabled",
+                &self.detection_signature_enabled,
+            )
+            .field(
+                "detection_classifier_enabled",
+                &self.detection_classifier_enabled,
+            )
+            .field(
+                "detection_classifier_threshold",
+                &self.detection_classifier_threshold,
+            )
             .finish()
     }
 }
@@ -1655,6 +1697,12 @@ impl Default for OffloadSettings {
             // wall early instead of running out the task deadline.
             external_fetch_max_calls: 40,
             external_fetch_max_bytes: 4 * 1024 * 1024,
+            // Both detection layers on. Surface-only, so "on" costs a header
+            // on a false positive, never a broken call — and the classifier is
+            // additionally inert until its weights are installed.
+            detection_signature_enabled: true,
+            detection_classifier_enabled: true,
+            detection_classifier_threshold: 0.9,
         }
     }
 }

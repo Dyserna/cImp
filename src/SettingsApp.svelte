@@ -55,8 +55,10 @@
     offloadReloadMcp,
     offloadEnableReadonlyCommands,
     describeMcpServerHealth,
+    detectionStatus,
     type BackendStatus,
     type ServiceStatus,
+    type DetectionStatus,
   } from './lib/offload';
   import { graphIgnorePick, graphRebuild, graphStatus, type GraphStatus } from './lib/graph';
   import ArrayEditor from './lib/settings/ArrayEditor.svelte';
@@ -380,6 +382,17 @@
   );
   // V8-03 warm pool: honest global in-flight + per-MCP-server health.
   let serviceStatus = $state<ServiceStatus | null>(null);
+  // V32 Phase C: how much of the injection-detection surface is actually live.
+  // Read-only disk facts (rule files compiled, classifier weights present), so
+  // it rides the same poller as the backend statuses rather than the settings
+  // snapshot — it is not a setting and never round-trips through `patch`.
+  let detection = $state<DetectionStatus | null>(null);
+  // Recompile the rules from disk and fold the fresh counts back in. The one
+  // consumer of `detection::reload()` today; the V32 C3 updater adds the
+  // scheduled path on top of the same entry point.
+  async function reloadDetection(): Promise<void> {
+    detection = await detectionStatus(true);
+  }
   let backendStatusTimer: ReturnType<typeof setInterval> | null = null;
   async function refreshBackendStatuses(): Promise<void> {
     try {
@@ -388,6 +401,8 @@
       console.warn('offload_statuses failed', e);
     }
     serviceStatus = await offloadServiceStatus();
+    // Cheap: cached disk facts, no recompile (`reload = false`).
+    detection = await detectionStatus();
   }
   function startBackendStatusPolling(): void {
     if (backendStatusTimer) return;
@@ -4073,6 +4088,100 @@
               one flagged row to Tools → Activities.
             </small>
           </label>
+
+          <h3>Injection detection</h3>
+          <small class="hint top">
+            Screens the text every external tool brings back (fetched pages, docs
+            lookups) for prompt-injection content. Both layers are
+            <strong>surface-only</strong>: a hit prepends a warning header for the
+            reading model and writes a flagged row to Tools → Activities — nothing
+            is ever blocked, withheld or modified, so a false positive costs a line
+            of noise, not a broken task.
+          </small>
+          {#if detection}
+            <ul class="mcp-health">
+              <li class:healthy={detection.rules.files_failed === 0 && detection.rules.files_loaded > 0} class:down={detection.rules.files_failed > 0 || detection.rules.files_loaded === 0}>
+                <span class="mcp-dot" aria-hidden="true"></span>
+                <span class="mcp-name">Signature rules</span>
+                <span class="mcp-detail" title={detection.rules.dir}>
+                  {detection.rules.files_loaded} file(s) loaded, {detection.rules.rules} rule(s){detection.rules.files_failed > 0
+                    ? ` — ${detection.rules.files_failed} failed: ${detection.rules.failed.join(', ')}`
+                    : ''}
+                </span>
+              </li>
+              <li class:healthy={detection.classifier.present} class:down={!detection.classifier.present}>
+                <span class="mcp-dot" aria-hidden="true"></span>
+                <span class="mcp-name">Classifier</span>
+                <span class="mcp-detail" title={detection.classifier.dir}>
+                  {detection.classifier.present
+                    ? 'Prompt Guard 2 weights loaded'
+                    : (detection.classifier.error ?? 'weights not installed')}
+                </span>
+              </li>
+            </ul>
+          {:else}
+            <small class="hint">Detection status unavailable (the app is still starting).</small>
+          {/if}
+          <button type="button" onclick={reloadDetection}>Reload rules</button>
+          <small class="hint">
+            Rules are plain <code>.yar</code> files next to cimp.exe under
+            <code>detection/rules.d/</code>. Drop your own in the
+            <code>local/</code> subfolder — a future auto-update replaces the
+            shipped bundle but never touches <code>local/</code>. A file that
+            fails to compile is skipped and the rest still load.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.detection_signature_enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.detection_signature_enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Signature screen (YARA rules)</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.detection_classifier_enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.detection_classifier_enabled = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Classifier screen (Prompt Guard 2)</span>
+          </label>
+          <label>
+            <span>Classifier threshold (0–1)</span>
+            <input
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              value={snapshot.offload.detection_classifier_threshold}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.detection_classifier_threshold = Math.min(
+                      1,
+                      Math.max(0, +(e.currentTarget as HTMLInputElement).value || 0),
+                    )),
+                )}
+            />
+            <small class="hint">
+              Probability at or above which the classifier flags a result. Lower
+              catches more and warns more often; 0.9 is the conservative default,
+              because a header on every page trains the model to ignore it.
+            </small>
+          </label>
+
           <label class="checkbox">
             <input
               type="checkbox"

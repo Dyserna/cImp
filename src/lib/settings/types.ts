@@ -1325,6 +1325,17 @@ export interface OffloadSettings {
   /// V32: cap on the cumulative bytes of EXTERNAL tool results one scope may
   /// pull. `0` disables the byte cap.
   external_fetch_max_bytes: number;
+  /// V32 (locked decision 7): run the YARA signature screen over every EXTERNAL
+  /// tool result. Rules are data files under `<exe-dir>/detection/rules.d/`.
+  /// Surface-only — a match adds a warning header and a Tool Activity row and
+  /// blocks nothing.
+  detection_signature_enabled: boolean;
+  /// V32: run the Prompt Guard 2 classifier over every EXTERNAL tool result.
+  /// On by default and inert until the model weights are installed.
+  detection_classifier_enabled: boolean;
+  /// V32: probability at or above which the classifier's verdict counts as a
+  /// flag (0-1).
+  detection_classifier_threshold: number;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1642,6 +1653,9 @@ export function defaultSettings(): Settings {
       session_push: false,
       external_fetch_max_calls: 40,
       external_fetch_max_bytes: 4 * 1024 * 1024,
+      detection_signature_enabled: true,
+      detection_classifier_enabled: true,
+      detection_classifier_threshold: 0.9,
     },
     graph: {
       enabled: false,

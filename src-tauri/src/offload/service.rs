@@ -727,6 +727,15 @@ impl OffloadService {
         }
     }
 
+    /// V32 Phase C (locked decision 7): which detection layers screen EXTERNAL
+    /// results, from settings. Read by the loopback proxy for the results it
+    /// returns to a tab; the worker's copy is snapshotted into its
+    /// [`HostRouter`](super::agent::HostRouter) at task start, so a task is
+    /// screened under one consistent configuration for its whole run.
+    pub fn detection_config(&self) -> super::detection::Config {
+        super::detection::Config::from_settings(&self.settings.current())
+    }
+
     /// Run one offload task end-to-end against the live pool and return the
     /// synthesized answer. Acquires the global permit *and* the chosen
     /// backend's slot, so `in_flight` is honest and the global gate queues a
@@ -1250,6 +1259,7 @@ impl OffloadService {
             allow_audit,
             task_scope.clone(),
             outbound::Policy::from_settings(&cur),
+            super::detection::Config::from_settings(&cur),
         );
         let cfg = AgentConfig {
             base_url: entry.base_url.clone(),

@@ -1152,6 +1152,31 @@ pub async fn offload_reload_mcp(
     Ok(service.status().await)
 }
 
+/// V32 Phase C: how much of the injection-detection surface is actually live —
+/// signature rule files loaded/failed and whether the classifier's weights are
+/// installed. Drives the Settings → Tools → Detection readout.
+///
+/// `reload = true` recompiles the rules from disk first, which is what the
+/// "Reload rules" button calls after the user edits a file in
+/// `detection/rules.d/local/`. Both paths do blocking file I/O and (on reload) a
+/// YARA compile, so they run on the blocking pool rather than the async
+/// runtime's worker.
+#[tauri::command]
+pub async fn detection_status(
+    reload: bool,
+) -> AppResult<crate::offload::detection::DetectionStatus> {
+    let status = tokio::task::spawn_blocking(move || {
+        if reload {
+            crate::offload::detection::reload()
+        } else {
+            crate::offload::detection::status()
+        }
+    })
+    .await
+    .map_err(|e| AppError::Offload(format!("detection status task failed: {e}")))?;
+    Ok(status)
+}
+
 /// V8-03: buffered `llama-server` output for a backend (primary when `name`
 /// is omitted) — the read-only Settings log panel's initial fill. Live lines
 /// arrive separately via the `offload-server-output` event.

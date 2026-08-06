@@ -262,6 +262,14 @@ jobs:
           Copy-Item -Recurse themes/* "$stageFull/bin/themes/"
           Copy-Item -Recurse palettes/* "$stageFull/bin/palettes/"
 
+          # V32 injection-detection YARA rules. Read from
+          # <exe-dir>/detection/rules.d/ (plus the user-owned local/ overlay the
+          # future auto-updater never touches). Data files exactly like
+          # themes/palettes — the signature layer has NO embedded fallback, so
+          # omitting these would ship an app with detection silently off.
+          New-Item -ItemType Directory -Force -Path "$stageFull/bin/detection" | Out-Null
+          Copy-Item -Recurse detection/* "$stageFull/bin/detection/"
+
           # Kokoro ONNX model and every voicepack, fetched from the
           # models-v1 release by the fetch step. Shipping all voices means
           # the user can switch via Settings -> Audio without re-downloading
@@ -334,6 +342,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stageSlim/bin/palettes" | Out-Null
           Copy-Item -Recurse themes/* "$stageSlim/bin/themes/"
           Copy-Item -Recurse palettes/* "$stageSlim/bin/palettes/"
+
+          # V32 detection rules (see the full-variant note). Tiny text files
+          # carrying no model weights, so the slim zip ships them too.
+          New-Item -ItemType Directory -Force -Path "$stageSlim/bin/detection" | Out-Null
+          Copy-Item -Recurse detection/* "$stageSlim/bin/detection/"
 
           Copy-Item LICENSE "$stageSlim/"
           Copy-Item NOTICE "$stageSlim/"
@@ -608,6 +621,9 @@ jobs:
           cp -r themes "$stageFull/bin/themes"
           cp -r palettes "$stageFull/bin/palettes"
 
+          # V32 injection-detection YARA rules (see the Windows note).
+          cp -r detection "$stageFull/bin/detection"
+
           # Kokoro model + all voicepacks + Whisper STT model (fetched from
           # the models-v1 release by the fetch step).
           cp models/kokoro-v1.0.onnx "$stageFull/models/"
@@ -632,6 +648,7 @@ jobs:
           [ -d "$rel/espeak-ng-data" ] && cp -r "$rel/espeak-ng-data" "$stageSlim/bin/"
           cp -r themes "$stageSlim/bin/themes"
           cp -r palettes "$stageSlim/bin/palettes"
+          cp -r detection "$stageSlim/bin/detection"
           cp LICENSE NOTICE "$stageSlim/"
           cp scripts/portable-readme-linux.txt "$stageSlim/README.txt"
 

@@ -23,15 +23,23 @@ fn set_linux_origin_rpath() {
     }
 }
 
-/// Copy the repo-root `themes/`, `palettes/`, and `ebin/` folders next to the
-/// built binary (`target/{profile}/themes` etc.), the same place the portable
-/// release stages them (`<exe-dir>/themes`, sibling `ebin/`). The app reads
-/// themes/palettes purely from disk and resolves bundled tools out of `ebin/`
-/// (see `pty::resolve`) — nothing is embedded or seeded at runtime — so this
-/// build-time copy is what makes dev / local builds find them without
-/// hand-staging a portable layout. `ebin/` carries no binaries in the repo
-/// (only a `.gitkeep`); drop a tool there to test resolution locally. The
-/// release zip gets its copies from `.github/workflows/release.yml` instead.
+/// Copy the repo-root `themes/`, `palettes/`, `ebin/` and `detection/` folders
+/// next to the built binary (`target/{profile}/themes` etc.), the same place the
+/// portable release stages them (`<exe-dir>/themes`, sibling `ebin/`). The app
+/// reads themes/palettes and the V32 detection rules purely from disk and
+/// resolves bundled tools out of `ebin/` (see `pty::resolve`) — nothing is
+/// embedded or seeded at runtime — so this build-time copy is what makes dev /
+/// local builds find them without hand-staging a portable layout. `ebin/`
+/// carries no binaries in the repo (only a `.gitkeep`); drop a tool there to
+/// test resolution locally. The release zip gets its copies from
+/// `.github/workflows/release.yml` instead.
+///
+/// `detection/` is synced like the rest, with one consequence worth naming: the
+/// sync PRUNES destination entries the source no longer has, so a `.yar` file a
+/// developer drops into `target/{profile}/detection/rules.d/local/` is removed
+/// on the next build. That is correct for a dev tree (the repo is the source of
+/// truth) and harmless for users, whose `local/` folder lives beside a released
+/// binary that no build ever touches.
 fn copy_theming_assets() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     // OUT_DIR = target/{profile}/build/cimp-{hash}/out → up 3 = target/{profile}.
@@ -45,7 +53,7 @@ fn copy_theming_assets() {
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = manifest.parent().expect("manifest has no parent");
 
-    for folder in ["themes", "palettes", "ebin"] {
+    for folder in ["themes", "palettes", "ebin", "detection"] {
         let src = repo_root.join(folder);
         println!("cargo:rerun-if-changed={}", src.display());
         if !src.is_dir() {

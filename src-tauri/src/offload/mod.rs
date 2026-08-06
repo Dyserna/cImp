@@ -27,12 +27,18 @@
 //! - [`spotlight`] (V32 Phase B) — the nonced data-not-instructions envelope
 //!   wrapped around every EXTERNAL tool result, at both the worker's and the
 //!   proxy's tool-result boundary.
+//! - [`outbound`] (V32 Phase C) — the SSRF, fetch-budget and canary screens on
+//!   what an EXTERNAL call sends *out*.
+//! - [`detection`] (V32 Phase C) — the YARA signature + Prompt Guard classifier
+//!   screens on what an EXTERNAL call brings *back*, composing the warning
+//!   header with [`spotlight`]'s envelope at the same two boundaries.
 //!
 //! The whole stack sits behind the minimal [`Backend`] seam (one Local
 //! impl today) so V8-02 can add remote/cloud backends + capability-aware
 //! routing without re-architecting the loop.
 
 pub mod agent;
+pub mod detection;
 pub mod loopback;
 pub mod mcp;
 pub mod mcp_host;

@@ -189,6 +189,46 @@ export async function offloadReloadMcp(): Promise<ServiceStatus | null> {
   }
 }
 
+/// V32 Phase C: how much of the injection-detection surface is actually live
+/// (mirror of Rust `detection::DetectionStatus`). Read-only — everything here
+/// is a fact about disk state, not a setting.
+export interface DetectionStatus {
+  rules: {
+    /// Rule files that compiled and are live.
+    files_loaded: number;
+    /// Rule files found but rejected (compile error) — the number that matters:
+    /// it means rules the user believes are active are not.
+    files_failed: number;
+    /// Individual rules across all loaded files.
+    rules: number;
+    /// Names of the rejected files.
+    failed: string[];
+    /// Where cImp looked, so "0 files" is diagnosable.
+    dir: string;
+  };
+  classifier: {
+    /// Weights found AND the ONNX session built.
+    present: boolean;
+    /// Where the weights are expected.
+    dir: string;
+    /// Why the classifier is not live, when it is not.
+    error: string | null;
+  };
+}
+
+/// Read the detection status. `reload = true` recompiles the YARA rules from
+/// disk first — what the "Reload rules" button calls after the user edits a
+/// file in `detection/rules.d/local/`. Returns `null` when the app isn't
+/// reachable so the caller can render a neutral state.
+export async function detectionStatus(reload = false): Promise<DetectionStatus | null> {
+  try {
+    return await invoke<DetectionStatus>('detection_status', { reload });
+  } catch (e) {
+    console.warn('detection_status failed', e);
+    return null;
+  }
+}
+
 /// V21 F7: merge the curated read-only command preset (`git` + `cargo`
 /// metadata/tree, with the `cargo` policy that pins it to those verbs) into the
 /// live offload settings, and return the updated Settings so the caller can

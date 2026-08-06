@@ -44,7 +44,7 @@ use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
 use super::router::TierHint;
 use super::service::{OffloadService, PushNotice};
-use super::spotlight;
+use super::detection;
 use super::outbound::{self, Budget};
 use super::toolclass::{self, Latch, Profile, ToolClass};
 
@@ -2447,6 +2447,15 @@ async fn handle_mcp_call(
         .as_ref()
         .map(LatchScope::label)
         .unwrap_or_else(|| format!("{agent}:(no tab identity)"));
+    // V32 Phase C: the flagged row's provenance, read from the arguments before
+    // they are moved into the call — the result alone cannot say which page it
+    // came from, and that is the first thing a user reads off the row.
+    let (flag_url, flag_host) = detection::origin_of(&body.arguments);
+    let detection_cfg = service.detection_config();
+    let root_key = cwd
+        .as_deref()
+        .map(crate::activity::root_key)
+        .unwrap_or_default();
     let r = match service
         .mcp_call(
             consumer_of(req),
@@ -2457,21 +2466,36 @@ async fn handle_mcp_call(
         )
         .await
     {
-        // Locked decision 6: the envelope goes on here, at the proxy's
-        // tool-result boundary, so EVERY consumer gets it identically — and it
-        // is applied whether or not the call carried tab identity, since it
-        // needs none. Same `envelope_if_external` the worker's boundary calls,
-        // so the external-only rule has one definition. Errors are
-        // cImp-composed strings, not fetched content, and are never wrapped.
+        // Locked decisions 5 + 6: detection, the envelope and the warning
+        // header all compose here, at the proxy's tool-result boundary, so
+        // EVERY consumer gets them identically — and they apply whether or not
+        // the call carried tab identity, since none of the three needs it. The
+        // same `wrap_external_result` the worker's boundary calls, so the
+        // external-only rule and the composition order have one definition.
+        // Errors are cImp-composed strings, not fetched content, and are never
+        // screened or wrapped.
         Ok(text) => {
             // V32 Phase C: charge what this call actually pulled, so the byte
             // half of the budget reflects external content ingested by this
             // session. Charged on the raw result, before the envelope adds
             // cImp's own preamble and markers.
             latches().charge(scope.as_ref(), text.len());
+            let wrapped = detection::wrap_external_result(
+                &body.name,
+                text,
+                detection::ResultCtx {
+                    consumer: agent,
+                    scope: &scope_label,
+                    root: root_key,
+                    url: flag_url,
+                    host: flag_host,
+                    cfg: detection_cfg,
+                },
+            )
+            .await;
             RunResult {
                 ok: true,
-                text: Some(spotlight::envelope_if_external(&body.name, text)),
+                text: Some(wrapped),
                 error: None,
             }
         }

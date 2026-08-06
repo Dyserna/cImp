@@ -568,6 +568,15 @@ pub enum Screen {
     /// it is the *expected* working of containment, not evidence of an attack,
     /// and the UI must be able to tell them apart.
     LatchRefusal,
+    /// The YARA signature screen matched an EXTERNAL result (decision 7).
+    /// Unlike every variant above, this one and [`Screen::Classifier`] denied
+    /// nothing — locked decision 5 makes detection surface-only, so their rows
+    /// record a *warning that was attached to a delivered result*. See
+    /// [`detection`](super::detection).
+    Signature,
+    /// The Prompt Guard classifier scored an EXTERNAL result over threshold
+    /// (decision 7). Surface-only, like [`Screen::Signature`].
+    Classifier,
 }
 
 impl Screen {
@@ -577,7 +586,16 @@ impl Screen {
             Screen::Budget => "budget",
             Screen::Canary => "canary",
             Screen::LatchRefusal => "latch_refusal",
+            Screen::Signature => "signature",
+            Screen::Classifier => "classifier",
         }
+    }
+
+    /// Whether this screen actually stopped something. The two detection
+    /// screens did not (surface-only), and a row that paints them as denials
+    /// would misreport what happened: the result was delivered in full.
+    pub fn is_denial(self) -> bool {
+        !matches!(self, Screen::Signature | Screen::Classifier)
     }
 }
 
@@ -646,9 +664,12 @@ pub fn record_flag(flag: Flag<'_>) {
             target,
             0,
             0,
-            // Every flag row is a denial. `ok: false` is what paints it as a
-            // failure in the feed without any per-kind UI work.
-            false,
+            // A denial row is painted as a failure in the feed (`ok: false`)
+            // with no per-kind UI work. The two Phase C *detection* screens are
+            // not denials — the result was delivered — so their rows stay
+            // `ok: true` and read as "flagged", which is exactly what locked
+            // decision 5 says happened.
+            !flag.screen.is_denial(),
         ),
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
         response: flag.detail.to_string(),

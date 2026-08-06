@@ -250,8 +250,10 @@ since the `cimp --offload-mcp` child is per-tab and cImp composes its whole
 command line: `tabs/config.rs` bakes `--tab <tab-id>` into both harness configs
 (Claude's `--mcp-config` server entry, OpenCode's
 `OPENCODE_CONFIG_CONTENT.mcp.cimp-offload`). The child forwards it as
-`GraphRunBody.tab` on `/graph_run` **only** — `/mcp/call` proxies to external
-servers, which hold no cImp memory scope. `handle_graph_run` resolves it at call
+`GraphRunBody.tab` on `/graph_run` — and, since V32 Phase B, as
+`McpCallBody.tab` on `/mcp/call` too: external servers still hold no cImp memory
+scope, but the proxy's taint latch is keyed by the same tab identity on both
+tool-serving routes. `handle_graph_run` resolves it at call
 time through `GraphService::live_session_for_tab(tab, agent)` (the V24
 live-session registry: exact key match, agent must match, TTL-filtered, never a
 guess — NC-2's resolver discipline), and threads the resulting session id down

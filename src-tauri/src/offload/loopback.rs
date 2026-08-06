@@ -12,6 +12,10 @@
 //!   V30 Phase B, addressed session pushes (`event: push` →
 //!   `notifications/claude/channel`).
 //!
+//! (It has grown a few more since — the graph/audit/context/memory routes the
+//! per-tab child and the harness hooks post to, plus `GET /status`, the V32
+//! Phase B taint-latch debug view.)
+//!
 //! The `{port, token, pid}` are advertised in a discovery file written next
 //! to the exe (the portable root — never `~/.claude`), created when offload
 //! is enabled and removed on exit. The token rotates every launch. This is
@@ -21,9 +25,9 @@
 //! observe task text — the same localhost-dev-server trust assumption,
 //! documented in MAINTENANCE.md.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +44,8 @@ use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
 use super::router::TierHint;
 use super::service::{OffloadService, PushNotice};
-use super::toolclass::Profile;
+use super::spotlight;
+use super::toolclass::{self, Latch, Profile, ToolClass};
 
 /// Discovery-file name under the portable root (next to `settings.json`).
 /// Legacy single-instance location, still written for anything that only
@@ -639,7 +644,7 @@ async fn handle_conn(
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
         ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
-        ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &req).await,
+        ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &app, &req).await,
         ("GET", "/describe") => {
             let text = service.describe().await;
             write_simple(
@@ -652,6 +657,7 @@ async fn handle_conn(
         }
         ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
+        ("GET", "/status") => handle_status(&mut stream).await,
         _ => write_simple(&mut stream, 404, "text/plain", b"not found").await,
     }
 }
@@ -834,6 +840,232 @@ struct McpCallBody {
     /// empty root.
     #[serde(default)]
     cwd: Option<String>,
+    /// V32 Phase B: the cImp TAB id the calling MCP child was spawned for.
+    /// V28 sent `tab` on `/graph_run` only — external servers hold no cImp
+    /// memory scope — but the taint latch needs the *same* identity on both
+    /// tool-serving routes or a tab could launder an external fetch past its
+    /// own latch. Optional on exactly the same fail-open terms as
+    /// [`GraphRunBody::tab`].
+    #[serde(default)]
+    tab: Option<String>,
+}
+
+// ── V32 Phase B — the consumer-side taint latch ────────────────────────────
+
+/// The identity one gated call carries: which agent, which tab, and which
+/// session that tab is currently running.
+///
+/// `agent` is always the normalized `claude`/`opencode` vocabulary
+/// ([`crate::graph::source_for_consumer`]) because the two gated routes learn
+/// the consumer differently — `/graph_run` from the body, `/mcp/call` from the
+/// `?consumer=` query — and one tab MUST key identically from either, or its
+/// web fetches and its graph reads would latch two separate scopes.
+struct LatchScope {
+    agent: &'static str,
+    tab: String,
+    /// The session the V28 registry currently reports for this tab, or `None`
+    /// when it withholds one (no live entry yet, TTL-stale, or the H1
+    /// same-root ambiguity). `None` is *absence of evidence*, never evidence of
+    /// a new session — see [`TabLatch::observe`].
+    session: Option<String>,
+}
+
+impl LatchScope {
+    /// The registry key. Tuple, not a formatted string, so no tab id
+    /// containing the separator could collide with another agent's tab.
+    fn key(&self) -> (&'static str, String) {
+        (self.agent, self.tab.clone())
+    }
+}
+
+/// Resolve the calling tab's latch scope, or `None` when the call carries no
+/// tab identity at all.
+///
+/// `None` is the **fail-open** case (locked, and V28's existing discipline): a
+/// child spawned before `--tab` existed sends nothing, and a tool call must
+/// never fail for lack of identity. It is deliberately NOT promoted to a
+/// global latch — one identityless call would then latch every consumer at
+/// once. Such calls still get the spotlighting envelope on EXTERNAL results,
+/// which needs no identity.
+fn latch_scope(app: &AppHandle, agent: &'static str, tab: Option<&str>) -> Option<LatchScope> {
+    let tab = tab.map(str::trim).filter(|t| !t.is_empty())?;
+    let session = app
+        .try_state::<Arc<crate::graph::GraphService>>()
+        .and_then(|g| g.live_session_for_tab(tab, agent));
+    Some(LatchScope {
+        agent,
+        tab: tab.to_string(),
+        session,
+    })
+}
+
+/// One tab's latch, together with the session identity it was engaged for.
+struct TabLatch {
+    session: Option<String>,
+    latch: Latch,
+}
+
+impl TabLatch {
+    /// Fold the currently-observed session id into this entry, resetting the
+    /// latch when the tab's session has demonstrably **rotated**.
+    ///
+    /// This is what makes the latch's scope "the tab's live session" rather
+    /// than "the tab": a tab restart starts a new harness session, the V28
+    /// registry re-stamps the tab with the new id, and the contaminated scope
+    /// ends with the conversation that was contaminated. (The tab id itself
+    /// never rotates — it is config-derived — so keying on it alone would
+    /// strand a tab latched until the app restarted.)
+    ///
+    /// The three cases, and why `None` is not one of them:
+    /// - a *different* session id ⇒ new scope, latch back to [`Latch::Open`];
+    /// - the *same* id ⇒ unchanged;
+    /// - **no** id ⇒ unchanged, and the stored id is kept. The registry
+    ///   withholds a session for reasons that have nothing to do with restarts
+    ///   (TTL staleness, the H1 same-root ambiguity, a tab that has not yet
+    ///   emitted a session-bearing event). Treating that silence as a restart
+    ///   would hand an injected model a trivial latch reset: keep calling until
+    ///   the registry blinks.
+    fn observe(&mut self, session: Option<&str>) {
+        let Some(s) = session else { return };
+        match self.session.as_deref() {
+            Some(prev) if prev == s => {}
+            Some(_) => {
+                self.session = Some(s.to_string());
+                self.latch = Latch::Open;
+            }
+            // First sighting: the same scope, only now identified. The latch
+            // carries over — calls made before the registry knew the session
+            // still happened in this conversation.
+            None => self.session = Some(s.to_string()),
+        }
+    }
+}
+
+/// Which tool-serving route a gate call is running for. The two differ in one
+/// respect only: what an [`ToolClass::External`] classification *means* there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatchRoute {
+    /// `/mcp/call` — proxied `<server>__<tool>` ids. Every name here is
+    /// namespaced and therefore EXTERNAL by the Phase A unknown-⇒-EXTERNAL
+    /// invariant; this route is the tab's untrusted-content intake.
+    Proxied,
+    /// `/graph_run` — cImp-native `graph_*` / `context_*` tools only. This
+    /// route physically cannot serve a proxied server's content, so a name
+    /// that classifies EXTERNAL here is not external content at all: it is a
+    /// typo or a hallucination that `run_graph_tool` will reject as unknown.
+    /// Letting it *engage* the latch would let one bad tool name poison a tab
+    /// for its whole session — so on this route EXTERNAL neither latches nor
+    /// is refused, and the graph service answers with its own error.
+    Native,
+}
+
+/// The per-tab-session taint latches for the tools this proxy serves.
+///
+/// Locked decision 3: consumer enforcement lives here, keyed by V28 tab
+/// identity. Two asymmetries with the worker's latch are deliberate:
+///
+/// - **Refusal, not def removal.** The worker rebuilds its advertised tool list
+///   every turn, so decision 2's def removal is available to it. Consumers
+///   cache `tools/list` at connect (the long-standing OpenCode behaviour that
+///   forces a tab restart after MCP flag changes, and Claude does the same), so
+///   removing a def mid-session would not be seen. The fixed-string refusals
+///   from [`toolclass`] are the whole enforcement here.
+/// - **Only the tools this proxy serves.** Claude's native Read/Bash and
+///   OpenCode's bash/write never route through cImp, so no latch of ours can
+///   reach them (decision 3's honest limit; OS containment is V33, optional
+///   hook gating is Phase E).
+#[derive(Default)]
+struct LatchRegistry {
+    tabs: Mutex<HashMap<(&'static str, String), TabLatch>>,
+}
+
+impl LatchRegistry {
+    /// Decide one call, and engage the latch when it may proceed.
+    ///
+    /// The whole check-then-engage runs under one lock and **before** the call
+    /// executes — loopback serves concurrent requests, so two simultaneous
+    /// calls from one tab must not both observe an open latch. A refused call
+    /// never engages or flips anything (same property as Phase A's
+    /// `latch_gate`): otherwise a hallucinated call to the blocked side could
+    /// redefine which side of the boundary the session is on.
+    fn gate(
+        &self,
+        scope: Option<&LatchScope>,
+        route: LatchRoute,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        // Fail-open: no tab identity ⇒ no latch (see [`latch_scope`]).
+        let Some(scope) = scope else { return Ok(()) };
+        let class = toolclass::classify(name);
+        if route == LatchRoute::Native && class == ToolClass::External {
+            return Ok(());
+        }
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = tabs.entry(scope.key()).or_insert(TabLatch {
+            session: None,
+            latch: Latch::Open,
+        });
+        entry.observe(scope.session.as_deref());
+        if let Some(refusal) = entry.latch.refusal(class) {
+            warn!(
+                target: "offload",
+                agent = scope.agent,
+                tab = %scope.tab,
+                tool = %name,
+                latch = entry.latch.label(),
+                "loopback: tool call refused by the V32 session taint latch"
+            );
+            return Err(refusal);
+        }
+        if entry.latch.engage(class) {
+            info!(
+                target: "offload",
+                agent = scope.agent,
+                tab = %scope.tab,
+                tool = %name,
+                latch = entry.latch.label(),
+                "loopback: V32 session taint latch engaged"
+            );
+        }
+        Ok(())
+    }
+
+    /// The `/status` view: one row per tab the proxy has served, sorted so the
+    /// output is stable to eyeball across polls.
+    fn snapshot(&self) -> Vec<LatchStatus> {
+        let tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut rows: Vec<LatchStatus> = tabs
+            .iter()
+            .map(|((agent, tab), st)| LatchStatus {
+                consumer: agent,
+                tab: tab.clone(),
+                session: st.session.clone(),
+                latch: st.latch.label(),
+            })
+            .collect();
+        rows.sort_by(|a, b| (a.consumer, &a.tab).cmp(&(b.consumer, &b.tab)));
+        rows
+    }
+}
+
+/// One `/status` latch row.
+#[derive(Serialize, Debug)]
+struct LatchStatus {
+    consumer: &'static str,
+    tab: String,
+    session: Option<String>,
+    /// [`Latch::label`]: `open` / `external` / `local`.
+    latch: &'static str,
+}
+
+/// The process-wide registry. Latch state is intentionally in-memory and
+/// non-durable: it describes *live* conversations, and an app restart
+/// necessarily ends every one of them. It is bounded by construction too — one
+/// entry per (agent, tab) pair, and tab ids are config-derived and reused
+/// across restarts, so nothing accumulates over a long-running app.
+fn latches() -> &'static LatchRegistry {
+    static LATCHES: OnceLock<LatchRegistry> = OnceLock::new();
+    LATCHES.get_or_init(LatchRegistry::default)
 }
 
 /// `POST /graph_run`: run one `graph_*` tool against the app's WARM graph index
@@ -874,14 +1106,37 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // and steal — one memory scope). Fail-open: no `tab`, an unknown key, a
     // different agent's entry, or a TTL-stale one all yield `None`, which is
     // exactly the pre-V28 behavior.
-    let session = body
-        .tab
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .and_then(|tab| {
-            graph.live_session_for_tab(tab, crate::graph::source_for_consumer(consumer))
-        });
+    //
+    // V32 Phase B folds that same resolution into the latch scope, so the
+    // registry is consulted once and the memory scope and the taint scope can
+    // never disagree about which session this call belongs to.
+    let scope = latch_scope(
+        app,
+        crate::graph::source_for_consumer(consumer),
+        body.tab.as_deref(),
+    );
+    let session = scope.as_ref().and_then(|s| s.session.clone());
+
+    // V32 Phase B: the session taint latch over the tools THIS route serves —
+    // the content-bearing graph tools (LOCAL-CAPABILITY), the structural ones
+    // and the memory reads (TRUSTED, never gated), and `context_note`
+    // (PERSISTENT-WRITE, refused with `REFUSAL_WRITE_BLOCKED` under an EXTERNAL
+    // latch). That refusal is INTERIM: locked decision 10 / Phase C2 replaces
+    // it with quarantine — the note is stored with a `tainted` flag, excluded
+    // from auto-injection and `context_recall`, and held for explicit user
+    // promote-or-discard — which preserves the legitimate research conclusion
+    // this block currently drops.
+    if let Err(refusal) = latches().gate(scope.as_ref(), LatchRoute::Native, &body.name) {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(refusal.to_string()),
+        };
+        // 200, like every other tool-level error here: the child renders
+        // `error` as the tool result, which is how the model reads the refusal.
+        return write_json(stream, 200, &r).await;
+    }
+
     let r = match graph
         .run_graph_tool(&cwd, &body.name, &body.args, consumer, session.as_deref())
         .await
@@ -2032,9 +2287,15 @@ async fn handle_mcp_list(
 /// The service guards the call against any tool not offered by a server
 /// exposed to that consumer. 200 even on a tool-level error (the child renders
 /// `error` as a tool result).
+///
+/// V32 Phase B adds the two halves of the consumer-side containment: the tab's
+/// session taint latch in front of the call, and the spotlighting envelope
+/// around its result. This is the tab's untrusted-content intake — the one
+/// route through which a fetched page's bytes reach a Claude/OpenCode session.
 async fn handle_mcp_call(
     stream: &mut TcpStream,
     service: &Arc<OffloadService>,
+    app: &AppHandle,
     req: &Request,
 ) -> AppResult<()> {
     let body: McpCallBody = match serde_json::from_slice(&req.body) {
@@ -2048,14 +2309,34 @@ async fn handle_mcp_call(
             return write_json(stream, 400, &r).await;
         }
     };
+    // Normalized through the same `source_for_consumer` vocabulary
+    // `/graph_run` uses, so one tab keys one latch from both routes.
+    let agent =
+        crate::graph::source_for_consumer(query_param(&req.path, "consumer").unwrap_or("claude"));
+    let scope = latch_scope(app, agent, body.tab.as_deref());
+    if let Err(refusal) = latches().gate(scope.as_ref(), LatchRoute::Proxied, &body.name) {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(refusal.to_string()),
+        };
+        return write_json(stream, 200, &r).await;
+    }
+
     let cwd = body.cwd.map(PathBuf::from);
     let r = match service
         .mcp_call(consumer_of(req), &body.name, body.arguments, cwd.as_deref())
         .await
     {
+        // Locked decision 6: the envelope goes on here, at the proxy's
+        // tool-result boundary, so EVERY consumer gets it identically — and it
+        // is applied whether or not the call carried tab identity, since it
+        // needs none. Same `envelope_if_external` the worker's boundary calls,
+        // so the external-only rule has one definition. Errors are
+        // cImp-composed strings, not fetched content, and are never wrapped.
         Ok(text) => RunResult {
             ok: true,
-            text: Some(text),
+            text: Some(spotlight::envelope_if_external(&body.name, text)),
             error: None,
         },
         Err(e) => RunResult {
@@ -2065,6 +2346,22 @@ async fn handle_mcp_call(
         },
     };
     write_json(stream, 200, &r).await
+}
+
+/// `GET /status`: the proxy's V32 Phase B debug view — one row per tab it has
+/// served, with that tab's resolved session and latch state
+/// ([`Latch::label`]). Read by hand (and by the live-verification recipes) to
+/// answer "why is this tab being refused?" without turning on trace logging.
+///
+/// Behind the same bearer token as every other route; it exposes no fetched
+/// content, only cImp's own identifiers and three fixed labels.
+async fn handle_status(stream: &mut TcpStream) -> AppResult<()> {
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "latches": latches().snapshot() }),
+    )
+    .await
 }
 
 /// Read one `?key=value` query parameter off a request path.
@@ -2861,5 +3158,391 @@ mod tests {
             serde_json::from_slice(br#"{"name":"context_notes","args":{},"future_field":1}"#)
                 .expect("unknown fields ignored");
         assert!(extra.tab.is_none());
+    }
+
+    // ── V32 Phase B — the proxy's per-session taint latch ──────────────────
+
+    use crate::offload::toolclass::{
+        REFUSAL_EXTERNAL_BLOCKED, REFUSAL_LOCAL_BLOCKED, REFUSAL_WRITE_BLOCKED,
+    };
+
+    /// A scope for `tab`, claiming session `session` (`None` = the registry
+    /// withheld one). `claude` unless the test says otherwise.
+    fn scope(tab: &str, session: Option<&str>) -> LatchScope {
+        LatchScope {
+            agent: "claude",
+            tab: tab.to_string(),
+            session: session.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mcp_call_body_carries_the_v32_tab_field_and_tolerates_its_absence() {
+        // V32 Phase B: the per-tab child now tags `/mcp/call` too, so the
+        // proxy can key the call to that tab's session latch.
+        let tagged: McpCallBody = serde_json::from_slice(
+            br#"{"name":"ddg__fetch_content","arguments":{"url":"x"},"cwd":"P:\\proj","tab":"claude-2"}"#,
+        )
+        .expect("tagged body parses");
+        assert_eq!(tagged.tab.as_deref(), Some("claude-2"));
+        assert_eq!(tagged.name, "ddg__fetch_content");
+
+        // Fail-open on the wire, exactly like `/graph_run`: a child from before
+        // this field (or an explicit null) must still be served, unlatched.
+        let absent: McpCallBody =
+            serde_json::from_slice(br#"{"name":"ddg__search","arguments":{}}"#)
+                .expect("pre-V32 body still parses");
+        assert!(absent.tab.is_none());
+        assert!(absent.cwd.is_none());
+        let null: McpCallBody =
+            serde_json::from_slice(br#"{"name":"ddg__search","arguments":{},"tab":null}"#)
+                .expect("explicit null parses");
+        assert!(null.tab.is_none());
+    }
+
+    /// Direction 1: the tab fetches the web first, so the content-bearing
+    /// (LOCAL-CAPABILITY) graph tools close for the rest of that session —
+    /// read-after-fetch is how an injected page steers later reads.
+    #[test]
+    fn external_first_closes_the_local_capability_side_for_that_tab() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+
+        for blocked in [
+            "graph_snippet",
+            "graph_search_docs",
+            "graph_semantic_docs",
+            "graph_semantic_code",
+        ] {
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Native, blocked),
+                Err(REFUSAL_LOCAL_BLOCKED),
+                "{blocked}"
+            );
+        }
+        // The external side itself stays usable — the latch is exclusion, not
+        // a kill switch.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "external");
+    }
+
+    /// Direction 2: the tab reads source text first, so the proxied servers
+    /// close — read-then-fetch is how secrets ride out on a fetch URL.
+    #[test]
+    fn local_capability_first_closes_the_external_side_for_that_tab() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+
+        for blocked in ["ddg__search", "ddg__fetch_content", "context7__query-docs"] {
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Proxied, blocked),
+                Err(REFUSAL_EXTERNAL_BLOCKED),
+                "{blocked}"
+            );
+        }
+        // Local work continues, including the memory write (only an EXTERNAL
+        // latch gates persistence).
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "context_note")
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "local");
+    }
+
+    /// TRUSTED tools are immune in both directions and never latch anything:
+    /// a structural graph query or a memory read must not cost the session
+    /// either capability.
+    #[test]
+    fn trusted_tools_never_latch_and_are_never_refused() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        for trusted in [
+            "graph_outline",
+            "graph_repo_map",
+            "context_recall",
+            "run_check",
+        ] {
+            assert!(
+                reg.gate(Some(&s), LatchRoute::Native, trusted).is_ok(),
+                "{trusted}"
+            );
+        }
+        assert!(reg.snapshot().is_empty() || reg.snapshot()[0].latch == "open");
+
+        // And under a latch of either kind they still answer.
+        for (route, first) in [
+            (LatchRoute::Proxied, "ddg__search"),
+            (LatchRoute::Native, "graph_snippet"),
+        ] {
+            let reg = LatchRegistry::default();
+            let s = scope("t", Some("s"));
+            assert!(reg.gate(Some(&s), route, first).is_ok());
+            for trusted in ["graph_outline", "context_recall", "context_notes"] {
+                assert!(
+                    reg.gate(Some(&s), LatchRoute::Native, trusted).is_ok(),
+                    "{trusted} under {first}"
+                );
+            }
+        }
+    }
+
+    /// The locked cross-module invariant, through the proxy: a server nobody
+    /// has classified is EXTERNAL, so calling it latches the session exactly
+    /// like `ddg__*` does.
+    #[test]
+    fn an_unknown_proxied_server_latches_as_external() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "somenewserver__anything")
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "external");
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+    }
+
+    /// Locked decision 10 (interim form): a memory write under an EXTERNAL
+    /// latch is refused with the fixed write-blocked string, so an injected
+    /// page cannot plant a pinned note that auto-injects into future clean
+    /// sessions. Phase C2 replaces the refusal with quarantine.
+    #[test]
+    fn context_note_is_refused_under_an_external_latch_only() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        // Unlatched: allowed, and the write itself does not latch.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "context_note")
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "open");
+
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Err(REFUSAL_WRITE_BLOCKED)
+        );
+        // Reads of the same store stay open — quarantine is about persistence.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "context_recall")
+            .is_ok());
+    }
+
+    /// Per-tab isolation: one contaminated tab must not disarm (or arm) any
+    /// other, and the same tab id under a different agent is a different tab.
+    #[test]
+    fn latches_are_isolated_per_tab_and_per_agent() {
+        let reg = LatchRegistry::default();
+        let a = scope("claude-1", Some("sess-a"));
+        let b = scope("claude-2", Some("sess-b"));
+        let opencode = LatchScope {
+            agent: "opencode",
+            tab: "claude-1".to_string(),
+            session: Some("sess-c".to_string()),
+        };
+
+        assert!(reg
+            .gate(Some(&a), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&a), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        // Tab B is untouched, and may latch the OTHER way.
+        assert!(reg
+            .gate(Some(&b), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search"),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+        // Same tab STRING, different agent ⇒ its own scope.
+        assert!(reg
+            .gate(Some(&opencode), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+
+        let rows = reg.snapshot();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.consumer, r.tab.as_str(), r.latch))
+                .collect::<Vec<_>>(),
+            [
+                ("claude", "claude-1", "external"),
+                ("claude", "claude-2", "local"),
+                ("opencode", "claude-1", "local"),
+            ]
+        );
+    }
+
+    /// Live-verify 5: a tab restart starts unlatched. The tab id is
+    /// config-derived and never rotates, so the reset rides the SESSION id the
+    /// V28 registry re-stamps when the new harness session comes up.
+    #[test]
+    fn a_new_session_for_the_same_tab_starts_unlatched() {
+        let reg = LatchRegistry::default();
+        let before = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&before), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&before), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+
+        // Tab restarted: same tab id, new session.
+        let after = scope("claude-1", Some("sess-b"));
+        assert!(reg
+            .gate(Some(&after), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        let rows = reg.snapshot();
+        assert_eq!(rows.len(), 1, "the restart reuses the tab's row: {rows:?}");
+        assert_eq!(rows[0].session.as_deref(), Some("sess-b"));
+        assert_eq!(rows[0].latch, "local");
+    }
+
+    /// A withheld session id is absence of evidence, not evidence of a
+    /// restart — otherwise an injected model could reset its own latch by
+    /// calling until the registry blinked (TTL staleness, the H1 same-root
+    /// ambiguity). The latch survives; a later real id adopts the same scope.
+    #[test]
+    fn a_withheld_session_neither_resets_nor_splits_the_latch() {
+        let reg = LatchRegistry::default();
+        // Latched before the registry knew any session at all.
+        let unknown = scope("claude-1", None);
+        assert!(reg
+            .gate(Some(&unknown), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+
+        // The session becomes known: same conversation, so the latch carries.
+        let known = scope("claude-1", Some("sess-a"));
+        assert_eq!(
+            reg.gate(Some(&known), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        assert_eq!(reg.snapshot()[0].session.as_deref(), Some("sess-a"));
+
+        // The registry blinks again: still no reset.
+        assert_eq!(
+            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        assert_eq!(
+            reg.snapshot()[0].session.as_deref(),
+            Some("sess-a"),
+            "a withheld id must not erase the known one"
+        );
+    }
+
+    /// Locked fail-open rule: a call with no tab identity (a child spawned
+    /// before `--tab`) is never gated. It is deliberately NOT folded into a
+    /// global latch — one identityless call would then latch every consumer.
+    /// Its EXTERNAL results are still spotlight-wrapped (that needs no
+    /// identity; see `handle_mcp_call`).
+    #[test]
+    fn an_identityless_call_is_never_gated() {
+        let reg = LatchRegistry::default();
+        for (route, name) in [
+            (LatchRoute::Proxied, "ddg__fetch_content"),
+            (LatchRoute::Native, "graph_snippet"),
+            (LatchRoute::Proxied, "ddg__search"),
+            (LatchRoute::Native, "context_note"),
+        ] {
+            assert!(reg.gate(None, route, name).is_ok(), "{name}");
+        }
+        assert!(
+            reg.snapshot().is_empty(),
+            "an identityless call must not create a latch row"
+        );
+        // And it does not leak into a tab that DOES have identity.
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+    }
+
+    /// A refused call must never engage or flip the latch: otherwise a
+    /// hallucinated (or injected) call to the blocked side could redefine which
+    /// side of the boundary the session is on.
+    #[test]
+    fn a_refused_call_does_not_move_the_latch() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        for _ in 0..3 {
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+                Err(REFUSAL_LOCAL_BLOCKED)
+            );
+            assert_eq!(reg.snapshot()[0].latch, "external");
+        }
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "external");
+    }
+
+    /// `/graph_run` cannot serve a proxied server's content, so a name that
+    /// classifies EXTERNAL there is a typo or a hallucination — `run_graph_tool`
+    /// answers "unknown tool". It must not latch the tab: one bad tool name
+    /// would otherwise cost the session its local graph tools until restart.
+    #[test]
+    fn an_unserveable_name_on_the_native_route_does_not_latch_the_tab() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        for junk in ["graph_", "graph_nosuchtool", "ddg__search", ""] {
+            assert!(
+                reg.gate(Some(&s), LatchRoute::Native, junk).is_ok(),
+                "{junk}"
+            );
+        }
+        assert!(
+            reg.snapshot().is_empty(),
+            "an unserveable native name must leave the tab unlatched"
+        );
+        // The real local-capability call that follows still latches normally.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "local");
+    }
+
+    /// `/status`'s shape: the `Latch::label()` vocabulary plus the identity
+    /// needed to tell whose latch it is.
+    #[test]
+    fn status_snapshot_serializes_the_latch_labels() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        let json = serde_json::to_value(reg.snapshot()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "consumer": "claude",
+                "tab": "claude-1",
+                "session": "sess-a",
+                "latch": "external",
+            }])
+        );
     }
 }

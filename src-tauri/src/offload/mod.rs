@@ -24,6 +24,9 @@
 //! - [`toolclass`] (V32 Phase A) — the tool-class taxonomy + taint latch:
 //!   the single source of truth deciding which tools a contaminated task or
 //!   session may still reach.
+//! - [`spotlight`] (V32 Phase B) — the nonced data-not-instructions envelope
+//!   wrapped around every EXTERNAL tool result, at both the worker's and the
+//!   proxy's tool-result boundary.
 //!
 //! The whole stack sits behind the minimal [`Backend`] seam (one Local
 //! impl today) so V8-02 can add remote/cloud backends + capability-aware
@@ -39,6 +42,7 @@ pub mod remote;
 pub mod router;
 pub mod server;
 pub mod service;
+pub mod spotlight;
 pub mod supervisor;
 pub mod toolclass;
 pub mod tools;

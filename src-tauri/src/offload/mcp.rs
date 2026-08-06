@@ -995,10 +995,11 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
         .timeout(Duration::from_secs(30))
         .build()
         .ok()?;
-    // V28: `tab` rides along ONLY here (`/graph_run`) — `/mcp/call` proxies to
-    // external servers, which hold no cImp memory scope. Omitted entirely when
-    // this child has no tab identity, so the body stays byte-identical to the
-    // pre-V28 shape on that path.
+    // V28: `tab` identifies which session's memory scope this call belongs to.
+    // (V32 Phase B sends it on `/mcp/call` too — not for memory, which external
+    // servers have none of, but because the proxy's taint latch is keyed by the
+    // same tab identity.) Omitted entirely when this child has no tab identity,
+    // so the body stays byte-identical to the pre-V28 shape.
     let mut body = json!({ "cwd": cwd, "name": name, "args": args, "consumer": consumer() });
     if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
         map.insert("tab".to_string(), Value::String(t.to_string()));
@@ -1082,7 +1083,14 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let body = json!({ "name": name, "arguments": args, "cwd": cwd });
+    // V32 Phase B: `tab` rides along so the app can key this call to THIS
+    // tab's session taint latch. Same fail-open shape as `/graph_run` — a child
+    // spawned without `--tab` omits the field and the app leaves it unlatched
+    // (its results are still spotlight-wrapped).
+    let mut body = json!({ "name": name, "arguments": args, "cwd": cwd });
+    if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
+        map.insert("tab".to_string(), Value::String(t.to_string()));
+    }
     let resp = match client
         .post(format!("{base}/mcp/call?consumer={}", consumer()))
         .bearer_auth(&token)

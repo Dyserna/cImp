@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phase A coded 2026-08-06 (#31); B–E pending. GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31) + B (#32) coded 2026-08-06; C–E pending. GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8

@@ -250,6 +250,12 @@ impl ToolRouter for HostRouter {
         // and a hallucinated call to a server without `offload_access` is
         // refused instead of silently reaching it.
         if name.contains("__") {
+            // V32 Phase B: this is the worker's EXTERNAL tool-result boundary —
+            // the one place a proxied server's bytes enter the worker's
+            // conversation — so the spotlighting envelope goes on here (locked
+            // decision 6). Only the success path: an `Err` is a cImp-composed
+            // refusal/transport message, not untrusted content, and enveloping
+            // it would teach the model that our own strings are suspect.
             self.host
                 .call_recorded(
                     super::mcp_host::Consumer::Offload,
@@ -258,6 +264,7 @@ impl ToolRouter for HostRouter {
                     args,
                 )
                 .await
+                .map(|text| super::spotlight::envelope_if_external(name, text))
         } else {
             tools::dispatch(name, args, &self.ctx).await
         }
@@ -426,6 +433,12 @@ narration, no citation markers, and cite nothing — the JSON is the whole answe
 
 /// Cap a tool result to `cap_tokens`, appending a truncation marker so
 /// the model knows it was cut and narrows/paginates.
+///
+/// V32 Phase B: truncation cuts the *tail*, which for an enveloped EXTERNAL
+/// result (a fetched page — routinely far over the cap) would drop the closing
+/// spotlight marker and leave the untrusted region unterminated. The cap is the
+/// single truncation point in the loop, so it re-closes the envelope itself
+/// (`spotlight::ensure_closed` is a no-op for every other result).
 fn cap_result(result: String, cap_tokens: u32) -> String {
     let cap_bytes = (cap_tokens as usize).saturating_mul(4);
     if result.len() <= cap_bytes {
@@ -437,7 +450,7 @@ fn cap_result(result: String, cap_tokens: u32) -> String {
     }
     let mut out = result[..cut].to_string();
     out.push_str("\n[result truncated — refine your query or page through it]");
-    out
+    super::spotlight::ensure_closed(out)
 }
 
 /// Whether to think on a given turn under the policy.
@@ -2195,6 +2208,27 @@ mod tests {
         let capped = cap_result(big, 100); // 100 tokens ≈ 400 bytes
         assert!(capped.len() < 1000);
         assert!(capped.contains("truncated"));
+    }
+
+    /// V32 Phase B: a fetched page is routinely far over the cap, and the cap
+    /// truncates the TAIL — so without the re-close the model would be handed
+    /// an untrusted region that never ends. The closing marker must survive,
+    /// with the same nonce the opening line carries.
+    #[test]
+    fn capping_an_enveloped_external_result_keeps_its_closing_marker() {
+        let full = crate::offload::spotlight::envelope(&"x".repeat(10_000));
+        let close = full.lines().last().unwrap().to_string();
+        let capped = cap_result(full, 100); // 100 tokens ≈ 400 bytes
+        assert!(capped.contains("truncated"));
+        assert!(
+            capped.ends_with(&close),
+            "the envelope must be re-closed with its own nonce: {capped}"
+        );
+        assert_eq!(
+            capped.matches(&close).count(),
+            1,
+            "exactly one closing marker"
+        );
     }
 
     #[test]

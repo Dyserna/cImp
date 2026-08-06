@@ -6113,6 +6113,73 @@ pub struct Point { x: i32 }
     }
 
     #[test]
+    fn widened_selection_lets_the_backfill_skip_poison_chunks() {
+        // The contract `embed_backfill`'s skip set depends on: this selector
+        // takes an ARBITRARY limit, so asking for `batch + skipped.len()` rows
+        // and filtering the skipped ids back out still yields a full batch of
+        // fresh work — and yields NOTHING once only skipped rows remain, which
+        // is what terminates the loop. Without the widening, the same rejected
+        // rows would fill every batch and the backfill would spin forever.
+        let dir = std::env::temp_dir().join(format!("ckg-skip-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        let md = "# One\n\nAlpha.\n\n# Two\n\nBravo.\n\n# Three\n\nCharlie.\n\n# Four\n\nDelta.\n";
+        idx.index_file_graph(&parse_file("docs/a.md", md, Lang::Markdown))
+            .expect("index md");
+
+        let epoch = "skip-epoch";
+        idx.ensure_vector_store(3, "m", epoch).expect("ensure");
+
+        let batch = 2usize;
+        let select = |skipped: &std::collections::HashSet<String>| -> Vec<String> {
+            idx.chunks_needing_vectors(epoch, batch + skipped.len())
+                .expect("need")
+                .into_iter()
+                .filter(|(id, _, _)| !skipped.contains(id))
+                .map(|(id, _, _)| id)
+                .collect()
+        };
+
+        let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let first = select(&skipped);
+        assert_eq!(first.len(), 4.min(batch), "a plain batch: {first:?}");
+
+        // The whole first batch turns out to be poison.
+        for id in &first {
+            skipped.insert(id.clone());
+        }
+        let second = select(&skipped);
+        assert_eq!(second.len(), batch, "widening surfaces fresh rows: {second:?}");
+        assert!(
+            second.iter().all(|id| !skipped.contains(id)),
+            "skipped ids must never come back: {second:?}"
+        );
+
+        // Embed the rest; only the skipped rows are left pending.
+        let vecs: Vec<(String, String, Vec<f32>)> = idx
+            .chunks_needing_vectors(epoch, 100)
+            .expect("need all")
+            .into_iter()
+            .filter(|(id, _, _)| !skipped.contains(id))
+            .map(|(id, hash, _)| (id, hash, vec![1.0, 0.0, 0.0]))
+            .collect();
+        idx.put_doc_vectors(epoch, &vecs).expect("put");
+
+        // Nothing embeddable remains → the backfill loop breaks instead of
+        // re-selecting the poison rows forever.
+        assert!(select(&skipped).is_empty(), "loop must terminate");
+        // …and the poison rows are genuinely still pending (not silently
+        // marked done), so a later run with a fixed server retries them.
+        assert_eq!(
+            idx.chunks_needing_vectors(epoch, 100).expect("need").len(),
+            skipped.len()
+        );
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clear_vectors_drops_hnsw_indexed_store() {
         // Regression: `clear_vectors` (Rebuild embeddings) and a dim-change must
         // drop the HNSW index before `::remove`-ing `doc_vec` — CozoDB rejects

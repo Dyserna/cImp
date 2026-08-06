@@ -1121,10 +1121,15 @@ async fn semantic_query(
         Ok(Some(e)) => e,
         _ => return fallback(idx),
     };
-    let Some(embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
+    let Some(mut embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
     else {
         return fallback(idx);
     };
+    // Apply the token budget WITHOUT probing: a pathological long query must
+    // not 500 the endpoint, but a search can't afford a `/props` round-trip.
+    // The manual override always applies; detection is inherited from the
+    // backfill's cached probe when it has already run in this process.
+    embedder.apply_token_limit(g.embedding_max_tokens);
     let qv = match embedder.embed_one(query).await {
         Ok(v) => v,
         Err(_) => return fallback(idx),
@@ -1179,10 +1184,12 @@ async fn semantic_code_query(
         Ok(Some(e)) => e,
         _ => return unavailable(),
     };
-    let Some(embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
+    let Some(mut embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
     else {
         return unavailable();
     };
+    // Same fit guarantee as the doc query path, still probe-free.
+    embedder.apply_token_limit(g.embedding_max_tokens);
     let qv = match embedder.embed_one(query).await {
         Ok(v) => v,
         // F22: a configured-but-UNREACHABLE embedder is a genuine outage, not a

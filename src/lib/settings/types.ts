@@ -933,6 +933,9 @@ export interface GraphSettings {
   embedding_dims: number;
   embed_code_bodies: boolean;
   embedding_batch: number;
+  /// Per-input token budget for the embedding endpoint; 0 = auto-detect from
+  /// the server's `/props`. Oversized texts are truncated before sending.
+  embedding_max_tokens: number;
   /// Project-wide cap on `code_chunk` rows kept by a full rebuild (V11 Phase G).
   semantic_code_max_chunks: number;
   // V10 context injection.
@@ -1653,6 +1656,7 @@ export function defaultSettings(): Settings {
       embedding_dims: 0,
       embed_code_bodies: false,
       embedding_batch: 32,
+      embedding_max_tokens: 0,
       semantic_code_max_chunks: 20_000,
       context_injection: false,
       context_per_file_chars: 800,

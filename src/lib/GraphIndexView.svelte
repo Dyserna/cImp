@@ -303,7 +303,14 @@
             <div class="embed-meta"><span>{r.digests} context digest{r.digests === 1 ? '' : 's'} cached</span></div>
           {/if}
           {#if r.semantic_enabled && r.embed_error}
-            <p class="error">Embedder: {r.embed_error}</p>
+            <!-- A message on a healthy state (e.g. "N chunks skipped") is an
+                 advisory, not an outage: render it as a warning so a completed
+                 run with a few rejected chunks doesn't read as a failure. -->
+            {@const fatal = r.embed_state === 'degraded' || r.embed_state === 'error'}
+            <p class="error" class:notice={!fatal}>
+              {fatal ? 'Embedder:' : 'Note:'}
+              {r.embed_error}
+            </p>
           {/if}
         </div>
       </section>
@@ -573,5 +580,9 @@
     color: var(--text-danger-soft, #ff8a80);
     font-size: 12px;
     margin: 6px 0 0;
+  }
+  /* Advisory variant of `.error` — same slot, warning colour. */
+  .error.notice {
+    color: var(--text-warning, #f0c674);
   }
 </style>

@@ -1689,6 +1689,15 @@ pub struct GraphSettings {
     pub embed_code_bodies: bool,
     /// Number of chunks per `/v1/embeddings` request (amortizes round-trips).
     pub embedding_batch: usize,
+    /// Hard per-input token budget for the embedding endpoint. `0` = auto-detect
+    /// from the server's `/props` (`default_generation_settings.n_ctx`, minus a
+    /// small margin), cached per endpoint for the process. Any text over the
+    /// budget is truncated (via the server's own tokenizer when available)
+    /// before it's sent, because a single oversized chunk makes the endpoint
+    /// reject the WHOLE batch. Set it manually for a non-llama server that
+    /// exposes no `/props`; with no override and no detection, texts are sent
+    /// unchanged.
+    pub embedding_max_tokens: u32,
     /// Project-wide cap on how many `code_chunk` rows a full rebuild keeps
     /// (a simple count cap for V1 — see `build_tree`). Bounds DB size and
     /// embedding cost on very large repos.
@@ -1950,6 +1959,7 @@ impl Default for GraphSettings {
             embedding_dims: 0,
             embed_code_bodies: false,
             embedding_batch: 32,
+            embedding_max_tokens: 0,
             semantic_code_max_chunks: 20_000,
             context_injection: false,
             context_per_file_chars: 800,

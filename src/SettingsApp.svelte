@@ -4770,6 +4770,29 @@
                     )}
                 />
               </label>
+              <label>
+                <span>Embedding max tokens (0 = auto-detect)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={snapshot.graph.embedding_max_tokens}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_max_tokens = Math.max(
+                          0,
+                          Number((e.currentTarget as HTMLInputElement).value) || 0,
+                        )),
+                    )}
+                />
+              </label>
+              <small class="hint">
+                0 = auto-detect from the server (a <code>llama-server</code>
+                reports its context window on <code>/props</code>). Longer texts
+                are truncated to fit before they're sent — without this, one
+                oversized chunk makes the endpoint reject the whole batch. Set it
+                manually only for a server that exposes no <code>/props</code>.
+              </small>
               <small class="hint">
                 Changing the model or dimensions starts a background re-embed.
                 Use <strong>Rebuild embeddings</strong> in Tools →

@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use crate::error::AppResult;
 use crate::settings::{GraphSettings, SettingsHandle};
 
+use super::embed;
 use super::embed::Embedder;
 use super::index::{GraphIndex, GraphStats, LangCount, SymbolHit};
 use super::memory::{
@@ -1047,18 +1048,29 @@ impl GraphService {
                 message: "Semantic search is off — enable it in Settings → Code graph.".into(),
             };
         }
-        let Some(embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model) else {
+        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model)
+        else {
             return EmbedderProbe {
                 ok: false,
                 dim: None,
                 message: "No embedding endpoint configured.".into(),
             };
         };
+        // "Test connection" is user-initiated and expects a round-trip, so it
+        // may probe `/props` — and by seeding the process cache it hands the
+        // detected budget to the query paths before any backfill has run.
+        let limit = embedder.ensure_max_tokens(snap.embedding_max_tokens).await;
         match embedder.probe_dim().await {
             Ok(dim) => EmbedderProbe {
                 ok: true,
                 dim: Some(dim),
-                message: format!("Reachable — {dim}-dim embeddings."),
+                message: match limit {
+                    Some(t) => format!("Reachable — {dim}-dim embeddings, {t}-token input budget."),
+                    None => format!(
+                        "Reachable — {dim}-dim embeddings (no token budget detected; \
+                         set one in Settings → Code graph if the server rejects long chunks)."
+                    ),
+                },
             },
             Err(e) => EmbedderProbe {
                 ok: false,
@@ -3936,7 +3948,8 @@ impl GraphService {
         .expect("graph write-lock task panicked")
     }
 
-    /// Embed any doc chunks missing a current-epoch vector and store them.
+    /// Embed any doc chunks missing a current-epoch vector and store them. See
+    /// [`embed_batch_isolated`] for the poison-chunk containment this relies on.
     /// Drives the embedding status fields. Degrades cleanly: an unconfigured or
     /// unreachable embedder leaves chunks queryable via full-text (the
     /// structural graph never depends on this).
@@ -3959,6 +3972,13 @@ impl GraphService {
             });
             return;
         };
+
+        // Resolve the per-input token budget BEFORE any embed call, so even
+        // the dimension probe rides the same fit guarantee. Manual override
+        // when set, else a one-per-process `/props` detection that the query
+        // paths then inherit from the cache for free. `None` (a server with no
+        // usable `/props`) keeps the pre-V31 "send unchanged" behavior.
+        embedder.ensure_max_tokens(snap.embedding_max_tokens).await;
 
         // Resolve the vector dimension: the configured one, else probe live.
         let dim = if snap.embedding_dims > 0 {
@@ -4013,8 +4033,15 @@ impl GraphService {
         });
 
         let batch = snap.embedding_batch.clamp(1, 256);
+        // Chunk ids this run gave up on (the embedder rejected them even at the
+        // token floor). They must stay OUT of every later selection, or the
+        // very next `chunks_needing_vectors` call re-returns the same poison
+        // rows and the backfill spins forever on them.
+        let mut skipped: HashSet<String> = HashSet::new();
         loop {
-            let pending = match idx.chunks_needing_vectors(&epoch, batch) {
+            // Widen the request by the skip count so filtering them out still
+            // leaves a full batch of embeddable rows behind them.
+            let pending = match idx.chunks_needing_vectors(&epoch, batch + skipped.len()) {
                 Ok(p) => p,
                 Err(e) => {
                     self.patch_status(root, |s| {
@@ -4024,42 +4051,18 @@ impl GraphService {
                     return;
                 }
             };
+            let pending: Vec<(String, String, String)> = pending
+                .into_iter()
+                .filter(|(id, _, _)| !skipped.contains(id))
+                .collect();
             if pending.is_empty() {
                 break;
             }
-            let texts: Vec<String> = pending.iter().map(|(_, _, t)| t.clone()).collect();
-            match embedder.embed(&texts).await {
-                Ok(vectors) if vectors.len() == pending.len() => {
-                    let rows: Vec<(String, String, Vec<f32>)> = pending
-                        .into_iter()
-                        .zip(vectors)
-                        .map(|((id, hash, _), v)| (id, hash, v))
-                        .collect();
-                    let put = {
-                        let idx = idx.clone();
-                        let epoch = epoch.clone();
-                        self.locked_write(move || idx.put_doc_vectors(&epoch, &rows))
-                            .await
-                    };
-                    if let Err(e) = put {
-                        self.patch_status(root, |s| {
-                            s.embed_state = "error".into();
-                            s.embed_error = Some(e.to_string());
-                        });
-                        return;
-                    }
-                    self.refresh_embed_coverage(root, &idx, &epoch, true);
-                }
-                Ok(_) => {
-                    self.patch_status(root, |s| {
-                        s.embed_state = "degraded".into();
-                        s.embedder_ready = false;
-                        s.embed_error = Some("embedding count mismatch".into());
-                    });
-                    return;
-                }
+            let rows = match embed_batch_isolated(&mut embedder, &pending, &mut skipped).await {
+                Ok(rows) => rows,
                 Err(e) => {
-                    // Endpoint went away mid-backfill — degrade, keep what we have.
+                    // Endpoint went away (or the model changed) mid-backfill —
+                    // degrade, keep what we have.
                     self.patch_status(root, |s| {
                         s.embed_state = "degraded".into();
                         s.embedder_ready = false;
@@ -4067,6 +4070,22 @@ impl GraphService {
                     });
                     return;
                 }
+            };
+            if !rows.is_empty() {
+                let put = {
+                    let idx = idx.clone();
+                    let epoch = epoch.clone();
+                    self.locked_write(move || idx.put_doc_vectors(&epoch, &rows))
+                        .await
+                };
+                if let Err(e) = put {
+                    self.patch_status(root, |s| {
+                        s.embed_state = "error".into();
+                        s.embed_error = Some(e.to_string());
+                    });
+                    return;
+                }
+                self.refresh_embed_coverage(root, &idx, &epoch, true);
             }
         }
 
@@ -4076,6 +4095,11 @@ impl GraphService {
         // code chunks are typically far more numerous, so they ride the same
         // backfill but strictly after. Gated on its own setting — off by
         // default, since it multiplies the vector count.
+        //
+        // Code chunks get their own skip set (a different id space) but the
+        // SAME isolation + adaptive-shrink helper, so a poison symbol body
+        // can't stall that loop either.
+        let mut code_skipped: HashSet<String> = HashSet::new();
         if snap.embed_code_bodies {
             {
                 let idx = idx.clone();
@@ -4093,7 +4117,7 @@ impl GraphService {
                 }
             }
             loop {
-                let pending = match idx.pending_code_chunks(&epoch, batch) {
+                let pending = match idx.pending_code_chunks(&epoch, batch + code_skipped.len()) {
                     Ok(p) => p,
                     Err(e) => {
                         self.patch_status(root, |s| {
@@ -4103,45 +4127,37 @@ impl GraphService {
                         return;
                     }
                 };
+                let pending: Vec<(String, String, String)> = pending
+                    .into_iter()
+                    .filter(|(id, _, _)| !code_skipped.contains(id))
+                    .collect();
                 if pending.is_empty() {
                     break;
                 }
-                let texts: Vec<String> = pending.iter().map(|(_, _, t)| t.clone()).collect();
-                match embedder.embed(&texts).await {
-                    Ok(vectors) if vectors.len() == pending.len() => {
-                        let rows: Vec<(String, String, Vec<f32>)> = pending
-                            .into_iter()
-                            .zip(vectors)
-                            .map(|((id, hash, _), v)| (id, hash, v))
-                            .collect();
-                        let put = {
-                            let idx = idx.clone();
-                            let epoch = epoch.clone();
-                            self.locked_write(move || idx.put_code_vectors(&epoch, &rows))
-                                .await
-                        };
-                        if let Err(e) = put {
+                let rows =
+                    match embed_batch_isolated(&mut embedder, &pending, &mut code_skipped).await {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            // Endpoint went away mid-backfill — degrade, keep what we have.
                             self.patch_status(root, |s| {
-                                s.embed_state = "error".into();
-                                s.embed_error = Some(e.to_string());
+                                s.embed_state = "degraded".into();
+                                s.embedder_ready = false;
+                                s.embed_error = Some(e);
                             });
                             return;
                         }
-                    }
-                    Ok(_) => {
+                    };
+                if !rows.is_empty() {
+                    let put = {
+                        let idx = idx.clone();
+                        let epoch = epoch.clone();
+                        self.locked_write(move || idx.put_code_vectors(&epoch, &rows))
+                            .await
+                    };
+                    if let Err(e) = put {
                         self.patch_status(root, |s| {
-                            s.embed_state = "degraded".into();
-                            s.embedder_ready = false;
-                            s.embed_error = Some("code embedding count mismatch".into());
-                        });
-                        return;
-                    }
-                    Err(e) => {
-                        // Endpoint went away mid-backfill — degrade, keep what we have.
-                        self.patch_status(root, |s| {
-                            s.embed_state = "degraded".into();
-                            s.embedder_ready = false;
-                            s.embed_error = Some(e);
+                            s.embed_state = "error".into();
+                            s.embed_error = Some(e.to_string());
                         });
                         return;
                     }
@@ -4167,10 +4183,24 @@ impl GraphService {
             .await;
         }
         self.refresh_embed_coverage(root, &idx, &epoch, true);
-        self.patch_status(root, |s| {
+        // Every quality signal needs a consumer: chunks the embedder refused
+        // are silently missing from semantic search forever, so the count has
+        // to reach the user. The run itself succeeded (the endpoint is up and
+        // everything else embedded), so the state stays `idle` — the monitor
+        // renders an `embed_error` alongside a non-error state as a WARNING,
+        // not a failure.
+        let skipped_total = skipped.len() + code_skipped.len();
+        self.patch_status(root, move |s| {
             s.embed_state = "idle".into();
             s.embedder_ready = true;
-            s.embed_error = None;
+            s.embed_error = (skipped_total > 0).then(|| {
+                format!(
+                    "{skipped_total} chunk{} skipped — the embedder rejected {} even at the \
+                     minimum size; everything else is embedded",
+                    if skipped_total == 1 { "" } else { "s" },
+                    if skipped_total == 1 { "it" } else { "them" },
+                )
+            });
         });
     }
 
@@ -4806,6 +4836,109 @@ fn embedding_epoch(model: &str, dim: usize) -> String {
     let m = model.trim();
     let m = if m.is_empty() { "default" } else { m };
     format!("{m}|{dim}|{EMBED_SCHEMA}")
+}
+
+/// Embed one batch with **per-item failure isolation**, shared by the doc and
+/// code backfill loops.
+///
+/// The failure this exists for: one chunk the server refuses (typically
+/// oversized) fails the *whole* batch with a non-2xx, and because the same
+/// chunk is re-selected on the next pass, embedding stalls permanently. So a
+/// batch failure is never fatal on its own — the items are retried one at a
+/// time, and only the individual offender is dropped.
+///
+/// Returns the vectors that DID embed (possibly fewer than `pending`, possibly
+/// none) and grows `skipped` with the chunk ids that were given up on.
+/// `Err` is reserved for failures that mean the endpoint is gone or the model
+/// behind it changed ([`embed::is_item_level_error`] draws the line) — those
+/// must still degrade-and-stop, because retrying per item would fail
+/// identically for every item and misreport an outage as skipped chunks.
+async fn embed_batch_isolated(
+    embedder: &mut Embedder,
+    pending: &[(String, String, String)],
+    skipped: &mut HashSet<String>,
+) -> Result<Vec<(String, String, Vec<f32>)>, String> {
+    let texts: Vec<String> = pending.iter().map(|(_, _, t)| t.clone()).collect();
+    match embedder.embed(&texts).await {
+        Ok(vectors) if vectors.len() == pending.len() => {
+            return Ok(pending
+                .iter()
+                .zip(vectors)
+                .map(|((id, hash, _), v)| (id.clone(), hash.clone(), v))
+                .collect());
+        }
+        // `embed` already guarantees the count matches, so this is defensive:
+        // treat a short response like any other per-request rejection.
+        Ok(_) => {}
+        Err(e) if !embed::is_item_level_error(&e) => return Err(e),
+        Err(e) => {
+            debug!(error = %e, items = pending.len(), "embed batch rejected — retrying per item");
+        }
+    }
+    let mut rows = Vec::with_capacity(pending.len());
+    for (id, hash, text) in pending {
+        match embed_item_isolated(embedder, text).await {
+            ItemOutcome::Ok(v) => rows.push((id.clone(), hash.clone(), v)),
+            ItemOutcome::Down(e) => return Err(e),
+            ItemOutcome::Skip(e) => {
+                warn!(chunk = %id, error = %e, "embedder rejected chunk — skipping it this run");
+                skipped.insert(id.clone());
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// What happened to one isolated item.
+enum ItemOutcome {
+    Ok(Vec<f32>),
+    /// The endpoint (not the item) is the problem — abort the run.
+    Down(String),
+    /// The server refuses this item at any size we're willing to try.
+    Skip(String),
+}
+
+/// Embed a single item, halving the token budget on failure down to
+/// [`embed::MIN_TOKEN_LIMIT`].
+///
+/// Why shrink at all: `/props` reports `n_ctx`, but a llama-server's real
+/// per-request bound for *pooled* embeddings can be the physical batch size
+/// (`n_ubatch`), which `/props` does not report. Detection can therefore
+/// overestimate, and the only way to find the true bound is to measure it. A
+/// size that works is fed back via `lower_max_tokens`, so the run (and every
+/// later handle in this process) self-heals to the real bound instead of
+/// repeating the search for every item.
+async fn embed_item_isolated(embedder: &mut Embedder, text: &str) -> ItemOutcome {
+    let input = [text.to_string()];
+    let first = match embedder.embed(&input).await {
+        Ok(mut v) if v.len() == 1 => return ItemOutcome::Ok(v.pop().unwrap_or_default()),
+        Ok(_) => "empty embedding response".to_string(),
+        Err(e) if !embed::is_item_level_error(&e) => return ItemOutcome::Down(e),
+        Err(e) => e,
+    };
+    // Nothing to shrink against (no detected window, no override): the server
+    // dislikes this item for a reason we can't act on.
+    let Some(start) = embedder.max_tokens() else {
+        return ItemOutcome::Skip(first);
+    };
+    let mut limit = start;
+    let mut last = first;
+    while limit > embed::MIN_TOKEN_LIMIT {
+        limit = (limit / 2).max(embed::MIN_TOKEN_LIMIT);
+        // Trial on a clone so a failed attempt can't shrink the run's budget.
+        let mut trial = embedder.clone();
+        trial.set_max_tokens(limit);
+        match trial.embed(&input).await {
+            Ok(mut v) if v.len() == 1 => {
+                embedder.lower_max_tokens(limit);
+                return ItemOutcome::Ok(v.pop().unwrap_or_default());
+            }
+            Ok(_) => last = "empty embedding response".to_string(),
+            Err(e) if !embed::is_item_level_error(&e) => return ItemOutcome::Down(e),
+            Err(e) => last = e,
+        }
+    }
+    ItemOutcome::Skip(last)
 }
 
 /// The indexable language for `path`, or `None` if its extension is unknown or

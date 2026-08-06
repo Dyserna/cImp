@@ -578,6 +578,10 @@ impl OffloadSupervisor {
             context: None,
             thinking,
             schema: None,
+            // V32: the self-test runs an app-composed canned prompt with no
+            // external caller, so it declares no profile and latches
+            // dynamically like any undeclared task.
+            profile: None,
         };
         let deadline = std::time::Instant::now() + timeout;
         // Self-test path: no external cancel source.

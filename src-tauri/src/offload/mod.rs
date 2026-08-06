@@ -21,6 +21,9 @@
 //!   (`cimp --offload-mcp`).
 //! - `mcp_host` (Phase C) — the MCP client aggregating the user's tool
 //!   servers.
+//! - [`toolclass`] (V32 Phase A) — the tool-class taxonomy + taint latch:
+//!   the single source of truth deciding which tools a contaminated task or
+//!   session may still reach.
 //!
 //! The whole stack sits behind the minimal [`Backend`] seam (one Local
 //! impl today) so V8-02 can add remote/cloud backends + capability-aware
@@ -37,6 +40,7 @@ pub mod router;
 pub mod server;
 pub mod service;
 pub mod supervisor;
+pub mod toolclass;
 pub mod tools;
 
 pub use remote::RemoteBackend;

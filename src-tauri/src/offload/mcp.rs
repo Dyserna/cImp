@@ -46,6 +46,7 @@ fn proxy_base() -> Option<(String, String)> {
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};
 use crate::offload::router::{self, BackendView, RouteError, TierHint};
 use crate::offload::server::{per_slot_n_ctx, ServerCommand};
+use crate::offload::toolclass::Profile;
 use crate::offload::tools::{self, ToolCtx};
 use crate::settings::{
     BackendTier, OffloadBackend, OffloadBackendKind, OffloadSettings, ToolScope,
@@ -427,6 +428,19 @@ async fn offload_task_tool_live() -> Value {
     tool
 }
 
+/// V32 Phase A: the shared `profile` parameter schema, identical on
+/// `offload_task` and each `offload_batch` subtask so a caller never has to
+/// learn two spellings. The `enum` here is advisory only — the value is
+/// re-validated post-hoc ([`Profile::parse`]) at both the child and the app
+/// parse boundaries.
+fn profile_param_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["research", "code"],
+        "description": "Optional task shape, for injection containment. 'research' = web/document work: the worker gets web/MCP-server tools and NEVER local file/search/command tools. 'code' = local work: the worker gets local tools and NEVER web/MCP-server tools. Omit and the worker latches on its own first tool call — once it has used one side, the other is unavailable for the rest of the task. Never put secrets or sensitive code in the instructions of a research task: the task prompt is visible to whatever web content the task fetches."
+    })
+}
+
 /// The `offload_task` tool descriptor, with its `description` rendered
 /// from the current (config-derived) capability set.
 fn offload_task_tool() -> Value {
@@ -458,7 +472,8 @@ fn offload_task_tool() -> Value {
                 "schema": {
                     "type": "object",
                     "description": "Optional JSON Schema. When provided, the worker's final answer is grammar-constrained (llama.cpp sampler) to a single JSON value matching it — guaranteed-parseable, no prose, composable into scripts. The worker still uses tools normally; only its final message is constrained. Omit for a normal prose answer."
-                }
+                },
+                "profile": profile_param_schema()
             },
             "required": ["instructions"]
         }
@@ -512,9 +527,10 @@ fn offload_task_description(settings: &OffloadSettings) -> String {
          only for pure transforms of context you provide; any task that needs tool calls (file \
          reads, searches, counting files) should use `auto` (default) or `on`. You can run \
          offloads in parallel — issue multiple offload_task calls at once to fan out independent \
-         subtasks; they queue if all slots are busy. Backends: {}.{}",
+         subtasks; they queue if all slots are busy. Backends: {}.{}{}",
         parts.join("; "),
-        routing_note
+        routing_note,
+        crate::offload::toolclass::PROFILE_TOOL_NOTE,
     )
 }
 
@@ -605,7 +621,15 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
         .unwrap_or("auto")
         .to_string();
     let schema = schema_arg(&args);
-    match run_one(instructions, context, thinking_str, tier_str, schema).await {
+    // V32 Phase A: validate `profile` here, at the child's parse boundary —
+    // the declared `enum` in the input schema is an upstream guarantee, and a
+    // typo must surface as a tool error rather than silently drop the
+    // containment profile.
+    let profile = match profile_arg(&args) {
+        Ok(p) => p,
+        Err(msg) => return Ok(tool_error(&msg)),
+    };
+    match run_one(instructions, context, thinking_str, tier_str, schema, profile).await {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         // A "not ready/busy" condition is returned as a tool result (not a
         // protocol error) so Opus can read it and retry/adapt.
@@ -627,6 +651,10 @@ async fn run_one(
     // V21 F9: optional JSON Schema — forwarded to the warm app (`/run`) or run
     // in the self-contained fallback; constrains the worker's final output.
     schema: Option<serde_json::Value>,
+    // V32 Phase A: already validated by the caller's parse boundary; forwarded
+    // to the warm app in its canonical spelling and passed straight into the
+    // self-contained fallback's agent loop.
+    profile: Option<Profile>,
 ) -> Result<String, String> {
     let thinking = ThinkingMode::parse(&thinking_str);
     let tier = TierHint::parse(&tier_str);
@@ -636,11 +664,29 @@ async fn run_one(
         &thinking_str,
         &tier_str,
         schema.as_ref(),
+        profile,
     )
     .await
     {
         Some(r) => r,
-        None => run_offload(instructions, context, thinking, tier, schema).await,
+        None => run_offload(instructions, context, thinking, tier, schema, profile).await,
+    }
+}
+
+/// V32 Phase A: extract and validate the optional `profile` argument of an
+/// `offload_task` / `offload_batch`-subtask arguments object. Absent ⇒ `None`
+/// (latch dynamically); present-but-not-a-string or an unrecognized value ⇒ a
+/// tool-facing error, never a silent fallback. Shared by both tools so they
+/// validate identically.
+fn profile_arg(args: &Value) -> Result<Option<Profile>, String> {
+    match args.get("profile") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Profile::parse(s).map(Some),
+        Some(_) => Err(
+            "`profile` must be a string — expected \"research\" or \"code\" (omit the argument to \
+             let the task latch dynamically on its first tool call)"
+                .to_string(),
+        ),
     }
 }
 
@@ -699,11 +745,16 @@ async fn handle_batch_tool(params: Value) -> Result<Value, (i64, String)> {
                 .to_string();
             // V21 F9: per-subtask JSON Schema (object only).
             let schema = schema_arg(t);
+            // V32 Phase A: per-subtask containment profile, validated here so
+            // one bad subtask fails as its own section instead of silently
+            // running uncontained (or failing the whole batch).
+            let profile = profile_arg(t);
             tokio::spawn(async move {
                 if instructions.trim().is_empty() {
                     return Err("subtask requires non-empty `instructions`".to_string());
                 }
-                run_one(instructions, context, thinking_str, tier_str, schema).await
+                let profile = profile?;
+                run_one(instructions, context, thinking_str, tier_str, schema, profile).await
             })
         })
         .collect();
@@ -745,7 +796,15 @@ fn schema_arg(args: &Value) -> Option<Value> {
 fn offload_batch_tool() -> Value {
     json!({
         "name": "offload_batch",
-        "description": "Run several offload subtasks IN PARALLEL across the local worker's slots in a single call. Prefer this over issuing multiple `offload_task` calls when you want real concurrency: separate tool calls are serialized by the MCP client, but this one call fans its subtasks out to the app at once (bounded by the backend's slot count; extras queue). Each subtask is independent and self-contained; you get back all results, one section per subtask, with per-subtask errors inline.",
+        "description": format!(
+            "Run several offload subtasks IN PARALLEL across the local worker's slots in a single \
+             call. Prefer this over issuing multiple `offload_task` calls when you want real \
+             concurrency: separate tool calls are serialized by the MCP client, but this one call \
+             fans its subtasks out to the app at once (bounded by the backend's slot count; extras \
+             queue). Each subtask is independent and self-contained; you get back all results, one \
+             section per subtask, with per-subtask errors inline.{}",
+            crate::offload::toolclass::PROFILE_TOOL_NOTE,
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -776,7 +835,8 @@ fn offload_batch_tool() -> Value {
                             "schema": {
                                 "type": "object",
                                 "description": "Optional JSON Schema for THIS subtask. When set, the worker's final answer is grammar-constrained to a single JSON value matching it (guaranteed-parseable, no prose). Omit for a normal prose answer."
-                            }
+                            },
+                            "profile": profile_param_schema()
                         },
                         "required": ["instructions"]
                     }
@@ -824,6 +884,7 @@ async fn proxy_run(
     thinking: &str,
     tier: &str,
     schema: Option<&serde_json::Value>,
+    profile: Option<Profile>,
 ) -> Option<Result<String, String>> {
     let (base, token) = proxy_base()?;
     // Short connect timeout to fast-detect "app not listening" (→ `None` →
@@ -853,6 +914,10 @@ async fn proxy_run(
         // V21 F9: forward the JSON Schema so the warm app constrains the final
         // turn. Omitted (null, `serde(default)` on the app side) when unset.
         "schema": schema,
+        // V32 Phase A: forward the containment profile in its canonical
+        // spelling. The app re-validates it (`Profile::parse` in
+        // `loopback::handle_run`) rather than trusting this side.
+        "profile": profile.map(Profile::as_str),
     });
     let mut resp = match client
         .post(format!("{base}/run"))
@@ -1526,6 +1591,11 @@ async fn run_offload(
     thinking: ThinkingMode,
     tier: TierHint,
     schema: Option<serde_json::Value>,
+    // V32 Phase A: threaded into every `run_on_backend` below (first attempt,
+    // fail-over re-route, and tier escalation) so the containment profile
+    // survives a re-run — a re-routed research task must not come back
+    // uncontained.
+    profile: Option<Profile>,
 ) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let settings = current_offload_settings();
@@ -1628,6 +1698,7 @@ async fn run_offload(
         context.clone(),
         thinking,
         schema.clone(),
+        profile,
     )
     .await;
 
@@ -1657,6 +1728,7 @@ async fn run_offload(
                         context.clone(),
                         thinking,
                         schema.clone(),
+                        profile,
                     )
                     .await;
                     (r, next)
@@ -1695,6 +1767,7 @@ async fn run_offload(
                 context.clone(),
                 thinking,
                 schema.clone(),
+                profile,
             )
             .await;
             if let Ok(q_text) = esc {
@@ -1718,6 +1791,7 @@ async fn run_on_backend(
     context: Option<String>,
     thinking: ThinkingMode,
     schema: Option<serde_json::Value>,
+    profile: Option<Profile>,
 ) -> Result<String, String> {
     let ctx = ToolCtx::new(
         settings.allowed_roots.clone(),
@@ -1746,6 +1820,7 @@ async fn run_on_backend(
         context: context.clone(),
         thinking,
         schema: schema.clone(),
+        profile,
     };
     let secs = settings.offload_timeout_secs.max(30);
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -1768,6 +1843,7 @@ async fn run_on_backend(
                 context,
                 thinking: ThinkingMode::Auto,
                 schema,
+                profile,
             };
             let deadline = Instant::now() + Duration::from_secs(secs);
             agent::run(client, &cfg, &router, task, deadline, None, &cancel).await
@@ -2149,5 +2225,87 @@ mod tests {
                 .is_object(),
             "offload_batch subtasks must advertise the optional schema param"
         );
+    }
+
+    // ── V32 Phase A — the `profile` param ──────────────────────────────────
+
+    /// Both tools advertise `profile` with the same shape, and both carry the
+    /// secrets warning in their description (the accepted-residual note from
+    /// locked decision 4 — a research task's prompt is visible to whatever it
+    /// fetches).
+    #[test]
+    fn tool_descriptors_advertise_profile_and_the_secrets_warning() {
+        let single = offload_task_tool();
+        assert_eq!(
+            single["inputSchema"]["properties"]["profile"],
+            profile_param_schema(),
+            "offload_task must advertise the optional profile param"
+        );
+        let batch = offload_batch_tool();
+        assert_eq!(
+            batch["inputSchema"]["properties"]["tasks"]["items"]["properties"]["profile"],
+            profile_param_schema(),
+            "offload_batch subtasks must advertise the optional profile param"
+        );
+        assert_eq!(
+            profile_param_schema()["enum"],
+            json!(["research", "code"]),
+            "the advertised enum must match `Profile::parse`"
+        );
+        let batch_desc = batch["description"].as_str().unwrap();
+        assert!(
+            batch_desc.contains("NEVER include secrets"),
+            "offload_batch description lost the secrets warning"
+        );
+        // `offload_task`'s description is rendered from live settings (and may
+        // be replaced by the app's `/describe`), so pin the shared note there
+        // rather than the whole rendered string.
+        assert!(crate::offload::toolclass::PROFILE_TOOL_NOTE.contains("NEVER include secrets"));
+    }
+
+    /// Validation at the parse boundary: absent ⇒ no profile, a known value
+    /// parses, and anything else is a tool-facing error rather than a silent
+    /// fallback to "no containment".
+    #[test]
+    fn profile_arg_validates_at_the_parse_boundary() {
+        assert_eq!(profile_arg(&json!({ "instructions": "x" })).unwrap(), None);
+        assert_eq!(profile_arg(&json!({ "profile": null })).unwrap(), None);
+        assert_eq!(
+            profile_arg(&json!({ "profile": "research" })).unwrap(),
+            Some(Profile::Research)
+        );
+        assert_eq!(
+            profile_arg(&json!({ "profile": "code" })).unwrap(),
+            Some(Profile::Code)
+        );
+        // Unknown value: rejected, never defaulted.
+        let err = profile_arg(&json!({ "profile": "web" })).unwrap_err();
+        assert!(err.contains("invalid `profile`"), "err: {err}");
+        // Wrong JSON type: also rejected (the schema `type` is not trusted).
+        let err = profile_arg(&json!({ "profile": 3 })).unwrap_err();
+        assert!(err.contains("must be a string"), "err: {err}");
+    }
+
+    /// Mirror of `handle_batch_tool`'s per-subtask parse: an invalid profile
+    /// fails only ITS subtask (as that section's error), while its siblings
+    /// still carry their own validated profiles.
+    #[test]
+    fn batch_threads_per_subtask_profiles_and_isolates_a_bad_one() {
+        let tasks = json!([
+            { "instructions": "research it", "profile": "research" },
+            { "instructions": "read it", "profile": "code" },
+            { "instructions": "no profile" },
+            { "instructions": "bad", "profile": "wat" },
+        ]);
+        let parsed: Vec<Result<Option<Profile>, String>> = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(profile_arg)
+            .collect();
+        assert_eq!(parsed[0], Ok(Some(Profile::Research)));
+        assert_eq!(parsed[1], Ok(Some(Profile::Code)));
+        assert_eq!(parsed[2], Ok(None));
+        assert!(parsed[3].is_err());
     }
 }

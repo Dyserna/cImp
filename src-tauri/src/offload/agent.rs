@@ -11,6 +11,14 @@
 //! the caller sets from `offload_timeout_secs`), and the per-slot token
 //! budget. On any cap the loop forces a final-synthesis turn ("answer
 //! from what you have now") rather than truncating mid-thought.
+//!
+//! V32 Phase A adds a fourth, security bound: the per-task **taint latch**
+//! ([`crate::offload::toolclass`]). The advertised tool list is recomputed
+//! from the router's snapshot on every request, so once the task has touched
+//! one of the mutually exclusive classes (EXTERNAL web/MCP content vs
+//! LOCAL-CAPABILITY file/process access) the other's defs simply stop being
+//! offered, and any in-flight or hallucinated call to the blocked side gets a
+//! fixed-string refusal instead of executing.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -28,6 +36,7 @@ use super::metrics::CallRecord;
 use super::openai::{
     strip_think, ChatChunk, ChatMessage, ChatRequest, ChatResponse, StreamAccumulator, ToolDef,
 };
+use super::toolclass::{self, Latch, Profile};
 use super::tools::{self, ToolCtx};
 
 /// Accumulates a [`CallRecord`] per LLM call as the loop runs, for the Offload
@@ -307,6 +316,13 @@ pub struct OffloadTask {
     /// and the loop returns that JSON verbatim after a belt-and-braces parse.
     /// `None` (the common case) leaves the answer as free-form prose.
     pub schema: Option<serde_json::Value>,
+    /// V32 Phase A: the caller-declared task shape, which **pre-applies** the
+    /// taint latch at task start (`research` ⇒ EXTERNAL-latched, so no
+    /// local-capability tool is ever advertised; `code` ⇒ LOCAL-latched, so no
+    /// external tool is). `None` starts the task unlatched and lets it latch on
+    /// its own first EXTERNAL / LOCAL-CAPABILITY call. See
+    /// [`crate::offload::toolclass`].
+    pub profile: Option<Profile>,
 }
 
 /// V21 F9: wrap a caller-supplied JSON Schema in the `response_format` envelope
@@ -1112,6 +1128,42 @@ impl CallCache {
     }
 }
 
+/// V32 Phase A: decide one tool call against the task's taint latch, and engage
+/// the latch when the call is allowed to proceed. Extracted from [`run`]'s tool
+/// loop so the ordering — which is the whole security property — is unit
+/// testable without a live server.
+///
+/// - `Err(refusal)` — the class is blocked: the call is answered with the fixed
+///   per-direction string and **never executes**. It also never touches the
+///   call cache and never engages or flips the latch: letting a refused call
+///   define the scope's taint would hand an injected page a way to redefine the
+///   boundary (call the blocked side twice and "flip" it back).
+/// - `Ok(())` — the call may run, and the latch has already been engaged for
+///   its class. Engaging *before* execution matters because a model may emit
+///   several `tool_calls` in one turn: the second one must already see the
+///   latch the first just set.
+fn latch_gate(latch: &mut Latch, name: &str) -> Result<(), &'static str> {
+    let class = toolclass::classify(name);
+    if let Some(refusal) = latch.refusal(class) {
+        warn!(
+            target: "offload",
+            tool = %name,
+            latch = latch.label(),
+            "offload: tool call refused by the V32 taint latch"
+        );
+        return Err(refusal);
+    }
+    if latch.engage(class) {
+        debug!(
+            target: "offload",
+            tool = %name,
+            latch = latch.label(),
+            "offload: V32 taint latch engaged"
+        );
+    }
+    Ok(())
+}
+
 /// Run the agent loop and return the synthesized final answer (with
 /// `<think>` stripped). `deadline` bounds the loop wall-clock; on expiry
 /// (or `max_steps`/budget) it forces a final-synthesis turn.
@@ -1125,7 +1177,20 @@ pub async fn run(
     cancel: &CancellationToken,
 ) -> AppResult<String> {
     let url = format!("{}/v1/chat/completions", cfg.base_url);
-    let tools = router.tool_defs();
+    // The router's full surface, snapshotted once (the warm pool is reconciled
+    // before the call, so the set is stable for the run). V32 Phase A: this is
+    // no longer what goes on the wire — `advertised` below is the latch-filtered
+    // view, rebuilt whenever the latch moves.
+    let all_tools = router.tool_defs();
+    // V32 Phase A: the per-task taint latch. A declared `profile` pre-applies
+    // it so a research task never sees a local-capability def and a code task
+    // never sees an external one; an undeclared task starts open and latches on
+    // its first EXTERNAL / LOCAL-CAPABILITY call.
+    let mut latch = Latch::from_profile(task.profile);
+    let mut advertised = toolclass::filter_defs(&all_tools, latch);
+    // The latch the current `advertised` view was built for, so the filter runs
+    // only when the state actually moves (not once per step).
+    let mut advertised_for = latch;
 
     let user = match &task.context {
         Some(c) if !c.is_empty() => format!("{}\n\n# Context\n{}", task.instructions, c),
@@ -1159,9 +1224,23 @@ pub async fn run(
     // V21 F8 loop breaker: per-run identical-call short-circuit. Built from the
     // advertised tool surface so pure lookups (cache-servable) and stateful
     // tools (re-execute) are classified from their `ToolDef.stateful` flag.
-    let mut call_cache = CallCache::new(&tools);
+    // Built from the UNFILTERED surface on purpose: the cache's only job is to
+    // remember which names are pure lookups, and that property is a fact about
+    // the tool, not about the latch. Feeding it the filtered view would silently
+    // reclassify a latched-out pure lookup as stateful if the latch later
+    // changed, and it would have to be rebuilt on every latch move.
+    let mut call_cache = CallCache::new(&all_tools);
 
     for step in 0..cfg.max_steps {
+        // Rebuild the advertised surface if the latch moved during the previous
+        // turn. Locked decision 2: enforcement is def REMOVAL — the model is
+        // simply not offered the blocked class again, which it handles far
+        // better than a refusal and which shrinks an injected page's steering
+        // surface.
+        if advertised_for != latch {
+            advertised = toolclass::filter_defs(&all_tools, latch);
+            advertised_for = latch;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             debug!("offload: deadline reached at step {step}; forcing final synthesis");
@@ -1204,9 +1283,14 @@ pub async fn run(
             &url,
             cfg,
             &convo.flatten(),
-            &tools,
+            &advertised,
             enable_thinking,
-            true,
+            // V32 Phase A: the latch can empty the surface (e.g. a `research`
+            // task on a pool with no MCP servers). Send that turn in the
+            // already-exercised no-tools shape (`tool_choice: "none"`) rather
+            // than `"auto"` with the `tools` key omitted — the model then just
+            // answers from what it has, which is the right outcome.
+            !advertised.is_empty(),
             None,
             cfg.per_call_timeout,
             gen_tps,
@@ -1376,6 +1460,17 @@ pub async fn run(
                 serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "_raw": call.function.arguments }))
             };
+            // V32 Phase A: the latch gate, at the call site so it covers BOTH
+            // the native route and the MCP-host route (`router.call` dispatches
+            // on the name; a check inside either router would miss the other).
+            if let Err(refusal) = latch_gate(&mut latch, name) {
+                obs_id += 1;
+                turn.push(ChatMessage::tool(
+                    &call.id,
+                    label_observation(obs_id, refusal),
+                ));
+                continue;
+            }
             // V21 F8: short-circuit an identical repeat before executing.
             let result = match call_cache.probe(name, &args) {
                 CacheProbe::Fresh => {
@@ -2910,5 +3005,238 @@ mod tests {
         let (b, l, n) = split_marker(&part);
         assert_eq!((b.as_str(), l), ("body", VerifiedLevel::Partially));
         assert_eq!(n.as_deref(), Some("a.rs, b.rs"));
+    }
+
+    // ── V32 Phase A — the per-task taint latch ─────────────────────────────
+
+    use crate::offload::toolclass::{
+        REFUSAL_EXTERNAL_BLOCKED, REFUSAL_LOCAL_BLOCKED, REFUSAL_WRITE_BLOCKED,
+    };
+
+    /// A representative worker surface, reached through the real [`ToolRouter`]
+    /// seam so the tests exercise the same snapshot `run` takes: native
+    /// local-capability tools, a content-bearing and a structural graph tool,
+    /// the memory write, and two proxied MCP-server tools.
+    fn latch_router() -> NativeRouter {
+        let cwd = std::env::current_dir().unwrap();
+        let defs = [
+            "read_file",
+            "code_search",
+            "graph_snippet",
+            "graph_outline",
+            "run_check",
+            "context_note",
+            "ddg__search",
+            "ddg__fetch_content",
+        ]
+        .into_iter()
+        .map(|n| ToolDef::function(n, "", json!({ "type": "object" })))
+        .collect();
+        NativeRouter::new(
+            defs,
+            ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd),
+            ToolScope::All,
+        )
+    }
+
+    /// The names on the wire for the next request, built the way the loop does:
+    /// filter the router snapshot for the current latch, then assemble the
+    /// request. This is the ADVERTISED list — decision 2's def removal is what
+    /// these tests pin, not merely the refusal.
+    fn advertised_names(all: &[ToolDef], latch: Latch) -> Vec<String> {
+        let filtered = toolclass::filter_defs(all, latch);
+        let req = build_chat_request(
+            &test_cfg(Some(50_000), Some(90_112), 8000),
+            &[ChatMessage::user("task")],
+            &filtered,
+            false,
+            true,
+            None,
+            Duration::from_secs(300),
+            50.0,
+        );
+        req.tools
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn external_first_latches_out_local_capability_defs_and_refuses_the_calls() {
+        let all = latch_router().tool_defs();
+        let mut latch = Latch::default();
+        // Turn 1: everything is on offer.
+        let before = advertised_names(&all, latch);
+        assert!(before.contains(&"read_file".to_string()));
+        assert!(before.contains(&"ddg__fetch_content".to_string()));
+
+        // A single fetch latches the task.
+        assert!(latch_gate(&mut latch, "ddg__fetch_content").is_ok());
+        assert_eq!(latch, Latch::External);
+
+        // Def removal (decision 2): the NEXT request no longer advertises the
+        // local-capability class at all — nor the persistent memory write.
+        let after = advertised_names(&all, latch);
+        for gone in ["read_file", "code_search", "graph_snippet", "context_note"] {
+            assert!(
+                !after.contains(&gone.to_string()),
+                "`{gone}` must be absent from the advertised list under an EXTERNAL latch: {after:?}"
+            );
+        }
+        // The external side and TRUSTED survive.
+        for kept in ["ddg__search", "ddg__fetch_content", "graph_outline", "run_check"] {
+            assert!(after.contains(&kept.to_string()), "`{kept}` missing: {after:?}");
+        }
+
+        // Belt and braces: an in-flight / hallucinated call is refused with the
+        // fixed string, and the memory write gets its own fixed refusal.
+        assert_eq!(
+            latch_gate(&mut latch, "read_file"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        assert_eq!(
+            latch_gate(&mut latch, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        assert_eq!(
+            latch_gate(&mut latch, "context_note"),
+            Err(REFUSAL_WRITE_BLOCKED)
+        );
+    }
+
+    #[test]
+    fn local_first_latches_out_external_defs_and_refuses_the_calls() {
+        let all = latch_router().tool_defs();
+        let mut latch = Latch::default();
+        assert!(latch_gate(&mut latch, "read_file").is_ok());
+        assert_eq!(latch, Latch::Local);
+
+        let after = advertised_names(&all, latch);
+        for gone in ["ddg__search", "ddg__fetch_content"] {
+            assert!(
+                !after.contains(&gone.to_string()),
+                "`{gone}` must be absent under a LOCAL latch: {after:?}"
+            );
+        }
+        // Local work continues unimpeded, including the memory write (only an
+        // EXTERNAL latch gates persistence).
+        for kept in ["read_file", "code_search", "graph_snippet", "context_note"] {
+            assert!(after.contains(&kept.to_string()), "`{kept}` missing: {after:?}");
+        }
+        assert_eq!(
+            latch_gate(&mut latch, "ddg__fetch_content"),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+    }
+
+    #[test]
+    fn trusted_tools_survive_both_latches_and_never_latch_the_task() {
+        let all = latch_router().tool_defs();
+        // A TRUSTED call on a virgin task leaves the latch open — a structural
+        // graph query must not cost the task either capability.
+        let mut latch = Latch::default();
+        assert!(latch_gate(&mut latch, "graph_outline").is_ok());
+        assert!(latch_gate(&mut latch, "run_check").is_ok());
+        assert_eq!(latch, Latch::Open);
+
+        for latched in [Latch::External, Latch::Local] {
+            let mut l = latched;
+            assert!(latch_gate(&mut l, "graph_outline").is_ok());
+            assert!(latch_gate(&mut l, "run_check").is_ok());
+            assert_eq!(l, latched, "a TRUSTED call must not move the latch");
+            let names = advertised_names(&all, latched);
+            for kept in ["graph_outline", "run_check"] {
+                assert!(
+                    names.contains(&kept.to_string()),
+                    "TRUSTED `{kept}` missing under {latched:?}: {names:?}"
+                );
+            }
+        }
+    }
+
+    /// An unknown / future MCP server's tool defaults to EXTERNAL, so calling it
+    /// latches the task exactly like `ddg__*` does — the locked cross-module
+    /// invariant, asserted through the loop's own gate.
+    #[test]
+    fn unknown_namespaced_tool_latches_as_external() {
+        let mut latch = Latch::default();
+        assert!(latch_gate(&mut latch, "somenewserver__anything").is_ok());
+        assert_eq!(latch, Latch::External);
+        assert_eq!(
+            latch_gate(&mut latch, "read_file"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+    }
+
+    /// A refused call must not itself set or flip a latch: otherwise a
+    /// hallucinated (or injected) call to the blocked side could redefine which
+    /// side of the boundary the task is on.
+    #[test]
+    fn a_refused_call_never_flips_the_latch() {
+        let mut latch = Latch::default();
+        assert!(latch_gate(&mut latch, "ddg__search").is_ok());
+        // Three refused local calls in a row leave the latch exactly where it
+        // was, and the external side stays usable throughout.
+        for _ in 0..3 {
+            assert_eq!(
+                latch_gate(&mut latch, "read_file"),
+                Err(REFUSAL_LOCAL_BLOCKED)
+            );
+            assert_eq!(latch, Latch::External);
+        }
+        assert!(latch_gate(&mut latch, "ddg__fetch_content").is_ok());
+        assert_eq!(latch, Latch::External);
+    }
+
+    /// Locked decision 4: a declared profile pre-applies the latch, so the
+    /// blocked class is absent from turn 1 — before any tool has been called.
+    #[test]
+    fn declared_profile_pre_latches_the_first_turn() {
+        let all = latch_router().tool_defs();
+
+        let research = Latch::from_profile(Some(Profile::Research));
+        let names = advertised_names(&all, research);
+        assert!(
+            !names.contains(&"read_file".to_string()),
+            "a research task must never be offered `read_file`: {names:?}"
+        );
+        assert!(names.contains(&"ddg__fetch_content".to_string()));
+        // And the gate refuses it even if the model invents the call.
+        let mut l = research;
+        assert_eq!(latch_gate(&mut l, "read_file"), Err(REFUSAL_LOCAL_BLOCKED));
+
+        let code = Latch::from_profile(Some(Profile::Code));
+        let names = advertised_names(&all, code);
+        assert!(
+            !names.contains(&"ddg__fetch_content".to_string()),
+            "a code task must never be offered `ddg__fetch_content`: {names:?}"
+        );
+        assert!(names.contains(&"read_file".to_string()));
+        let mut l = code;
+        assert_eq!(
+            latch_gate(&mut l, "ddg__search"),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+
+        // Undeclared: nothing removed on turn 1.
+        let open = advertised_names(&all, Latch::from_profile(None));
+        assert_eq!(open.len(), all.len());
+    }
+
+    /// The call cache is built from the UNFILTERED snapshot, so a tool's
+    /// pure-lookup property (V21 F8) stays a fact about the tool rather than
+    /// something the latch can change mid-run.
+    #[test]
+    fn call_cache_classification_is_independent_of_the_latch() {
+        let all = vec![
+            ToolDef::function("graph_outline", "", json!({ "type": "object" })).pure(),
+            ToolDef::function("read_file", "", json!({ "type": "object" })),
+        ];
+        let cache = CallCache::new(&all);
+        assert!(cache.pure_lookup.contains("graph_outline"));
+        assert!(!cache.pure_lookup.contains("read_file"));
+        // The latched view drops `read_file`, but the cache built from the full
+        // snapshot is unaffected — no rebuild needed on a latch move.
+        assert_eq!(toolclass::filter_defs(&all, Latch::External).len(), 1);
     }
 }

@@ -40,6 +40,7 @@ use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
 use super::router::TierHint;
 use super::service::{OffloadService, PushNotice};
+use super::toolclass::Profile;
 
 /// Discovery-file name under the portable root (next to `settings.json`).
 /// Legacy single-instance location, still written for anything that only
@@ -397,6 +398,13 @@ struct RunBody {
     /// grammar-constrained to matching JSON. Absent on legacy child requests.
     #[serde(default)]
     schema: Option<serde_json::Value>,
+    /// V32 Phase A: optional task shape (`"research"` | `"code"`) that
+    /// pre-applies the worker's taint latch. Kept as a raw string on the wire
+    /// and re-validated here (see [`handle_run`]) rather than deserialized into
+    /// the enum, so an invalid value produces the tool-facing error message
+    /// instead of a generic serde "bad request body".
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 /// A `POST /run` response.
@@ -689,6 +697,25 @@ async fn handle_run(
     let thinking = ThinkingMode::parse(body.thinking.as_deref().unwrap_or("auto"));
     let tier = TierHint::parse(body.tier.as_deref().unwrap_or("auto"));
 
+    // V32 Phase A: validate `profile` at this parse boundary. Unlike
+    // thinking/tier (benign fallbacks), an unrecognized profile must NOT
+    // silently degrade to "no containment" — the MCP schema's `enum` is an
+    // upstream guarantee, and upstream guarantees get re-checked post-hoc.
+    let profile = match body.profile.as_deref() {
+        None => None,
+        Some(raw) => match Profile::parse(raw) {
+            Ok(p) => Some(p),
+            Err(msg) => {
+                let r = RunResult {
+                    ok: false,
+                    text: None,
+                    error: Some(msg),
+                };
+                return write_json(stream, 400, &r).await;
+            }
+        },
+    };
+
     let session_cwd = body.cwd.map(std::path::PathBuf::from);
 
     // Cancellation: trip the token if the calling client disconnects while the
@@ -705,6 +732,7 @@ async fn handle_run(
         tier,
         session_cwd,
         body.schema,
+        profile,
         cancel.clone(),
     );
     tokio::pin!(run_fut);

@@ -44,6 +44,7 @@ use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
 use super::server::{LlamaServer, ServerCommand};
 use super::supervisor::OffloadSupervisor;
+use super::toolclass::{Profile, PROFILE_TOOL_NOTE};
 use super::tools::{self, ToolCtx};
 use super::Backend;
 
@@ -725,6 +726,11 @@ impl OffloadService {
         // turn is grammar-constrained to matching JSON (threaded to `run_on` →
         // `OffloadTask::schema`). `None` leaves the answer free-form.
         schema: Option<serde_json::Value>,
+        // V32 Phase A: the caller-declared task shape (`research`/`code`),
+        // already validated at the loopback parse boundary. Pre-applies the
+        // taint latch in the agent loop so the blocked class is never
+        // advertised, not even on turn 1. `None` latches dynamically.
+        profile: Option<Profile>,
         // Trips when the calling session goes away (loopback disconnect) so the
         // in-flight chat stream is dropped and llama-server frees the slot
         // instead of running an orphan to completion.
@@ -844,6 +850,7 @@ impl OffloadService {
                 thinking,
                 session_cwd.clone(),
                 schema.clone(),
+                profile,
                 overall_deadline,
                 Some(&mut trace),
                 &cancel,
@@ -879,6 +886,7 @@ impl OffloadService {
                             thinking,
                             session_cwd.clone(),
                             schema.clone(),
+                            profile,
                             overall_deadline,
                             Some(&mut trace),
                             &cancel,
@@ -918,6 +926,7 @@ impl OffloadService {
                     ThinkingMode::Auto,
                     session_cwd.clone(),
                     schema.clone(),
+                    profile,
                     retry_deadline,
                     Some(&mut trace),
                     &cancel,
@@ -972,6 +981,7 @@ impl OffloadService {
                         thinking,
                         session_cwd.clone(),
                         schema.clone(),
+                        profile,
                         esc_deadline,
                         Some(&mut trace),
                         &cancel,
@@ -1143,6 +1153,9 @@ impl OffloadService {
         thinking: ThinkingMode,
         session_cwd: Option<PathBuf>,
         schema: Option<serde_json::Value>,
+        // V32 Phase A: pre-applies the agent loop's taint latch (see
+        // `agent::OffloadTask::profile`).
+        profile: Option<Profile>,
         deadline: Instant,
         trace: Option<&mut RunTrace>,
         cancel: &CancellationToken,
@@ -1222,6 +1235,7 @@ impl OffloadService {
             context,
             thinking,
             schema,
+            profile,
         };
         agent::run(&self.client, &cfg, &router, task, deadline, trace, cancel).await
     }
@@ -1542,7 +1556,7 @@ impl OffloadService {
              web research) to a local/remote model to conserve this session's context. Pass a \
              self-contained instruction; you get back only the synthesized result. Backends: {}. \
              {tools_note}. Pass `tier` (fast|quality) to bias the choice; local-file tasks run on \
-             a backend with file access (never a cloud backend).{parallel_note}",
+             a backend with file access (never a cloud backend).{parallel_note}{PROFILE_TOOL_NOTE}",
             parts.join("; ")
         )
     }

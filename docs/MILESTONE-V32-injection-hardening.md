@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** SPEC — not yet coded (2026-08-06). GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phase A coded 2026-08-06 (#31); B–E pending. GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -50,14 +50,18 @@ by the worker loop, the loopback proxy, and tests.
 | Class | Members | Latch behavior |
 |---|---|---|
 | **EXTERNAL** | everything proxied from configured MCP servers: `ddg_*`, `context7_*`, and **any unknown/future server by default** | first call latches the task/session: LOCAL-CAPABILITY becomes unavailable |
-| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs` | first call latches the other way: EXTERNAL becomes unavailable |
-| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`), `run_check`, `context_recall`/`context_notes` (reads), `security_audit`/`quality_audit`, `offload_task`/`offload_batch` themselves | never latches, never blocked |
+| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code` | first call latches the other way: EXTERNAL becomes unavailable |
+| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `run_check`, `context_recall`/`context_notes` (reads), `security_audit`/`quality_audit`, `offload_task`/`offload_batch` themselves | never latches, never blocked |
 | **PERSISTENT-WRITE** | `context_note` (the one tool whose output outlives the session) | never latches; **write-gated while EXTERNAL-latched** (decision 10) |
 
 Rationale for the graph split: structural tools return names/edges/metadata
 (near-zero exfil value); content-bearing tools return source text, which
 re-opens a bounded exfil channel if EXTERNAL stays live. A research task
 rarely needs snippet *bodies*; a code task rarely needs the web.
+(Phase A amendment 2026-08-06: `graph_path`/`graph_architecture` (V15) and
+`graph_semantic_code` were shipped but missing from the original table; they
+were classified by this same rationale — first two structural ⇒ TRUSTED,
+the code-body search content-bearing ⇒ LOCAL-CAPABILITY.)
 
 **Invariant (cross-module): unknown = EXTERNAL.** A newly configured MCP
 server must never default into TRUSTED or LOCAL-CAPABILITY. Reclassification

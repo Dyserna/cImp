@@ -669,9 +669,20 @@ pub async fn llm_pricing_get() -> AppResult<Vec<crate::settings::LlmPricingModel
 /// price edits apply to every project. Mirror of
 /// `compose_templates_global_set`; see
 /// `settings::persistence::write_global_llm_pricing`'s doc comment.
+///
+/// Because this bypasses the `SettingsHandle` (and therefore the
+/// `settings-changed` broadcast), it emits its own `llm-pricing-changed`
+/// event after a successful write so already-open cost surfaces (Code
+/// Intelligence Cost/Dashboard cards, Sessions rows) refetch instead of
+/// showing a stale table until restart.
 #[tauri::command]
-pub async fn llm_pricing_set(pricing: Vec<crate::settings::LlmPricingModel>) -> AppResult<()> {
-    crate::settings::write_global_llm_pricing(pricing)
+pub async fn llm_pricing_set(
+    app: AppHandle,
+    pricing: Vec<crate::settings::LlmPricingModel>,
+) -> AppResult<()> {
+    crate::settings::write_global_llm_pricing(pricing)?;
+    let _ = app.emit("llm-pricing-changed", ());
+    Ok(())
 }
 
 /// V14 Phase A: read-only project-scope listing for the Settings window's

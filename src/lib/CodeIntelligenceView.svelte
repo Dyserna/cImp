@@ -78,6 +78,7 @@
   } from './usageMath';
   import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
   import { fmtDate, fmtTime } from './format';
+  import { listen } from '@tauri-apps/api/event';
   import { listenManaged } from './listenManaged';
   import { settings, applySettings } from './settings/store';
   import { llmPricingGet, openSettingsWindowToSection } from './settings/ipc';
@@ -397,9 +398,9 @@
     if (u && d.apply) usage = u;
     if (a) advice = a;
     // V16 Feature 8: the cost view's auto-match price table. Fetched once
-    // per view lifetime here (not per poll — prices change rarely); the
-    // cost POPUP still refetches on every open, so Settings edits apply
-    // there immediately either way.
+    // per view lifetime here (not per poll — prices change rarely); Settings
+    // edits land live via the `llm-pricing-changed` listener, and card opens
+    // refetch too.
     if (costMode === 'cost' && pricingTable === null) void refreshPricingTable();
     // Unawaited on purpose: commitCounts is independent $state that renders
     // when it lands — the poll's critical path shouldn't wait on a git
@@ -639,8 +640,8 @@
   }
 
   // Refresh the shared price table each time the Cost or Dashboard card opens
-  // (Settings edits keep applying — the popup's freshness contract, now shared
-  // with the toggle + Sessions rows).
+  // — belt-and-braces alongside the `llm-pricing-changed` push listener (which
+  // covers Settings edits while a card is already open).
   $effect(() => {
     if (costCardOpen || dashCardOpen) void refreshPricingTable();
   });
@@ -1273,6 +1274,11 @@
   // Registered at component init (not in the async onMount) so its teardown is
   // armed before any await — avoids the unmount-during-await listener leak.
   listenManaged(() => onGraphStatus(upsert));
+  // Pricing edits are saved from the Settings window straight to the global
+  // file (bypassing the settings-changed broadcast), so `llm_pricing_set`
+  // emits its own event: refetch the shared table so already-open cost
+  // surfaces reprice without a card reopen or an app restart.
+  listenManaged(() => listen('llm-pricing-changed', () => void refreshPricingTable()));
   // V12 Phase F (6c): analyses-auto trigger badges (see the state block above).
   listenManaged(() =>
     onGraphAnalyses((a) => {

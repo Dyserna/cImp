@@ -568,6 +568,13 @@ pub enum Screen {
     /// it is the *expected* working of containment, not evidence of an attack,
     /// and the UI must be able to tell them apart.
     LatchRefusal,
+    /// V32 Phase C2 (decision 10): a `context_note` written under an EXTERNAL
+    /// latch was stored **quarantined**. Like the two detection screens below
+    /// it denied nothing — the note was saved — so its row reads as flagged,
+    /// not failed. Its consumer is the user: without a row, a quarantined note
+    /// would be discoverable only by opening the Memory view and noticing a
+    /// badge.
+    MemoryQuarantine,
     /// The YARA signature screen matched an EXTERNAL result (decision 7).
     /// Unlike every variant above, this one and [`Screen::Classifier`] denied
     /// nothing — locked decision 5 makes detection surface-only, so their rows
@@ -586,16 +593,21 @@ impl Screen {
             Screen::Budget => "budget",
             Screen::Canary => "canary",
             Screen::LatchRefusal => "latch_refusal",
+            Screen::MemoryQuarantine => "memory_quarantine",
             Screen::Signature => "signature",
             Screen::Classifier => "classifier",
         }
     }
 
     /// Whether this screen actually stopped something. The two detection
-    /// screens did not (surface-only), and a row that paints them as denials
-    /// would misreport what happened: the result was delivered in full.
+    /// screens did not (surface-only), and neither did the C2 memory
+    /// quarantine (the note was stored) — a row that painted any of them as a
+    /// denial would misreport what happened.
     pub fn is_denial(self) -> bool {
-        !matches!(self, Screen::Signature | Screen::Classifier)
+        !matches!(
+            self,
+            Screen::Signature | Screen::Classifier | Screen::MemoryQuarantine
+        )
     }
 }
 
@@ -984,8 +996,22 @@ mod tests {
             Screen::Budget,
             Screen::Canary,
             Screen::LatchRefusal,
+            Screen::MemoryQuarantine,
         ];
         let labels: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
-        assert_eq!(labels, ["ssrf", "budget", "canary", "latch_refusal"]);
+        assert_eq!(
+            labels,
+            [
+                "ssrf",
+                "budget",
+                "canary",
+                "latch_refusal",
+                "memory_quarantine"
+            ]
+        );
+        // Denial vs. flagged: the quarantine STORED the note, so its row must
+        // not be painted as a failure in the feed.
+        assert!(!Screen::MemoryQuarantine.is_denial());
+        assert!(Screen::LatchRefusal.is_denial());
     }
 }

@@ -15,6 +15,7 @@
     graphImpact,
     graphMemory,
     graphMemoryClear,
+    graphNoteReview,
     graphNoteSetPinned,
     graphFacts,
     graphFactUpdate,
@@ -281,10 +282,15 @@
   // Memory (Phase C): per-project session/action memory. Fetched while the
   // Memory section is open (via refresh()'s poll) and on demand.
   let memory = $state<MemorySnapshot | null>(null);
+  /// Whether the snapshot has been fetched at least once in this view's
+  /// lifetime — see `refresh()`, which primes it off-section exactly once so the
+  /// V32 quarantine badge is honest before anyone opens Memory.
+  let memoryPrimed = false;
 
   async function refreshMemory(): Promise<void> {
     try {
       memory = await graphMemory();
+      memoryPrimed = true;
     } catch (e) {
       console.warn('graph_memory failed', e);
     }
@@ -296,6 +302,30 @@
       await refreshMemory();
     } catch (e) {
       console.error('graph_note_set_pinned failed', e);
+    }
+  }
+
+  // V32 Phase C2: the quarantine review queue. A note written while its session
+  // was externally tainted is stored but withheld from every read path — recall,
+  // listings, the compaction carry-over, the fact distiller and therefore the
+  // launch-time auto-injection — until it is promoted or discarded here. This
+  // view is the ONLY reader of tainted notes, which is why the count also rides
+  // the section tab as a badge: a quarantined note nobody notices is a research
+  // conclusion silently lost, and the whole point of quarantining rather than
+  // refusing the write was to not lose it.
+  let quarantined = $derived(memory?.quarantined ?? []);
+  let reviewBusy = $state<string | null>(null);
+
+  async function reviewNote(noteId: string, action: 'promote' | 'discard'): Promise<void> {
+    if (action === 'discard' && !confirm('Discard this quarantined note permanently?')) return;
+    reviewBusy = noteId;
+    try {
+      await graphNoteReview(noteId, action);
+      await refreshMemory();
+    } catch (e) {
+      console.error('graph_note_review failed', e);
+    } finally {
+      reviewBusy = null;
     }
   }
 
@@ -1259,10 +1289,17 @@
     // V22: fetch the checks suggestion once an index is complete (guarded so it
     // runs at most once — the chip then recomputes reactively from settings).
     await maybeFetchChecksSuggestion();
-    // Memory is only fetched while its section is visible (opens the warm index).
+    // Memory is only fetched while its section is visible (opens the warm
+    // index) — with ONE exception: V32 Phase C2's quarantine badge sits on the
+    // section nav and has to be honest from whichever section the view opens
+    // on, or a note held for review is only ever found by someone who already
+    // went looking. So prime the snapshot once per view lifetime, then fall
+    // back to the section-gated poll.
     if (section === 'memory') {
       await refreshMemory();
       await refreshFacts();
+    } else if (!memoryPrimed) {
+      await refreshMemory();
     }
     // Usage (V14 Phase D/D2): same "only while visible" posture — the Usage
     // cards now render inside the Overview section.
@@ -1331,7 +1368,7 @@
             refreshUsage();
           }
         }}
-      >{s.label}{#if s.id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}</button>
+      >{s.label}{#if s.id === 'analyses' && analysesBadgeTotal > 0}<span class="badge" title="New since last pass">+{analysesBadgeTotal}</span>{/if}{#if s.id === 'memory' && quarantined.length > 0}<span class="badge" title="Quarantined notes awaiting review">⚠{quarantined.length}</span>{/if}</button>
     {/each}
   </nav>
 
@@ -1994,6 +2031,50 @@
   </div>
 
   {:else if section === 'memory'}
+    {#if quarantined.length > 0}
+      <!--
+        V32 Phase C2 (memory quarantine). First card in the section on purpose:
+        these notes are the only ones that need a decision, and everything below
+        is already live memory. No pin control here — a quarantined note is not
+        in memory at all yet, so "pinned" is a property that only starts to mean
+        anything after Promote (which preserves whatever the writer asked for).
+      -->
+      <section class="card quarantine">
+        <div class="history-head">
+          ⚠ Quarantined notes <span class="muted">({quarantined.length})</span>
+        </div>
+        <p class="caveat">
+          Written while the session had used an external tool (web/MCP-server), so
+          they are held out of recall, listings and the launch-time injection — an
+          injected instruction must not gain persistence. Promote to accept a note
+          into project memory (keeping its pinned state), or discard it.
+        </p>
+        <div class="rows">
+          {#each quarantined as n (n.note_id)}
+            <div class="arow note tainted">
+              <span class="qmark" title="Quarantined pending review">⚠</span>
+              <span class="ntext" title={`session: ${n.session_id || '(none)'}${n.pinned ? ' · would be pinned' : ''}`}
+                >{n.text}</span
+              >
+              <span class="aloc">{fmtTime(n.ts_ms)}</span>
+              <button
+                class="mini"
+                disabled={reviewBusy === n.note_id}
+                title="Accept into project memory"
+                onclick={() => reviewNote(n.note_id, 'promote')}>Promote</button
+              >
+              <button
+                class="mini danger"
+                disabled={reviewBusy === n.note_id}
+                title="Delete permanently"
+                onclick={() => reviewNote(n.note_id, 'discard')}>Discard</button
+              >
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
     <section class="card">
       <div class="history-head">Facts <span class="muted">({facts.length})</span></div>
       <p class="caveat">
@@ -2680,6 +2761,17 @@
   }
   .arow.note {
     grid-template-columns: auto 1fr auto;
+  }
+  /* V32 Phase C2: the quarantine review queue. Warning-tinted rather than
+     danger-tinted — a held note is a decision waiting, not a failure. */
+  .arow.note.tainted {
+    grid-template-columns: auto 1fr auto auto auto;
+  }
+  .card.quarantine {
+    border-color: var(--border-warning, #c9820a);
+  }
+  .qmark {
+    color: var(--surface-warning, #c9820a);
   }
   .arow.fact {
     grid-template-columns: auto 1fr auto auto;

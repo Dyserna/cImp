@@ -46,7 +46,7 @@ use super::router::TierHint;
 use super::service::{OffloadService, PushNotice};
 use super::detection;
 use super::outbound::{self, Budget};
-use super::toolclass::{self, Latch, Profile, ToolClass};
+use super::toolclass::{self, Latch, Profile, ProxyGate, ToolClass, WriteTaint};
 
 /// Discovery-file name under the portable root (next to `settings.json`).
 /// Legacy single-instance location, still written for anything that only
@@ -1009,17 +1009,26 @@ impl LatchRegistry {
     /// never engages or flips anything (same property as Phase A's
     /// `latch_gate`): otherwise a hallucinated call to the blocked side could
     /// redefine which side of the boundary the session is on.
+    ///
+    /// V32 Phase C2: the success arm now carries a [`WriteTaint`]. It is
+    /// [`WriteTaint::Quarantined`] for exactly one case — a PERSISTENT-WRITE
+    /// under an EXTERNAL latch, which Phase B refused and locked decision 10
+    /// turns into a quarantined write — and `Clean` for everything else. The
+    /// caller must thread it into the call it is about to make; ignoring it
+    /// would store an externally-influenced note as ordinary memory.
     fn gate(
         &self,
         scope: Option<&LatchScope>,
         route: LatchRoute,
         name: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<WriteTaint, &'static str> {
         // Fail-open: no tab identity ⇒ no latch (see [`latch_scope`]).
-        let Some(scope) = scope else { return Ok(()) };
+        let Some(scope) = scope else {
+            return Ok(WriteTaint::Clean);
+        };
         let class = toolclass::classify(name);
         if route == LatchRoute::Native && class == ToolClass::External {
-            return Ok(());
+            return Ok(WriteTaint::Clean);
         }
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = tabs.entry(scope.key()).or_insert(TabLatch {
@@ -1029,7 +1038,42 @@ impl LatchRegistry {
             latch_flagged: false,
         });
         entry.observe(scope.session.as_deref());
-        if let Some(refusal) = entry.latch.refusal(class) {
+        let refusal = match entry.latch.proxy_gate(class) {
+            ProxyGate::Proceed(WriteTaint::Quarantined) => {
+                // Locked decision 10: store it, flag it, hold it for the user.
+                // The write itself never latches (PERSISTENT-WRITE is not a
+                // latching class), so nothing about the scope changes here.
+                warn!(
+                    target: "offload",
+                    agent = scope.agent,
+                    tab = %scope.tab,
+                    tool = %name,
+                    latch = entry.latch.label(),
+                    "loopback: persistent memory write quarantined by the V32 session taint latch"
+                );
+                // Unlike the refusal below this is NOT one-row-per-scope: each
+                // quarantined note is a separate item in the user's review
+                // queue, and a feed that reported only the first would leave
+                // later ones discoverable solely by opening the Memory view.
+                drop(tabs);
+                outbound::record_flag(outbound::Flag {
+                    screen: outbound::Screen::MemoryQuarantine,
+                    consumer: scope.agent,
+                    scope: &scope.label(),
+                    tool: name,
+                    host: None,
+                    url: None,
+                    resolved_ip: None,
+                    canary: false,
+                    root: String::new(),
+                    detail: toolclass::QUARANTINE_WRITE_NOTICE,
+                });
+                return Ok(WriteTaint::Quarantined);
+            }
+            ProxyGate::Proceed(WriteTaint::Clean) => None,
+            ProxyGate::Refuse(r) => Some(r),
+        };
+        if let Some(refusal) = refusal {
             warn!(
                 target: "offload",
                 agent = scope.agent,
@@ -1069,7 +1113,7 @@ impl LatchRegistry {
                 "loopback: V32 session taint latch engaged"
             );
         }
-        Ok(())
+        Ok(WriteTaint::Clean)
     }
 
     /// V32 Phase C (locked decision 11): whether this tab's session may make
@@ -1222,25 +1266,38 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // V32 Phase B: the session taint latch over the tools THIS route serves —
     // the content-bearing graph tools (LOCAL-CAPABILITY), the structural ones
     // and the memory reads (TRUSTED, never gated), and `context_note`
-    // (PERSISTENT-WRITE, refused with `REFUSAL_WRITE_BLOCKED` under an EXTERNAL
-    // latch). That refusal is INTERIM: locked decision 10 / Phase C2 replaces
-    // it with quarantine — the note is stored with a `tainted` flag, excluded
-    // from auto-injection and `context_recall`, and held for explicit user
-    // promote-or-discard — which preserves the legitimate research conclusion
-    // this block currently drops.
-    if let Err(refusal) = latches().gate(scope.as_ref(), LatchRoute::Native, &body.name) {
-        let r = RunResult {
-            ok: false,
-            text: None,
-            error: Some(refusal.to_string()),
-        };
-        // 200, like every other tool-level error here: the child renders
-        // `error` as the tool result, which is how the model reads the refusal.
-        return write_json(stream, 200, &r).await;
-    }
+    // (PERSISTENT-WRITE).
+    //
+    // V32 Phase C2 (locked decision 10): a `context_note` under an EXTERNAL
+    // latch is no longer refused. The gate returns `Quarantined` and the write
+    // proceeds with that verdict threaded into it — the note is stored with a
+    // `tainted` flag, kept out of `context_recall`/`context_notes`/the
+    // compaction carry-over/the fact distiller (and so out of auto-injection),
+    // and held for explicit user promote-or-discard. That preserves the
+    // legitimate research conclusion the Phase B refusal dropped.
+    let taint = match latches().gate(scope.as_ref(), LatchRoute::Native, &body.name) {
+        Ok(t) => t,
+        Err(refusal) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(refusal.to_string()),
+            };
+            // 200, like every other tool-level error here: the child renders
+            // `error` as the tool result, which is how the model reads it.
+            return write_json(stream, 200, &r).await;
+        }
+    };
 
     let r = match graph
-        .run_graph_tool(&cwd, &body.name, &body.args, consumer, session.as_deref())
+        .run_graph_tool(
+            &cwd,
+            &body.name,
+            &body.args,
+            consumer,
+            session.as_deref(),
+            taint,
+        )
         .await
     {
         Ok(text) => RunResult {
@@ -2416,6 +2473,11 @@ async fn handle_mcp_call(
     let agent =
         crate::graph::source_for_consumer(query_param(&req.path, "consumer").unwrap_or("claude"));
     let scope = latch_scope(app, agent, body.tab.as_deref());
+    // The gate's V32 Phase C2 `WriteTaint` is discarded here, and can only ever
+    // be `Clean`: this route serves proxied `<server>__<tool>` ids, every one of
+    // which classifies EXTERNAL by the unknown-⇒-EXTERNAL invariant, so no
+    // PERSISTENT-WRITE can arrive on it. Memory writes reach cImp through
+    // `/graph_run` alone.
     if let Err(refusal) = latches().gate(scope.as_ref(), LatchRoute::Proxied, &body.name) {
         let r = RunResult {
             ok: false,
@@ -3323,7 +3385,7 @@ mod tests {
     // ── V32 Phase B — the proxy's per-session taint latch ──────────────────
 
     use crate::offload::toolclass::{
-        REFUSAL_EXTERNAL_BLOCKED, REFUSAL_LOCAL_BLOCKED, REFUSAL_WRITE_BLOCKED,
+        REFUSAL_EXTERNAL_BLOCKED, REFUSAL_LOCAL_BLOCKED,
     };
 
     /// A scope for `tab`, claiming session `session` (`None` = the registry
@@ -3473,31 +3535,60 @@ mod tests {
         );
     }
 
-    /// Locked decision 10 (interim form): a memory write under an EXTERNAL
-    /// latch is refused with the fixed write-blocked string, so an injected
-    /// page cannot plant a pinned note that auto-injects into future clean
-    /// sessions. Phase C2 replaces the refusal with quarantine.
+    /// Locked decision 10, as built in Phase C2: a memory write under an
+    /// EXTERNAL latch is **quarantined, not refused** — the note is stored with
+    /// a `tainted` flag and withheld from every read path, so an injected page
+    /// still cannot plant a note that auto-injects into future clean sessions,
+    /// but a legitimate research conclusion is preserved for review instead of
+    /// being thrown away (the Phase A/B behaviour).
     #[test]
-    fn context_note_is_refused_under_an_external_latch_only() {
+    fn context_note_is_quarantined_under_an_external_latch_only() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
-        // Unlatched: allowed, and the write itself does not latch.
-        assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "context_note")
-            .is_ok());
+        // Unlatched: clean, and the write itself does not latch.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Clean)
+        );
         assert_eq!(reg.snapshot()[0].latch, "open");
 
         assert!(reg
             .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
             .is_ok());
+        // EXTERNAL-latched: proceeds, tainted — NOT `Err(REFUSAL_WRITE_BLOCKED)`.
         assert_eq!(
             reg.gate(Some(&s), LatchRoute::Native, "context_note"),
-            Err(REFUSAL_WRITE_BLOCKED)
+            Ok(WriteTaint::Quarantined)
         );
+        // ...and the quarantined write still does not move the latch.
+        assert_eq!(reg.snapshot()[0].latch, "external");
         // Reads of the same store stay open — quarantine is about persistence.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_recall"),
+            Ok(WriteTaint::Clean)
+        );
+    }
+
+    /// The other direction of the same rule: a LOCAL-CAPABILITY latch never
+    /// taints a write (only external content can contaminate persistence), and
+    /// an identityless call fails open exactly as it does for the latch itself.
+    #[test]
+    fn a_local_latch_and_a_tabless_call_both_write_clean() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "context_recall")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
             .is_ok());
+        assert_eq!(reg.snapshot()[0].latch, "local");
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Clean)
+        );
+        // No tab identity ⇒ no scope to latch and none to taint.
+        assert_eq!(
+            reg.gate(None, LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Clean)
+        );
     }
 
     /// Per-tab isolation: one contaminated tab must not disarm (or arm) any

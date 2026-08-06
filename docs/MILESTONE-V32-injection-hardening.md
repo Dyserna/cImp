@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34), C3 (#35), E (#37) pending; live-verifies pending. GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) coded 2026-08-07; C3 (#35), E (#37) pending; live-verifies pending. GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -333,10 +333,54 @@ declares its class AND its mutation capability in one reviewed place.
   Settings section (modes, versions, Check now, revert, open folder);
   publish the first curated rule bundle + manifest as release assets;
   MAINTENANCE.md row = updater health review + bundle curation.
-- **C2 — memory quarantine (decision 10).** `tainted` flag on `mem_event`
-  notes written under latch; recall/auto-injection exclusion; Memory UI
+- **C2 — memory quarantine (decision 10).** `tainted` flag on `mem_note`
+  rows written under latch; recall/auto-injection exclusion; Memory UI
   promote-or-discard; spotlighting envelope on all recalled memory at
   delivery.
+  **Phase C2 amendment 2026-08-07 (as built).**
+  - **The flag lives on `mem_note`, not `mem_event`** (the spec line above said
+    `mem_event`; that relation holds read/edit/query events, not notes).
+    Migration is the V24 `usage_stat` stage-and-swap pattern
+    (`GraphIndex::migrate_mem_note_tainted`, stage `mem_note_v32`), existing
+    rows default to NOT tainted, and `GRAPH_SCHEMA_VERSION` goes **5 → 6** —
+    the bump is what makes the migration run at all (`open` only migrates in
+    the version-mismatch branch) and what makes read-only `open_existing`
+    consumers reject a store whose `mem_note` has no `tainted` column yet.
+    Cost: one derived-relation rebuild per project, as in V24.
+  - **The two gates now differ deliberately.** `Latch::proxy_gate` returns
+    `Proceed(WriteTaint::Quarantined)` for PERSISTENT-WRITE under an EXTERNAL
+    latch (loopback `/graph_run` → `run_graph_tool` → `dispatch_recorded` →
+    `run_tool` → `mem_add_note`), while the WORKER keeps Phase A's hard
+    `REFUSAL_WRITE_BLOCKED` — it cannot dispatch `context_*` at all today
+    (#38), so it has no legitimate write to preserve. Converting the worker to
+    quarantine is a follow-up **only if #38 is closed**.
+  - **Exclusion is enforced at the storage layer, once.** `mem_notes` filters
+    tainted rows, so every reader inherits it: `context_notes`, the compaction
+    carry-over (`context::compaction_block`), the fact distiller (and therefore
+    the launch-time `fact_promotion_block` auto-injection, which is built from
+    `project_fact`), and the Memory UI's clean list. A tripwire test
+    (`mem_note_is_queried_only_from_this_file`) fails the build if any module
+    other than `graph/index.rs` writes a `*mem_note{…}` atom, which is what
+    keeps the single filter from being bypassed by a future call site.
+    `context_recall` never read notes at all — it returns the working set plus
+    project facts — so its exclusion is structural.
+  - `context_notes` reports a **count** of withheld notes, never their text: a
+    quarantine that echoed its contents back would be a read channel for
+    exactly what it is holding.
+  - **Spotlighting on delivery** uses a second standing instruction,
+    `spotlight::RECALL_PREAMBLE`, with the SAME markers (the Phase D guidance
+    teaches one vocabulary and already names "recalled memory"); calling a
+    replayed note an "EXTERNAL TOOL RESULT" would be a lie the model can check.
+    Wrapped at `context_recall`, `context_notes` and `fact_promotion_block`;
+    NOT wrapped: the Memory UI (human reader) and the `context_note` write ack.
+  - Each quarantined write also writes an `injection_flag` activity row
+    (`Screen::MemoryQuarantine`, `ok: true` — nothing was denied), and the
+    Code Intelligence → Memory section carries a ⚠ count badge; the snapshot is
+    primed once off-section so the badge is honest before anyone opens Memory.
+  - **Known residual:** an UNPINNED quarantined note is still evicted with its
+    session by the ordinary retention sweep (30 days / 20-session cap) if the
+    user never reviews it. Fail-safe direction (the note is dropped, never
+    released), but it does mean the review queue is not durable indefinitely.
 - **D — consumer hygiene.** Pinned OpenCode `permission` block; guidance
   addendum line for Claude tabs (the `--append-system-prompt` /
   guidance-addendum seam in `ipc/commands.rs:981`) stating the

@@ -2013,6 +2013,32 @@ pub async fn graph_note_set_pinned(
     service.mem_set_note_pinned(&root, &note_id, pinned)
 }
 
+/// V32 Phase C2 (Memory): resolve one QUARANTINED note — `action` is
+/// `"promote"` (clear the taint; the note becomes ordinary memory, pinned state
+/// preserved) or `"discard"` (delete it). `root` defaults to the launch
+/// directory.
+///
+/// Shaped like [`graph_fact_update`] rather than as two commands: the two
+/// actions are the two halves of one review decision, always rendered side by
+/// side, and an unknown `action` is rejected here rather than silently ignored —
+/// a typo must not read as "reviewed, nothing happened" on a security control.
+#[tauri::command]
+pub async fn graph_note_review(
+    service: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    root: Option<String>,
+    note_id: String,
+    action: String,
+) -> AppResult<()> {
+    let root = resolve_graph_root(root)?;
+    match action.as_str() {
+        "promote" => service.mem_promote_note(&root, &note_id),
+        "discard" => service.mem_delete_note(&root, &note_id),
+        other => Err(AppError::Graph(format!(
+            "unknown note review action `{other}` (expected \"promote\" or \"discard\")"
+        ))),
+    }
+}
+
 /// V12 Phase E (Memory): the project's durable facts (pinned first, then
 /// newest), excluding archived ones. `root` defaults to the launch directory.
 #[tauri::command]

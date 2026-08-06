@@ -802,6 +802,23 @@ fn injection_hygiene_applies(cfg: &AiToolTabConfig, settings: &Settings) -> bool
 /// hasn't been built at `root` yet, has no pinned facts, or can't be opened —
 /// best-effort, same posture as this module's other launch-time I/O (e.g.
 /// [`write_opencode_instructions`]).
+///
+/// V32 Phase C2 (locked decision 10): this is THE auto-injection path — the one
+/// that carries a past session's words into a fresh, clean one — so it is also
+/// where memory quarantine matters most. Two things guard it:
+///
+/// - **Quarantined notes can never reach it.** The block is built from
+///   `project_fact` rows, and the only automatic producer of those is the
+///   distiller, which reads notes through `GraphIndex::mem_notes` — where
+///   tainted rows are filtered out at the storage layer. So a quarantined note
+///   cannot become a fact and then be injected.
+/// - **What does reach it is spotlight-enveloped**, including facts that are
+///   not tainted at all. Pre-V32 memory is unauditable by construction, and this
+///   block lands in a system-prompt addendum, the highest-trust position in the
+///   session — exactly where an old injected line would do the most damage. The
+///   Phase D guidance addendum (composed just above, in
+///   [`compose_capability_guidance`]) already names "recalled memory" as a
+///   marker-wrapped source, so the session knows how to read it.
 fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
     const CAP_CHARS: usize = 1500;
     let sub = settings.graph.effective_db_subdir();
@@ -828,7 +845,11 @@ fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
         }
         out.push_str(&line);
     }
-    Some(out)
+    // Wrap once, at delivery, with a fresh nonce — the same discipline the
+    // proxy's EXTERNAL results follow. The cap above is applied to the FACTS,
+    // before wrapping, so the envelope can never be the thing that gets
+    // truncated away.
+    Some(crate::offload::spotlight::recall_envelope(&out))
 }
 
 /// V30 Phase A: the Claude Code flag that registers our stdio MCP child as a
@@ -3351,7 +3372,16 @@ mod tests {
         settings.graph.promote_pinned_facts = true;
 
         let block = fact_promotion_block(&dir, &settings).expect("block present");
-        assert!(block.starts_with("## cImp project facts\n"), "{block}");
+        // V32 Phase C2: the injected block is spotlight-enveloped at delivery —
+        // it lands in a system-prompt addendum, so the facts inside must be
+        // marked as replayed data before the session reads them.
+        assert!(
+            block.starts_with(crate::offload::spotlight::RECALL_PREAMBLE),
+            "{block}"
+        );
+        assert!(block.contains("<<<BEGIN UNTRUSTED-DATA "), "{block}");
+        assert!(block.trim_end().ends_with(">>>"), "{block}");
+        assert!(block.contains("## cImp project facts\n"), "{block}");
         assert!(block.contains("newest pinned fact"), "{block}");
         assert!(block.contains("oldest pinned fact"), "{block}");
         assert!(
@@ -3386,11 +3416,18 @@ mod tests {
         settings.graph.promote_pinned_facts = true;
 
         let block = fact_promotion_block(&dir, &settings).expect("block present");
+        // The cap bounds the FACTS; the V32 Phase C2 envelope is fixed overhead
+        // added afterwards (preamble + two nonced markers), so it is measured
+        // out of the budget rather than allowed to eat into it — a per-tab
+        // constant is the price of the injected block being marked as data.
+        let overhead =
+            crate::offload::spotlight::RECALL_PREAMBLE.len() + 2 * (32 + 26) + 4;
         assert!(
-            block.len() <= 1500 + 200,
-            "block should stay near the cap: {} chars",
+            block.len() <= 1500 + 200 + overhead,
+            "block should stay near the cap: {} chars (envelope overhead ~{overhead})",
             block.len()
         );
+        assert!(block.contains("## cImp project facts\n"), "{block}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -48,6 +48,16 @@ pub struct MemNote {
     pub text: String,
     pub ts_ms: i64,
     pub pinned: bool,
+    /// V32 Phase C2 (locked decision 10): the note was written while its
+    /// session was EXTERNAL-latched, so it is **quarantined** — stored, but
+    /// excluded from every read path (`context_recall`, `context_notes`, the
+    /// compaction carry-over, the distiller, and therefore auto-injection)
+    /// until a human promotes it in the Memory UI.
+    ///
+    /// Orthogonal to `pinned` and to the V28 per-tab session scope: quarantine
+    /// says *whether* the note may be read at all, the other two say where.
+    /// Pre-C2 rows migrate as `false` (`GraphIndex::migrate_mem_note_tainted`).
+    pub tainted: bool,
 }
 
 /// A session summary row for the Memory UI's "recent sessions" list.
@@ -69,7 +79,14 @@ pub struct MemorySnapshot {
     /// The current session's ranked working set.
     pub working_set: Vec<WorkingSetEntry>,
     /// The current session's notes plus every pinned note in the project.
+    /// **Quarantined notes are not here** — they are in [`Self::quarantined`].
     pub notes: Vec<MemNote>,
+    /// V32 Phase C2: every quarantined note in the project, newest first —
+    /// project-wide and session-independent, unlike [`Self::notes`], because
+    /// the review queue must not hide a note behind "which session is current".
+    /// This is the ONE read path a tainted note is allowed to reach, and its
+    /// consumer is the Memory UI's promote-or-discard affordance.
+    pub quarantined: Vec<MemNote>,
     /// All known sessions, newest activity first.
     pub sessions: Vec<SessionInfo>,
 }

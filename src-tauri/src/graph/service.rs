@@ -1091,6 +1091,14 @@ impl GraphService {
     /// (see [`Self::live_session_for_tab`]); the `context_*` memory tools scope
     /// to it instead of "the most recent session for this agent". `None` keeps
     /// exactly the pre-V28 behavior.
+    ///
+    /// V32 Phase C2: `taint` is the loopback taint latch's verdict for THIS
+    /// call ([`Latch::proxy_gate`](crate::offload::toolclass::Latch::proxy_gate)).
+    /// It is consumed by `context_note` alone — a
+    /// [`Quarantined`](crate::offload::toolclass::WriteTaint::Quarantined) write
+    /// is stored with the `tainted` flag instead of entering project memory. It
+    /// is threaded rather than re-derived here because only the proxy holds the
+    /// per-tab latch state; the graph layer must never guess it.
     pub async fn run_graph_tool(
         &self,
         cwd: &Path,
@@ -1098,6 +1106,7 @@ impl GraphService {
         args: &serde_json::Value,
         consumer: &str,
         session: Option<&str>,
+        taint: crate::offload::toolclass::WriteTaint,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
@@ -1117,7 +1126,8 @@ impl GraphService {
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session).await
+        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session, taint)
+            .await
     }
 
     /// The configured per-project db subdirectory (default `.cimp`).
@@ -1938,6 +1948,7 @@ impl GraphService {
                 current_session: None,
                 working_set: Vec::new(),
                 notes: Vec::new(),
+                quarantined: Vec::new(),
                 sessions: Vec::new(),
             };
         };
@@ -1946,17 +1957,33 @@ impl GraphService {
             .as_deref()
             .map(|s| idx.mem_working_set(s, 50).unwrap_or_default())
             .unwrap_or_default();
-        // With a current session, notes = its notes + pinned; without, just pinned.
+        // With a current session, notes = its notes + pinned; without, just
+        // pinned. Quarantined notes are NOT among them (`mem_notes` filters them
+        // at the storage layer) — they come back separately below, project-wide,
+        // because the Memory UI is the only reader allowed to see them.
         let notes = idx
             .mem_notes(current.as_deref().unwrap_or(""))
             .unwrap_or_default();
+        let quarantined = idx.mem_quarantined_notes().unwrap_or_default();
         let sessions = idx.mem_sessions().unwrap_or_default();
         MemorySnapshot {
             current_session: current,
             working_set,
             notes,
+            quarantined,
             sessions,
         }
+    }
+
+    /// V32 Phase C2: release a quarantined note into normal memory (its pinned
+    /// state is preserved — see [`GraphIndex::mem_promote_note`]).
+    pub fn mem_promote_note(&self, root: &Path, note_id: &str) -> AppResult<()> {
+        self.index_for(root)?.mem_promote_note(note_id)
+    }
+
+    /// V32 Phase C2: permanently discard a quarantined note.
+    pub fn mem_delete_note(&self, root: &Path, note_id: &str) -> AppResult<()> {
+        self.index_for(root)?.mem_delete_note(note_id)
     }
 
     /// Clear one session's memory (`Some`) or the whole project's (`None`).

@@ -21,7 +21,17 @@
 /// `reset()`, so the bump *triggers* the open path but the actual column add is
 /// a bespoke recreate-and-copy (`GraphIndex::migrate_usage_stat_origin`) that
 /// defaults existing rows to `"session"` — no usage data is lost.
-pub const GRAPH_SCHEMA_VERSION: i64 = 5;
+/// V32 == 6: the `mem_note` memory relation gains a `tainted` column (Phase C2
+/// memory quarantine). Same shape as the V24 bump and for the same two reasons:
+/// (a) `mem_note` survives `reset()`, so the column is added by a bespoke
+/// stage-and-swap (`GraphIndex::migrate_mem_note_tainted`) defaulting existing
+/// rows to `false`; (b) the version is what makes the migration *run at all* —
+/// `GraphIndex::open` only migrates inside the version-mismatch branch — and
+/// what protects the read-only `open_existing` consumers, which reject a stale
+/// store rather than query a `mem_note` that has no `tainted` column yet.
+/// The cost is one derived-relation rebuild per project, which is the accepted
+/// price of this discipline (every `RELATIONS` row is re-derivable from source).
+pub const GRAPH_SCHEMA_VERSION: i64 = 6;
 
 /// `(name, create-script)` for every stored relation. Order matters only in
 /// that all are ensured before any write.

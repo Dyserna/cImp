@@ -252,6 +252,12 @@ export interface MemNote {
   text: string;
   ts_ms: number;
   pinned: boolean;
+  /// V32 Phase C2: written while its session was externally tainted, so it is
+  /// quarantined — stored but excluded from every read path (recall, listings,
+  /// the compaction carry-over, the fact distiller and therefore auto-injection)
+  /// until promoted here. Always `false` for entries in `MemorySnapshot.notes`
+  /// and `true` for entries in `MemorySnapshot.quarantined`.
+  tainted: boolean;
 }
 
 /// A session summary row. Mirror of Rust `graph::memory::SessionInfo`.
@@ -268,7 +274,11 @@ export interface SessionInfo {
 export interface MemorySnapshot {
   current_session: string | null;
   working_set: WorkingSetEntry[];
+  /// Clean notes only — quarantined ones are in `quarantined`.
   notes: MemNote[];
+  /// V32 Phase C2: the project-wide quarantine review queue. This UI is the only
+  /// reader allowed to see these notes; promote or discard each one.
+  quarantined: MemNote[];
   sessions: SessionInfo[];
 }
 
@@ -434,6 +444,16 @@ export function graphMemoryClear(session?: string, root?: string): Promise<void>
 /// Pin/unpin a note (pinned notes survive session eviction, show project-wide).
 export function graphNoteSetPinned(noteId: string, pinned: boolean, root?: string): Promise<void> {
   return invoke<void>('graph_note_set_pinned', { root: root ?? null, noteId, pinned });
+}
+
+/// V32 Phase C2: resolve one quarantined note — `promote` clears the taint (the
+/// note becomes ordinary memory, keeping its pinned state), `discard` deletes it.
+export function graphNoteReview(
+  noteId: string,
+  action: 'promote' | 'discard',
+  root?: string,
+): Promise<void> {
+  return invoke<void>('graph_note_review', { root: root ?? null, noteId, action });
 }
 
 /// V10 (Context): the result of a context retrieval. Mirror of Rust

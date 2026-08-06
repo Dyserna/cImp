@@ -235,9 +235,20 @@ impl ToolRouter for HostRouter {
             ));
         }
         // Namespaced ids (`<server>__<tool>`) belong to an MCP server; bare
-        // names are the native baseline.
+        // names are the native baseline. Routed through the recorded,
+        // consumer-guarded entry point: the row lands in the Tool Activity
+        // feed (source `offload`, root = the session's first allowed root),
+        // and a hallucinated call to a server without `offload_access` is
+        // refused instead of silently reaching it.
         if name.contains("__") {
-            self.host.call(name, args).await
+            self.host
+                .call_recorded(
+                    super::mcp_host::Consumer::Offload,
+                    self.ctx.allowed_roots.first().map(|p| p.as_path()),
+                    name,
+                    args,
+                )
+                .await
         } else {
             tools::dispatch(name, args, &self.ctx).await
         }

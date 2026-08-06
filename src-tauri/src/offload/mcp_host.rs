@@ -19,7 +19,7 @@
 //! the priority targets are the stdio `npx`/`uvx` servers).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -458,6 +458,16 @@ impl Consumer {
         }
     }
 
+    /// The activity-feed `source` badge for this consumer — the same
+    /// `claude`/`opencode`/`offload` vocabulary graph entries use.
+    fn source(self) -> &'static str {
+        match self {
+            Consumer::Claude => "claude",
+            Consumer::Offload => "offload",
+            Consumer::Opencode => "opencode",
+        }
+    }
+
     /// Whether `server` is exposed to this consumer.
     fn wants(self, server: &McpServer) -> bool {
         match self {
@@ -466,6 +476,31 @@ impl Consumer {
             Consumer::Opencode => server.opencode_access,
         }
     }
+}
+
+/// The at-a-glance `target` column for an MCP activity row: the argument
+/// that best headlines the call. MCP tool schemas are arbitrary, so this is
+/// heuristic — try the common primary-argument names first, then fall back
+/// to the first string-valued property. Capped so a prompt-sized argument
+/// can't blow up the list feed (the full args are in the recorded request).
+fn mcp_target(args: &Value) -> String {
+    const PREFERRED: [&str; 10] = [
+        "query", "url", "path", "file", "prompt", "question", "name", "id", "topic", "text",
+    ];
+    const CAP: usize = 160;
+    let Some(obj) = args.as_object() else {
+        return String::new();
+    };
+    let picked = PREFERRED
+        .iter()
+        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+        .or_else(|| obj.values().find_map(Value::as_str))
+        .unwrap_or("");
+    let mut out: String = picked.chars().take(CAP).collect();
+    if picked.chars().count() > CAP {
+        out.push('…');
+    }
+    out
 }
 
 /// One connected (or failed) MCP tool server.
@@ -756,19 +791,6 @@ impl McpHost {
         self.call(namespaced, args).await
     }
 
-    /// Route a Claude-exposed namespaced call. Claude must never reach an
-    /// offload-only server's tools.
-    pub async fn call_for_claude(&self, namespaced: &str, args: Value) -> Result<String, String> {
-        self.call_for_consumer(Consumer::Claude, namespaced, args)
-            .await
-    }
-
-    /// V19: route an OpenCode-exposed namespaced call.
-    pub async fn call_for_opencode(&self, namespaced: &str, args: Value) -> Result<String, String> {
-        self.call_for_consumer(Consumer::Opencode, namespaced, args)
-            .await
-    }
-
     /// Route a namespaced `<server>__<tool>` call to its owning server.
     pub async fn call(&self, namespaced: &str, args: Value) -> Result<String, String> {
         // Route by actual ownership (an exact match on the namespaced def
@@ -796,6 +818,46 @@ impl McpHost {
         if was_healthy && !server.is_healthy() {
             self.signal_change(); // a server just went down mid-call
         }
+        result
+    }
+
+    /// [`call_for_consumer`](Self::call_for_consumer) plus a Tool Activity
+    /// record (`kind: "mcp"`, source = the consumer's badge) — the one entry
+    /// point every live MCP dispatch goes through: the loopback `/mcp/call`
+    /// route (Claude/OpenCode) via `OffloadService::mcp_call`, and the offload
+    /// worker's `HostRouter`. Recording here (not in `call`) keeps the
+    /// unattributed primitive available without double-recording. `root` is
+    /// the calling session's project root when known (`None` ⇒ empty, like
+    /// offload runs with no session cwd).
+    pub async fn call_recorded(
+        &self,
+        consumer: Consumer,
+        root: Option<&Path>,
+        namespaced: &str,
+        args: Value,
+    ) -> Result<String, String> {
+        let started = crate::activity::now_ms();
+        let target = mcp_target(&args);
+        let request = serde_json::to_string_pretty(&args).unwrap_or_default();
+        let result = self.call_for_consumer(consumer, namespaced, args).await;
+        crate::activity::record_bg(crate::activity::ActivityRecord {
+            entry: crate::activity::ActivityEntry::new(
+                crate::activity::ActivityKind::Mcp,
+                started,
+                root.map(crate::activity::root_key).unwrap_or_default(),
+                consumer.source().to_string(),
+                namespaced.to_string(),
+                target,
+                result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
+                crate::activity::now_ms().saturating_sub(started),
+                result.is_ok(),
+            ),
+            request,
+            response: match &result {
+                Ok(text) => text.clone(),
+                Err(msg) => format!("[error] {msg}"),
+            },
+        });
         result
     }
 
@@ -1571,16 +1633,42 @@ mod tests {
 
         // Claude must not be able to invoke the offload-only server's tool.
         let err = host
-            .call_for_claude("beta__y", json!({}))
+            .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
             .await
             .unwrap_err();
         assert!(err.contains("not available to Claude"), "got: {err}");
         // OpenCode must not reach the Claude-only server's tool.
         let err2 = host
-            .call_for_opencode("alpha__x", json!({}))
+            .call_for_consumer(Consumer::Opencode, "alpha__x", json!({}))
             .await
             .unwrap_err();
         assert!(err2.contains("not available to OpenCode"), "got: {err2}");
+        // The offload worker must not reach a server without offload_access
+        // (the guard `HostRouter` now goes through via `call_recorded`).
+        let err3 = host
+            .call_for_consumer(Consumer::Offload, "alpha__x", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err3.contains("not available to the offload worker"), "got: {err3}");
+    }
+
+    #[test]
+    fn mcp_target_prefers_primary_keys_and_caps() {
+        // A preferred key wins over other string fields.
+        assert_eq!(
+            mcp_target(&json!({ "max_results": "5", "query": "rust async traits" })),
+            "rust async traits"
+        );
+        // No preferred key: fall back to the first string value.
+        assert_eq!(mcp_target(&json!({ "n": 3, "lang": "rust" })), "rust");
+        // Non-object args (or no strings at all) yield an empty target.
+        assert_eq!(mcp_target(&json!(null)), "");
+        assert_eq!(mcp_target(&json!({ "n": 3 })), "");
+        // Oversized values are cut with a marker.
+        let long = "x".repeat(500);
+        let t = mcp_target(&json!({ "query": long }));
+        assert_eq!(t.chars().count(), 161);
+        assert!(t.ends_with('…'));
     }
 
     #[test]

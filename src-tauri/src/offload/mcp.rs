@@ -1012,7 +1012,12 @@ async fn proxy_mcp_call(params: &Value) -> Result<Value, (i64, String)> {
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| (-32603, format!("client build failed: {e}")))?;
-    let body = json!({ "name": name, "arguments": args });
+    // The child's cwd is the calling session's project root — sent so the
+    // app can attribute the Tool Activity row to that project.
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let body = json!({ "name": name, "arguments": args, "cwd": cwd });
     let resp = match client
         .post(format!("{base}/mcp/call?consumer={}", consumer()))
         .bearer_auth(&token)

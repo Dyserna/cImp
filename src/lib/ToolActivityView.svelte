@@ -271,7 +271,14 @@
   }
 
   function rowMain(e: ActivityEntry): string {
-    const tool = e.kind === 'graph' ? e.tool.replace('graph_', '') : e.tool;
+    // mcp tools are namespaced `<server>__<tool>` — render the first `__`
+    // as a separator so the server reads as a prefix.
+    const tool =
+      e.kind === 'graph'
+        ? e.tool.replace('graph_', '')
+        : e.kind === 'mcp'
+          ? e.tool.replace('__', '/')
+          : e.tool;
     return e.target ? `${tool} · ${e.target}` : tool;
   }
 
@@ -322,9 +329,10 @@
         {/if}
       </div>
       <p class="caveat">
-        Code-intelligence graph calls, offload runs, and Code Audit scans,
-        merged into one chronological feed that survives restarts. Click a row
-        to see the actual request and response; × deletes a single entry.
+        Code-intelligence graph calls, offload runs, Code Audit scans, and
+        proxied MCP tool calls, merged into one chronological feed that
+        survives restarts. Click a row to see the actual request and response;
+        × deletes a single entry.
       </p>
       {#if entries.length === 0}
         <div class="history-empty">
@@ -669,11 +677,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Feed-kind accents: graph = info, offload = success, audit = orange.
-     Semantic theme tokens (not the neutral --text-* ramp, which follows the
-     terminal palette) so each theme keeps them legible — dark ink variants
-     on light themes. Orange has no token of its own, so it's mixed from the
-     warning/danger semantics to stay distinct from read_advisor's yellow. */
+  /* Feed-kind accents: graph = info, offload = success, audit = orange,
+     mcp = purple. Semantic theme tokens (not the neutral --text-* ramp, which
+     follows the terminal palette) so each theme keeps them legible — dark ink
+     variants on light themes. Orange has no token of its own, so it's mixed
+     from the warning/danger semantics to stay distinct from read_advisor's
+     yellow. */
   .hkind.graph {
     color: var(--text-info, #58a6ff);
   }
@@ -682,6 +691,9 @@
   }
   .hkind.audit {
     color: color-mix(in srgb, var(--warning, #f0a020) 60%, var(--danger, #f06080));
+  }
+  .hkind.mcp {
+    color: var(--accent-purple, #d2a8ff);
   }
   /* Agent-source accents for graph rows (claude/opencode/offload, plus the
      backend-internal read_advisor/auto_check services), matching the palette

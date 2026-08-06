@@ -1,8 +1,8 @@
 // The unified, persistent tool-activity store (backend `crate::activity`) —
 // invoke wrappers for the Tool Activity tab. Entries cover graph/context tool
-// calls, completed offload_task runs, AND Code Audit tool runs; they survive
-// app restarts, and each keeps a (truncated) copy of the actual
-// request/response for the detail popup.
+// calls, completed offload_task runs, Code Audit tool runs, AND proxied MCP
+// tool calls; they survive app restarts, and each keeps a (truncated) copy of
+// the actual request/response for the detail popup.
 import { invoke } from '@tauri-apps/api/core';
 
 /// One activity, without payloads. Mirror of Rust `activity::ActivityEntry`.
@@ -11,8 +11,9 @@ export interface ActivityEntry {
   id: number;
   ts_ms: number;
   /// `graph` = a graph/context tool call; `offload` = an offload_task run;
-  /// `audit` = one Code Audit tool run (V23).
-  kind: 'graph' | 'offload' | 'audit';
+  /// `audit` = one Code Audit tool run (V23); `mcp` = one proxied MCP tool
+  /// call (`<server>__<tool>` through the warm host).
+  kind: 'graph' | 'offload' | 'audit' | 'mcp';
   /// Canonicalized project root the call ran against ('' when unknown).
   root: string;
   /// Agent (claude/opencode/offload/read_advisor/auto_check) for graph

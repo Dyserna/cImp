@@ -800,6 +800,12 @@ struct McpCallBody {
     /// The tool arguments.
     #[serde(default)]
     arguments: Value,
+    /// The calling session's working directory (the child's cwd), used to
+    /// attribute the Tool Activity row to a project. Optional by design — a
+    /// child from before this field sends none, and the row just gets an
+    /// empty root.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// `POST /graph_run`: run one `graph_*` tool against the app's WARM graph index
@@ -2014,8 +2020,9 @@ async fn handle_mcp_call(
             return write_json(stream, 400, &r).await;
         }
     };
+    let cwd = body.cwd.map(PathBuf::from);
     let r = match service
-        .mcp_call(consumer_of(req), &body.name, body.arguments)
+        .mcp_call(consumer_of(req), &body.name, body.arguments, cwd.as_deref())
         .await
     {
         Ok(text) => RunResult {

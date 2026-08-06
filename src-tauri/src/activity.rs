@@ -2,11 +2,13 @@
 //! Activity tab.
 //!
 //! Grew out of the V9-01 in-memory graph-call ring (`graph/activity.rs`): one
-//! process-wide, newest-first history of tool calls, now covering *both*
-//! consumers — `graph_*`/`context_*` calls (recorded by
-//! `graph::mcp::dispatch_recorded` and friends) and completed `offload_task`
-//! runs (recorded by `offload::service`) — with the actual request/response
-//! payloads captured (truncated) so the UI can show them in a detail popup.
+//! process-wide, newest-first history of tool calls, covering every feed —
+//! `graph_*`/`context_*` calls (recorded by `graph::mcp::dispatch_recorded`
+//! and friends), completed `offload_task` runs (recorded by
+//! `offload::service`), Code Audit runs, and proxied MCP tool calls
+//! (recorded by `offload::mcp_host::McpHost::call_recorded`) — with the
+//! actual request/response payloads captured (truncated) so the UI can show
+//! them in a detail popup.
 //!
 //! Entries survive an app restart: the ring is mirrored to a JSONL file next
 //! to the executable (`<exe-dir>/tool-activity.jsonl`, the same portable
@@ -58,6 +60,10 @@ const OFFLOAD_CAP: usize = 100;
 /// V23: Code Audit scan runs are rare (user-triggered) and comparatively
 /// valuable — its own window so a graph-heavy session can't evict them.
 const AUDIT_CAP: usize = 100;
+/// Proxied MCP tool calls (`<server>__<tool>` through the warm host) sit
+/// between the chatty graph calls and the rare offload runs in volume — their
+/// own window so neither feed crowds the other out.
+const MCP_CAP: usize = 200;
 /// Payload caps (chars) applied at record time — a request is typically a
 /// small JSON args object or an offload instruction; responses can be large
 /// tool output. Anything past the cap is cut with an explicit marker.
@@ -86,6 +92,11 @@ pub enum ActivityKind {
     /// agent call (roll-up row, source = the consumer — see
     /// `audit::mcp::run_audit`).
     Audit,
+    /// One proxied MCP tool call (`<server>__<tool>`) through the warm
+    /// [`McpHost`](crate::offload::mcp_host::McpHost) — from Claude/OpenCode
+    /// via the loopback `/mcp/call` route or from the offload worker's
+    /// in-process router (recorded by `McpHost::call_recorded`).
+    Mcp,
 }
 
 impl ActivityKind {
@@ -94,6 +105,7 @@ impl ActivityKind {
             ActivityKind::Graph => "graph",
             ActivityKind::Offload => "offload",
             ActivityKind::Audit => "audit",
+            ActivityKind::Mcp => "mcp",
         }
     }
 }
@@ -105,6 +117,8 @@ fn kind_cap(kind: &str) -> usize {
         OFFLOAD_CAP
     } else if kind == ActivityKind::Audit.as_str() {
         AUDIT_CAP
+    } else if kind == ActivityKind::Mcp.as_str() {
+        MCP_CAP
     } else {
         GRAPH_CAP
     }
@@ -134,7 +148,7 @@ pub struct ActivityEntry {
     /// `"read_advisor"` / `"auto_check"` for graph entries; the backend name
     /// for offload entries; `"audit"` for per-scanner audit rows and the
     /// consumer (`"claude"` / `"opencode"` / `"offload"`) for audit roll-up
-    /// rows.
+    /// rows and MCP entries.
     pub source: String,
     /// The tool name, e.g. `graph_find_symbol` or `offload_task`.
     pub tool: String,
@@ -762,6 +776,24 @@ mod tests {
             1,
             "offload entry was evicted by graph traffic"
         );
+        assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn mcp_entries_keep_their_own_window() {
+        // MCP rows get their own retention window (MCP_CAP), independent of
+        // graph traffic in both directions.
+        let store = temp_store("mcp-cap");
+        store.record(rec_kind(ActivityKind::Mcp, "an mcp call"));
+        for i in 0..(GRAPH_CAP + 50) {
+            store.record(rec(&format!("g{i}")));
+        }
+        for i in 0..(MCP_CAP + 10) {
+            store.record(rec_kind(ActivityKind::Mcp, &format!("m{i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert_eq!(snap.iter().filter(|e| e.kind == "mcp").count(), MCP_CAP);
         assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
         let _ = fs::remove_file(&store.path);
     }

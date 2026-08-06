@@ -22,7 +22,7 @@
 //! ([`super::agent`]) so they can't drift on routing or loop semantics.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -682,19 +682,24 @@ impl OffloadService {
     }
 
     /// Execute one proxied-consumer MCP tool call. Guarded — refuses any tool
-    /// not offered by a server exposed to `consumer`.
+    /// not offered by a server exposed to `consumer`. Recorded in the Tool
+    /// Activity feed (`kind: "mcp"`) by the host; `cwd` is the calling
+    /// session's working directory when the child sent one, attributing the
+    /// row to that project.
     pub async fn mcp_call(
         &self,
         consumer: Consumer,
         name: &str,
         args: serde_json::Value,
+        cwd: Option<&Path>,
     ) -> Result<String, String> {
-        match consumer {
-            Consumer::Opencode => self.host.call_for_opencode(name, args).await,
-            // See `mcp_tool_descriptors`: `offload` never legitimately reaches
-            // this proxy; fall back to the Claude-guarded set.
-            Consumer::Claude | Consumer::Offload => self.host.call_for_claude(name, args).await,
-        }
+        // See `mcp_tool_descriptors`: `offload` never legitimately reaches
+        // this proxy; fall back to the Claude-guarded set.
+        let consumer = match consumer {
+            Consumer::Opencode => Consumer::Opencode,
+            Consumer::Claude | Consumer::Offload => Consumer::Claude,
+        };
+        self.host.call_recorded(consumer, cwd, name, args).await
     }
 
     /// Run one offload task end-to-end against the live pool and return the

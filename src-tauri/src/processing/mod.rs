@@ -21,13 +21,20 @@
 //!   structured side channels (`crate::oob`), so the layer simply forwards the
 //!   raw PTY stream to xterm verbatim and maintains the cell model used by
 //!   permission detection ([`recent_rendered`](ProcessingLayer::recent_rendered)).
+//!
+//! - [`strip_terminal_escapes`] (V32 Phase D) is the inverse direction: text
+//!   arriving from OUTSIDE cImp (fetched pages, model prose quoting them) is
+//!   stripped of ANSI/OSC/C0 control sequences before it is composed into a
+//!   non-HTML sink such as TTS. See `sanitize.rs` for the threat model.
 
 pub mod patterns_file;
 pub mod permission;
+mod sanitize;
 mod screen;
 mod segmenter;
 mod tags;
 
+pub use sanitize::strip_terminal_escapes;
 pub use segmenter::segment_sentences;
 pub use tags::normalize_for_dedup;
 

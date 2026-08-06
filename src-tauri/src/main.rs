@@ -24,6 +24,12 @@ mod preview;
 mod process_guard;
 mod processing;
 mod procutil;
+/// V32 Phase D (locked decision 9): the channel-content tripwire — a
+/// source-scanning test that no production `PushNotice` producer may compose
+/// its text from LLM output, scanner findings or fetched content. Test-only:
+/// it holds no runtime code, only the reviewed allowlist and the scan.
+#[cfg(test)]
+mod push_tripwire;
 mod pty;
 mod read_hook;
 mod settings;
@@ -55,8 +61,9 @@ use crate::ipc::commands::{
     checks_validate_pattern, close_settings_window, compose_attach_image, compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get, consume_settings_deep_link, content_clear, content_open_folder,
-    get_claude_usage, get_system_stats, graph_architecture, graph_context_preview, graph_cycles,
-    graph_dead_exports, graph_fact_add, graph_fact_update, graph_facts, graph_history,
+    detection_status, get_claude_usage, get_system_stats, graph_architecture,
+    graph_context_preview, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update,
+    graph_facts, graph_history,
     graph_ignore_pick, graph_impact, graph_language_census, graph_memory, graph_memory_clear,
     graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
     graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
@@ -376,6 +383,15 @@ fn main() {
     // in the `CloseRequested` handler) ran. Fixed 3-day age cap — not a
     // user setting, this is opportunistic disk hygiene, not a feature.
     attach::prune(3);
+
+    // V32 Phase C: compile the injection-detection signature rules from
+    // `<exe-dir>/detection/rules.d/` and report whether the classifier's
+    // weights are installed. Done here, on the launch thread and before any
+    // tool call can happen, so the very first fetched page is screened by a
+    // ready layer instead of paying the compile inline — and so a broken rules
+    // file is a startup WARN the user can act on rather than a surprise later.
+    // Infallible: both layers degrade to inert (see `detection::init`).
+    offload::detection::init();
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with
     // TTS silent and a warning logged. Init is deferred to the Tauri `setup`
@@ -953,6 +969,7 @@ fn main() {
             offload_enable_readonly_commands,
             offload_service_status,
             offload_reload_mcp,
+            detection_status,
             offload_server_log,
             offload_server_metrics,
             graph_status,

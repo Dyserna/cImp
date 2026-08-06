@@ -695,6 +695,30 @@ export function createTerminal(
   offscreen.appendChild(host);
 
   const display = get(displaySettings);
+  // ── V32 Phase D — OSC 52 clipboard-write audit (2026-08-06) ──────────────
+  // VERDICT: a clipboard hijack via an escape sequence in displayed output is
+  // NOT possible here, and no config change was needed. Evidence, against the
+  // pinned @xterm/xterm 6.0.0 in package.json:
+  //   * xterm.js core registers OSC handlers for 0, 1, 2, 4, 8, 10, 11, 12,
+  //     104, 110, 111, 112 only (verified by reading the shipped
+  //     `lib/xterm.js.map` sourcesContent for `src/common/InputHandler.ts`).
+  //     There is no OSC 52 handler and no catch-all OSC fallback, so an
+  //     `ESC ] 52 ; c ; <base64> BEL` in PTY output is parsed and DISCARDED.
+  //   * OSC 52 in xterm.js lives in the optional `@xterm/addon-clipboard`
+  //     addon, which this project does not depend on (package.json carries
+  //     only addon-fit / addon-serialize / addon-webgl) and never loads.
+  //   * cImp registers exactly two parser handlers of its own —
+  //     `registerCsiHandler({prefix:'?', final:'h'|'l'})` for DECSET mouse
+  //     modes in `installAiMouseControl` — and no OSC handler anywhere.
+  //   * `windowOptions` is not set; every sub-option defaults to false, so the
+  //     CSI-t window-manipulation reporting channel stays closed too.
+  //   * `allowProposedApi: true` below only unlocks proposed APIs for loaded
+  //     addons; it does not enable any escape-sequence behaviour by itself.
+  // Re-run this audit if a clipboard addon is ever added, if an OSC handler is
+  // registered here, or on an xterm major upgrade — those are the three ways
+  // the verdict can change. cImp writes to the clipboard only through the
+  // Tauri clipboard-manager plugin, from explicit user gestures (copy-on-
+  // select, right-click paste), never from terminal output.
   const term = new Terminal({
     fontFamily: display.terminal_font_family,
     fontSize: display.terminal_font_size,

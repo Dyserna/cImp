@@ -105,11 +105,21 @@ impl OobContext {
     /// suppressible `Synthesize` request (so Esc/`tts_stop` cuts the rest of
     /// the burst, exactly like the old scrape path). Markdown is reduced to
     /// speakable prose first; empty/code-only input speaks nothing.
+    ///
+    /// V32 Phase D — **escape hygiene at the one external-text boundary the
+    /// TTS path has.** `text` is assistant prose lifted from a transcript /
+    /// event stream, and an assistant that just read a fetched page routinely
+    /// quotes it verbatim — so a page carrying `ESC ] 52 ; c ; …` (a clipboard
+    /// write) or cursor-motion sequences reaches this composition site intact.
+    /// Stripping here rather than at each tap keeps it one decision in one
+    /// place, and it happens BEFORE markdown reduction so a control sequence
+    /// cannot alter how `to_speakable` sees fences or list markers.
     pub async fn speak(&self, text: &str) {
         if !self.tts_enabled() {
             return;
         }
-        let prose = prose::to_speakable(text);
+        let text = crate::processing::strip_terminal_escapes(text);
+        let prose = prose::to_speakable(&text);
         if prose.trim().is_empty() {
             return;
         }

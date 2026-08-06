@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31) + B (#32) coded 2026-08-06; C–E pending. GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34), C3 (#35), E (#37) pending; live-verifies pending. GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -292,6 +292,42 @@ declares its class AND its mutation capability in one reviewed place.
   canary screen (decision 12) at the proxy's outbound path — one
   chokepoint, three screens. Decoy honeytokens (decision 12 tier 2) as a
   settings-gated extra.
+  **Phase C amendment 2026-08-06 (detection half, as built).**
+  - Composition order at both EXTERNAL boundaries is fixed in ONE helper,
+    `offload/detection::wrap_external_result`: **detect on the raw text →
+    envelope → prepend the warning header outside the markers**. The header
+    goes in *front* because the worker's `cap_result` truncates the tail, so a
+    trailing warning would be lost on exactly the oversized pages most likely
+    to need it; `spotlight::ensure_closed` learned to skip the header so a
+    truncated flagged result still gets its closing marker.
+  - **Work caps** (documented here because they bound what detection can
+    promise): the signature screen scans the first **256 KiB** of a result
+    under a **750 ms** scanner timeout; the classifier tokenizes at most
+    **64 KiB** and scores at most **32** 512-token windows (overlap 64,
+    max-score wins). Past those bounds a result is *unscreened*, not "clean" —
+    consistent with surface-only, a missing verdict costs a header, not
+    correctness.
+  - Rules ship as data at `<exe-dir>/detection/rules.d/` (+ user-owned
+    `local/`), staged by `build.rs` and both release zips exactly like
+    `themes/`. Seed bundle: 19 rules in 3 files across the
+    instruction-override, role-forgery, role-reassignment, guardrail-removal,
+    prompt-extraction, covert-instruction, exfiltration, tool-steering,
+    hidden-text and encoded-payload families, derived from the Vigil and garak
+    corpora (provenance + licences in `detection/rules.d/README.md`).
+  - **The decision-7 local-LLM judge is NOT in this run.** It stays specced:
+    it costs a llama-server turn per fetched page against a single-slot
+    server, so it lands behind a settings toggle (default off) once the load
+    impact is measured.
+  - **Deploy follow-ups (blocking for the classifier layer, not for the
+    milestone's other work):** the Prompt Guard 2 22M weights are HF-gated and
+    could not be fetched here, so the classifier is *gracefully inert* —
+    Settings shows "weights not installed", one line is logged at startup, and
+    the signature screen carries detection alone. The full checklist (accept
+    the Llama licence, export to ONNX, real SHA-256s, `models-v1` asset upload
+    with a non-colliding asset name, `release.yml` cache + staging lines,
+    NOTICE attribution for the Llama 4 Community Licence) is recorded as
+    commented placeholders in `models/CHECKSUMS.txt`.
+
 - **C3 — detection updater (decision 13).** Manifest fetch + daily
   scheduler + validate-activate-rollback + `rules.d/local/` overlay +
   Settings section (modes, versions, Check now, revert, open folder);

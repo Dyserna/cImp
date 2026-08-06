@@ -695,6 +695,16 @@
   .hkind.mcp {
     color: var(--accent-purple, #d2a8ff);
   }
+  /* V32: injection-containment denials. Danger red, and the only kind with a
+     tinted chip — a blocked SSRF target or a canary hit is the one row in this
+     feed that means "something tried something", so it must not read as
+     ordinary traffic when scrolling past. */
+  .hkind.injection_flag {
+    color: var(--danger, #f06080);
+    background: color-mix(in srgb, var(--danger, #f06080) 14%, transparent);
+    border-radius: 3px;
+    padding: 0 3px;
+  }
   /* Agent-source accents for graph rows (claude/opencode/offload, plus the
      backend-internal read_advisor/auto_check services), matching the palette
      the Code Intelligence activity feed used. */

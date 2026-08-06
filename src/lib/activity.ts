@@ -12,12 +12,16 @@ export interface ActivityEntry {
   ts_ms: number;
   /// `graph` = a graph/context tool call; `offload` = an offload_task run;
   /// `audit` = one Code Audit tool run (V23); `mcp` = one proxied MCP tool
-  /// call (`<server>__<tool>` through the warm host).
-  kind: 'graph' | 'offload' | 'audit' | 'mcp';
+  /// call (`<server>__<tool>` through the warm host); `injection_flag` = one
+  /// V32 injection-containment denial (SSRF screen, external-fetch budget,
+  /// canary hit, or taint-latch refusal).
+  kind: 'graph' | 'offload' | 'audit' | 'mcp' | 'injection_flag';
   /// Canonicalized project root the call ran against ('' when unknown).
   root: string;
   /// Agent (claude/opencode/offload/read_advisor/auto_check) for graph
-  /// entries; the backend name for offload entries.
+  /// entries; the backend name for offload entries. For `injection_flag` rows
+  /// it names the SCREEN that fired: `ssrf` / `budget` / `canary` /
+  /// `latch_refusal`.
   source: string;
   tool: string;
   target: string;

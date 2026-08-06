@@ -45,6 +45,7 @@ use super::mcp_host::Consumer;
 use super::router::TierHint;
 use super::service::{OffloadService, PushNotice};
 use super::spotlight;
+use super::outbound::{self, Budget};
 use super::toolclass::{self, Latch, Profile, ToolClass};
 
 /// Discovery-file name under the portable root (next to `settings.json`).
@@ -876,6 +877,13 @@ impl LatchScope {
     fn key(&self) -> (&'static str, String) {
         (self.agent, self.tab.clone())
     }
+
+    /// The human-readable scope label carried by V32 `injection_flag` activity
+    /// rows. Formatted (unlike [`key`](Self::key)) because it is for a reader,
+    /// not for equality.
+    fn label(&self) -> String {
+        format!("{}:{}", self.agent, self.tab)
+    }
 }
 
 /// Resolve the calling tab's latch scope, or `None` when the call carries no
@@ -903,6 +911,15 @@ fn latch_scope(app: &AppHandle, agent: &'static str, tab: Option<&str>) -> Optio
 struct TabLatch {
     session: Option<String>,
     latch: Latch,
+    /// V32 Phase C: this session's EXTERNAL call/byte spend (locked decision
+    /// 11). It lives *here*, beside the latch, precisely so it inherits the
+    /// latch's scope and reset rule — one contaminated conversation, one
+    /// budget, both cleared together when the tab's session rotates.
+    budget: Budget,
+    /// Whether this session's taint-latch refusal has already been reported to
+    /// the Tool Activity feed. One row per scope: the latch is sticky, so every
+    /// later refusal restates the same fact.
+    latch_flagged: bool,
 }
 
 impl TabLatch {
@@ -932,6 +949,10 @@ impl TabLatch {
             Some(_) => {
                 self.session = Some(s.to_string());
                 self.latch = Latch::Open;
+                // V32 Phase C: the new conversation gets a fresh budget and a
+                // fresh right to report — same scope, same reset.
+                self.budget.reset();
+                self.latch_flagged = false;
             }
             // First sighting: the same scope, only now identified. The latch
             // carries over — calls made before the registry knew the session
@@ -1004,6 +1025,8 @@ impl LatchRegistry {
         let entry = tabs.entry(scope.key()).or_insert(TabLatch {
             session: None,
             latch: Latch::Open,
+            budget: Budget::default(),
+            latch_flagged: false,
         });
         entry.observe(scope.session.as_deref());
         if let Some(refusal) = entry.latch.refusal(class) {
@@ -1015,6 +1038,25 @@ impl LatchRegistry {
                 latch = entry.latch.label(),
                 "loopback: tool call refused by the V32 session taint latch"
             );
+            // V32 Phase C: Phase B left this refusal without a consumer — the
+            // user could only see it as a tool that mysteriously stopped
+            // working. One row per scope (see `TabLatch::latch_flagged`).
+            let first = !std::mem::replace(&mut entry.latch_flagged, true);
+            drop(tabs);
+            if first {
+                outbound::record_flag(outbound::Flag {
+                    screen: outbound::Screen::LatchRefusal,
+                    consumer: scope.agent,
+                    scope: &scope.label(),
+                    tool: name,
+                    host: None,
+                    url: None,
+                    resolved_ip: None,
+                    canary: false,
+                    root: String::new(),
+                    detail: refusal,
+                });
+            }
             return Err(refusal);
         }
         if entry.latch.engage(class) {
@@ -1028,6 +1070,66 @@ impl LatchRegistry {
             );
         }
         Ok(())
+    }
+
+    /// V32 Phase C (locked decision 11): whether this tab's session may make
+    /// another EXTERNAL call, and the one-per-scope exhaustion report.
+    ///
+    /// Runs only on `/mcp/call` — every name that route serves is proxied and
+    /// therefore EXTERNAL; `/graph_run` serves cImp-native tools that pull no
+    /// external bytes and are not budgeted. Fail-open on a call with no tab
+    /// identity, exactly like [`gate`](Self::gate): there is no scope to charge.
+    fn budget_gate(
+        &self,
+        scope: Option<&LatchScope>,
+        limits: outbound::BudgetLimits,
+        tool: &str,
+    ) -> Result<(), &'static str> {
+        let Some(scope) = scope else { return Ok(()) };
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = tabs.get_mut(&scope.key()) else {
+            // No entry yet ⇒ `gate` has not run for this tab, so nothing is
+            // spent. (In practice `gate` always runs first on this route.)
+            return Ok(());
+        };
+        if !entry.budget.exhausted(limits) {
+            return Ok(());
+        }
+        let first = entry.budget.claim_flag();
+        drop(tabs);
+        if first {
+            warn!(
+                target: "offload",
+                agent = scope.agent,
+                tab = %scope.tab,
+                tool = %tool,
+                "loopback: external fetch budget exhausted for this session"
+            );
+            outbound::record_flag(outbound::Flag {
+                screen: outbound::Screen::Budget,
+                consumer: scope.agent,
+                scope: &scope.label(),
+                tool,
+                host: None,
+                url: None,
+                resolved_ip: None,
+                canary: false,
+                root: String::new(),
+                detail: outbound::REFUSAL_BUDGET,
+            });
+        }
+        Err(outbound::REFUSAL_BUDGET)
+    }
+
+    /// Charge one completed EXTERNAL call to this tab's session budget.
+    /// Silently no-ops without tab identity (nothing to charge) — the same
+    /// fail-open the latch takes.
+    fn charge(&self, scope: Option<&LatchScope>, response_bytes: usize) {
+        let Some(scope) = scope else { return };
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = tabs.get_mut(&scope.key()) {
+            entry.budget.charge(response_bytes);
+        }
     }
 
     /// The `/status` view: one row per tab the proxy has served, sorted so the
@@ -2322,10 +2424,37 @@ async fn handle_mcp_call(
         };
         return write_json(stream, 200, &r).await;
     }
+    // V32 Phase C: the session's EXTERNAL budget, checked after the latch (a
+    // latched-out call was never going to run, and must not consume the one
+    // budget report) and before the call leaves the process.
+    if let Err(refusal) =
+        latches().budget_gate(scope.as_ref(), service.external_budget_limits(), &body.name)
+    {
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(refusal.to_string()),
+        };
+        return write_json(stream, 200, &r).await;
+    }
 
     let cwd = body.cwd.map(PathBuf::from);
+    // The scope label the SSRF screen's `injection_flag` row carries. Without
+    // tab identity we are already fail-open on the latch and the budget; the
+    // SSRF screen still runs (it needs no identity), so name the scope honestly
+    // rather than inventing one.
+    let scope_label = scope
+        .as_ref()
+        .map(LatchScope::label)
+        .unwrap_or_else(|| format!("{agent}:(no tab identity)"));
     let r = match service
-        .mcp_call(consumer_of(req), &body.name, body.arguments, cwd.as_deref())
+        .mcp_call(
+            consumer_of(req),
+            &body.name,
+            body.arguments,
+            cwd.as_deref(),
+            &scope_label,
+        )
         .await
     {
         // Locked decision 6: the envelope goes on here, at the proxy's
@@ -2334,11 +2463,18 @@ async fn handle_mcp_call(
         // needs none. Same `envelope_if_external` the worker's boundary calls,
         // so the external-only rule has one definition. Errors are
         // cImp-composed strings, not fetched content, and are never wrapped.
-        Ok(text) => RunResult {
-            ok: true,
-            text: Some(spotlight::envelope_if_external(&body.name, text)),
-            error: None,
-        },
+        Ok(text) => {
+            // V32 Phase C: charge what this call actually pulled, so the byte
+            // half of the budget reflects external content ingested by this
+            // session. Charged on the raw result, before the envelope adds
+            // cImp's own preamble and markers.
+            latches().charge(scope.as_ref(), text.len());
+            RunResult {
+                ok: true,
+                text: Some(spotlight::envelope_if_external(&body.name, text)),
+                error: None,
+            }
+        }
         Err(e) => RunResult {
             ok: false,
             text: None,
@@ -3544,5 +3680,111 @@ mod tests {
                 "latch": "external",
             }])
         );
+    }
+
+    // ── V32 Phase C — the proxy's per-session EXTERNAL fetch budget ─────────
+
+    const TEST_LIMITS: outbound::BudgetLimits = outbound::BudgetLimits {
+        max_calls: 3,
+        max_bytes: 1000,
+    };
+
+    /// The count half: three proxied calls, then every further one is refused
+    /// with the fixed string — and the fourth refusal is the same as the first
+    /// (a spent budget does not un-spend).
+    #[test]
+    fn the_session_budget_stops_a_fetch_loop() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        for _ in 0..3 {
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+                .is_ok());
+            assert!(reg
+                .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
+                .is_ok());
+            reg.charge(Some(&s), 10);
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content"),
+                Err(outbound::REFUSAL_BUDGET)
+            );
+        }
+    }
+
+    /// The byte half, and the fact that it bites on the call AFTER the one
+    /// that crossed the cap (a response's size is unknowable beforehand).
+    #[test]
+    fn the_session_budget_also_counts_bytes() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+        assert!(reg
+            .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
+            .is_ok());
+        reg.charge(Some(&s), 999);
+        assert!(reg
+            .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
+            .is_ok());
+        reg.charge(Some(&s), 1);
+        assert_eq!(
+            reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content"),
+            Err(outbound::REFUSAL_BUDGET)
+        );
+    }
+
+    /// Budgets are scoped exactly like the latch: per tab, and reset when the
+    /// tab's SESSION rotates (a tab restart). A withheld session id is not a
+    /// rotation — otherwise a model could reset its budget by waiting for the
+    /// V28 registry to blink.
+    #[test]
+    fn the_session_budget_is_per_tab_and_resets_on_session_rotation() {
+        let reg = LatchRegistry::default();
+        let a = scope("claude-1", Some("sess-a"));
+        let b = scope("claude-2", Some("sess-b"));
+        for _ in 0..3 {
+            assert!(reg
+                .gate(Some(&a), LatchRoute::Proxied, "ddg__search")
+                .is_ok());
+            reg.charge(Some(&a), 1);
+        }
+        assert_eq!(
+            reg.budget_gate(Some(&a), TEST_LIMITS, "ddg__search"),
+            Err(outbound::REFUSAL_BUDGET)
+        );
+        // A different tab is untouched.
+        assert!(reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search").is_ok());
+        assert!(reg.budget_gate(Some(&b), TEST_LIMITS, "ddg__search").is_ok());
+
+        // The registry withholding a session must NOT reset the budget.
+        let a_silent = scope("claude-1", None);
+        assert!(reg
+            .gate(Some(&a_silent), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(
+            reg.budget_gate(Some(&a_silent), TEST_LIMITS, "ddg__search"),
+            Err(outbound::REFUSAL_BUDGET)
+        );
+
+        // A genuinely new session does.
+        let a2 = scope("claude-1", Some("sess-a2"));
+        assert!(reg
+            .gate(Some(&a2), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert!(reg.budget_gate(Some(&a2), TEST_LIMITS, "ddg__search").is_ok());
+    }
+
+    /// Fail-open, exactly like the latch: a call with no tab identity has no
+    /// scope to charge, so it is never budget-refused.
+    #[test]
+    fn a_call_without_tab_identity_is_not_budgeted() {
+        let reg = LatchRegistry::default();
+        for _ in 0..50 {
+            assert!(reg.budget_gate(None, TEST_LIMITS, "ddg__search").is_ok());
+            reg.charge(None, 100_000);
+        }
     }
 }

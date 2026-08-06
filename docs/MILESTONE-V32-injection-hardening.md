@@ -194,14 +194,20 @@ declares its class AND its mutation capability in one reviewed place.
     (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`),
     link-local (`169.254/16`, `fe80::/10`), CGNAT (`100.64/10`),
     `0.0.0.0/8`, and IPv4-mapped IPv6 (`::ffff:0:0/96` — else
-    `::ffff:192.168.1.1` slips a private v4 past a v4-only screen). The
+    `::ffff:192.168.1.1` slips a private v4 past a v4-only screen).
+    (Phase C amendment 2026-08-06, same closing-the-analogous-hole logic:
+    `fc00::/7` IPv6 unique-local — the v6 RFC1918 — and the deprecated
+    IPv4-compatible form `::a.b.c.d`, unmapped and re-checked so `::7f00:1`
+    cannot spell loopback.) The
     explicitly configured LAN endpoints (e.g. `172.21.1.11`, itself inside
     `172.16/12`) are the ONLY allow-exceptions, carved back out by exact
     host:port. Hostname targets are **resolved first and every resolved IP
     is range-checked** — a public name that resolves to a private address
     (DNS-rebinding-shaped) is denied on the resolved IP, not the name.
     Redirects are re-screened per hop (a public URL 302'ing to
-    `http://169.254.169.254/` must not slip through).
+    `http://169.254.169.254/` must not slip through — see the Accepted
+    residuals amendment: not enforceable from cImp; the fetch runs in the
+    third-party MCP server's process).
 12. **Canary tokens — leak detection as a tripwire, two tiers.**
     - **In-band canary (built-in, always on with the latch):** the worker
       embeds a per-task random canary string in its system context (never
@@ -327,6 +333,27 @@ declares its class AND its mutation capability in one reviewed place.
   latch holds, and treating the user's repo as hostile would gut the product.
 - **Claude/OpenCode native tools stay outside the latch** unless Phase E
   lands (decision 3); OS containment is V33.
+- **Redirect re-screening and DNS-rebinding TOCTOU on the SSRF guard**
+  (amends decision 11, Phase C 2026-08-06). cImp never performs the web fetch
+  itself: `ddg`/`context7` are third-party MCP servers running as their own
+  processes on another host, and cImp only forwards `tools/call` to them. So
+  the SSRF guard screens the URL *arguments* of an EXTERNAL call at cImp's
+  chokepoint (`McpHost::call_recorded`), and DNS resolution happens from
+  cImp's vantage, not the fetching host's. Two consequences:
+  - **Per-hop redirect re-screening is not enforceable from cImp** — the
+    redirect is followed inside the MCP server's process, which cImp does not
+    observe. Decision 11's last sentence therefore describes a property only
+    the fetch servers themselves could provide; closing it means either
+    hardening those servers or moving fetch in-process, neither in scope.
+  - **DNS-rebinding TOCTOU**: cImp resolves a name, then the fetch server
+    resolves it again. A name answering publicly to us and privately to them
+    slips the screen.
+  What the guard *does* close is the dominant case: an injected page telling
+  the model to fetch a literal private address, or a hostname that already
+  resolves into a private range. A resolution failure on cImp's side lets the
+  URL through deliberately (the fetch server would fail on the same name a
+  moment later; blocking would break legitimate research on a DNS hiccup with
+  a security-shaped error).
 
 ## Live verification (definition of done, per global principle 9)
 

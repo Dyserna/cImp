@@ -1822,6 +1822,16 @@ async fn run_on_backend(
         per_tool_result_token_cap: settings.per_tool_result_token_cap.max(256),
         auth_token: backend.auth_token.clone(),
         per_call_timeout: Duration::from_secs(settings.offload_timeout_secs.max(30)),
+        // V32 Phase C: the app-not-running fallback runs a NativeRouter — no
+        // MCP host, so no EXTERNAL tool is reachable and the budget is inert
+        // here. It is still filled from the user's settings rather than a
+        // hardcoded value, so the two paths can never disagree if this one ever
+        // grows a host.
+        task_scope: crate::offload::outbound::new_task_scope(),
+        external_budget: crate::offload::outbound::BudgetLimits {
+            max_calls: settings.external_fetch_max_calls,
+            max_bytes: settings.external_fetch_max_bytes,
+        },
     };
     let task = OffloadTask {
         instructions: instructions.to_string(),

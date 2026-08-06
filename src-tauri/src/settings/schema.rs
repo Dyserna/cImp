@@ -1533,6 +1533,32 @@ pub struct OffloadSettings {
     /// twin). Spawn-baked, so it carries a `spawn_inject_sig` entry and a
     /// restart hint. Additive `#[serde(default)]` — pre-v29 files load `false`.
     pub session_push: bool,
+    /// V32 (locked decision 11): cap on how many EXTERNAL (proxied MCP-server)
+    /// tool calls one contaminated scope may make — a worker task, or a
+    /// (agent, tab) session at the loopback proxy. Past the cap every further
+    /// external call is refused with a fixed string and one Tool Activity row
+    /// is written for the scope.
+    ///
+    /// Generous by design: this exists to stop runaway fetch loops and bulk
+    /// exfiltration staging, not to ration research. `0` disables the count
+    /// half entirely.
+    ///
+    /// Additive `#[serde(default)]` — old settings files round-trip with the
+    /// default cap. No schema-version bump (the V8/V16/V23 precedent for a
+    /// plain additive field).
+    pub external_fetch_max_calls: u32,
+    /// V32 (locked decision 11): cap on the cumulative bytes of EXTERNAL tool
+    /// results one contaminated scope may pull. The companion to
+    /// [`external_fetch_max_calls`] — a handful of huge pages is the same
+    /// exfil-staging shape as many small ones. Charged after each call
+    /// completes (a response's size is unknowable before asking for it), so the
+    /// cap bites on the call *after* the one that crossed it.
+    ///
+    /// `0` disables the byte half entirely. Additive `#[serde(default)]`; no
+    /// schema-version bump.
+    ///
+    /// [`external_fetch_max_calls`]: Self::external_fetch_max_calls
+    pub external_fetch_max_bytes: u64,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1567,6 +1593,8 @@ impl std::fmt::Debug for OffloadSettings {
             .field("opencode_provider", &self.opencode_provider)
             .field("opencode_provider_auto", &self.opencode_provider_auto)
             .field("session_push", &self.session_push)
+            .field("external_fetch_max_calls", &self.external_fetch_max_calls)
+            .field("external_fetch_max_bytes", &self.external_fetch_max_bytes)
             .finish()
     }
 }
@@ -1620,6 +1648,13 @@ impl Default for OffloadSettings {
             opencode_provider: None,
             opencode_provider_auto: false,
             session_push: false,
+            // 40 fetches / 4 MiB per scope. Sized against real research
+            // behaviour: a thorough multi-source task runs well under a dozen
+            // fetches, and 4 MiB is many pages' worth of extracted text — while
+            // both are small enough that a loop or a staged bulk read hits the
+            // wall early instead of running out the task deadline.
+            external_fetch_max_calls: 40,
+            external_fetch_max_bytes: 4 * 1024 * 1024,
         }
     }
 }

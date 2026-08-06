@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 use crate::settings::McpServerConfig;
 
 use super::openai::ToolDef;
+use super::outbound;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "cimp-offload-host";
@@ -829,16 +830,62 @@ impl McpHost {
     /// unattributed primitive available without double-recording. `root` is
     /// the calling session's project root when known (`None` ⇒ empty, like
     /// offload runs with no session cwd).
+    ///
+    /// # V32 Phase C — this is the SSRF chokepoint
+    ///
+    /// Because both consumers' calls (loopback `/mcp/call` → `mcp_call`) and
+    /// the worker's calls (`agent.rs::HostRouter::call`) converge here, and
+    /// nowhere earlier, the outbound URL screen ([`outbound::screen_urls`])
+    /// lives here — once, rather than re-implemented on each path with the
+    /// inevitable drift. `scope` names the contaminated scope for the activity
+    /// row; `policy` carries the user's own configured endpoints, the only
+    /// carve-outs from the range check.
+    ///
+    /// The screen runs **before** [`call_for_consumer`](Self::call_for_consumer)
+    /// and therefore before any byte leaves the machine: a denied call never
+    /// reaches the MCP server, which is the point (the server is a separate
+    /// process on another host and would do the fetch for real).
     pub async fn call_recorded(
         &self,
         consumer: Consumer,
         root: Option<&Path>,
         namespaced: &str,
         args: Value,
+        scope: &str,
+        policy: &outbound::Policy,
     ) -> Result<String, String> {
         let started = crate::activity::now_ms();
         let target = mcp_target(&args);
         let request = serde_json::to_string_pretty(&args).unwrap_or_default();
+        // Only EXTERNAL calls carry an outbound channel worth screening. Every
+        // name routed here is namespaced and therefore EXTERNAL under the
+        // Phase A unknown-⇒-EXTERNAL invariant, but the classification is read
+        // rather than assumed so a future promotion in the class table cannot
+        // leave a stale assumption behind.
+        if super::toolclass::classify(namespaced) == super::toolclass::ToolClass::External {
+            if let Err(denial) = outbound::screen_urls(&args, policy).await {
+                warn!(
+                    target: "offload",
+                    tool = %namespaced,
+                    host = %denial.host,
+                    resolved = %denial.ip,
+                    "offload: outbound fetch refused by the V32 SSRF screen"
+                );
+                outbound::record_flag(outbound::Flag {
+                    screen: outbound::Screen::Ssrf,
+                    consumer: consumer.source(),
+                    scope,
+                    tool: namespaced,
+                    host: Some(&denial.host),
+                    url: Some(&denial.url),
+                    resolved_ip: Some(&denial.ip),
+                    canary: false,
+                    root: root.map(crate::activity::root_key).unwrap_or_default(),
+                    detail: outbound::REFUSAL_SSRF,
+                });
+                return Err(outbound::REFUSAL_SSRF.to_string());
+            }
+        }
         let result = self.call_for_consumer(consumer, namespaced, args).await;
         crate::activity::record_bg(crate::activity::ActivityRecord {
             entry: crate::activity::ActivityEntry::new(

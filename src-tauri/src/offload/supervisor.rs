@@ -572,6 +572,14 @@ impl OffloadSupervisor {
             per_tool_result_token_cap: snap.per_tool_result_token_cap.max(256),
             auth_token: None,
             per_call_timeout: timeout,
+            // V32 Phase C: the self-test uses a NativeRouter (no MCP host), so
+            // no EXTERNAL tool is reachable and the budget is inert — filled
+            // from settings anyway so the paths cannot drift.
+            task_scope: super::outbound::new_task_scope(),
+            external_budget: super::outbound::BudgetLimits {
+                max_calls: snap.external_fetch_max_calls,
+                max_bytes: snap.external_fetch_max_bytes,
+            },
         };
         let task = super::agent::OffloadTask {
             instructions,

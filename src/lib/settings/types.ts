@@ -1317,6 +1317,14 @@ export interface OffloadSettings {
   /// (flips raise the AI-tab restart hint), default off — the registration
   /// flag is a research preview and pushes are fire-and-forget.
   session_push: boolean;
+  /// V32 (injection hardening, locked decision 11): cap on how many EXTERNAL
+  /// (proxied MCP-server) tool calls one contaminated scope may make — a
+  /// worker task, or an agent/tab session at the loopback proxy. `0` disables
+  /// the count cap.
+  external_fetch_max_calls: number;
+  /// V32: cap on the cumulative bytes of EXTERNAL tool results one scope may
+  /// pull. `0` disables the byte cap.
+  external_fetch_max_bytes: number;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1632,6 +1640,8 @@ export function defaultSettings(): Settings {
       opencode_provider: null,
       opencode_provider_auto: false,
       session_push: false,
+      external_fetch_max_calls: 40,
+      external_fetch_max_bytes: 4 * 1024 * 1024,
     },
     graph: {
       enabled: false,

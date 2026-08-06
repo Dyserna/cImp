@@ -38,6 +38,7 @@ pub mod mcp;
 pub mod mcp_host;
 pub mod metrics;
 pub mod openai;
+pub mod outbound;
 pub mod remote;
 pub mod router;
 pub mod server;

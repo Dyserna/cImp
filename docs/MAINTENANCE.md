@@ -693,11 +693,12 @@ Two independent version numbers; don't conflate them.
   (`GraphIndex::migrate_usage_stat_origin`, defaulting existing rows to
   `"session"`). Any future column on a rebuild-surviving relation needs the same
   treatment. Note each bump here.
-- **Settings schema — `CURRENT_SCHEMA_VERSION = 28`** (`settings/schema.rs`).
-  The current version is **v28: the TUI theme consolidation (2026-08-04)** —
-  the four `tui-*` themes were collapsed into one built-in `tui` theme plus a
-  user-picked accent (`ui.tui_accent`), and the v27 → v28 migration rewrites any
-  persisted `tui-*` theme id. Earlier recent moves: v20 → v21 (V14,
+- **Settings schema — `CURRENT_SCHEMA_VERSION = 29`** (`settings/schema.rs`).
+  The current version is **v29: the `offload.session_push` version stamp
+  (2026-08-05, V30)**. Before that, **v28: the TUI theme consolidation
+  (2026-08-04)** — the four `tui-*` themes were collapsed into one built-in
+  `tui` theme plus a user-picked accent (`ui.tui_accent`), and the v27 → v28
+  migration rewrites any persisted `tui-*` theme id. Earlier recent moves: v20 → v21 (V14,
   `TabConfig::Preview`), v22 → v23 (V25, Code Quality tab retired), v25 → v26
   (Graph View tab retired), v26 → v27 (Code Audit tab retired).
 - **Retiring a tab takes two changes, not one:** the migration *and* a

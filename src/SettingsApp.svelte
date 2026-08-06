@@ -4030,6 +4030,49 @@
               auto-sizes from the summed per-backend slot counts.
             </small>
           </label>
+          <label>
+            <span>External fetch budget — calls (0 = unlimited)</span>
+            <input
+              type="number"
+              min="0"
+              value={snapshot.offload.external_fetch_max_calls}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.external_fetch_max_calls = Math.max(
+                      0,
+                      Math.floor(+(e.currentTarget as HTMLInputElement).value) || 0,
+                    )),
+                )}
+            />
+            <small class="hint">
+              How many external (web / MCP-server) tool calls one offload task —
+              or one Claude/OpenCode tab session — may make before further ones
+              are refused. Generous by design: it stops runaway fetch loops and
+              bulk data staging, not research.
+            </small>
+          </label>
+          <label>
+            <span>External fetch budget — bytes (0 = unlimited)</span>
+            <input
+              type="number"
+              min="0"
+              value={snapshot.offload.external_fetch_max_bytes}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.external_fetch_max_bytes = Math.max(
+                      0,
+                      Math.floor(+(e.currentTarget as HTMLInputElement).value) || 0,
+                    )),
+                )}
+            />
+            <small class="hint">
+              Cumulative bytes of external content one task/session may pull.
+              Exhausting either budget refuses further external calls and writes
+              one flagged row to Tools → Activities.
+            </small>
+          </label>
           <label class="checkbox">
             <input
               type="checkbox"

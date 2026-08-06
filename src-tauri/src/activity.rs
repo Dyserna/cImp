@@ -64,6 +64,14 @@ const AUDIT_CAP: usize = 100;
 /// between the chatty graph calls and the rare offload runs in volume — their
 /// own window so neither feed crowds the other out.
 const MCP_CAP: usize = 200;
+/// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
+/// refusals). Its own window for both reasons the split exists: these rows are
+/// the *only* consumer of every denial the containment layer makes, so a
+/// graph-heavy session must not evict them — and a model looping against a
+/// boundary must not evict the graph feed either. Sized like the MCP window:
+/// large enough to hold a whole session's worth of denials, small enough that
+/// the file stays modest.
+const INJECTION_FLAG_CAP: usize = 200;
 /// Payload caps (chars) applied at record time — a request is typically a
 /// small JSON args object or an offload instruction; responses can be large
 /// tool output. Anything past the cap is cut with an explicit marker.
@@ -97,6 +105,13 @@ pub enum ActivityKind {
     /// via the loopback `/mcp/call` route or from the offload worker's
     /// in-process router (recorded by `McpHost::call_recorded`).
     Mcp,
+    /// V32: one injection-containment denial — an SSRF-screened URL, an
+    /// exhausted per-scope fetch budget, a canary hit, or a taint-latch
+    /// refusal. Recorded by
+    /// [`offload::outbound::record_flag`](crate::offload::outbound::record_flag);
+    /// which screen fired is carried in the row's `source` field and (with the
+    /// full detail) in its request payload.
+    InjectionFlag,
 }
 
 impl ActivityKind {
@@ -106,6 +121,7 @@ impl ActivityKind {
             ActivityKind::Offload => "offload",
             ActivityKind::Audit => "audit",
             ActivityKind::Mcp => "mcp",
+            ActivityKind::InjectionFlag => "injection_flag",
         }
     }
 }
@@ -119,6 +135,8 @@ fn kind_cap(kind: &str) -> usize {
         AUDIT_CAP
     } else if kind == ActivityKind::Mcp.as_str() {
         MCP_CAP
+    } else if kind == ActivityKind::InjectionFlag.as_str() {
+        INJECTION_FLAG_CAP
     } else {
         GRAPH_CAP
     }
@@ -148,7 +166,10 @@ pub struct ActivityEntry {
     /// `"read_advisor"` / `"auto_check"` for graph entries; the backend name
     /// for offload entries; `"audit"` for per-scanner audit rows and the
     /// consumer (`"claude"` / `"opencode"` / `"offload"`) for audit roll-up
-    /// rows and MCP entries.
+    /// rows and MCP entries. For V32 `injection_flag` rows it names the SCREEN
+    /// that fired (`"ssrf"` / `"budget"` / `"canary"` / `"latch_refusal"`) —
+    /// which screen denied a call is the fact worth reading at a glance, and
+    /// the issuing consumer is carried in that row's request payload instead.
     pub source: String,
     /// The tool name, e.g. `graph_find_symbol` or `offload_task`.
     pub tool: String,
@@ -794,6 +815,34 @@ mod tests {
         }
         let snap = store.snapshot_since(0);
         assert_eq!(snap.iter().filter(|e| e.kind == "mcp").count(), MCP_CAP);
+        assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// V32: security denials are the only consumer of every containment
+    /// refusal, so a chatty session must never evict them — their own window,
+    /// like every other kind.
+    #[test]
+    fn injection_flag_entries_keep_their_own_window() {
+        let store = temp_store("flag-cap");
+        store.record(rec_kind(ActivityKind::InjectionFlag, "a denial"));
+        for i in 0..(GRAPH_CAP + 50) {
+            store.record(rec(&format!("g{i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert_eq!(
+            snap.iter().filter(|e| e.kind == "injection_flag").count(),
+            1,
+            "a graph flood evicted the security denials"
+        );
+        for i in 0..(INJECTION_FLAG_CAP + 10) {
+            store.record(rec_kind(ActivityKind::InjectionFlag, &format!("d{i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert_eq!(
+            snap.iter().filter(|e| e.kind == "injection_flag").count(),
+            INJECTION_FLAG_CAP
+        );
         assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
         let _ = fs::remove_file(&store.path);
     }

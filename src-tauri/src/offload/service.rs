@@ -40,6 +40,7 @@ use crate::settings::{
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, RunTrace, ThinkingMode};
 use super::mcp_host::{host_config_sig, Consumer, McpHost, McpServerHealth};
 use super::metrics::{BackendDashboard, CallRecord, MetricsPoller, RunRecord, ServerMetrics};
+use super::outbound;
 use super::remote::RemoteBackend;
 use super::router::{self, BackendView, RouteError, TierHint};
 use super::server::{LlamaServer, ServerCommand};
@@ -687,12 +688,20 @@ impl OffloadService {
     /// Activity feed (`kind: "mcp"`) by the host; `cwd` is the calling
     /// session's working directory when the child sent one, attributing the
     /// row to that project.
+    ///
+    /// V32 Phase C: `scope` names the calling tab's contaminated scope
+    /// (`agent:tab`, or a fail-open placeholder when the child sent no tab
+    /// identity) for the SSRF screen's `injection_flag` row, and the screen's
+    /// carve-out [`Policy`](super::outbound::Policy) is derived from the live
+    /// settings snapshot here — the endpoints the user configured are the only
+    /// private addresses an external tool may be pointed at.
     pub async fn mcp_call(
         &self,
         consumer: Consumer,
         name: &str,
         args: serde_json::Value,
         cwd: Option<&Path>,
+        scope: &str,
     ) -> Result<String, String> {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
         // this proxy; fall back to the Claude-guarded set.
@@ -700,7 +709,22 @@ impl OffloadService {
             Consumer::Opencode => Consumer::Opencode,
             Consumer::Claude | Consumer::Offload => Consumer::Claude,
         };
-        self.host.call_recorded(consumer, cwd, name, args).await
+        let policy = outbound::Policy::from_settings(&self.settings.current());
+        self.host
+            .call_recorded(consumer, cwd, name, args, scope, &policy)
+            .await
+    }
+
+    /// The configured EXTERNAL-call budget for one contaminated scope. Read by
+    /// the loopback proxy for its per-tab-session budget and by
+    /// [`Self::run`] for the worker's per-task one, so both halves of locked
+    /// decision 11 read the same two settings.
+    pub fn external_budget_limits(&self) -> outbound::BudgetLimits {
+        let snap = self.settings.current().offload;
+        outbound::BudgetLimits {
+            max_calls: snap.external_fetch_max_calls,
+            max_bytes: snap.external_fetch_max_bytes,
+        }
     }
 
     /// Run one offload task end-to-end against the live pool and return the
@@ -1210,6 +1234,12 @@ impl OffloadService {
             native_defs.extend(tools::audit_tools::defs());
         }
         let mcp_defs = self.host.tool_defs_for_offload().await;
+        // V32 Phase C: one scope id for this run, shared by the router (whose
+        // SSRF rows the shared chokepoint writes) and the loop (whose budget /
+        // canary / latch rows it writes), so every `injection_flag` row from
+        // this task correlates. The SSRF carve-out policy is snapshotted here
+        // beside the tool surface, from the same settings read.
+        let task_scope = outbound::new_task_scope();
         let router = HostRouter::new(
             native_defs,
             mcp_defs,
@@ -1218,6 +1248,8 @@ impl OffloadService {
             entry.tool_scope.clone(),
             allow_graph,
             allow_audit,
+            task_scope.clone(),
+            outbound::Policy::from_settings(&cur),
         );
         let cfg = AgentConfig {
             base_url: entry.base_url.clone(),
@@ -1229,6 +1261,11 @@ impl OffloadService {
             per_tool_result_token_cap: snap.per_tool_result_token_cap.max(256),
             auth_token: entry.auth_token.clone(),
             per_call_timeout: Duration::from_secs(snap.offload_timeout_secs.max(30)),
+            task_scope,
+            external_budget: outbound::BudgetLimits {
+                max_calls: snap.external_fetch_max_calls,
+                max_bytes: snap.external_fetch_max_bytes,
+            },
         };
         let task = OffloadTask {
             instructions: instructions.to_string(),

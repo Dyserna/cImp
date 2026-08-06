@@ -22,6 +22,7 @@ import {
   costRowState,
   costOverrideForIdx,
   isEmptyDetailRow,
+  decideUsageApply,
   costGrandTotal,
   originShareLine,
   FREE_RATES,
@@ -312,6 +313,49 @@ describe('isEmptyDetailRow (V24 Phase C — vanished-session guard)', () => {
     // an agent-less row with a real timestamp shouldn't be a real session.
     expect(isEmptyDetailRow({ agent: 'claude', started_ms: 0 })).toBe(false);
     expect(isEmptyDetailRow({ agent: '', started_ms: 1 })).toBe(false);
+  });
+});
+
+describe('decideUsageApply (store_error contract)', () => {
+  test('a healthy snapshot applies and clears the error state', () => {
+    expect(decideUsageApply({ store_error: null }, true)).toEqual({
+      apply: true,
+      errored: false,
+      flash: false,
+    });
+  });
+
+  test('empty is not absent: a healthy snapshot with no sessions still applies', () => {
+    // The zero-sessions case must reach the UI so it renders "0" — only
+    // `store_error` may suppress an apply.
+    expect(decideUsageApply({ store_error: null }, false).apply).toBe(true);
+  });
+
+  test('a store_error snapshot is not applied — last-good data stays on screen', () => {
+    expect(decideUsageApply({ store_error: 'lock timeout' }, false)).toEqual({
+      apply: false,
+      errored: true,
+      flash: true,
+    });
+  });
+
+  test('a persistent store_error flashes only on the transition into it', () => {
+    const first = decideUsageApply({ store_error: 'busy' }, false);
+    expect(first.flash).toBe(true);
+    // Next 2s tick, same condition → no re-flash (no notice spam).
+    expect(decideUsageApply({ store_error: 'busy' }, first.errored).flash).toBe(false);
+    // Recovered, then broken again → flashes again.
+    const healthy = decideUsageApply({ store_error: null }, true);
+    expect(decideUsageApply({ store_error: 'busy' }, healthy.errored).flash).toBe(true);
+  });
+
+  test('a failed IPC (null) keeps last-good data and leaves the error state untouched', () => {
+    expect(decideUsageApply(null, false)).toEqual({ apply: false, errored: false, flash: false });
+    expect(decideUsageApply(null, true)).toEqual({ apply: false, errored: true, flash: false });
+  });
+
+  test('a snapshot from an older build without the field is treated as healthy', () => {
+    expect(decideUsageApply({}, false).apply).toBe(true);
   });
 });
 

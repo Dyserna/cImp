@@ -5,6 +5,36 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.1] — 2026-08-06
+
+### Fixed
+
+- **Usage Overview flapping / slow load on large graph stores.** The
+  Code Intelligence Overview's sessions list cycled between loaded and
+  "0 sessions" (~30 s rhythm) and took tens of seconds to first paint on
+  months-old stores. Four defects compounded: every session-keyed
+  CozoScript query bound the session as a post-filter, full-scanning the
+  relation (rewritten to inline prefix binds — `usage_all_sessions`
+  measured 27.6 s → 1.4 s on a real 166 MB `graph.db`); the 2 s Overview
+  poll had no in-flight or ordering guard, so slow passes piled up and
+  applied out of order (both guards added, drill-in refetch included);
+  store errors were silently swallowed into empty lists that rendered as
+  a healthy "0 sessions" (`UsageSnapshot.store_error` now surfaces them —
+  the UI keeps last-good data and shows a transient store-busy notice);
+  and the warm-index cache keyed roots by raw path spelling, so the
+  loopback's `\\?\` form opened a second in-process cozo storage over
+  the same SQLite file (cache key now canonicalized — one file, one
+  handle).
+
+### Changed
+
+- **30-day session-detail retention.** Sessions idle longer than 30 days
+  are purged from the graph store at warm open: the session row plus its
+  `usage_stat`, `mem_event`, unpinned `mem_note`, and `session_distilled`
+  rows. Pinned notes and Workbench `session_commit` provenance
+  deliberately survive. Read-only store consumers (the `--offload-mcp`
+  child) never run the sweep.
+
 ## [0.50.0] — 2026-08-05
 
 ### Added

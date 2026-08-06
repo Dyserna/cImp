@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use super::memory::{
     MemNote, ModelUsage, OriginSplit, ProjectFact, SessionInfo, SessionUsageRow, TurnUsage,
     UsageEvent, UsageOrigin, UsageTotals, WorkingSetEntry, MAX_EVENTS_PER_SESSION,
-    MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT, MAX_USAGE_PER_SESSION,
+    MAX_LIVE_PROJECT_FACTS, MAX_SESSIONS_PER_ROOT, MAX_USAGE_PER_SESSION, SESSION_RETENTION_DAYS,
 };
 use super::model::{Confidence, EdgeKind, FileGraph, Lang};
 use super::schema::{GRAPH_SCHEMA_VERSION, RELATIONS};
@@ -338,6 +338,7 @@ impl GraphIndex {
                 index.schema_reset.store(true, Ordering::Relaxed);
             }
         }
+        index.prune_retention_on_open();
         Ok(index)
     }
 
@@ -367,6 +368,40 @@ impl GraphIndex {
             )));
         }
         Ok(index)
+    }
+
+    /// Apply the [`SESSION_RETENTION_DAYS`] sweep once, at the tail of
+    /// [`Self::open`] — the app's warm path — and **deliberately NOT from
+    /// [`Self::open_existing`]**. Do not "fix" that asymmetry: the handle
+    /// discipline in `docs/MAINTENANCE.md` requires every `open_existing`
+    /// consumer (the `--offload-mcp` child, `tabs/config.rs`, the audit paths)
+    /// to stay strictly READ-ONLY on the store. Sweeping from there would make
+    /// each of them a second cross-process WRITER against a live main app,
+    /// which is the lock-contention/corruption hazard that discipline exists to
+    /// prevent — a cost far above the value of expiring rows a few hours
+    /// earlier. Coverage is unaffected in practice: the app reaches every store
+    /// it serves through `GraphService::index_for` → `open`, so a root that
+    /// only read-only consumers ever touch legitimately never expires.
+    ///
+    /// Placed AFTER the schema-version gate so a stale store is never written
+    /// to. Never fatal: a failed sweep is logged and the open proceeds —
+    /// retention is hygiene, not a correctness precondition.
+    fn prune_retention_on_open(&self) {
+        let now_ms = crate::activity::now_ms() as i64;
+        match self.prune_expired_sessions(now_ms) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(sessions = n, "graph: retention sweep dropped idle sessions"),
+            Err(e) => tracing::debug!(error = %e, "graph: retention sweep failed"),
+        }
+    }
+
+    /// Drop sessions idle longer than [`SESSION_RETENTION_DAYS`] relative to
+    /// `now_ms`, in ONE bounded write transaction (a handful of `:rm`s per
+    /// expired session, and none at all when nothing expired). `now_ms` is a
+    /// parameter rather than read here so the boundary is directly testable.
+    /// Returns the number of sessions removed.
+    pub fn prune_expired_sessions(&self, now_ms: i64) -> AppResult<usize> {
+        self.with_write_txn(|tx| prune_expired_sessions_in_tx(tx, now_ms))
     }
 
     /// Take (and clear) the "stale schema was reset on open" flag. Returns `true`
@@ -3334,9 +3369,15 @@ impl GraphIndex {
 
             // Next per-session seq — monotonic even after a prune: max(seq)+1.
             // Aggregations must live in the rule head in CozoScript.
+            // `session_id` is bound INLINE in the relation atom (not as a
+            // `== $sid` post-filter): it is `mem_event`'s leading key, so the
+            // inline form is a prefix scan while the post-filter form scans
+            // the whole relation. Every per-session query in this file follows
+            // that rule. `seq` MUST stay projected — relations are SETS, so
+            // dropping it would collapse duplicate value rows.
             let rows = tx_run(
                 tx,
-                "?[count(seq), max(seq)] := *mem_event{session_id, seq}, session_id == $sid",
+                "?[count(seq), max(seq)] := *mem_event{session_id: $sid, seq}",
                 p.clone(),
             )?;
             let (cnt, mx) = rows
@@ -3349,7 +3390,7 @@ impl GraphIndex {
             // Upsert the session: keep its started_ms, bump last_ms to now.
             let existing = tx_run(
                 tx,
-                "?[started_ms] := *session{session_id, started_ms}, session_id == $sid",
+                "?[started_ms] := *session{session_id: $sid, started_ms}",
                 p.clone(),
             )?;
             let started = existing.rows.first().map(|r| cell_i64(r, 0)).unwrap_or(ts_ms);
@@ -3383,7 +3424,10 @@ impl GraphIndex {
                 vec![row],
             )?;
 
-            // Ring-prune this session's oldest events beyond the cap.
+            // Ring-prune this session's oldest events beyond the cap. The
+            // `:rm` head needs `session_id` as a column, so the inline prefix
+            // bind is paired with a trailing unification that re-materializes
+            // it — the scan is still prefix-bounded.
             let cutoff = seq - MAX_EVENTS_PER_SESSION;
             if cutoff >= 0 {
                 let mut pc = BTreeMap::new();
@@ -3391,7 +3435,7 @@ impl GraphIndex {
                 pc.insert("cut".to_string(), DataValue::Num(Num::Int(cutoff)));
                 tx_run(
                     tx,
-                    "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid, seq <= $cut\n:rm mem_event {session_id, seq}",
+                    "?[session_id, seq] := *mem_event{session_id: $sid, seq}, seq <= $cut, session_id = $sid\n:rm mem_event {session_id, seq}",
                     pc,
                 )?;
             }
@@ -3432,7 +3476,7 @@ impl GraphIndex {
             // Upsert the session (identical shape to `record_mem_event`).
             let existing = tx_run(
                 tx,
-                "?[started_ms] := *session{session_id, started_ms}, session_id == $sid",
+                "?[started_ms] := *session{session_id: $sid, started_ms}",
                 p.clone(),
             )?;
             let started = existing.rows.first().map(|r| cell_i64(r, 0)).unwrap_or(ts_ms);
@@ -3455,8 +3499,8 @@ impl GraphIndex {
                 pm.insert("mid".to_string(), DataValue::Str(msg_id.as_str().into()));
                 let rows = tx_run(
                     tx,
-                    "?[seq] := *usage_stat{session_id, seq, kind, msg_id}, \
-                        session_id == $sid, kind == \"turn\", msg_id == $mid\n:limit 1",
+                    "?[seq] := *usage_stat{session_id: $sid, seq, kind, msg_id}, \
+                        kind == \"turn\", msg_id == $mid\n:limit 1",
                     pm,
                 )?;
                 rows.rows.first().map(|r| cell_i64(r, 0))
@@ -3469,7 +3513,7 @@ impl GraphIndex {
                 None => {
                     let rows = tx_run(
                         tx,
-                        "?[count(seq), max(seq)] := *usage_stat{session_id, seq}, session_id == $sid",
+                        "?[count(seq), max(seq)] := *usage_stat{session_id: $sid, seq}",
                         p.clone(),
                     )?;
                     let (cnt, mx) =
@@ -3535,7 +3579,8 @@ impl GraphIndex {
                 vec![row],
             )?;
 
-            // Ring-prune this session's oldest usage rows beyond the cap.
+            // Ring-prune this session's oldest usage rows beyond the cap
+            // (same inline-bind + head unification as `record_mem_event`'s).
             let cutoff = seq - MAX_USAGE_PER_SESSION;
             if cutoff >= 0 {
                 let mut pc = BTreeMap::new();
@@ -3543,7 +3588,7 @@ impl GraphIndex {
                 pc.insert("cut".to_string(), DataValue::Num(Num::Int(cutoff)));
                 tx_run(
                     tx,
-                    "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid, seq <= $cut\n:rm usage_stat {session_id, seq}",
+                    "?[session_id, seq] := *usage_stat{session_id: $sid, seq}, seq <= $cut, session_id = $sid\n:rm usage_stat {session_id, seq}",
                     pc,
                 )?;
             }
@@ -3564,7 +3609,7 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
-            "?[seq] := *usage_stat{session_id, seq, kind}, session_id == $sid, kind == \"turn\"\n:limit 1",
+            "?[seq] := *usage_stat{session_id: $sid, seq, kind}, kind == \"turn\"\n:limit 1",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3580,10 +3625,13 @@ impl GraphIndex {
         // CozoScript relations are SETS, so two turns with identical token
         // counts would otherwise collapse into one row and undercount (the
         // same reason `mem_working_set` keeps `seq` in its own projection).
+        // `session_id` is bound INLINE (it is `usage_stat`'s leading key) —
+        // a `session_id == $sid` post-filter would scan every session's rows;
+        // this is the per-session pattern the whole file uses.
         let rows = self.run(
             "?[seq, in_tok, out_tok, cache_read, cache_make] := \
-                *usage_stat{session_id, seq, kind, in_tok, out_tok, cache_read, cache_make}, \
-                session_id == $sid, kind == \"turn\"",
+                *usage_stat{session_id: $sid, seq, kind, in_tok, out_tok, cache_read, cache_make}, \
+                kind == \"turn\"",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3606,11 +3654,12 @@ impl GraphIndex {
     pub fn usage_session_models(&self, session_id: &str) -> AppResult<Vec<String>> {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
-        // Same `seq`-keeps-rows-distinct reasoning as `usage_session_totals`.
+        // Same `seq`-keeps-rows-distinct and inline-`session_id` reasoning as
+        // `usage_session_totals`.
         let rows = self.run(
             "?[seq, model, in_tok, out_tok, cache_read, cache_make] := \
-                *usage_stat{session_id, seq, kind, model, in_tok, out_tok, cache_read, cache_make}, \
-                session_id == $sid, kind == \"turn\"",
+                *usage_stat{session_id: $sid, seq, kind, model, in_tok, out_tok, cache_read, cache_make}, \
+                kind == \"turn\"",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3644,8 +3693,8 @@ impl GraphIndex {
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
             "?[seq, model, in_tok, out_tok, cache_read, cache_make, origin] := \
-                *usage_stat{session_id, seq, kind, model, in_tok, out_tok, cache_read, cache_make, origin}, \
-                session_id == $sid, kind == \"turn\"",
+                *usage_stat{session_id: $sid, seq, kind, model, in_tok, out_tok, cache_read, cache_make, origin}, \
+                kind == \"turn\"",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3703,10 +3752,11 @@ impl GraphIndex {
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         // Same `seq`-keeps-rows-distinct reasoning as `usage_session_totals`:
         // without it, two tool results with identical (tool, chars) — e.g.
-        // two 1-char Bash results — would collapse into one row.
+        // two 1-char Bash results — would collapse into one row. Same inline
+        // `session_id` prefix bind, too.
         let rows = self.run(
-            "?[seq, tool, chars] := *usage_stat{session_id, seq, kind, tool, chars}, \
-                session_id == $sid, kind == \"tool_result\"",
+            "?[seq, tool, chars] := *usage_stat{session_id: $sid, seq, kind, tool, chars}, \
+                kind == \"tool_result\"",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3733,8 +3783,8 @@ impl GraphIndex {
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
             "?[seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin] := \
-                *usage_stat{session_id, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin}, \
-                session_id == $sid\n:order seq",
+                *usage_stat{session_id: $sid, seq, kind, model, msg_id, in_tok, out_tok, cache_read, cache_make, tool, chars, ts_ms, origin}\n\
+                :order seq",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3851,7 +3901,7 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
-            "?[ts_ms, hash] := *session_commit{session_id, hash, ts_ms}, session_id == $sid\n:order ts_ms",
+            "?[ts_ms, hash] := *session_commit{session_id: $sid, hash, ts_ms}\n:order ts_ms",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3915,7 +3965,7 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
-            "?[agent] := *session{session_id, agent}, session_id == $sid",
+            "?[agent] := *session{session_id: $sid, agent}",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -3931,7 +3981,7 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
-            "?[path] := *mem_event{session_id, path, kind}, session_id == $sid, \
+            "?[path] := *mem_event{session_id: $sid, path, kind}, \
                 (kind == \"read\" or kind == \"edit\")",
             p,
             ScriptMutability::Immutable,
@@ -4208,10 +4258,11 @@ impl GraphIndex {
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         // `seq` stays in the projection for the same set-semantics reason as
         // `usage_per_tool` — two identical (tool, chars) tool-result rows
-        // must not collapse into one.
+        // must not collapse into one — and `session_id` binds inline for the
+        // same prefix-scan reason.
         let rows = self.run(
-            "?[seq, tool, chars] := *usage_stat{session_id, seq, kind, tool, chars}, \
-                session_id == $sid, kind == \"tool_result\"",
+            "?[seq, tool, chars] := *usage_stat{session_id: $sid, seq, kind, tool, chars}, \
+                kind == \"tool_result\"",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -4238,7 +4289,7 @@ impl GraphIndex {
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
             "?[path, kind, symbol, ts_ms, seq] := \
-                *mem_event{session_id, seq, kind, path, symbol, ts_ms}, session_id == $sid",
+                *mem_event{session_id: $sid, seq, kind, path, symbol, ts_ms}",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -4436,14 +4487,19 @@ impl GraphIndex {
                 Some(sid) => {
                     let mut p = BTreeMap::new();
                     p.insert("sid".to_string(), DataValue::Str(sid.into()));
-                    tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
-                    tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
-                    tx_run(tx, "?[session_id, hash] := *session_commit{session_id, hash}, session_id == $sid\n:rm session_commit {session_id, hash}", p.clone())?;
+                    // Inline prefix binds + a trailing `session_id = $sid`
+                    // unification where the `:rm` head needs the column back.
+                    // `mem_note` is the exception: `session_id` is a VALUE
+                    // column there (the key is `note_id`), so no prefix scan
+                    // exists and the post-filter stays.
+                    tx_run(tx, "?[session_id, seq] := *mem_event{session_id: $sid, seq}, session_id = $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+                    tx_run(tx, "?[session_id, seq] := *usage_stat{session_id: $sid, seq}, session_id = $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
+                    tx_run(tx, "?[session_id, hash] := *session_commit{session_id: $sid, hash}, session_id = $sid\n:rm session_commit {session_id, hash}", p.clone())?;
                     tx_run(tx, "?[note_id] := *mem_note{note_id, session_id}, session_id == $sid\n:rm mem_note {note_id}", p.clone())?;
                     // F5: drop the distilled flag too, else a cleared session
                     // stays marked distilled and its later work is never distilled.
-                    tx_run(tx, "?[session_id] := *session_distilled{session_id}, session_id == $sid\n:rm session_distilled {session_id}", p.clone())?;
-                    tx_run(tx, "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}", p)?;
+                    tx_run(tx, "?[session_id] := *session_distilled{session_id: $sid, distilled}, session_id = $sid\n:rm session_distilled {session_id}", p.clone())?;
+                    tx_run(tx, "?[session_id] := *session{session_id: $sid, agent}, session_id = $sid\n:rm session {session_id}", p)?;
                 }
                 None => {
                     tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}\n:rm mem_event {session_id, seq}", BTreeMap::new())?;
@@ -4625,7 +4681,7 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
         let rows = self.run(
-            "?[distilled] := *session_distilled{session_id, distilled}, session_id == $sid",
+            "?[distilled] := *session_distilled{session_id: $sid, distilled}",
             p,
             ScriptMutability::Immutable,
         )?;
@@ -4844,23 +4900,74 @@ fn prune_sessions_in_tx(tx: &MultiTransaction) -> AppResult<()> {
     for sid in &ids[MAX_SESSIONS_PER_ROOT..] {
         let mut p = BTreeMap::new();
         p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
-        tx_run(tx, "?[session_id, seq] := *mem_event{session_id, seq}, session_id == $sid\n:rm mem_event {session_id, seq}", p.clone())?;
-        tx_run(tx, "?[session_id, seq] := *usage_stat{session_id, seq}, session_id == $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
-        tx_run(tx, "?[session_id, hash] := *session_commit{session_id, hash}, session_id == $sid\n:rm session_commit {session_id, hash}", p.clone())?;
+        // Inline prefix binds on the session-keyed relations; `mem_note` keeps
+        // its post-filter (there `session_id` is a value column, not a key).
+        tx_run(tx, "?[session_id, seq] := *mem_event{session_id: $sid, seq}, session_id = $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+        tx_run(tx, "?[session_id, seq] := *usage_stat{session_id: $sid, seq}, session_id = $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
+        tx_run(tx, "?[session_id, hash] := *session_commit{session_id: $sid, hash}, session_id = $sid\n:rm session_commit {session_id, hash}", p.clone())?;
         tx_run(tx, "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n:rm mem_note {note_id}", p.clone())?;
         // F5: also drop the distilled-flag row. Without this it leaks one row per
         // evicted session forever, and — because a Claude `session_id` is the
         // transcript UUID (stable across `--resume`/`--continue`) — a resumed
         // session that was evicted would hit `is_session_distilled == true` and
         // the idle sweep would skip distilling all its NEW work.
-        tx_run(tx, "?[session_id] := *session_distilled{session_id}, session_id == $sid\n:rm session_distilled {session_id}", p.clone())?;
+        tx_run(tx, "?[session_id] := *session_distilled{session_id: $sid, distilled}, session_id = $sid\n:rm session_distilled {session_id}", p.clone())?;
         tx_run(
             tx,
-            "?[session_id] := *session{session_id}, session_id == $sid\n:rm session {session_id}",
+            "?[session_id] := *session{session_id: $sid, agent}, session_id = $sid\n:rm session {session_id}",
             p,
         )?;
     }
     Ok(())
+}
+
+/// Drop every session whose `last_ms` predates `now_ms` by more than
+/// [`SESSION_RETENTION_DAYS`], cascading its `usage_stat` rows, `mem_event`
+/// rows, **unpinned** notes and distilled flag, plus the `session` row itself
+/// — the same cascade [`prune_sessions_in_tx`] applies to a count-capped
+/// eviction, so the two prunes leave a store in the same shape and "keep only
+/// the last N days of session detail" means all of it. Pinned notes survive
+/// project-wide (they outlive the session that wrote them, by definition).
+///
+/// The one deliberate exclusion is `session_commit`: Workbench commit
+/// provenance keeps its own lifetime, so an expired session leaves its commit
+/// rows behind — inert, since no consumer reads them without a live `session`
+/// row. Project facts are never session-scoped and are never touched.
+///
+/// Boundary is exclusive (`last_ms < cutoff`), so a session idle for exactly
+/// the retention window survives. Returns the number of sessions removed.
+fn prune_expired_sessions_in_tx(tx: &MultiTransaction, now_ms: i64) -> AppResult<usize> {
+    let cutoff = now_ms - SESSION_RETENTION_DAYS as i64 * 86_400_000;
+    let mut pc = BTreeMap::new();
+    pc.insert("cut".to_string(), DataValue::Num(Num::Int(cutoff)));
+    let rows = tx_run(
+        tx,
+        "?[session_id] := *session{session_id, last_ms}, last_ms < $cut",
+        pc,
+    )?;
+    let ids: Vec<String> = rows.rows.iter().map(|r| cell_str(r, 0)).collect();
+    for sid in &ids {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(sid.as_str().into()));
+        tx_run(tx, "?[session_id, seq] := *mem_event{session_id: $sid, seq}, session_id = $sid\n:rm mem_event {session_id, seq}", p.clone())?;
+        tx_run(tx, "?[session_id, seq] := *usage_stat{session_id: $sid, seq}, session_id = $sid\n:rm usage_stat {session_id, seq}", p.clone())?;
+        // `mem_note` keeps the post-filter: `session_id` is a VALUE column
+        // there (the key is `note_id`), so no prefix scan exists.
+        tx_run(tx, "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n:rm mem_note {note_id}", p.clone())?;
+        // Drop the distilled flag with the session. Without this, a Claude
+        // `session_id` — the transcript UUID, stable across `--resume` — that
+        // is resumed after the retention window would read
+        // `is_session_distilled == true` against a session whose rows are gone,
+        // and the idle sweep would skip distilling ALL its new work. Same
+        // reasoning as `prune_sessions_in_tx`'s F5 note.
+        tx_run(tx, "?[session_id] := *session_distilled{session_id: $sid, distilled}, session_id = $sid\n:rm session_distilled {session_id}", p.clone())?;
+        tx_run(
+            tx,
+            "?[session_id] := *session{session_id: $sid, agent}, session_id = $sid\n:rm session {session_id}",
+            p,
+        )?;
+    }
+    Ok(ids.len())
 }
 
 /// V12 Phase E: pure cap-enforcement decision for [`GraphIndex::add_project_fact`].
@@ -7115,6 +7222,121 @@ pub struct Point { x: i32 }
                 .iter()
                 .any(|s| s.session_id == "s0"),
             "s0 itself was evicted"
+        );
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The [`SESSION_RETENTION_DAYS`] sweep is age-based and exclusive at the
+    /// boundary: a session idle 31 days is purged with its whole cascade
+    /// (`session` row, `usage_stat`, `mem_event`, unpinned `mem_note`,
+    /// `session_distilled`), while 29-day-old and fresh sessions keep every
+    /// row. `last_ms` — not `started_ms` — decides, so a long-running session
+    /// that was active yesterday survives.
+    #[test]
+    fn retention_sweep_purges_only_sessions_past_the_window() {
+        let dir = std::env::temp_dir().join(format!("ckg-retain-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+
+        let day = 86_400_000i64;
+        let now = 100 * day;
+        // (id, last_ms) — `record_*` stamps `last_ms` from the event ts.
+        for (sid, age_days) in [("old", 31i64), ("edge", 29), ("fresh", 0)] {
+            let ts = now - age_days * day;
+            idx.record_mem_event(sid, "claude", "read", "a.rs", None, None, ts, None)
+                .unwrap();
+            idx.record_usage_event(
+                sid,
+                "claude",
+                &UsageEvent::ToolResult {
+                    tool: Some("Read".to_string()),
+                    chars: 7,
+                },
+                ts,
+            )
+            .unwrap();
+            idx.mem_add_note(&format!("n-{sid}"), sid, "a decision", ts, false)
+                .unwrap();
+            idx.mark_session_distilled(sid, ts).unwrap();
+        }
+
+        assert_eq!(idx.prune_expired_sessions(now).unwrap(), 1, "only `old`");
+
+        let live: Vec<String> = idx
+            .mem_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert!(!live.contains(&"old".to_string()), "`old` session row gone");
+        assert!(live.contains(&"edge".to_string()), "29 days survives");
+        assert!(live.contains(&"fresh".to_string()), "fresh survives");
+
+        // The purge cascades across every session-scoped relation.
+        assert!(idx.usage_per_tool("old").unwrap().is_empty(), "usage gone");
+        assert!(
+            idx.mem_working_set("old", 10).unwrap().is_empty(),
+            "events gone"
+        );
+        assert!(
+            !idx.mem_notes("old")
+                .unwrap()
+                .iter()
+                .any(|n| n.note_id == "n-old"),
+            "unpinned note gone"
+        );
+        assert!(
+            !idx.is_session_distilled("old").unwrap(),
+            "distilled flag gone — a resume after the window must distil again"
+        );
+
+        // The survivors keep theirs, row for row.
+        for sid in ["edge", "fresh"] {
+            assert_eq!(idx.usage_per_tool(sid).unwrap().len(), 1, "{sid} usage kept");
+            assert_eq!(
+                idx.mem_working_set(sid, 10).unwrap().len(),
+                1,
+                "{sid} events kept"
+            );
+            assert!(
+                idx.mem_notes(sid)
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.note_id == format!("n-{sid}")),
+                "{sid} note kept"
+            );
+            assert!(
+                idx.is_session_distilled(sid).unwrap(),
+                "{sid} distilled flag kept"
+            );
+        }
+
+        // Idempotent: a second sweep at the same clock removes nothing more.
+        assert_eq!(idx.prune_expired_sessions(now).unwrap(), 0);
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep runs on EVERY open, so a store reopened after the window has
+    /// passed comes back already pruned — the seam both `open` and
+    /// `open_existing` share.
+    #[test]
+    fn retention_sweep_runs_on_open() {
+        let dir = std::env::temp_dir().join(format!("ckg-retain-open-{}", uuid::Uuid::new_v4()));
+        {
+            let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+            // Stamped at the epoch, so it is far past the retention window
+            // against the real clock `open` reads.
+            idx.record_mem_event("ancient", "claude", "read", "a.rs", None, None, 1, None)
+                .unwrap();
+            assert_eq!(idx.mem_sessions().unwrap().len(), 1);
+        }
+        let idx = GraphIndex::open(&dir, ".ckg").expect("reopen");
+        assert!(
+            idx.mem_sessions().unwrap().is_empty(),
+            "the reopen's retention sweep dropped the expired session"
         );
 
         drop(idx);

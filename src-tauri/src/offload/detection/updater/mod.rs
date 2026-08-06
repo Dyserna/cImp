@@ -1,0 +1,1214 @@
+//! V32 Phase C3 (locked decision 13) — the **detection auto-updater**.
+//!
+//! # Why this exists
+//!
+//! Signature rules and a classifier decay without updates, and tying freshness
+//! to manual maintenance runs makes staleness the default. So the data both
+//! detection layers read is kept current on a daily check, from a channel the
+//! project curates ([`manifest`]).
+//!
+//! # The shape of one run
+//!
+//! ```text
+//!   scheduler tick (due? per component)
+//!        │
+//!        ├─ fetch the manifest ─────────────────► parse boundary (manifest.rs)
+//!        │                                        schema, names, sizes,
+//!        │                                        digests, asset origin
+//!        ├─ newer than installed? applicable to this app version?
+//!        │        │
+//!        │        ├─ mode = check-only ─► record "available" + Advisor card. STOP.
+//!        │        └─ mode = auto ────────┐
+//!        │                               ▼
+//!        ├─ download each file into MEMORY, verify SHA-256, only then write to
+//!        │  staging/ (nothing untrusted reaches disk before its digest is
+//!        │  checked, and nothing reaches a parser before that either)
+//!        │
+//!        ├─ validate ───────────────────────────► the validate.rs gauntlet
+//!        │        └─ fail ─► reject, wipe staging, keep old data, card + row
+//!        │
+//!        ├─ activate: archive the current files under previous/, move the
+//!        │            staged files in, hot-reload
+//!        │        └─ reload unhealthy ─► restore the archive, card + row
+//!        │
+//!        └─ record state (version, outcome) + activity row
+//! ```
+//!
+//! # Invariants this module is responsible for
+//!
+//! - **`rules.d/local/` is never touched.** Structural, not conditional: the
+//!   activation path only ever enumerates the top level of `rules.d`
+//!   ([`store::managed_rule_files`]). Nothing here opens `local/`.
+//! - **Checksum before content.** A downloaded byte is hashed before it is
+//!   written to disk and long before it is compiled. A mismatch aborts the
+//!   component's run with the staging directory wiped.
+//! - **Old data stays live on any failure.** There is no path from "the new
+//!   bundle is bad" to "no bundle": the live set changes in exactly one place,
+//!   after the gauntlet passed, and is restored if the hot-reload disagrees.
+//! - **Inert when off.** With both modes `off` the scheduler tick returns
+//!   before touching the network, the disk, or anything but the two mode
+//!   fields.
+//!
+//! # Every signal has its consumer
+//!
+//! Every outcome writes an `injection_flag` Tool Activity row (screen
+//! `updater`, `ok` reflecting the outcome), and the two that need a decision
+//! also reach the Advisor: `detection.update_available.v1` (check-only found
+//! something newer) and `detection.update_failed.v1` (a bundle was rejected).
+//! Versions, last-check time and outcome live in Settings → Tools → Detection,
+//! next to Check now, Apply, Revert and Open rules folder.
+//!
+//! # Testability
+//!
+//! Every path is driven through a [`Layout`] (four directories) and a
+//! [`manifest::Fetcher`], so the whole pipeline — checksum mismatch, broken
+//! bundle, false-positive smoke failure, successful swap, revert — runs against
+//! a temp directory and an in-memory map with **no network and no writes
+//! outside that directory**.
+
+pub mod manifest;
+pub mod store;
+pub mod validate;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::Duration;
+
+use tracing::{info, warn};
+
+use manifest::{Component, Fetcher, Manifest};
+use store::{ComponentState, State};
+
+use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord};
+use crate::offload::outbound::Screen;
+use crate::settings::Settings;
+
+// ── Modes and scheduling ───────────────────────────────────────────────────
+
+/// What the updater is allowed to do for one component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Mode {
+    /// Never check. Fully inert: no network, no disk.
+    Off,
+    /// Check and report; never download or activate.
+    Check,
+    /// Check, validate and activate.
+    Auto,
+}
+
+impl Mode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::Check => "check",
+            Mode::Auto => "auto",
+        }
+    }
+
+    /// Parse a settings string. An unrecognized value becomes `check` — the
+    /// middle setting, deliberately: a typo must neither silently disable the
+    /// updater (staleness by accident) nor silently grant it activation rights.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Mode::Off,
+            "auto" => Mode::Auto,
+            "check" | "check-only" => Mode::Check,
+            other => {
+                warn!(
+                    target: "offload",
+                    mode = %other,
+                    "detection updater: unrecognized mode; treating it as check-only"
+                );
+                Mode::Check
+            }
+        }
+    }
+}
+
+/// How often the scheduler wakes up to ask whether anything is due.
+///
+/// Deliberately much shorter than the check interval, and fixed: the loop's
+/// cadence is not the policy — [`is_due`] is. A tick that re-reads the current
+/// settings means an interval change (or a mode change away from `off`) takes
+/// effect within 15 minutes instead of at the end of the old interval, and a
+/// tick with both components off costs one comparison.
+pub const POLL_TICK: Duration = Duration::from_secs(15 * 60);
+
+/// How long after launch the first tick happens — the debounce decision 13 asks
+/// for. Launch is the busiest moment in the process (graph index build, model
+/// loads, PTY spawns); a network fetch and a YARA compile have no business
+/// competing with it, and detection data two minutes staler than it could be
+/// costs nothing.
+pub const LAUNCH_DELAY: Duration = Duration::from_secs(120);
+
+/// Floor on the configurable interval: a mistyped `0` must not turn the updater
+/// into a request loop against a release asset.
+pub const MIN_INTERVAL_HOURS: u32 = 1;
+
+/// Whether a component is due for a check.
+///
+/// Pure, so the scheduler's policy is unit-testable without timers:
+/// - `Off` is never due — that is what "fully inert" means;
+/// - never checked ⇒ due (this is also the launch check, after the debounce);
+/// - a `last_check_ms` in the FUTURE ⇒ due. A clock that moved backwards (or a
+///   state file copied from another machine) would otherwise park the component
+///   until real time caught up, which for a 24-hour interval can be forever.
+pub fn is_due(mode: Mode, now_ms: u64, last_check_ms: u64, interval_hours: u32) -> bool {
+    if mode == Mode::Off {
+        return false;
+    }
+    if last_check_ms == 0 || last_check_ms > now_ms {
+        return true;
+    }
+    let interval_ms = interval_hours.max(MIN_INTERVAL_HOURS) as u64 * 60 * 60 * 1000;
+    now_ms.saturating_sub(last_check_ms) >= interval_ms
+}
+
+/// The two modes plus the interval, snapshotted from `Settings` the same way
+/// [`super::Config`] snapshots the layer toggles: read once where a `Settings`
+/// is in hand, carried through the run, never re-read mid-flight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Schedule {
+    pub rules: Mode,
+    pub classifier: Mode,
+    pub interval_hours: u32,
+}
+
+impl Schedule {
+    pub fn from_settings(s: &Settings) -> Self {
+        Self {
+            rules: Mode::parse(&s.offload.detection_update_rules_mode),
+            classifier: Mode::parse(&s.offload.detection_update_classifier_mode),
+            interval_hours: s.offload.detection_update_interval_hours,
+        }
+    }
+
+    pub fn mode(self, c: Component) -> Mode {
+        match c {
+            Component::Rules => self.rules,
+            Component::Classifier => self.classifier,
+        }
+    }
+
+    /// Both components off ⇒ the updater does nothing at all.
+    pub fn is_inert(self) -> bool {
+        self.rules == Mode::Off && self.classifier == Mode::Off
+    }
+}
+
+/// The manifest URL in effect: the settings override when set, else the pinned
+/// default. Trimmed, because a stray space would silently 404 forever.
+pub fn manifest_url(s: &Settings) -> String {
+    let over = s.offload.detection_update_manifest_url.trim();
+    if over.is_empty() {
+        manifest::DEFAULT_MANIFEST_URL.to_string()
+    } else {
+        over.to_string()
+    }
+}
+
+// ── Layout ─────────────────────────────────────────────────────────────────
+
+/// The four directories one run touches. Passed as a value rather than resolved
+/// from `current_exe()` at each use so the whole pipeline is drivable against a
+/// temp tree — and so a reader can see, in one struct, everything the updater
+/// is able to write to.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    /// `<exe-dir>/detection-updates` — state file, staging, retained versions.
+    pub state_root: PathBuf,
+    /// `<exe-dir>/detection/rules.d` — the live rule bundle (whose `local/`
+    /// subdirectory is never enumerated).
+    pub rules_dest: PathBuf,
+    /// `<models>/promptguard2-22m` — the live classifier weights.
+    pub classifier_dest: PathBuf,
+    /// `<exe-dir>/detection/smoke` — the validation corpus.
+    pub smoke_dir: PathBuf,
+}
+
+impl Layout {
+    /// The real layout. `None` when the exe path has no usable parent, in which
+    /// case the updater stays inert rather than guessing at directories — the
+    /// same discipline `signature::rules_dir` follows.
+    pub fn resolve() -> Option<Self> {
+        Some(Self {
+            state_root: store::state_dir()?,
+            rules_dest: store::destination(Component::Rules)?,
+            classifier_dest: store::destination(Component::Classifier)?,
+            smoke_dir: validate::smoke_dir()?,
+        })
+    }
+
+    pub fn dest(&self, c: Component) -> &Path {
+        match c {
+            Component::Rules => &self.rules_dest,
+            Component::Classifier => &self.classifier_dest,
+        }
+    }
+}
+
+/// How a component is made live after its files are in place.
+///
+/// A function rather than a direct call to `signature::reload()` because the
+/// activation path must be able to reload a *specific* directory: production
+/// reloads the process-wide rule set, the tests reload a temp directory without
+/// disturbing the global one every other test reads.
+/// `Send + Sync` because [`run`] holds one across the manifest `await` and the
+/// scheduler's task must be spawnable — a plain `&dyn Fn` would make the whole
+/// future non-`Send`.
+pub type Reloader<'a> = &'a (dyn Fn(Component, &Path) -> Result<String, String> + Send + Sync);
+
+/// The production reloader: recompile the live rules / rebuild the live `ort`
+/// session, and report an error when the result is not healthy.
+pub fn live_reload(c: Component, dir: &Path) -> Result<String, String> {
+    match c {
+        Component::Rules => {
+            let s = super::signature::reload();
+            health_from_rules(&s, dir)
+        }
+        Component::Classifier => {
+            let s = super::classifier::rebuild();
+            if s.present {
+                Ok("weights loaded".to_string())
+            } else {
+                Err(s.error.unwrap_or_else(|| "weights did not load".into()))
+            }
+        }
+    }
+}
+
+/// Turn a rules [`Status`](super::signature::Status) into "healthy, and here is
+/// the summary" or "unhealthy, and here is why". One definition, shared by the
+/// live reloader and the tests' directory-scoped one, so both judge health the
+/// same way.
+pub fn health_from_rules(s: &super::signature::Status, dir: &Path) -> Result<String, String> {
+    if s.files_loaded == 0 || s.rules == 0 || s.files_failed > 0 {
+        return Err(format!(
+            "{} file(s) loaded, {} rule(s), {} rejected ({}) from {}",
+            s.files_loaded,
+            s.rules,
+            s.files_failed,
+            s.failed.join(", "),
+            dir.display()
+        ));
+    }
+    Ok(format!("{} file(s), {} rule(s) live", s.files_loaded, s.rules))
+}
+
+// ── Cached state ───────────────────────────────────────────────────────────
+//
+// The state file is read once per root and kept in memory. The Settings poller
+// and the Advisor's signal assembly both read it every couple of seconds;
+// re-parsing a JSON file on each of those would be disk churn for a value only
+// this module ever writes.
+
+fn cache() -> &'static Mutex<HashMap<PathBuf, State>> {
+    static C: OnceLock<Mutex<HashMap<PathBuf, State>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The state under `root`, hydrating from disk on first use.
+pub fn state_at(root: &Path) -> State {
+    let mut g = cache().lock().unwrap_or_else(PoisonError::into_inner);
+    g.entry(root.to_path_buf())
+        .or_insert_with(|| store::load_state(root))
+        .clone()
+}
+
+/// The state for the real layout — what Settings and the Advisor read.
+pub fn state() -> State {
+    match store::state_dir() {
+        Some(root) => state_at(&root),
+        None => State::default(),
+    }
+}
+
+/// Mutate the state under `root` and persist it. A failed write is logged and
+/// the in-memory copy still updates: losing the *record* of an update must not
+/// make the update itself look like it never happened.
+fn update_state_at(root: &Path, f: impl FnOnce(&mut State)) {
+    let mut next = state_at(root);
+    f(&mut next);
+    if let Err(e) = store::save_state(root, &next) {
+        warn!(target: "offload", error = %e, "detection updater: could not persist state");
+    }
+    cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(root.to_path_buf(), next);
+}
+
+// ── What Settings renders ──────────────────────────────────────────────────
+
+/// One component's updater readout.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComponentStatus {
+    pub component: &'static str,
+    /// The mode as its settings string (`off`/`check`/`auto`), so the Settings
+    /// select can compare it to the value it writes without a mapping table.
+    pub mode: &'static str,
+    /// Empty before the first successful update: the shipped bundle carries no
+    /// manifest version, and inventing one would make the first real update
+    /// look like a downgrade.
+    pub installed_version: String,
+    pub previous_version: String,
+    /// True exactly when Revert has something to restore.
+    pub can_revert: bool,
+    pub available_version: String,
+    pub available_notes: String,
+    pub last_check_ms: u64,
+    pub last_outcome: String,
+    pub last_ok: bool,
+    pub last_failure: String,
+}
+
+/// The whole updater surface, folded into `DetectionStatus` so the Settings
+/// poller that already asks for rule counts gets this for free.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdaterStatus {
+    pub components: Vec<ComponentStatus>,
+    /// The manifest URL actually in use, so "nothing ever updates" is
+    /// diagnosable without opening the settings file.
+    pub manifest_url: String,
+    pub interval_hours: u32,
+    /// What "Open rules folder" opens — shown as text too, so the path is
+    /// visible even when the button cannot open a file manager.
+    pub rules_dir: String,
+    pub state_dir: String,
+}
+
+/// Build the status from the cached state plus the live settings.
+pub fn status(settings: &Settings) -> UpdaterStatus {
+    let st = state();
+    let sched = Schedule::from_settings(settings);
+    UpdaterStatus {
+        components: Component::ALL
+            .iter()
+            .map(|c| {
+                let cs = st.get(*c);
+                ComponentStatus {
+                    component: c.as_str(),
+                    mode: sched.mode(*c).as_str(),
+                    installed_version: cs.installed_version.clone(),
+                    previous_version: cs.previous_version.clone(),
+                    can_revert: !cs.previous_version.is_empty(),
+                    available_version: cs.available_version.clone(),
+                    available_notes: cs.available_notes.clone(),
+                    last_check_ms: cs.last_check_ms,
+                    last_outcome: cs.last_outcome.clone(),
+                    last_ok: cs.last_ok,
+                    last_failure: cs.last_failure.clone(),
+                }
+            })
+            .collect(),
+        manifest_url: manifest_url(settings),
+        interval_hours: sched.interval_hours.max(MIN_INTERVAL_HOURS),
+        rules_dir: super::signature::rules_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
+        state_dir: store::state_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+// ── Outcomes and their activity rows ───────────────────────────────────────
+
+/// What happened to one component on one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Checked; already current.
+    UpToDate,
+    /// A newer bundle exists and was not applied (check-only mode, or blocked
+    /// by `min_app_version`).
+    Available,
+    /// Downloaded, validated and activated.
+    Applied,
+    /// Rejected before activation, or rolled back after it. Old data still live.
+    Rejected,
+    /// The previous bundle was restored.
+    Reverted,
+}
+
+impl Outcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Outcome::UpToDate => "up-to-date",
+            Outcome::Available => "available",
+            Outcome::Applied => "applied",
+            Outcome::Rejected => "rejected",
+            Outcome::Reverted => "reverted",
+        }
+    }
+
+    /// `Rejected` is the only unhealthy outcome. "Available" is check-only mode
+    /// working exactly as configured and must not paint the feed red.
+    pub const fn ok(self) -> bool {
+        !matches!(self, Outcome::Rejected)
+    }
+}
+
+/// Write one updater row into the Tool Activity feed.
+///
+/// Composed here rather than through
+/// [`outbound::record_flag`](crate::offload::outbound::record_flag) because
+/// that function encodes "a flag row's `ok` follows [`Screen::is_denial`]",
+/// which is true of every other screen and false of this one: an updater row's
+/// `ok` is the outcome. Bending `record_flag` to carry an override would make
+/// six call sites carry a field only this one uses.
+fn record_row(c: Component, outcome: Outcome, version: &str, detail: &str) {
+    let ts = crate::activity::now_ms();
+    let request = serde_json::json!({
+        "screen": Screen::Updater.as_str(),
+        "component": c.as_str(),
+        "outcome": outcome.as_str(),
+        "version": version,
+    });
+    let root = std::env::current_dir()
+        .map(|d| crate::activity::root_key(&d))
+        .unwrap_or_default();
+    crate::activity::record_bg(ActivityRecord {
+        entry: ActivityEntry::new(
+            ActivityKind::InjectionFlag,
+            ts,
+            root,
+            Screen::Updater.as_str().to_string(),
+            c.as_str().to_string(),
+            // The at-a-glance column: what happened, to which version.
+            if version.is_empty() {
+                outcome.as_str().to_string()
+            } else {
+                format!("{} {version}", outcome.as_str())
+            },
+            0,
+            0,
+            outcome.ok(),
+        ),
+        request: serde_json::to_string_pretty(&request).unwrap_or_default(),
+        response: detail.to_string(),
+    });
+}
+
+// ── Advisor signals ────────────────────────────────────────────────────────
+
+/// A component with a newer version the user has not taken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AvailableUpdate {
+    pub component: String,
+    pub installed: String,
+    pub available: String,
+    pub notes: String,
+}
+
+/// A component whose last update attempt was rejected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedUpdate {
+    pub component: String,
+    pub version: String,
+    pub reason: String,
+}
+
+/// The two Advisor inputs, read from the cached state — no disk, no clock, so
+/// they are safe on the advice poll's cadence.
+pub fn advisor_signals() -> (Vec<AvailableUpdate>, Vec<FailedUpdate>) {
+    signals_from(&state())
+}
+
+/// The pure half, so the rules that consume these can be tested from a state
+/// value.
+pub fn signals_from(st: &State) -> (Vec<AvailableUpdate>, Vec<FailedUpdate>) {
+    let mut available = Vec::new();
+    let mut failed = Vec::new();
+    for c in Component::ALL {
+        let cs = st.get(c);
+        if !cs.available_version.is_empty() {
+            available.push(AvailableUpdate {
+                component: c.as_str().to_string(),
+                installed: cs.installed_version.clone(),
+                available: cs.available_version.clone(),
+                notes: cs.available_notes.clone(),
+            });
+        }
+        if !cs.last_failure.is_empty() {
+            failed.push(FailedUpdate {
+                component: c.as_str().to_string(),
+                version: cs.last_failure_version.clone(),
+                reason: cs.last_failure.clone(),
+            });
+        }
+    }
+    (available, failed)
+}
+
+// ── One component's run ────────────────────────────────────────────────────
+
+/// The result of checking (and possibly applying) one component.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunResult {
+    pub component: Component,
+    pub outcome: Outcome,
+    pub version: String,
+    pub detail: String,
+}
+
+/// Check one component against `man`, applying it when `mode` allows.
+///
+/// Separated from the manifest fetch so one download serves both components,
+/// and so tests drive the whole pipeline from a parsed manifest.
+pub async fn run_component(
+    c: Component,
+    man: &Manifest,
+    mode: Mode,
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    reload: Reloader<'_>,
+) -> RunResult {
+    let now = crate::activity::now_ms();
+    let root = layout.state_root.clone();
+    let Some(entry) = man.components.get(&c) else {
+        return finish(
+            c,
+            &root,
+            now,
+            Outcome::UpToDate,
+            String::new(),
+            format!(
+                "the manifest lists no `{}` component; nothing to do",
+                c.as_str()
+            ),
+        );
+    };
+    let installed = state_at(&root).get(c).installed_version.clone();
+    if !manifest::is_newer(&entry.version, &installed) {
+        return finish(
+            c,
+            &root,
+            now,
+            Outcome::UpToDate,
+            entry.version.clone(),
+            format!(
+                "installed version `{}` is current (the manifest offers `{}`)",
+                if installed.is_empty() {
+                    "(shipped)"
+                } else {
+                    installed.as_str()
+                },
+                entry.version
+            ),
+        );
+    }
+    if !manifest::app_version_satisfies(entry.min_app_version.as_deref()) {
+        return finish(
+            c,
+            &root,
+            now,
+            Outcome::Available,
+            entry.version.clone(),
+            format!(
+                "version `{}` needs cImp {} or newer (this build is {}) — update the app to take it",
+                entry.version,
+                entry.min_app_version.as_deref().unwrap_or("?"),
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+    }
+    if mode != Mode::Auto {
+        return finish(
+            c,
+            &root,
+            now,
+            Outcome::Available,
+            entry.version.clone(),
+            format!(
+                "version `{}` is available; this component is set to check-only, so nothing was \
+                 downloaded and nothing on disk changed",
+                entry.version
+            ),
+        );
+    }
+
+    // ── auto: download, verify, validate, activate ──────────────────────
+    let staging = store::staging_dir(&root, c);
+    store::wipe_dir(&staging);
+    let applied = apply_component(c, entry, fetcher, layout, &staging, reload).await;
+    // Whatever happened, the staging directory does not outlive the run — a
+    // rejected bundle must leave nothing behind that a later reader could
+    // mistake for validated content.
+    store::wipe_dir(&staging);
+    match applied {
+        Ok(detail) => finish(c, &root, now, Outcome::Applied, entry.version.clone(), detail),
+        Err(detail) => finish(
+            c,
+            &root,
+            now,
+            Outcome::Rejected,
+            entry.version.clone(),
+            detail,
+        ),
+    }
+}
+
+/// Download + verify + validate + activate. Every early return leaves the live
+/// data exactly as it was.
+async fn apply_component(
+    c: Component,
+    entry: &manifest::ComponentEntry,
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    staging: &Path,
+    reload: Reloader<'_>,
+) -> Result<String, String> {
+    std::fs::create_dir_all(staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+
+    // Fetch each artifact into memory, verify its size and digest, and only
+    // then write it. Nothing untrusted touches disk before its checksum is
+    // confirmed, and nothing reaches a parser before that either.
+    for f in &entry.files {
+        let bytes = fetcher.get(&f.url, f.size).await?;
+        if bytes.len() as u64 != f.size {
+            return Err(format!(
+                "`{}` is {} bytes but the manifest declares {} — rejected before the content was \
+                 written or parsed",
+                f.name,
+                bytes.len(),
+                f.size
+            ));
+        }
+        let got = manifest::sha256_hex(&bytes);
+        if got != f.sha256 {
+            return Err(format!(
+                "checksum mismatch on `{}` (expected {}, got {}) — rejected before the content \
+                 was written or parsed",
+                f.name, f.sha256, got
+            ));
+        }
+        std::fs::write(staging.join(&f.name), &bytes)
+            .map_err(|e| format!("stage `{}`: {e}", f.name))?;
+    }
+    let names: Vec<String> = entry.files.iter().map(|f| f.name.clone()).collect();
+    validate::staged_files_present(staging, c, &names)?;
+
+    // Validation and activation are blocking work (a YARA compile bounded by
+    // `validate::COMPILE_BUDGET`, an ONNX session, a handful of file moves) and
+    // run inline rather than on the blocking pool. Two reasons: the reloader is
+    // a borrowed closure that cannot be moved into a `spawn_blocking` task, and
+    // this runs at most once a day on a background task with nothing waiting on
+    // it — the seconds-scale ceiling is the whole point of having a ceiling.
+    match c {
+        Component::Rules => validate_and_activate_rules(staging, layout, &entry.version, reload),
+        Component::Classifier => {
+            validate_and_activate_classifier(staging, layout, &entry.version, &names, reload)
+        }
+    }
+}
+
+/// The rules half.
+fn validate_and_activate_rules(
+    staging: &Path,
+    layout: &Layout,
+    version: &str,
+    reload: Reloader<'_>,
+) -> Result<String, String> {
+    let sources = super::signature::read_sources(staging);
+    let corpus = validate::load_corpus(&layout.smoke_dir);
+    let report = validate::validate_rules(&sources, &corpus)?;
+    activate(Component::Rules, staging, layout, version, reload)?;
+    Ok(format!(
+        "activated rules `{version}`: {} file(s), {} rule(s), validated against {} benign + {} \
+         hostile control document(s) (compile {} ms, slowest scan {} ms). The previous bundle is \
+         retained and can be reverted from Settings; `rules.d/local/` was not touched.",
+        report.files,
+        report.rules,
+        report.benign_samples,
+        report.hostile_samples,
+        report.compile_ms,
+        report.slowest_scan_ms
+    ))
+}
+
+/// The classifier half.
+///
+/// The staged weights score the shipped smoke corpus BEFORE anything is
+/// swapped. With no usable corpus — or with staged weights the scorer cannot
+/// load — the update is rejected rather than trusted: swapping a classifier is
+/// exactly the change locked decision 13 said should *ask*, and installing an
+/// unverified model is the opposite of asking.
+fn validate_and_activate_classifier(
+    staging: &Path,
+    layout: &Layout,
+    version: &str,
+    names: &[String],
+    reload: Reloader<'_>,
+) -> Result<String, String> {
+    let corpus = validate::load_corpus(&layout.smoke_dir);
+    if !corpus.is_usable() {
+        return Err(format!(
+            "the smoke corpus is missing or empty ({} benign, {} hostile documents) — staged \
+             weights cannot be verified, so they are rejected rather than trusted",
+            corpus.benign.len(),
+            corpus.hostile.len()
+        ));
+    }
+    let injection = super::classifier::score_many_with(staging, &corpus.hostile)?;
+    let benign = super::classifier::score_many_with(staging, &corpus.benign)?;
+    validate::classifier_smoke_verdict(&injection, &benign)?;
+    let _ = names;
+    activate(Component::Classifier, staging, layout, version, reload)?;
+    Ok(format!(
+        "activated classifier weights `{version}`, verified against {} injection + {} benign \
+         control document(s). The previous weights are retained and can be reverted from Settings.",
+        injection.len(),
+        benign.len()
+    ))
+}
+
+/// Swap the staged files into the component's destination, archiving the
+/// current ones, then hot-reload.
+///
+/// The ordering is what "atomic-as-possible" means here. A directory swap has
+/// no all-or-nothing primitive across two multi-file directories, so instead:
+/// the outgoing files are archived FIRST, the incoming ones moved in second,
+/// and a failure at any point in the second step restores the archive. The
+/// window in which the destination is short of files is the move loop itself,
+/// and the only way out of it is "new set live and healthy" or "old set back".
+///
+/// The hot-reload is part of the transaction, not a follow-up: a set that moved
+/// perfectly but does not LOAD (an identifier collision with a `local/` rule, a
+/// file quarantined by antivirus between validation and activation) is rolled
+/// back exactly like a failed move.
+fn activate(
+    c: Component,
+    staging: &Path,
+    layout: &Layout,
+    version: &str,
+    reload: Reloader<'_>,
+) -> Result<(), String> {
+    let dest = layout.dest(c);
+    let root = &layout.state_root;
+    std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    // ONE label for the outgoing version, used both for the archive directory
+    // and for the `previous_version` recorded in state. They were briefly two
+    // expressions and the empty case diverged (`unknown` on disk vs.
+    // `(shipped)` in state), which made Revert look for a directory that had
+    // never existed — the archive path and the recorded name must be derived
+    // from the same string.
+    let installed = state_at(root).get(c).installed_version.clone();
+    let outgoing_version = if installed.is_empty() {
+        SHIPPED_VERSION.to_string()
+    } else {
+        installed
+    };
+    let archive = store::previous_dir(root, c, &outgoing_version);
+    store::wipe_dir(&archive);
+
+    // Archive the current managed set. For rules this is the top level of
+    // `rules.d` only, so `local/` is untouched by construction.
+    let mut archived: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for p in store::managed_files(dest, c) {
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        let to = archive.join(&name);
+        store::move_file(&p, &to)?;
+        archived.push((to, p.clone()));
+    }
+
+    // Move the staged set in. On any failure, put the archive back.
+    for p in store::managed_files(staging, c) {
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        if let Err(e) = store::move_file(&p, &dest.join(&name)) {
+            roll_back(c, dest, &archived, layout, reload);
+            return Err(format!(
+                "activating the staged bundle failed ({e}); the previous version was restored"
+            ));
+        }
+    }
+
+    match reload(c, dest) {
+        Ok(live) => {
+            update_state_at(root, |s| {
+                let cs = s.get_mut(c);
+                cs.previous_version = outgoing_version.clone();
+                cs.installed_version = version.to_string();
+            });
+            info!(
+                target: "offload",
+                component = c.as_str(),
+                version,
+                live = %live,
+                "detection updater: bundle activated"
+            );
+            Ok(())
+        }
+        Err(why) => {
+            roll_back(c, dest, &archived, layout, reload);
+            Err(format!(
+                "the activated bundle did not load cleanly ({why}); the previous version was \
+                 restored"
+            ))
+        }
+    }
+}
+
+/// The label recorded for the bundle that shipped with the app — the one
+/// version that has no manifest entry. Displayed in Settings as the revert
+/// target, so it has to read as something a user recognizes.
+pub const SHIPPED_VERSION: &str = "(shipped)";
+
+/// Remove whatever is at `dest` for this component, put the archive back, and
+/// reload. Used by both failure paths in [`activate`].
+fn roll_back(
+    c: Component,
+    dest: &Path,
+    archived: &[(PathBuf, PathBuf)],
+    layout: &Layout,
+    reload: Reloader<'_>,
+) {
+    for p in store::managed_files(dest, c) {
+        let _ = std::fs::remove_file(&p);
+    }
+    for (from, to) in archived {
+        if let Err(e) = store::move_file(from, to) {
+            warn!(
+                target: "offload",
+                from = %from.display(),
+                to = %to.display(),
+                error = %e,
+                "detection updater: could not restore a previous file"
+            );
+        }
+    }
+    let _ = layout;
+    if let Err(e) = reload(c, dest) {
+        warn!(
+            target: "offload",
+            component = c.as_str(),
+            error = %e,
+            "detection updater: the restored version did not reload cleanly"
+        );
+    }
+}
+
+/// Record the outcome, write the row, and return it.
+///
+/// One funnel, so no path can produce an outcome without also producing its
+/// consumers: the state record, the activity row, and (through the state) the
+/// Advisor card.
+fn finish(
+    c: Component,
+    root: &Path,
+    now_ms: u64,
+    outcome: Outcome,
+    version: String,
+    detail: String,
+) -> RunResult {
+    update_state_at(root, |s| {
+        let cs: &mut ComponentState = s.get_mut(c);
+        cs.last_check_ms = now_ms;
+        cs.last_outcome = detail.clone();
+        cs.last_ok = outcome.ok();
+        match outcome {
+            Outcome::Available => {
+                cs.available_version = version.clone();
+            }
+            // A successful apply, a clean check or a revert clears both the
+            // pending offer and the failure record: the condition each card
+            // reports is over, and a card outliving its condition is worse
+            // than no card.
+            Outcome::Applied | Outcome::UpToDate | Outcome::Reverted => {
+                cs.available_version.clear();
+                cs.available_notes.clear();
+                cs.last_failure.clear();
+                cs.last_failure_version.clear();
+            }
+            Outcome::Rejected => {
+                cs.last_failure = detail.clone();
+                cs.last_failure_version = version.clone();
+                // The offer stands: the user may still want to retry, and the
+                // Settings row should keep saying which version was refused.
+                cs.available_version = version.clone();
+            }
+        }
+    });
+    record_row(c, outcome, &version, &detail);
+    if outcome == Outcome::Rejected {
+        warn!(
+            target: "offload",
+            component = c.as_str(),
+            version = %version,
+            detail = %detail,
+            "detection updater: bundle rejected; the previous data is still active"
+        );
+    } else {
+        info!(
+            target: "offload",
+            component = c.as_str(),
+            outcome = outcome.as_str(),
+            version = %version,
+            "detection updater: check complete"
+        );
+    }
+    RunResult {
+        component: c,
+        outcome,
+        version,
+        detail,
+    }
+}
+
+// ── The entry points ───────────────────────────────────────────────────────
+
+/// Fetch the manifest and run every component in `components`.
+///
+/// `force_auto` is what Settings' "Apply" passes: it overrides the configured
+/// mode for this one run, so an explicit click applies the update without the
+/// user having to flip a setting and wait for a tick. It never overrides
+/// `Off` — a component the user turned off stays off, including against a
+/// button press meant for the other one.
+pub async fn run(
+    components: &[Component],
+    sched: Schedule,
+    manifest_url: &str,
+    force_auto: bool,
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    reload: Reloader<'_>,
+) -> Vec<RunResult> {
+    let root = layout.state_root.clone();
+    let raw = match fetcher.get(manifest_url, manifest::MAX_MANIFEST_BYTES).await {
+        Ok(b) => b,
+        Err(e) => return fail_all(components, sched, &root, &e),
+    };
+    let text = match String::from_utf8(raw) {
+        Ok(t) => t,
+        Err(_) => return fail_all(components, sched, &root, "the manifest is not valid UTF-8"),
+    };
+    let man = match Manifest::parse(&text, manifest_url) {
+        Ok(m) => m,
+        Err(e) => return fail_all(components, sched, &root, &e),
+    };
+
+    let mut out = Vec::new();
+    for c in components {
+        let configured = sched.mode(*c);
+        if configured == Mode::Off {
+            continue;
+        }
+        let effective = if force_auto { Mode::Auto } else { configured };
+        let result = run_component(*c, &man, effective, fetcher, layout, reload).await;
+        if result.outcome == Outcome::Available {
+            // The curator's note belongs to the offer, so it is recorded only
+            // on the path that creates one. Remote text: stored and displayed,
+            // never interpreted.
+            if let Some(notes) = man.components.get(c).and_then(|e| e.notes.clone()) {
+                update_state_at(&root, |s| s.get_mut(*c).available_notes = notes);
+            }
+        }
+        out.push(result);
+    }
+    out
+}
+
+/// The production wrapper: resolve the layout, use the HTTP fetcher and the
+/// live reloader.
+pub async fn run_live(
+    components: &[Component],
+    settings: &Settings,
+    force_auto: bool,
+) -> Vec<RunResult> {
+    let Some(layout) = Layout::resolve() else {
+        warn!(target: "offload", "detection updater: no usable layout; skipping");
+        return Vec::new();
+    };
+    run(
+        components,
+        Schedule::from_settings(settings),
+        &manifest_url(settings),
+        force_auto,
+        &manifest::HttpFetcher,
+        &layout,
+        &live_reload,
+    )
+    .await
+}
+
+/// A manifest-level failure is every enabled component's failure: none of them
+/// could be checked, and a silent no-op would be indistinguishable from
+/// "everything is current".
+fn fail_all(
+    components: &[Component],
+    sched: Schedule,
+    root: &Path,
+    reason: &str,
+) -> Vec<RunResult> {
+    let now = crate::activity::now_ms();
+    components
+        .iter()
+        .filter(|c| sched.mode(**c) != Mode::Off)
+        .map(|c| {
+            finish(
+                *c,
+                root,
+                now,
+                Outcome::Rejected,
+                String::new(),
+                format!("update check failed: {reason}"),
+            )
+        })
+        .collect()
+}
+
+/// Restore a component's previous version — the Settings Revert button.
+///
+/// Symmetric with activation: the files being replaced are archived under the
+/// version they represent, so a revert is itself revertible.
+pub fn revert(c: Component, layout: &Layout, reload: Reloader<'_>) -> RunResult {
+    let now = crate::activity::now_ms();
+    let root = layout.state_root.clone();
+    let st = state_at(&root);
+    let cs = st.get(c);
+    let previous_version = cs.previous_version.clone();
+    let current_version = cs.installed_version.clone();
+    if previous_version.is_empty() {
+        return finish(
+            c,
+            &root,
+            now,
+            Outcome::Rejected,
+            String::new(),
+            format!("nothing to revert to for `{}`", c.as_str()),
+        );
+    }
+    match revert_inner(c, layout, &previous_version, &current_version, reload) {
+        Ok(detail) => finish(
+            c,
+            &root,
+            now,
+            Outcome::Reverted,
+            previous_version,
+            detail,
+        ),
+        Err(e) => finish(
+            c,
+            &root,
+            now,
+            Outcome::Rejected,
+            previous_version,
+            format!("revert failed: {e}"),
+        ),
+    }
+}
+
+/// The production wrapper for [`revert`].
+pub fn revert_live(c: Component) -> RunResult {
+    match Layout::resolve() {
+        Some(layout) => revert(c, &layout, &live_reload),
+        None => RunResult {
+            component: c,
+            outcome: Outcome::Rejected,
+            version: String::new(),
+            detail: "revert failed: no usable layout".to_string(),
+        },
+    }
+}
+
+fn revert_inner(
+    c: Component,
+    layout: &Layout,
+    previous_version: &str,
+    current_version: &str,
+    reload: Reloader<'_>,
+) -> Result<String, String> {
+    let dest = layout.dest(c);
+    let root = &layout.state_root;
+    let archive = store::previous_dir(root, c, previous_version);
+    let restoring = store::managed_files(&archive, c);
+    if restoring.is_empty() {
+        return Err(format!(
+            "the retained `{previous_version}` version is empty or missing from {}",
+            archive.display()
+        ));
+    }
+    // Archive what is live now under ITS version, so this revert can be undone.
+    let keep = store::previous_dir(root, c, current_version);
+    store::wipe_dir(&keep);
+    for p in store::managed_files(dest, c) {
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        store::move_file(&p, &keep.join(&name))?;
+    }
+    for p in &restoring {
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        store::move_file(p, &dest.join(&name))?;
+    }
+    let live = reload(c, dest)?;
+    update_state_at(root, |s| {
+        let cs = s.get_mut(c);
+        cs.installed_version = previous_version.to_string();
+        cs.previous_version = current_version.to_string();
+    });
+    Ok(format!(
+        "reverted `{}` to `{previous_version}` ({live}); `{current_version}` is retained and can \
+         be restored the same way",
+        c.as_str()
+    ))
+}
+
+// ── The scheduler ──────────────────────────────────────────────────────────
+
+/// Spawn the background scheduler: a debounced launch check plus a periodic
+/// due-ness poll.
+///
+/// Follows the app's existing background-task shape (a `tauri::async_runtime`
+/// task around a `tokio::time::interval`, as `state::manager` and the loopback
+/// heartbeats use) rather than introducing a scheduling framework. Settings are
+/// re-read on every tick, so a mode or interval change takes effect within one
+/// [`POLL_TICK`] with no restart and no broadcast subscription to keep in sync.
+pub fn spawn_scheduler(settings: crate::settings::SettingsHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(LAUNCH_DELAY).await;
+        let mut tick = tokio::time::interval(POLL_TICK);
+        // `Delay`, not `Burst`: a machine waking from sleep must not fire every
+        // missed tick at once against a release asset.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick_once(&settings).await;
+            tick.tick().await;
+        }
+    });
+}
+
+/// One scheduler pass. Separated so the inertness property is visible in one
+/// place: with both components `off` this returns before reading the state file
+/// and long before touching the network.
+async fn tick_once(settings: &crate::settings::SettingsHandle) {
+    let snap = settings.current();
+    let sched = Schedule::from_settings(&snap);
+    if sched.is_inert() {
+        return;
+    }
+    let st = state();
+    let now = crate::activity::now_ms();
+    let due: Vec<Component> = Component::ALL
+        .iter()
+        .copied()
+        .filter(|c| {
+            is_due(
+                sched.mode(*c),
+                now,
+                st.get(*c).last_check_ms,
+                sched.interval_hours,
+            )
+        })
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    info!(
+        target: "offload",
+        components = %due.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","),
+        "detection updater: scheduled check"
+    );
+    run_live(&due, &snap, false).await;
+}
+
+#[cfg(test)]
+mod tests;

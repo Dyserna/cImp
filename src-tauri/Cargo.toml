@@ -266,6 +266,14 @@ tauri-plugin-opener = "2"
 # transitive dependency (reqwest/tauri), so depending on it directly adds no
 # new entries to the tree.
 url = "2"
+# V32 Phase C3 (detection updater): SHA-256 over every downloaded manifest
+# artifact, verified BEFORE the bytes are written to disk or handed to a
+# parser. Already resolved in Cargo.lock as a transitive dependency (rustls /
+# tauri / cozo all pull it), so depending on it directly adds no new entries to
+# the tree — the same promotion rationale as `url` above. Deliberately NOT
+# hand-rolled: a bespoke SHA-256 in the one code path whose whole job is
+# rejecting tampered files is exactly the wrong place to save a dependency line.
+sha2 = "0.10"
 
 # V32 Phase C (injection hardening) — the two detection layers.
 #

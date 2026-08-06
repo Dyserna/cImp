@@ -22,7 +22,9 @@ export interface ActivityEntry {
   /// Agent (claude/opencode/offload/read_advisor/auto_check) for graph
   /// entries; the backend name for offload entries. For `injection_flag` rows
   /// it names the SCREEN that fired: `ssrf` / `budget` / `canary` /
-  /// `latch_refusal` / `memory_quarantine` / `signature` / `classifier`.
+  /// `latch_refusal` / `memory_quarantine` / `signature` / `classifier`, plus
+  /// `updater` for the V32 C3 detection auto-updater (whose `tool` is the
+  /// component and whose `ok` is the outcome — `rejected` is the only false).
   source: string;
   tool: string;
   target: string;

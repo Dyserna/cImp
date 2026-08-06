@@ -48,6 +48,12 @@
 //!    auto-updated (decision 13).
 //! 2. [`classifier`] — Llama Prompt Guard 2 22M under `ort`, inert until the
 //!    weights are installed.
+//!
+//! Alongside them, [`updater`] (Phase C3, locked decision 13) keeps the data
+//! both layers read fresh: a daily manifest check against a curated release
+//! channel, validate-before-activate with a retained rollback, and a Settings
+//! section with per-component modes. Not a detection layer itself — it is what
+//! stops the two above from decaying.
 //! 3. *(not implemented this run)* the optional grammar-constrained local-LLM
 //!    judge of locked decision 7. It stays specced: it costs a llama-server
 //!    turn per fetched page against a **single-slot** server, so it lands
@@ -56,6 +62,7 @@
 
 pub mod classifier;
 pub mod signature;
+pub mod updater;
 
 use serde_json::Value;
 use tracing::warn;
@@ -341,27 +348,33 @@ pub fn init() {
 }
 
 /// Recompile the rules from disk and return the fresh combined status. The
-/// Settings block's "Reload rules" affordance; the C3 milestone's file watcher
-/// and validated-bundle swap hang off the same entry point.
-pub fn reload() -> DetectionStatus {
+/// Settings block's "Reload rules" affordance, and what the C3 updater calls
+/// after it swaps a validated bundle into place.
+pub fn reload(settings: &Settings) -> DetectionStatus {
     DetectionStatus {
         rules: signature::reload(),
         classifier: classifier::status(),
+        updater: updater::status(settings),
     }
 }
 
 /// What Settings → Tools → Detection renders.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DetectionStatus {
     pub rules: signature::Status,
     pub classifier: classifier::Status,
+    /// C3: installed/available versions, last check, per-component modes. Rides
+    /// this struct rather than a command of its own so the Settings poller that
+    /// already asks for rule counts gets it in the same round trip.
+    pub updater: updater::UpdaterStatus,
 }
 
 /// The current status without recompiling.
-pub fn status() -> DetectionStatus {
+pub fn status(settings: &Settings) -> DetectionStatus {
     DetectionStatus {
         rules: signature::status(),
         classifier: classifier::status(),
+        updater: updater::status(settings),
     }
 }
 

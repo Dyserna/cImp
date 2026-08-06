@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) coded 2026-08-07; C3 (#35), E (#37) pending; live-verifies pending. GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) coded 2026-08-07; E (#37) pending; live-verifies pending, and C3's release-asset publishing is a blocking deploy follow-up (see its amendment). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -333,6 +333,98 @@ declares its class AND its mutation capability in one reviewed place.
   Settings section (modes, versions, Check now, revert, open folder);
   publish the first curated rule bundle + manifest as release assets;
   MAINTENANCE.md row = updater health review + bundle curation.
+  **Phase C3 amendment 2026-08-07 (as built).**
+  - **Manifest schema v1**, documented in
+    `offload/detection/updater/manifest.rs` with a worked example committed at
+    `detection/manifest.example.json`: `{schema, generated, components: [{
+    component: "rules"|"classifier", version, min_app_version?, notes?,
+    files: [{name, sha256, size, url}]}]}`. Pinned URL =
+    `https://github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json`
+    (fixed tag, assets replaced/added — the `models-v1` precedent).
+    `schema` is an EXACT match (an unknown schema is rejected, never
+    best-effort parsed); an unknown *component* is skipped, so a manifest that
+    grows a third one still updates these two.
+  - **Locked invariant added while building: every artifact URL must live under
+    the manifest's own directory** (the manifest URL minus its last path
+    segment). Without it, whoever can rewrite the manifest can redirect the
+    download to any host — the curated channel would be curated in name only.
+    It also makes the `detection_update_manifest_url` override safe and
+    special-case-free: an override relocates the whole bundle, never part of it.
+  - **No archive format, therefore no new archive dependency.** Files are
+    listed and fetched individually: a zip would put a decompressor over
+    attacker-controlled bytes *before* validation, in the module whose entire
+    job is to not do that. One dependency was added — `sha2 = "0.10"`, already
+    in `Cargo.lock` transitively, promoted to a direct dep with the same
+    rationale as `url`/`quick-xml`. Hand-rolling SHA-256 in the code path whose
+    only job is rejecting tampered files was rejected.
+  - **Scheduler:** a `tauri::async_runtime` task around a `tokio::time::interval`
+    (the `state::manager` / loopback-heartbeat shape, no new framework).
+    120 s launch debounce, then a fixed 15-minute poll whose only job is to ask
+    the pure `updater::is_due(mode, now, last_check, interval_hours)`. Settings
+    are re-read every tick, so a mode/interval change takes effect without a
+    restart. Interval floored at 1 h. Both modes `off` ⇒ the tick returns before
+    touching disk or network.
+  - **State** lives in `<exe-dir>/detection-updates/` (`state.json`, `staging/`,
+    `previous/<component>/<version>/`) — a **sibling** of `detection/`, not a
+    subdirectory, because `build.rs` mirrors-and-prunes `detection/` on every
+    dev build and `release.yml` copies it wholesale.
+  - **Validation gauntlet** (`updater/validate.rs`): compiles clean (ANY
+    rejected file fails the whole bundle — the live loader's per-file tolerance
+    exists for the user's `local/` rules, not for a bundle we published),
+    compiles inside 5 s, scans each control document inside 750 ms (the same
+    budget the live scanner enforces), **no benign control matches**, and — added
+    while building — **every hostile control MUST match**. That positive control
+    is what stops a syntactically perfect match-nothing bundle from passing
+    every other gate and silently disabling the layer. An absent or empty corpus
+    REJECTS rather than waving the bundle through. Corpus ships as data at
+    `detection/smoke/{benign,hostile}/*.txt`.
+  - **Activation** archives the outgoing files first, moves the staged ones in
+    second, and restores the archive on any failure — including a hot-reload
+    that comes back unhealthy, which is part of the transaction rather than a
+    follow-up (it catches a set that moved perfectly but collides with a
+    `local/` rule). `rules.d/local/` is untouched *by construction*:
+    `store::managed_rule_files` is non-recursive and nothing in the updater
+    opens `local/`.
+  - **Consumers:** `injection_flag` activity rows with a new
+    `outbound::Screen::Updater` (`source = "updater"`), the one screen whose row
+    `ok` is its outcome rather than `is_denial()` — so it composes its own row
+    instead of bending `record_flag`'s every-flag-is-a-denial shape. Plus two
+    Advisor rules, `detection.update_available.v1` and
+    `detection.update_failed.v1`, both warn-only and signed
+    `component:version` so a dismissal holds for one bundle and re-fires on the
+    next. Settings → Tools → Detection grew a *Detection updates* block:
+    per-component mode select, installed/available versions, last check +
+    verbatim outcome, Check now / Apply / Revert, plus Open rules folder and the
+    manifest URL in force.
+  - **Defaults as locked:** rules `auto`, classifier `check`, interval 24 h. An
+    unrecognized mode string reads as `check` — a typo must neither disable the
+    updater nor grant it activation rights.
+  - **Deploy follow-ups (blocking for the feature to do anything at all):**
+    1. create the `detection-v1` release on `Dyserna/cImp`;
+    2. curate the first rule bundle (date-versioned, e.g. `2026.08.07`) from
+       `detection/rules.d/` + the current Vigil/garak refresh;
+    3. verify it locally first via `offload.detection_update_manifest_url`
+       pointed at a staged copy (live-verification recipe 11);
+    4. upload the `.yar` assets under `<version>-<file>` names (release assets
+       are flat, so names must be unique across versions);
+    5. write `manifest.json` with real SHA-256s and sizes and upload it **last**
+       — a manifest published ahead of its assets makes every install fail a
+       check it would otherwise have skipped;
+    6. leave the `classifier` component OUT of the published manifest until the
+       Prompt Guard 2 weights themselves are published (see
+       `models/CHECKSUMS.txt`) — an entry with no assets behind it turns every
+       daily check into a rejected-update card.
+    The checklist is also recorded in `detection/manifest.example.json`.
+  - **Known residuals.** (a) The compile ceiling is measured *around* the
+    compile, not enforced inside it — yara-x exposes no compile deadline, so a
+    pathological bundle is reliably *rejected* but still costs its own wall time
+    on a background task. (b) The classifier's apply path cannot be exercised
+    end-to-end anywhere today (the weights are unpublished); its pure decision
+    function `classifier_smoke_verdict` is unit-tested, the scoring wrapper is
+    not. (c) In a **dev tree** the updater's `detection-updates/` directory
+    survives `build.rs`, but a rule file the updater installs into
+    `target/{profile}/detection/rules.d/` is pruned by the next build, since the
+    repo is the source of truth there — installed layouts are unaffected.
 - **C2 — memory quarantine (decision 10).** `tainted` flag on `mem_note`
   rows written under latch; recall/auto-injection exclusion; Memory UI
   promote-or-discard; spotlighting envelope on all recalled memory at

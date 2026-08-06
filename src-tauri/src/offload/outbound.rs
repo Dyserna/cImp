@@ -584,6 +584,19 @@ pub enum Screen {
     /// The Prompt Guard classifier scored an EXTERNAL result over threshold
     /// (decision 7). Surface-only, like [`Screen::Signature`].
     Classifier,
+    /// V32 Phase C3 (decision 13): the detection **auto-updater** checked,
+    /// applied, rejected or reverted a rules/classifier bundle. Not a screen
+    /// over a tool call at all — it borrows this vocabulary because its rows
+    /// belong in the same feed as the layers it maintains, and because the
+    /// person reading `injection_flag` rows is exactly the person who needs to
+    /// know the detection data changed.
+    ///
+    /// It is the ONE source whose rows are written outside [`record_flag`]:
+    /// every other screen's `ok` follows [`Screen::is_denial`], while an
+    /// updater row's `ok` is its outcome (rejected ⇒ false, everything else ⇒
+    /// true). See
+    /// [`detection::updater`](super::detection::updater)`::record_row`.
+    Updater,
 }
 
 impl Screen {
@@ -596,17 +609,23 @@ impl Screen {
             Screen::MemoryQuarantine => "memory_quarantine",
             Screen::Signature => "signature",
             Screen::Classifier => "classifier",
+            Screen::Updater => "updater",
         }
     }
 
     /// Whether this screen actually stopped something. The two detection
     /// screens did not (surface-only), and neither did the C2 memory
     /// quarantine (the note was stored) — a row that painted any of them as a
-    /// denial would misreport what happened.
+    /// denial would misreport what happened. [`Screen::Updater`] is not a
+    /// screen over a call at all, so it is likewise never a denial; its rows
+    /// carry their own `ok`.
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
-            Screen::Signature | Screen::Classifier | Screen::MemoryQuarantine
+            Screen::Signature
+                | Screen::Classifier
+                | Screen::MemoryQuarantine
+                | Screen::Updater
         )
     }
 }
@@ -989,14 +1008,20 @@ mod tests {
         assert!(ABORT_CANARY.contains("ABORTED"));
     }
 
+    /// Every screen's wire value, pinned: these strings are the row `source`
+    /// column the Tool Activity feed filters and groups on, so a rename is a
+    /// UI change, not a refactor.
     #[test]
-    fn screen_labels_are_the_four_distinct_wire_values() {
+    fn screen_labels_are_the_distinct_wire_values() {
         let all = [
             Screen::Ssrf,
             Screen::Budget,
             Screen::Canary,
             Screen::LatchRefusal,
             Screen::MemoryQuarantine,
+            Screen::Signature,
+            Screen::Classifier,
+            Screen::Updater,
         ];
         let labels: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
         assert_eq!(
@@ -1006,12 +1031,20 @@ mod tests {
                 "budget",
                 "canary",
                 "latch_refusal",
-                "memory_quarantine"
+                "memory_quarantine",
+                "signature",
+                "classifier",
+                "updater"
             ]
         );
-        // Denial vs. flagged: the quarantine STORED the note, so its row must
-        // not be painted as a failure in the feed.
+        // Denial vs. flagged: the quarantine STORED the note, the two detection
+        // screens delivered their result, and the updater is not a screen over
+        // a call at all — none of them may be painted as a failure in the feed.
         assert!(!Screen::MemoryQuarantine.is_denial());
+        assert!(!Screen::Signature.is_denial());
+        assert!(!Screen::Classifier.is_denial());
+        assert!(!Screen::Updater.is_denial());
         assert!(Screen::LatchRefusal.is_denial());
+        assert!(Screen::Ssrf.is_denial());
     }
 }

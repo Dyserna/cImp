@@ -1336,6 +1336,18 @@ export interface OffloadSettings {
   /// V32: probability at or above which the classifier's verdict counts as a
   /// flag (0-1).
   detection_classifier_threshold: number;
+  /// V32 C3: what the detection auto-updater may do with the signature rule
+  /// bundle — `"off"` / `"check"` / `"auto"`. Default `auto`.
+  detection_update_rules_mode: string;
+  /// V32 C3: the same for the classifier weights. Default `check` — a model
+  /// swap can shift false-positive behaviour, so it asks.
+  detection_update_classifier_mode: string;
+  /// V32 C3: hours between update checks. Default 24, floored at 1.
+  detection_update_interval_hours: number;
+  /// V32 C3: override for the pinned manifest URL; empty means the pinned one.
+  /// Artifact URLs must live under whichever manifest URL is in force, so an
+  /// override relocates the whole bundle.
+  detection_update_manifest_url: string;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1656,6 +1668,10 @@ export function defaultSettings(): Settings {
       detection_signature_enabled: true,
       detection_classifier_enabled: true,
       detection_classifier_threshold: 0.9,
+      detection_update_rules_mode: 'auto',
+      detection_update_classifier_mode: 'check',
+      detection_update_interval_hours: 24,
+      detection_update_manifest_url: '',
     },
     graph: {
       enabled: false,

@@ -1,0 +1,30 @@
+Prompt engineering for retrieval-augmented systems
+
+Indirect prompt injection is the best-documented failure mode of agentic LLM
+systems, and it is worth understanding before designing a retrieval pipeline.
+The essential problem is that a model reads one flat token stream: the system
+prompt the developer wrote, the user's question, and the contents of whatever
+document the retriever pulled in all arrive as tokens with no intrinsic
+provenance. A jailbreak, by contrast, is a direct attack by the user; the
+injection case is more interesting because the attacker is a third party who
+merely has to get some text indexed.
+
+Practitioners generally reach for four mitigations. Spotlighting delimits
+retrieved passages with markers and explains their status to the model.
+Capability containment restricts which tools remain available once untrusted
+content has been read, which is more robust because it does not depend on the
+model's judgement. Classifier-based guardrails score passages before they are
+appended to the context. Finally, output filtering inspects generated text for
+markers of a successful attack, such as unexpected outbound URLs.
+
+Evaluation is the hard part. Corpora such as garak's probe suite and the
+various public benchmarks are useful for regression testing, but false positive
+rates on ordinary technical documentation are rarely reported, and a guardrail
+that fires on every page discussing security is worse than none: operators
+learn to dismiss it. Base64-encoded payloads, zero-width characters and Unicode
+tag blocks all appear in the literature as delivery mechanisms, and each has a
+benign counterpart in normal web content.
+
+Our own pipeline logs a per-document score and keeps a sample of high-scoring
+documents for weekly review. We have not yet found it necessary to block
+anything automatically.

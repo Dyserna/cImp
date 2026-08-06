@@ -114,13 +114,26 @@ struct Engine {
 /// `Ok(engine)` once, or the reason there isn't one. Resolved on first use and
 /// cached — including the failure, so an absent model does not re-stat the disk
 /// on every fetch.
-fn engine() -> &'static Mutex<Result<Engine, String>> {
-    static E: OnceLock<Mutex<Result<Engine, String>>> = OnceLock::new();
-    E.get_or_init(|| Mutex::new(load()))
+///
+/// The inner `Option` is the C3 updater's re-load seam: `None` means "not
+/// resolved yet", so [`rebuild`] can drop a live session and have the next
+/// caller load the swapped weights. A bare `OnceLock<Result<…>>` would have
+/// pinned the first answer for the life of the process, which is exactly what a
+/// weights update must be able to undo.
+fn engine() -> &'static Mutex<Option<Result<Engine, String>>> {
+    static E: OnceLock<Mutex<Option<Result<Engine, String>>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(None))
 }
 
 fn load() -> Result<Engine, String> {
     let dir = model_dir().ok_or_else(|| "models directory could not be resolved".to_string())?;
+    load_from(&dir)
+}
+
+/// Build an engine from an explicit directory. The updater validates STAGED
+/// weights with this before anything is swapped, so the smoke run scores the
+/// files it is about to install rather than the ones already installed.
+fn load_from(dir: &std::path::Path) -> Result<Engine, String> {
     let model = dir.join(MODEL_FILE);
     let tok = dir.join(TOKENIZER_FILE);
     if !model.is_file() || !tok.is_file() {
@@ -155,7 +168,9 @@ pub fn status() -> Status {
     let dir = model_dir()
         .map(|d| d.display().to_string())
         .unwrap_or_else(|| "(unknown — models directory unresolved)".into());
-    match &*engine().lock().unwrap_or_else(PoisonError::into_inner) {
+    let mut guard = engine().lock().unwrap_or_else(PoisonError::into_inner);
+    let resolved = guard.get_or_insert_with(load);
+    match resolved {
         Ok(_) => Status {
             present: true,
             dir,
@@ -167,6 +182,39 @@ pub fn status() -> Status {
             error: Some(e.clone()),
         },
     }
+}
+
+/// Drop the cached session and load again from the models directory, returning
+/// the fresh [`Status`].
+///
+/// The C3 updater's hot-swap: activating new weights is a file move, and
+/// without this the process would keep serving the old graph until restart —
+/// an update that appears to have applied while nothing changed is worse than
+/// one that visibly did not.
+pub fn rebuild() -> Status {
+    *engine().lock().unwrap_or_else(PoisonError::into_inner) = None;
+    status()
+}
+
+/// Score `samples` with the weights in `dir`, on a throwaway session.
+///
+/// The updater's classifier smoke set runs through here so the *staged* weights
+/// are judged before they are installed — scoring with the live session would
+/// only ever confirm what is already active. The session is dropped when this
+/// returns; nothing about the live one is disturbed either way.
+pub fn score_many_with(
+    dir: &std::path::Path,
+    samples: &[(String, String)],
+) -> Result<Vec<(String, f32)>, String> {
+    let mut engine = load_from(dir)?;
+    let mut out = Vec::with_capacity(samples.len());
+    for (name, text) in samples {
+        let score = score_with(&mut engine, text).ok_or_else(|| {
+            format!("the staged weights produced no score for the control document `{name}`")
+        })?;
+        out.push((name.clone(), score));
+    }
+    Ok(out)
 }
 
 /// One startup log line, so an absent classifier is visible in the log and not
@@ -275,7 +323,14 @@ fn capped(text: &str) -> &str {
 /// [`super::screen`]), never directly on the async fetch path.
 pub fn score_blocking(text: &str) -> Option<f32> {
     let mut guard = engine().lock().unwrap_or_else(PoisonError::into_inner);
-    let engine = guard.as_mut().ok()?;
+    let engine = guard.get_or_insert_with(load).as_mut().ok()?;
+    score_with(engine, text)
+}
+
+/// The scoring itself, against an explicit engine — the seam
+/// [`score_many_with`] drives with a throwaway session built from staged
+/// weights.
+fn score_with(engine: &mut Engine, text: &str) -> Option<f32> {
     let encoding = match engine.tokenizer.encode(capped(text), false) {
         Ok(e) => e,
         Err(e) => {

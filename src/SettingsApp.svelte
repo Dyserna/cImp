@@ -56,6 +56,9 @@
     offloadEnableReadonlyCommands,
     describeMcpServerHealth,
     detectionStatus,
+    detectionCheckNow,
+    detectionRevert,
+    detectionOpenRulesFolder,
     type BackendStatus,
     type ServiceStatus,
     type DetectionStatus,
@@ -387,11 +390,37 @@
   // it rides the same poller as the backend statuses rather than the settings
   // snapshot — it is not a setting and never round-trips through `patch`.
   let detection = $state<DetectionStatus | null>(null);
-  // Recompile the rules from disk and fold the fresh counts back in. The one
-  // consumer of `detection::reload()` today; the V32 C3 updater adds the
-  // scheduled path on top of the same entry point.
+  // Recompile the rules from disk and fold the fresh counts back in.
   async function reloadDetection(): Promise<void> {
     detection = await detectionStatus(true);
+  }
+  // V32 Phase C3: which component (if any) has a check/apply/revert in flight.
+  // A single slot rather than a per-button flag because all three buttons on
+  // both rows drive the same updater and a second concurrent run would race the
+  // same staging directory — so any one running disables all of them.
+  let detectionBusy = $state<string | null>(null);
+  // Check now / Apply. The whole run (download, validation, swap) is awaited,
+  // so the returned status already reflects the outcome and nothing has to be
+  // polled for.
+  async function checkDetectionUpdate(component: string, apply: boolean): Promise<void> {
+    if (detectionBusy) return;
+    detectionBusy = component;
+    try {
+      const next = await detectionCheckNow(component, apply);
+      if (next) detection = next;
+    } finally {
+      detectionBusy = null;
+    }
+  }
+  async function revertDetection(component: string): Promise<void> {
+    if (detectionBusy) return;
+    detectionBusy = component;
+    try {
+      const next = await detectionRevert(component);
+      if (next) detection = next;
+    } finally {
+      detectionBusy = null;
+    }
   }
   let backendStatusTimer: ReturnType<typeof setInterval> | null = null;
   async function refreshBackendStatuses(): Promise<void> {
@@ -401,8 +430,11 @@
       console.warn('offload_statuses failed', e);
     }
     serviceStatus = await offloadServiceStatus();
-    // Cheap: cached disk facts, no recompile (`reload = false`).
-    detection = await detectionStatus();
+    // Cheap: cached disk facts, no recompile (`reload = false`). Skipped while
+    // an updater run is in flight — a 4-second poll landing mid-swap would
+    // overwrite the button row with a half-applied snapshot, and the run's own
+    // return value is the authoritative one.
+    if (!detectionBusy) detection = await detectionStatus();
   }
   function startBackendStatusPolling(): void {
     if (backendStatusTimer) return;
@@ -4122,11 +4154,16 @@
           {:else}
             <small class="hint">Detection status unavailable (the app is still starting).</small>
           {/if}
-          <button type="button" onclick={reloadDetection}>Reload rules</button>
+          <div class="row">
+            <button type="button" onclick={reloadDetection}>Reload rules</button>
+            <button type="button" onclick={() => void detectionOpenRulesFolder()}>
+              Open rules folder
+            </button>
+          </div>
           <small class="hint">
             Rules are plain <code>.yar</code> files next to cimp.exe under
             <code>detection/rules.d/</code>. Drop your own in the
-            <code>local/</code> subfolder — a future auto-update replaces the
+            <code>local/</code> subfolder — the auto-updater below replaces the
             shipped bundle but never touches <code>local/</code>. A file that
             fails to compile is skipped and the rest still load.
           </small>
@@ -4179,6 +4216,136 @@
               Probability at or above which the classifier flags a result. Lower
               catches more and warns more often; 0.9 is the conservative default,
               because a header on every page trains the model to ignore it.
+            </small>
+          </label>
+
+          <h4>Detection updates</h4>
+          <small class="hint top">
+            Rules and classifier weights go stale: signatures only match
+            phrasings someone has already written down, and a model only
+            generalises as far as its training. cImp checks a curated manifest
+            (its own GitHub release, never third-party repos) on a daily
+            interval. A candidate bundle is verified by SHA-256, compiled, and
+            run against shipped control documents — it must catch the known
+            attacks and must NOT flag the benign ones — before it goes live. If
+            anything fails, the old data stays active and you get a card;
+            detection never silently degrades to nothing.
+          </small>
+          {#if detection}
+            {#each detection.updater.components as comp (comp.component)}
+              <div class="updater-row">
+                <div class="row">
+                  <strong>{comp.component === 'rules' ? 'Signature rules' : 'Classifier weights'}</strong>
+                  <span class="mcp-detail">
+                    installed: <code>{comp.installed_version || '(shipped)'}</code>
+                    {#if comp.available_version && comp.available_version !== comp.installed_version}
+                      · available: <code>{comp.available_version}</code>
+                    {/if}
+                    {#if comp.last_check_ms > 0}
+                      · checked {new Date(comp.last_check_ms).toLocaleString()}
+                    {:else}
+                      · never checked
+                    {/if}
+                  </span>
+                </div>
+                <label>
+                  <span>Update mode</span>
+                  <select
+                    value={comp.component === 'rules'
+                      ? snapshot.offload.detection_update_rules_mode
+                      : snapshot.offload.detection_update_classifier_mode}
+                    onchange={(e) => {
+                      const v = (e.currentTarget as HTMLSelectElement).value;
+                      patch((s) => {
+                        if (comp.component === 'rules') s.offload.detection_update_rules_mode = v;
+                        else s.offload.detection_update_classifier_mode = v;
+                      });
+                    }}
+                  >
+                    <option value="off">Off — never check</option>
+                    <option value="check">Check only — tell me, change nothing</option>
+                    <option value="auto">Auto — validate and apply</option>
+                  </select>
+                </label>
+                <div class="row">
+                  <button
+                    type="button"
+                    onclick={() => void checkDetectionUpdate(comp.component, false)}
+                    disabled={detectionBusy !== null}
+                  >
+                    {detectionBusy === comp.component ? 'Checking…' : 'Check now'}
+                  </button>
+                  <button
+                    type="button"
+                    onclick={() => void checkDetectionUpdate(comp.component, true)}
+                    disabled={detectionBusy !== null || !comp.available_version}
+                  >
+                    Apply update
+                  </button>
+                  <button
+                    type="button"
+                    onclick={() => void revertDetection(comp.component)}
+                    disabled={detectionBusy !== null || !comp.can_revert}
+                  >
+                    Revert to {comp.previous_version || 'previous'}
+                  </button>
+                </div>
+                {#if comp.last_outcome}
+                  <small class="hint" class:down={!comp.last_ok}>
+                    Last check: {comp.last_outcome}
+                  </small>
+                {/if}
+                {#if comp.available_notes}
+                  <small class="hint">Release note: {comp.available_notes}</small>
+                {/if}
+              </div>
+            {/each}
+            <small class="hint">
+              Manifest: <code>{detection.updater.manifest_url}</code>
+            </small>
+          {/if}
+          <label>
+            <span>Check interval (hours)</span>
+            <input
+              type="number"
+              min="1"
+              max="720"
+              step="1"
+              value={snapshot.offload.detection_update_interval_hours}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.detection_update_interval_hours = Math.max(
+                      1,
+                      Math.round(+(e.currentTarget as HTMLInputElement).value || 24),
+                    )),
+                )}
+            />
+            <small class="hint">
+              Also checked once shortly after launch, and skipped if the last
+              check was inside this window — a restart does not re-download.
+              Floored at 1 hour.
+            </small>
+          </label>
+          <label>
+            <span>Manifest URL override</span>
+            <input
+              type="text"
+              placeholder="(the pinned cImp detection manifest)"
+              value={snapshot.offload.detection_update_manifest_url}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.detection_update_manifest_url = (
+                      e.currentTarget as HTMLInputElement
+                    ).value.trim()),
+                )}
+            />
+            <small class="hint">
+              Leave empty for the pinned URL. Downloads must live under the same
+              directory as whatever manifest is in force, so an override
+              relocates the whole bundle rather than letting a manifest point at
+              a host of its choosing. Mainly for testing a staged bundle.
             </small>
           </label>
 
@@ -6247,6 +6414,30 @@
   }
   .mcp-detail {
     color: var(--text-secondary);
+  }
+  /* V32 C3 — one updatable detection component: a header line, its mode
+     select, and the three buttons. Boxed like `.mcp-row` so the two components
+     read as two units rather than one long column of controls. */
+  .updater-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: var(--space-2) 0;
+    border-top: 1px solid var(--border-faint);
+  }
+  .updater-row .mcp-detail {
+    font-size: var(--font-size-xs);
+  }
+  /* A rejected update: the old data is still live, so this is a warning the
+     user should act on, not an error state for the whole section. */
+  small.hint.down {
+    color: var(--danger, #c9564b);
+  }
+  h4 {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    margin: var(--space-4) 0 var(--space-1) 0;
+    color: var(--text-primary);
   }
   /* Editable MCP server groups: three stacked lines per server —
      name + remove, full-width URL, then the access checkboxes. */

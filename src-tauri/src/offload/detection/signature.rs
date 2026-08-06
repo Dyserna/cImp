@@ -122,7 +122,13 @@ pub fn rules_dir() -> Option<PathBuf> {
 /// the *local* file that gets rejected — the user's own file names its own
 /// rules, and losing a shipped rule to a stranger's typo would silently
 /// weaken the layer.
-fn read_sources(dir: &Path) -> Vec<(String, String)> {
+///
+/// Public because the C3 updater reads a **staged** bundle with exactly this
+/// function: "what counts as a rule file, and in what order" must have one
+/// definition, or a bundle could validate against a different file set than the
+/// one that later loads. A staging directory simply has no `local/`
+/// subdirectory, so the second pass finds nothing there.
+pub fn read_sources(dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (label, d) in [("", dir.to_path_buf()), ("local/", dir.join("local"))] {
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -218,24 +224,36 @@ fn try_compile<'a>(sources: impl Iterator<Item = &'a str>) -> Option<yara_x::Rul
     Some(compiler.build())
 }
 
-/// (Re)compile the rule set from disk. Called once at startup and again
-/// whenever the user asks Settings to reload; the C3 milestone adds the file
-/// watcher and the validated-bundle swap on top of this same entry point.
-pub fn reload() -> Status {
-    let dir = rules_dir();
+/// Compile the rule set that `dir` (plus its `local/` overlay) would produce,
+/// and report it — **without** touching the live slot.
+///
+/// The pure half of [`reload`], split out for the C3 updater: after it swaps a
+/// validated bundle into a directory it wants "what does this directory
+/// actually load as" as an answer, and its tests want that answer for a
+/// temporary directory without disturbing the process-wide rule set every other
+/// test reads.
+pub fn compile_report(dir: Option<&Path>) -> (Option<Arc<yara_x::Rules>>, Status) {
     let mut status = Status {
         dir: dir
-            .as_ref()
             .map(|d| d.display().to_string())
             .unwrap_or_else(|| "(unknown — exe has no parent directory)".into()),
         ..Status::default()
     };
-    let sources = dir.as_deref().map(read_sources).unwrap_or_default();
+    let sources = dir.map(read_sources).unwrap_or_default();
     let (rules, failed) = compile_sources(&sources);
     status.files_failed = failed.len();
     status.files_loaded = sources.len() - failed.len();
     status.failed = failed;
     status.rules = rules.as_ref().map_or(0, |r| r.iter().count());
+    (rules, status)
+}
+
+/// (Re)compile the rule set from disk and make it live. Called once at startup,
+/// whenever the user asks Settings to reload, and by the C3 updater after it
+/// activates a validated bundle.
+pub fn reload() -> Status {
+    let dir = rules_dir();
+    let (rules, status) = compile_report(dir.as_deref());
 
     if status.files_failed > 0 {
         warn!(

@@ -155,6 +155,27 @@ pub const RULE_DRIFT_PAYLOAD: &str = "drift.payload.v1";
 pub const RULE_DRIFT_READ_BYPASS: &str = "drift.read_bypass.v1";
 pub const RULE_DRIFT_SUBAGENT: &str = "drift.subagent_transcripts.v1";
 
+// ── V32 Phase C3 — detection-updater canaries ───────────────────────────
+//
+// Locked decision 13's "every signal has its consumer": the updater records
+// what it found and what it refused, and these two rules are what turn those
+// records into something the user actually sees. Both are warn-only — the fix
+// is a button in Settings → Tools → Detection, not a settings write the Apply
+// path could make — and both carry their own trigger (a fact, not a statistic),
+// so neither sits behind the global `MIN_SESSIONS` floor.
+
+/// A newer detection bundle exists and was not applied: the component is in
+/// `check-only` mode (the locked default for the classifier), or its
+/// `min_app_version` is ahead of this build. Signature = `component:version`,
+/// so a dismissal holds for THAT bundle and re-fires on the next one.
+pub const RULE_DETECTION_UPDATE_AVAILABLE: &str = "detection.update_available.v1";
+/// The last update attempt was rejected — bad checksum, a bundle that would not
+/// compile, a failed smoke control. The old data is still live (the updater
+/// never degrades to no-detection), but a component that keeps refusing every
+/// bundle is silently freezing, which is exactly what a card is for.
+/// Signature = `component:version`, same re-fire boundary.
+pub const RULE_DETECTION_UPDATE_FAILED: &str = "detection.update_failed.v1";
+
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
 /// breakage detector, and waiting longer just burns more bare refusals.
@@ -290,6 +311,18 @@ pub struct Signals {
     /// an `"unverified"` E1 (the default) must never auto-graduate a hook we've
     /// never seen work. Gates `adopt.read_advisor.v1`.
     pub e1_pass: bool,
+
+    // ── V32 Phase C3 — detection updater ────────────────────────────────
+    /// Components with a newer bundle recorded but not taken (check-only mode,
+    /// or blocked by `min_app_version`). Read from the updater's state file via
+    /// `detection::updater::advisor_signals`; empty is the healthy steady state
+    /// (`auto` applies and clears it, so a standing entry means a decision is
+    /// waiting).
+    pub detection_updates: Vec<crate::offload::detection::updater::AvailableUpdate>,
+    /// Components whose last update attempt was rejected, with the reason. The
+    /// old data is still live either way — this reports a component that is
+    /// freezing, not one that broke.
+    pub detection_update_failures: Vec<crate::offload::detection::updater::FailedUpdate>,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -640,6 +673,79 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 action: None,
             });
         }
+    }
+
+    // V32 C3 — detection.update_available.v1: a newer detection bundle was
+    // found and not taken. This is the consumer for check-only mode: without
+    // it, "check-only" would mean "silently record a version nobody reads".
+    // Warn-only — Apply lives in Settings → Tools → Detection, next to the
+    // versions and the revert button, because taking an update is not a
+    // settings write.
+    for u in &sig.detection_updates {
+        let signature = format!("{}:{}", u.component, u.available);
+        if is_dismissed(&sig.dismissed, RULE_DETECTION_UPDATE_AVAILABLE, &signature) {
+            continue;
+        }
+        out.push(Proposal {
+            setting: String::new(),
+            current: if u.installed.is_empty() {
+                "(shipped)".to_string()
+            } else {
+                u.installed.clone()
+            },
+            proposed: u.available.clone(),
+            rationale: format!(
+                "A newer injection-detection {} bundle ({}) is available and was not applied — \
+                 this component is set to check-only, or the bundle needs a newer cImp. Detection \
+                 data decays without updates, so a component that keeps declining them slowly \
+                 stops matching what attackers actually send.{} Review and take it from Settings \
+                 → Tools → Detection (Apply), or switch the component to auto.",
+                u.component,
+                u.available,
+                if u.notes.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" Curator's note: {}.", u.notes.trim())
+                }
+            ),
+            rule_id: RULE_DETECTION_UPDATE_AVAILABLE,
+            signature,
+            warn_only: true,
+            action: None,
+        });
+    }
+
+    // V32 C3 — detection.update_failed.v1: a bundle was refused. Nothing
+    // broke (the old data is still live and the updater never degrades to
+    // no-detection), but a component whose every candidate is rejected is
+    // frozen, and freezing quietly is the failure this rule exists to prevent.
+    for f in &sig.detection_update_failures {
+        let signature = format!("{}:{}", f.component, f.version);
+        if is_dismissed(&sig.dismissed, RULE_DETECTION_UPDATE_FAILED, &signature) {
+            continue;
+        }
+        out.push(Proposal {
+            setting: String::new(),
+            current: format!("{} update rejected", f.component),
+            proposed: "a bundle that passes validation".to_string(),
+            rationale: format!(
+                "The injection-detection {} update{} was REJECTED before activation, and the \
+                 previous data is still live: {}. Nothing is degraded right now, but this \
+                 component is not getting fresher either — check the manifest/bundle per \
+                 MAINTENANCE.md → \"Detection updater\", then re-run Check now.",
+                f.component,
+                if f.version.is_empty() {
+                    String::new()
+                } else {
+                    format!(" to `{}`", f.version)
+                },
+                f.reason
+            ),
+            rule_id: RULE_DETECTION_UPDATE_FAILED,
+            signature,
+            warn_only: true,
+            action: None,
+        });
     }
 
     // Feature 4 — drift.read_bypass.v1: the agent routes around the advisor
@@ -1892,5 +1998,102 @@ mod tests {
             let both = ids.contains(&RULE_ADOPT_SUBSTITUTE) && ids.contains(&RULE_ADVISOR_LINES);
             assert!(!both, "rate={rate} fired both rules: {ids:?}");
         }
+    }
+
+    // ── V32 Phase C3 — detection-updater canaries ───────────────────────
+
+    use crate::offload::detection::updater::{AvailableUpdate, FailedUpdate};
+
+    /// The consumer for check-only mode: a recorded offer becomes a card that
+    /// names both versions and points at where to take it.
+    #[test]
+    fn an_available_detection_update_raises_a_warn_only_card() {
+        let sig = Signals {
+            detection_updates: vec![AvailableUpdate {
+                component: "classifier".into(),
+                installed: String::new(),
+                available: "22m-2".into(),
+                notes: "multilingual variant".into(),
+            }],
+            ..Signals::default()
+        };
+        let p = evaluate(&sig)
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_UPDATE_AVAILABLE)
+            .expect("fires");
+        assert!(p.warn_only, "there is nothing safe to auto-apply");
+        assert!(p.setting.is_empty());
+        assert_eq!(p.proposed, "22m-2");
+        assert_eq!(p.current, "(shipped)", "no installed version yet");
+        assert!(p.rationale.contains("classifier"));
+        assert!(p.rationale.contains("multilingual variant"), "{}", p.rationale);
+        assert_eq!(p.signature, "classifier:22m-2");
+    }
+
+    /// A rejected bundle is a card too — nothing is degraded, but a component
+    /// that refuses every candidate is freezing, and freezing quietly is the
+    /// failure the rule exists to catch.
+    #[test]
+    fn a_rejected_detection_update_raises_a_card_that_says_nothing_broke() {
+        let sig = Signals {
+            detection_update_failures: vec![FailedUpdate {
+                component: "rules".into(),
+                version: "2026.08.07".into(),
+                reason: "false-positive smoke failed: readme.txt matched Foo".into(),
+            }],
+            ..Signals::default()
+        };
+        let p = evaluate(&sig)
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_UPDATE_FAILED)
+            .expect("fires");
+        assert!(p.warn_only);
+        assert!(p.rationale.contains("previous data is still live"));
+        assert!(p.rationale.contains("false-positive smoke failed"));
+        assert_eq!(p.signature, "rules:2026.08.07");
+    }
+
+    /// Dismissal is keyed to the VERSION, so declining one bundle does not
+    /// silence the next — the whole point of a freshness canary.
+    #[test]
+    fn a_dismissed_detection_card_refires_on_the_next_version() {
+        let update = |v: &str| AvailableUpdate {
+            component: "rules".into(),
+            installed: "2026.07.01".into(),
+            available: v.into(),
+            notes: String::new(),
+        };
+        let dismissed = vec![DismissedRule {
+            rule_id: RULE_DETECTION_UPDATE_AVAILABLE.to_string(),
+            signature: "rules:2026.08.07".to_string(),
+        }];
+        let same = Signals {
+            detection_updates: vec![update("2026.08.07")],
+            dismissed: dismissed.clone(),
+            ..Signals::default()
+        };
+        assert!(!evaluate(&same)
+            .iter()
+            .any(|p| p.rule_id == RULE_DETECTION_UPDATE_AVAILABLE));
+        let next = Signals {
+            detection_updates: vec![update("2026.09.01")],
+            dismissed,
+            ..Signals::default()
+        };
+        assert!(evaluate(&next)
+            .iter()
+            .any(|p| p.rule_id == RULE_DETECTION_UPDATE_AVAILABLE));
+    }
+
+    /// The healthy steady state — auto mode applying updates and clearing both
+    /// records — says nothing at all.
+    #[test]
+    fn a_healthy_updater_raises_no_detection_card() {
+        let ids: Vec<&str> = evaluate(&Signals::default())
+            .iter()
+            .map(|p| p.rule_id)
+            .collect();
+        assert!(!ids.contains(&RULE_DETECTION_UPDATE_AVAILABLE));
+        assert!(!ids.contains(&RULE_DETECTION_UPDATE_FAILED));
     }
 }

@@ -1152,9 +1152,10 @@ pub async fn offload_reload_mcp(
     Ok(service.status().await)
 }
 
-/// V32 Phase C: how much of the injection-detection surface is actually live —
-/// signature rule files loaded/failed and whether the classifier's weights are
-/// installed. Drives the Settings → Tools → Detection readout.
+/// V32 Phase C/C3: how much of the injection-detection surface is actually live
+/// — signature rule files loaded/failed, whether the classifier's weights are
+/// installed, and (C3) the updater's installed/available versions, last check
+/// and per-component modes. Drives the Settings → Tools → Detection readout.
 ///
 /// `reload = true` recompiles the rules from disk first, which is what the
 /// "Reload rules" button calls after the user edits a file in
@@ -1163,18 +1164,98 @@ pub async fn offload_reload_mcp(
 /// runtime's worker.
 #[tauri::command]
 pub async fn detection_status(
+    state: State<'_, AppState>,
     reload: bool,
 ) -> AppResult<crate::offload::detection::DetectionStatus> {
+    let settings = state.settings.current();
     let status = tokio::task::spawn_blocking(move || {
         if reload {
-            crate::offload::detection::reload()
+            crate::offload::detection::reload(&settings)
         } else {
-            crate::offload::detection::status()
+            crate::offload::detection::status(&settings)
         }
     })
     .await
     .map_err(|e| AppError::Offload(format!("detection status task failed: {e}")))?;
     Ok(status)
+}
+
+/// V32 Phase C3: run an update check right now for one component (or both when
+/// `component` is omitted), returning the refreshed detection status.
+///
+/// `apply = true` is the Settings "Apply" button: it overrides a `check-only`
+/// mode for this one run so an explicit click can take an offered update
+/// without the user flipping a setting and waiting for a tick. It never
+/// overrides `off` — a component the user turned off stays off.
+///
+/// The whole run (network + validation + swap) is awaited, because the caller
+/// is a button whose next action is to re-render the result.
+#[tauri::command]
+pub async fn detection_check_now(
+    state: State<'_, AppState>,
+    component: Option<String>,
+    apply: bool,
+) -> AppResult<crate::offload::detection::DetectionStatus> {
+    use crate::offload::detection::updater::{self, manifest::Component};
+    let components: Vec<Component> = match component.as_deref() {
+        None | Some("") => Component::ALL.to_vec(),
+        Some(name) => vec![Component::parse(name).ok_or_else(|| {
+            AppError::Offload(format!(
+                "unknown detection component `{name}` (expected \"rules\" or \"classifier\")"
+            ))
+        })?],
+    };
+    let settings = state.settings.current();
+    updater::run_live(&components, &settings, apply).await;
+    Ok(crate::offload::detection::status(&settings))
+}
+
+/// V32 Phase C3: restore a component's retained previous version — the Settings
+/// Revert button. Blocking (file moves plus a YARA recompile or an `ort`
+/// session rebuild), so it runs on the blocking pool.
+#[tauri::command]
+pub async fn detection_revert(
+    state: State<'_, AppState>,
+    component: String,
+) -> AppResult<crate::offload::detection::DetectionStatus> {
+    use crate::offload::detection::updater::{self, manifest::Component};
+    let c = Component::parse(&component).ok_or_else(|| {
+        AppError::Offload(format!(
+            "unknown detection component `{component}` (expected \"rules\" or \"classifier\")"
+        ))
+    })?;
+    tokio::task::spawn_blocking(move || updater::revert_live(c))
+        .await
+        .map_err(|e| AppError::Offload(format!("detection revert task failed: {e}")))?;
+    let settings = state.settings.current();
+    Ok(crate::offload::detection::status(&settings))
+}
+
+/// V32 Phase C3: open `<exe-dir>/detection/rules.d/` in the host file manager,
+/// creating it first so the call does not fail on a layout where the folder was
+/// never staged. Same shape as [`content_open_folder`] — one pattern for "show
+/// me this directory".
+#[tauri::command]
+pub async fn detection_open_rules_folder() -> AppResult<()> {
+    let dir = crate::offload::detection::signature::rules_dir().ok_or_else(|| {
+        AppError::Settings("the rules directory could not be resolved".to_string())
+    })?;
+    if let Err(e) = std::fs::create_dir_all(dir.join("local")) {
+        return Err(AppError::Settings(format!(
+            "create_dir_all {}: {e}",
+            dir.display()
+        )));
+    }
+    let result = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&dir).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&dir).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&dir).spawn()
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| AppError::Settings(format!("open folder: {e}")))
 }
 
 /// V8-03: buffered `llama-server` output for a backend (primary when `name`
@@ -2267,6 +2348,14 @@ pub async fn graph_usage_advice(
     };
     let e1_pass = hv.e1_status.trim().eq_ignore_ascii_case("pass");
 
+    // V32 Phase C3: the detection updater's two canaries. Read from its
+    // in-memory state cache — no disk and no clock, so this is safe on the
+    // advice poll's cadence — and unlike every other signal here they are not
+    // per-root: the detection data is process-wide, so the same card shows in
+    // whichever project the user happens to have open.
+    let (detection_updates, detection_update_failures) =
+        crate::offload::detection::updater::advisor_signals();
+
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
     // (whose own session count may be far lower). Both this filter and the
@@ -2306,6 +2395,8 @@ pub async fn graph_usage_advice(
         redundant_reads_per_session,
         redundant_read_sessions,
         e1_pass,
+        detection_updates,
+        detection_update_failures,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not

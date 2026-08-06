@@ -61,7 +61,8 @@ use crate::ipc::commands::{
     checks_validate_pattern, close_settings_window, compose_attach_image, compose_content_changed,
     compose_templates, compose_templates_global_get, compose_templates_global_set,
     compose_templates_project_get, consume_settings_deep_link, content_clear, content_open_folder,
-    detection_status, get_claude_usage, get_system_stats, graph_architecture,
+    detection_check_now, detection_open_rules_folder, detection_revert, detection_status,
+    get_claude_usage, get_system_stats, graph_architecture,
     graph_context_preview, graph_cycles, graph_dead_exports, graph_fact_add, graph_fact_update,
     graph_facts, graph_history,
     graph_ignore_pick, graph_impact, graph_language_census, graph_memory, graph_memory_clear,
@@ -857,6 +858,17 @@ fn main() {
 
             spawn_settings_broadcast(app.handle().clone(), settings_for_setup.clone());
 
+            // V32 Phase C3 (locked decision 13): keep the detection data fresh
+            // — a debounced launch check plus a periodic due-ness poll, per
+            // component, against a curated manifest. Spawned unconditionally:
+            // the task re-reads settings on every tick, so turning a component
+            // on later needs no restart, and with both components `off` a tick
+            // returns before touching the network or the disk. Deliberately
+            // NOT gated on `offload.enabled` — detection guards content that
+            // reaches Claude/OpenCode tabs through the proxy too, so its data
+            // must stay current whatever the worker is doing.
+            offload::detection::updater::spawn_scheduler(settings_for_setup.clone());
+
             // Apply the project-derived window title. The hardcoded
             // "cImp" from tauri.conf.json is what the OS sees before
             // this fires; this overwrite happens during setup so the
@@ -970,6 +982,9 @@ fn main() {
             offload_service_status,
             offload_reload_mcp,
             detection_status,
+            detection_check_now,
+            detection_revert,
+            detection_open_rules_folder,
             offload_server_log,
             offload_server_metrics,
             graph_status,

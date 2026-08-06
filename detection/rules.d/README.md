@@ -39,6 +39,31 @@ files still load** — a typo in one hand-written local rule must never take the
 whole signature layer offline. The Settings → Tools → Detection block shows the
 loaded/failed file counts.
 
+## The auto-updater (V32 Phase C3)
+
+cImp checks a curated manifest daily (Settings → Tools → Detection → *Detection
+updates*; mode `auto` for rules by default) and replaces the shipped bundle when
+a newer one validates. Three things worth knowing if you keep rules of your own:
+
+- **`local/` is never touched.** The updater enumerates only the top level of
+  `rules.d`; it never opens, lists or deletes anything in `local/`. This is
+  structural — `store::managed_rule_files` is non-recursive — not a filter
+  someone could forget.
+- **Identifier collisions still cost the LOCAL file.** The shipped bundle is
+  read first, so if a new bundle introduces a rule whose identifier matches one
+  of yours, YARA rejects the *set* and yours is the file dropped (with a WARN,
+  and counted in the Settings readout). Prefixing yours — `My_…` — avoids it.
+- **A candidate bundle is validated before it goes live**: it must compile
+  clean and inside a time budget, scan the control documents in
+  `detection/smoke/` inside a per-document budget, match every hostile control
+  and match no benign one. Failure keeps the old bundle live and raises an
+  Advisor card. The previous bundle is retained under
+  `<exe-dir>/detection-updates/previous/` with a one-click Revert in Settings.
+
+Note that validation compiles the *staged bundle alone* — your `local/` rules
+are not part of that check, which is deliberate: a typo in a file you own must
+not be able to block a security update.
+
 ## Writing your own rules
 
 Drop a `.yar` file in `rules.d/local/`. Rule identifiers must be unique across

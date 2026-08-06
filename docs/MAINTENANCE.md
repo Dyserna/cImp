@@ -66,6 +66,11 @@ apply / defer / watch decision before anything is changed.
      features, CLI flags that would let an existing cImp feature be built
      better (e.g. a supported API replacing a scraped/undocumented one) or
      enable a new feature.
+5b. **Detection updater health + bundle curation (V32 C3).** Review whether the
+   daily checks happened and whether anything failed validation, then curate the
+   next rule bundle — see *Injection detection & its updater* below for where to
+   look and what to publish. The run no longer refreshes the rules by editing
+   files; it publishes to the channel the app pulls from.
 6. **Feature-opportunity scan.** For each major feature area (TTS/STT, offload,
    code graph/intelligence, audits, usage tracking, TUI), ask: has anything
    found in steps 3–5 unlocked a better approach? Also re-check the
@@ -200,7 +205,10 @@ version edit — `cargo update` will not move them.
 | `notify` | `8` | FS watcher (incremental re-index) | `ReadDirectoryChangesW` on Windows. Bumped 6 → 8 in the 2026-08-04 run. |
 | `rfd` | `0.17` | Native file/folder picker (`graph_ignore_pick` in Settings) | `default-features = false` + `xdg-portal,wayland` — **not** gtk3, so the Linux build doesn't link a second GTK next to Tauri's. 0.17 DELETED the `tokio` feature (xdg-portal now always drives `pollster`; a non-issue — `graph_ignore_pick` already runs the sync dialog in `spawn_blocking`). `wayland` supplies the Linux parent-window handle and is the source of the two accepted quick-xml advisories in `.cargo/audit.toml` (RUSTSEC-2026-0194/0195 — Linux-only build-time codegen via `wayland-scanner`, no runtime exposure). |
 | `similar` | `3` | Line-level unified diff for the read advisor's diff-substitute (V17) | `default-features = false`, `features = ["std", "text"]` (pure Rust, no C-FFI) — 3.x split `std` out of the always-on baseline, so it must now be named explicitly. Single call site: `graph::context::unified_diff`. |
-| `url` | `2` | Parses/classifies Preview-tab navigation targets | Already transitive via reqwest/tauri, so the direct dep adds no tree entries. |
+| `url` | `2` | Parses/classifies Preview-tab navigation targets | Already transitive via reqwest/tauri, so the direct dep adds no tree entries. Also the V32 detection layer's URL/host extraction. |
+| `yara-x` | `1.12` | V32 signature screen — YARA rules over EXTERNAL tool results | `default-features = false` + `constant-folding`/`fast-regexp`/`linkme`: the default `default-modules` set drags in the whole PE/ELF/dotnet/crypto malware-analysis stack for a scanner that only sees UTF-8 text. **Version tracks the MSRV** — 1.12 is the newest release whose own `rust-version` is ≤ 1.88 (resolver v3 enforces it). Pure Rust; no libyara, no C toolchain. |
+| `tokenizers` | `0.23` | V32 classifier screen — DeBERTa-v3 vocabulary from `tokenizer.json` | `default-features = false` + `fancy-regex`: the defaults are `progressbar` (a CLI bar in a GUI app), `esaxx_fast` (C++) and `onig` (C) — the pure-Rust regex alternative keeps it building with cargo alone. |
+| `sha2` | `0.10` | V32 C3 detection updater — SHA-256 over every downloaded artifact, verified before the bytes hit disk or a parser | Already transitive (rustls/tauri/cozo), so the direct dep adds no tree entries. Deliberately not hand-rolled: this is the one code path whose job is rejecting tampered files. |
 | Windows-only deps *(`cfg(windows)`)* | see notes | Registry probe, process reaping, WebView2 capture | `winreg 0.52` (Git Bash detection in `shell::detect`); `windows-sys 0.59` (Job Object backstop in `process_guard` — version matched to Tauri's to avoid a duplicate); `webview2-com 0.38` (`ICoreWebView2::CapturePreview`, **pinned to exactly what wry 0.55 resolves to** so the COM type is nominally identical, not just GUID-compatible); `windows 0.61` (`SHCreateStreamOnFileW` + `STGM_*`, pinned to match `webview2-com` 0.38.2's own dep). Drift in the last two is a compile error, not a silent misbehavior. |
 | `filetime` *(dev-dep)* | `0.2` | Backdates a dir mtime in `attach::tests` (exercises `attach::prune`'s age cutoff) | Already transitive; direct pin adds no tree entries. |
 
@@ -662,6 +670,58 @@ MCP host (V8).*
   `LLAMA_ARG_KV_UNIFIED` set in the environment instead of on the command line.
   A *remote* unified-KV server has no command to parse — give it a per-slot
   `declared_context`.
+
+### Injection detection & its updater (V32 Phase C / C3)
+
+*Architecture: `src-tauri/src/offload/detection/` — `signature.rs` (yara-x),
+`classifier.rs` (Prompt Guard 2 under `ort`), `updater/` (decision 13).*
+
+**The run's role changed with C3.** Refreshing the rules is no longer something
+the maintenance run *does* — the app checks a curated manifest daily and applies
+validated rule bundles itself. The run now does two things instead:
+
+1. **Review updater HEALTH.** Per component (`rules`, `classifier`):
+   - Settings → Tools → Detection → *Detection updates* shows installed /
+     available version, last-check time and the last outcome verbatim.
+   - Tool Activity → filter `injection_flag`, source `updater` — one row per
+     check with `ok` reflecting the outcome (`applied` / `up-to-date` /
+     `available` / `reverted` are healthy, `rejected` is not).
+   - Advisor cards: `detection.update_available.v1` (something newer is
+     waiting on a decision) and `detection.update_failed.v1` (a bundle was
+     rejected; the old data is still live).
+   - On-disk record: `<exe-dir>/detection-updates/state.json`.
+   Two symptoms to act on: **checks that never happened** (`last_check_ms` far
+   in the past with the mode not `off` — the scheduler or the network is the
+   suspect) and **a component rejecting every bundle** — nothing is degraded,
+   but that component has stopped getting fresher, which is the failure the
+   whole phase exists to prevent.
+2. **Curate the upstream bundle.** Refresh the rules from the Vigil / garak
+   corpora and our own additions, publish them as `detection-v1` release assets
+   with a new dated version, and grow `detection/smoke/` in the same change: a
+   new rule family arrives with a hostile control proving it fires; a
+   field-observed false positive arrives as a benign control that would have
+   caught it. The publish checklist is in `detection/manifest.example.json`.
+
+Facts worth keeping in mind when something looks wrong:
+
+- **`rules.d/local/` is never touched** by the updater — structurally, not by a
+  filter (`store::managed_rule_files` is non-recursive). Hand-written rules
+  survive every update; report anything else as a bug, not a config issue.
+- **Assets may only come from the manifest's own directory.** Artifact URLs
+  must start with the manifest URL minus its last segment, so a manifest cannot
+  redirect a download elsewhere. The `detection_update_manifest_url` override
+  moves both together — that is how a staged bundle is tested locally.
+- **Validation gates, in order:** compiles clean (any rejected file fails the
+  whole bundle), compiles inside 5 s, scans each control document inside 750 ms,
+  no benign control matches, every hostile control matches. The last one is
+  what stops a match-nothing bundle from silently disabling the layer.
+- **A rejected bundle changes nothing on disk** and the previous version stays
+  retained under `detection-updates/previous/`, one-click revertible in
+  Settings.
+- **The classifier ships nothing yet.** Its component stays out of the published
+  manifest until the Prompt Guard 2 weights are on `models-v1` (see
+  `models/CHECKSUMS.txt`); publishing a `classifier` entry with no assets behind
+  it turns every daily check into a rejected-update card.
 
 ### Code graph grammars (V9-02)
 

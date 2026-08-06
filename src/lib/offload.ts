@@ -214,6 +214,45 @@ export interface DetectionStatus {
     /// Why the classifier is not live, when it is not.
     error: string | null;
   };
+  /// V32 Phase C3 (mirror of Rust `detection::updater::UpdaterStatus`): where
+  /// the auto-updater stands for each component. Rides this same status so the
+  /// Settings poller gets it in one round trip.
+  updater: UpdaterStatus;
+}
+
+/// One updatable detection component's update state.
+export interface DetectionComponentStatus {
+  /// `rules` | `classifier` — the wire name every updater command takes.
+  component: string;
+  /// `off` | `check` | `auto`, matching the settings string exactly.
+  mode: string;
+  /// Empty until the first successful update: the shipped bundle carries no
+  /// manifest version.
+  installed_version: string;
+  previous_version: string;
+  /// True exactly when Revert has something to restore.
+  can_revert: boolean;
+  /// A newer version found but not applied — what Apply would take.
+  available_version: string;
+  /// The curator's note for it. REMOTE TEXT: rendered as text (Svelte escapes
+  /// it), never as markup.
+  available_notes: string;
+  /// Epoch ms; 0 = never checked.
+  last_check_ms: number;
+  last_outcome: string;
+  last_ok: boolean;
+  /// Non-empty when the last attempt was rejected. The old data is still live.
+  last_failure: string;
+}
+
+export interface UpdaterStatus {
+  components: DetectionComponentStatus[];
+  /// The manifest URL actually in use, so "nothing ever updates" is
+  /// diagnosable without opening the settings file.
+  manifest_url: string;
+  interval_hours: number;
+  rules_dir: string;
+  state_dir: string;
 }
 
 /// Read the detection status. `reload = true` recompiles the YARA rules from
@@ -226,6 +265,45 @@ export async function detectionStatus(reload = false): Promise<DetectionStatus |
   } catch (e) {
     console.warn('detection_status failed', e);
     return null;
+  }
+}
+
+/// V32 Phase C3: run an update check now. `component` omitted checks both;
+/// `apply = true` overrides a `check-only` mode for this one run (never `off`).
+/// Awaits the whole run — download, validation and swap included — and returns
+/// the refreshed status, so the caller re-renders the outcome rather than
+/// polling for it.
+export async function detectionCheckNow(
+  component?: string,
+  apply = false,
+): Promise<DetectionStatus | null> {
+  try {
+    return await invoke<DetectionStatus>('detection_check_now', {
+      component: component ?? null,
+      apply,
+    });
+  } catch (e) {
+    console.warn('detection_check_now failed', e);
+    return null;
+  }
+}
+
+/// V32 Phase C3: restore a component's retained previous version.
+export async function detectionRevert(component: string): Promise<DetectionStatus | null> {
+  try {
+    return await invoke<DetectionStatus>('detection_revert', { component });
+  } catch (e) {
+    console.warn('detection_revert failed', e);
+    return null;
+  }
+}
+
+/// V32 Phase C3: open `detection/rules.d/` in the host file manager.
+export async function detectionOpenRulesFolder(): Promise<void> {
+  try {
+    await invoke('detection_open_rules_folder');
+  } catch (e) {
+    console.warn('detection_open_rules_folder failed', e);
   }
 }
 

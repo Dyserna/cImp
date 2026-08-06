@@ -1589,6 +1589,48 @@ pub struct OffloadSettings {
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
     pub detection_classifier_threshold: f32,
+    /// V32 Phase C3 (locked decision 13): what the auto-updater may do with the
+    /// **signature rule bundle** — `"off"` / `"check"` / `"auto"`.
+    ///
+    /// Default `auto`, as the decision locks. Rules are small text files behind
+    /// a validate-before-activate gauntlet with a one-click revert, and a stale
+    /// signature set is the failure mode the updater exists to prevent — so the
+    /// rules half is the one that maintains itself.
+    ///
+    /// An unrecognized string is read as `check` (see
+    /// `detection::updater::Mode::parse`): a typo must neither silently disable
+    /// the updater nor silently grant it activation rights.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_update_rules_mode: String,
+    /// V32 Phase C3: the same for the **classifier weights**.
+    ///
+    /// Default `check` — deliberately different from the rules default. A model
+    /// swap can shift false-positive behaviour across every page the app ever
+    /// fetches, and that is a change the user should agree to rather than wake
+    /// up to. The Advisor card and the Settings Apply button are how they say
+    /// yes.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_update_classifier_mode: String,
+    /// V32 Phase C3: hours between update checks. Default 24; floored at
+    /// `detection::updater::MIN_INTERVAL_HOURS` so a mistyped `0` cannot become
+    /// a request loop against a release asset.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_update_interval_hours: u32,
+    /// V32 Phase C3: override for the pinned manifest URL. Empty (the default)
+    /// means `detection::updater::manifest::DEFAULT_MANIFEST_URL`.
+    ///
+    /// Exists for the milestone's live-verification recipe — pointing the
+    /// updater at a locally staged bundle is the only way to exercise the
+    /// download/validate/swap path before the real release assets are
+    /// published. It does NOT weaken the asset-origin invariant: artifact URLs
+    /// must still live under whatever manifest URL is in force, so an override
+    /// relocates the whole bundle, never just part of it.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub detection_update_manifest_url: String,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1636,6 +1678,22 @@ impl std::fmt::Debug for OffloadSettings {
             .field(
                 "detection_classifier_threshold",
                 &self.detection_classifier_threshold,
+            )
+            .field(
+                "detection_update_rules_mode",
+                &self.detection_update_rules_mode,
+            )
+            .field(
+                "detection_update_classifier_mode",
+                &self.detection_update_classifier_mode,
+            )
+            .field(
+                "detection_update_interval_hours",
+                &self.detection_update_interval_hours,
+            )
+            .field(
+                "detection_update_manifest_url",
+                &self.detection_update_manifest_url,
             )
             .finish()
     }
@@ -1703,6 +1761,13 @@ impl Default for OffloadSettings {
             detection_signature_enabled: true,
             detection_classifier_enabled: true,
             detection_classifier_threshold: 0.9,
+            // The locked C3 defaults: rules maintain themselves, the
+            // classifier asks. See the field docs for why they differ.
+            detection_update_rules_mode: "auto".into(),
+            detection_update_classifier_mode: "check".into(),
+            detection_update_interval_hours: 24,
+            // Empty = the pinned manifest URL.
+            detection_update_manifest_url: String::new(),
         }
     }
 }

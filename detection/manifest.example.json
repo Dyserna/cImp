@@ -1,0 +1,86 @@
+{
+  "_comment": [
+    "EXAMPLE ONLY — this file is documentation, not a live manifest. cImp never",
+    "reads it: the updater fetches the pinned URL in",
+    "src-tauri/src/offload/detection/updater/manifest.rs::DEFAULT_MANIFEST_URL",
+    "(https://github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json).",
+    "It is committed so the schema has a worked example next to the data it",
+    "describes, and so the first real publish is a copy-edit rather than a",
+    "design step.",
+    "",
+    "DEPLOY FOLLOW-UP (V32 Phase C3 — nothing updates until these are done):",
+    "  1. Create the `detection-v1` release on Dyserna/cImp. Fixed tag, assets",
+    "     replaced/added over time — the `models-v1` precedent. Never a moving",
+    "     'latest' pointer: the pinned URL is what makes the channel curated.",
+    "  2. Curate the first bundle from detection/rules.d/*.yar (the shipped",
+    "     seed) plus whatever the current maintenance run pulled from the Vigil",
+    "     and garak corpora. Version it as a DATE (e.g. 2026.08.07) — the rule",
+    "     bundle is not semver.",
+    "  3. Verify the candidate locally before publishing: point",
+    "     offload.detection_update_manifest_url at a local http server serving",
+    "     a staged copy and confirm the run reports `applied`. That exercises",
+    "     the same gauntlet the release will face, including the smoke corpus",
+    "     in detection/smoke/.",
+    "  4. Upload the .yar files as release assets. Asset names must be unique",
+    "     on the release across versions (assets are flat), hence the",
+    "     `<version>-<file>` convention in the URLs below.",
+    "  5. Write manifest.json with the real sha256 (sha256sum) and byte sizes,",
+    "     and upload it LAST — a manifest published before its assets makes",
+    "     every install fail a check it would otherwise have skipped.",
+    "  6. Set min_app_version only when a bundle actually needs a newer app",
+    "     (e.g. a rule using a yara-x feature an older build cannot compile).",
+    "  7. The `classifier` component below stays UNPUBLISHED until the Prompt",
+    "     Guard 2 weights themselves are (see models/CHECKSUMS.txt). Publishing",
+    "     a classifier entry with no assets behind it would turn every daily",
+    "     check into a failed download and a rejected-update Advisor card."
+  ],
+  "schema": 1,
+  "generated": "2026-08-07T00:00:00Z",
+  "components": [
+    {
+      "component": "rules",
+      "version": "2026.08.07",
+      "notes": "Seed bundle: 19 rules across the instruction-override, role-forgery, guardrail-removal, prompt-extraction, exfiltration, tool-steering, hidden-text and encoded-payload families.",
+      "files": [
+        {
+          "name": "injection_core.yar",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 0,
+          "url": "https://github.com/Dyserna/cImp/releases/download/detection-v1/2026.08.07-injection_core.yar"
+        },
+        {
+          "name": "exfiltration.yar",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 0,
+          "url": "https://github.com/Dyserna/cImp/releases/download/detection-v1/2026.08.07-exfiltration.yar"
+        },
+        {
+          "name": "obfuscation.yar",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 0,
+          "url": "https://github.com/Dyserna/cImp/releases/download/detection-v1/2026.08.07-obfuscation.yar"
+        }
+      ]
+    },
+    {
+      "component": "classifier",
+      "version": "22m-1",
+      "min_app_version": "0.51.0",
+      "notes": "Llama Prompt Guard 2 22M, ONNX export. NOT PUBLISHED — see the deploy note above and models/CHECKSUMS.txt.",
+      "files": [
+        {
+          "name": "model.onnx",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 0,
+          "url": "https://github.com/Dyserna/cImp/releases/download/detection-v1/22m-1-model.onnx"
+        },
+        {
+          "name": "tokenizer.json",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 0,
+          "url": "https://github.com/Dyserna/cImp/releases/download/detection-v1/22m-1-tokenizer.json"
+        }
+      ]
+    }
+  ]
+}

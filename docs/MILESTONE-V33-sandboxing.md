@@ -1,6 +1,6 @@
 # V33 — OS Sandboxing & Max Paranoia Mode
 
-**Status:** SPEC — not yet coded (2026-08-06). GitHub issue: TBD.
+**Status:** SPEC — not yet coded (2026-08-06). GitHub: milestone 6, umbrella #30.
 **Builds on:** the two spawn seams cImp owns — `pty/manager.rs::PtyLaunchSpec:20`
 (every AI tab: Claude, OpenCode, future harnesses) and the offload worker's
 `run_command` children (`offload/tools/run_command.rs`, plain non-PTY `Stdio`

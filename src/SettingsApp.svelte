@@ -529,6 +529,14 @@
       hint: 'The pinned OpenCode permission block and the data-not-instructions paragraph in the session guidance. Off: OpenCode inherits its upstream defaults and the session is never told how to read cImp’s markers.',
     },
     {
+      key: 'opencode_native_gate',
+      field: 'opencode_native_gate_enabled',
+      label: 'OpenCode native-tool gating',
+      spawnBaked: true,
+      scopes: ['tabs'],
+      hint: 'OFF BY DEFAULT — the only control here that does. With it on, an OpenCode tab that has read external content is refused its OWN bash/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own webfetch/websearch instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside OpenCode’s process, so a nested ungated `opencode`, OPENCODE_PURE=1, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on Claude tabs.',
+    },
+    {
       key: 'terminal_escape_hygiene',
       field: 'terminal_escape_hygiene_enabled',
       label: 'Terminal escape hygiene',
@@ -1420,15 +1428,17 @@
       cwd: t.cwd,
       env: t.env,
       use_local_provider: t.use_local_provider,
-      // V32 Phase G: two of this tab's injection overrides are SPAWN-BAKED
-      // (native-web visibility and consumer hygiene), so flipping either needs
-      // the tab restarted before it means anything. The other six resolve per
-      // call and are deliberately excluded — a restart hint for a change that
-      // takes effect immediately is how a hint stops being read. This mirrors
-      // `spawn_inject_sig`'s split on the backend.
+      // V32 Phase G: three of this tab's injection overrides are SPAWN-BAKED
+      // (native-web visibility, consumer hygiene, and V32 Phase H's OpenCode
+      // native-tool gate, whose flag is compiled into the generated plugin), so
+      // flipping any of them needs the tab restarted before it means anything.
+      // The others resolve per call and are deliberately excluded — a restart
+      // hint for a change that takes effect immediately is how a hint stops
+      // being read. This mirrors `spawn_inject_sig`'s split on the backend.
       injection_spawn_baked: [
         t.injection_overrides?.native_web ?? 'inherit',
         t.injection_overrides?.consumer_hygiene ?? 'inherit',
+        t.injection_overrides?.opencode_native_gate ?? 'inherit',
       ],
     };
   }

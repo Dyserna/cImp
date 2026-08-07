@@ -135,6 +135,17 @@ const RAW_FIELDS: &[RawField] = &[
                resolver also reads it in `spawn_sig` (spawn-baked ⇒ restart hint).",
     },
     RawField {
+        needle: "opencode_native_gate_enabled",
+        allowed: &[SCHEMA, RESOLVER],
+        note: "L2 for V32 Phase H's OpenCode native-tool gate. Enforcement reads \
+               `tabs::config::opencode_native_gate_for` (a thin wrapper over `effective`, feeding \
+               the plugin's baked flag and `opencode_plugin_wanted`) and \
+               `loopback::native_gate_verdict` (which resolves it live for the plugin's \
+               `/latch/state` query); the resolver also reads it in `spawn_sig`, because the flag \
+               is compiled into the plugin at spawn and a flip owes the user a restart hint. The \
+               ONE L2 flag that defaults false — see `Feature::default_enabled`.",
+    },
+    RawField {
         needle: "terminal_escape_hygiene_enabled",
         allowed: &[SCHEMA, RESOLVER],
         note: "L2 for the escape stripper. App-wide (no L3 row); enforcement is \

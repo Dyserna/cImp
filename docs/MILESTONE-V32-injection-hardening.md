@@ -638,6 +638,99 @@ declares its class AND its mutation capability in one reviewed place.
   the toggle can default off without a second failure mode. The Phase F
   manual override moves this gate with it: a user who flips to local gets
   the native local tools back, which is the whole point of decision 15.
+  **Phase H amendment 2026-08-07 (as built).**
+  - **The feature** is `Feature::OpencodeNativeGate` (`opencode_native_gate`),
+    L2 `offload.injection.opencode_native_gate_enabled` (additive
+    `#[serde(default)]`, no schema bump) plus a per-tab L3 cell. Worker scope is
+    a **type** fact, not a rule: there is simply no field for it on
+    `WorkerInjectionOverrides`, so a worker override is unrepresentable and
+    `set()` returns `None` for it.
+  - **The first default-off control, and what that cost.** Phase G had one
+    predicate reading "every feature defaults on" as a law — `protection_reduced`
+    (and its frontend twin `reducedFeaturesFor`) counted *any* feature resolving
+    off as reduced protection. A default-off control would have raised the
+    ⛨ chip and the muted tab badge on every fresh install, which is how an
+    indicator stops being read. So `Feature::default_enabled()` was added,
+    "reduced" is now measured **against each feature's default**, and the report
+    row publishes `default_on` so the frontend applies the backend's rule rather
+    than a second list of defaults in TypeScript. Consequence, stated because it
+    is a deliberate asymmetry: a scope that switches the gate ON is *more*
+    protected than default and is likewise not "reduced". The migration test was
+    renamed to `an_untouched_config_resolves_every_feature_to_its_default` and
+    now names the default-off set explicitly — a second one appearing by
+    accident fails there.
+  - **The tool-name mapping lives in ONE reviewed place**, and it is deliberately
+    a *second* table beside the class table: `toolclass::OPENCODE_NATIVE_TABLE`.
+    `classify`'s locked unknown-⇒-EXTERNAL invariant is right for cImp's routed
+    vocabulary and wrong for a harness registry — it would classify `todowrite`
+    as External and the gate would refuse a bookkeeping tool under a LOCAL latch.
+    The new table is therefore **allowlist-only: an unlisted name is UNGATED**.
+    Local: `bash`, `read`, `glob`, `grep`, `edit`, `write`, `patch`,
+    `apply_patch`. Web: `webfetch`, `websearch` — and the beacon's own
+    `CIMP_WEB_TOOLS` is now rendered from the same table, so the two halves of
+    one hook cannot disagree about what "web" means. Two new fixed refusals
+    (`REFUSAL_NATIVE_LOCAL_BLOCKED` / `REFUSAL_NATIVE_WEB_BLOCKED`) rather than a
+    reuse of the proxied ones, which enumerate cImp's own tools and would read as
+    a lie the model can check.
+  - **`task` is deliberately NOT gated.** The E2 spike confirmed a sub-agent's
+    own tool calls fire the same hook in the child session, and `CIMP_TAB_ID` is
+    process-wide, so the child's `bash`/`read`/`webfetch` are refused at the same
+    latch — the leaves are closed, and gating the spawn would refuse an
+    orchestration primitive for nothing. Verified not to open a laundering path:
+    the child's session id never becomes the tab's live session (the V24
+    `parent_session_id` contract drops child tool events and marks only the
+    parent live), so `task` cannot rotate the latch or clear contamination.
+    `skill`/`todowrite`/`question` are ungated for the same "no capability"
+    reason. Both refusals name the sub-agent path so a compromised model does not
+    read `task` as a way around; neither mentions the decision-15 override button
+    (a refusal that names the human's escape hatch teaches an injected page to
+    ask for it).
+  - **The endpoint is new, not an extension**: authenticated `POST /latch/state`
+    → `{ok, gate, latch, contaminated}`. `/latch/beacon` *mutates* (it engages
+    EXTERNAL), so reusing it for a read would latch a tab on every local file
+    read; `/status` is the whole-app view and answers nothing about *this* tab.
+    The backend resolves `injection::effective` and hands the plugin one boolean,
+    so no part of the hierarchy ships into JS. `gate` is the AND of
+    `OpencodeNativeGate` **and** `TaintLatch` — this gate enforces the latch's
+    boundary, so with the latch feature off there is no policy to enforce. That
+    AND is resolved live per query, which is what keeps the taint latch a live
+    feature even though the gate's own flag is spawn-baked. `LatchRegistry`
+    gained a read path (`view_for`) that does **not** create a row but **does**
+    `observe` — a stale `external` from a rotated session would deny the whole
+    local surface for a fresh conversation.
+  - **The cache**: an in-memory verdict with a 2 s TTL in the plugin, so the hot
+    path is a `Set` lookup and a clock read. A miss costs one loopback POST
+    (~1 ms on localhost, 1.5 s timeout); failures are cached like successes, so a
+    dead app costs one attempt per TTL rather than one per tool call. The beacon
+    invalidates the cache **before** its POST, because it is about to move the
+    very latch the cache describes and must invalidate even if the POST throws.
+    With the toggle off (the default) no query is ever made — zero added latency.
+  - **Ordering, and the property it preserves**: the gate half runs BEFORE the
+    beacon half, so a refused call never engages the latch or contaminates the
+    conversation — the same invariant the proxy-side `gate` has. The gate half is
+    the only code in the generated file allowed to throw; the beacon half keeps
+    its never-throws wrapper.
+  - **Spawn-baked**: `Feature::spawn_baked()` includes it, so `injection::spawn_sig`
+    carries every tab's resolved value automatically, and the L2 flag was added to
+    the `l2` array so a flip moves the signature even on an install with no AI
+    tabs. `opencode_plugin_wanted` gained the gate as a third disjunct — the E2
+    fail-open trap again: without it, turning the graph off would delete the file
+    carrying a gate the user switched on. `restartShape` in the Settings window
+    grew the matching third cell.
+  - **Honest limits are stated in the generated file itself**, not only here:
+    policy, not containment — it runs inside OpenCode's own process, so
+    `OPENCODE_PURE=1` or a nested ungated `opencode` walks around it, a
+    user-typed `!shell` and the raw PTY never reach a plugin hook, and `bash`
+    stays egress-capable by nature. OS containment remains V33's job.
+  - **Known residuals.** (a) The per-tab override row appears on Claude tabs too
+    and does nothing there: `injection_status` reports tabs through
+    `Scope::tab_only`, which carries no agent (Phase G's "override lookup keys on
+    the tab id alone"), so "OpenCode-only" is stated in the Settings hint rather
+    than structurally. (b) There is no JS-execution harness in the repo, so the
+    plugin's gate is pinned by Rust-side source assertions over the generated
+    file (both directions, the fail-open arms, the cache, the ordering, the
+    absence of `output.args`); its runtime behaviour was verified out-of-band
+    against a stubbed loopback during implementation, not in CI.
 - **F — native-web visibility modes + manual latch override (decisions 14
   + 15; user-decided 2026-08-07).** `native_web_visibility` setting
   (`off | sensor | deny`, default `sensor`): report-only beacon hooks

@@ -645,6 +645,7 @@ async fn handle_conn(
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
         ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
         ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
+        ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
         ("POST", "/latch/override") => handle_latch_override(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &app, &req).await,
@@ -1414,6 +1415,33 @@ impl LatchRegistry {
             );
         }
         view
+    }
+
+    /// V32 Phase H: this tab's current view, **read-only** — the state the
+    /// OpenCode plugin's native-tool gate decides against.
+    ///
+    /// Two properties, both deliberate:
+    ///
+    /// - **It does not create an entry.** A tab that has never made a gated call
+    ///   has nothing to report, and materializing a row for every poll would put
+    ///   tabs in `/status` that no tool call ever touched. Absent ⇒
+    ///   [`LatchView::default`] ⇒ `open` ⇒ the gate denies nothing. Fail-open by
+    ///   construction, not by a branch someone has to remember.
+    /// - **It DOES `observe`.** A stale `external` left over from a rotated
+    ///   session would deny `read`/`bash` for a whole fresh conversation — a
+    ///   false deny of the harness's core tools, which is far worse than the
+    ///   read-only purity of not touching the entry. `observe` is the same
+    ///   rotation rule `gate` and `beacon` apply, so the three cannot disagree
+    ///   about when a conversation ended.
+    fn view_for(&self, scope: &LatchScope) -> LatchView {
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        match tabs.get_mut(&scope.key()) {
+            Some(entry) => {
+                entry.observe(scope.session.as_deref());
+                entry.view()
+            }
+            None => LatchView::default(),
+        }
     }
 
     /// V32 Phase F (locked decision 15): apply a USER-initiated latch move.
@@ -3085,6 +3113,21 @@ struct LatchBeaconBody {
     tool: Option<String>,
 }
 
+/// A `POST /latch/state` body — V32 Phase H (locked decision 17).
+///
+/// Same two identity fields as [`LatchBeaconBody`] and nothing else: the query
+/// is "what is in force for this tab", and the answer must not depend on
+/// anything the *caller* claims about the tool it is about to run.
+#[derive(Deserialize)]
+struct LatchStateBody {
+    /// The cImp tab id. Absent ⇒ no scope ⇒ the fail-open answer (`gate:false`).
+    #[serde(default)]
+    tab: Option<String>,
+    /// `claude` / `opencode`, normalized through `source_for_consumer`.
+    #[serde(default)]
+    consumer: Option<String>,
+}
+
 /// A `POST /latch/override` body — V32 Phase F (locked decision 15).
 #[derive(Deserialize)]
 struct LatchOverrideBody {
@@ -3131,6 +3174,89 @@ async fn handle_latch_beacon(
     let policy = GatePolicy::resolve(&live_settings(app), scope.as_ref());
     let view = latches().beacon(scope.as_ref(), tool, policy);
     write_json(stream, 200, &serde_json::json!({ "ok": true, "latch": view })).await
+}
+
+/// V32 Phase H (locked decision 17): whether the OpenCode native-tool gate is
+/// **in force** for one tab — the single resolved boolean the plugin is told, so
+/// no part of the three-level hierarchy has to be reimplemented in JS.
+///
+/// It is the AND of two features, and the second one is the point:
+///
+/// - [`Feature::OpencodeNativeGate`] — the Phase H switch itself (default off).
+/// - [`Feature::TaintLatch`] — because this gate enforces *the latch's*
+///   boundary on tools cImp does not route. With the latch feature off the
+///   registry stops engaging (see [`GatePolicy`]), so the latch label the plugin
+///   would read is not a boundary anyone is maintaining; denying against it
+///   would be enforcement without a policy behind it.
+///
+/// Resolving it here rather than in the plugin is also what keeps the taint
+/// latch a LIVE feature: the gate's own flag is spawn-baked into the plugin
+/// file, but this AND is recomputed on every query, so switching the latch off
+/// stops the denials without a tab restart.
+fn native_gate_verdict(settings: &crate::settings::Settings, scope: &LatchScope) -> bool {
+    use crate::settings::injection::{effective, Feature};
+    let s = scope.injection();
+    effective(Feature::OpencodeNativeGate, s, settings) && effective(Feature::TaintLatch, s, settings)
+}
+
+/// `POST /latch/state`: the resolved containment state of one tab (V32 Phase H).
+///
+/// **Why a new route rather than an extension of an existing one.**
+/// `/latch/beacon` *mutates* — it engages the EXTERNAL latch — so reusing it for
+/// a read would latch a tab every time the model touched a local file.
+/// `/status` is the whole-app debug view (every tab, every feature, at every
+/// scope): far more than a hook on the hot path should parse, and it answers
+/// nothing about *this* tab without the plugin knowing which row is its own.
+/// This route answers exactly the two facts the gate needs, for one tab.
+///
+/// Behind the same bearer check as every other route (it precedes dispatch in
+/// [`handle_conn`]), because the reply describes a tab's containment posture.
+///
+/// **Always 200, and always fail-open in shape**: an unknown tab, a tab the
+/// proxy has never served, or a body with no identity at all all answer
+/// `{"gate": false, "latch": "open"}` — the values that deny nothing. The
+/// plugin's own error paths land on the same verdict, so "the app is down" and
+/// "the app says no gate" are the same behaviour rather than two.
+async fn handle_latch_state(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: LatchStateBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("opencode"));
+    let (gate, view) = match latch_scope(app, agent, body.tab.as_deref()) {
+        Some(scope) => (
+            native_gate_verdict(&live_settings(app), &scope),
+            latches().view_for(&scope),
+        ),
+        // No identity ⇒ nothing to resolve and nothing to enforce against.
+        None => (false, LatchView::default()),
+    };
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({
+            "ok": true,
+            // The RESOLVED verdict, not the stored switch: the plugin holds no
+            // part of the hierarchy.
+            "gate": gate,
+            // Flattened rather than nested so the hook reads one string. The
+            // full view rides along for a human reading a trace.
+            "latch": view.latch,
+            "contaminated": view.contaminated,
+        }),
+    )
+    .await
 }
 
 /// `POST /latch/override`: apply a user-initiated latch move (locked decision
@@ -4348,6 +4474,123 @@ mod tests {
             reg.gate(None, LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Clean)
         );
+    }
+
+    // ── V32 Phase H — the OpenCode native-tool gate's backend half ─────────
+
+    /// An OpenCode scope for `tab`.
+    fn oc_scope(tab: &str, session: Option<&str>) -> LatchScope {
+        LatchScope {
+            agent: "opencode",
+            tab: tab.to_string(),
+            session: session.map(str::to_string),
+        }
+    }
+
+    /// Settings carrying the builtin OpenCode tab, so a per-tab L3 cell has a
+    /// tab to attach to (`Settings::default()` ships an EMPTY tab list).
+    fn oc_settings() -> (crate::settings::Settings, String) {
+        let tab = match crate::settings::default_opencode_tab() {
+            crate::settings::TabConfig::AiTool(c) => c,
+            _ => unreachable!("default_opencode_tab is an AI tool tab"),
+        };
+        let id = tab.id.clone();
+        (
+            crate::settings::Settings {
+                tabs: vec![crate::settings::TabConfig::AiTool(tab)],
+                ..Default::default()
+            },
+            id,
+        )
+    }
+
+    /// The verdict the plugin is handed: **off by default**, on only when the
+    /// Phase H feature AND the taint latch both resolve on, and off again the
+    /// moment the master switch goes.
+    #[test]
+    fn the_native_gate_verdict_is_off_by_default_and_needs_the_latch_too() {
+        use crate::settings::injection::{Feature, Override};
+        let (mut s, id) = oc_settings();
+        let scope = oc_scope(&id, Some("ses"));
+        assert!(
+            !native_gate_verdict(&s, &scope),
+            "locked decision 17: the gate ships OFF"
+        );
+
+        // The app-wide L2.
+        s.offload.injection.opencode_native_gate_enabled = true;
+        assert!(native_gate_verdict(&s, &scope));
+
+        // The taint latch is what this gate enforces — with that feature off
+        // there is no boundary to enforce, so the gate reports off LIVE (no tab
+        // restart), even though its own flag stays baked in the plugin.
+        s.offload.injection.taint_latch_enabled = false;
+        assert!(!native_gate_verdict(&s, &scope));
+        s.offload.injection.taint_latch_enabled = true;
+
+        // The usual way in: L2 off app-wide, one tab's L3 `On`.
+        s.offload.injection.opencode_native_gate_enabled = false;
+        for t in &mut s.tabs {
+            if let crate::settings::TabConfig::AiTool(c) = t {
+                c.injection_overrides
+                    .set(Feature::OpencodeNativeGate, Override::On);
+            }
+        }
+        assert!(native_gate_verdict(&s, &scope), "an L3 On enables one tab");
+        assert!(
+            !native_gate_verdict(&s, &oc_scope("some-other-tab", Some("ses"))),
+            "and only that tab"
+        );
+
+        // Nothing re-enables past the master.
+        s.offload.injection.protection = false;
+        assert!(!native_gate_verdict(&s, &scope));
+    }
+
+    /// `view_for` is the gate's read path: it must answer for a tab the proxy
+    /// has never served WITHOUT creating a row (a poll is not a tool call), and
+    /// the answer must be the one that denies nothing.
+    #[test]
+    fn view_for_answers_open_for_an_unknown_tab_without_creating_a_row() {
+        let reg = LatchRegistry::default();
+        let view = reg.view_for(&oc_scope("never-served", Some("ses")));
+        assert_eq!(view, LatchView::default());
+        assert_eq!(view.latch, "open", "fail-open: nothing to deny against");
+        assert!(
+            reg.snapshot().is_empty(),
+            "a state read must not materialize a latch row"
+        );
+    }
+
+    /// The read path reports the live latch — including after the decision-15
+    /// override, which is what makes "switch to local" move the native gate with
+    /// it (locked decision 17's last sentence) — and it rotates a stale latch
+    /// with the session, so a fresh conversation is never denied `read`/`bash`
+    /// on the strength of the previous one's fetch.
+    #[test]
+    fn view_for_tracks_the_latch_including_overrides_and_session_rotation() {
+        let reg = LatchRegistry::default();
+        let s = oc_scope("opencode", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .is_ok());
+        // EXTERNAL ⇒ the plugin denies the local natives.
+        let view = reg.view_for(&s);
+        assert_eq!(view.latch, "external");
+        assert!(view.contaminated);
+
+        // Decision 15's workflow button flips the boundary; the gate follows,
+        // because it reads live state rather than caching a verdict.
+        reg.apply_override(&s, LatchOverride::FlipLocal).unwrap();
+        let view = reg.view_for(&s);
+        assert_eq!(view.latch, "local", "the web side is now the denied one");
+        assert!(view.contaminated, "an override never un-reads a page");
+
+        // A tab restart rotates the session, and the read path sees it — a
+        // stale `external` here would deny the whole local surface for a fresh
+        // conversation.
+        let after = oc_scope("opencode", Some("sess-b"));
+        assert_eq!(reg.view_for(&after).latch, "open");
     }
 
     /// Per-tab isolation: one contaminated tab must not disarm (or arm) any

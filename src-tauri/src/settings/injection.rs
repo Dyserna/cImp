@@ -14,8 +14,12 @@
 //!   `true`). Off disables every V32 control everywhere: all tabs AND the
 //!   offload worker. It is the one switch nothing overrides upward.
 //! - **L2 — per feature, app-wide.** One `<feature>_enabled` flag per
-//!   [`Feature`] (default `true`), with the deliberate exception of
-//!   [`Feature::NativeWeb`] — see *Native-web reconciliation* below.
+//!   [`Feature`] (default `true`), with two deliberate exceptions:
+//!   [`Feature::NativeWeb`], whose L2 is a tri-mode rather than a boolean (see
+//!   *Native-web reconciliation* below), and [`Feature::OpencodeNativeGate`],
+//!   whose default is **`false`** (V32 Phase H, locked decision 17 — see
+//!   [`Feature::default_enabled`], and note what that means for
+//!   [`protection_reduced`]).
 //! - **L3 — per scope.** A tri-state [`Override`] (`Inherit` | `On` | `Off`,
 //!   default `Inherit`) stored per scope, per feature.
 //!
@@ -79,11 +83,13 @@
 //!
 //! # Spawn-baked vs live
 //!
-//! [`Feature::spawn_baked`] names the two features applied when a tab launches
-//! ([`Feature::NativeWeb`], [`Feature::ConsumerHygiene`]). Their L2 *and* L3
-//! values ride `tabs::config::spawn_inject_sig` via [`spawn_sig`], so flipping
-//! either raises the restart hint. Every other feature resolves per call and
-//! takes effect immediately.
+//! [`Feature::spawn_baked`] names the features applied when a tab launches
+//! ([`Feature::NativeWeb`], [`Feature::ConsumerHygiene`], and Phase H's
+//! [`Feature::OpencodeNativeGate`], whose flag is compiled into the generated
+//! OpenCode plugin). Their L2 *and* L3 values ride
+//! `tabs::config::spawn_inject_sig` via [`spawn_sig`], so flipping any of them
+//! raises the restart hint. Every other feature resolves per call and takes
+//! effect immediately.
 
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +131,16 @@ pub enum Feature {
     /// The pinned OpenCode permission block + the injection-hygiene guidance
     /// addendum. Both spawn-baked.
     ConsumerHygiene,
+    /// V32 Phase H (locked decision 17): the OpenCode plugin's
+    /// `tool.execute.before` handler *denying* the harness's own native tools
+    /// against the tab's taint latch, rather than only beaconing on them.
+    ///
+    /// **The one feature whose L2 default is `false`** — see
+    /// [`Feature::default_enabled`]. Spawn-baked (the flag is compiled into the
+    /// generated plugin) and tab-scoped only: it is delivered by an OpenCode
+    /// plugin, so the offload worker has no row for it and neither does any
+    /// non-OpenCode consumer.
+    OpencodeNativeGate,
     /// Stripping terminal control sequences out of external text cImp composes
     /// into non-HTML sinks. App-wide: TTS and toasts are global surfaces.
     TerminalEscapeHygiene,
@@ -143,6 +159,7 @@ impl Feature {
         Feature::MemoryQuarantine,
         Feature::NativeWeb,
         Feature::ConsumerHygiene,
+        Feature::OpencodeNativeGate,
         Feature::TerminalEscapeHygiene,
     ];
 
@@ -159,6 +176,7 @@ impl Feature {
             Feature::MemoryQuarantine => "memory_quarantine",
             Feature::NativeWeb => "native_web",
             Feature::ConsumerHygiene => "consumer_hygiene",
+            Feature::OpencodeNativeGate => "opencode_native_gate",
             Feature::TerminalEscapeHygiene => "terminal_escape_hygiene",
         }
     }
@@ -175,8 +193,29 @@ impl Feature {
             Feature::MemoryQuarantine => "Memory quarantine",
             Feature::NativeWeb => "Native-web visibility",
             Feature::ConsumerHygiene => "Consumer hygiene",
+            Feature::OpencodeNativeGate => "OpenCode native-tool gating",
             Feature::TerminalEscapeHygiene => "Terminal escape hygiene",
         }
+    }
+
+    /// This feature's **L2 default** — the value an untouched settings file
+    /// resolves it to.
+    ///
+    /// Every V32 control before Phase H defaulted `true`, and one predicate read
+    /// that as a law: "any feature resolving off means protection is REDUCED"
+    /// ([`protection_reduced`], and its frontend twin `reducedFeaturesFor`).
+    /// [`Feature::OpencodeNativeGate`] breaks it — locked decision 17 ships it
+    /// **default off**, because whole-surface denial of `bash`/`read`/`edit`
+    /// materially changes everyday tab UX and is an opt-in posture, not a
+    /// baseline. Without this predicate a fresh install would raise the
+    /// reduced-protection chip on every tab out of the box, which is how an
+    /// indicator stops being read.
+    ///
+    /// So "reduced" is measured against the DEFAULT, not against `true`: a
+    /// default-off control that is off is the baseline, and one switched on is
+    /// *more* protection, never less.
+    pub fn default_enabled(self) -> bool {
+        !matches!(self, Feature::OpencodeNativeGate)
     }
 
     /// Whether this feature carries a per-TAB L3 row. Mirrors
@@ -192,6 +231,7 @@ impl Feature {
                 | Feature::MemoryQuarantine
                 | Feature::NativeWeb
                 | Feature::ConsumerHygiene
+                | Feature::OpencodeNativeGate
         )
     }
 
@@ -201,8 +241,9 @@ impl Feature {
     /// Memory quarantine is deliberately absent: the worker cannot dispatch
     /// `context_*` at all (issue #38) and serves a hard refusal instead, so a
     /// worker quarantine row would be a switch with no enforcement site behind
-    /// it. Native-web visibility and consumer hygiene are absent because the
-    /// worker is not a harness — it has no native tools and no spawn config.
+    /// it. Native-web visibility, consumer hygiene and the Phase H OpenCode
+    /// native gate are absent because the worker is not a harness — it has no
+    /// native tools and no spawn config.
     pub fn has_worker_scope(self) -> bool {
         matches!(
             self,
@@ -221,8 +262,15 @@ impl Feature {
     /// [`spawn_sig`]): a spawn-baked feature's L2/L3 values must move the
     /// signature so the user gets the restart hint, because a running tab keeps
     /// whatever posture it launched with.
+    ///
+    /// [`Feature::OpencodeNativeGate`] joins the pair in Phase H: its flag is
+    /// baked into the generated OpenCode plugin, and the plugin is written at
+    /// tab spawn.
     pub fn spawn_baked(self) -> bool {
-        matches!(self, Feature::NativeWeb | Feature::ConsumerHygiene)
+        matches!(
+            self,
+            Feature::NativeWeb | Feature::ConsumerHygiene | Feature::OpencodeNativeGate
+        )
     }
 }
 
@@ -367,6 +415,10 @@ pub struct TabInjectionOverrides {
     pub memory_quarantine: Override,
     pub native_web: Override,
     pub consumer_hygiene: Override,
+    /// V32 Phase H. An `On` here is the per-tab way to enable the gate over its
+    /// app-wide default `off` — the shape locked decision 17 expects most users
+    /// to reach for first (one hardened OpenCode tab, everything else as it was).
+    pub opencode_native_gate: Override,
 }
 
 impl TabInjectionOverrides {
@@ -383,6 +435,7 @@ impl TabInjectionOverrides {
             Feature::MemoryQuarantine => self.memory_quarantine,
             Feature::NativeWeb => self.native_web,
             Feature::ConsumerHygiene => self.consumer_hygiene,
+            Feature::OpencodeNativeGate => self.opencode_native_gate,
             Feature::Canary | Feature::TerminalEscapeHygiene => Override::Inherit,
         }
     }
@@ -401,6 +454,7 @@ impl TabInjectionOverrides {
             Feature::MemoryQuarantine => self.memory_quarantine = value,
             Feature::NativeWeb => self.native_web = value,
             Feature::ConsumerHygiene => self.consumer_hygiene = value,
+            Feature::OpencodeNativeGate => self.opencode_native_gate = value,
             Feature::Canary | Feature::TerminalEscapeHygiene => return None,
         }
         Some(())
@@ -434,6 +488,7 @@ impl WorkerInjectionOverrides {
             Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => Override::Inherit,
         }
     }
@@ -452,6 +507,7 @@ impl WorkerInjectionOverrides {
             Feature::MemoryQuarantine
             | Feature::NativeWeb
             | Feature::ConsumerHygiene
+            | Feature::OpencodeNativeGate
             | Feature::TerminalEscapeHygiene => return None,
         }
         Some(())
@@ -549,6 +605,7 @@ fn feature_l2(feature: Feature, s: &Settings) -> bool {
         Feature::Canary => inj.canary_enabled,
         Feature::MemoryQuarantine => inj.memory_quarantine_enabled,
         Feature::ConsumerHygiene => inj.consumer_hygiene_enabled,
+        Feature::OpencodeNativeGate => inj.opencode_native_gate_enabled,
         Feature::TerminalEscapeHygiene => inj.terminal_escape_hygiene_enabled,
         // No boolean of its own — the tri-mode IS the L2 (module docs).
         Feature::NativeWeb => native_web_l2(s) != NativeWebMode::Off,
@@ -712,6 +769,7 @@ pub fn spawn_sig(s: &Settings) -> serde_json::Value {
         "l2": [
             s.offload.native_web_visibility,
             s.offload.injection.consumer_hygiene_enabled,
+            s.offload.injection.opencode_native_gate_enabled,
         ],
         "tabs": rows,
     })
@@ -732,6 +790,29 @@ pub struct FeatureState {
     /// still reported — "this control does not apply here" is an answer the
     /// question "why is this tab not latching?" sometimes needs.
     pub in_scope: bool,
+    /// V32 Phase H: this feature's L2 default ([`Feature::default_enabled`]).
+    ///
+    /// Published rather than mirrored in the frontend so the "is protection
+    /// REDUCED here?" question has one definition. The tab badge and the
+    /// status-bar chip both mean "something is off that ships on"; a
+    /// default-off control that is simply off is the baseline, not a reduction,
+    /// and the rule that decides which is which must not live in two languages.
+    pub default_on: bool,
+}
+
+/// Whether `scope` carries a row for `feature` at all — the structural question
+/// [`report`] answers per row and [`protection_reduced`] must ask before
+/// counting a feature as switched off somewhere.
+///
+/// Extracted so the two cannot disagree: a feature counted "off at the app
+/// scope" that in fact has no app row would light the reduced-protection
+/// indicator forever.
+fn feature_in_scope(feature: Feature, scope: Scope<'_>) -> bool {
+    match scope {
+        Scope::Tab { .. } => feature.has_tab_scope(),
+        Scope::OffloadWorker => feature.has_worker_scope(),
+        Scope::App => !feature.has_tab_scope() && !feature.has_worker_scope(),
+    }
 }
 
 /// Every feature's resolved state at one scope — what `/status`, the
@@ -747,18 +828,21 @@ pub fn report(s: &Settings, scope: Scope<'_>) -> Vec<FeatureState> {
                 effective: d.effective,
                 decided_by: d.decided_by,
                 override_value: scope_override(*f, scope, s).as_str(),
-                in_scope: match scope {
-                    Scope::Tab { .. } => f.has_tab_scope(),
-                    Scope::OffloadWorker => f.has_worker_scope(),
-                    Scope::App => !f.has_tab_scope() && !f.has_worker_scope(),
-                },
+                in_scope: feature_in_scope(*f, scope),
+                default_on: f.default_enabled(),
             }
         })
         .collect()
 }
 
 /// Whether protection is REDUCED anywhere the user can see — the master is off,
-/// or any feature resolves off at the app scope or at any scope with a row.
+/// or any feature that ships ON resolves off at a scope that has a row for it.
+///
+/// **"Reduced" is measured against each feature's default**
+/// ([`Feature::default_enabled`]), not against `true`. Phase H's OpenCode native
+/// gate ships off by user decision, so a fresh install must not report reduced
+/// protection; and a scope that switches that gate ON has more protection than
+/// the default, never less.
 ///
 /// This is the predicate behind the out-of-Settings indicator (locked decision
 /// 16: "a reduced-protection state … is visible outside Settings too … so
@@ -779,7 +863,11 @@ pub fn protection_reduced(s: &Settings) -> bool {
     if !s.offload.injection.protection {
         return true;
     }
-    let any_off = |scope: Scope<'_>| report(s, scope).iter().any(|r| r.in_scope && !r.effective);
+    let any_off = |scope: Scope<'_>| {
+        Feature::ALL.iter().any(|f| {
+            f.default_enabled() && feature_in_scope(*f, scope) && !effective(*f, scope, s)
+        })
+    };
     if any_off(Scope::App) || any_off(Scope::OffloadWorker) {
         return true;
     }
@@ -836,21 +924,89 @@ mod tests {
         }
     }
 
-    /// The migration-safety test: an untouched config resolves EVERY feature ON
-    /// at every scope — i.e. exactly the pre-Phase-G behaviour, at every layer
-    /// at once.
+    /// The migration-safety test: an untouched config resolves every feature to
+    /// its DECLARED DEFAULT at every scope — i.e. exactly the pre-Phase-G
+    /// behaviour, at every layer at once.
+    ///
+    /// "Its default", not "on", since V32 Phase H: exactly one feature ships off
+    /// (locked decision 17), and this test is the place that says which — a
+    /// second one appearing by accident fails here.
     #[test]
-    fn an_untouched_config_resolves_every_feature_on() {
+    fn an_untouched_config_resolves_every_feature_to_its_default() {
         let s = settings();
         let id = a_tab(&s);
         for f in Feature::ALL {
             for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::App] {
                 let d = decide(*f, scope, &s);
-                assert!(d.effective, "{:?} at {:?} must default ON", f, scope);
+                assert_eq!(
+                    d.effective,
+                    f.default_enabled(),
+                    "{f:?} at {scope:?} must resolve to its declared default"
+                );
                 assert_eq!(d.decided_by, DecidedBy::Feature, "{f:?}");
             }
         }
+        // The default-off set, named rather than counted: adding a feature here
+        // is a product decision, and it should read like one in the diff.
+        let default_off: Vec<_> = Feature::ALL
+            .iter()
+            .filter(|f| !f.default_enabled())
+            .collect();
+        assert_eq!(default_off, vec![&Feature::OpencodeNativeGate]);
+        // And a fresh install does NOT report reduced protection because of it.
         assert!(!protection_reduced(&s));
+    }
+
+    /// V32 Phase H: the default-off feature, end to end through the hierarchy.
+    ///
+    /// The interesting property is the one that made `default_enabled` necessary:
+    /// a control that ships off, and is off, is the BASELINE — it must not light
+    /// the reduced-protection indicator — while switching it on is *more*
+    /// protection and must not light it either.
+    #[test]
+    fn the_opencode_native_gate_ships_off_without_reading_as_reduced_protection() {
+        let mut s = settings();
+        let id = a_tab(&s);
+        let f = Feature::OpencodeNativeGate;
+        assert!(!f.default_enabled());
+        assert!(f.spawn_baked(), "its flag is baked into the plugin");
+        assert!(f.has_tab_scope());
+        assert!(!f.has_worker_scope(), "the worker is not a harness");
+
+        // Default: off everywhere, and nothing reads as reduced.
+        assert!(!effective(f, tab_scope(&id), &s));
+        assert!(!protection_reduced(&s));
+
+        // An L3 `On` over the app-wide `off` — the shape decision 17 expects
+        // most users to reach for — enables exactly one tab…
+        set_tab_override(&mut s, &id, f, Override::On);
+        assert!(effective(f, tab_scope(&id), &s));
+        assert!(!effective(f, tab_scope("some-other-tab"), &s));
+        // …and MORE protection than the default is still not "reduced".
+        assert!(!protection_reduced(&s));
+
+        // The app-wide L2 works the same way, and the master still wins.
+        let mut s = settings();
+        s.offload.injection.opencode_native_gate_enabled = true;
+        assert!(effective(f, tab_scope(&id), &s));
+        assert!(!protection_reduced(&s));
+        s.offload.injection.protection = false;
+        assert!(!effective(f, tab_scope(&id), &s));
+        assert!(protection_reduced(&s), "the master switch always counts");
+
+        // The report publishes the default so the frontend need not mirror it.
+        let rows = report(&settings(), tab_scope(&id));
+        let row = rows
+            .iter()
+            .find(|r| r.feature == "opencode_native_gate")
+            .expect("the feature has a row");
+        assert!(!row.default_on);
+        assert!(!row.effective);
+        assert!(row.in_scope);
+        assert!(
+            rows.iter().filter(|r| !r.default_on).count() == 1,
+            "exactly one default-off row"
+        );
     }
 
     /// The locked resolution table, exhaustively: every (L1, L2, L3) triple for
@@ -1072,6 +1228,22 @@ mod tests {
                 Box::new(|s: &mut Settings| {
                     let id = a_tab(s);
                     set_tab_override(s, &id, Feature::ConsumerHygiene, Override::Off);
+                }),
+            ),
+            // V32 Phase H: both levels of the OpenCode native gate. Its flag is
+            // compiled into the generated plugin, so a flip that does not move
+            // this signature is a gate the user believes is on and is not.
+            (
+                "opencode-native-gate L2",
+                Box::new(|s: &mut Settings| {
+                    s.offload.injection.opencode_native_gate_enabled = true
+                }),
+            ),
+            (
+                "opencode-native-gate L3",
+                Box::new(|s: &mut Settings| {
+                    let id = a_tab(s);
+                    set_tab_override(s, &id, Feature::OpencodeNativeGate, Override::On);
                 }),
             ),
             (

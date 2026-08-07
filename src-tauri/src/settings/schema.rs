@@ -1703,8 +1703,10 @@ pub struct OffloadSettings {
 /// contradictory state representable. See
 /// [`injection`](crate::settings::injection) for the full reconciliation.
 ///
-/// Every default is `true`, so an untouched (or pre-Phase-G) settings file
-/// resolves exactly as the app behaved before this block existed — the
+/// Every default is `true` — except V32 Phase H's
+/// [`opencode_native_gate_enabled`](Self::opencode_native_gate_enabled), which
+/// ships `false` — so an untouched (or pre-Phase-G) settings file resolves
+/// exactly as the app behaved before this block existed. That is the
 /// migration-safety property, pinned by a test in the resolver.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -1732,6 +1734,16 @@ pub struct InjectionSettings {
     /// L2: the pinned OpenCode permission block + the injection-hygiene
     /// guidance addendum. Spawn-baked.
     pub consumer_hygiene_enabled: bool,
+    /// L2: V32 Phase H (locked decision 17) — the OpenCode plugin denying the
+    /// harness's OWN native tools against the tab's taint latch, rather than
+    /// only beaconing on the web ones. Spawn-baked (the flag is compiled into
+    /// the generated plugin).
+    ///
+    /// **The one L2 flag that defaults `false`**, by user decision: whole-surface
+    /// denial of `bash`/`read`/`edit` under an EXTERNAL latch changes everyday
+    /// tab UX materially, so it is opt-in. Consequences of that asymmetry are
+    /// handled in `settings::injection` (`Feature::default_enabled`), not here.
+    pub opencode_native_gate_enabled: bool,
     /// L2: stripping terminal control sequences out of external text cImp
     /// composes into non-HTML sinks. App-wide — no per-scope row, because TTS
     /// and toasts are global surfaces (the global-only avatar/TTS decision).
@@ -1756,6 +1768,9 @@ impl Default for InjectionSettings {
             canary_enabled: true,
             memory_quarantine_enabled: true,
             consumer_hygiene_enabled: true,
+            // V32 Phase H: the deliberate exception — see the field's docs and
+            // `injection::Feature::default_enabled`.
+            opencode_native_gate_enabled: false,
             terminal_escape_hygiene_enabled: true,
             worker: Default::default(),
         }

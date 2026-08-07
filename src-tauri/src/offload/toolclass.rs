@@ -186,6 +186,92 @@ pub const TABLE: &[ClassRow] = &[
     row("Bash", ToolClass::LocalCapability, true),
 ];
 
+// ── V32 Phase H — OpenCode's OWN native tool names ─────────────────────────
+
+/// The OpenCode 1.18.13 native tool ids, classified for the Phase H gate.
+///
+/// # Why this is a SECOND table and not more rows in [`TABLE`]
+///
+/// [`TABLE`] is cImp's own tool vocabulary — the names cImp *routes*, where the
+/// locked invariant is **unknown ⇒ EXTERNAL** because every unrouted name is a
+/// proxied MCP id in disguise. That default is exactly wrong for a harness's own
+/// registry, which is a closed, published set with members that are neither
+/// external nor local-capability (`todowrite`, `question`, `skill`, `invalid`).
+/// Folding these names into `TABLE` would make `classify("todowrite")` answer
+/// `External` and the Phase H gate would refuse a bookkeeping tool under a LOCAL
+/// latch — a partial, arbitrary gate, which the E2 spike showed is worse than
+/// none.
+///
+/// So the two tables share the [`ToolClass`] vocabulary and nothing else, and
+/// this one is **allowlist-only**: a name absent here is UNGATED, deliberately.
+/// The class table's `Edit`/`Write`/`Bash` rows stay where they are — those are
+/// *Claude's* capitalized natives, read by V33's `mutates_fs` consumer, and a
+/// second namespace under the same lookup would be the drift this comment
+/// exists to prevent.
+///
+/// Sourced from `GET /experimental/tool/ids` on the running binary
+/// (`docs/HARNESS-NATIVE-TOOLS.md` §3), not from documentation. `apply_patch` is
+/// load-bearing: it *replaces* `edit`/`write` on OpenAI-provider models, so a
+/// list naming only `edit`/`write` would leave the whole mutation surface open
+/// on exactly those tabs.
+pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass)] = &[
+    // Local capability: private data + process execution + mutation.
+    ("bash", ToolClass::LocalCapability),
+    ("read", ToolClass::LocalCapability),
+    ("glob", ToolClass::LocalCapability),
+    ("grep", ToolClass::LocalCapability),
+    ("edit", ToolClass::LocalCapability),
+    ("write", ToolClass::LocalCapability),
+    // Not in the 1.18.13 registry, but the plugin's own `CIMP_EDIT_TOOLS` has
+    // carried it since V12 and the milestone's locked list names it. Gating a
+    // name the harness does not serve costs nothing and closes it in advance.
+    ("patch", ToolClass::LocalCapability),
+    ("apply_patch", ToolClass::LocalCapability),
+    // The harness's own web tools — the EXTERNAL side of the same boundary.
+    ("webfetch", ToolClass::External),
+    ("websearch", ToolClass::External),
+    // Deliberately ABSENT, and each for a stated reason:
+    // - `task` (sub-agent spawn): orchestration, not a capability of its own.
+    //   The E2 spike confirmed a sub-agent's tool calls fire this same hook in
+    //   the child session, and the plugin's tab identity is process-wide
+    //   (`CIMP_TAB_ID`), so the child's `bash`/`read`/`webfetch` are gated at
+    //   the same latch. Gating the spawn itself would refuse an orchestration
+    //   primitive whose dangerous leaves are already closed.
+    // - `skill`, `todowrite`, `question`, `invalid`: no file access, no process
+    //   execution, no egress. Denying them would buy nothing and would make the
+    //   gate look arbitrary to the model it is talking to.
+];
+
+/// The class of one OpenCode native tool name, or `None` when the gate does not
+/// apply to it.
+///
+/// `None` (not `External`) for an unknown name is the whole difference from
+/// [`classify`] — see [`OPENCODE_NATIVE_TABLE`].
+///
+/// Test-only today, like [`mutates_fs`]: production reads the table through
+/// [`opencode_native_names`], because the *lookup* happens in the generated
+/// plugin's JS rather than in Rust. It stays because the unknown-⇒-`None`
+/// contract is the whole reason this table is separate, and a contract with no
+/// executable statement is a comment.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn opencode_native_class(name: &str) -> Option<ToolClass> {
+    OPENCODE_NATIVE_TABLE
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+}
+
+/// Every OpenCode native name in one class, in table order — the input the
+/// plugin-source builder bakes into its `Set` literals, so the JS the gate runs
+/// and the table reviewed here cannot drift.
+pub fn opencode_native_names(class: ToolClass) -> Vec<&'static str> {
+    OPENCODE_NATIVE_TABLE
+        .iter()
+        .filter(|(_, c)| *c == class)
+        .map(|(n, _)| *n)
+        .collect()
+}
+
 /// The class of `name`. **Unknown ⇒ [`ToolClass::External`]** — the locked
 /// cross-module invariant (see the module docs): a future/newly configured MCP
 /// server's `<server>__<tool>` ids are unknown here and must land in the most
@@ -398,6 +484,41 @@ pub const REFUSAL_WRITE_BLOCKED: &str = "REFUSED (security boundary): this task 
     external tool (web/MCP-server), so it may not write persistent memory — a note written under \
     external influence would be auto-injected into future sessions. This cannot be unlocked or \
     worked around; it is enforced outside the model. Put the finding in your answer instead.";
+
+/// V32 Phase H — the refusal the OpenCode plugin throws when the harness's OWN
+/// local tools are reached for under an EXTERNAL latch.
+///
+/// A separate constant from [`REFUSAL_LOCAL_BLOCKED`] rather than a reuse,
+/// because the two describe **different tool surfaces to different readers**:
+/// the proxied one enumerates cImp's tools ("code search, source-text graph
+/// lookups"), which is not what was just denied here and would read as a lie the
+/// model can check — and a standing instruction a model can catch out is one it
+/// learns to discount (the same reasoning that split the warning header's
+/// suffix in Phase G). The vocabulary is deliberately identical:
+/// `REFUSED (security boundary)`, the same three facts, no dynamic content.
+///
+/// It says "session", not "task": the scope here is a tab's conversation.
+///
+/// **It deliberately does not mention the decision-15 "Switch to local"
+/// button.** Under an EXTERNAL latch the model may already be compromised, and a
+/// refusal that names the human's escape hatch is a refusal that teaches an
+/// injected page to ask for it.
+pub const REFUSAL_NATIVE_LOCAL_BLOCKED: &str = "REFUSED (security boundary): this session has \
+    already used an external tool (web fetch/search or an MCP-server tool), so this harness's own \
+    local tools — file reads, edits, patches, file search and shell commands — are unavailable for \
+    the remainder of this session. This cannot be unlocked, re-asked for, or worked around; it is \
+    enforced outside the model, and spawning a sub-agent or a nested shell reaches the same \
+    boundary. Continue with the tools you still have, or answer with what you have gathered.";
+
+/// V32 Phase H — the mirror refusal: the harness's own web tools under a LOCAL
+/// latch. See [`REFUSAL_NATIVE_LOCAL_BLOCKED`] for why these are their own
+/// constants.
+pub const REFUSAL_NATIVE_WEB_BLOCKED: &str = "REFUSED (security boundary): this session has \
+    already used a local-capability tool (file read, edit, file search or shell command), so this \
+    harness's own web tools — fetch and search — are unavailable for the remainder of this \
+    session. This cannot be unlocked, re-asked for, or worked around; it is enforced outside the \
+    model, and spawning a sub-agent reaches the same boundary. Continue with the tools you still \
+    have, or answer with what you have gathered.";
 
 /// V32 Phase C2 — the fixed suffix appended to a `context_note` result that was
 /// stored **quarantined** (locked decision 10).
@@ -816,5 +937,84 @@ mod tests {
         assert!(PROFILE_TOOL_NOTE.contains("code"));
         assert!(PROFILE_TOOL_NOTE.contains("NEVER include secrets"));
         assert!(PROFILE_TOOL_NOTE.contains("prompt exfiltration cannot be blocked"));
+    }
+
+    // ── V32 Phase H — the OpenCode native-name table ───────────────────────
+
+    /// **The whole-surface property**, which the E2 spike bought with a live
+    /// probe: with only `write` gated the model created the file through `bash`,
+    /// so the LOCAL side must be the harness's complete local-capability surface
+    /// — `apply_patch` included, because it REPLACES `edit`/`write` on
+    /// OpenAI-provider models and a list naming only those two leaves the whole
+    /// mutation surface open on exactly those tabs.
+    #[test]
+    fn the_opencode_native_table_covers_the_whole_local_surface() {
+        let local = opencode_native_names(ToolClass::LocalCapability);
+        for n in [
+            "bash",
+            "read",
+            "glob",
+            "grep",
+            "edit",
+            "write",
+            "patch",
+            "apply_patch",
+        ] {
+            assert!(local.contains(&n), "{n} missing from the local set");
+            assert_eq!(
+                opencode_native_class(n),
+                Some(ToolClass::LocalCapability),
+                "{n}"
+            );
+        }
+        assert_eq!(local.len(), 8, "got: {local:?}");
+
+        let web = opencode_native_names(ToolClass::External);
+        assert_eq!(web, vec!["webfetch", "websearch"]);
+        // The two sides are disjoint — one name must not be denied under both
+        // latches, which would be a tool nobody can ever call.
+        assert!(!web.iter().any(|n| local.contains(n)));
+    }
+
+    /// The reason this is a SECOND table: `classify`'s unknown-⇒-EXTERNAL
+    /// invariant is right for cImp's routed vocabulary and wrong for a harness
+    /// registry, where an unlisted name must be UNGATED.
+    #[test]
+    fn unknown_opencode_natives_are_ungated_not_external() {
+        // Orchestration + bookkeeping: no capability of their own, so no row.
+        for n in ["task", "skill", "todowrite", "question", "invalid"] {
+            assert_eq!(opencode_native_class(n), None, "{n} must be ungated");
+            // …and this is exactly where `classify` would have said EXTERNAL,
+            // i.e. "deny under a LOCAL latch" — the misclassification the
+            // separate table exists to avoid.
+            assert_eq!(classify(n), ToolClass::External, "{n}");
+        }
+        assert_eq!(opencode_native_class("some_future_tool"), None);
+        // The two tables share no rows: `TABLE`'s harness natives are Claude's
+        // capitalized names, kept there for V33's `mutates_fs` consumer.
+        for (name, _) in OPENCODE_NATIVE_TABLE {
+            assert!(
+                !TABLE.iter().any(|r| r.name == *name),
+                "{name} is in both tables — one lookup, two vocabularies"
+            );
+        }
+    }
+
+    /// The Phase H refusals share the V32 vocabulary, carry no dynamic content,
+    /// and name the sub-agent path (which reaches the same boundary) so a
+    /// compromised model does not read `task` as a way around.
+    #[test]
+    fn the_native_refusals_are_fixed_and_speak_the_v32_vocabulary() {
+        for r in [REFUSAL_NATIVE_LOCAL_BLOCKED, REFUSAL_NATIVE_WEB_BLOCKED] {
+            assert!(r.starts_with("REFUSED (security boundary):"), "{r}");
+            assert!(r.contains("enforced outside the model"), "{r}");
+            assert!(r.contains("sub-agent"), "{r}");
+            assert!(!r.contains('{') && !r.contains('%'), "no templating: {r}");
+            // Deliberately silent about the decision-15 override button — see
+            // the constant's docs.
+            assert!(!r.to_lowercase().contains("switch to local"), "{r}");
+        }
+        assert!(REFUSAL_NATIVE_LOCAL_BLOCKED.contains("already used an external tool"));
+        assert!(REFUSAL_NATIVE_WEB_BLOCKED.contains("already used a local-capability tool"));
     }
 }

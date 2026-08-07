@@ -57,6 +57,11 @@ export interface FeatureState {
   /// still reported — "this control does not apply here" is sometimes the
   /// answer to "why is this tab not latching?".
   in_scope: boolean;
+  /// V32 Phase H: this feature's app-wide DEFAULT. Published by the backend
+  /// rather than mirrored here, so "is protection reduced?" has one definition:
+  /// a control that ships off (the OpenCode native gate) being off is the
+  /// baseline, not a reduction.
+  default_on: boolean;
 }
 
 /// One scope's rows. `scope` is `app`, `offload-worker`, or a tab id.
@@ -71,9 +76,10 @@ export interface InjectionScope {
 export interface InjectionStatus {
   /// The L1 master switch.
   protection: boolean;
-  /// True when the master is off OR any feature resolves off at any scope —
-  /// the predicate behind the out-of-Settings indicator, so protection cannot
-  /// be off and forgotten.
+  /// True when the master is off OR any feature that SHIPS ON resolves off at
+  /// any scope — the predicate behind the out-of-Settings indicator, so
+  /// protection cannot be off and forgotten. Measured against each feature's
+  /// default (V32 Phase H), never against `true`.
   reduced: boolean;
   scopes: InjectionScope[];
 }
@@ -93,14 +99,21 @@ export const protectionReduced: Readable<boolean> = derived(
 );
 
 /// The features resolved OFF for one tab, for the tab badge and its popover.
-/// Only rows the scope actually has are considered — a tab is not "reduced"
-/// because the worker-only canary does not apply to it.
+///
+/// Two filters, both structural rather than cosmetic:
+/// - only rows the scope actually HAS — a tab is not "reduced" because the
+///   worker-only canary does not apply to it;
+/// - only features that ship ON (`default_on`). V32 Phase H's OpenCode native
+///   gate defaults off by user decision, and counting it would raise the muted
+///   badge on every tab of a fresh install — which is how a badge stops being
+///   read. Mirrors the backend's `protection_reduced`, using the backend's own
+///   `default_on` rather than a second list of defaults in TypeScript.
 export function reducedFeaturesFor(
   status: InjectionStatus | null,
   tab: TabId,
 ): FeatureState[] {
   const scope = status?.scopes.find((s) => s.scope === tab);
-  return (scope?.features ?? []).filter((f) => f.in_scope && !f.effective);
+  return (scope?.features ?? []).filter((f) => f.in_scope && !f.effective && f.default_on);
 }
 
 export async function fetchLatchStatus(): Promise<LatchRow[]> {

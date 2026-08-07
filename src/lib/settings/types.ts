@@ -331,6 +331,9 @@ export interface TabInjectionOverrides {
   memory_quarantine: InjectionOverride;
   native_web: InjectionOverride;
   consumer_hygiene: InjectionOverride;
+  /// V32 Phase H: the OpenCode native-tool gate. `'on'` here is the per-tab way
+  /// to enable it over its app-wide default `off`.
+  opencode_native_gate: InjectionOverride;
 }
 
 /// V32 Phase G: the `offload-worker` pseudo-scope's override row (mirror of
@@ -366,6 +369,11 @@ export interface InjectionSettings {
   canary_enabled: boolean;
   memory_quarantine_enabled: boolean;
   consumer_hygiene_enabled: boolean;
+  /// V32 Phase H (locked decision 17): the OpenCode plugin denying the harness's
+  /// OWN native tools against the tab's taint latch. **The one L2 flag that
+  /// defaults `false`** — whole-surface denial of `bash`/`read`/`edit` is an
+  /// opt-in posture, so it is not counted as "reduced protection" when off.
+  opencode_native_gate_enabled: boolean;
   /// App-wide, no per-scope row — TTS and toasts are global surfaces.
   terminal_escape_hygiene_enabled: boolean;
   worker: WorkerInjectionOverrides;
@@ -1619,6 +1627,7 @@ export function defaultSettings(): Settings {
           memory_quarantine: "inherit",
           native_web: "inherit",
           consumer_hygiene: "inherit",
+          opencode_native_gate: "inherit",
         },
       },
       {
@@ -1657,6 +1666,7 @@ export function defaultSettings(): Settings {
           memory_quarantine: "inherit",
           native_web: "inherit",
           consumer_hygiene: "inherit",
+          opencode_native_gate: "inherit",
         },
       },
     ],
@@ -1785,6 +1795,8 @@ export function defaultSettings(): Settings {
         canary_enabled: true,
         memory_quarantine_enabled: true,
         consumer_hygiene_enabled: true,
+        // V32 Phase H: the deliberate exception — ships OFF (locked decision 17).
+        opencode_native_gate_enabled: false,
         terminal_escape_hygiene_enabled: true,
         worker: {
           taint_latch: 'inherit',

@@ -33,9 +33,9 @@ pub fn def() -> ToolDef {
          and get back DEDUPLICATED, STRUCTURED diagnostics. Use this to VERIFY a build/test/lint \
          claim with a real observation before you state it — never assert \"this compiles\", \"the \
          tests pass\", or \"the lint is clean\" without running the relevant check and reporting \
-         what it returned. `name` selects among the project's configured checks (omit it when only \
-         one is configured; an unknown or omitted-with-multiple name returns the list of configured \
-         names). The command is fixed by the user's project config — never model-supplied. \
+         what it returned. `name` selects among the project's configured checks — the `name` enum \
+         in this schema is the exact list, and `name` is REQUIRED when the project configures more \
+         than one. The command is fixed by the user's project config — never model-supplied. \
          `changed_only: true` filters diagnostics to files touched since HEAD. If the check times \
          out, the result says so — report that as unverified, do not guess the outcome.",
         spec.parameters,

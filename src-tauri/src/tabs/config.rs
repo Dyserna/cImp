@@ -1131,10 +1131,12 @@ return precise, token-bounded results from an index, so they're cheaper and more
 search for 'where is X defined', 'who calls X', and impact analysis. `graph_dead_exports` lists \
 candidate unused public symbols and `graph_cycles` lists import cycles. For the edit→check→fix \
 loop: before changing shared code run `graph_impact` (what your working-tree diff could break) and \
-`graph_tests_for` (which tests cover a symbol); after edits run `run_check {changed_only:true}` for \
-deduplicated diagnostics instead of a raw build dump — including test runs: prefer a configured \
-test check over running the test command in Bash; it returns failures only; `graph_recent_changes` \
-shows what's been churning lately. This project also has \
+`graph_tests_for` (which tests cover a symbol); after edits run `run_check` for deduplicated \
+diagnostics instead of a raw build dump — pass `name` (the check to run; its schema lists this \
+project's configured names, and it is required when there is more than one) plus \
+`changed_only:true`, e.g. `run_check {name: <one of the schema's names>, changed_only: true}` — \
+including test runs: prefer a configured test check over running the test command in Bash; it \
+returns failures only; `graph_recent_changes` shows what's been churning lately. This project also has \
 session memory: call `context_recall` at the start of a follow-up task to reload what this session \
 has been working on, and `context_note` to record a non-obvious decision (pin=true to keep it \
 across sessions) so it survives into later sessions.";

@@ -270,6 +270,18 @@
     return KNOWN_SOURCES.has(source) ? ` ${source}` : '';
   }
 
+  // Sources that are TELEMETRY CHANNELS rather than tool invocations:
+  // `read_advisor` reports advisor reminders and full-file-Read bypasses,
+  // `harness` reports contract/sub-agent drift. Both record `ok: false` to mean
+  // "this signal fired", not "this call failed" — so painting them with the
+  // error colour made the feed read as mostly-broken when nothing had broken
+  // (20 of 28 red rows on this machine were bypass canaries). They get their own
+  // muted treatment and a "signal" label instead of "failed".
+  const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
+  function isCanary(e: ActivityEntry): boolean {
+    return !e.ok && CANARY_SOURCES.has(e.source);
+  }
+
   function rowMain(e: ActivityEntry): string {
     // mcp tools are namespaced `<server>__<tool>` — render the first `__`
     // as a separator so the server reads as a prefix.
@@ -344,7 +356,8 @@
           {#each entries as r (r.id)}
             <div
               class="hrow"
-              class:err={!r.ok}
+              class:err={!r.ok && !isCanary(r)}
+              class:canary={isCanary(r)}
               role="button"
               tabindex="0"
               onclick={() => void openDetail(r.id)}
@@ -432,7 +445,8 @@
         <div class="detail-title">
           <span class="hkind {detail.kind}">{detail.kind}</span>
           <span class="detail-tool">{detail.tool}</span>
-          {#if !detail.ok}<span class="detail-failed">failed</span>{/if}
+          {#if isCanary(detail)}<span class="detail-signal">signal</span>
+          {:else if !detail.ok}<span class="detail-failed">failed</span>{/if}
         </div>
         <button type="button" class="detail-close" onclick={closeDetail} aria-label="Close">×</button>
       </header>
@@ -647,6 +661,11 @@
   .hrow.err {
     color: var(--text-danger-soft, #ffb4ab);
   }
+  /* Canary rows: a fired signal, not a failure — visibly distinct from a normal
+     row but never the error colour. */
+  .hrow.canary {
+    color: var(--text-warning, #e3b341);
+  }
   /* Per-row delete: kept invisible until the row is hovered/focused so the
      feed stays visually calm. */
   .hdel {
@@ -785,6 +804,11 @@
   }
   .detail-failed {
     color: var(--text-danger-soft, #ffb4ab);
+    text-transform: uppercase;
+    font-size: 0.8em;
+  }
+  .detail-signal {
+    color: var(--text-warning, #e3b341);
     text-transform: uppercase;
     font-size: 0.8em;
   }

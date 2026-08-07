@@ -381,15 +381,20 @@ pub struct SurfaceStats {
 /// - `semantic_search`— gates `graph_semantic_docs` in both.
 /// - `embed_code_bodies` — gates `graph_semantic_code` in both.
 /// - `lean_tools`     — drops [`LEAN_HIDDEN`] from both.
-/// - `has_checks`     — gates `run_check` in [`tools`] (only emptiness matters;
-///   the spec text is fixed, independent of the checks' contents).
+/// - `checks_sig`     — gates `run_check` in [`tools`] AND fixes its schema.
+///   Emptiness alone is NOT enough: [`run_check_spec`] bakes the configured
+///   check NAMES into `name`'s `enum`/description and flips `required` on the
+///   one-vs-many boundary, so renaming a check or adding a second one changes
+///   the advertised bytes without changing emptiness. Hashing the names (in
+///   order) covers every input the spec reads — an empty list hashes to its own
+///   distinct value, so this subsumes the old `has_checks` bool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SurfaceFingerprint {
     graph_enabled: bool,
     semantic_search: bool,
     embed_code_bodies: bool,
     lean_tools: bool,
-    has_checks: bool,
+    checks_sig: u64,
 }
 
 impl SurfaceFingerprint {
@@ -399,9 +404,22 @@ impl SurfaceFingerprint {
             semantic_search: settings.graph.semantic_search,
             embed_code_bodies: settings.graph.embed_code_bodies,
             lean_tools: settings.graph.lean_tools,
-            has_checks: !settings.checks.is_empty(),
+            checks_sig: checks_sig(settings),
         }
     }
+}
+
+/// Hash the configured check names, in order — every input [`run_check_spec`]
+/// reads. Process-local memo key only, so `DefaultHasher`'s
+/// unstable-across-releases hash is fine; it never leaves this process.
+fn checks_sig(settings: &crate::settings::Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    settings.checks.len().hash(&mut h);
+    for c in &settings.checks {
+        c.name.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Process-wide memo for [`surface_stats`]: `(fingerprint, stats)`. `None` until
@@ -578,6 +596,13 @@ pub(crate) async fn dispatch_recorded(
 ) -> Result<String, String> {
     let (max_rows, max_snippet) = limits(settings);
     let started = crate::activity::now_ms();
+    // Single normalization point for every graph tool on both surfaces (MCP and
+    // the offload worker both land here). `raw_args` stays the recorded request
+    // so a mis-keyed call is still visible in the activity detail rather than
+    // silently rewritten — the alias fixes the call, the log keeps the evidence.
+    let raw_args = args;
+    let normalized = normalize_arg_aliases(name, args);
+    let args: &Value = &normalized;
     let result = if name == "graph_semantic_docs" {
         // F8: `query` is schema-required — enforce it on THIS (primary async)
         // path too, not just in `run_tool`. An empty query would embed "" and
@@ -644,7 +669,7 @@ pub(crate) async fn dispatch_recorded(
             crate::activity::now_ms().saturating_sub(started),
             result.is_ok(),
         ),
-        request: serde_json::to_string_pretty(args).unwrap_or_default(),
+        request: serde_json::to_string_pretty(raw_args).unwrap_or_default(),
         response: activity_response(&result),
     });
     result
@@ -692,9 +717,57 @@ fn arg_summary(name: &str, args: &Value) -> String {
         .to_string()
 }
 
-/// Run one graph tool against an open index and format its result as compact,
-/// token-bounded text. Shared by the MCP adapter and the offload worker. `Err`
-/// is a human-readable message the caller surfaces to its model.
+/// Tolerated argument-name aliases, keyed by tool: `(tool, alias, canonical)`.
+///
+/// Model callers reliably guess a *plausible* key over the declared one when a
+/// tool breaks the convention its neighbours follow, and each guess costs a
+/// wasted round trip that the schema alone does not prevent. Both entries here
+/// were observed failing in the live activity log: every other `graph_*` lookup
+/// takes `name`, so `graph_snippet`/`graph_tests_for`'s `symbol` is the odd one
+/// out; and `context_note`'s payload key is `text` while the tool is *called*
+/// note.
+///
+/// This is normalization, NOT a relaxation of validation — the canonical key is
+/// still what every downstream reader requires (`require_str` et al). An alias
+/// only fills a canonical slot that is otherwise absent or blank, so a caller
+/// that sends the real key always wins and no tool gains a new argument.
+const ARG_ALIASES: &[(&str, &str, &str)] = &[
+    ("graph_snippet", "name", "symbol"),
+    ("graph_tests_for", "name", "symbol"),
+    ("context_note", "note", "text"),
+];
+
+/// Apply [`ARG_ALIASES`] for `tool`. Borrows unchanged in the common case (no
+/// alias present), so the funnel pays nothing when callers get the key right.
+fn normalize_arg_aliases<'a>(tool: &str, args: &'a Value) -> std::borrow::Cow<'a, Value> {
+    let mut out = std::borrow::Cow::Borrowed(args);
+    for (t, alias, canonical) in ARG_ALIASES {
+        if *t != tool {
+            continue;
+        }
+        // Only a non-blank string alias, and only into an absent/blank slot.
+        let Some(Value::String(v)) = args.get(alias) else {
+            continue;
+        };
+        if v.trim().is_empty() {
+            continue;
+        }
+        let canonical_vacant = match args.get(canonical) {
+            Some(Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+            None => true,
+        };
+        if !canonical_vacant {
+            continue;
+        }
+        let v = Value::String(v.clone());
+        if let Some(obj) = out.to_mut().as_object_mut() {
+            obj.insert((*canonical).to_string(), v);
+        }
+    }
+    out
+}
+
 /// A required string arg. Rejects missing / blank / wrong-typed values rather
 /// than silently coercing them to "" — a `find_symbol("")` (from a `null` or
 /// numeric arg the LLM sent) would otherwise match everything or nothing and
@@ -743,6 +816,9 @@ fn maybe_recall_envelope(out: String, guards: CallGuards) -> String {
     }
 }
 
+/// Run one graph tool against an open index and format its result as compact,
+/// token-bounded text. Shared by the MCP adapter and the offload worker. `Err`
+/// is a human-readable message the caller surfaces to its model.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tool(
     idx: &GraphIndex,
@@ -1014,23 +1090,61 @@ pub fn semantic_code_spec() -> GraphToolSpec {
 
 /// The `run_check` tool spec (V12 Phase A), advertised only when `checks` is
 /// non-empty (see [`tools`]) — independent of the graph tool set.
+///
+/// The **schema is project-scoped**: `name`'s `enum` carries this project's
+/// actual check names, and `name` is `required` whenever more than one is
+/// configured. Prose alone did not carry that — a static `"required": []` plus
+/// "omit it when only one is configured" left the caller no way to know that
+/// *this* project configures three, and the live activity log showed
+/// `run_check {changed_only: true}` failing on it repeatedly. A schema the
+/// caller cannot satisfy by reading it is a defect in the schema, not the
+/// caller. Consumers of the resulting spec text/enum must fold the check names
+/// into their cache key — see [`SurfaceFingerprint`].
 pub fn run_check_spec() -> GraphToolSpec {
+    run_check_spec_for(&current_settings())
+}
+
+/// Pure half of [`run_check_spec`], so the project-scoped schema is testable
+/// without reaching through the global settings snapshot.
+fn run_check_spec_for(settings: &crate::settings::Settings) -> GraphToolSpec {
+    let names: Vec<&str> = settings.checks.iter().map(|c| c.name.as_str()).collect();
+    let mut name_prop = serde_json::Map::new();
+    name_prop.insert("type".into(), Value::String("string".into()));
+    name_prop.insert(
+        "description".into(),
+        Value::String(if names.len() > 1 {
+            format!(
+                "REQUIRED — which configured check to run. This project configures {}: {}.",
+                names.len(),
+                names.join(", ")
+            )
+        } else {
+            "Which configured check to run. Omit if only one is configured.".to_string()
+        }),
+    );
+    if !names.is_empty() {
+        name_prop.insert(
+            "enum".into(),
+            Value::Array(names.iter().map(|n| Value::String((*n).into())).collect()),
+        );
+    }
     GraphToolSpec {
         name: "run_check",
         description: "Run one of this project's configured checker commands (build / typecheck / \
             lint / test) and get back DEDUPLICATED, STRUCTURED diagnostics instead of a raw dump — \
             the cheap way to see what broke after an edit. `name` selects among the project's \
-            configured checks (omit it when only one is configured; an unknown or omitted-with- \
-            multiple name returns the list of configured names). The command itself is fixed by the \
-            user's project config — never model-supplied. `changed_only: true` filters diagnostics \
-            to files touched since HEAD (pairs well with editing loops).",
+            configured checks — the `name` enum in this schema is the exact list, and `name` is \
+            REQUIRED when the project configures more than one (calling without it just returns \
+            the list, costing a round trip). The command itself is fixed by the user's project \
+            config — never model-supplied. `changed_only: true` filters diagnostics to files \
+            touched since HEAD (pairs well with editing loops).",
         parameters: json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "Which configured check to run. Omit if only one is configured." },
+                "name": Value::Object(name_prop),
                 "changed_only": { "type": "boolean", "description": "Filter diagnostics to files changed since HEAD. Default false." }
             },
-            "required": []
+            "required": if names.len() > 1 { json!(["name"]) } else { json!([]) }
         }),
     }
 }
@@ -1099,9 +1213,15 @@ async fn run_check_inner(
     let def = if requested.is_empty() {
         match settings.checks.as_slice() {
             [only] => only,
+            // Informational, not a failure: the caller asked which checks exist
+            // and gets the list. Returning `Err` here marked a well-formed
+            // discovery call as a failed tool call in the activity feed (and in
+            // the model's transcript) when nothing had actually gone wrong.
+            // An UNKNOWN name below stays an error — that IS a caller mistake.
             _ => {
-                return Err(format!(
-                    "run_check needs a `name` — this project has {} configured checks: {}",
+                return Ok(format!(
+                    "run_check needs a `name` — this project has {} configured checks: {}. \
+                     Re-call with one of those names.",
                     settings.checks.len(),
                     names()
                 ))
@@ -2348,7 +2468,7 @@ pub(crate) fn find_graph_root(start: &Path, sub: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod run_check_tests {
-    use super::{fmt_check_report, run_check_inner, run_check_spec};
+    use super::{fmt_check_report, run_check_inner};
     use crate::checks::{CheckDef, CheckReport, DiagGroup, ParserKind, Severity};
     use crate::settings::Settings;
     use serde_json::json;
@@ -2363,11 +2483,70 @@ mod run_check_tests {
         }
     }
 
+    /// The schema must be self-sufficient: a caller that reads it and nothing
+    /// else has to be able to produce a call this project accepts. With several
+    /// checks configured that means `name` is `required` and its `enum` names
+    /// them — the exact gap that made `run_check {changed_only: true}` the most
+    /// frequent failed tool call in the live activity log.
     #[test]
-    fn spec_has_no_required_args() {
-        let spec = run_check_spec();
+    fn spec_requires_and_enumerates_name_when_several_checks_exist() {
+        let settings = Settings {
+            checks: vec![
+                def("cargo-check", "cargo check"),
+                def("cargo-test", "cargo test"),
+                def("tsc", "tsc --noEmit"),
+            ],
+            ..Settings::default()
+        };
+        let spec = super::run_check_spec_for(&settings);
         assert_eq!(spec.name, "run_check");
+        assert_eq!(spec.parameters["required"], json!(["name"]));
+        assert_eq!(
+            spec.parameters["properties"]["name"]["enum"],
+            json!(["cargo-check", "cargo-test", "tsc"])
+        );
+    }
+
+    /// A sole check keeps the historical ergonomics — `name` stays optional so
+    /// the zero-arg call still works — but is still enumerated.
+    #[test]
+    fn spec_leaves_name_optional_for_a_sole_check() {
+        let settings = Settings {
+            checks: vec![def("only", "cargo check")],
+            ..Settings::default()
+        };
+        let spec = super::run_check_spec_for(&settings);
         assert_eq!(spec.parameters["required"], json!([]));
+        assert_eq!(
+            spec.parameters["properties"]["name"]["enum"],
+            json!(["only"])
+        );
+    }
+
+    #[test]
+    fn spec_omits_the_enum_when_no_checks_are_configured() {
+        let spec = super::run_check_spec_for(&Settings::default());
+        assert_eq!(spec.parameters["required"], json!([]));
+        assert_eq!(spec.parameters["properties"]["name"]["enum"], json!(null));
+    }
+
+    /// The advertised bytes now depend on the check NAMES, so the memo key must
+    /// too — renaming a check with the count unchanged has to invalidate the
+    /// cache, which the old `has_checks: bool` could not see.
+    #[test]
+    fn surface_fingerprint_tracks_check_names_not_just_emptiness() {
+        let with = |names: &[&str]| Settings {
+            checks: names.iter().map(|n| def(n, "cargo check")).collect(),
+            ..Settings::default()
+        };
+        let a = super::SurfaceFingerprint::of(&with(&["cargo"]));
+        let renamed = super::SurfaceFingerprint::of(&with(&["tsc"]));
+        let added = super::SurfaceFingerprint::of(&with(&["cargo", "tsc"]));
+        let none = super::SurfaceFingerprint::of(&Settings::default());
+        assert_ne!(a, renamed, "a rename must invalidate the surface cache");
+        assert_ne!(a, added);
+        assert_ne!(a, none);
+        assert_eq!(a, super::SurfaceFingerprint::of(&with(&["cargo"])));
     }
 
     #[tokio::test]
@@ -2394,17 +2573,21 @@ mod run_check_tests {
         assert!(err.contains("cargo"), "{err}");
     }
 
+    /// Omitting `name` is a DISCOVERY call, not a failure: it answers with the
+    /// list. Returning `Err` here logged a well-formed call as a failed tool
+    /// call in the activity feed and the model's transcript. (An unknown name
+    /// stays an error — see `unknown_name_lists_configured_checks`.)
     #[tokio::test]
     async fn ambiguous_without_name_lists_configured_checks() {
         let settings = Settings {
             checks: vec![def("cargo", "cargo check"), def("tsc", "tsc --noEmit")],
             ..Settings::default()
         };
-        let err = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
+        let out = run_check_inner(&std::env::temp_dir(), &settings, &json!({}))
             .await
-            .expect_err("multiple configured checks with no name should error");
-        assert!(err.contains("needs a `name`"), "{err}");
-        assert!(err.contains("cargo") && err.contains("tsc"), "{err}");
+            .expect("omitted name should inform, not fail");
+        assert!(out.contains("needs a `name`"), "{out}");
+        assert!(out.contains("cargo") && out.contains("tsc"), "{out}");
     }
 
     #[tokio::test]
@@ -2487,6 +2670,60 @@ mod run_check_tests {
         // V21 F6: a timed-out check must carry the "unverified" cue so the
         // worker reports it as a non-result (composes with F2).
         assert!(out.to_uppercase().contains("UNVERIFIED"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod arg_alias_tests {
+    use super::normalize_arg_aliases;
+    use serde_json::json;
+
+    #[test]
+    fn fills_the_canonical_key_from_a_known_alias() {
+        // The two shapes observed failing in the live activity log.
+        let snippet = json!({ "name": "record_bg" });
+        assert_eq!(
+            normalize_arg_aliases("graph_snippet", &snippet)["symbol"],
+            json!("record_bg")
+        );
+        let note = json!({ "note": "hi", "pin": true });
+        let out = normalize_arg_aliases("context_note", &note);
+        assert_eq!(out["text"], json!("hi"));
+        // Untouched siblings ride along.
+        assert_eq!(out["pin"], json!(true));
+    }
+
+    #[test]
+    fn never_overrides_an_explicit_canonical_value() {
+        let args = json!({ "name": "wrong", "symbol": "right" });
+        let out = normalize_arg_aliases("graph_snippet", &args);
+        assert_eq!(out["symbol"], json!("right"));
+    }
+
+    #[test]
+    fn ignores_blank_aliases_and_unrelated_tools() {
+        // A blank alias must not manufacture an empty canonical value — that
+        // would turn a clear "requires a non-empty string" error into a silent
+        // match-everything/match-nothing query.
+        let args = json!({ "name": "   " });
+        assert_eq!(
+            normalize_arg_aliases("graph_snippet", &args)["symbol"],
+            json!(null)
+        );
+        // `name` is the real key for every other graph tool — leave it alone.
+        let args = json!({ "name": "embed" });
+        let other = normalize_arg_aliases("graph_find_symbol", &args);
+        assert_eq!(other["symbol"], json!(null));
+        assert_eq!(other["name"], json!("embed"));
+    }
+
+    #[test]
+    fn borrows_when_there_is_nothing_to_rewrite() {
+        let args = json!({ "symbol": "alpha" });
+        assert!(matches!(
+            normalize_arg_aliases("graph_snippet", &args),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }
 

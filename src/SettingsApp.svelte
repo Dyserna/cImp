@@ -452,119 +452,139 @@
       ?.features.find((f) => f.feature === 'detection')?.effective ?? true,
   );
 
-  /// The feature rows the matrix renders, in the backend's `Feature::ALL` order.
-  /// `field` is the L2 settings key; `scopes` names which override rows the
-  /// feature HAS (mirroring `Feature::has_tab_scope` / `has_worker_scope` —
-  /// worker-only and app-wide controls must not offer rows they cannot store).
-  type InjectionFeatureRow = {
-    key: string;
-    /// The L2 settings key on `offload.injection`. Typed as a keyof rather than
-    /// a bare string so a renamed flag is a compile error here, not a silently
-    /// dead checkbox.
-    field: keyof InjectionSettings;
-    label: string;
-    spawnBaked: boolean;
-    /// Which override rows this feature HAS: `worker` for the offload-worker
-    /// pseudo-scope, `tabs` for every AI tab. Empty for the app-wide control.
-    /// Mirrors `Feature::has_tab_scope` / `has_worker_scope` — the UI must not
-    /// offer a cell the backend has nowhere to store.
-    scopes: string[];
+  /// The per-feature copy this window still owns: the hint text, and the L2
+  /// settings key when it cannot be derived.
+  ///
+  /// **Everything else now comes from the backend's report** (#48, F-y). This
+  /// table used to carry eleven literal rows duplicating each feature's key,
+  /// label, `spawnBaked` and scope predicates — a hand-kept mirror of
+  /// `Feature::ALL`, `label()`, `spawn_baked()` and `has_tab_scope()` /
+  /// `has_worker_scope()`, with no drift guard. #47 made every *Rust* mirror a
+  /// compile error, which quietly made this worse: the seven errors a new
+  /// variant now produces all point at Rust files, so the prompt that used to
+  /// sit beside a hand-edited `const ALL` array is gone and this was the only
+  /// enumeration left with no signal at all. A V33 control would have shipped
+  /// with a status-bar warning naming it and no checkbox here to change it.
+  ///
+  /// So the matrix renders from `injection.scopes`, and a feature missing from
+  /// this table is missing its HINT, not its control.
+  type InjectionFeatureMeta = {
+    /// The L2 settings key on `offload.injection`. Omit to derive it by the
+    /// `<feature>_enabled` convention every flag follows; `null` for a feature
+    /// with no boolean L2 at all, whose row is then read-only.
+    ///
+    /// Typed as a keyof rather than a bare string so a renamed flag is a compile
+    /// error here, not a silently dead checkbox. It was previously `'protection'`
+    /// — the GLOBAL MASTER — as filler on the native-web row; doubly guarded and
+    /// inert, but `keyof InjectionSettings` permitted it, and one regressed guard
+    /// would have made that checkbox toggle L1.
+    field?: keyof InjectionSettings | null;
     hint: string;
   };
 
-  const INJECTION_FEATURES: InjectionFeatureRow[] = [
-    {
-      key: 'taint_latch',
-      field: 'taint_latch_enabled',
-      label: 'Taint latch',
-      spawnBaked: false,
-      scopes: ['worker', 'tabs'],
+  const INJECTION_FEATURE_META: Record<string, InjectionFeatureMeta> = {
+    taint_latch: {
       hint: 'Bidirectional mutual exclusion between external (web/MCP) tools and local file/source-text tools, per task and per tab session. Off: no latching, no refusals, and the offload worker advertises its whole tool surface all run.',
     },
-    {
-      key: 'spotlighting',
-      field: 'spotlighting_enabled',
-      label: 'Spotlighting envelope',
-      spawnBaked: false,
-      scopes: ['worker', 'tabs'],
+    spotlighting: {
       hint: 'Wraps every external tool result and every recalled memory in nonced data-not-instructions markers. Off: results arrive as raw text, with no standing instruction around them.',
     },
-    {
-      key: 'detection',
-      field: 'detection_enabled',
-      label: 'Injection detection',
-      spawnBaked: false,
-      scopes: ['worker', 'tabs'],
+    detection: {
       hint: 'Parent of the signature and classifier layers below — off here disables both regardless of their own toggles.',
     },
-    {
-      key: 'ssrf_guard',
-      field: 'ssrf_guard_enabled',
-      label: 'SSRF guard',
-      spawnBaked: false,
-      scopes: ['worker', 'tabs'],
+    ssrf_guard: {
       hint: 'Screens every outbound fetch URL against the private/loopback/link-local ranges before the call leaves the machine. Off: an injected page can point a fetch at your LAN.',
     },
-    {
-      key: 'fetch_budgets',
-      field: 'fetch_budgets_enabled',
-      label: 'Fetch budgets',
-      spawnBaked: false,
-      scopes: ['worker', 'tabs'],
+    fetch_budgets: {
       hint: 'The on/off above the call/byte caps below. Off: neither cap applies, whatever their numbers say.',
     },
-    {
-      key: 'canary',
-      field: 'canary_enabled',
-      label: 'Canary (offload worker)',
-      spawnBaked: false,
-      scopes: ['worker'],
+    canary: {
       hint: 'A per-task marker planted in the worker’s system context; seeing it leave in a tool argument aborts the task. Worker-only — a Claude/OpenCode system prompt is not ours to mark.',
     },
-    {
-      key: 'memory_quarantine',
-      field: 'memory_quarantine_enabled',
-      label: 'Memory quarantine',
-      spawnBaked: false,
-      scopes: ['tabs'],
+    memory_quarantine: {
       hint: 'Notes written by a conversation that has read external content are stored held-for-review instead of entering project memory. Off: they are stored normally. Notes ALREADY held stay held — turning this off never releases them.',
     },
-    {
-      key: 'native_web',
-      field: 'protection',
-      label: 'Native-web visibility',
-      spawnBaked: true,
-      scopes: ['tabs'],
+    native_web: {
+      // No boolean L2: `native_web_visibility`'s tri-mode IS this feature's
+      // app-wide switch (the Phase G reconciliation), so there is no field to
+      // bind and the checkbox is read-only.
+      field: null,
       hint: 'Set by the Native web tools mode below, which is this feature’s app-wide switch — its "off" IS this control off. Use the per-tab overrides here to exempt or force one tab.',
     },
-    {
-      key: 'consumer_hygiene',
-      field: 'consumer_hygiene_enabled',
-      label: 'Consumer hygiene',
-      spawnBaked: true,
-      scopes: ['tabs'],
+    consumer_hygiene: {
       hint: 'The pinned OpenCode permission block and the data-not-instructions paragraph in the session guidance. Off: OpenCode inherits its upstream defaults and the session is never told how to read cImp’s markers.',
     },
-    {
-      key: 'opencode_native_gate',
-      field: 'opencode_native_gate_enabled',
-      label: 'OpenCode native-tool gating',
-      spawnBaked: true,
-      scopes: ['tabs'],
+    opencode_native_gate: {
       hint: 'OFF BY DEFAULT — the only control here that does. With it on, an OpenCode tab that has read external content is refused its OWN bash/read/edit/write/patch/glob/grep for the rest of the session (and, having gone local first, its own webfetch/websearch instead). Whole-surface by design: a partial gate is routed around. Policy, not containment — it runs inside OpenCode’s process, so a nested ungated `opencode`, OPENCODE_PURE=1, a user-typed !shell and the raw terminal all bypass it. A per-tab override is the usual way in; it does nothing on Claude tabs.',
     },
-    {
-      key: 'terminal_escape_hygiene',
-      field: 'terminal_escape_hygiene_enabled',
-      label: 'Terminal escape hygiene',
-      spawnBaked: false,
-      scopes: [],
+    terminal_escape_hygiene: {
       hint: 'Strips ANSI/OSC control sequences (including OSC 52 clipboard writes) out of external text cImp composes into spoken/toast output. Off: a fetched page’s escape sequences travel with the text.',
     },
-  ];
+  };
 
+  /// One matrix row, composed from the backend report plus the local meta.
+  type InjectionFeatureRow = {
+    key: string;
+    label: string;
+    spawnBaked: boolean;
+    /// `null` ⇒ no boolean L2 to bind; the checkbox is read-only.
+    field: keyof InjectionSettings | null;
+    hint: string;
+  };
+
+  /// The L2 settings key for a feature: the meta table's, or the convention
+  /// every flag follows. Checked against the live snapshot rather than assumed,
+  /// so a convention-derived name that does not exist yields `null` (a read-only
+  /// row) instead of a checkbox bound to `undefined`.
+  function injectionL2Field(key: string): keyof InjectionSettings | null {
+    const meta = INJECTION_FEATURE_META[key];
+    if (meta && meta.field !== undefined) return meta.field;
+    const derived = `${key}_enabled`;
+    return snapshot && derived in snapshot.offload.injection
+      ? (derived as keyof InjectionSettings)
+      : null;
+  }
+
+  /// The matrix rows, in the backend's `Feature::ALL` order. Every scope reports
+  /// every feature, so the first scope that has been reported is enough; the
+  /// union is taken anyway so a future partial report loses nothing.
+  const injectionRows = $derived.by((): InjectionFeatureRow[] => {
+    const seen = new Map<string, InjectionFeatureRow>();
+    for (const scope of injection?.scopes ?? []) {
+      for (const f of scope.features) {
+        if (seen.has(f.feature)) continue;
+        seen.set(f.feature, {
+          key: f.feature,
+          label: f.label,
+          spawnBaked: f.spawn_baked,
+          field: injectionL2Field(f.feature),
+          hint: INJECTION_FEATURE_META[f.feature]?.hint ?? '',
+        });
+      }
+    }
+    return [...seen.values()];
+  });
+
+  /// A feature's app-wide L2 value, for the read-only display and for the
+  /// "Inherit (on/off)" label on every override cell. One reader, because the
+  /// tri-mode exception below used to be spelled out at each of them.
+  function injectionL2On(f: InjectionFeatureRow): boolean {
+    if (!snapshot) return false;
+    if (f.field) return snapshot.offload.injection[f.field] as boolean;
+    // The one feature with no boolean L2 (see the meta table). Its app-wide
+    // switch is the `native_web_visibility` select below; `off` IS this control
+    // off.
+    return f.key === 'native_web' ? snapshot.offload.native_web_visibility !== 'off' : false;
+  }
 
   /// One override cell, resolved for display.
+  ///
+  /// Which scopes a feature HAS comes from the report's `in_scope` (#48, F-y) —
+  /// it is `Feature::has_tab_scope` / `has_worker_scope` as the backend answers
+  /// them, rather than a TypeScript copy of the same two predicates. The stored
+  /// cell value still comes from `snapshot`, which is live: the report reflects
+  /// SAVED settings, so binding the select to it would make a just-changed cell
+  /// snap back until the debounced save and the next poll landed.
   function injectionScopeRows(f: InjectionFeatureRow): Array<{
     scope: string;
     label: string;
@@ -580,46 +600,34 @@
       inherited: boolean;
       resolved: string;
     }> = [];
-    // The app-wide value a cell inherits. Native-web's L2 is its tri-mode, not
-    // a boolean (the Phase G reconciliation), so it is read from there.
-    const inherited =
-      f.key === 'native_web'
-        ? snapshot.offload.native_web_visibility !== 'off'
-        : (snapshot.offload.injection[f.field] as boolean);
-    const push = (scope: string, label: string, value: string): void => {
-      const row = injection?.scopes
-        .find((s) => s.scope === scope)
-        ?.features.find((x) => x.feature === f.key);
+    const inherited = injectionL2On(f);
+    for (const scope of injection?.scopes ?? []) {
+      // The app scope has no override cells — it is the level the cells inherit
+      // FROM — so it is reported but never rendered as a row here.
+      if (scope.scope === 'app') continue;
+      const row = scope.features.find((x) => x.feature === f.key);
+      if (!row?.in_scope) continue;
+      const stored =
+        scope.scope === 'offload-worker'
+          ? (snapshot.offload.injection.worker as unknown as Record<string, string>)[f.key]
+          : (
+              snapshot.tabs.find((t) => t.kind === 'ai_tool' && t.id === scope.scope) as
+                | { injection_overrides?: Record<string, string> }
+                | undefined
+            )?.injection_overrides?.[f.key];
       const why =
-        row?.decided_by === 'global'
+        row.decided_by === 'global'
           ? 'master'
-          : row?.decided_by === 'scope'
+          : row.decided_by === 'scope'
             ? 'this scope'
             : 'app-wide';
       out.push({
-        scope,
-        label,
-        value,
+        scope: scope.scope,
+        label: scope.label,
+        value: stored ?? 'inherit',
         inherited,
-        resolved: row ? `→ ${row.effective ? 'on' : 'off'} (${why})` : '',
+        resolved: `→ ${row.effective ? 'on' : 'off'} (${why})`,
       });
-    };
-    if (f.scopes.includes('worker')) {
-      push(
-        'offload-worker',
-        'Offload worker',
-        (snapshot.offload.injection.worker as unknown as Record<string, string>)[f.key] ?? 'inherit',
-      );
-    }
-    if (f.scopes.includes('tabs')) {
-      for (const t of snapshot.tabs) {
-        if (t.kind !== 'ai_tool') continue;
-        push(
-          t.id,
-          t.name,
-          (t.injection_overrides as unknown as Record<string, string>)?.[f.key] ?? 'inherit',
-        );
-      }
     }
     return out;
   }
@@ -4361,31 +4369,38 @@
               per-feature switches below are the smaller instrument.
             </small>
           {/if}
-          {#each INJECTION_FEATURES as f (f.key)}
+          {#if injectionRows.length === 0}
+            <small class="hint down">
+              ⚠ The resolved injection state could not be read from the backend,
+              so the per-feature matrix cannot be rendered — it is built from
+              that report rather than from a second copy of the feature list.
+              The master switch above still applies. Check the console.
+            </small>
+          {/if}
+          {#each injectionRows as f (f.key)}
             <div class="updater-row">
               <label class="checkbox">
                 <input
                   type="checkbox"
-                  disabled={!snapshot.offload.injection.protection || f.key === 'native_web'}
-                  checked={f.key === 'native_web'
-                    ? snapshot.offload.native_web_visibility !== 'off'
-                    : (snapshot.offload.injection[f.field] as boolean)}
+                  disabled={!snapshot.offload.injection.protection || f.field === null}
+                  checked={injectionL2On(f)}
                   onchange={(e) => {
-                    // Native-web's L2 IS the tri-mode select in "Native web
-                    // tools" below (its `off` is this feature's off), so this
-                    // row shows the derived value read-only. Guarded as well as
-                    // `disabled` because a checkbox that could write here would
-                    // put the same decision in two controls — the contradictory
-                    // state the Phase G reconciliation exists to prevent.
-                    if (f.key === 'native_web') return;
+                    // A feature with no boolean L2 (native-web: its L2 IS the
+                    // tri-mode select in "Native web tools" below) shows the
+                    // derived value read-only. Guarded as well as `disabled`
+                    // because a checkbox that could write here would put the
+                    // same decision in two controls — the contradictory state
+                    // the Phase G reconciliation exists to prevent.
+                    const field = f.field;
+                    if (field === null) return;
                     const on = (e.currentTarget as HTMLInputElement).checked;
-                    patch((s) => ((s.offload.injection[f.field] as boolean) = on));
+                    patch((s) => ((s.offload.injection[field] as boolean) = on));
                   }}
                 />
                 <span>{f.label}{f.spawnBaked ? ' (needs a tab restart)' : ''}</span>
               </label>
-              <small class="hint">{f.hint}</small>
-              {#if f.scopes.length > 0}
+              {#if f.hint}<small class="hint">{f.hint}</small>{/if}
+              {#if injectionScopeRows(f).length > 0}
                 <div class="row">
                   {#each injectionScopeRows(f) as sc (sc.scope)}
                     <label class="inline-override">
@@ -4409,8 +4424,10 @@
                 </div>
               {:else}
                 <small class="hint">
-                  App-wide only — TTS and toasts are global surfaces, so this
-                  control has no per-tab or per-worker override.
+                  App-wide only — the backend reports no per-tab or per-worker
+                  override row for this control, so there is nothing narrower to
+                  set. (Terminal escape hygiene is the case that exists today:
+                  TTS and toasts are global surfaces.)
                 </small>
               {/if}
             </div>

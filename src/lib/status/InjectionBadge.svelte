@@ -14,29 +14,33 @@
   //
   // Two levels of severity, because they mean very different things:
   //   * the MASTER is off  — every V32 control is inert, everywhere;
-  //   * something is off   — some feature is disabled at some scope.
+  //   * something is off   — some feature is disabled at some scope;
+  //   * the state is UNKNOWN — the poll behind this chip has failed for several
+  //     ticks running (#48, G-3). Rendering nothing there would be the one
+  //     failure this surface cannot have: "no chip" reads as "fully protected",
+  //     which is exactly the off-and-forgotten state decision 16 forbids.
   // Clicking opens Settings, where the matrix says exactly which and why.
   import { openSettingsWindow } from '../settings/ipc';
-  import { injectionStatus } from '../latch';
+  import { injectionStatus, injectionStatusUnknown, reducedSummary } from '../latch';
 
   const status = $derived($injectionStatus);
-  const masterOff = $derived(!!status && !status.protection);
-  const visible = $derived(!!status?.reduced);
+  const unknown = $derived($injectionStatusUnknown);
+  const masterOff = $derived(!unknown && !!status && !status.protection);
+  const visible = $derived(unknown || !!status?.reduced);
 
-  /// How many (scope, feature) pairs are switched off, for the tooltip. Counted
-  /// over rows the scope actually HAS — a tab is not "reduced" because the
-  /// worker-only canary does not apply to it.
-  const offCount = $derived(
-    (status?.scopes ?? []).reduce(
-      (n, s) => n + s.features.filter((f) => f.in_scope && !f.effective).length,
-      0,
-    ),
-  );
+  /// What is reduced, in the tooltip's words. The rule is `latch.ts`'s
+  /// `isReducedRow` — the same one the tab badge beside this chip uses — rather
+  /// than a third copy of it (#48, G-2): the chip previously counted
+  /// `in_scope && !effective`, omitting the `default_on` clause Phase H
+  /// published specifically to prevent the two disagreeing in one viewport.
+  const summary = $derived(reducedSummary(status));
 
   const title = $derived(
-    masterOff
-      ? 'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings.'
-      : `Injection protection is reduced — ${offCount} control${offCount === 1 ? '' : 's'} switched off. Click to open Settings.`,
+    unknown
+      ? 'Injection protection state is UNKNOWN — cImp has not been able to read it for several polls, so this app cannot tell you what is switched on. Check the console. Click to open Settings.'
+      : masterOff
+        ? 'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings.'
+        : `Injection protection is reduced — ${summary}. Click to open Settings.`,
   );
 </script>
 
@@ -45,12 +49,13 @@
     type="button"
     class="status-button injection"
     class:master-off={masterOff}
+    class:unknown
     onclick={() => void openSettingsWindow()}
     {title}
     aria-label={title}
   >
     <span class="glyph" aria-hidden="true">⛨</span>
-    <span class="text">{masterOff ? 'off' : 'reduced'}</span>
+    <span class="text">{unknown ? 'unknown' : masterOff ? 'off' : 'reduced'}</span>
   </button>
 {/if}
 
@@ -80,6 +85,13 @@
   .master-off {
     color: var(--text-danger-soft);
     border-color: var(--text-danger-soft);
+  }
+  /* "Unknown" is not "off": it is a broken instrument, not a posture the user
+     chose. Same weight as the reduced state, dashed so it does not read as a
+     confident claim about anything (#48, G-3). */
+  .unknown {
+    border-style: dashed;
+    border-color: var(--awaiting);
   }
   .status-button:hover {
     background: var(--surface-3);

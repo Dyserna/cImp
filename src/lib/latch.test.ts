@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   reducedFeaturesFor,
+  isReducedRow,
+  reducedSummary,
+  recordPoll,
+  HEALTHY_POLL,
+  UNKNOWN_AFTER_FAILURES,
   isTainted,
   withSignatureHealth,
   SIGNATURE_RULES_FEATURE,
@@ -26,6 +31,7 @@ function feature(over: Partial<FeatureState>): FeatureState {
     override_value: 'inherit',
     in_scope: true,
     default_on: true,
+    spawn_baked: false,
     ...over,
   };
 }
@@ -74,6 +80,108 @@ describe('reducedFeaturesFor', () => {
   it('reports nothing for an unknown tab or a missing status', () => {
     expect(reducedFeaturesFor(null, TAB)).toEqual([]);
     expect(reducedFeaturesFor(status([]), 'claude' as TabId)).toEqual([]);
+  });
+
+  /// #48, G-2: the status chip counted `in_scope && !effective` and omitted the
+  /// `default_on` clause, so the chip and the tab badge disagreed in the same
+  /// viewport — the chip said "N controls switched off" while the badge beside
+  /// it named one. The predicate is now exported once and called by both.
+  it('is the predicate both surfaces call, so they cannot disagree', () => {
+    const rows = [
+      feature({ feature: 'taint_latch', effective: false }),
+      feature({ feature: 'opencode_native_gate', effective: false, default_on: false }),
+      feature({ feature: 'canary', effective: false, in_scope: false }),
+      feature({ feature: 'spotlighting' }),
+    ];
+    expect(rows.filter(isReducedRow).map((f) => f.feature)).toEqual(['taint_latch']);
+    expect(reducedFeaturesFor(status(rows), TAB)).toEqual(rows.filter(isReducedRow));
+  });
+});
+
+/// #48, G-2 — the status chip's tooltip.
+describe('reducedSummary', () => {
+  it('counts distinct controls rather than (scope, feature) pairs', () => {
+    // One app-wide flip lands on every scope's row. The user unticked ONE box.
+    const off = feature({ feature: 'taint_latch', effective: false });
+    const s: InjectionStatus = {
+      protection: true,
+      reduced: true,
+      scopes: [
+        { scope: 'offload-worker', label: 'Offload worker', features: [off] },
+        { scope: 'claude', label: 'Claude', features: [off] },
+        { scope: 'opencode', label: 'OpenCode', features: [off] },
+      ],
+    };
+    expect(reducedSummary(s)).toBe('1 control switched off');
+  });
+
+  it('excludes the default-off Phase H gate, exactly as the badge does', () => {
+    const s = status([
+      feature({ feature: 'taint_latch', effective: false }),
+      feature({ feature: 'opencode_native_gate', effective: false, default_on: false }),
+    ]);
+    expect(reducedSummary(s)).toBe('1 control switched off');
+  });
+
+  /// Spec residual (g): the synthetic signature-health row is a reduction, but
+  /// nobody switched it off — counting it as "a control switched off" made the
+  /// chip's sentence untrue.
+  it('counts a row that carries its own reason separately from the switches', () => {
+    const s = withSignatureHealth(
+      status([
+        feature({ feature: 'detection', label: 'Injection detection' }),
+        feature({ feature: 'taint_latch', effective: false }),
+      ]),
+      { armed: false },
+    );
+    expect(reducedSummary(s)).toBe('1 control switched off, 1 layer switched on but inert');
+    // …and on its own it never claims a switch was flipped.
+    const only = withSignatureHealth(status([feature({ feature: 'detection' })]), {
+      armed: false,
+    });
+    expect(reducedSummary(only)).toBe('1 layer switched on but inert');
+  });
+
+  it('still says something when the backend reports reduced and no row explains it', () => {
+    expect(reducedSummary(null)).toBe('something is off');
+    expect(reducedSummary(status([feature({})]))).toBe('something is off');
+  });
+});
+
+/// #48, G-3 — the reduced-protection indicator must not fail silent.
+///
+/// Both poll `catch` blocks were empty, so a permanently failing
+/// `injection_status` left the chip hidden and every tab badge absent: the app
+/// rendered as fully protected, indefinitely, with a clean console. The doc
+/// comment's intent ("an INDIVIDUAL failed poll is swallowed") is the right one
+/// and is what this reducer finally lets the code express.
+describe('recordPoll', () => {
+  it('swallows an individual failure but not a permanent one', () => {
+    let h = HEALTHY_POLL;
+    for (let i = 1; i < UNKNOWN_AFTER_FAILURES; i++) {
+      h = recordPoll(h, false);
+      expect(h.unknown).toBe(false);
+      expect(h.failures).toBe(i);
+    }
+    h = recordPoll(h, false);
+    expect(h).toEqual({ failures: UNKNOWN_AFTER_FAILURES, unknown: true });
+    // It stays unknown while it stays broken.
+    expect(recordPoll(h, false).unknown).toBe(true);
+  });
+
+  it('clears on the first success — the state is "we cannot see", not "we saw something bad"', () => {
+    let h = HEALTHY_POLL;
+    for (let i = 0; i < UNKNOWN_AFTER_FAILURES + 5; i++) h = recordPoll(h, false);
+    expect(h.unknown).toBe(true);
+    expect(recordPoll(h, true)).toEqual(HEALTHY_POLL);
+  });
+
+  it('a single failure between successes never shows the user anything', () => {
+    let h = HEALTHY_POLL;
+    for (let i = 0; i < 20; i++) {
+      h = recordPoll(recordPoll(h, false), true);
+      expect(h.unknown).toBe(false);
+    }
   });
 });
 

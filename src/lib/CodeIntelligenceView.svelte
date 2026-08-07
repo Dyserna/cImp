@@ -282,15 +282,34 @@
   // Memory (Phase C): per-project session/action memory. Fetched while the
   // Memory section is open (via refresh()'s poll) and on demand.
   let memory = $state<MemorySnapshot | null>(null);
-  /// Whether the snapshot has been fetched at least once in this view's
-  /// lifetime — see `refresh()`, which primes it off-section exactly once so the
+  /// When the snapshot was last fetched, epoch ms; `0` ⇒ never in this
+  /// instance's lifetime. See `refresh()`, which primes it off-section so the
   /// V32 quarantine badge is honest before anyone opens Memory.
-  let memoryPrimed = false;
+  ///
+  /// **A timestamp rather than the boolean it replaces (#48, M-3.)** The boolean
+  /// was set once and never reset, and since `appViews.ts` keeps ONE instance of
+  /// this component alive for the app's lifetime, "once per instance" was "once
+  /// per app run" — the badge was a snapshot of the moment the view first
+  /// rendered. A user who opened Code Intelligence on Overview primed it at 0
+  /// and stayed off the Memory section; a contaminated tab then wrote notes,
+  /// each quarantined correctly, and the badge stayed absent forever. It was
+  /// honest only about notes quarantined *before* first render — the opposite of
+  /// its purpose, and it failed the same way in the clearing direction.
+  ///
+  /// Throttled rather than unguarded, because the concern that motivated the
+  /// original flag is real: `graph_memory` opens the warm index, and the poll
+  /// below runs every 2 s.
+  let memoryPrimedAt = 0;
+
+  /// How stale the off-section snapshot may get. Well under the time it takes to
+  /// write a note and wonder where it went, and 1/10th the poll's off-section
+  /// cost at 2 s.
+  const MEMORY_OFF_SECTION_MS = 20_000;
 
   async function refreshMemory(): Promise<void> {
     try {
       memory = await graphMemory();
-      memoryPrimed = true;
+      memoryPrimedAt = Date.now();
     } catch (e) {
       console.warn('graph_memory failed', e);
     }
@@ -1293,12 +1312,14 @@
     // index) — with ONE exception: V32 Phase C2's quarantine badge sits on the
     // section nav and has to be honest from whichever section the view opens
     // on, or a note held for review is only ever found by someone who already
-    // went looking. So prime the snapshot once per view lifetime, then fall
-    // back to the section-gated poll.
+    // went looking. So prime the snapshot off-section — immediately on the
+    // first tick, then at most every `MEMORY_OFF_SECTION_MS` (#48, M-3: priming
+    // exactly ONCE made the badge a snapshot of app-start, blind to every note
+    // quarantined afterwards).
     if (section === 'memory') {
       await refreshMemory();
       await refreshFacts();
-    } else if (!memoryPrimed) {
+    } else if (Date.now() - memoryPrimedAt >= MEMORY_OFF_SECTION_MS) {
       await refreshMemory();
     }
     // Usage (V14 Phase D/D2): same "only while visible" posture — the Usage

@@ -1028,11 +1028,12 @@ declares its class AND its mutation capability in one reviewed place.
     "empty or missing" — `RevertFailed`, non-destructive, and cleared by the
     next successful update. Archiving into a temp directory and swapping would
     close it and was judged not worth a third path through the same code.
-    (g) The `InjectionBadge` chip's tooltip counts `in_scope && !effective`
-    rows, so the synthetic signature row from amendment (d) is counted as a
-    "control switched off". The chip's own count rule is review finding G-2 and
-    is owned separately; the count is one high either way, and the popover the
-    click leads to names the row correctly. (h) **U-4 is still open**: a broken
+    (g) **CLOSED 2026-08-08 by G-2** (see the Phase G/H amendment): the chip's
+    tooltip counted `in_scope && !effective` rows, so the synthetic signature row
+    from amendment (d) read as a "control switched off". Both count rules are now
+    `latch.ts`'s one `isReducedRow`, and a row that carries its own `reason` is
+    counted separately as a layer "switched on but inert" rather than as a switch
+    someone flipped. (h) **U-4 is still open**: a broken
     user rule in `rules.d/local/` still vetoes every update, because validation
     compiles the staged bundle alone while the post-activation health check
     compiles staged **plus** `local/`. Staged separately and deliberately not
@@ -1139,7 +1140,21 @@ declares its class AND its mutation capability in one reviewed place.
   - Each quarantined write also writes an `injection_flag` activity row
     (`Screen::MemoryQuarantine`, `ok: true` — nothing was denied), and the
     Code Intelligence → Memory section carries a ⚠ count badge; the snapshot is
-    primed once off-section so the badge is honest before anyone opens Memory.
+    primed off-section so the badge is honest before anyone opens Memory.
+  - **Amendment 2026-08-08 (#48, M-3) — the badge was a one-shot snapshot.**
+    "Primed once off-section" was implemented as a boolean that is set and never
+    reset, and `appViews.ts` keeps one instance of `CodeIntelligenceView` alive
+    for the app's lifetime, so "once per instance" was "once per app run": a user
+    who opened the view on Overview primed the count at 0 and, staying off the
+    Memory section, never saw it move again. Notes written afterwards by a
+    contaminated tab were quarantined correctly and the badge stayed absent
+    **forever** — honest only about notes held *before* first render, the
+    opposite of its stated purpose, and wrong in the clearing direction too. The
+    flag is now a timestamp and the off-section prime repeats at most every 20 s.
+    Throttled rather than removed: the "only fetch while visible" concern that
+    motivated it is real (`graph_memory` opens the warm index) and the poll runs
+    every 2 s. A count-only IPC over `GraphIndex::mem_quarantined_count` would be
+    cheaper still and remains the upgrade if the snapshot cost ever matters.
   - **Known residual:** an UNPINNED quarantined note is still evicted with its
     session by the ordinary retention sweep (30 days / 20-session cap) if the
     user never reviews it. Fail-safe direction (the note is dropped, never
@@ -1861,6 +1876,62 @@ declares its class AND its mutation capability in one reviewed place.
     silent while everything is on. The frontend re-uses the backend's resolution
     (one extra IPC per 4 s poll) rather than reimplementing the rule in
     TypeScript.
+  **Phase G/H amendment 2026-08-08 (#48 review — G-1, G-2, G-3, N-1, F-y).**
+    - **A typed override typo no longer resets the settings file (G-1).**
+      `Override` carried `#[serde(from = "String")]`, so the post-hoc parse only
+      ever saw *strings*; `#[serde(default)]` fires for an absent key, never for
+      a present one that fails to type. `"taint_latch": true` — the intuitive
+      typo, since the control it overrides IS a boolean — and `"taint_latch":
+      null` — the intuitive way to clear a cell — therefore failed the typed
+      parse of the whole file, which is quarantined and replaced with seeded
+      defaults: themes, tabs, backends, checks, MCP servers, pricing. A
+      hand-written `Deserialize` over `serde_json::Value` now reads every JSON
+      shape as `Inherit`. The old guard test passed only strings, which is why it
+      stayed green; the new ones enumerate the JSON type space and drive a whole
+      `Settings` round trip.
+    - **An identity-less call honours a per-tab `On` (N-1).** `Scope::for_tab`
+      maps a missing `--tab` to `Scope::App`, documented as unconditionally
+      fail-OPEN. That reading holds only while L2 ≥ L3 — and decision 17 ships
+      the configuration that inverts it ("one hardened OpenCode tab, everything
+      else as it was" is L3 `On` over L2 `Off`), so a call from that tab ran
+      unprotected while Settings showed `→ on (this scope)` for it. `decide` now
+      resolves `Scope::App` to `On` when **any** configured tab states an L3 `On`.
+      Only `On` travels up, so it can add protection and never remove it; the
+      resolution order for a *known* scope is untouched. The fallback is
+      fail-open **relative to L2**, not absolutely — the module docs say so now.
+    - **One reduced-protection predicate, not three (G-2).** The status chip
+      counted `in_scope && !effective` and omitted the `default_on` clause Phase
+      H published to prevent exactly that, so the chip and the tab badge beside
+      it disagreed in one viewport. `latch.ts` exports `isReducedRow`; the badge,
+      the popover and the chip all call it. The chip's tooltip counts **distinct
+      controls** rather than (scope, feature) pairs — one app-wide flip lands on
+      every scope's row — and counts rows carrying their own `reason` separately
+      ("switched on but inert"), which closes residual (g) below: nobody switched
+      the signature-health row off.
+    - **The indicator no longer fails silent (G-3).** Both poll `catch` blocks
+      were empty, so a permanently failing `injection_status` left the chip
+      hidden and every tab badge absent — the app rendered as fully protected,
+      indefinitely, with a clean console. Both arms now warn (matching
+      `SettingsApp`, whose asymmetry was unintentional), and three consecutive
+      failures of the hierarchy poll raise a `⛨ unknown` chip. The transition is
+      a pure reducer (`recordPoll`) so it is testable; the component is not.
+    - **The Settings matrix renders from the backend report (F-y).**
+      `INJECTION_FEATURES` hand-mirrored `Feature::ALL`, `label()`,
+      `spawn_baked()` and both scope predicates in TypeScript with no drift
+      guard — and #47 made every *Rust* mirror a compile error, which quietly
+      made this worse: the seven errors a new variant now produces all point at
+      Rust files, so the prompt that used to sit beside a hand-edited `const ALL`
+      array is gone and this was the last hand-maintained enumeration with no
+      signal at all. A V33 control would have shipped with a status-bar warning
+      naming it and no checkbox to change it. `FeatureState` now also publishes
+      `spawn_baked`; the matrix builds its rows from `injection.scopes` and keeps
+      only `hint` (plus the L2 field where the `<feature>_enabled` convention
+      does not hold) in a local table keyed by the backend's feature string, so a
+      missing entry is a missing hint rather than a missing control. Per the
+      MAINTENANCE.md cross-module-invariant rule, **no drift-scanning test was
+      added** — the duplication is gone instead. The native-web row's
+      `field: 'protection'` filler (the global master, bound as a placeholder on
+      a row with no L2 boolean) is now `null`, and the type permits it.
   - **Known residuals.** (a) The Settings matrix's resolved column reflects
     *saved* settings, so it lags an unsaved flip by the 500 ms debounce; the raw
     switches beside it are live. (b) `Scope::Tab`'s `agent` is carried for the
@@ -1869,6 +1940,17 @@ declares its class AND its mutation capability in one reviewed place.
     exists for callers with no agent in hand. (c) Terminal escape hygiene's
     enforcement site is the TTS composition path only; the Phase D audit's other
     conclusion (xterm.js does not honour OSC 52) is structural and has no switch.
+    (d) *New with the F-y amendment:* the matrix is built from
+    `injection_status`, so if that command fails the per-feature rows are
+    replaced by an explicit warning instead of rendering. The L1 master switch —
+    the documented escape hatch — is read from `snapshot` and stays available.
+    The command is an in-process mutex read with no I/O. (e) *New with N-1:*
+    `Scope::App` now answers two questions with one variant — "the app-wide
+    value" and "what applies to a caller with no identity" — and resolves both
+    over-protectively. Separating them needs a new `Scope` variant and edits in
+    `offload/loopback.rs` (`LatchScoping::injection`, `GatePolicy::resolve`),
+    which is why it was not done here; the current shape fixes every
+    identity-less site at once and can only add protection.
 
 ## Accepted residuals (documented, not solved)
 

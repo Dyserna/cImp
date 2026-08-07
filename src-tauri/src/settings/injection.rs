@@ -353,8 +353,15 @@ pub enum Scope<'a> {
     /// The offload worker — a task-scoped service with no tab.
     OffloadWorker,
     /// No narrower scope applies: an app-wide feature, or a call that carries no
-    /// tab identity (the same fail-open shape the latch takes, resolved here as
-    /// "the app-wide answer" rather than as "off").
+    /// tab identity.
+    ///
+    /// **Both readings share one variant, so its resolution has to be safe for
+    /// the second one** (#48, N-1). An app-wide feature genuinely has no
+    /// narrower answer; an identity-less *call* does — the caller is some tab,
+    /// we just cannot tell which. So this scope resolves to the app-wide answer
+    /// **plus every L3 `On` any configured tab states**: see [`decide`]. The
+    /// elevation is one-directional (an L3 `Off` never travels up), so it can
+    /// only ever add protection.
     App,
 }
 
@@ -366,6 +373,18 @@ impl<'a> Scope<'a> {
     /// answer rather than to "off": V28's discipline is that a tool call must
     /// never fail for lack of identity, and a pre-`--tab` child losing its
     /// protection would be a silent downgrade rather than a graceful one.
+    ///
+    /// "Fail-open" is **relative to L2, not absolute** (#48, N-1). It reads as
+    /// graceful only while L2 ≥ L3, and locked decision 17 ships the exact
+    /// configuration that inverts it: "one hardened OpenCode tab, everything
+    /// else as it was" is an L3 `On` over an L2 `Off`, and an app-wide answer of
+    /// `off` would run a call from that hardened tab unprotected — while the
+    /// Settings matrix still shows `→ on (this scope)` for it. Reachable today:
+    /// a user-configured MCP entry invoking `cimp --offload-mcp` without
+    /// `--tab`, or a generated `--mcp-config` written before V28. [`decide`]
+    /// therefore honours any tab's L3 `On` at this scope — over-protective for a
+    /// caller with no identity, which is the correct direction for a control
+    /// whose failure mode is silent under-enforcement.
     pub fn for_tab(agent: &'a str, tab: Option<&'a str>) -> Self {
         match tab.map(str::trim).filter(|t| !t.is_empty()) {
             Some(tab) => Scope::Tab { agent, tab },
@@ -416,8 +435,20 @@ pub const APP_SCOPE_KEY: &str = "app";
 /// — the neutral cell. A typo must neither grant a scope protection the user did
 /// not ask for nor take away protection they did not remove; deferring to the
 /// app-wide answer is the only reading that does neither.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "String", into = "String")]
+///
+/// **The typo is not always a string** (#48, G-1). `#[serde(from = "String")]`
+/// made the post-hoc parse cover unrecognized *strings* only, and
+/// `#[serde(default)]` on the rows below fires for an ABSENT key, never for a
+/// key whose value fails to type. So `"taint_latch": true` — the intuitive typo,
+/// since the control it overrides *is* a boolean — and `"taint_latch": null` —
+/// the intuitive way to clear a cell — failed the typed parse of the whole
+/// settings file, which `settings::persistence` quarantines and replaces with
+/// seeded defaults: themes, tabs, backends, checks, MCP servers and pricing all
+/// reset because one cell was hand-edited wrong. The [`Deserialize`] impl below
+/// therefore reads ANY JSON shape and keeps the same neutral answer; only the
+/// two recognized words move a cell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
 pub enum Override {
     /// Take the app-wide L2 value.
     #[default]
@@ -448,9 +479,27 @@ impl Override {
     }
 }
 
-impl From<String> for Override {
-    fn from(s: String) -> Self {
-        Override::parse(&s)
+/// Hand-written rather than `#[serde(from = "String")]` (#48, G-1): the derived
+/// form only reaches [`Override::parse`] once the value has already typed as a
+/// string, so every non-string shape failed the parse and quarantined the
+/// settings file instead of resolving to the neutral cell.
+///
+/// Deserializing through [`serde_json::Value`] first is what makes the fallback
+/// total — `true`, `null`, `1`, `[]`, `{}` and a nested object all land in the
+/// catch-all arm. Settings are JSON on every path (`from_str` at load,
+/// `from_value` after migration), so requiring a self-describing format costs
+/// nothing here.
+impl<'de> Deserialize<'de> for Override {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(s) => Override::parse(&s),
+            // Every other shape is a hand-edit that did not mean anything the
+            // hierarchy can honour. Neutral, and NOT an error.
+            _ => Override::Inherit,
+        })
     }
 }
 
@@ -596,6 +645,12 @@ pub enum DecidedBy {
     /// L2: the scope inherits, so the app-wide per-feature flag decided.
     Feature,
     /// L3: this scope states its own answer.
+    ///
+    /// At [`Scope::App`] it means something slightly wider — "a narrower scope's
+    /// `On` is being honoured here", the identity-less elevation on [`decide`]
+    /// (#48, N-1). The app scope has no cell of its own, so there is no other
+    /// reading of `scope` available there, and the honest alternative
+    /// ([`DecidedBy::Feature`]) would claim L2 said `on` when it said `off`.
     Scope,
 }
 
@@ -608,9 +663,19 @@ pub struct Decision {
 
 /// The single source of truth for every V32 enforcement site.
 ///
-/// See the module docs for the locked rule. The only subtlety in the code below
-/// is that [`Feature::NativeWeb`]'s L2 is derived from the tri-mode rather than
-/// stored as a boolean — [`native_web_l2`].
+/// See the module docs for the locked rule — L1 short-circuits, then L3, then
+/// L2 — which is unchanged. Two subtleties in the code below:
+///
+/// - [`Feature::NativeWeb`]'s L2 is derived from the tri-mode rather than stored
+///   as a boolean ([`native_web_l2`]);
+/// - at [`Scope::App`] an L3 `On` stated by **any** configured tab is honoured
+///   (#48, N-1). That scope stands in for two different questions — "what is the
+///   app-wide answer" and "what applies to a call that sent no `--tab`" — and
+///   the second one has a tab behind it that we simply cannot name. Only `On`
+///   travels up: an L3 `Off` stays where the user put it, so this can never
+///   remove protection, only add it to a caller with no identity. It never
+///   applies to a scope that HAS an answer (a known tab, the worker), so the
+///   locked resolution order for a known scope does not move.
 pub fn decide(feature: Feature, scope: Scope<'_>, s: &Settings) -> Decision {
     let inj = &s.offload.injection;
     if !inj.protection {
@@ -628,11 +693,39 @@ pub fn decide(feature: Feature, scope: Scope<'_>, s: &Settings) -> Decision {
             effective: false,
             decided_by: DecidedBy::Scope,
         },
+        // N-1: the app scope has no cell of its own, so this is where the
+        // identity-less reading gets its answer, BEFORE falling through to L2.
+        Override::Inherit if matches!(scope, Scope::App) && any_tab_override_on(feature, s) => {
+            Decision {
+                effective: true,
+                decided_by: DecidedBy::Scope,
+            }
+        }
         Override::Inherit => Decision {
             effective: feature_l2(feature, s),
             decided_by: DecidedBy::Feature,
         },
     }
+}
+
+/// Whether ANY configured AI tab states an L3 `On` for `feature` — the
+/// identity-less elevation described on [`Scope::App`] and [`Scope::for_tab`]
+/// (#48, N-1).
+///
+/// Tabs only, deliberately: the offload worker is never the caller behind an
+/// identity-less consumer call (it resolves through [`Scope::OffloadWorker`],
+/// which it always has), so folding its row in would raise protection for a
+/// population it does not describe.
+///
+/// A feature with no per-tab row can never match — [`TabInjectionOverrides::get`]
+/// returns `Inherit` for those — so an app-only control (terminal escape
+/// hygiene) is untouched by this, and with it [`protection_reduced`]'s app-scope
+/// pass, which only ever looks at app-only controls.
+fn any_tab_override_on(feature: Feature, s: &Settings) -> bool {
+    s.tabs.iter().any(|t| match t {
+        TabConfig::AiTool(c) => c.injection_overrides.get(feature) == Override::On,
+        _ => false,
+    })
 }
 
 /// [`decide`], boolean only. The form every enforcement site calls.
@@ -869,6 +962,17 @@ pub struct FeatureState {
     /// default-off control that is simply off is the baseline, not a reduction,
     /// and the rule that decides which is which must not live in two languages.
     pub default_on: bool,
+    /// [`Feature::spawn_baked`] — whether changing this control only takes
+    /// effect on the next tab spawn.
+    ///
+    /// Published for the same reason as `label` and `default_on` (#48, F-y): the
+    /// Settings matrix used to carry its own copy of this predicate beside its
+    /// own copy of the labels and the scope rules, and #47 made every Rust
+    /// mirror of the feature table a compile error while leaving that one — the
+    /// only hand-maintained enumeration left — with no signal at all. The matrix
+    /// now renders from this report, so a V33 control appears in Settings with
+    /// its restart hint the day it is declared.
+    pub spawn_baked: bool,
 }
 
 /// Whether `scope` carries a row for `feature` at all — the structural question
@@ -901,6 +1005,7 @@ pub fn report(s: &Settings, scope: Scope<'_>) -> Vec<FeatureState> {
                 override_value: scope_override(*f, scope, s).as_str(),
                 in_scope: feature_in_scope(*f, scope),
                 default_on: f.default_enabled(),
+                spawn_baked: f.spawn_baked(),
             }
         })
         .collect()
@@ -1551,6 +1656,192 @@ mod tests {
         assert_eq!(junk.taint_latch, Override::Inherit);
     }
 
+    /// **#48, G-1 — the shapes the test above did not feed it.**
+    ///
+    /// The guard test up there passes only STRINGS, which is why it stayed green
+    /// while `#[serde(from = "String")]` rejected everything else: the post-hoc
+    /// parse never ran for a value that failed to type as a string, and
+    /// `#[serde(default)]` fires for an absent key, not for a present one that
+    /// will not deserialize. `{"taint_latch": true}` — the intuitive typo, since
+    /// the control it overrides IS a boolean — and `{"taint_latch": null}` — the
+    /// intuitive way to clear a cell — therefore failed the typed parse of the
+    /// whole settings file and reset every setting in it.
+    ///
+    /// So this enumerates the JSON type space, not a list of plausible typos.
+    #[test]
+    fn a_non_string_override_cell_reads_as_inherit() {
+        for junk in [
+            r#"{"taint_latch":true}"#,
+            r#"{"taint_latch":false}"#,
+            r#"{"taint_latch":null}"#,
+            r#"{"taint_latch":1}"#,
+            r#"{"taint_latch":0}"#,
+            r#"{"taint_latch":-1}"#,
+            r#"{"taint_latch":0.5}"#,
+            r#"{"taint_latch":[]}"#,
+            r#"{"taint_latch":["on"]}"#,
+            r#"{"taint_latch":{}}"#,
+            r#"{"taint_latch":{"value":"on"}}"#,
+        ] {
+            let row: TabInjectionOverrides = serde_json::from_str(junk)
+                .unwrap_or_else(|e| panic!("{junk} must not fail the parse: {e}"));
+            assert_eq!(row.taint_latch, Override::Inherit, "{junk}");
+            // …and no neighbouring cell moved either.
+            assert_eq!(row, TabInjectionOverrides::default(), "{junk}");
+        }
+        // The worker row is the same type, so it inherits the property; asserted
+        // rather than assumed, since it is a separate struct with its own
+        // `#[serde(default)]`.
+        for junk in [r#"{"canary":true}"#, r#"{"canary":null}"#] {
+            let row: WorkerInjectionOverrides = serde_json::from_str(junk).expect(junk);
+            assert_eq!(row.canary, Override::Inherit, "{junk}");
+        }
+    }
+
+    /// **The contract G-1 states, at the level it is stated at**: "a hand-edited
+    /// typo must neither grant protection nor remove it, and must not quarantine
+    /// the settings file."
+    ///
+    /// The unit test above covers the two rows; this drives a whole `Settings`
+    /// round trip — the shape `settings::persistence` actually deserializes,
+    /// where a failure means `quarantine_corrupt_file` and seeded defaults for
+    /// themes, tabs, backends, checks, MCP servers and pricing.
+    #[test]
+    fn a_non_string_override_cell_neither_quarantines_the_file_nor_moves_protection() {
+        for bogus in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!("maybe"),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let s = settings();
+            let id = a_tab(&s);
+            let mut v = serde_json::to_value(&s).expect("settings serialize");
+            for t in v["tabs"].as_array_mut().expect("tabs is an array") {
+                if t.get("id").and_then(|x| x.as_str()) == Some(id.as_str()) {
+                    t["injection_overrides"]["taint_latch"] = bogus.clone();
+                }
+            }
+            v["offload"]["injection"]["worker"]["canary"] = bogus.clone();
+
+            let back: Settings = serde_json::from_value(v)
+                .unwrap_or_else(|e| panic!("{bogus} quarantines the settings file: {e}"));
+            // Neither granted nor removed: both cells resolve exactly as an
+            // untouched file does.
+            assert_eq!(
+                effective(Feature::TaintLatch, tab_scope(&id), &back),
+                Feature::TaintLatch.default_enabled(),
+                "{bogus}"
+            );
+            assert_eq!(
+                effective(Feature::Canary, Scope::OffloadWorker, &back),
+                Feature::Canary.default_enabled(),
+                "{bogus}"
+            );
+            // …and the rest of the file survived, which is the whole finding.
+            assert_eq!(back.tabs.len(), s.tabs.len(), "{bogus}");
+        }
+    }
+
+    /// **#48, N-1 — an identity-less call must not silently ignore a per-tab
+    /// L3 `On`.**
+    ///
+    /// [`Scope::for_tab`] maps a missing `--tab` to [`Scope::App`], documented as
+    /// unconditionally fail-OPEN. That reading holds only while L2 ≥ L3, and
+    /// locked decision 17 ships the configuration that inverts it: one hardened
+    /// tab (L3 `On`) over an app-wide `Off`. The app-wide answer is `off`, so a
+    /// call from that tab — a user-configured MCP entry invoking
+    /// `cimp --offload-mcp` without `--tab`, or a pre-V28 generated
+    /// `--mcp-config` — ran unprotected while Settings showed it as on.
+    #[test]
+    fn an_identity_less_call_honours_any_tabs_scope_on() {
+        let mut s = settings();
+        let id = a_tab(&s);
+        let f = Feature::OpencodeNativeGate; // L2 default off — decision 17's shape.
+
+        // Nothing overridden: the app-wide answer is the L2 default, decided at
+        // L2. The elevation must not fire on an untouched config.
+        assert_eq!(
+            decide(f, Scope::App, &s),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Feature
+            }
+        );
+
+        // One hardened tab. The identity-less call now resolves ON.
+        set_tab_override(&mut s, &id, f, Override::On);
+        assert_eq!(
+            decide(f, Scope::App, &s),
+            Decision {
+                effective: true,
+                decided_by: DecidedBy::Scope
+            },
+            "a call with no identity may be from the hardened tab"
+        );
+        // The known scopes are untouched: the tab that asked for it, and one
+        // that did not.
+        assert!(effective(f, tab_scope(&id), &s));
+        assert!(!effective(f, tab_scope("some-other-tab"), &s));
+
+        // Same shape over an L2 that is ON for a normally-on feature: an L3
+        // `Off` must NOT travel up, or the elevation would be a downgrade path.
+        let mut s = settings();
+        set_tab_override(&mut s, &id, Feature::TaintLatch, Override::Off);
+        assert_eq!(
+            decide(Feature::TaintLatch, Scope::App, &s),
+            Decision {
+                effective: true,
+                decided_by: DecidedBy::Feature
+            },
+            "only `On` travels up — this can add protection, never remove it"
+        );
+
+        // L1 still short-circuits everything, elevation included.
+        let mut s = settings();
+        set_tab_override(&mut s, &id, f, Override::On);
+        s.set_master_for_test(false);
+        assert_eq!(
+            decide(f, Scope::App, &s),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Global
+            }
+        );
+
+        // The worker keeps its own answer: it always has an identity, so the
+        // elevation must not reach it.
+        let mut s = settings();
+        set_tab_override(&mut s, &id, Feature::Canary, Override::On);
+        assert_eq!(
+            decide(Feature::Canary, Scope::OffloadWorker, &s).decided_by,
+            DecidedBy::Feature,
+            "the canary has no tab cell to elevate from, and the worker has its own row"
+        );
+
+        // Structural: the elevation cannot flip an APP-ONLY control, because a
+        // feature with no tab row can never carry a tab `On`. That is what keeps
+        // `protection_reduced`'s app-scope pass — which only ever inspects
+        // app-only controls — reading exactly as before.
+        for feature in Feature::ALL.iter().filter(|f| !f.has_tab_scope()) {
+            let mut s = settings();
+            s.set_l2_for_test(*feature, false);
+            assert!(
+                !effective(*feature, Scope::App, &s),
+                "{feature:?} has no tab row, so nothing can elevate it"
+            );
+        }
+        // …stated at the level that matters: an app-only control switched off is
+        // still reduced protection.
+        let mut s = settings();
+        set_tab_override(&mut s, &id, Feature::TaintLatch, Override::On);
+        s.set_l2_for_test(Feature::TerminalEscapeHygiene, false);
+        assert!(protection_reduced(&s));
+    }
+
     /// The report is the introspection contract: one row per feature, naming
     /// the deciding level for each.
     #[test]
@@ -1562,6 +1853,17 @@ mod tests {
         set_tab_override(&mut s, &id, Feature::TaintLatch, Override::On);
         let rows = report(&s, tab_scope(&id));
         assert_eq!(rows.len(), Feature::ALL.len());
+        // #48 F-y: the report carries every property the Settings matrix used to
+        // hand-mirror — key, label, scope membership, shipping default and, as
+        // of that finding, whether the control is spawn-baked. The matrix
+        // renders from these, so a control that stops publishing one loses its
+        // row rather than growing a stale copy of it.
+        for (row, f) in rows.iter().zip(Feature::ALL) {
+            assert_eq!(row.feature, f.key());
+            assert_eq!(row.label, f.label());
+            assert_eq!(row.default_on, f.default_enabled());
+            assert_eq!(row.spawn_baked, f.spawn_baked(), "{}", f.key());
+        }
         let by = |k: &str| rows.iter().find(|r| r.feature == k).unwrap();
         assert_eq!(by("detection").decided_by, DecidedBy::Feature);
         assert!(!by("detection").effective);

@@ -312,6 +312,57 @@ declares its class AND its mutation capability in one reviewed place.
     through an authenticated loopback endpoint; every override writes an
     `injection_flag` row (`screen=latch_override`, ok:true) so the feed
     records who opened what.
+16. **Three-level enable hierarchy (user decision 2026-08-07).** Until now
+    roughly half of V32 was structurally always-on (the latch itself, the
+    envelope, the SSRF guard, the canary, memory quarantine, consumer
+    hygiene) — a security control with no escape hatch becomes a reason to
+    stop using the app when it misfires. Every V32 control therefore gets
+    three levels of switch, resolved by ONE shared function
+    (`settings::injection::effective(feature, scope) -> bool`), which is
+    the single source of truth for every enforcement site:
+
+    - **L1 global master:** `injection_protection: bool` (default true).
+      OFF disables every V32 control everywhere — all tabs AND the offload
+      worker. It is the one switch that cannot be overridden upward.
+    - **L2 per-feature:** `<feature>_enabled` (default true), app-wide.
+    - **L3 per-scope override:** tri-state `Inherit | On | Off` (default
+      `Inherit`) stored per scope, per feature.
+
+    **Resolution (locked, and the invariant every call site must obey):**
+    `if !L1 { false } else { match L3 { On => true, Off => false, Inherit
+    => L2 } }`. So an L3 `On` CAN re-enable a feature its L2 default
+    disabled (that is what an override means), but NOTHING re-enables past
+    an L1 `off` (that is what a master switch means). No enforcement site
+    reads a raw settings field directly — they all call `effective`, so a
+    future control cannot accidentally ignore a level.
+
+    **"Scope" is not always a tab.** Tabs are the scope for the
+    consumer-side controls, but the offload worker is a task-scoped service
+    with no tab; it is a first-class pseudo-scope (`offload-worker`)
+    carrying its own L3 row, and worker-only features (the canary, worker
+    fetch budgets) have ONLY that row. Features listed per scope:
+    taint latch, spotlighting (external results + recalled memory), the
+    detection surface (with its existing signature/classifier sub-toggles),
+    SSRF guard, fetch budgets, canary (worker only), memory quarantine,
+    native-web visibility (decision 14 — its `off` value already IS this
+    feature's off), consumer hygiene (pinned OpenCode permissions +
+    guidance addendum), terminal escape hygiene (app-wide, no per-scope
+    row — TTS/toasts are global surfaces per the global-only avatar/TTS
+    decision).
+
+    **Spawn-baked vs live.** Native-web visibility and consumer hygiene are
+    applied at tab spawn, so their L2/L3 changes MUST appear in
+    `spawn_inject_sig` and produce the restart hint; every other feature
+    resolves per call and takes effect immediately.
+
+    **Effective state must be introspectable** (the same
+    every-signal-needs-a-consumer discipline, applied to configuration):
+    with three levels, "why is this tab not latching?" has to be answerable
+    without reading code. `/status` and the Settings UI show the RESOLVED
+    value per scope per feature — not the raw fields — and name which level
+    decided it. A reduced-protection state (L1 off, or any feature off) is
+    visible outside Settings too, on the existing status surface and the
+    decision-15 tab badge, so protection cannot be off and forgotten.
 
 ## Phases
 
@@ -660,3 +711,14 @@ declares its class AND its mutation capability in one reviewed place.
     confirmation) restores both sides; both actions show as
     `latch_override` rows in Tool Activity; a tab restart still resets
     everything.
+14. Enable hierarchy (decision 16): with the global master OFF, a seeded
+    injection page fetched in a Claude tab arrives unwrapped and
+    unflagged, `graph_snippet` still answers after it, and a
+    `context_note` under a would-be-latched session stores clean — i.e.
+    pre-V32 behavior, confirmed at every layer at once. Turn the master
+    back ON: the same sequence latches, envelopes and quarantines again
+    with no restart (the live features) — only native-web visibility and
+    consumer hygiene need the restart the hint asks for. Then, with the
+    master ON and the taint latch feature OFF app-wide, set one tab's
+    latch override to `On`: that tab latches, a second tab does not, and
+    `/status` names which level decided each.

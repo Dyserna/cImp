@@ -889,6 +889,14 @@ impl OffloadService {
     /// [`Scope::App`](crate::settings::injection::Scope::App) — the app-wide
     /// answer, the same fail-open shape the latch takes for an identity-less
     /// call.
+    ///
+    /// #48: `audit` is the calling tab session's claim ledger, threaded from
+    /// the loopback handler (which owns the registry the ledger lives in) to
+    /// the SSRF chokepoint. It is passed through rather than resolved here for
+    /// the same reason the settings snapshot is: this service must not take a
+    /// second, independent read of state the handler already holds.
+    // See `McpHost::call_recorded`, whose argument list this forwards verbatim.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mcp_call(
         &self,
         consumer: Consumer,
@@ -897,6 +905,7 @@ impl OffloadService {
         cwd: Option<&Path>,
         scope: &str,
         tab: Option<&str>,
+        audit: &dyn outbound::ScopeAudit,
     ) -> Result<String, String> {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
         // this proxy; fall back to the Claude-guarded set.
@@ -911,7 +920,7 @@ impl OffloadService {
             crate::settings::injection::Scope::for_tab(agent, tab),
         );
         self.host
-            .call_recorded(consumer, cwd, name, args, scope, &policy)
+            .call_recorded(consumer, cwd, name, args, scope, &policy, audit)
             .await
     }
 

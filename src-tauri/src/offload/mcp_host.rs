@@ -850,6 +850,28 @@ impl McpHost {
     /// and therefore before any byte leaves the machine: a denied call never
     /// reaches the MCP server, which is the point (the server is a separate
     /// process on another host and would do the fetch for real).
+    ///
+    /// # The denial's audit row is per-scope, not per denial (#48)
+    ///
+    /// `audit` is the calling scope's claim ledger. Every denial used to write
+    /// an `injection_flag` row with no dedup at all — unlike the budget and
+    /// latch-refusal rows, which have had a claim bit since Phase C — and that
+    /// feed is capped at `INJECTION_FLAG_CAP` and evicts oldest-first *within a
+    /// kind*. So a model looping denied URLs did not merely make noise: it
+    /// evicted the `Canary`, `LatchBeacon` and `MemoryQuarantine` rows that are
+    /// the only forensic record of an attack that got through. `269daf2` made
+    /// it cheaper still, by turning 25 previously-allowed call shapes into a
+    /// denial each.
+    ///
+    /// The refusal served to the model is [`outbound::REFUSAL_SSRF`] whatever
+    /// the ledger says — locked decision 11 fixes that string precisely so a
+    /// caller cannot learn which address it hit, and the claim must not become
+    /// a side channel that tells it whether this denial was its first.
+    // Each argument is one leg of the chokepoint's contract (who is calling,
+    // for which project, under which policy, into which ledger) and is
+    // documented above; bundling them into a struct would move the same list
+    // one indirection away from the enforcement that reads it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn call_recorded(
         &self,
         consumer: Consumer,
@@ -858,6 +880,7 @@ impl McpHost {
         args: Value,
         scope: &str,
         policy: &outbound::Policy,
+        audit: &dyn outbound::ScopeAudit,
     ) -> Result<String, String> {
         let started = crate::activity::now_ms();
         let target = mcp_target(&args);
@@ -876,19 +899,25 @@ impl McpHost {
                     resolved = %denial.ip,
                     "offload: outbound fetch refused by the V32 SSRF screen"
                 );
-                outbound::record_flag(outbound::Flag {
-                    screen: outbound::Screen::Ssrf,
-                    origin: outbound::Origin::Internal,
-                    consumer: consumer.source(),
-                    scope,
-                    tool: namespaced,
-                    host: Some(&denial.host),
-                    url: Some(&denial.url),
-                    resolved_ip: Some(&denial.ip),
-                    canary: false,
-                    root: root.map(crate::activity::root_key).unwrap_or_default(),
-                    detail: outbound::REFUSAL_SSRF,
-                });
+                // The claim is taken on EVERY denial (it is what counts them);
+                // only the row is conditional. The enforcement above is
+                // untouched by it — see the function docs.
+                let row = audit.claim_ssrf();
+                if let outbound::SsrfRow::Write { .. } = row {
+                    outbound::record_flag(outbound::Flag {
+                        screen: outbound::Screen::Ssrf,
+                        origin: outbound::Origin::Internal,
+                        consumer: consumer.source(),
+                        scope,
+                        tool: namespaced,
+                        host: Some(&denial.host),
+                        url: Some(&denial.url),
+                        resolved_ip: Some(&denial.ip),
+                        canary: false,
+                        root: root.map(crate::activity::root_key).unwrap_or_default(),
+                        detail: &outbound::ssrf_flag_detail(row),
+                    });
+                }
                 return Err(outbound::REFUSAL_SSRF.to_string());
             }
         }

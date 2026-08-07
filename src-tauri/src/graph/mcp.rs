@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use super::index::{ArchReport, DocHit, GraphIndex, PathHit, RefHit, SymbolHit};
 use super::memory::{MemNote, ProjectFact, WorkingSetEntry};
 use super::model::EdgeKind;
-use crate::offload::toolclass::{CallGuards, WriteTaint, QUARANTINE_WRITE_NOTICE};
+use crate::offload::toolclass::{
+    classify, CallGuards, ToolClass, WriteTaint, QUARANTINE_WRITE_NOTICE,
+};
 
 /// One graph tool's identity, description, and JSON-Schema parameters — the
 /// shared definition both surfaces render into their own shape.
@@ -519,6 +521,15 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
         };
     }
 
+    // V32 Phase C2, #48 finding M-2 (user decision 2026-08-07): a PERSISTENT
+    // WRITE is REFUSED on this path, before the index is even opened. Reads stay
+    // fail-open below. See [`HEADLESS_WRITE_UNAVAILABLE`] for the whole
+    // argument; the check is `classify`, not a name, so a future
+    // PERSISTENT-WRITE tool inherits it without anyone remembering to.
+    if headless_write_refused(name) {
+        return Ok(refuse_headless_write(&cwd, &sub, source, name, &args));
+    }
+
     let (root, idx) = match open_project_index(&cwd, &sub) {
         Ok(pair) => pair,
         Err(msg) => return Ok(tool_error(&msg)),
@@ -529,11 +540,11 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
     // `None` keeps the pre-V28 most-recent-session scoping.
     //
     // V32 Phase C2: and no latch either — the latch registry lives in the app
-    // process this path exists precisely because it could not reach. Fail-open
-    // (`Clean`), consistent with the loopback gate's own no-tab-identity rule:
-    // the alternative would quarantine every note written while the app is
-    // closed, which is neither evidence of taint nor something a user could
-    // anticipate.
+    // process this path exists precisely because it could not reach. `Clean` is
+    // what reaches the tools below, and it is now safe for the reason it was
+    // NOT safe before: the one tool that consumed it, `context_note`, no longer
+    // reaches this line (the refusal above). Everything past here is a read,
+    // for which fail-open is the documented and intended posture.
     //
     // V32 Phase G: the recall envelope, unlike the latch, needs no registry —
     // only settings, which this path already read. It therefore resolves for
@@ -563,6 +574,90 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
         Err(msg) if msg.starts_with("unknown graph tool") => Err((-32602, msg)),
         Err(msg) => Ok(tool_error(&msg)),
     }
+}
+
+/// V32 Phase C2, #48 finding M-2 — served when a PERSISTENT-WRITE tool is
+/// called on the **headless** path (the MCP child could not reach the app).
+///
+/// # Why a refusal here and fail-open everywhere else
+///
+/// This path exists because [`proxy_graph`](crate::offload::mcp) could not reach
+/// the app, and it therefore has neither of the two facts a memory write needs:
+/// no live-session registry (so no session identity) and no taint latch (so no
+/// verdict on whether the writing conversation is contaminated). As shipped it
+/// wrote the note anyway, `WriteTaint::Clean` with `session: None`, and the
+/// justification — *"quarantining every note written while the app is closed is
+/// neither evidence of taint nor something a user could anticipate"* — assumed
+/// the condition was not attacker-selectable.
+///
+/// It is. The proxy falls back for FIVE reasons, not one, and the cheapest needs
+/// no shell: corrupt `<portable_root>/.cimp-discovery/<pid>.json` with a single
+/// byte and `read_all_discoveries`'s `filter_map(… .ok())` drops it silently, so
+/// every later `graph_*`/`context_*` call from that child takes this path for
+/// the rest of the tab's life. Claude's own `Write` tool reaches that file.
+///
+/// So the write is refused and the reads stay fail-open. That split is what
+/// keeps locked decision 10's rationale for READS (a contaminated tab must not
+/// lose its own memory) while removing the one unquarantined write a model can
+/// reach: an app-down `context_note { pin: true }` stored under `sid = ""` is
+/// project-wide, permanent, unattributable AND unquarantined, which is the
+/// highest-privilege write the memory surface offers.
+///
+/// The string is fixed and content-free, like every other boundary message
+/// (`REFUSAL_*`, `QUARANTINE_WRITE_NOTICE`): it states what happened, that
+/// retrying now will not change it, and the one action that does — start cImp.
+/// Unlike those it is explicitly NOT permanent, because this one really is
+/// transient, and a model told "this cannot be unlocked" would drop a finding it
+/// could have re-recorded a minute later.
+pub const HEADLESS_WRITE_UNAVAILABLE: &str = "NOT SAVED: cImp is not running, so this note cannot \
+    be attached to a session or checked against the session's taint state, and a note written \
+    blind here would be auto-injected into every future session with neither. Nothing was stored. \
+    Include the finding in your answer now, and re-save it with `context_note` once cImp is \
+    running — this is a transient condition, not a permanent boundary.";
+
+/// The headless path's write gate, as a predicate over the tool name.
+///
+/// Split out of [`handle_call`] so the property that matters — *which* tools
+/// this refuses — is assertable without a process cwd, a global settings
+/// snapshot and an on-disk index. It reads the class table rather than naming
+/// `context_note`, so a future PERSISTENT-WRITE tool is covered the day it is
+/// classified, not the day someone remembers this line.
+fn headless_write_refused(name: &str) -> bool {
+    classify(name) == ToolClass::PersistentWrite
+}
+
+/// Refuse a headless PERSISTENT-WRITE and record it, so the fallback is visible
+/// in Tool Activity instead of being indistinguishable from a normal write.
+///
+/// The row is written directly rather than through [`dispatch_recorded`]:
+/// that function requires an open [`GraphIndex`], and the refusal must hold even
+/// when the index cannot be opened at all. `ok: false` is honest — the caller
+/// asked for a write and did not get one, which is exactly the shape
+/// `dispatch_recorded` would have recorded for an error result.
+fn refuse_headless_write(cwd: &Path, sub: &str, source: &str, name: &str, args: &Value) -> Value {
+    let started = crate::activity::now_ms();
+    let root = find_graph_root(cwd, sub).unwrap_or_else(|| cwd.to_path_buf());
+    tracing::warn!(
+        target: "graph",
+        tool = %name,
+        "graph: refused a persistent memory write on the headless path (cImp is not running)"
+    );
+    crate::activity::record_bg(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            started,
+            crate::activity::root_key(&root),
+            source.to_string(),
+            name.to_string(),
+            arg_summary(name, args),
+            HEADLESS_WRITE_UNAVAILABLE.chars().count(),
+            0,
+            false,
+        ),
+        request: serde_json::to_string_pretty(args).unwrap_or_default(),
+        response: HEADLESS_WRITE_UNAVAILABLE.to_string(),
+    });
+    json!({ "content": [{ "type": "text", "text": HEADLESS_WRITE_UNAVAILABLE }] })
 }
 
 /// Execute one resolved `graph_*` / `context_*` tool against an open index —
@@ -803,6 +898,34 @@ fn scoped_session(
         .map_err(|e| e.to_string())
 }
 
+/// V32 Phase C2, #48 — the Tool Activity row for a note the secret screen held.
+///
+/// Reuses [`Screen::MemoryQuarantine`](crate::offload::outbound::Screen), which
+/// is the accurate name for what happened (a memory write was held, nothing was
+/// denied, so the row stays `ok: true`) and puts it in the same feed as the
+/// latch-driven quarantine a reviewer is already reading. The `detail` is what
+/// distinguishes the two: it names the rules, never the matched text.
+///
+/// `Origin::Internal` — cImp's own dispatch decided this about a call it was
+/// already executing, which is exactly what that variant claims.
+fn record_secret_screen_flag(agent: Option<&str>, hits: &[String]) {
+    use crate::offload::outbound::{record_flag, Flag, Origin, Screen};
+    let detail = super::secrets::write_notice(hits);
+    record_flag(Flag {
+        screen: Screen::MemoryQuarantine,
+        origin: Origin::Internal,
+        consumer: agent.unwrap_or("offload"),
+        scope: "memory secret screen",
+        tool: "context_note",
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: false,
+        root: String::new(),
+        detail: &detail,
+    });
+}
+
 /// V32 Phase G: apply the delivery-time recall envelope, or don't.
 ///
 /// One helper for both memory-read tools so the switch cannot be honoured at
@@ -1008,17 +1131,39 @@ pub fn run_tool(
             // promotes it. The Phase A/B behaviour was a hard refusal, which
             // threw away the legitimate conclusions a research session exists to
             // produce; the model is told the difference in the result below.
-            let quarantined = guards.taint.is_quarantined();
+            let tainted = guards.taint.is_quarantined();
+            // V32 Phase C2, #48 (user decision 2026-08-07): the SECRET screen,
+            // which is about the note's own content rather than the writing
+            // conversation's state. Same holding pen, second reason — see
+            // `graph::secrets` for why a hit quarantines rather than refuses or
+            // redacts, and why the reads were not latched instead.
+            //
+            // Screened HERE, in `run_tool`, because this is the one funnel every
+            // write path reaches: the loopback `/graph_run` route, the headless
+            // MCP child and the offload worker's native route all land on this
+            // arm. A screen at any caller would be a screen one caller could
+            // forget.
+            let secrets = super::secrets::screen(&text);
+            let quarantined = tainted || !secrets.is_empty();
             idx.mem_add_note(&note_id, &sid, &text, ts, pin, quarantined)
                 .map(|_| {
+                    if !secrets.is_empty() {
+                        record_secret_screen_flag(agent, &secrets);
+                    }
                     let scope = if pin {
                         " (pinned, kept across sessions)"
                     } else {
                         ""
                     };
                     let mut out = format!("Noted{scope}.");
-                    if quarantined {
+                    // Both notices when both fired: they are different facts
+                    // about the same held note, and collapsing them would tell
+                    // the user's review queue only half of why the row is there.
+                    if tainted {
                         out.push_str(QUARANTINE_WRITE_NOTICE);
+                    }
+                    if !secrets.is_empty() {
+                        out.push_str(&super::secrets::write_notice(&secrets));
                     }
                     out
                 })
@@ -3621,5 +3766,199 @@ mod surface_tests {
             "SURFACE_STATS mcp_tools={} mcp_chars={} offload_tools={} offload_chars={}",
             s.mcp_tools, s.mcp_chars, s.offload_tools, s.offload_chars
         );
+    }
+}
+
+/// V32 Phase C2, #48 — the memory-write boundary: what the **headless** path
+/// refuses, and what the secret screen holds.
+#[cfg(test)]
+mod memory_write_boundary_tests {
+    use super::*;
+    use crate::graph::GraphIndex;
+
+    fn temp_index(tag: &str) -> (std::path::PathBuf, GraphIndex) {
+        let dir = std::env::temp_dir().join(format!("ckg-{tag}-{}", uuid::Uuid::new_v4()));
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        (dir, idx)
+    }
+
+    /// Finding M-2's deliverable: with the proxy unreachable the note write is
+    /// REFUSED, and the reads on the same path still answer.
+    ///
+    /// The gate is asserted as a predicate over the whole advertised tool set
+    /// rather than by driving `handle_call`, which needs a process cwd and a
+    /// global settings snapshot; the read half is driven through `run_tool`,
+    /// which is literally what `handle_call` reaches after the gate.
+    #[test]
+    fn the_headless_path_refuses_a_note_write_and_still_serves_a_read() {
+        // Exactly the PERSISTENT-WRITE tools are refused — no read is caught in
+        // the blast radius, which is the half of the user's decision that
+        // preserves locked decision 10's rationale for reads.
+        let mut refused: Vec<&str> = Vec::new();
+        for spec in tool_specs() {
+            if headless_write_refused(spec.name) {
+                refused.push(spec.name);
+            }
+        }
+        assert_eq!(
+            refused,
+            vec!["context_note"],
+            "the headless gate must refuse the persistent writes and nothing else"
+        );
+
+        let (dir, idx) = temp_index("headless-write");
+        idx.mem_add_note("n1", "s1", "we chose FNV hashing", 1_000, true, false)
+            .expect("seed a note");
+
+        // The read half of the same path.
+        let out = run_tool(
+            &idx,
+            "context_notes",
+            &json!({}),
+            50,
+            200,
+            Some("claude"),
+            Some("s1"),
+            CallGuards::clean(),
+        )
+        .expect("a read must still be served with the app down");
+        assert!(out.contains("we chose FNV hashing"), "{out}");
+
+        // The refusal string states the three facts a model needs: nothing was
+        // stored, the condition is transient, and what actually fixes it.
+        assert!(HEADLESS_WRITE_UNAVAILABLE.starts_with("NOT SAVED"));
+        assert!(HEADLESS_WRITE_UNAVAILABLE.contains("cImp is not running"));
+        assert!(HEADLESS_WRITE_UNAVAILABLE.contains("transient"));
+        assert!(!HEADLESS_WRITE_UNAVAILABLE.contains('{'));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The compounding half (N-1): the write the headless path would otherwise
+    /// have made is the highest-privilege one the memory surface offers — a
+    /// PINNED note with no session, stored under an empty session id,
+    /// project-wide, permanent, unattributable AND unquarantined. It is also
+    /// exactly what a model reaches for when the child cannot resolve a session,
+    /// because `context_note`'s own no-session branch tells it to.
+    ///
+    /// Pinned here as a property of the storage layer so that if the refusal is
+    /// ever narrowed to "unpinned writes only", this states what that would let
+    /// back in.
+    #[test]
+    fn a_pinned_sessionless_note_is_project_wide_and_unattributable() {
+        let (dir, idx) = temp_index("pin-no-session");
+        idx.mem_add_note("n1", "", "reachable from every session", 1_000, true, false)
+            .expect("write");
+        for sid in ["", "some-other-session", "a-third-one"] {
+            let notes = idx.mem_notes(sid).expect("read");
+            assert_eq!(
+                notes.len(),
+                1,
+                "a pinned sessionless note is returned to session {sid:?}"
+            );
+            assert_eq!(notes[0].session_id, "", "and carries no attribution");
+        }
+        assert!(
+            headless_write_refused("context_note"),
+            "which is why the headless path must not be able to make one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The secret screen holds a credential-bearing note: it IS stored (nothing
+    /// is dropped), it is invisible to every read path, it appears in the review
+    /// queue, and the model is told which rules matched and not what they saw.
+    #[test]
+    fn a_note_carrying_a_credential_is_held_for_review() {
+        let (dir, idx) = temp_index("secret-screen");
+        let out = run_tool(
+            &idx,
+            "context_note",
+            &json!({
+                "text": "prod creds for the staging bucket: AKIAIOSFODNN7EXAMPLE",
+                "pin": true
+            }),
+            50,
+            200,
+            Some("claude"),
+            Some("s1"),
+            CallGuards::clean(),
+        )
+        .expect("the write is accepted, not refused");
+        assert!(out.starts_with("Noted"), "{out}");
+        assert!(out.contains("HELD FOR REVIEW (secret screen)"), "{out}");
+        assert!(out.contains("secret_aws_access_key_id"), "{out}");
+        assert!(
+            !out.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the notice must not echo the matched text back: {out}"
+        );
+
+        // Not recallable…
+        assert!(
+            idx.mem_notes("s1").expect("read").is_empty(),
+            "a held note must not reach a recall path"
+        );
+        // …but recoverable: it is in the review queue, with its text intact.
+        let held = idx.mem_quarantined_notes().expect("review queue");
+        assert_eq!(held.len(), 1);
+        assert!(
+            held[0].text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "nothing was stripped — the user can still read what was found"
+        );
+        assert!(held[0].pinned, "the model's scope choice is preserved");
+
+        // Promotion is the one-click escape hatch a false positive needs.
+        idx.mem_promote_note(&held[0].note_id).expect("promote");
+        assert_eq!(idx.mem_notes("s1").expect("read").len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary research conclusion is unaffected — the screen must not be a
+    /// tax on the thing `context_note` exists for.
+    #[test]
+    fn an_ordinary_note_is_not_held() {
+        let (dir, idx) = temp_index("secret-clean");
+        let out = run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "we chose FNV hashing because the keys are short", "pin": true }),
+            50,
+            200,
+            Some("claude"),
+            Some("s1"),
+            CallGuards::clean(),
+        )
+        .expect("write");
+        assert_eq!(out, "Noted (pinned, kept across sessions).");
+        assert_eq!(idx.mem_notes("s1").expect("read").len(), 1);
+        assert_eq!(idx.mem_quarantined_count().expect("count"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both reasons can hold the same note, and the model is told both. A single
+    /// collapsed notice would leave the review queue's reader with half of why
+    /// the row is there.
+    #[test]
+    fn taint_and_the_secret_screen_compose() {
+        let (dir, idx) = temp_index("secret-and-taint");
+        let out = run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "token = \"ghp_0123456789abcdefghijklmnopqrstuvwxyzAB\"" }),
+            50,
+            200,
+            Some("claude"),
+            Some("s1"),
+            CallGuards {
+                taint: WriteTaint::Quarantined,
+                spotlight_recall: true,
+            },
+        )
+        .expect("write");
+        assert!(out.contains("QUARANTINED (security boundary)"), "{out}");
+        assert!(out.contains("HELD FOR REVIEW (secret screen)"), "{out}");
+        assert_eq!(idx.mem_quarantined_count().expect("count"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

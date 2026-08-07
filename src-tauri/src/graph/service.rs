@@ -2516,7 +2516,19 @@ impl GraphService {
             return None;
         }
         let idx = self.index_for(root).ok()?;
-        let block = super::context::compaction_block(&idx, session_id);
+        // V32 Phase C2, #48 finding M-1: the compaction carry-over is the fourth
+        // memory-replay path and had no envelope. Resolved HERE rather than
+        // threaded from the caller because the caller is the loopback's
+        // `POST /context/compaction` route, whose body carries a `cwd` and a
+        // `session_id` and no tab identity at all — so `Scope::App` is not a
+        // fallback, it is the only scope that exists on this route. The same
+        // choice, for the same reason, as the headless MCP child's.
+        let spotlight = crate::settings::injection::effective(
+            crate::settings::injection::Feature::Spotlighting,
+            crate::settings::injection::Scope::App,
+            &self.settings.current(),
+        );
+        let block = super::context::compaction_block(&idx, session_id, spotlight);
         if block.is_empty() {
             None
         } else {

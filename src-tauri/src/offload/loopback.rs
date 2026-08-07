@@ -1427,20 +1427,53 @@ impl BeaconOutcome {
 
 /// Which tool-serving route a gate call is running for. The two differ in one
 /// respect only: what an [`ToolClass::External`] classification *means* there.
+///
+/// `pub(super)` since #48 because the **worker** needs the same distinction and
+/// was making the decision without it (review finding A-1). One definition of
+/// the rule, in the module that first got it right, rather than a second copy
+/// in `agent.rs` that can drift from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LatchRoute {
-    /// `/mcp/call` — proxied `<server>__<tool>` ids. Every name here is
-    /// namespaced and therefore EXTERNAL by the Phase A unknown-⇒-EXTERNAL
-    /// invariant; this route is the tab's untrusted-content intake.
+pub(super) enum LatchRoute {
+    /// A proxied `<server>__<tool>` id: `/mcp/call`, and the worker's
+    /// MCP-host branch. Every name here is namespaced and therefore EXTERNAL
+    /// by the Phase A unknown-⇒-EXTERNAL invariant; this route is the
+    /// untrusted-content intake.
     Proxied,
-    /// `/graph_run` — cImp-native `graph_*` / `context_*` tools only. This
-    /// route physically cannot serve a proxied server's content, so a name
-    /// that classifies EXTERNAL here is not external content at all: it is a
-    /// typo or a hallucination that `run_graph_tool` will reject as unknown.
-    /// Letting it *engage* the latch would let one bad tool name poison a tab
-    /// for its whole session — so on this route EXTERNAL neither latches nor
-    /// is refused, and the graph service answers with its own error.
+    /// A cImp-native bare name: `/graph_run`'s `graph_*` / `context_*` tools,
+    /// and the worker's native dispatch. This route physically cannot serve a
+    /// proxied server's content, so a name that classifies EXTERNAL here is not
+    /// external content at all: it is a typo or a hallucination that dispatch
+    /// will reject as unknown. Letting it *engage* the latch would let one bad
+    /// tool name poison a scope for its whole session — so on this route
+    /// EXTERNAL neither latches nor is refused, and dispatch answers with its
+    /// own error.
     Native,
+}
+
+impl LatchRoute {
+    /// The route a tool name arrives on, by the one convention both dispatchers
+    /// use: a namespaced `<server>__<tool>` id is proxied, a bare name is
+    /// native (`agent.rs::HostRouter::call`, `mcp_host::call_for_consumer`).
+    pub(super) fn of_tool(name: &str) -> Self {
+        if name.contains("__") {
+            LatchRoute::Proxied
+        } else {
+            LatchRoute::Native
+        }
+    }
+
+    /// Whether an [`ToolClass::External`] classification on this route really
+    /// means **external content**.
+    ///
+    /// `false` on [`LatchRoute::Native`] is the whole rule, and it is not a
+    /// weakening of the unknown-⇒-EXTERNAL invariant: every proxied id contains
+    /// `__` by construction, so the restrictive default still governs every
+    /// name that can carry external content. What it excludes is the name that
+    /// cannot — a misspelled `graph_symbols`, which is a hallucination, not a
+    /// page.
+    pub(super) fn external_is_content(self) -> bool {
+        self == LatchRoute::Proxied
+    }
 }
 
 /// The per-tab-session taint latches for the tools this proxy serves.
@@ -1551,7 +1584,7 @@ impl LatchRegistry {
             return Ok(WriteTaint::Clean);
         };
         let class = toolclass::classify(name);
-        if route == LatchRoute::Native && class == ToolClass::External {
+        if class == ToolClass::External && !route.external_is_content() {
             return Ok(WriteTaint::Clean);
         }
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1958,6 +1991,45 @@ impl LatchRegistry {
         }
     }
 
+    /// Charge one **attempted** proxied call, whatever it returned (#48, D-3).
+    ///
+    /// The charge used to sit on the `Ok` arm only, so a loop of fetches
+    /// against a host that 500s advanced neither the byte counter nor the call
+    /// counter and never exhausted the budget — while the worker's copy of the
+    /// same contract charged both arms (an `Err` there becomes an `ERROR: …`
+    /// tool result with `executed = true`). Two paths, one contract, opposite
+    /// behaviour.
+    ///
+    /// A failed fetch charges **zero bytes and one call**: nothing was
+    /// ingested, but the request left the machine and `max_calls` is what
+    /// exists to stop a loop. Taking the whole decision here — rather than a
+    /// `map` at the call site — is what makes it testable: the handler's use is
+    /// one unconditional statement above the match it used to be inside.
+    fn charge_call(&self, scope: Option<&LatchScope>, result: &Result<String, String>) {
+        self.charge(scope, result.as_ref().map(|t| t.len()).unwrap_or(0));
+    }
+
+    /// Claim one of this tab session's audit-row bits — see
+    /// [`outbound::AuditClaims`]. Locks for exactly the length of the claim, so
+    /// nothing is held across the SSRF screen's DNS `await`.
+    ///
+    /// Without a registry entry (no tab identity, or `gate` has not run) the
+    /// call reports: there is no session to attribute a repeat to, which is the
+    /// same fail-open the latch and the budget take.
+    fn claim<T>(
+        &self,
+        scope: Option<&LatchScope>,
+        claim: impl FnOnce(&mut outbound::Budget) -> T,
+        unscoped: T,
+    ) -> T {
+        let Some(scope) = scope else { return unscoped };
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        match tabs.get_mut(&scope.key()) {
+            Some(entry) => claim(&mut entry.budget),
+            None => unscoped,
+        }
+    }
+
     /// The `/status` view: one row per tab the proxy has served, sorted so the
     /// output is stable to eyeball across polls.
     fn snapshot(&self) -> Vec<LatchStatus> {
@@ -2023,6 +2095,37 @@ impl LatchStatus {
 fn latches() -> &'static LatchRegistry {
     static LATCHES: OnceLock<LatchRegistry> = OnceLock::new();
     LATCHES.get_or_init(LatchRegistry::default)
+}
+
+/// One tab session's audit-row claim ledger, as the SSRF chokepoint and the
+/// detection boundary see it (#48).
+///
+/// The ledger itself lives inside the tab's [`outbound::Budget`], which is the
+/// only per-conversation state with the right lifetime *and* the right reset
+/// rule: `TabLatch::observe` wipes it on a proved session rotation, so a
+/// genuinely new conversation is entitled to its own rows. A process-global
+/// `HashSet<scope>` was the alternative and is wrong for exactly that reason —
+/// proxy scopes are stable `agent:tab` strings, so it would suppress a tab's
+/// rows permanently, across every session it ever holds.
+///
+/// A handle rather than a borrow because the ledger sits behind the registry
+/// mutex, which must not be held across the SSRF screen's DNS `await`.
+struct TabAudit<'a>(Option<&'a LatchScope>);
+
+impl outbound::ScopeAudit for TabAudit<'_> {
+    fn claim_ssrf(&self) -> outbound::SsrfRow {
+        latches().claim(
+            self.0,
+            outbound::Budget::claim_ssrf_flag,
+            outbound::SsrfRow::Write {
+                total: 0,
+                suppressed: 0,
+            },
+        )
+    }
+    fn claim_unscreened(&self) -> bool {
+        latches().claim(self.0, outbound::Budget::claim_unscreened_flag, true)
+    }
 }
 
 /// V32 Phase F: the `/status` latch rows, read **in process**.
@@ -3663,7 +3766,11 @@ async fn handle_mcp_call(
         .as_deref()
         .map(crate::activity::root_key)
         .unwrap_or_default();
-    let r = match service
+    // #48: the tab session's audit-row claim ledger, threaded to the SSRF
+    // chokepoint and to the detection boundary so neither can flood a capped
+    // feed on a loop. See `TabAudit`.
+    let audit = TabAudit(scope.as_ref());
+    let called = service
         .mcp_call(
             consumer_of(req),
             &body.name,
@@ -3671,9 +3778,14 @@ async fn handle_mcp_call(
             cwd.as_deref(),
             &scope_label,
             body.tab.as_deref(),
+            &audit,
         )
-        .await
-    {
+        .await;
+    // V32 Phase C, corrected in #48 (D-3): charge the session's EXTERNAL budget
+    // for the call that was just ATTEMPTED — before the match, so it cannot
+    // again end up on one arm only. See `LatchRegistry::charge_call`.
+    latches().charge_call(scope.as_ref(), &called);
+    let r = match called {
         // Locked decisions 5 + 6: detection, the envelope and the warning
         // header all compose here, at the proxy's tool-result boundary, so
         // EVERY consumer gets them identically — and they apply whether or not
@@ -3683,11 +3795,6 @@ async fn handle_mcp_call(
         // Errors are cImp-composed strings, not fetched content, and are never
         // screened or wrapped.
         Ok(text) => {
-            // V32 Phase C: charge what this call actually pulled, so the byte
-            // half of the budget reflects external content ingested by this
-            // session. Charged on the raw result, before the envelope adds
-            // cImp's own preamble and markers.
-            latches().charge(scope.as_ref(), text.len());
             let wrapped = detection::wrap_external_result(
                 &body.name,
                 text,
@@ -3699,6 +3806,7 @@ async fn handle_mcp_call(
                     host: flag_host,
                     cfg: detection_cfg,
                     spotlight: spotlight_on,
+                    audit: &audit,
                 },
             )
             .await;
@@ -5771,6 +5879,145 @@ mod tests {
             reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content"),
             Err(outbound::REFUSAL_BUDGET)
         );
+    }
+
+    /// #48 (finding D-3) — **a FAILED proxied fetch advances the call
+    /// counter.** The charge sat on the `Ok` arm alone, so a loop of fetches
+    /// against a host that 500s advanced nothing and never exhausted the
+    /// budget: the one screen whose whole purpose is stopping a loop was blind
+    /// to the loop that costs least to run. The worker's copy of the same
+    /// contract charged both arms (an `Err` there becomes an `ERROR: …` tool
+    /// result with `executed = true`), so the two paths disagreed.
+    ///
+    /// Driven through `charge_call` — the exact function the handler calls, in
+    /// one unconditional statement above the match it used to live inside.
+    #[test]
+    fn a_failed_proxy_fetch_still_advances_the_call_counter() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        let failure: Result<String, String> = Err("upstream 500".into());
+        for _ in 0..3 {
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .is_ok());
+            assert!(reg
+                .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
+                .is_ok());
+            reg.charge_call(Some(&s), &failure);
+        }
+        assert_eq!(
+            reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content"),
+            Err(outbound::REFUSAL_BUDGET),
+            "three failed fetches must spend the three-call budget"
+        );
+        // Zero bytes, though: nothing was ingested. The call cap is what stops
+        // a loop; the byte cap is about content that arrived.
+        let reg = LatchRegistry::default();
+        let s = scope("claude-2", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .is_ok());
+        reg.charge_call(Some(&s), &failure);
+        reg.charge_call(Some(&s), &Ok("x".repeat(999)));
+        assert!(
+            reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
+                .is_ok(),
+            "999 bytes is under the 1000-byte cap — the failure contributed none"
+        );
+    }
+
+    /// #48 — the SSRF denial row is bounded per tab session, and the bound
+    /// resets on a proved session rotation.
+    ///
+    /// Every denial used to write a row with no dedup at all, while
+    /// `INJECTION_FLAG_CAP` is 200 and evicts oldest-first within a kind: a
+    /// model looping denied URLs destroyed the `Canary`, `LatchBeacon` and
+    /// `MemoryQuarantine` rows that are the only record of an attack that got
+    /// through. A process-global set keyed on the scope string was the wrong
+    /// shape — proxy scopes are stable `agent:tab`, so it would suppress a
+    /// tab's rows across every future session — which is why the ledger rides
+    /// the tab's `Budget`.
+    #[test]
+    fn ssrf_denial_rows_are_bounded_per_session_and_reset_on_rotation() {
+        use outbound::{ScopeAudit, SsrfRow};
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .is_ok());
+        // Drive the registry's own ledger the way `TabAudit` does.
+        let claim = || {
+            reg.claim(
+                Some(&s),
+                outbound::Budget::claim_ssrf_flag,
+                SsrfRow::Suppress,
+            )
+        };
+        let written: Vec<u32> = (0..200)
+            .filter_map(|_| match claim() {
+                SsrfRow::Write { total, .. } => Some(total),
+                SsrfRow::Suppress => None,
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![1, 2, 4, 8, 16, 32, 64, 128],
+            "200 denials cost the capped feed 8 rows, not 200"
+        );
+        // The first denial still reports immediately — a single one behaves
+        // exactly as it always did.
+        let fresh = LatchRegistry::default();
+        let f = scope("claude-2", Some("sess-a"));
+        assert!(fresh
+            .gate(Some(&f), LatchRoute::Proxied, "ddg__search", ON)
+            .is_ok());
+        assert!(matches!(
+            fresh.claim(
+                Some(&f),
+                outbound::Budget::claim_ssrf_flag,
+                SsrfRow::Suppress
+            ),
+            SsrfRow::Write { total: 1, .. }
+        ));
+
+        // A new conversation is entitled to its own rows: the rotation that
+        // resets the budget resets the ledger with it.
+        let rotated = scope("claude-1", Some("sess-b"));
+        assert!(reg
+            .gate(Some(&rotated), LatchRoute::Proxied, "ddg__search", ON)
+            .is_ok());
+        assert!(matches!(
+            reg.claim(
+                Some(&rotated),
+                outbound::Budget::claim_ssrf_flag,
+                SsrfRow::Suppress
+            ),
+            SsrfRow::Write { total: 1, .. }
+        ));
+
+        // A call with no tab identity has no session to attribute a repeat to,
+        // so it reports — the same fail-open the latch and the budget take.
+        let unscoped = TabAudit(None);
+        assert!(matches!(unscoped.claim_ssrf(), SsrfRow::Write { .. }));
+        assert!(unscoped.claim_unscreened());
+    }
+
+    /// #48 (finding A-1, proxy side) — restated as the shared rule the worker
+    /// now uses too. A bare name that classifies EXTERNAL is a hallucination,
+    /// and every proxied id contains `__` by construction, so the restrictive
+    /// unknown-⇒-EXTERNAL default still governs every name that can carry
+    /// external content.
+    #[test]
+    fn the_route_rule_is_one_definition_shared_with_the_worker() {
+        assert_eq!(LatchRoute::of_tool("graph_symbols"), LatchRoute::Native);
+        assert_eq!(LatchRoute::of_tool("read_file"), LatchRoute::Native);
+        assert_eq!(LatchRoute::of_tool("ddg__search"), LatchRoute::Proxied);
+        assert_eq!(
+            LatchRoute::of_tool("somenewserver__anything"),
+            LatchRoute::Proxied
+        );
+        assert!(LatchRoute::Proxied.external_is_content());
+        assert!(!LatchRoute::Native.external_is_content());
     }
 
     /// Budgets are scoped exactly like the latch: per tab, and reset when the

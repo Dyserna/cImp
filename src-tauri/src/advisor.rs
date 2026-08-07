@@ -225,6 +225,22 @@ pub const RULE_DETECTION_UPDATE_STALLED: &str = "detection.update_stalled.v1";
 /// holds for the state the user looked at and re-raises when it changes.
 pub const RULE_DETECTION_SIGNATURE_DOWN: &str = "detection.signature_down.v1";
 
+/// `detection.local_rules_broken.v1`: a rule file the USER wrote in
+/// `rules.d/local/` does not compile, so it is being skipped while the rest of
+/// the layer runs.
+///
+/// The consumer for the second half of #48's U-4. The first half stopped a
+/// broken `local/` file from vetoing every bundle update forever; that fix has
+/// to come with a way for the user to find out the file is broken, or it just
+/// trades a loud wrong signal for a quiet absent one — a `warn!` in a log
+/// nobody opens, and rules the user believes are protecting them that are not.
+///
+/// Warn-only and signed by the failing file names, so a dismissal holds for the
+/// files the user looked at and re-raises when the set changes. Deliberately
+/// suppressed while `detection.signature_down.v1` is up: the disarmed-layer card
+/// is louder and about the same folder.
+pub const RULE_DETECTION_LOCAL_RULES_BROKEN: &str = "detection.local_rules_broken.v1";
+
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
 /// breakage detector, and waiting longer just burns more bare refusals.
@@ -387,6 +403,13 @@ pub struct Signals {
     /// about the update channel, which is why nothing else here could stand in
     /// for it.
     pub detection_signature_down: Option<crate::offload::detection::signature::SignatureDown>,
+    /// A user rule file in `rules.d/local/` that does not compile (#48, U-4).
+    /// Distinct from the field above: there the layer has NOTHING to match with,
+    /// here it is matching fine and a file the user wrote is being skipped. It
+    /// only became a silent condition once U-4 stopped letting it veto the
+    /// update channel — before that it was loud, and wrong about why.
+    pub detection_local_rules_broken:
+        Option<crate::offload::detection::updater::BrokenLocalRules>,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -899,6 +922,42 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                     d.dir
                 ),
                 rule_id: RULE_DETECTION_SIGNATURE_DOWN,
+                signature,
+                warn_only: true,
+                action: None,
+            });
+        }
+    }
+
+    // V32 Phase C3 / #48 U-4 — detection.local_rules_broken.v1: a rule file the
+    // USER wrote is on disk and does not compile, so it is skipped while the
+    // rest of the layer runs. Suppressed while the card above is up (same
+    // folder, louder problem) — the updater's `broken_local_rules` applies that
+    // suppression at the source, so the two can never both fire.
+    if let Some(b) = &sig.detection_local_rules_broken {
+        let signature = b.failed.join(",");
+        if !is_dismissed(&sig.dismissed, RULE_DETECTION_LOCAL_RULES_BROKEN, &signature) {
+            out.push(Proposal {
+                setting: String::new(),
+                current: format!(
+                    "{} rejected: {} ({} file(s), {} rule(s) still live)",
+                    b.failed.len(),
+                    b.failed.join(", "),
+                    b.files_loaded,
+                    b.rules
+                ),
+                proposed: "a `rules.d/local/` that compiles".to_string(),
+                rationale: format!(
+                    "Your own detection rule file(s) in `rules.d/local/` do not compile, so they \
+                     are being skipped: the patterns you wrote are not screening anything, while \
+                     the rest of the layer runs normally and reports nothing wrong. A rule file is \
+                     also rejected when it collides on a rule IDENTIFIER with the shipped bundle, \
+                     which an update can introduce without your file changing at all. cImp looked \
+                     in {}. Fix or rename the rule(s), then press Reload rules in Settings → Tools \
+                     → Detection.",
+                    b.dir
+                ),
+                rule_id: RULE_DETECTION_LOCAL_RULES_BROKEN,
                 signature,
                 warn_only: true,
                 action: None,
@@ -2488,5 +2547,89 @@ mod tests {
         })
         .iter()
         .any(|p| p.rule_id == RULE_DETECTION_SIGNATURE_DOWN));
+    }
+
+    // ── #48 U-4 — a user rule that does not compile ─────────────────────
+
+    use crate::offload::detection::updater::BrokenLocalRules;
+
+    fn broken_local(files: &[&str]) -> Signals {
+        Signals {
+            detection_local_rules_broken: Some(BrokenLocalRules {
+                dir: r"C:\cimp\detection\rules.d".into(),
+                failed: files.iter().map(|f| (*f).to_string()).collect(),
+                files_loaded: 3,
+                rules: 12,
+            }),
+            ..Signals::default()
+        }
+    }
+
+    /// The consumer for U-4's other half. Stopping a broken `local/` file from
+    /// vetoing the update channel is only half a fix: without a card the user's
+    /// own rules are silently not protecting them, and the only trace is a
+    /// `warn!` line. The card must say what is skipped AND that the rest is
+    /// live, or it reads as "detection is off".
+    #[test]
+    fn a_broken_user_rule_raises_a_warn_only_card() {
+        let p = evaluate(&broken_local(&["local/mine.yar"]))
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN)
+            .expect("a skipped user rule must say so");
+        assert!(p.warn_only, "the fix is a file on disk");
+        assert!(p.setting.is_empty());
+        assert!(p.action.is_none());
+        assert!(p.current.contains("local/mine.yar"), "{}", p.current);
+        assert!(
+            p.current.contains("12 rule(s) still live"),
+            "the card must not read as an outage: {}",
+            p.current
+        );
+        assert!(
+            p.rationale.contains("do not compile"),
+            "{}",
+            p.rationale
+        );
+        // The identifier-collision cause is named, because it is the one an
+        // update can introduce without the user's file changing at all.
+        assert!(p.rationale.contains("IDENTIFIER"), "{}", p.rationale);
+        assert!(
+            p.rationale.contains(r"C:\cimp\detection\rules.d"),
+            "{}",
+            p.rationale
+        );
+    }
+
+    /// Signed by the failing file NAMES, so a dismissal holds for the files the
+    /// user looked at and re-raises when a different file breaks.
+    #[test]
+    fn a_dismissed_broken_rule_card_refires_for_a_different_file() {
+        let dismissed = vec![DismissedRule {
+            rule_id: RULE_DETECTION_LOCAL_RULES_BROKEN.to_string(),
+            signature: "local/mine.yar".to_string(),
+        }];
+        let fires = |files: &[&str]| {
+            let mut s = broken_local(files);
+            s.dismissed = dismissed.clone();
+            evaluate(&s)
+                .iter()
+                .any(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN)
+        };
+        assert!(!fires(&["local/mine.yar"]), "dismissed for what it named");
+        assert!(fires(&["local/other.yar"]), "a different file is a new fact");
+        assert!(
+            fires(&["local/mine.yar", "local/other.yar"]),
+            "a widened set is a new fact"
+        );
+    }
+
+    /// `None` is the healthy steady state, and the producer owns every reason to
+    /// stay quiet (layer off, everything compiles, the failure is in a bundle
+    /// file, or the layer is disarmed and the louder card is already up).
+    #[test]
+    fn no_broken_rule_signal_means_no_card() {
+        assert!(!evaluate(&Signals::default())
+            .iter()
+            .any(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN));
     }
 }

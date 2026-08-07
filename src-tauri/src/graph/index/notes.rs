@@ -52,23 +52,43 @@
 //! sits behind a `//` on its line, so prose satisfying the count is a red test
 //! rather than a silent hole. Write "the atom form" in words instead.
 //!
-//! # What this scan does NOT see (stated, not fixed)
+//! # The two blind spots, and what happened to them (#48)
 //!
-//! It is a literal scan over one spelling, so two shapes are outside it:
+//! Both were recorded here as "stated, not fixed" when the module shipped. They
+//! are closed now, by different means, and the residue that remains is named.
 //!
-//! - **A query whose relation name is interpolated.**
-//!   [`GraphIndex::mem_note_row_count`] builds its atom with a `format!` over a
-//!   `name` parameter, so no literal atom appears in the source at all. It is
-//!   in this file (the boundary holds) and it is migration-only, but a future
-//!   parameterized *read* elsewhere would be invisible here. The module
-//!   boundary, not the scan, is what covers that.
+//! - **A query whose relation name is interpolated** was invisible to a literal
+//!   scan: `mem_note_row_count` built its atom with a `format!` over a `name`
+//!   parameter, so no literal atom appeared in the source at all. That call was
+//!   migration-only and its blast radius was bounded by the module boundary
+//!   rather than by the scan — which is exactly the argument that would have to
+//!   be re-made, correctly, for every future one.
+//!
+//!   Fixed by **removing the interpolation**: [`GraphIndex::mem_note_stage_row_count`]
+//!   spells the stage relation out, and `tests::no_interpolated_relation_atom`
+//!   makes a new one a red test. The residue: an interpolated atom is only
+//!   banned *here*. `graph/index.rs` legitimately has two (over `usage_stat` and
+//!   the session relations) and a blanket ban would be wrong there, so a future
+//!   parameterized read in the parent whose parameter happens to be this
+//!   relation is still covered by the module boundary alone — 8,800 lines of it.
+//!   Narrowing that is a type problem (a relation newtype), not a scan problem.
+//!
 //! - **Statements that name the relation without an atom.** `graph/index.rs`'s
-//!   `#[cfg(test)] mod tests` still runs four — `::remove mem_note`,
-//!   a pre-C2 `:create`, and two `:put`s — to build the fixtures the migration
-//!   tests need. None of them can *read* a row (they are DDL and writes), so
-//!   none can bypass the quarantine filter, which is why the scan is green with
-//!   them present and why widening the pattern to catch them would only add
-//!   noise.
+//!   `#[cfg(test)] mod tests` ran four — a `::remove`, a pre-C2 `:create`, and
+//!   two `:put`s — to build the fixtures the migration tests need. None could
+//!   *read* a row (they are DDL and writes), so none could bypass the filter,
+//!   which is why the scan was green with them present.
+//!
+//!   Fixed by **moving the text here**: they are the `FIXTURE_*` constants at
+//!   the bottom of this file, and the parent's tests reference them. The module
+//!   docs' claim — *"every statement naming the relation lives here, where a
+//!   reviewer opening the file sees all of them at once"* — is now literally
+//!   true rather than true-except-for-four. The residue: no scan enforces it,
+//!   because the only pattern that would (the bare relation IDENTIFIER) also
+//!   matches the dozen legitimate prose mentions across `index.rs`,
+//!   `memory.rs`, `schema.rs` and `toolclass.rs`, and separating those needs
+//!   the comment heuristic `docs/MAINTENANCE.md` § *Cross-module invariants*
+//!   bans. Stated rather than half-enforced.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -203,7 +223,7 @@ impl GraphIndex {
             )?;
         }
         // Verify the stage captured every old row before dropping the original.
-        let staged = self.mem_note_row_count(Self::MEM_NOTE_STAGE)?;
+        let staged = self.mem_note_stage_row_count()?;
         if staged != expected {
             self.run_mut(&format!("::remove {}", Self::MEM_NOTE_STAGE), BTreeMap::new())?;
             return Err(AppError::Graph(format!(
@@ -226,12 +246,24 @@ impl GraphIndex {
         Ok(())
     }
 
-    /// Row count of a `mem_note`-shaped relation, counted by its `note_id`
+    /// Row count of the migration STAGE relation, counted by its `note_id`
     /// primary key so CozoScript's set semantics cannot dedupe distinct rows
     /// into an undercount. Migration verification only.
-    fn mem_note_row_count(&self, name: &str) -> AppResult<usize> {
+    ///
+    /// **The relation name is spelled out, not interpolated** (#48). The
+    /// previous form took a `name` parameter and built its atom by interpolating
+    /// that parameter with `format!`, which is a real note query the scan below
+    /// cannot see — the first blind spot the module docs recorded. Nothing needed the
+    /// parameter: the only caller passes [`Self::MEM_NOTE_STAGE`]. The literal
+    /// deliberately does not match `atom()` (a name continuing past the
+    /// relation name has neither `{` nor `[` next), which is the same property
+    /// that keeps the stage out of the [`tests::NOTE_QUERIES`] floor.
+    ///
+    /// [`tests::the_stage_literal_matches_the_constant`] is what keeps the two
+    /// spellings from drifting.
+    fn mem_note_stage_row_count(&self) -> AppResult<usize> {
         let rows = self.run(
-            &format!("?[note_id] := *{name}{{note_id}}"),
+            "?[note_id] := *mem_note_v32{note_id}",
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
@@ -424,6 +456,43 @@ impl GraphIndex {
     }
 }
 
+// ── Migration-test fixture scripts (#48) ───────────────────────────────────
+//
+// `graph/index.rs`'s migration tests need to build a PRE-C2 store and an
+// interrupted-swap store, which means running DDL and writes that name the
+// relation. They lived in that file, which made the module docs' "every
+// statement naming the relation lives here" claim false by four.
+//
+// None of them can read a row, so none could ever bypass the quarantine filter
+// — moving them buys no enforcement. What it buys is the property the module
+// exists for: a reviewer who opens this file sees every statement that names
+// the relation, with nothing to remember about a second location.
+
+/// Drop the live relation, so a test can re-create it in the pre-C2 shape.
+#[cfg(test)]
+pub(super) const FIXTURE_DROP: &str = "::remove mem_note";
+
+/// The relation's shape BEFORE Phase C2 — no `tainted` column. Deliberately not
+/// derived from [`GraphIndex::mem_note_create_ddl`]: it is the historical shape
+/// the migration must cope with, and a fixture that tracked the current DDL
+/// would stop testing the migration the day the DDL changed again.
+#[cfg(test)]
+pub(super) const FIXTURE_CREATE_PRE_C2: &str =
+    ":create mem_note {note_id: String => session_id: String, text: String, ts_ms: Int, \
+     pinned: Bool}";
+
+/// Insert `$rows` in the pre-C2 column set.
+#[cfg(test)]
+pub(super) const FIXTURE_PUT_PRE_C2: &str = "?[note_id, session_id, text, ts_ms, pinned] <- $rows\n\
+     :put mem_note {note_id => session_id, text, ts_ms, pinned}";
+
+/// Insert `$rows` into the migration stage, in the C2 column set — what an
+/// interrupted swap leaves behind for the recovery branch to adopt.
+#[cfg(test)]
+pub(super) const FIXTURE_PUT_STAGE: &str =
+    "?[note_id, session_id, text, ts_ms, pinned, tainted] <- $rows\n\
+     :put mem_note_v32 {note_id => session_id, text, ts_ms, pinned, tainted}";
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -492,6 +561,25 @@ mod tests {
     /// test failure instead of a comment nobody re-reads.
     fn atom() -> regex::Regex {
         regex::Regex::new(r"\*\s*mem_note\s*[\{\[]").expect("a static pattern compiles")
+    }
+
+    /// A datalog atom whose relation name is a `format!` placeholder rather
+    /// than a literal — the shape [`atom`] cannot see, and the first of the two
+    /// blind spots the module docs recorded (#48).
+    ///
+    /// Deliberately never spelled out in prose anywhere in this file: the house
+    /// rule that governs the relation's atom form governs this shape for
+    /// exactly the same reason, and unlike guard 4's subject this guard scans
+    /// EVERY match in the file — including one sitting in its own doc comment.
+    ///
+    /// Scoped to `SELF` on purpose. `graph/index.rs` has two legitimate
+    /// interpolated atoms over other relations (`usage_stat`'s row count, the
+    /// session migration's read), and banning the shape there would be wrong.
+    /// Banning it *here* is not: this file has exactly one relation to talk
+    /// about, so an interpolated name in it is either this relation or a
+    /// mistake, and both want the author to stop and write the name out.
+    fn interpolated_atom() -> regex::Regex {
+        regex::Regex::new(r"\*\s*\{\w+\}").expect("a static pattern compiles")
     }
 
     /// The text preceding byte offset `at` on its own line, plus that line's
@@ -611,5 +699,71 @@ mod tests {
              `GraphIndex::mem_quarantined_notes` (the review UI's explicit opt-in), or move the \
              query into `{SELF}` beside the others."
         );
+    }
+
+    /// Guard 5 (#48) — no note query in this file may hide its relation name
+    /// behind a `format!` placeholder.
+    ///
+    /// This is the first blind spot the module docs used to record as "stated,
+    /// not fixed": `mem_note_row_count` interpolated the relation name into its
+    /// atom, and was therefore a real note query that
+    /// [`note_queries_live_only_in_this_module`]'s pattern could not count,
+    /// could not place, and could not have missed the disappearance of. The
+    /// query is spelled out now; this keeps the next one from being written.
+    ///
+    /// Like guard 4 it only ever moves in the failing direction: the pattern
+    /// recognizes the one Rust shape that produces an interpolated atom, and a
+    /// shape it does not recognize leaves the scan exactly where it stands.
+    #[test]
+    fn no_interpolated_relation_atom() {
+        let text = std::fs::read_to_string(src_root().join(SELF))
+            .unwrap_or_else(|e| panic!("cannot read {SELF}: {e}"));
+        let re = interpolated_atom();
+        let hits: Vec<String> = re
+            .find_iter(&text)
+            .map(|m| {
+                let (line, _) = line_prefix(&text, m.start());
+                format!("{SELF}:{line} `{}`", m.as_str())
+            })
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "INTERPOLATED NOTE QUERY — a datalog atom whose relation name is a `format!` \
+             placeholder is invisible to `note_queries_live_only_in_this_module`, so it is neither \
+             counted by the floor nor found by a rename: {hits:?}\n\n\
+             Write the relation name out. If the query really must be generic over two relations, \
+             match on the name and hold one literal script per arm."
+        );
+    }
+
+    /// The one place a relation name is written twice: [`GraphIndex::MEM_NOTE_STAGE`]
+    /// and the literal inside `mem_note_stage_row_count`'s script. Removing the
+    /// interpolation traded an invisible query for a possible drift; this is the
+    /// trade's other half.
+    #[test]
+    fn the_stage_literal_matches_the_constant() {
+        assert_eq!(
+            super::GraphIndex::MEM_NOTE_STAGE,
+            "mem_note_v32",
+            "the stage constant moved — update the literal script in \
+             `mem_note_stage_row_count` (and `FIXTURE_PUT_STAGE`) in the same commit"
+        );
+        assert!(
+            super::FIXTURE_PUT_STAGE.contains(super::GraphIndex::MEM_NOTE_STAGE),
+            "the stage fixture names a different relation than the constant"
+        );
+    }
+
+    /// The migration fixtures the parent's tests run are here, and they are the
+    /// shapes those tests actually need: the pre-C2 relation has no `tainted`
+    /// column (that is the whole point of the migration test) and the stage
+    /// fixture does.
+    #[test]
+    fn the_migration_fixtures_are_the_shapes_they_claim() {
+        assert!(!super::FIXTURE_CREATE_PRE_C2.contains("tainted"));
+        assert!(super::FIXTURE_CREATE_PRE_C2.contains("pinned: Bool"));
+        assert!(!super::FIXTURE_PUT_PRE_C2.contains("tainted"));
+        assert!(super::FIXTURE_PUT_STAGE.contains("tainted"));
+        assert_eq!(super::FIXTURE_DROP, "::remove mem_note");
     }
 }

@@ -1032,7 +1032,147 @@ async fn proxy_run(
 /// caller falls back to opening graph.db directly); on success returns the same
 /// JSON-RPC tool result shape as [`crate::graph::handle_mcp_call`].
 async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
-    let (base, token) = proxy_base()?;
+    match proxy_graph_outcome(params).await {
+        Ok(v) => Some(v),
+        Err(miss) => {
+            miss.report();
+            None
+        }
+    }
+}
+
+/// Every distinct reason [`proxy_graph`] hands the call to the headless
+/// fallback (#48, finding M-2).
+///
+/// # Why these are named
+///
+/// The fallback is a security-relevant path: until this commit it wrote
+/// unquarantined, unattributed memory, and it still serves reads with no latch
+/// and no session identity. A fallback's reachability is the union of its
+/// triggers, and the triggers were collapsed into one `Option::None` produced
+/// by five different `?`s spread across thirty lines — so "how does an attacker
+/// get onto the headless path" had no answer anybody could enumerate, and the
+/// documented justification for the path's behaviour silently assumed the
+/// answer was "the app is closed".
+///
+/// It is not. [`NoInstance`](Self::NoInstance) alone covers a corrupted
+/// `<portable_root>/.cimp-discovery/<pid>.json` — `read_all_discoveries` drops
+/// an unparseable entry with `filter_map(… .ok())` — which one file write
+/// produces and which Claude's own `Write` tool can reach. `HttpStatus(500)`
+/// means the app answered and refused, which is a completely different fact
+/// about the system and used to be indistinguishable from "cImp is not
+/// running".
+///
+/// Each is reported once per process (see [`report`](Self::report)): the
+/// condition is stable — a corrupt discovery file stays corrupt for the child's
+/// whole life — so a line per tool call would be noise that buries the first
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyMiss {
+    /// No usable loopback endpoint: no discovery file, or none of the entries
+    /// parsed. **The attacker-cheapest trigger**, and the one that needs no
+    /// running process to be wrong about.
+    NoInstance,
+    /// The HTTP client itself could not be constructed (TLS/backend init).
+    /// Process-local and unrelated to the app's state.
+    ClientBuild,
+    /// The request never got an answer: connection refused, DNS, the 30 s
+    /// timeout. The app is genuinely unreachable — the case the fallback was
+    /// designed for.
+    Transport,
+    /// The app answered with a non-2xx status. It is RUNNING and it declined:
+    /// 401 is a stale bearer token, 5xx is a fault inside the warm path.
+    HttpStatus(u16),
+    /// A 2xx answer whose body was not JSON. The app is running and something
+    /// between it and here is rewriting the response.
+    Unparseable,
+}
+
+impl ProxyMiss {
+    /// A stable, distinct label per reason — what the log line carries and what
+    /// the test enumerates.
+    fn as_str(&self) -> &'static str {
+        match self {
+            ProxyMiss::NoInstance => "no-instance",
+            ProxyMiss::ClientBuild => "client-build",
+            ProxyMiss::Transport => "transport",
+            ProxyMiss::HttpStatus(_) => "http-status",
+            ProxyMiss::Unparseable => "unparseable-response",
+        }
+    }
+
+    /// Say it once per reason per process, on stderr — the same channel the
+    /// handshake diagnostics use, because `tracing` is not initialized in this
+    /// child.
+    fn report(&self) {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let key = match self {
+            ProxyMiss::HttpStatus(code) => format!("http-status:{code}"),
+            other => other.as_str().to_string(),
+        };
+        let mut seen = SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !seen.insert(key.clone()) {
+            return;
+        }
+        eprintln!(
+            "cimp-offload: graph/context calls are taking the HEADLESS fallback ({key}) — the \
+             app's warm index is not serving them. Reads still work; persistent memory writes are \
+             refused until cImp is reachable. If cImp IS running, the discovery file under \
+             `.cimp-discovery/` is unreadable or stale."
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_miss_tests {
+    use super::ProxyMiss;
+
+    /// The set is enumerable and its members are distinguishable — the property
+    /// finding M-2 asked for. "No instance" and "the app answered 500" were the
+    /// same `None`; a security fallback whose trigger set nobody can enumerate
+    /// is a fallback whose reachability nobody can bound.
+    ///
+    /// Written as an exhaustive `match` so a sixth reason added later fails to
+    /// compile here rather than joining the set unlabelled.
+    #[test]
+    fn every_fallback_reason_is_named_and_distinct() {
+        let all = [
+            ProxyMiss::NoInstance,
+            ProxyMiss::ClientBuild,
+            ProxyMiss::Transport,
+            ProxyMiss::HttpStatus(500),
+            ProxyMiss::Unparseable,
+        ];
+        for m in &all {
+            // Exhaustiveness: the compiler is the enumeration guard.
+            let _: () = match m {
+                ProxyMiss::NoInstance
+                | ProxyMiss::ClientBuild
+                | ProxyMiss::Transport
+                | ProxyMiss::HttpStatus(_)
+                | ProxyMiss::Unparseable => (),
+            };
+            assert!(!m.as_str().is_empty());
+        }
+        let labels: std::collections::HashSet<&str> = all.iter().map(|m| m.as_str()).collect();
+        assert_eq!(labels.len(), all.len(), "two reasons share a label");
+        // The two the review conflated are not equal, and the status is carried
+        // rather than discarded — 401 (stale token) and 500 (warm-path fault)
+        // are different incidents.
+        assert_ne!(ProxyMiss::NoInstance, ProxyMiss::HttpStatus(500));
+        assert_ne!(ProxyMiss::HttpStatus(401), ProxyMiss::HttpStatus(500));
+        assert_ne!(ProxyMiss::Transport, ProxyMiss::NoInstance);
+    }
+}
+
+/// The five-outcome half of [`proxy_graph`]. `Ok` is the app's answer (which may
+/// itself be a tool error), `Err` names why the caller must fall back.
+async fn proxy_graph_outcome(params: &Value) -> Result<Result<Value, (i64, String)>, ProxyMiss> {
+    let (base, token) = proxy_base().ok_or(ProxyMiss::NoInstance)?;
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     let cwd = std::env::current_dir()
@@ -1041,7 +1181,7 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .ok()?;
+        .map_err(|_| ProxyMiss::ClientBuild)?;
     // V28: `tab` identifies which session's memory scope this call belongs to.
     // (V32 Phase B sends it on `/mcp/call` too — not for memory, which external
     // servers have none of, but because the proxy's taint latch is keyed by the
@@ -1057,21 +1197,24 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
         .json(&body)
         .send()
         .await
-        .ok()?; // transport failure → None → direct-open fallback
-    if !resp.status().is_success() {
-        return None;
+        .map_err(|_| ProxyMiss::Transport)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(ProxyMiss::HttpStatus(status.as_u16()));
     }
-    let v: Value = resp.json().await.ok()?;
+    let v: Value = resp.json().await.map_err(|_| ProxyMiss::Unparseable)?;
     let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
     if ok {
         let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
-        Some(Ok(json!({ "content": [{ "type": "text", "text": text }] })))
+        Ok(Ok(json!({ "content": [{ "type": "text", "text": text }] })))
     } else {
         let err = v
             .get("error")
             .and_then(|e| e.as_str())
             .unwrap_or("graph query failed");
-        Some(Ok(
+        // NOT a miss: the app answered and said the tool failed. Falling back
+        // here would re-run the call headless and hide the app's own verdict.
+        Ok(Ok(
             json!({ "content": [{ "type": "text", "text": err }], "isError": true }),
         ))
     }

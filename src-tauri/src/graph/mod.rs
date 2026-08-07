@@ -29,6 +29,8 @@ mod mcp;
 mod memory;
 mod model;
 mod schema;
+// V32 Phase C2 (#48): the write-time credential screen for `context_note`.
+mod secrets;
 mod service;
 // V17 Phase B: strict whole-file-read command parser, shared by the read-hook
 // shim (`crate::read_hook`) and the bypass tap (`service::check_bypass`).

@@ -6819,13 +6819,12 @@ pub struct Point { x: i32 }
         let dir = std::env::temp_dir().join(format!("ckg-note-migr-{}", uuid::Uuid::new_v4()));
         {
             let idx = GraphIndex::open(&dir, ".ckg").expect("open");
-            idx.run_mut("::remove mem_note", BTreeMap::new()).unwrap();
-            idx.run_mut(
-                ":create mem_note {note_id: String => session_id: String, text: String, \
-                    ts_ms: Int, pinned: Bool}",
-                BTreeMap::new(),
-            )
-            .unwrap();
+            // The scripts live in `graph/index/notes.rs` with every other
+            // statement that names the relation (#48) — see that module's docs.
+            idx.run_mut(super::notes::FIXTURE_DROP, BTreeMap::new())
+                .unwrap();
+            idx.run_mut(super::notes::FIXTURE_CREATE_PRE_C2, BTreeMap::new())
+                .unwrap();
             let old_row = DataValue::List(vec![
                 DataValue::Str("n1".into()),
                 DataValue::Str("s1".into()),
@@ -6835,12 +6834,7 @@ pub struct Point { x: i32 }
             ]);
             let mut p = BTreeMap::new();
             p.insert("rows".to_string(), DataValue::List(vec![old_row]));
-            idx.run_mut(
-                "?[note_id, session_id, text, ts_ms, pinned] <- $rows\n\
-                 :put mem_note {note_id => session_id, text, ts_ms, pinned}",
-                p,
-            )
-            .unwrap();
+            idx.run_mut(super::notes::FIXTURE_PUT_PRE_C2, p).unwrap();
             idx.write_schema_version(1).unwrap();
         }
 
@@ -6884,12 +6878,7 @@ pub struct Point { x: i32 }
             ]);
             let mut p = BTreeMap::new();
             p.insert("rows".to_string(), DataValue::List(vec![staged]));
-            idx.run_mut(
-                "?[note_id, session_id, text, ts_ms, pinned, tainted] <- $rows\n\
-                 :put mem_note_v32 {note_id => session_id, text, ts_ms, pinned, tainted}",
-                p,
-            )
-            .unwrap();
+            idx.run_mut(super::notes::FIXTURE_PUT_STAGE, p).unwrap();
             idx.write_schema_version(1).unwrap();
         }
 

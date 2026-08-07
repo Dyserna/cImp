@@ -774,6 +774,10 @@ pub struct Budget {
     /// requirement: ONE row per scope, not one per subsequent refused call — a
     /// model that keeps asking must not turn the feed into a denial log.
     flagged: bool,
+    /// The same requirement, for the two screens that can fire on *every* call
+    /// rather than once — see [`AuditClaims`]. They ride the budget because it
+    /// already has exactly the right lifetime and reset rule (#48).
+    claims: AuditClaims,
 }
 
 impl Budget {
@@ -798,6 +802,17 @@ impl Budget {
         !std::mem::replace(&mut self.flagged, true)
     }
 
+    /// Claim this scope's next SSRF denial row — see [`AuditClaims::claim_ssrf`].
+    pub fn claim_ssrf_flag(&mut self) -> SsrfRow {
+        self.claims.claim_ssrf()
+    }
+
+    /// Claim this scope's ONE unscreened-content row — see
+    /// [`AuditClaims::claim_unscreened`].
+    pub fn claim_unscreened_flag(&mut self) -> bool {
+        self.claims.claim_unscreened()
+    }
+
     /// Wipe the scope's spend (a tab's session rotated — see
     /// `loopback::TabLatch::observe`). The flag resets too: the new scope is
     /// entitled to its own report.
@@ -808,6 +823,134 @@ impl Budget {
     #[cfg(test)]
     fn spend(&self) -> (u32, u64) {
         (self.calls, self.bytes)
+    }
+}
+
+// ── Per-scope audit-row claims ─────────────────────────────────────────────
+//
+// The `injection_flag` feed is capped (`activity::INJECTION_FLAG_CAP`, 200) and
+// evicts the OLDEST row of its kind. So an unbounded row source is not merely
+// noisy: a model looping one refused shape destroys the `Canary`,
+// `LatchBeacon` and `MemoryQuarantine` rows that are the only forensic record
+// of the attack that got through. `Budget` already solved this for the
+// exhaustion row with a claim bit; these are the two screens that were missed.
+
+/// What one SSRF denial should do about its `injection_flag` row (#48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsrfRow {
+    /// Write the row. `total` is how many denials this scope has served
+    /// (`0` = an unledgered scope, see [`UnscopedAudit`]), and `suppressed` how
+    /// many were folded into this one since the last row was written.
+    Write { total: u32, suppressed: u32 },
+    /// Counted, not written.
+    Suppress,
+}
+
+/// One scope's claim bits for the screens that can fire on **every** call.
+///
+/// `Copy` and inert by default so it can ride inside [`Budget`], whose
+/// [`reset`](Budget::reset) — a tab's session rotation — is exactly the moment
+/// a new conversation becomes entitled to its own rows again. A process-global
+/// `HashSet<scope>` was the other option and is wrong for that reason: proxy
+/// scopes are stable `agent:tab` strings, so it would suppress a tab's rows
+/// permanently, across every future session it ever holds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AuditClaims {
+    /// Denials served in this scope.
+    ssrf_denials: u32,
+    /// `ssrf_denials` as of the last row written, so a row can say how many
+    /// denials it stands for.
+    ssrf_reported: u32,
+    /// Whether the one unscreened-content row has been written.
+    unscreened: bool,
+}
+
+impl AuditClaims {
+    /// Count one SSRF denial and decide whether it gets a row.
+    ///
+    /// Rows are written at denials 1, 2, 4, 8, 16 … — the count doubles between
+    /// them. A single denial (overwhelmingly the common case) behaves exactly
+    /// as it always did; a model looping denied URLs costs the feed
+    /// `log2(n)` rows instead of `n`, so 200 denials write 8. Strict
+    /// one-row-per-scope was rejected because the suppressed count would then
+    /// have nowhere to go, and a counter with no consumer is the defect class
+    /// this whole pass exists to close: every row here **names** how many
+    /// denials it stands for, so the magnitude of a loop survives in the audit
+    /// window instead of being inferred from its absence.
+    pub fn claim_ssrf(&mut self) -> SsrfRow {
+        self.ssrf_denials = self.ssrf_denials.saturating_add(1);
+        let total = self.ssrf_denials;
+        if !total.is_power_of_two() {
+            return SsrfRow::Suppress;
+        }
+        let suppressed = total.saturating_sub(self.ssrf_reported).saturating_sub(1);
+        self.ssrf_reported = total;
+        SsrfRow::Write { total, suppressed }
+    }
+
+    /// Claim the ONE "part of this content was not screened" row for this
+    /// scope. `true` exactly once.
+    ///
+    /// A hard bit rather than the doubling above, because unlike a denial this
+    /// is not evidence of an attack: it is a fact about cImp's own caps, true
+    /// of every large page a research session fetches. One row per scope says
+    /// everything a later reader needs; a row per page would evict the feed for
+    /// a routine condition.
+    pub fn claim_unscreened(&mut self) -> bool {
+        !std::mem::replace(&mut self.unscreened, true)
+    }
+}
+
+/// How a screen reaches the claim bits of the scope it is running for.
+///
+/// A trait rather than a `&mut AuditClaims` because the two scopes hold theirs
+/// differently and neither can hand out a borrow: the proxy's lives inside a
+/// `TabLatch` behind the registry mutex, which must not be held across the
+/// SSRF screen's DNS `await`, and the worker's lives in its router behind a
+/// `&self`. Both claim by locking for the length of one claim.
+pub trait ScopeAudit: Send + Sync {
+    /// See [`AuditClaims::claim_ssrf`].
+    fn claim_ssrf(&self) -> SsrfRow;
+    /// See [`AuditClaims::claim_unscreened`].
+    fn claim_unscreened(&self) -> bool;
+}
+
+/// A scope that owns its ledger outright — the offload worker's per-task
+/// router, whose lifetime *is* the task's. (The proxy's rides the tab's
+/// [`Budget`], which is where a session rotation resets it.)
+#[derive(Default)]
+pub struct TaskAudit(std::sync::Mutex<AuditClaims>);
+
+impl ScopeAudit for TaskAudit {
+    fn claim_ssrf(&self) -> SsrfRow {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim_ssrf()
+    }
+    fn claim_unscreened(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim_unscreened()
+    }
+}
+
+/// The `detail` an SSRF denial row carries: verbatim what the model was told,
+/// plus — only when this row stands for more than itself — how many denials it
+/// covers.
+///
+/// The refusal string is unchanged and stays first, because the row's job is to
+/// show exactly what was served (locked decision 11 fixes that string so the
+/// model never learns which address it hit; nothing here reaches the model).
+pub fn ssrf_flag_detail(row: SsrfRow) -> String {
+    match row {
+        SsrfRow::Write { total, suppressed } if total > 1 => format!(
+            "{REFUSAL_SSRF}\n\n[cImp: SSRF denial #{total} for this scope. {suppressed} \
+             intervening denial(s) were counted but not written — this feed is capped and a loop \
+             of refused URLs must not evict the rows that record an attack that got through.]"
+        ),
+        _ => REFUSAL_SSRF.to_string(),
     }
 }
 
@@ -922,6 +1065,22 @@ pub enum Screen {
     /// The Prompt Guard classifier scored an EXTERNAL result over threshold
     /// (decision 7). Surface-only, like [`Screen::Signature`].
     Classifier,
+    /// V32 review finding D-1 (#48): part of an EXTERNAL result was **not
+    /// screened** — a size cap dropped some of it, or a layer that ran did not
+    /// finish (a yara-x timeout is indistinguishable from a clean scan at the
+    /// API, and was indistinguishable from one at the envelope too).
+    ///
+    /// The spec's Phase C amendment says *"past those bounds a result is
+    /// unscreened, not 'clean'"* and nothing represented that state: a 4 MiB
+    /// page with its payload at byte 300,000 arrived byte-identical in shape to
+    /// a 2 KiB page read end to end and cleared. This is the user-facing half of
+    /// representing it (the reading model gets the header sentence).
+    ///
+    /// **Not a denial and not a flag**: nothing was found, nothing was stopped,
+    /// and the result was delivered unmodified. It says only that the absence of
+    /// a verdict is not a verdict of absence. One row per scope
+    /// ([`AuditClaims::claim_unscreened`]) — large pages are ordinary.
+    Unscreened,
     /// V32 Phase C3 (decision 13): the detection **auto-updater** checked,
     /// applied, rejected or reverted a rules/classifier bundle. Not a screen
     /// over a tool call at all — it borrows this vocabulary because its rows
@@ -1047,6 +1206,7 @@ impl Screen {
             Screen::MemoryQuarantine => "memory_quarantine",
             Screen::Signature => "signature",
             Screen::Classifier => "classifier",
+            Screen::Unscreened => "unscreened",
             Screen::Updater => "updater",
             Screen::LatchOverride => "latch_override",
             Screen::LatchBeacon => "latch_beacon",
@@ -1060,12 +1220,15 @@ impl Screen {
     /// screen over a call at all, so it is likewise never a denial; its rows
     /// carry their own `ok`. Nor is [`Screen::LatchOverride`], which records
     /// the user *granting* capability back, nor [`Screen::LatchBeacon`], which
-    /// records containment *engaging* before anything has been refused.
+    /// records containment *engaging* before anything has been refused, nor
+    /// [`Screen::Unscreened`], which records that a screen did **less** than a
+    /// full pass over a result it nonetheless delivered.
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
             Screen::Signature
                 | Screen::Classifier
+                | Screen::Unscreened
                 | Screen::MemoryQuarantine
                 | Screen::Updater
                 | Screen::LatchOverride

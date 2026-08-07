@@ -2460,6 +2460,12 @@ pub async fn graph_usage_advice(
     // clock) and resolves the layer's own switch through the injection
     // hierarchy, so a layer the user turned off says nothing.
     let detection_signature_down = crate::offload::detection::signature::advisor_signal(&settings);
+    // #48/U-4: the fifth — a rule file the USER wrote that does not compile.
+    // Its own signal rather than a widening of the one above, because the two
+    // are different states (skipped file vs. disarmed layer) with different
+    // fixes; the updater suppresses this one while that one is up.
+    let detection_local_rules_broken =
+        crate::offload::detection::updater::broken_local_rules(&settings);
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -2504,6 +2510,7 @@ pub async fn graph_usage_advice(
         detection_update_failures,
         detection_update_stalled,
         detection_signature_down,
+        detection_local_rules_broken,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not

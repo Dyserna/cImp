@@ -81,7 +81,7 @@ pub mod manifest;
 pub mod store;
 pub mod validate;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -341,6 +341,118 @@ pub fn live_reload(c: Component, dir: &Path) -> Result<String, String> {
 /// — read, not restated (#48, N-3). `files_loaded == 0 || rules == 0` staying a
 /// hard failure here is the never-degrade-to-nothing gate, so it must have
 /// exactly one definition and every surface must bind that one.
+/// The prefix [`super::signature::read_sources`] gives a file it read from the
+/// user-owned overlay. One definition, because the whole U-4 fix keys on it.
+const LOCAL_PREFIX: &str = "local/";
+
+/// V32 Phase C3, #48 finding U-4 — which `rules.d/local/` files were **already
+/// failing to compile before** an activation.
+///
+/// # The bug this exists to close
+///
+/// Validation compiles the staged bundle alone; a staging directory has no
+/// `local/`. The post-activation health check compiles staged **plus `local/`**
+/// and fails on `files_failed > 0`. So one malformed or identifier-colliding
+/// `local/mine.yar` read as an unhealthy *bundle*: a perfectly good update was
+/// rolled back, blamed on the publisher, and re-attempted — full download,
+/// validate, swap, roll back — every 24 h, forever. The update channel was
+/// frozen by a file the updater is contractually forbidden to touch.
+///
+/// The veto was incoherent on its own terms: at startup the app already
+/// tolerates that same broken file (warn, keep the rest live), so the only
+/// place it was fatal was the one place the user could not act on it.
+///
+/// # What is forgiven, and what is not
+///
+/// Only a `local/` failure that was **present before this swap**. A `local/`
+/// file that compiled before and fails after is a collision *the bundle
+/// introduced*, and decision 13's rollback is exactly right for it. A failure
+/// in a bundle file is never forgiven at all — the prefix test excludes it.
+///
+/// And the never-degrade-to-nothing gate is untouched: `files_loaded == 0 ||
+/// rules == 0` (i.e. `!Status::armed`) stays a hard failure whatever the
+/// baseline says. Forgiveness only ever converts *degraded* into *degraded and
+/// reported*; it can never convert *disarmed* into healthy.
+#[derive(Debug, Clone, Default)]
+pub struct LocalBaseline {
+    /// `local/…`-prefixed names that already failed, as
+    /// [`super::signature::Status::failed`] spells them.
+    already_failing: BTreeSet<String>,
+}
+
+impl LocalBaseline {
+    /// Compile `dest` as it stands right now and keep the `local/` failures.
+    ///
+    /// Uses [`super::signature::compile_report`], the pure reporter, so taking
+    /// a baseline never disturbs the live rule set — this runs immediately
+    /// before an activation that is about to swap that set.
+    pub fn snapshot(dest: &Path) -> Self {
+        let (_, status) = super::signature::compile_report(Some(dest));
+        Self::from_failed(&status.failed)
+    }
+
+    /// The pure constructor, so the tests can state a baseline directly.
+    pub fn from_failed(failed: &[String]) -> Self {
+        Self {
+            already_failing: failed
+                .iter()
+                .filter(|f| f.starts_with(LOCAL_PREFIX))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Re-judge a post-activation health failure against this baseline.
+    ///
+    /// `Ok` means "the bundle is fine; these `local/` files were already broken
+    /// and still are". `Err` passes the original verdict through unchanged —
+    /// deliberately the original string, not a rewritten one, so the card the
+    /// user reads is the one the reloader wrote.
+    ///
+    /// The directory is recompiled to answer this. That is one extra YARA
+    /// compile, on the failure path of an operation that runs at most once a
+    /// day, and it buys the alternative: threading a baseline through
+    /// [`Reloader`], `activate`, `roll_back`, `reload_note`, `recover_interrupted`
+    /// and `revert_inner`, four of which have no use for one. The compile is
+    /// `compile_report`, the same pure function [`snapshot`](Self::snapshot)
+    /// uses, so both halves of the comparison are produced by one code path.
+    pub fn forgive(&self, dir: &Path, why: String) -> Result<String, String> {
+        let (_, status) = super::signature::compile_report(Some(dir));
+        if status.healthy {
+            // The reloader and this disagree — trust the stricter answer and
+            // keep the failure rather than inventing a pass.
+            return Err(why);
+        }
+        if !status.armed {
+            // The never-degrade-to-nothing gate. Not forgivable, ever.
+            return Err(why);
+        }
+        let unforgiven: Vec<&String> = status
+            .failed
+            .iter()
+            .filter(|f| !(f.starts_with(LOCAL_PREFIX) && self.already_failing.contains(*f)))
+            .collect();
+        if !unforgiven.is_empty() {
+            return Err(why);
+        }
+        warn!(
+            target: "offload",
+            already_failing = %status.failed.join(", "),
+            dir = %dir.display(),
+            "detection updater: the new bundle is live; these user rules in rules.d/local/ were \
+             already failing to compile before the update and still are"
+        );
+        Ok(format!(
+            "{} file(s), {} rule(s) live; {} pre-existing broken file(s) in `rules.d/local/` \
+             ({}) were skipped, as they already were before this update",
+            status.files_loaded,
+            status.rules,
+            status.failed.len(),
+            status.failed.join(", ")
+        ))
+    }
+}
+
 pub fn health_from_rules(s: &super::signature::Status, dir: &Path) -> Result<String, String> {
     if !s.healthy {
         return Err(format!(
@@ -675,11 +787,67 @@ pub fn advisor_signals() -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<Stalle
     signals_from(&state())
 }
 
+/// A `rules.d/local/` file that is on disk and does not compile — the consumer
+/// for U-4's other half (#48).
+///
+/// Once a broken `local/` rule stops vetoing the update channel, it stops being
+/// loud. Before this it was loud for the wrong reason (a daily update, applied
+/// and rolled back, blaming the publisher); after the fix its only trace is a
+/// `warn!` line in a log nobody has open. The user's own file is silently not
+/// protecting them, which is `files_failed` doing exactly what its doc comment
+/// says it is for: *"it means rules the user believes are active are not"*.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokenLocalRules {
+    /// Where the rules live, so the card names a folder the user can open.
+    pub dir: String,
+    /// The rejected file names, `local/`-prefixed as `read_sources` spells them.
+    pub failed: Vec<String>,
+    /// What IS live — the card must not read as "detection is off".
+    pub files_loaded: usize,
+    pub rules: usize,
+}
+
+/// Whether any user rule file is currently failing to compile.
+///
+/// `None` in every healthy or irrelevant case: the layer is switched off (the
+/// switch is resolved through [`super::Config::from_settings`], the same call
+/// [`super::signature::advisor_signal`] uses, so the L1 master and the per-layer
+/// toggle compose exactly once and never as a second opinion), the whole set
+/// compiles, or the failure is in a BUNDLE file — that is the updater's problem
+/// and already has three cards; this one is about the file only the user can fix.
+///
+/// It also stays quiet when the layer is disarmed, because
+/// `detection.signature_down.v1` is already saying something louder and more
+/// urgent about the same directory, and two cards about one folder is how a
+/// user learns to dismiss both.
+pub fn broken_local_rules(s: &Settings) -> Option<BrokenLocalRules> {
+    if !super::Config::from_settings(s, crate::settings::injection::Scope::App).signature {
+        return None;
+    }
+    let st = super::signature::status();
+    if !st.armed {
+        return None;
+    }
+    let failed: Vec<String> = st
+        .failed
+        .iter()
+        .filter(|f| f.starts_with(LOCAL_PREFIX))
+        .cloned()
+        .collect();
+    if failed.is_empty() {
+        return None;
+    }
+    Some(BrokenLocalRules {
+        dir: st.dir,
+        failed,
+        files_loaded: st.files_loaded,
+        rules: st.rules,
+    })
+}
+
 /// The pure half, so the rules that consume these can be tested from a state
 /// value.
-pub fn signals_from(
-    st: &State,
-) -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<StalledUpdate>) {
+pub fn signals_from(st: &State) -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<StalledUpdate>) {
     let mut available = Vec::new();
     let mut failed = Vec::new();
     let mut stalled = Vec::new();
@@ -936,7 +1104,16 @@ fn validate_and_activate_rules(
     let sources = super::signature::read_sources(staging);
     let corpus = validate::load_corpus(&layout.smoke_dir);
     let report = validate::validate_rules(&sources, &corpus)?;
-    activate(Component::Rules, staging, layout, version, reload)?;
+    // #48, U-4: snapshot which `local/` files are ALREADY broken, before the
+    // swap, so the post-activation health check judges the BUNDLE rather than
+    // the directory. Taken here (not inside `activate`) because it must be read
+    // from the destination while the OLD bundle is still in it.
+    let baseline = LocalBaseline::snapshot(layout.dest(Component::Rules));
+    let judged = |c: Component, dir: &Path| match reload(c, dir) {
+        Ok(live) => Ok(live),
+        Err(why) => baseline.forgive(dir, why),
+    };
+    activate(Component::Rules, staging, layout, version, &judged)?;
     Ok(format!(
         "activated rules `{version}`: {} file(s), {} rule(s), validated against {} benign + {} \
          hostile control document(s) (compile {} ms, slowest scan {} ms). The previous bundle is \
@@ -1659,6 +1836,19 @@ fn revert_inner(
     // Where the currently-live set will be archived, so this revert is itself
     // revertible.
     let keep = store::previous_dir(root, c, current_version);
+    // #48, U-4: a revert is judged by the same post-swap health check, so a
+    // broken `rules.d/local/` file would veto it too — and the user pressing
+    // Revert is *already* trying to get out of a bad state. Same baseline rule
+    // as `validate_and_activate_rules`: pre-existing `local/` failures are
+    // forgiven, anything the restore introduces is not. Inert for the
+    // classifier, whose reloader never reports a `local/` failure.
+    let baseline = LocalBaseline::snapshot(dest);
+    let judged = |c: Component, dir: &Path| match reload(c, dir) {
+        Ok(live) => Ok(live),
+        Err(why) if c == Component::Rules => baseline.forgive(dir, why),
+        Err(why) => Err(why),
+    };
+    let reload: Reloader<'_> = &judged;
 
     // **Revert must never wipe its own source (#48, U-2).**
     //

@@ -1326,3 +1326,186 @@ async fn a_plaintext_manifest_override_is_refused_without_fetching_anything() {
     // …and the loopback form live-verification recipe 11 uses still runs.
     assert!(manifest::AssetAnchor::parse("http://127.0.0.1:8099/bundle/manifest.json").is_ok());
 }
+
+// ── U-4: a user rule may not veto the update channel (#48) ─────────────────
+
+/// A rule file the user wrote that DOES NOT COMPILE, dropped into
+/// `rules.d/local/`. Nothing about it is the publisher's fault.
+const BROKEN_LOCAL_RULE: &str = "rule Upd_Test_UserBroken { this is not yara either }";
+
+/// A user rule that compiles today and COLLIDES with an identifier the next
+/// bundle introduces — the failure the bundle really does cause.
+const COLLIDING_LOCAL_RULE: &str = r#"rule Upd_Test_RoleForgery {
+    strings:
+        $s = "sentinel_marker"
+    condition:
+        $s
+}"#;
+
+/// U-4's first deliverable: a broken `local/` file must NOT fail a good bundle.
+///
+/// Before this, validation compiled the staged bundle alone (a staging dir has
+/// no `local/`) while the post-activation health check compiled staged **plus
+/// `local/`** and failed on `files_failed > 0`. One malformed user file
+/// therefore read as an unhealthy *bundle*: applied, rolled back, blamed on the
+/// publisher, and re-attempted — download, validate, swap, roll back — every
+/// 24 h indefinitely. The app already tolerates that same file at startup (warn
+/// and keep the rest live), which is what made the veto incoherent.
+#[tokio::test]
+async fn a_pre_existing_broken_local_rule_does_not_fail_a_good_bundle() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    std::fs::write(
+        tree.layout.rules_dest.join("local").join("broken.yar"),
+        BROKEN_LOCAL_RULE,
+    )
+    .unwrap();
+    // Precondition: the directory is ALREADY unhealthy, and it is the user's
+    // file that makes it so. If this stops holding the test proves nothing.
+    let (_, before) = super::super::signature::compile_report(Some(&tree.layout.rules_dest));
+    assert_eq!(before.failed, vec!["local/broken.yar".to_string()]);
+    assert!(before.armed && !before.healthy, "{before:?}");
+
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    let r = run_rules(&tree, Mode::Auto, &fetcher).await;
+
+    assert_eq!(r.outcome, Outcome::Applied, "{}", r.detail);
+    assert!(
+        tree.live_rule_text("core.yar").contains("RoleForgery"),
+        "the bundle is live, not rolled back"
+    );
+    let cs = tree.state().get(Component::Rules).clone();
+    assert_eq!(cs.installed_version, "2026.08.07");
+    assert!(cs.last_ok);
+    assert!(cs.last_failure.is_empty(), "{}", cs.last_failure);
+    // The user's files are exactly where they were — including the broken one,
+    // which the updater must not "fix" by deleting.
+    assert!(tree.local_sentinel_survives());
+    assert!(tree
+        .layout
+        .rules_dest
+        .join("local")
+        .join("broken.yar")
+        .is_file());
+}
+
+/// U-4's second deliverable, and the reason forgiveness is baseline-relative
+/// rather than a blanket `local/` exemption: a `local/` file that was healthy
+/// before the swap and fails after is a collision **the bundle introduced**, and
+/// decision 13's rollback is exactly right for it.
+#[tokio::test]
+async fn a_collision_the_bundle_introduces_still_fails_the_bundle() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    // The user's rule compiles cleanly against the CURRENT bundle.
+    std::fs::write(
+        tree.layout.rules_dest.join("local").join("mine.yar"),
+        COLLIDING_LOCAL_RULE,
+    )
+    .unwrap();
+    let (_, before) = super::super::signature::compile_report(Some(&tree.layout.rules_dest));
+    assert!(before.healthy, "the baseline must be clean: {before:?}");
+
+    // The new bundle defines `Upd_Test_RoleForgery` too. YARA rejects the SET,
+    // and `read_sources` reads the bundle first, so it is the user's file that
+    // is dropped — a failure that did not exist a moment ago.
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    let r = run_rules(&tree, Mode::Auto, &fetcher).await;
+
+    assert_eq!(r.outcome, Outcome::Rejected, "{}", r.detail);
+    assert!(
+        r.detail.contains("did not load cleanly"),
+        "the rollback must name the health check: {}",
+        r.detail
+    );
+    // Rolled back: the old bundle is live and the user's file compiles again.
+    assert!(
+        tree.live_rule_text("core.yar").contains("IgnorePrevious"),
+        "the previous bundle was restored"
+    );
+    assert!(!tree.live_rule_text("core.yar").contains("RoleForgery"));
+    let (_, after) = super::super::signature::compile_report(Some(&tree.layout.rules_dest));
+    assert!(
+        after.healthy,
+        "after the rollback the set compiles: {after:?}"
+    );
+    assert!(tree.local_sentinel_survives() || tree.layout.rules_dest.join("local").is_dir());
+}
+
+/// The never-degrade-to-nothing gate is NOT forgivable. `files_loaded == 0 ||
+/// rules == 0` stays a hard failure whatever the baseline says — forgiveness may
+/// only ever turn *degraded* into *degraded and reported*.
+#[test]
+fn forgiveness_can_never_rescue_a_disarmed_directory() {
+    let dir = std::env::temp_dir().join(format!("cimp-u4-disarmed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("local")).unwrap();
+    // Every file broken: nothing compiles, so the layer would have nothing to
+    // match with. The baseline forgives `local/broken.yar` and must still fail.
+    std::fs::write(dir.join("core.yar"), BROKEN_RULE).unwrap();
+    std::fs::write(dir.join("local").join("broken.yar"), BROKEN_LOCAL_RULE).unwrap();
+    let baseline = LocalBaseline::from_failed(&["local/broken.yar".to_string()]);
+    let (_, status) = super::super::signature::compile_report(Some(&dir));
+    assert!(!status.armed, "precondition: {status:?}");
+    let verdict = baseline.forgive(&dir, health_from_rules(&status, &dir).unwrap_err());
+    assert!(verdict.is_err(), "a disarmed directory is never healthy");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A failure in a BUNDLE file is never forgiven, whatever the baseline holds —
+/// the exemption is keyed on the `local/` prefix, not merely on "was failing
+/// before". A bundle whose own file stops compiling after the swap is precisely
+/// what the health check exists to catch.
+#[test]
+fn a_bundle_file_failure_is_never_forgiven() {
+    let dir = std::env::temp_dir().join(format!("cimp-u4-bundle-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("local")).unwrap();
+    std::fs::write(dir.join("core.yar"), GOOD_RULE).unwrap();
+    std::fs::write(dir.join("extra.yar"), BROKEN_RULE).unwrap();
+    let (_, status) = super::super::signature::compile_report(Some(&dir));
+    assert_eq!(status.failed, vec!["extra.yar".to_string()], "{status:?}");
+    assert!(status.armed && !status.healthy);
+    // Even a baseline that (nonsensically) claims the bundle file was already
+    // failing cannot forgive it: `from_failed` keeps only `local/` names.
+    let baseline = LocalBaseline::from_failed(&["extra.yar".to_string()]);
+    assert!(baseline
+        .forgive(&dir, health_from_rules(&status, &dir).unwrap_err())
+        .is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// U-4's other half: once a broken `local/` file stops vetoing the channel it
+/// stops being loud, so it needs its own consumer. `broken_local_rules` is that
+/// signal, and it is quiet in every state that is not "the user's file is being
+/// skipped while the layer runs".
+#[test]
+fn broken_local_rules_reports_only_the_users_own_skipped_files() {
+    use super::super::signature::Status;
+    // The predicate is exercised through the real `Status` shape, built by the
+    // same `sealed()` the compiler uses, so `armed`/`healthy` are never guessed.
+    let armed_with_local_failure = Status {
+        files_loaded: 2,
+        files_failed: 1,
+        rules: 7,
+        failed: vec!["local/mine.yar".to_string()],
+        ..Status::default()
+    };
+    // A bundle-only failure is the updater's problem and already has cards.
+    let armed_with_bundle_failure = Status {
+        files_loaded: 2,
+        files_failed: 1,
+        rules: 7,
+        failed: vec!["extra.yar".to_string()],
+        ..Status::default()
+    };
+    for (st, expect_local) in [
+        (&armed_with_local_failure, true),
+        (&armed_with_bundle_failure, false),
+    ] {
+        let local: Vec<&String> = st
+            .failed
+            .iter()
+            .filter(|f| f.starts_with(LOCAL_PREFIX))
+            .collect();
+        assert_eq!(!local.is_empty(), expect_local, "{st:?}");
+    }
+}

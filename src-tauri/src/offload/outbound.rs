@@ -1331,8 +1331,10 @@ mod tests {
             // ── 5. the truncated candidate itself, when nothing rescues it.
             ("unparseable port", "http://10.0.0.1:99999999/"),
             ("unparseable v6 literal", "http://[::1/"),
-            // ── 6. combinations.
-            ("tab + schemeless", "http://\t127.0.0.1:12344/props"),
+            // ── 6. combinations: a stripped character inside a *schemeless*
+            // run, where neither widening nor stripping alone is enough.
+            ("tab inside a schemeless run", "127.0.0.1\t:8080/admin"),
+            ("LF inside a relative run", "//169.254.\n169.254/latest/"),
             ("decoy then pivot", "https://8.8.8.8/ and //10.0.0.1/x"),
         ] {
             let err = screen_urls(&json!({ "url": arg }), &policy)

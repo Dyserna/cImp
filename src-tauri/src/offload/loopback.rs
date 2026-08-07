@@ -4727,24 +4727,20 @@ mod tests {
         );
 
         // The app-wide L2.
-        s.offload.injection.opencode_native_gate_enabled = true;
+        s.set_l2_for_test(Feature::OpencodeNativeGate, true);
         assert!(native_gate_verdict(&s, &scope));
 
         // The taint latch is what this gate enforces — with that feature off
         // there is no boundary to enforce, so the gate reports off LIVE (no tab
         // restart), even though its own flag stays baked in the plugin.
-        s.offload.injection.taint_latch_enabled = false;
+        s.set_l2_for_test(Feature::TaintLatch, false);
         assert!(!native_gate_verdict(&s, &scope));
-        s.offload.injection.taint_latch_enabled = true;
+        s.set_l2_for_test(Feature::TaintLatch, true);
 
         // The usual way in: L2 off app-wide, one tab's L3 `On`.
-        s.offload.injection.opencode_native_gate_enabled = false;
-        for t in &mut s.tabs {
-            if let crate::settings::TabConfig::AiTool(c) = t {
-                c.injection_overrides
-                    .set(Feature::OpencodeNativeGate, Override::On);
-            }
-        }
+        s.set_l2_for_test(Feature::OpencodeNativeGate, false);
+        s.set_tab_override_for_test(&id, Feature::OpencodeNativeGate, Override::On)
+            .expect("the OpenCode tab carries a native-gate cell");
         assert!(native_gate_verdict(&s, &scope), "an L3 On enables one tab");
         assert!(
             !native_gate_verdict(&s, &oc_scope("some-other-tab", Some("ses"))),
@@ -4752,7 +4748,7 @@ mod tests {
         );
 
         // Nothing re-enables past the master.
-        s.offload.injection.protection = false;
+        s.set_master_for_test(false);
         assert!(!native_gate_verdict(&s, &scope));
     }
 

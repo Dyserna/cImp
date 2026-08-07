@@ -2180,6 +2180,17 @@ mod tests {
         }
     }
 
+    /// The id of the AI tab at `idx`. The V32 L3 override cells are
+    /// `pub(in crate::settings)` (#44), so a test writes one by tab id through
+    /// `Settings::set_tab_override_for_test` rather than by reaching into the
+    /// config — and this is how the fixtures name the tab they just built.
+    fn ai_tab_id(s: &Settings, idx: usize) -> String {
+        match &s.tabs[idx] {
+            TabConfig::AiTool(c) => c.id.clone(),
+            _ => unreachable!("tab {idx} is an AI tool tab"),
+        }
+    }
+
     /// The value following the first `--settings` flag in `args`, parsed
     /// as JSON. `None` if no `--settings` flag is present.
     fn settings_overlay(args: &[String]) -> Option<serde_json::Value> {
@@ -3610,18 +3621,20 @@ mod tests {
 
         // OFF app-wide: no `agent` key at all, no paragraph.
         let mut off = base();
-        off.offload.injection.consumer_hygiene_enabled = false;
+        off.set_l2_for_test(crate::settings::injection::Feature::ConsumerHygiene, false);
         assert!(cfg(&off)["agent"].is_null(), "{}", cfg(&off));
         assert!(!guidance(&off).contains("Untrusted-content handling"));
 
         // OFF per tab (L3) does the same for that tab.
         let mut per_tab = base();
-        if let TabConfig::AiTool(c) = &mut per_tab.tabs[0] {
-            c.injection_overrides.set(
+        let id = ai_tab_id(&per_tab, 0);
+        per_tab
+            .set_tab_override_for_test(
+                &id,
                 crate::settings::injection::Feature::ConsumerHygiene,
                 crate::settings::injection::Override::Off,
-            );
-        }
+            )
+            .expect("an AI tab carries a consumer-hygiene cell");
         assert!(cfg(&per_tab)["agent"].is_null());
 
         // Hygiene off + native-web `deny`: the DENIALS survive, because they are
@@ -3644,7 +3657,7 @@ mod tests {
         };
         s.offload.enabled = true;
         s.offload.native_web_visibility = "deny".into();
-        s.offload.injection.protection = false;
+        s.set_master_for_test(false);
 
         let TabConfig::AiTool(claude) = &s.tabs[0] else {
             unreachable!()
@@ -3676,11 +3689,11 @@ mod tests {
         let base = spawn_inject_sig(&with_tab());
         // L1.
         let mut s = with_tab();
-        s.offload.injection.protection = false;
+        s.set_master_for_test(false);
         assert_ne!(spawn_inject_sig(&s)[0], base[0], "the master switch");
         // L2 for consumer hygiene (native-web's L2 is covered above).
         let mut s = with_tab();
-        s.offload.injection.consumer_hygiene_enabled = false;
+        s.set_l2_for_test(crate::settings::injection::Feature::ConsumerHygiene, false);
         assert_ne!(spawn_inject_sig(&s)[1], base[1], "consumer hygiene L2");
         // L3, per tab, for both spawn-baked features.
         for feature in [
@@ -3688,17 +3701,16 @@ mod tests {
             crate::settings::injection::Feature::ConsumerHygiene,
         ] {
             let mut s = with_tab();
-            if let TabConfig::AiTool(c) = &mut s.tabs[0] {
-                c.injection_overrides
-                    .set(feature, crate::settings::injection::Override::Off);
-            }
+            let id = ai_tab_id(&s, 0);
+            s.set_tab_override_for_test(&id, feature, crate::settings::injection::Override::Off)
+                .expect("both spawn-baked features carry a tab cell");
             assert_ne!(spawn_inject_sig(&s)[0], base[0], "{feature:?} L3");
         }
         // A LIVE feature must not move it — the restart hint is only honest if
         // it fires for changes that actually need a restart.
         let mut s = with_tab();
-        s.offload.injection.taint_latch_enabled = false;
-        s.offload.injection.detection_enabled = false;
+        s.set_l2_for_test(crate::settings::injection::Feature::TaintLatch, false);
+        s.set_l2_for_test(crate::settings::injection::Feature::Detection, false);
         assert_eq!(spawn_inject_sig(&s), base, "live features must not nag");
     }
 
@@ -4092,21 +4104,25 @@ mod tests {
             !opencode_plugin_wanted(&s, &id),
             "nothing wants it yet — the baseline"
         );
-        s.offload.injection.opencode_native_gate_enabled = true;
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            true,
+        );
         assert!(
             opencode_plugin_wanted(&s, &id),
             "the gate alone must keep the file on disk"
         );
         // …and a per-tab `On` over an app-wide `off` does the same, for that tab.
-        s.offload.injection.opencode_native_gate_enabled = false;
-        for t in &mut s.tabs {
-            if let TabConfig::AiTool(c) = t {
-                c.injection_overrides.set(
-                    crate::settings::injection::Feature::OpencodeNativeGate,
-                    crate::settings::injection::Override::On,
-                );
-            }
-        }
+        s.set_l2_for_test(
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            false,
+        );
+        s.set_tab_override_for_test(
+            &id,
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Override::On,
+        )
+        .expect("the OpenCode tab carries a native-gate cell");
         assert!(opencode_plugin_wanted(&s, &id));
         assert!(
             !opencode_plugin_wanted(&s, "some-other-tab"),
@@ -4127,18 +4143,20 @@ mod tests {
         let before = spawn_inject_sig(&base);
 
         let mut l2 = base.clone();
-        l2.offload.injection.opencode_native_gate_enabled = true;
+        l2.set_l2_for_test(
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            true,
+        );
         assert_ne!(spawn_inject_sig(&l2)[1], before[1], "L2 flip");
 
         let mut l3 = base.clone();
-        for t in &mut l3.tabs {
-            if let TabConfig::AiTool(c) = t {
-                c.injection_overrides.set(
-                    crate::settings::injection::Feature::OpencodeNativeGate,
-                    crate::settings::injection::Override::On,
-                );
-            }
-        }
+        let id = ai_tab_id(&l3, 0);
+        l3.set_tab_override_for_test(
+            &id,
+            crate::settings::injection::Feature::OpencodeNativeGate,
+            crate::settings::injection::Override::On,
+        )
+        .expect("the OpenCode tab carries a native-gate cell");
         assert_ne!(spawn_inject_sig(&l3)[1], before[1], "L3 flip");
     }
 

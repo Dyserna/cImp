@@ -12,12 +12,6 @@ mod context_hook;
 mod error;
 mod fsutil;
 mod graph;
-/// V32 Phase G (locked decision 16): the no-raw-reads tripwire — a
-/// source-scanning test that no V32 enforcement site reads a raw injection
-/// switch instead of resolving it through `settings::injection`. Test-only,
-/// like its Phase D sibling `push_tripwire`.
-#[cfg(test)]
-mod injection_tripwire;
 mod ipc;
 mod logging;
 mod mcp_stdio;

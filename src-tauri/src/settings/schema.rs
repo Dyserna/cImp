@@ -977,7 +977,14 @@ pub struct AiToolTabConfig {
     /// spawn-baked and therefore ride `spawn_inject_sig`, so flipping them
     /// raises the "restart the AI tab" hint; the rest take effect on the next
     /// call.
-    pub injection_overrides: crate::settings::injection::TabInjectionOverrides,
+    ///
+    /// `pub(in crate::settings)` (#44): an L3 cell answers a *different*
+    /// question from `effective(feature, scope, settings)` — it ignores the
+    /// global master and the app-wide flag — so reading one outside the resolver
+    /// is the same defect as reading a raw L1/L2 switch, and is now the same
+    /// compile error. Test code outside `crate::settings` writes cells through
+    /// `Settings::set_tab_override_for_test`.
+    pub(in crate::settings) injection_overrides: crate::settings::injection::TabInjectionOverrides,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -1680,9 +1687,13 @@ pub struct OffloadSettings {
     /// pseudo-scope (which has no tab config to hang one off).
     ///
     /// Every field here is read through [`crate::settings::injection`] and
-    /// nowhere else — the cross-module invariant a source tripwire
-    /// (`crate::injection_tripwire`) pins. See that module for the resolution
-    /// rule and for why native-web visibility has no flag in this block.
+    /// nowhere else. That cross-module invariant is **structural** (#44): the
+    /// fields of [`InjectionSettings`] are `pub(in crate::settings)`, so a read
+    /// from an enforcement site is a privacy error rather than something a
+    /// source scan has to notice. The FIELD stays `pub` — reaching the block is
+    /// legal, naming a switch inside it is not. See
+    /// [`injection`](crate::settings::injection) for the resolution rule and for
+    /// why native-web visibility has no flag in this block.
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
     pub injection: InjectionSettings,
@@ -1708,32 +1719,51 @@ pub struct OffloadSettings {
 /// ships `false` — so an untouched (or pre-Phase-G) settings file resolves
 /// exactly as the app behaved before this block existed. That is the
 /// migration-safety property, pinned by a test in the resolver.
+///
+/// # Why every field is `pub(in crate::settings)` (#44)
+///
+/// The no-raw-reads invariant — "no enforcement site reads a raw switch" — has
+/// the shape *only module X may name field Y*, and that is what Rust visibility
+/// expresses. Until #44 it was watched by a source-scanning tripwire with a
+/// per-field allowlist; a scan is a strictly weaker restatement (aliasing the
+/// binding, a `//` anywhere on the line, or an accessor added inside an allowed
+/// file all defeated it), so the watcher was replaced by the boundary itself.
+///
+/// The consequence for a future control: the only way to read one of these from
+/// an enforcement site is to widen a field here — one line, in the file the
+/// reviewer is already looking at. Serde is unaffected (the generated impls live
+/// in this module), and the Settings window never touches Rust fields — it
+/// round-trips whole [`Settings`] objects through `apply_settings`.
+///
+/// Test code outside `crate::settings` goes through the enum-keyed
+/// `Settings::set_master_for_test` / `set_l2_for_test` helpers in the resolver,
+/// which cannot name a flag that no longer exists.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct InjectionSettings {
     /// **L1 — the global master** (spec decision 16's `injection_protection`).
     /// Default `true`. Off = pre-V32 behaviour at every layer at once.
-    pub protection: bool,
+    pub(in crate::settings) protection: bool,
     /// L2: the bidirectional taint latch (worker + proxy).
-    pub taint_latch_enabled: bool,
+    pub(in crate::settings) taint_latch_enabled: bool,
     /// L2: the spotlighting envelope on EXTERNAL results and recalled memory.
-    pub spotlighting_enabled: bool,
+    pub(in crate::settings) spotlighting_enabled: bool,
     /// L2: the detection surface. Parent of the existing
     /// `detection_signature_enabled` / `detection_classifier_enabled`
     /// sub-toggles — parent off ⇒ both layers off regardless of them.
-    pub detection_enabled: bool,
+    pub(in crate::settings) detection_enabled: bool,
     /// L2: the outbound URL range screen at `McpHost::call_recorded`.
-    pub ssrf_guard_enabled: bool,
+    pub(in crate::settings) ssrf_guard_enabled: bool,
     /// L2: per-scope EXTERNAL call/byte caps. The `external_fetch_max_*`
     /// numerics stay the tuning knobs; this is the on/off above them.
-    pub fetch_budgets_enabled: bool,
+    pub(in crate::settings) fetch_budgets_enabled: bool,
     /// L2: the worker's in-band canary (worker-scoped feature).
-    pub canary_enabled: bool,
+    pub(in crate::settings) canary_enabled: bool,
     /// L2: quarantine of `context_note` writes from a contaminated session.
-    pub memory_quarantine_enabled: bool,
+    pub(in crate::settings) memory_quarantine_enabled: bool,
     /// L2: the pinned OpenCode permission block + the injection-hygiene
     /// guidance addendum. Spawn-baked.
-    pub consumer_hygiene_enabled: bool,
+    pub(in crate::settings) consumer_hygiene_enabled: bool,
     /// L2: V32 Phase H (locked decision 17) — the OpenCode plugin denying the
     /// harness's OWN native tools against the tab's taint latch, rather than
     /// only beaconing on the web ones. Spawn-baked (the flag is compiled into
@@ -1743,15 +1773,20 @@ pub struct InjectionSettings {
     /// denial of `bash`/`read`/`edit` under an EXTERNAL latch changes everyday
     /// tab UX materially, so it is opt-in. Consequences of that asymmetry are
     /// handled in `settings::injection` (`Feature::default_enabled`), not here.
-    pub opencode_native_gate_enabled: bool,
+    pub(in crate::settings) opencode_native_gate_enabled: bool,
     /// L2: stripping terminal control sequences out of external text cImp
     /// composes into non-HTML sinks. App-wide — no per-scope row, because TTS
     /// and toasts are global surfaces (the global-only avatar/TTS decision).
-    pub terminal_escape_hygiene_enabled: bool,
+    pub(in crate::settings) terminal_escape_hygiene_enabled: bool,
     /// **L3 for the `offload-worker` pseudo-scope.** The worker is a
     /// task-scoped service with no tab, so its override row lives here beside
     /// the app-wide flags rather than on a tab config.
-    pub worker: crate::settings::injection::WorkerInjectionOverrides,
+    ///
+    /// `pub(in crate::settings)` for the same reason as the switches above: an
+    /// L3 cell read on its own ignores L1 and L2, which is the exact failure the
+    /// hierarchy exists to prevent (#44 — the override cells were guarded by
+    /// nothing at all before).
+    pub(in crate::settings) worker: crate::settings::injection::WorkerInjectionOverrides,
 }
 
 impl Default for InjectionSettings {

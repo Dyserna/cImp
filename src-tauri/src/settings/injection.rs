@@ -41,10 +41,23 @@
 //! [`budget_limits`], [`detection_config`], [`native_web_mode`] — which call it
 //! themselves). Otherwise a future control would silently ignore a level, and
 //! the master switch would be a master switch of everything except the newest
-//! thing. The invariant is pinned by a source-scanning tripwire
-//! (`crate::injection_tripwire`), in the style of the Phase D channel-content
-//! tripwire: the raw field names may appear only in this module, in the schema
-//! that declares them, and in the reviewed per-field allowlist there.
+//! thing.
+//!
+//! The invariant is **structural** (#44). Every L1/L2 switch on
+//! [`InjectionSettings`](super::schema::InjectionSettings), every L3 cell on
+//! [`TabInjectionOverrides`] / [`WorkerInjectionOverrides`], and the two fields
+//! that hold those rows (`InjectionSettings::worker`,
+//! `AiToolTabConfig::injection_overrides`) are `pub(in crate::settings)`: naming
+//! one from an enforcement site is a **privacy error**, not something a reviewer
+//! or a source scan has to catch. It was watched by a scanning tripwire
+//! (`src/injection_tripwire.rs`) until #44 retired it — a scan is a strictly
+//! weaker restatement of "only module X may name field Y", and it had three
+//! bypasses, two of which needed no intent at all.
+//!
+//! The one thing privacy cannot express is the level *above* the fields: that
+//! every [`Feature`] has L2 storage of its own. That is
+//! `every_feature_has_a_guarded_l2_field` in this module's tests, relocated here
+//! when the tripwire went.
 //!
 //! # Scope is not always a tab
 //!
@@ -407,25 +420,25 @@ impl From<Override> for String {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TabInjectionOverrides {
-    pub taint_latch: Override,
-    pub spotlighting: Override,
-    pub detection: Override,
-    pub ssrf_guard: Override,
-    pub fetch_budgets: Override,
-    pub memory_quarantine: Override,
-    pub native_web: Override,
-    pub consumer_hygiene: Override,
+    pub(in crate::settings) taint_latch: Override,
+    pub(in crate::settings) spotlighting: Override,
+    pub(in crate::settings) detection: Override,
+    pub(in crate::settings) ssrf_guard: Override,
+    pub(in crate::settings) fetch_budgets: Override,
+    pub(in crate::settings) memory_quarantine: Override,
+    pub(in crate::settings) native_web: Override,
+    pub(in crate::settings) consumer_hygiene: Override,
     /// V32 Phase H. An `On` here is the per-tab way to enable the gate over its
     /// app-wide default `off` — the shape locked decision 17 expects most users
     /// to reach for first (one hardened OpenCode tab, everything else as it was).
-    pub opencode_native_gate: Override,
+    pub(in crate::settings) opencode_native_gate: Override,
 }
 
 impl TabInjectionOverrides {
     /// This row's cell for `feature`, or [`Override::Inherit`] for a feature
     /// that has no tab scope — the honest answer, since there is no cell to
     /// read and inheriting is what "no override" means.
-    pub fn get(&self, feature: Feature) -> Override {
+    pub(in crate::settings) fn get(&self, feature: Feature) -> Override {
         match feature {
             Feature::TaintLatch => self.taint_latch,
             Feature::Spotlighting => self.spotlighting,
@@ -441,10 +454,14 @@ impl TabInjectionOverrides {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    /// Set one cell, for the Settings IPC. `None` for a feature with no tab
-    /// scope — the caller is asking for a cell that does not exist, and
-    /// silently dropping the write would look like it worked.
-    pub fn set(&mut self, feature: Feature, value: Override) -> Option<()> {
+    /// Set one cell. `None` for a feature with no tab scope — the caller is
+    /// asking for a cell that does not exist, and silently dropping the write
+    /// would look like it worked.
+    ///
+    /// `pub(in crate::settings)` like the cells themselves: an L3 write from an
+    /// enforcement site is as wrong as an L3 read. Tests outside the boundary go
+    /// through [`Settings::set_tab_override_for_test`].
+    pub(in crate::settings) fn set(&mut self, feature: Feature, value: Override) -> Option<()> {
         match feature {
             Feature::TaintLatch => self.taint_latch = value,
             Feature::Spotlighting => self.spotlighting = value,
@@ -466,18 +483,18 @@ impl TabInjectionOverrides {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerInjectionOverrides {
-    pub taint_latch: Override,
-    pub spotlighting: Override,
-    pub detection: Override,
-    pub ssrf_guard: Override,
-    pub fetch_budgets: Override,
-    pub canary: Override,
+    pub(in crate::settings) taint_latch: Override,
+    pub(in crate::settings) spotlighting: Override,
+    pub(in crate::settings) detection: Override,
+    pub(in crate::settings) ssrf_guard: Override,
+    pub(in crate::settings) fetch_budgets: Override,
+    pub(in crate::settings) canary: Override,
 }
 
 impl WorkerInjectionOverrides {
     /// This row's cell for `feature`, or [`Override::Inherit`] for a feature
     /// with no worker scope.
-    pub fn get(&self, feature: Feature) -> Override {
+    pub(in crate::settings) fn get(&self, feature: Feature) -> Override {
         match feature {
             Feature::TaintLatch => self.taint_latch,
             Feature::Spotlighting => self.spotlighting,
@@ -494,9 +511,9 @@ impl WorkerInjectionOverrides {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    /// Set one cell, for the Settings IPC. `None` for a feature with no worker
-    /// scope (see [`TabInjectionOverrides::set`]).
-    pub fn set(&mut self, feature: Feature, value: Override) -> Option<()> {
+    /// Set one cell. `None` for a feature with no worker scope (see
+    /// [`TabInjectionOverrides::set`]).
+    pub(in crate::settings) fn set(&mut self, feature: Feature, value: Override) -> Option<()> {
         match feature {
             Feature::TaintLatch => self.taint_latch = value,
             Feature::Spotlighting => self.spotlighting = value,
@@ -593,7 +610,8 @@ fn scope_override(feature: Feature, scope: Scope<'_>, s: &Settings) -> Override 
 /// The app-wide L2 answer for `feature`.
 ///
 /// **This function and [`InjectionSettings`]'s declaration are the only places
-/// in the crate that read these raw fields** — the invariant the tripwire pins.
+/// in the crate that read these raw fields** — and since #44 that is enforced by
+/// their `pub(in crate::settings)` visibility rather than watched by a scan.
 fn feature_l2(feature: Feature, s: &Settings) -> bool {
     let inj = &s.offload.injection;
     match feature {
@@ -732,7 +750,8 @@ pub fn detection_config(s: &Settings, scope: Scope<'_>) -> crate::offload::detec
 ///
 /// It lives here rather than in `tabs::config` because it is the only other
 /// thing that has to look at the raw switches, and the no-raw-reads invariant is
-/// worth more than the locality.
+/// worth more than the locality. Since #44 that is not a preference: the fields
+/// are `pub(in crate::settings)`, so `tabs::config` could not read them anyway.
 ///
 /// The resolved native-web MODE rides alongside the switches deliberately:
 /// `sensor` and `deny` both resolve the feature "on" but launch a tab very
@@ -854,7 +873,11 @@ pub fn report(s: &Settings, scope: Scope<'_>) -> Vec<FeatureState> {
 ///
 /// A function rather than a direct field read at those call sites, because the
 /// no-raw-reads invariant is only enforceable if it has no exceptions worth
-/// arguing about.
+/// arguing about — and since #44 there is no other option: `protection` is
+/// `pub(in crate::settings)`, so this accessor is the ONLY way an outside module
+/// can see the master. Callers outside the crate's settings module today:
+/// `offload::detection::updater::tick_once` (#46 — the update scheduler is
+/// gated under L1) and the surfaces that render it as a switch. Keep it `pub`.
 pub fn master_enabled(s: &Settings) -> bool {
     s.offload.injection.protection
 }
@@ -878,6 +901,81 @@ pub fn protection_reduced(s: &Settings) -> bool {
         }),
         _ => false,
     })
+}
+
+// ── Test-only writers (the boundary's other half) ─────────────────────────
+//
+// The switches are `pub(in crate::settings)`, so a test in `offload::*` or
+// `tabs::config` that wants a feature off cannot poke the field. These helpers
+// are the sanctioned way in, and they are keyed on [`Feature`] rather than on
+// field names deliberately: a test cannot ask for a flag that no longer exists,
+// and adding a variant to `Feature` fails to compile here until the new
+// control's L2 storage is named. That is a stronger property than the field
+// names the retired tripwire searched for (#44).
+#[cfg(test)]
+impl Settings {
+    /// L1 — the global master.
+    pub(crate) fn set_master_for_test(&mut self, on: bool) {
+        self.offload.injection.protection = on;
+    }
+
+    /// L2 — the app-wide flag for one feature.
+    ///
+    /// Total over [`Feature`], including [`Feature::NativeWeb`], whose L2 is the
+    /// `native_web_visibility` tri-mode rather than a boolean (the Phase G
+    /// reconciliation): `false` writes `off`, `true` writes the mode's own
+    /// default `sensor`. A test that needs `deny` sets the mode itself — that
+    /// is a posture, not an on/off.
+    pub(crate) fn set_l2_for_test(&mut self, feature: Feature, on: bool) {
+        let inj = &mut self.offload.injection;
+        match feature {
+            Feature::TaintLatch => inj.taint_latch_enabled = on,
+            Feature::Spotlighting => inj.spotlighting_enabled = on,
+            Feature::Detection => inj.detection_enabled = on,
+            Feature::SsrfGuard => inj.ssrf_guard_enabled = on,
+            Feature::FetchBudgets => inj.fetch_budgets_enabled = on,
+            Feature::Canary => inj.canary_enabled = on,
+            Feature::MemoryQuarantine => inj.memory_quarantine_enabled = on,
+            Feature::ConsumerHygiene => inj.consumer_hygiene_enabled = on,
+            Feature::OpencodeNativeGate => inj.opencode_native_gate_enabled = on,
+            Feature::TerminalEscapeHygiene => inj.terminal_escape_hygiene_enabled = on,
+            Feature::NativeWeb => {
+                self.offload.native_web_visibility = if on {
+                    NativeWebMode::Sensor.as_str().to_string()
+                } else {
+                    NativeWebMode::Off.as_str().to_string()
+                }
+            }
+        }
+    }
+
+    /// L3 — one tab's override cell. `None` when no AI tab carries `tab_id`, or
+    /// when `feature` has no per-tab row: both are a write the caller believes
+    /// landed and did not, which is exactly what
+    /// [`TabInjectionOverrides::set`]'s `Option` exists to say.
+    pub(crate) fn set_tab_override_for_test(
+        &mut self,
+        tab_id: &str,
+        feature: Feature,
+        value: Override,
+    ) -> Option<()> {
+        self.tabs.iter_mut().find_map(|t| match t {
+            TabConfig::AiTool(c) if c.id == tab_id => {
+                Some(c.injection_overrides.set(feature, value))
+            }
+            _ => None,
+        })?
+    }
+
+    /// L3 — the `offload-worker` pseudo-scope's override cell. `None` for a
+    /// feature with no worker row (see [`WorkerInjectionOverrides::set`]).
+    pub(crate) fn set_worker_override_for_test(
+        &mut self,
+        feature: Feature,
+        value: Override,
+    ) -> Option<()> {
+        self.offload.injection.worker.set(feature, value)
+    }
 }
 
 #[cfg(test)]
@@ -915,10 +1013,44 @@ mod tests {
     }
 
     fn set_tab_override(s: &mut Settings, id: &str, feature: Feature, value: Override) {
-        for t in &mut s.tabs {
-            if let TabConfig::AiTool(c) = t {
-                if c.id == id {
-                    c.injection_overrides.set(feature, value);
+        s.set_tab_override_for_test(id, feature, value);
+    }
+
+    /// **Relocated from the retired `injection_tripwire.rs` (#44.)**
+    ///
+    /// Privacy makes "no enforcement site reads a raw switch" a compile error,
+    /// but it cannot say anything about the level above the fields: that every
+    /// [`Feature`] the hierarchy knows about *has* L2 storage, and storage of
+    /// its own. A control added to the enum and then resolved off a field it
+    /// shares with another one would be perfectly private and completely
+    /// broken — which is the drift the tripwire's second test watched for, one
+    /// level up from the fields it scanned.
+    ///
+    /// The property, stated against behaviour rather than against field names:
+    /// for every feature, flipping its L2 moves that feature's resolved value at
+    /// [`Scope::App`] and **no other feature's**. `set_l2_for_test`'s exhaustive
+    /// `match` is what makes a new variant impossible to add without naming its
+    /// storage; this test is what makes naming the WRONG storage fail.
+    #[test]
+    fn every_feature_has_a_guarded_l2_field() {
+        for f in Feature::ALL {
+            for on in [false, true] {
+                let mut s = settings();
+                s.set_l2_for_test(*f, on);
+                assert_eq!(
+                    feature_l2(*f, &s),
+                    on,
+                    "{f:?} has no L2 storage of its own — `set_l2_for_test` writes a field \
+                     `feature_l2` does not read back"
+                );
+                // Every OTHER feature stays at its declared default: the flip
+                // must not be sharing a cell with a neighbour.
+                for other in Feature::ALL.iter().filter(|o| *o != f) {
+                    assert_eq!(
+                        feature_l2(*other, &s),
+                        other.default_enabled(),
+                        "flipping {f:?}'s L2 also moved {other:?} — they share storage"
+                    );
                 }
             }
         }
@@ -1088,7 +1220,8 @@ mod tests {
     fn the_worker_scope_is_independent_of_every_tab() {
         let mut s = settings();
         let id = a_tab(&s);
-        s.offload.injection.worker.canary = Override::Off;
+        s.set_worker_override_for_test(Feature::Canary, Override::Off)
+            .expect("the canary is a worker-scoped feature");
         assert!(!effective(Feature::Canary, Scope::OffloadWorker, &s));
         // The canary has no tab row at all, so a tab still reports the L2
         // answer for it (and the report marks it out of scope).
@@ -1301,7 +1434,8 @@ mod tests {
         assert!(protection_reduced(&s), "an app-wide feature counts");
 
         let mut s = settings();
-        s.offload.injection.worker.canary = Override::Off;
+        s.set_worker_override_for_test(Feature::Canary, Override::Off)
+            .expect("the canary is a worker-scoped feature");
         assert!(protection_reduced(&s), "the worker scope counts");
 
         let mut s = settings();

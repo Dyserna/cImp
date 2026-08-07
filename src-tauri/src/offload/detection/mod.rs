@@ -633,7 +633,7 @@ mod tests {
         let mut s = Settings::default();
         s.offload.detection_signature_enabled = true;
         s.offload.detection_classifier_enabled = true;
-        s.offload.injection.detection_enabled = false;
+        s.set_l2_for_test(crate::settings::injection::Feature::Detection, false);
         let cfg = Config::from_settings(&s, crate::settings::injection::Scope::App);
         assert!(!cfg.signature && !cfg.classifier);
         let out = wrap_external_result("ddg__fetch_content", HOSTILE.to_string(), ctx(cfg)).await;

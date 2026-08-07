@@ -1009,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_ssrf_guard_lets_private_addresses_through() {
         let mut s = crate::settings::Settings::default();
-        s.offload.injection.ssrf_guard_enabled = false;
+        s.set_l2_for_test(crate::settings::injection::Feature::SsrfGuard, false);
         let policy = Policy::from_settings(&s, crate::settings::injection::Scope::App);
         for bad in [
             "http://192.168.0.1/",
@@ -1023,7 +1023,7 @@ mod tests {
         }
         // …and the master switch alone is enough, with the feature flag left on.
         let mut s = crate::settings::Settings::default();
-        s.offload.injection.protection = false;
+        s.set_master_for_test(false);
         let policy = Policy::from_settings(&s, crate::settings::injection::Scope::App);
         assert!(screen_urls(&json!({ "url": "http://10.1.2.3/" }), &policy)
             .await
@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn disabled_budgets_never_exhaust() {
         let mut s = crate::settings::Settings::default();
-        s.offload.injection.fetch_budgets_enabled = false;
+        s.set_l2_for_test(crate::settings::injection::Feature::FetchBudgets, false);
         let limits =
             crate::settings::injection::budget_limits(&s, crate::settings::injection::Scope::App);
         assert_eq!((limits.max_calls, limits.max_bytes), (0, 0));

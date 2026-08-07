@@ -1006,8 +1006,8 @@ declares its class AND its mutation capability in one reviewed place.
   enforcement site; L1 master + L2 per feature + L3 per scope (tabs and the
   `offload-worker` pseudo-scope); `/status` + an `injection_status` IPC command
   reporting the resolved value and the deciding level; a Settings matrix; a
-  reduced-protection indicator outside Settings; and a source-scanning tripwire
-  that no enforcement site reads a raw switch.
+  reduced-protection indicator outside Settings; and an enforced invariant that
+  no enforcement site reads a raw switch.
   **Phase G amendment 2026-08-07 (as built).**
   - **The resolver** is `settings::injection`
     (`decide(feature, scope, settings) -> Decision { effective, decided_by }`,
@@ -1052,20 +1052,45 @@ declares its class AND its mutation capability in one reviewed place.
     `Override` serializes as a lowercase string and is parsed **post-hoc**
     (unknown ⇒ `Inherit`, the neutral cell): a hand-edited typo must neither
     grant protection nor remove it, and must not quarantine the settings file.
-  - **The no-raw-reads invariant** is pinned by `src/injection_tripwire.rs`, a
-    source scan in the Phase D channel-tripwire style. For each guarded field it
-    fails the build on any occurrence outside comments and `#[cfg(test)]` items
-    that is not in a reviewed `allowed` list (today: the schema that declares it
-    and the resolver), with a per-field note recording why each reader is not an
-    enforcement decision — and it fails if a guarded field vanishes from the
-    tree, since a scan that watches nothing passes for the wrong reason. A
-    second test asserts every `Feature` has a guarded L2 field, so a control
-    cannot be added to the hierarchy without being added to the scan.
-    The run-scoped verdicts are deliberately named differently from the stored
+  - **The no-raw-reads invariant is structural** (amended 2026-08-07, #44).
+    Every L1/L2 switch on `InjectionSettings`, every L3 cell on
+    `TabInjectionOverrides` / `WorkerInjectionOverrides`, and the two fields that
+    hold those rows (`InjectionSettings::worker`,
+    `AiToolTabConfig::injection_overrides`) are **`pub(in crate::settings)`**.
+    Naming one from an enforcement site is a privacy error (`E0616`), so the
+    invariant is enforced by the compiler rather than watched by a test. The
+    `offload.injection` field itself stays `pub`: reaching the block is legal,
+    naming a switch inside it is not. Serde is unaffected (the derived impls live
+    in the declaring module) and the Settings window never touches Rust fields —
+    it round-trips whole `Settings` objects through `apply_settings`.
+    `injection::master_enabled` is therefore the ONLY way an outside module can
+    see L1, which is what `offload::detection::updater::tick_once` (#46) uses.
+    Test code outside the boundary writes switches through the enum-keyed
+    `#[cfg(test)] Settings::set_master_for_test` / `set_l2_for_test` /
+    `set_tab_override_for_test` / `set_worker_override_for_test`: keyed on
+    `Feature`, not on field names, so a test cannot set a flag that no longer
+    exists and adding a `Feature` fails to compile until its L2 storage is named.
+    The run-scoped verdicts stay deliberately named differently from the stored
     switches (`AgentConfig::latch_active` / `canary_active`, `GatePolicy::latch`)
-    so the scan cannot be satisfied by a read of the resolved value.
-    **Fixed while building:** the shared scanner's `balanced()` did not skip
-    `'…'` char literals, so `offload/outbound.rs`'s test module (which contains
+    — no longer to defeat a scan, but because the two are different questions.
+    **Superseded:** until #44 this was `src/injection_tripwire.rs`, a source scan
+    in the Phase D channel-tripwire style with a per-field `allowed` list. It was
+    clean the whole time it ran — this was never a bug fix — but a scan is a
+    strictly weaker restatement of "only module X may name field Y" and had three
+    bypasses, two needing no intent: aliasing the binding
+    (`let inj = &s.offload.injection; if !inj.protection` — the resolver's own
+    idiom, and invisible to L1's qualified needle), the shared `in_comment`
+    heuristic (a line starting with `*`, or containing `//` anywhere, read as a
+    comment), and an accessor added inside an already-allowed file. It also never
+    covered the L3 override cells at all. The file is deleted; its second test,
+    `every_feature_has_a_guarded_l2_field`, moved into `settings/injection.rs` —
+    that property (every `Feature` has L2 storage, and storage *of its own*) sits
+    one level above the fields and is the part privacy cannot express. It is now
+    stated against behaviour rather than against field names: flipping a
+    feature's L2 must move that feature's resolved value and no other's.
+    **Fixed while the scan existed, and kept because `push_tripwire` still uses
+    it:** the shared scanner's `balanced()` did not skip `'…'` char literals, so
+    `offload/outbound.rs`'s test module (which contains
     `assert!(!s.contains('{'))`) came back with *no* `#[cfg(test)]` span — the
     whole module read as production code. A mis-parsing scanner is worse than an
     absent one: the failure is a wrong answer, not a missing one.

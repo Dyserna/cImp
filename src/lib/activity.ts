@@ -24,7 +24,11 @@ export interface ActivityEntry {
   /// it names the SCREEN that fired: `ssrf` / `budget` / `canary` /
   /// `latch_refusal` / `memory_quarantine` / `signature` / `classifier`, plus
   /// `updater` for the V32 C3 detection auto-updater (whose `tool` is the
-  /// component and whose `ok` is the outcome — `rejected` is the only false).
+  /// component and whose `ok` is the outcome — `rejected` is the only false),
+  /// `latch_override` for a user-applied latch move and `latch_beacon` for a
+  /// native-web beacon engaging one. Every row's request payload carries an
+  /// `origin` (`internal` / `ipc` / `http`) naming who asked; `ipc` is the only
+  /// one that means a human acted (#45).
   source: string;
   tool: string;
   target: string;

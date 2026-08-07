@@ -335,10 +335,13 @@ declares its class AND its mutation capability in one reviewed place.
     **Contamination outlives the override:** a contaminated bit survives
     every flip/unlatch — post-override `context_note` writes stay
     quarantined and EXTERNAL results stay enveloped. Contamination is a
-    property of the conversation, not of the latch position. Overrides go
-    through an authenticated loopback endpoint; every override writes an
-    `injection_flag` row (`screen=latch_override`, ok:true) so the feed
-    records who opened what.
+    property of the conversation, not of the latch position. Every override
+    writes an `injection_flag` row (`screen=latch_override`, ok:true) so the
+    feed records who opened what.
+    **Amended 2026-08-07 (#45, review finding C-3):** the override is reachable
+    from the `latch_override` Tauri IPC command **only**. The authenticated
+    `POST /latch/override` route this decision originally also specified has
+    been removed — see the Phase F amendment below.
 16. **Three-level enable hierarchy (user decision 2026-08-07).** Until now
     roughly half of V32 was structurally always-on (the latch itself, the
     envelope, the SSRF guard, the canary, memory quarantine, consumer
@@ -768,8 +771,9 @@ declares its class AND its mutation capability in one reviewed place.
   config-level denial of the native web tools (Claude settings overlay +
   OpenCode pinned permission block). Per-tab taint badge + "Switch to
   local" / "Full unlatch" (confirm) / restart guidance, contamination bit
-  surviving overrides (quarantine + envelope stay), authenticated loopback
-  override endpoint, `latch_override` activity rows. Companion deliverable:
+  surviving overrides (quarantine + envelope stay), an override path
+  (originally an authenticated loopback endpoint; IPC-only since #45),
+  `latch_override` activity rows. Companion deliverable:
   a harness-native-tool coverage document (what Claude/OpenCode native
   tools provide vs. what local/proxied MCP equivalents cover, gaps, and a
   recommended all-local configuration for `deny` mode).
@@ -840,11 +844,66 @@ declares its class AND its mutation capability in one reviewed place.
     (verified, not assumed).
   - **Override state machine**: `flip_local` from External only, `unlatch` from
     any non-open latch, both erroring (not no-op'ing) otherwise; neither
-    touches `contaminated` or the spent fetch budget. Reachable two ways
-    through one implementation — authenticated `POST /latch/override` and the
-    `latch_override` IPC command — and every application writes an
-    `injection_flag` row under a new `Screen::LatchOverride` (`latch_override`,
-    `ok: true`, detail naming action + prior latch + contamination).
+    touches `contaminated` or the spent fetch budget. Every application writes
+    an `injection_flag` row under a new `Screen::LatchOverride`
+    (`latch_override`, `ok: true`, detail naming action + prior latch +
+    contamination). As first built it was reachable two ways through one
+    implementation — authenticated `POST /latch/override` and the
+    `latch_override` IPC command; the HTTP route is gone, see the amendment
+    below.
+
+  - **Phase F amendment 2026-08-07 (#45, review finding C-3) — the override is
+    IPC-only, and the beacon states its origin.** The loopback's only control is
+    a per-launch bearer token, and that token is readable by any process running
+    as the same user: `<exe-dir>/.cimp-offload.json`,
+    `.cimp-discovery/<pid>.json`, and `<project>/.opencode/plugin/cimp-inject.js`
+    inside the project tree. Every AI tab's model has native Bash. So "behind
+    the token" meant "reachable by the model", on both Phase F routes, with tab
+    ids free from `GET /status`.
+    - **`POST /latch/override` is REMOVED** (user decision 2026-08-07). It
+      existed so the action was also reachable "from a child or a
+      live-verification script"; no such caller shipped, and the `latch_override`
+      IPC command already serves the only legitimate one (the badge popover,
+      which holds no token and makes no HTTP call). The path now 404s.
+      `apply_latch_override` is unchanged and reachable from IPC. What this buys
+      is **not** containment — decision 3 is unmoved, a model with a shell
+      already has what the latch withholds — it is that a capability GRANT can
+      no longer be produced by anything but a human, so the row that records one
+      means what it says.
+    - **`/latch/beacon` stays**, because it has a real caller that has no IPC
+      available to it (the `PreToolUse` shim and the OpenCode plugin both fire
+      from child processes), and because it can only ever TIGHTEN: Open →
+      External plus the contamination bit. It cannot flip to Local, cannot
+      unlatch, and cannot clear contamination. Its abuse case is a denial of the
+      user's own local tools, recoverable by a tab restart.
+    - **Tab ids are validated** (`loopback::is_configured_tab`, applied inside
+      `latch_scope`, the one funnel `gate` and `beacon` both resolve through).
+      An id that is not a configured **AI** tab yields no scope: `/latch/beacon`
+      answers 400, and every other route treats it as the existing fail-open
+      "no identity" case. This is also the fix for the review's MED-1: the
+      registry is keyed on a body-supplied string with no TTL, cap or eviction,
+      and every entry is serialized into every `/status` response and every 4 s
+      `latch_status` poll. `latches()`'s "bounded by construction" claim is now
+      true and tested rather than asserted in a comment.
+      **The check is deliberately "is this a configured tab id", not "is this
+      the tab that owns this connection"** — the OpenCode plugin is written per
+      *working directory*, not per tab (the review's unfixed H-2), so the baked
+      tab id may belong to a different tab sharing that directory. The stricter
+      form would reject legitimate beacons today.
+    - **Rows state their origin.** `outbound::Origin` (`internal` / `ipc` /
+      `http`) is a new key on every `injection_flag` row's request payload,
+      written by `record_flag_from`; `record_flag` keeps the claim-nothing
+      `internal` default for cImp's own screens. `ipc` is the only value that
+      means a human acted. A beacon that actually MOVES a latch now also writes
+      its own row (`Screen::LatchBeacon`, `ok: true` — it engaged containment,
+      it denied nothing) marked `http`, whose detail says in words that the
+      expected shim being the usual sender is not evidence that it was. Bounded
+      to one row per tab-session, because the latch is sticky and only the
+      transition is recorded.
+    - **A rejected beacon writes no row**, only a `warn!`. The tab id is
+      entirely caller-supplied, so a row per rejection would be an unbounded
+      write into a capped feed — it would evict the genuine rows this fix exists
+      to preserve. The signal's consumer is the enforcement itself.
   - **`/status`** rows grew `contaminated`, `can_flip_local`, `can_unlatch` via
     a flattened `LatchView`, so `latch` stays a top-level key for the Phase B
     readers. Availability is published by the backend rather than re-derived in
@@ -1020,6 +1079,34 @@ declares its class AND its mutation capability in one reviewed place.
   latch holds, and treating the user's repo as hostile would gut the product.
 - **Claude/OpenCode native tools stay outside the latch** unless Phase E
   lands (decision 3); OS containment is V33.
+- **Natives do not merely sit *outside* the latch — before #45 they could
+  *move* it** (2026-08-07, review finding C-3). Decision 3 documented the
+  first half and not the second: the loopback's only control is a per-launch
+  bearer token, readable by any process running as the same user, and every
+  AI tab's model has native Bash. What that reached, and what it reaches now:
+  - **No longer reachable: the manual override.** `POST /latch/override` is
+    removed. Nothing outside the app process can flip a latch to Local,
+    unlatch a tab, or produce a `latch_override` row. A row saying
+    `origin: ipc` therefore means a human clicked.
+  - **Still reachable: `/latch/beacon`**, with a real caller that has no IPC
+    path. It can only tighten — Open → External plus contamination — for a
+    **configured** tab id, and it writes an `origin: http` row saying so. The
+    residual is a **cross-tab denial of service**: a shell-capable model in
+    tab A can beacon tab B (or every tab) into EXTERNAL + contaminated, and
+    every proxied local-capability tool there refuses until that tab is
+    restarted. Bounded (configured tabs only), audited (one row per
+    tab-session, honestly attributed), and recoverable (a restart), but not
+    closed. Closing it needs a per-tab secret the beacon proves possession
+    of, which the OpenCode plugin cannot hold while it is written per
+    *working directory* rather than per tab (finding H-2).
+  - **Never reachable, by either route: clearing `contaminated`.** Decision 15
+    holds — contamination is a property of the conversation, not of the latch
+    position. (The separate finding C-2, that a forged session rotation does
+    clear it, is tracked on its own and is not addressed here.)
+  - This is not a containment regression and never was one: decision 3 already
+    says a model with a shell has the capabilities the latch withholds. What
+    #45 restores is the *audit trail's* meaning — the difference between a feed
+    that records a user's decision and one that records a POST.
 - **Redirect re-screening and DNS-rebinding TOCTOU on the SSRF guard**
   (amends decision 11, Phase C 2026-08-06). cImp never performs the web fetch
   itself: `ddg`/`context7` are third-party MCP servers running as their own
@@ -1091,17 +1178,32 @@ declares its class AND its mutation capability in one reviewed place.
 12. Sensor mode (default): in a Claude tab, use the NATIVE WebFetch tool —
     the tab's badge appears, `/status` shows the latch engaged, and a
     proxied `graph_snippet` is refused; same via OpenCode's native
-    webfetch. Set `native_web_visibility: off`, restart the tab, repeat —
-    no badge, no latch (and no hook injected at all). `deny` mode: the
-    native web tools are refused by the harness itself; a proxied
-    `ddg__fetch_content` still works and latches as in (3).
-13. Override: with a tab EXTERNAL-latched, "Switch to local" restores
-    `graph_snippet` and refuses `ddg__*` (flip, not unlatch); a
-    `context_note pin=true` written AFTER the flip still lands quarantined
-    (contamination survives the override); "Full unlatch" (after its
-    confirmation) restores both sides; both actions show as
-    `latch_override` rows in Tool Activity; a tab restart still resets
-    everything.
+    webfetch. **A `latch_beacon` row appears in Tool Activity, and its
+    request payload reads `"origin": "http"`** (#45) — exactly one row for
+    the whole session, since the latch is sticky. Set
+    `native_web_visibility: off`, restart the tab, repeat — no badge, no
+    latch, no row (and no hook injected at all). `deny` mode: the native web
+    tools are refused by the harness itself; a proxied `ddg__fetch_content`
+    still works and latches as in (3).
+13. Override (**UI only — there is no HTTP route for this since #45**): with
+    a tab EXTERNAL-latched, click the ⛨ badge and use "Switch to local" —
+    `graph_snippet` answers again and `ddg__*` is refused (flip, not
+    unlatch); a `context_note pin=true` written AFTER the flip still lands
+    quarantined (contamination survives the override); "Full unlatch" (after
+    its confirmation) restores both sides; both actions show as
+    `latch_override` rows in Tool Activity whose payload reads
+    `"origin": "ipc"`; a tab restart still resets everything.
+13b. #45's two negative checks, run from a shell with the launch token and
+    port from `<exe-dir>/.cimp-offload.json`:
+    - `curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization:
+      Bearer $TOK" -d '{"tab":"claude","consumer":"claude","action":"unlatch"}'
+      http://127.0.0.1:$PORT/latch/override` → **404**. The route is gone; the
+      tab's latch is unchanged and no `latch_override` row appears.
+    - `curl -s -X POST -H "Authorization: Bearer $TOK" -d
+      '{"tab":"not-a-tab","consumer":"claude","tool":"WebFetch"}'
+      http://127.0.0.1:$PORT/latch/beacon` → **400**, `/status` grows no row
+      for `not-a-tab`, and no activity row is written. Repeat with a REAL tab
+      id → 200 and the sensor-mode behaviour of (12).
 14. Enable hierarchy (decision 16): with the global master OFF, a seeded
     injection page fetched in a Claude tab arrives unwrapped and
     unflagged, `graph_snippet` still answers after it, and a

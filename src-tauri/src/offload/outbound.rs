@@ -648,6 +648,57 @@ pub enum Screen {
     /// it, when, and from which prior state is what makes the rest legible
     /// after the fact.
     LatchOverride,
+    /// V32 Phase F (locked decision 14), added by #45: a native-web **beacon**
+    /// engaged a tab's EXTERNAL latch. The harness's own `WebFetch`/`webfetch`
+    /// never routes through cImp, so this transition used to be visible only as
+    /// a `tracing` line — and then, later and indirectly, as whichever
+    /// [`Screen::LatchRefusal`] row the *victim's* next local tool call
+    /// produced. A row here names the cause at the moment it happens.
+    ///
+    /// Not a denial: at beacon time nothing has been refused, exactly like
+    /// [`Screen::MemoryQuarantine`]. What makes it worth reading is its
+    /// [`Origin`], which is always [`Origin::Http`] — see that type.
+    LatchBeacon,
+}
+
+/// Who asked for the state change a flag row records (#45).
+///
+/// The V32 review's sharpest finding about the audit trail was not that a row
+/// was missing but that a row *lied by omission*: an `injection_flag` row said
+/// what happened and never said who asked, so "the user clicked the button" and
+/// "a local process POSTed the loopback" rendered identically. This enum is the
+/// missing column. It is a statement of provenance, never of verdict — `ok`
+/// keeps following [`Screen::is_denial`], because whether cImp stopped something
+/// is a different question from who asked it to act.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Origin {
+    /// cImp's own dispatch. The row records a decision **cImp** took over a call
+    /// it was already executing (a screen, a refusal, a quarantine). The request
+    /// that triggered it came from a child, but the recorded act is cImp's.
+    Internal,
+    /// A capability-scoped Tauri IPC command — i.e. the user, through the app's
+    /// own UI. The webview holds no bearer token and makes no HTTP call
+    /// (re-verified for #45), so no process outside the app can forge this.
+    /// **This is the only origin that means "a human did it".**
+    Ipc,
+    /// An authenticated `POST` to a loopback route. The per-launch bearer token
+    /// is readable by any process running as the same user — from
+    /// `.cimp-offload.json`, from `.cimp-discovery/<pid>.json`, and from the
+    /// generated OpenCode plugin inside the project tree — so this means
+    /// "some local process asserted this", **not** "the user did this". The
+    /// expected sender being a cImp-spawned shim does not make it evidence of
+    /// one.
+    Http,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Internal => "internal",
+            Origin::Ipc => "ipc",
+            Origin::Http => "http",
+        }
+    }
 }
 
 impl Screen {
@@ -662,6 +713,7 @@ impl Screen {
             Screen::Classifier => "classifier",
             Screen::Updater => "updater",
             Screen::LatchOverride => "latch_override",
+            Screen::LatchBeacon => "latch_beacon",
         }
     }
 
@@ -671,7 +723,8 @@ impl Screen {
     /// denial would misreport what happened. [`Screen::Updater`] is not a
     /// screen over a call at all, so it is likewise never a denial; its rows
     /// carry their own `ok`. Nor is [`Screen::LatchOverride`], which records
-    /// the user *granting* capability back.
+    /// the user *granting* capability back, nor [`Screen::LatchBeacon`], which
+    /// records containment *engaging* before anything has been refused.
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
@@ -680,6 +733,7 @@ impl Screen {
                 | Screen::MemoryQuarantine
                 | Screen::Updater
                 | Screen::LatchOverride
+                | Screen::LatchBeacon
         )
     }
 }
@@ -715,13 +769,25 @@ pub struct Flag<'a> {
     pub detail: &'a str,
 }
 
-/// Write one `injection_flag` Tool Activity row.
+/// Write one `injection_flag` Tool Activity row, attributed to
+/// [`Origin::Internal`] — cImp's own dispatch deciding something about a call it
+/// was already executing.
 ///
 /// This is the consumer for every denial Phase C adds: without it a refusal is
 /// a silent failure the user only notices as a task that inexplicably gave up.
 /// Uses `record_bg` like every other recorder — the store does synchronous file
 /// I/O and these fire from async paths.
+///
+/// **A caller that is *applying a request from outside cImp's own dispatch* —
+/// an IPC command, or a loopback route — must use [`record_flag_from`]
+/// instead.** `Internal` is the safe default only because it claims the least:
+/// it never asserts that a human acted.
 pub fn record_flag(flag: Flag<'_>) {
+    record_flag_from(Origin::Internal, flag);
+}
+
+/// [`record_flag`] with the row's provenance stated explicitly (#45).
+pub fn record_flag_from(origin: Origin, flag: Flag<'_>) {
     let ts = crate::activity::now_ms();
     // The at-a-glance column: the offending host when the screen had one,
     // otherwise the scope that hit its limit.
@@ -729,16 +795,7 @@ pub fn record_flag(flag: Flag<'_>) {
         Some(h) => format!("{h} ({})", flag.scope),
         None => flag.scope.to_string(),
     };
-    let request = serde_json::json!({
-        "screen": flag.screen.as_str(),
-        "consumer": flag.consumer,
-        "scope": flag.scope,
-        "tool": flag.tool,
-        "host": flag.host,
-        "url": flag.url,
-        "resolved_ip": flag.resolved_ip,
-        "canary": flag.canary,
-    });
+    let request = flag_request(origin, &flag);
     crate::activity::record_bg(ActivityRecord {
         entry: ActivityEntry::new(
             ActivityKind::InjectionFlag,
@@ -759,6 +816,29 @@ pub fn record_flag(flag: Flag<'_>) {
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
         response: flag.detail.to_string(),
     });
+}
+
+/// The row's request payload — the JSON the Tool Activity detail pane shows.
+///
+/// Split out of [`record_flag_from`] as a pure function so the fields a reader
+/// depends on after an incident (the screen, the scope, and since #45 the
+/// [`Origin`]) are assertable in a unit test. The write itself needs the
+/// activity store, which is process-global file I/O; this does not.
+pub fn flag_request(origin: Origin, flag: &Flag<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "screen": flag.screen.as_str(),
+        // Who asked. Deliberately adjacent to `screen`, because the two are
+        // only useful together: "the latch moved" is not a finding, "the latch
+        // moved and nobody clicked anything" is.
+        "origin": origin.as_str(),
+        "consumer": flag.consumer,
+        "scope": flag.scope,
+        "tool": flag.tool,
+        "host": flag.host,
+        "url": flag.url,
+        "resolved_ip": flag.resolved_ip,
+        "canary": flag.canary,
+    })
 }
 
 #[cfg(test)]
@@ -1127,6 +1207,7 @@ mod tests {
             Screen::Classifier,
             Screen::Updater,
             Screen::LatchOverride,
+            Screen::LatchBeacon,
         ];
         let labels: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
         assert_eq!(
@@ -1140,7 +1221,8 @@ mod tests {
                 "signature",
                 "classifier",
                 "updater",
-                "latch_override"
+                "latch_override",
+                "latch_beacon"
             ]
         );
         // Denial vs. flagged: the quarantine STORED the note, the two detection
@@ -1153,7 +1235,50 @@ mod tests {
         // V32 Phase F: an override GRANTS capability back — a denial-shaped row
         // would read as "cImp blocked something", the opposite of what happened.
         assert!(!Screen::LatchOverride.is_denial());
+        // #45: a beacon ENGAGES containment; nothing has been refused yet, and
+        // the refusals that follow get their own `latch_refusal` rows.
+        assert!(!Screen::LatchBeacon.is_denial());
         assert!(Screen::LatchRefusal.is_denial());
         assert!(Screen::Ssrf.is_denial());
+    }
+
+    /// #45: the provenance column. Its whole value is that the three cases are
+    /// *distinguishable* — a shared spelling would put "the user clicked" and
+    /// "a local process POSTed" back in the same bucket, which is the finding.
+    #[test]
+    fn flag_origins_are_distinct_wire_values() {
+        let all = [Origin::Internal, Origin::Ipc, Origin::Http];
+        let labels: Vec<&str> = all.iter().map(|o| o.as_str()).collect();
+        assert_eq!(labels, ["internal", "ipc", "http"]);
+    }
+
+    /// #45: every flag row carries its origin, and `record_flag`'s convenience
+    /// default is the claim-nothing one. A row that omitted the field would be
+    /// read as "no reason to doubt it", which is exactly the reading the finding
+    /// says is unearned.
+    #[test]
+    fn every_flag_row_states_who_asked() {
+        let flag = Flag {
+            screen: Screen::LatchOverride,
+            consumer: "claude",
+            scope: "claude:claude-1",
+            tool: "unlatch",
+            host: None,
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: String::new(),
+            detail: "detail",
+        };
+        for (origin, expected) in [
+            (Origin::Internal, "internal"),
+            (Origin::Ipc, "ipc"),
+            (Origin::Http, "http"),
+        ] {
+            let req = flag_request(origin, &flag);
+            assert_eq!(req["origin"], expected);
+            assert_eq!(req["screen"], "latch_override");
+            assert_eq!(req["scope"], "claude:claude-1");
+        }
     }
 }

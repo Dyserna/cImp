@@ -864,11 +864,20 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             );
         }
         if advertises_audit_to_claude(settings) {
+            // V32 C-1b: `--tab <id>` here for the same reason as on the offload
+            // child, and NOT for the same purpose. The audit child resolves no
+            // memory scope — it takes no arguments and always scans the app's
+            // own launch root — but a taint latch is keyed by `(agent, tab)`,
+            // and `security_audit`/`quality_audit` became LOCAL-CAPABILITY on
+            // 2026-08-07. Without an identity, `/audit/run` has no latch to
+            // consult and a contaminated tab keeps a gitleaks report one tool
+            // call away. Unconditional and not Settings-derived, so it needs no
+            // `spawn_inject_sig` entry (same reasoning as the offload child's).
             servers.insert(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
                     "command": exe,
-                    "args": ["--code-audit-mcp"]
+                    "args": ["--code-audit-mcp", "--tab", tab]
                 }),
             );
         }
@@ -1953,7 +1962,10 @@ fn build_opencode_config(
                 "cimp-code-audit".to_string(),
                 serde_json::json!({
                     "type": "local",
-                    "command": [exe, "--code-audit-mcp", "--consumer", "opencode"]
+                    // V32 C-1b: see the Claude-side note in `build_pre_args` —
+                    // the tab identity is what gives `/audit/run` a latch to
+                    // gate on.
+                    "command": [exe, "--code-audit-mcp", "--consumer", "opencode", "--tab", tab]
                 }),
             );
         }
@@ -3053,23 +3065,59 @@ mod tests {
         }
     }
 
+    /// V32 C-1b (2026-08-07 review) — this REPLACES
+    /// `the_code_audit_child_gets_no_tab_id`, which pinned the opposite.
+    ///
+    /// That test was right about V28's question (the audit child resolves no
+    /// memory scope) and wrong about V32's: a taint latch is keyed by
+    /// `(agent, tab)`, and once `security_audit`/`quality_audit` became
+    /// LOCAL-CAPABILITY, a child with no identity meant `/audit/run` had no
+    /// latch to consult — a contaminated tab could still run a gitleaks scan and
+    /// put the findings in its next search query. The identity is the gate's
+    /// input, so it is pinned per tab and on BOTH consumers' spawn paths.
     #[test]
-    fn the_code_audit_child_gets_no_tab_id() {
-        // Scope check: only the `cimp-offload` child proxies `/graph_run`, so
-        // only it needs (and gets) the tab identity. The audit child's argv is
-        // unchanged by V28.
+    fn the_code_audit_child_carries_its_own_tab_id() {
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
         settings.code_audit.expose_claude = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
-        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
-        let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
-        let argv = cfg["mcpServers"]["cimp-code-audit"]["args"]
+        for tab in ["claude", "claude-local"] {
+            let args = build_pre_args(&claude_cfg(), &settings, tab);
+            let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+            let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
+            let argv: Vec<String> = cfg["mcpServers"]["cimp-code-audit"]["args"]
+                .as_array()
+                .expect("audit args")
+                .iter()
+                .map(|v| v.as_str().expect("string arg").to_string())
+                .collect();
+            assert_eq!(argv[0], "--code-audit-mcp", "{argv:?}");
+            assert!(
+                argv.windows(2).any(|w| w == ["--tab", tab]),
+                "tab {tab} argv: {argv:?}"
+            );
+        }
+        // The OpenCode mirror bakes it into the same `mcp` block that already
+        // carries `--consumer opencode`.
+        let mut oc = Settings::default();
+        oc.code_audit.enabled = true;
+        oc.code_audit.expose_opencode = true;
+        let cfg = build_opencode_config(&opencode_cfg(), &oc, "opencode-2");
+        let cmd: Vec<String> = cfg["mcp"]["cimp-code-audit"]["command"]
             .as_array()
-            .expect("audit args");
-        assert!(
-            !argv.iter().any(|v| v == "--tab"),
-            "audit child needs no tab identity: {argv:?}"
+            .expect("audit command")
+            .iter()
+            .map(|v| v.as_str().expect("string arg").to_string())
+            .collect();
+        assert_eq!(
+            &cmd[1..],
+            [
+                "--code-audit-mcp",
+                "--consumer",
+                "opencode",
+                "--tab",
+                "opencode-2"
+            ],
+            "got: {cmd:?}"
         );
     }
 
@@ -4200,15 +4248,23 @@ mod tests {
             argv.windows(2).any(|w| w == ["--tab", "opencode"]),
             "got: {argv:?}"
         );
-        // The audit child stays identity-free on this side too.
+        // V32 C-1b: the audit child carries one too now — it is the taint
+        // gate's input on `/audit/run`, not a memory scope. The full argv shape
+        // is pinned by `the_code_audit_child_carries_its_own_tab_id`.
         let mut audit = Settings::default();
         audit.code_audit.enabled = true;
         audit.code_audit.expose_opencode = true;
         let cfg = build_opencode_config(&opencode_cfg(), &audit, "opencode");
-        let argv = cfg["mcp"]["cimp-code-audit"]["command"]
+        let argv: Vec<&str> = cfg["mcp"]["cimp-code-audit"]["command"]
             .as_array()
-            .expect("audit command");
-        assert!(!argv.iter().any(|v| v == "--tab"), "got: {argv:?}");
+            .expect("audit command")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            argv.windows(2).any(|w| w == ["--tab", "opencode"]),
+            "got: {argv:?}"
+        );
 
         // End-to-end through the env composer the PTY actually launches with.
         let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
@@ -4254,9 +4310,19 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        // Exact shape: [exe, "--code-audit-mcp", "--consumer", "opencode"].
-        assert_eq!(cmd.len(), 4, "got: {cmd:?}");
-        assert_eq!(&cmd[1..], ["--code-audit-mcp", "--consumer", "opencode"]);
+        // Exact shape (V32 C-1b added `--tab <id>`):
+        // [exe, "--code-audit-mcp", "--consumer", "opencode", "--tab", <id>].
+        assert_eq!(cmd.len(), 6, "got: {cmd:?}");
+        assert_eq!(
+            &cmd[1..],
+            [
+                "--code-audit-mcp",
+                "--consumer",
+                "opencode",
+                "--tab",
+                "opencode"
+            ]
+        );
         // Offload gate is off ⇒ its entry must be absent.
         assert!(
             cfg["mcp"]["cimp-offload"].is_null(),

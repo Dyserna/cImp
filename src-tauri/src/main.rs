@@ -133,7 +133,8 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --taint-beacon --tab <id>              PreToolUse native-web beacon shim (report-only)
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
-  --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
+  --code-audit-mcp [--consumer <name>] [--tab <id>]
+                                         stdio MCP server (security_audit / quality_audit)
 
 The MCP servers and hooks proxy to a RUNNING cImp instance launched in the
 project directory; they are injected automatically into the AI tabs cImp
@@ -325,7 +326,16 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str)
             .unwrap_or("claude");
-        audit::mcp::run(consumer);
+        // V32 C-1b: `--tab <id>` names the cImp tab this child serves, so
+        // `/audit/run` can gate the scan on that tab's taint latch. Until the
+        // 2026-08-07 review this child deliberately carried no identity and the
+        // route held no latch call at all — see `audit::mcp::TAB`.
+        let tab = args
+            .iter()
+            .position(|a| a == "--tab")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        audit::mcp::run(consumer, tab);
         return;
     }
 

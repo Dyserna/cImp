@@ -36,9 +36,12 @@
 //!
 //! They are disjoint: the worker calls the warm host in-process and never
 //! travels the loopback route, and a worker *answer* (which may quote an
-//! enveloped page) goes back as an `offload_task` result, which is TRUSTED and
-//! never wrapped. So an already-enveloped result can never reach the other
-//! boundary and be wrapped twice.
+//! enveloped page) goes back as an `offload_task` result, which is not EXTERNAL
+//! and so is never wrapped. So an already-enveloped result can never reach the
+//! other boundary and be wrapped twice. (`offload_task`/`offload_batch` were
+//! TRUSTED until the 2026-08-07 review demoted them to LOCAL-CAPABILITY; the
+//! property this paragraph needs is EXTERNAL-or-not, which is unchanged — see
+//! [`is_external`].)
 //!
 //! Note what is deliberately **not** done: this module never inspects the
 //! content to decide whether it "looks already wrapped". That check would be
@@ -157,9 +160,12 @@ fn envelope_with(preamble: &str, content: &str) -> String {
 /// [`toolclass::classify`](crate::offload::toolclass::classify), so an
 /// unknown/newly configured server's tool is wrapped by the same
 /// unknown-⇒-EXTERNAL invariant that latches it — a new server can never
-/// silently deliver un-spotlit content. Structural graph output, memory reads
-/// and worker-synthesized `offload_task` answers are TRUSTED and pass through
-/// untouched.
+/// silently deliver un-spotlit content. Structural graph output, memory reads,
+/// local reads and worker-synthesized `offload_task` answers are all non-EXTERNAL
+/// and pass through untouched — the test is EXTERNAL-or-not, never "which
+/// non-external class", so the 2026-08-07 demotions
+/// (`run_check`, the audit tools, `offload_task`/`offload_batch`) left this
+/// boundary exactly where it was.
 ///
 /// Both boundaries reach this through
 /// [`detection::wrap_external_result`](super::detection::wrap_external_result),
@@ -358,7 +364,10 @@ mod tests {
         ] {
             assert!(is_external(external), "{external} must be enveloped");
         }
-        for trusted in [
+        // Every non-EXTERNAL class, deliberately mixed: the rule is
+        // EXTERNAL-or-not, so a reclassification between the other three
+        // (2026-08-07 moved five tools between them) must not move this line.
+        for not_external in [
             "graph_outline",
             "graph_snippet",
             "graph_search_docs",
@@ -371,7 +380,10 @@ mod tests {
             "run_check",
             "security_audit",
         ] {
-            assert!(!is_external(trusted), "{trusted} must not be enveloped");
+            assert!(
+                !is_external(not_external),
+                "{not_external} must not be enveloped"
+            );
         }
     }
 

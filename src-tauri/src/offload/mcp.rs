@@ -629,7 +629,17 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
         Ok(p) => p,
         Err(msg) => return Ok(tool_error(&msg)),
     };
-    match run_one(instructions, context, thinking_str, tier_str, schema, profile).await {
+    match run_one(
+        "offload_task",
+        instructions,
+        context,
+        thinking_str,
+        tier_str,
+        schema,
+        profile,
+    )
+    .await
+    {
         Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
         // A "not ready/busy" condition is returned as a tool result (not a
         // protocol error) so Opus can read it and retry/adapt.
@@ -644,6 +654,10 @@ async fn handle_tools_call(params: Value) -> Result<Value, (i64, String)> {
 /// as-is, not retried locally. Shared by the single (`offload_task`) and batch
 /// (`offload_batch`) tools.
 async fn run_one(
+    // V32 C-1c: which of the two offload tools the caller invoked, forwarded to
+    // `/run` for the app's taint gate. `&'static str` so only the two pinned
+    // names can reach it.
+    tool: &'static str,
     instructions: String,
     context: Option<String>,
     thinking_str: String,
@@ -659,6 +673,7 @@ async fn run_one(
     let thinking = ThinkingMode::parse(&thinking_str);
     let tier = TierHint::parse(&tier_str);
     match proxy_run(
+        tool,
         &instructions,
         context.as_deref(),
         &thinking_str,
@@ -754,7 +769,16 @@ async fn handle_batch_tool(params: Value) -> Result<Value, (i64, String)> {
                     return Err("subtask requires non-empty `instructions`".to_string());
                 }
                 let profile = profile?;
-                run_one(instructions, context, thinking_str, tier_str, schema, profile).await
+                run_one(
+                    "offload_batch",
+                    instructions,
+                    context,
+                    thinking_str,
+                    tier_str,
+                    schema,
+                    profile,
+                )
+                .await
             })
         })
         .collect();
@@ -878,7 +902,17 @@ async fn proxy_describe() -> Option<String> {
 /// - `Some(Ok(text))` → the synthesized answer from the warm pool.
 /// - `Some(Err(msg))` → a task-level error the app already resolved (busy /
 ///   no backend / timeout) — surfaced to Claude as-is, not retried locally.
+///
+/// V32 C-1c: the body also carries this child's identity (`tab` + `consumer`)
+/// and `tool`, so the app can gate the delegation against the calling tab's
+/// taint latch. A containment refusal arrives as `Some(Err(refusal))` — a
+/// task-level error, deliberately, so it is NOT retried through the
+/// self-contained fallback, which would run the very sub-task the latch just
+/// refused.
 async fn proxy_run(
+    // V32 C-1c: which of the two offload tools the caller invoked, so the app's
+    // refusal and its activity row name the tool the model actually called.
+    tool: &'static str,
     instructions: &str,
     context: Option<&str>,
     thinking: &str,
@@ -905,7 +939,7 @@ async fn proxy_run(
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let body = json!({
+    let mut body = json!({
         "instructions": instructions,
         "context": context,
         "thinking": thinking,
@@ -918,7 +952,20 @@ async fn proxy_run(
         // spelling. The app re-validates it (`Profile::parse` in
         // `loopback::handle_run`) rather than trusting this side.
         "profile": profile.map(Profile::as_str),
+        // V32 C-1c: who is delegating. The latch registry is keyed by
+        // `(agent, tab)`, so both halves have to ride along or the app gates
+        // an OpenCode tab's call against a Claude tab's latch. Sent in the body
+        // exactly as `/graph_run` does. `tool` names which of the two offload
+        // tools asked — an `offload_batch` fans out to one `/run` per subtask,
+        // so the route cannot tell them apart on its own.
+        "consumer": consumer(),
+        "tool": tool,
     });
+    // Omitted entirely when this child has no tab identity, so the body stays
+    // byte-identical to the pre-C-1c shape for a hand-run child.
+    if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
+        map.insert("tab".to_string(), Value::String(t.to_string()));
+    }
     let mut resp = match client
         .post(format!("{base}/run"))
         .bearer_auth(&token)

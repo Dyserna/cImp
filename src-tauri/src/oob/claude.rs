@@ -94,7 +94,7 @@ struct HeartbeatState {
     /// The session id the drain loop last CONFIRMED live for this tab, if any
     /// (`None` until confirmation — the first transcript a tap attaches to is
     /// usually a finished session, and marking it live would report the wrong
-    /// one; see `live_confirmed` in [`run`]).
+    /// one; see [`LiveSessionGate`]).
     session: Option<String>,
 }
 
@@ -205,6 +205,78 @@ fn spawn_heartbeat(ctx: OobContext, root: PathBuf, hb: Arc<TapHeartbeat>) {
     });
 }
 
+/// Whether the transcript the tap is attached to is demonstrably **this tab's
+/// live session** — the one fact that may repoint the live-session registry.
+///
+/// # Why this is a type and not a `bool` in [`run`]
+///
+/// It was a `bool`, and its rule was `live_confirmed = !first_attach`: a file
+/// that appeared after launch was taken as a freshly-started session, live *by
+/// construction*, with no growth check. The 2026-08-07 review's finding C-2 is
+/// what that costs, and the chain runs through three modules, which is why the
+/// decision now has a name and a test rather than living inside a loop:
+///
+/// 1. A Claude tab's session id is the file stem of the newest `*.jsonl` in
+///    `~/.claude/projects/<encoded-root>/`, and [`newest_jsonl`] ranks purely by
+///    mtime. So `type nul > …/aaaa.jsonl` from Bash — a *zero-byte* file — wins
+///    the ranking within one 200 ms poll.
+/// 2. The old rule marked it live immediately, and `mark_live_session` repoints
+///    the registry entry keyed by this tab id.
+/// 3. `loopback::TabLatch::observe` reads that entry, sees a **changed** session
+///    id, and treats it as a new conversation: `latch = Open`, `budget.reset()`,
+///    `latch_flagged = false`, **`contaminated = false`**. It is called from all
+///    three state paths (`gate`, `beacon`, `view_for`), so even a `/latch/state`
+///    poll applies it.
+///
+/// Clearing contamination is the sharp end: locked decision 15 says
+/// *"contamination is a property of the conversation, not of the latch
+/// position"*, and `/latch/override` deliberately cannot clear it. After that
+/// reset the next `context_note` stores **clean**, so an injected conclusion is
+/// auto-injected into every future clean session — the persistence decision 10
+/// exists to prevent.
+///
+/// # The rule
+///
+/// **Growth is the proof, and it is the only proof.** A file's appearance means
+/// nothing; bytes arriving in it mean a live harness is writing. Rotation drops
+/// confirmation ([`rotated`](Self::rotated)) and only
+/// [`observed`](Self::observed) restores it. That leaves the decision-15
+/// invariant intact where it matters: keeping `latch = Open` and a fresh budget
+/// on a *proven* rotation is fine, and it is specifically clearing
+/// `contaminated` that now requires proof.
+///
+/// Cost: a genuinely new session is reported live one poll (200 ms) later than
+/// before, once its first line lands — the harness writes its first entry within
+/// the same tick it creates the file, so this is not observable in practice.
+///
+/// This closes the filesystem half of C-2 only. The token half — a
+/// `/memory/event` POST keying the same registry with a tab-colliding string —
+/// is closed in `offload/loopback.rs::mark_live_session_from_event`. **Neither
+/// alone is sufficient**: they are two independent writers into one registry.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveSessionGate {
+    confirmed: bool,
+}
+
+impl LiveSessionGate {
+    /// The tap attached to a different transcript file. Confirmation is
+    /// dropped, unconditionally — a file that merely *appeared* is not evidence
+    /// of a conversation, whoever created it.
+    pub(crate) fn rotated(&mut self) {
+        self.confirmed = false;
+    }
+
+    /// The drain ran from `before` and left the offset at `after`. New bytes
+    /// confirm the file, permanently (until the next rotation). Returns whether
+    /// the tap may report this session live.
+    pub(crate) fn observed(&mut self, before: u64, after: u64) -> bool {
+        if after != before {
+            self.confirmed = true;
+        }
+        self.confirmed
+    }
+}
+
 /// Tail the active transcript for `project_dir`, speaking new assistant text
 /// until the tab's cancel token fires. Resilient: if the project dir or any
 /// file is missing it simply waits; transient read/parse errors are skipped.
@@ -261,13 +333,10 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // launch; skip it by seeking to EOF. Files that appear *later* (a new
     // session) are read from the start.
     let mut first_attach = true;
-    // Whether the attached transcript is demonstrably THIS tab's live session.
-    // The first file we attach to is usually a finished session from a previous
-    // run (a fresh tab hasn't written its transcript yet), so marking it live
-    // would report the OLD session as "current" until the new one begins.
-    // Confirmed by growth: any new bytes since attach. Files that appear after
-    // launch are new sessions and confirmed immediately (rotation branch).
-    let mut live_confirmed = false;
+    // Whether the attached transcript is demonstrably THIS tab's live session
+    // — growth is the only proof, on every attach and every rotation alike.
+    // See [`LiveSessionGate`].
+    let mut live = LiveSessionGate::default();
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -288,11 +357,11 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
 
         match newest_jsonl(&root) {
             Some(path) if Some(&path) != cur.as_ref() => {
-                // Rotated to a new (or first) transcript file. A file that
-                // appears AFTER launch is a freshly-started session — live by
-                // construction; the pre-existing first file must prove itself
-                // by growing (see `live_confirmed`'s doc above).
-                live_confirmed = !first_attach;
+                // Rotated to a new (or first) transcript file. Either way the
+                // file must prove itself by GROWING before it is reported live
+                // (V32 C-2 — see [`LiveSessionGate`]); `first_attach` still
+                // decides the backlog posture, and only that.
+                live.rotated();
                 offset = if first_attach {
                     std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
                 } else {
@@ -358,10 +427,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
             // session active — but only once the file is confirmed to be this
             // tab's own session, so a dead previous-run transcript is never
             // reported as the current one.
-            if offset != before {
-                live_confirmed = true;
-            }
-            if live_confirmed {
+            if live.observed(before, offset) {
                 ctx.mark_live_session(&session_id, "claude");
                 // H1-R2: hand the confirmed session to the heartbeat so it
                 // refreshes `live_sessions` too while this loop is parked in

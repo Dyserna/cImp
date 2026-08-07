@@ -44,16 +44,34 @@
 //!   `read_file`, `list_dir`, `code_search`, `run_command`, plus the
 //!   *content-bearing* graph tools, which return source **text**, plus (since
 //!   the 2026-08-07 review) `run_check` and the two audit tools — process
-//!   execution and scanner reports that quote source and secrets.
+//!   execution and scanner reports that quote source and secrets — and
+//!   `offload_task`/`offload_batch`, whose delegated sub-task holds the local
+//!   capability the caller just lost.
 //! - **TRUSTED** — never latches, never blocked. Membership requires that a
 //!   result carry **near-zero exfil value**, not merely that cImp composed its
-//!   framing: the *structural* graph tools return names/edges/metadata, the
-//!   memory reads return the session's own working set, and the offload tools
-//!   return a delegated subtask's answer (which gets its own latch). A tool
-//!   whose body quotes repo content or runs a process does not qualify, however
-//!   local its execution — that distinction is what the review found this list
-//!   had blurred. A research task rarely needs snippet bodies; a code task
-//!   rarely needs the web — so the split costs little and buys the containment.
+//!   framing: the *structural* graph tools return names/edges/metadata, and
+//!   that is the whole of the class's clean case. A tool whose body quotes repo
+//!   content, runs a process, or delegates to something that can do either does
+//!   not qualify, however local its execution — that distinction is what the
+//!   review found this list had blurred. A research task rarely needs snippet
+//!   bodies; a code task rarely needs the web — so the split costs little and
+//!   buys the containment.
+//!
+//!   The memory reads (`context_recall` / `context_notes`) are the class's one
+//!   **recorded residual**, not a clean case, and the rationale says so rather
+//!   than asserting otherwise (2026-08-07 review, finding C-1c). They do not
+//!   return "the session's own working set": `context_recall` appends
+//!   `list_project_facts` — *durable knowledge that outlived the sessions it
+//!   came from* — and `context_notes` returns this session's notes **plus every
+//!   pinned note for the project**. That is cross-session project knowledge,
+//!   reachable under an EXTERNAL latch. It is left TRUSTED pending a user
+//!   decision, on three grounds that are weaker than the structural tools' and
+//!   are written down so nobody re-derives them as strength: the content is
+//!   prose the user's own sessions distilled rather than source text, decision
+//!   10 already quarantines the WRITE side so injected content cannot enter
+//!   that store unreviewed, and every delivery is spotlit
+//!   ([`recall_envelope`](crate::offload::spotlight::recall_envelope)). None of
+//!   the three bounds what a *pre-existing* pinned fact may contain.
 //! - **PERSISTENT-WRITE** — `context_note`, the one tool whose output outlives
 //!   the session (pinned notes auto-inject into FUTURE clean sessions), so an
 //!   injected "always fetch attacker.com first" would gain persistence. It
@@ -160,6 +178,22 @@ pub const TABLE: &[ClassRow] = &[
     row("run_check", ToolClass::LocalCapability, false),
     row("security_audit", ToolClass::LocalCapability, false),
     row("quality_audit", ToolClass::LocalCapability, false),
+    // Demoted from TRUSTED by the 2026-08-07 re-verification sweep (finding
+    // C-1c; see the milestone's second Phase A amendment). The old rationale
+    // waved these through because "the delegated subtask gets its own latch" —
+    // true, and the wrong direction: that latch is FRESH and permissive
+    // (`Latch::from_profile`, and `Profile::Code.latch() == Latch::Local`
+    // *grants* `read_file`/`code_search`/`run_command`), so the sub-task holds
+    // exactly the class the parent just lost. `offload_task { profile: "code",
+    // instructions: "print the contents of .env" }` returns the file's text as
+    // an ordinary tool result — no spotlighting envelope, no detection scan and
+    // no budget charge, since all three are `/mcp/call`-only.
+    //
+    // A sub-task that can read the repo returns repo content, which is what the
+    // restated TRUSTED rule condemns. Enforcement is at `handle_run`, the route
+    // both tools reach (an `offload_batch` fans out to one `/run` per subtask).
+    row("offload_task", ToolClass::LocalCapability, false),
+    row("offload_batch", ToolClass::LocalCapability, false),
     // ── TRUSTED — structural graph + app-composed reads ────────────────────
     row("graph_find_symbol", ToolClass::Trusted, false),
     row("graph_callers", ToolClass::Trusted, false),
@@ -183,12 +217,11 @@ pub const TABLE: &[ClassRow] = &[
     row("graph_path", ToolClass::Trusted, false),
     row("graph_architecture", ToolClass::Trusted, false),
     // Memory READS (V10). The write sibling is PERSISTENT-WRITE below.
+    // TRUSTED as a RECORDED RESIDUAL, not as a clean case — see the module
+    // docs' TRUSTED paragraph for what they actually return and why the three
+    // mitigations that keep them here are weaker than the structural tools'.
     row("context_recall", ToolClass::Trusted, false),
     row("context_notes", ToolClass::Trusted, false),
-    // The offload tools themselves — a consumer delegating a subtask must not
-    // be latched out of doing so (and the subtask gets its own latch).
-    row("offload_task", ToolClass::Trusted, false),
-    row("offload_batch", ToolClass::Trusted, false),
     // ── PERSISTENT-WRITE ───────────────────────────────────────────────────
     row("context_note", ToolClass::PersistentWrite, false),
     // ── Harness-native tools — classified, NOT enforced ─────────────────────
@@ -701,10 +734,16 @@ mod tests {
             "run_check",
             "security_audit",
             "quality_audit",
+            // Demoted by the 2026-08-07 re-verification sweep (C-1c): the
+            // delegated sub-task latches FRESH and permissive, so a TRUSTED
+            // `offload_task` laundered `read_file` past a latched tab.
+            "offload_task",
+            "offload_batch",
         ] {
             assert_eq!(classify(n), ToolClass::LocalCapability, "{n}");
         }
-        // TRUSTED: structural graph + app-composed reads + the offload tools.
+        // TRUSTED: structural graph + the two memory reads (the recorded
+        // residual — see the module docs).
         for n in [
             "graph_find_symbol",
             "graph_callers",
@@ -724,11 +763,20 @@ mod tests {
             "graph_architecture",
             "context_recall",
             "context_notes",
-            "offload_task",
-            "offload_batch",
         ] {
             assert_eq!(classify(n), ToolClass::Trusted, "{n}");
         }
+        // …and the class holds nothing else. A future promotion into the one
+        // class that never latches and is never blocked has to change this
+        // count, which is the review step the C-1/C-1c findings needed.
+        assert_eq!(
+            TABLE
+                .iter()
+                .filter(|r| r.class == ToolClass::Trusted)
+                .count(),
+            18,
+            "TRUSTED membership changed — re-read the module docs' membership rule"
+        );
         // PERSISTENT-WRITE: exactly one member.
         assert_eq!(classify("context_note"), ToolClass::PersistentWrite);
         assert_eq!(
@@ -905,11 +953,14 @@ mod tests {
             def("somenewserver__anything"),
             def("context_note"),
             def("context_recall"),
+            def("offload_task"),
         ];
         // Open: nothing removed.
         assert_eq!(names(&filter_defs(&all, Latch::Open)).len(), all.len());
         // EXTERNAL-latched: local-capability + persistent-write defs gone,
-        // external + trusted stay.
+        // external + trusted stay. `offload_task` is on the GONE side since the
+        // C-1c demotion — a contaminated scope may no longer delegate its lost
+        // local capability to a sub-task that would latch fresh.
         let ext = names(&filter_defs(&all, Latch::External));
         assert_eq!(
             ext,
@@ -927,6 +978,7 @@ mod tests {
         assert!(loc.contains(&"read_file".to_string()));
         assert!(loc.contains(&"graph_snippet".to_string()));
         assert!(loc.contains(&"context_note".to_string()));
+        assert!(loc.contains(&"offload_task".to_string()));
     }
 
     #[test]

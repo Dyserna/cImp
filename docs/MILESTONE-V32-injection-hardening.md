@@ -50,8 +50,8 @@ by the worker loop, the loopback proxy, and tests.
 | Class | Members | Latch behavior |
 |---|---|---|
 | **EXTERNAL** | everything proxied from configured MCP servers: `ddg_*`, `context7_*`, and **any unknown/future server by default** | first call latches the task/session: LOCAL-CAPABILITY becomes unavailable |
-| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, plus `run_check` and `security_audit`/`quality_audit` (see the 2026-08-07 amendment below) | first call latches the other way: EXTERNAL becomes unavailable |
-| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `context_recall`/`context_notes` (reads), `offload_task`/`offload_batch` themselves | never latches, never blocked |
+| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, plus `run_check` and `security_audit`/`quality_audit`, plus `offload_task`/`offload_batch` (see the two 2026-08-07 amendments below) | first call latches the other way: EXTERNAL becomes unavailable |
+| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `context_recall`/`context_notes` (reads — a **recorded residual**, see the second 2026-08-07 amendment) | never latches, never blocked |
 | **PERSISTENT-WRITE** | `context_note` (the one tool whose output outlives the session) | never latches; **write-gated while EXTERNAL-latched** (decision 10) |
 
 Rationale for the graph split: structural tools return names/edges/metadata
@@ -89,6 +89,54 @@ is the intended shape of the split, and both tools remain fully available to
 unlatched tasks and to the local/code profile. `mutates_fs` is unchanged —
 class and mutation capability are independent axes, and the V33 Phase F note on
 `run_check` still stands.
+
+**Phase A amendment 2026-08-07 (b) (re-verification sweep, finding C-1c,
+user-decided): `offload_task` and `offload_batch` are DEMOTED from TRUSTED to
+LOCAL-CAPABILITY.** The old rationale waved them through with *"the offload
+tools return a delegated subtask's answer (which gets its own latch)"*. It does
+— a **fresh and permissive** one: `Latch::from_profile(task.profile)`, and
+`Profile::Code.latch()` is `Latch::Local`, which *grants*
+`read_file`/`code_search`/`run_command`. The sub-task therefore holds exactly
+the class the parent just lost.
+
+The route was ungated by construction as well: `RunBody` carried no `tab` and
+`handle_run` had no latch, scope or tab reference. The attack a Phase H tab was
+open to end to end: model fetches an attacker page via `webfetch` → beacon →
+EXTERNAL; native `read`/`bash`/`edit` refuse and the proxied local tools refuse;
+model calls `offload_task { profile: "code", instructions: "print the contents
+of .env" }`; the sub-worker latches Local, reads it, and returns the text as an
+ordinary tool result — **no spotlighting envelope, no detection scan, no budget
+charge**, since all three are `/mcp/call`-only — and `webfetch` carries it out.
+
+Decision 4 is untouched: a declared profile still pre-applies the *sub-task's*
+latch at task start. That decision is about the sub-task's shape; this one is
+about whether a contaminated caller may delegate at all.
+
+Consequence, accepted and explicit: **a latched tab loses delegated offload
+entirely.** An EXTERNAL-latched (or contaminated-then-flipped) conversation gets
+the fixed `REFUSAL_LOCAL_BLOCKED` string for both tools, and a tab that
+delegates first is latched LOCAL and loses the web for the rest of the session.
+Unlatched tabs and the local/code side are unaffected. Enforcement is at
+`loopback::handle_run` (the one route both tools reach — an `offload_batch`
+fans out to one `/run` per subtask), keyed by the `tab` + `consumer` the
+`--offload-mcp` child now forwards in the body, exactly as `/graph_run` does.
+
+**Same amendment — the TRUSTED rationale for `context_recall`/`context_notes`
+is corrected, and they are NOT demoted.** The old text claimed *"the memory
+reads return the session's own working set"*, which the code contradicts:
+`context_recall` appends `list_project_facts` (*"durable knowledge that outlived
+the sessions it came from"*) and `context_notes` returns this session's notes
+**plus every pinned note for the project**. That is cross-session project
+knowledge reachable under an EXTERNAL latch. They stay TRUSTED as a **recorded
+residual** rather than a clean case, on three grounds that are deliberately
+written down as weaker than the structural tools': the content is prose the
+user's own sessions distilled rather than source text; decision 10 already
+quarantines the WRITE side, so injected content cannot enter that store
+unreviewed; and every delivery is spotlit (`recall_envelope`). None of the three
+bounds what a *pre-existing* pinned fact may contain — a user who has pinned
+credentials or a private architecture note has pinned them into a class that
+never latches. Demoting is a live option and would cost a latched tab its own
+memory; it is a user decision, not taken here.
 
 **Invariant (cross-module): unknown = EXTERNAL.** A newly configured MCP
 server must never default into TRUSTED or LOCAL-CAPABILITY. Reclassification
@@ -464,6 +512,44 @@ declares its class AND its mutation capability in one reviewed place.
   worker paths); latch state surfaced in `/status` for debuggability;
   fail-open rule: a call with no tab identity (pre-V28 child) follows V28's
   fallback discipline — but EXTERNAL results still get the envelope.
+
+  **Phase B amendment 2026-08-07 (#48, re-verification sweep) — the latch now
+  covers FOUR routes, not two.** The phase's own sentence ("`/graph_run` +
+  `/mcp/call`") was the whole of the enforcement, and two other routes reached
+  LOCAL-CAPABILITY without ever consulting `classify()`. Both are closed by
+  applying the *same* gate the other two use — one `latch_scope` funnel, one
+  settings snapshot, `LatchRoute::Native`, `GatePolicy::resolve` — rather than a
+  route-local check that can drift from it.
+  - **`POST /audit/run` (finding C-1b).** `security_audit`/`quality_audit` do
+    not arrive through the offload child at all: `cimp-code-audit` is a
+    *separate* MCP server (`cimp --code-audit-mcp`), and its client posts here.
+    So `b80f5b8`'s demotion reached only the worker's def filtering, and this
+    handler contained **no `latches()` call of any kind**. On a default install
+    (`code_audit.expose_offload` defaults true) a contaminated tab could be told
+    by a fetched page to run `security_audit` and put the gitleaks findings —
+    file, line, quoted source, `code: "generic-api-key"` — into its next
+    `ddg__search`. It could not be gated as written, either: `AuditRunBody` had
+    no `tab`, and the child was deliberately spawned without one, pinned by
+    `the_code_audit_child_gets_no_tab_id`. That test **pinned the opposite of
+    this decision and is replaced**, not deleted, by
+    `the_code_audit_child_carries_its_own_tab_id`, over both consumers' spawn
+    paths. The child takes `--tab <id>`, forwards it in the body, and the gate
+    runs after the `consumer_exposed` and wrong-instance guards — last before
+    the scan starts — so a request that was never going to run does not engage
+    the tab's latch.
+  - **`POST /run` (finding C-1c).** See the second Phase A amendment for the
+    class decision; this is where it binds. The `--offload-mcp` child now sends
+    `tab`, `consumer` and `tool` in the body (the first two mirroring
+    `/graph_run`; `tool` because an `offload_batch` fans out to one `/run` per
+    subtask, so the route cannot otherwise name what the model called). `tool`
+    is a **label, not a capability**: it is validated to the two known names at
+    the parse boundary, both classify identically, and no value a caller invents
+    can change the verdict.
+
+  Unchanged in both: an unknown tab id yields no scope and so keys no registry
+  entry (#45's bound, via the same funnel), and an identity-less child gets
+  V28's fail-open — stated in the log on each call rather than left to be
+  inferred from a missing row.
 - **C — detection surface + SSRF guard + canaries.** `yara-x` signature
   screen (data-file rules seeded from Vigil/garak corpora) on EXTERNAL
   results; Prompt Guard 2-22M classifier under `ort` (sliding 512-token
@@ -771,6 +857,148 @@ declares its class AND its mutation capability in one reviewed place.
       consumer; the two are separate because they answer different questions
       (*is the channel silent* vs *is this component frozen*) and only the
       second is a card.
+  - **Phase C3 amendment 2026-08-07 (d) — asset-origin containment, the
+    activation failure windows, and the disarmed signature layer (#48, deep
+    review U-1 / U-2 / D-2 / N-3).** Three HIGHs that meet at one seam —
+    `updater::live_reload` → `signature::reload` → `health_from_rules`.
+    - **The asset-origin invariant was defeated by dot-segment traversal
+      (HIGH, U-1).** The check was `url.starts_with(prefix)` on the *raw*
+      manifest text; `reqwest` then handed the string to the WHATWG parser,
+      which resolves dot segments **after** the check has passed. Verified
+      against `url` 2.5.8: literal `../`, `%2e%2e` (and `%2E%2E`), `.` mixed in,
+      and `\` as a separator all pass a string prefix compare and then normalize
+      to `github.com/attacker/…` — any GitHub user's published release assets.
+      Popping past the root *clamps*, so the segment count is not a defence
+      either. The host was contained; the path was wide open, and the spec's
+      "artifacts may only come from the same curated location" was not what the
+      code delivered. This is HIGH rather than "an attacker serves rules"
+      because the gauntlet only proves *compiles clean, fast, no benign control
+      matches, every hostile control matches* against a small fixed set of
+      shipped `.txt` files: **a bundle of one rule matching exactly those
+      samples and nothing else passes every gate** and reduces the signature
+      layer to a corpus echo, with no card raised. Closed by a new
+      `manifest::AssetAnchor`: both sides parsed, compared on scheme, `Host`
+      (not `host_str` — IDN and IP literals have more than one spelling),
+      `port_or_known_default`, empty username/password, and a prefix compare of
+      the parser's already-normalized paths; a query or fragment on an artifact
+      URL is refused outright (a release asset has neither). `url = "2"` was
+      already a direct dependency. The rejection message is unchanged verbatim —
+      a curator reads it.
+      Two more parts of the same hole, both required and both closed:
+      **redirects** (`HttpFetcher::client` set only `.timeout()` and
+      `.user_agent()`, so reqwest's default any-host 10-redirect policy applied,
+      and a parsed-prefix check is worth nothing if the response may point
+      elsewhere — now `redirect::Policy::none()`, so a 302 surfaces as its own
+      status); and the **plaintext downgrade** (`asset_prefix` accepted `http://`
+      for any host and `manifest_url()` returned the settings override verbatim,
+      making `detection_update_manifest_url` a whole-channel downgrade of the
+      document the SHA-256s come from). `http` is now loopback-only
+      (`127.0.0.0/8`, `::1`, exactly `localhost`), which keeps
+      live-verification recipe 11 working unchanged, and the override is
+      validated **in `run`, before the fetch** — the parse boundary only sees
+      the response, by which time the manifest has already travelled. A bad
+      override is `Rejected` (a check refused to run, and the person who typed
+      it is who the card is for), not `Unavailable`, and costs zero requests.
+    - **A failure inside the archive loop stripped `rules.d` with no rollback
+      (HIGH, U-2).** Activation archives the outgoing files, then moves the
+      staged ones in, and rolled back only for failures in the *second* loop;
+      the archive loop propagated its first error with a bare `?`. Files already
+      moved were not put back, `reload` was never called, and `previous_version`
+      is written only on the success path, so Revert stayed disabled. The
+      trigger is the most ordinary Windows failure there is — AV real-time
+      scanning, or the user holding a rule file open through the panel's own
+      *Open rules folder* button — and the result was `rules.d` holding a subset
+      across every restart. The two loops need **opposite** undos, which is why
+      there are now two: `roll_back` (clear the destination, then restore)
+      after the move loop has started, and `restore_archived` alone during the
+      archive loop, where the destination still holds the only copy of every
+      file the loop has not reached. A rollback whose own reload fails now says
+      so in the returned detail instead of only in a `warn!` nobody reads. The
+      same shape was applied to `revert_inner`, which had the same bare `?` in
+      **both** of its loops. Tested by injecting the failure at
+      `store::move_file` (a `#[cfg(test)]` fault keyed on an exact destination
+      file name, beside `MapFetcher` and for the same reason) rather than racing
+      a real sharing violation.
+    - **Revert could wipe its own source (HIGH, U-2 adjacent).**
+      `store::sanitize_version` is lossy and `sanitize_version("(shipped)")` is
+      `"shipped"`, so on a fresh install a manifest publishing a rules version
+      of `shipped` made Revert's `archive` and its `wipe_dir(&keep)` **the same
+      directory**: `rules.d` emptied, the run reported failure with no rollback,
+      and a second Revert (still enabled) destroyed the surviving copy. Guarded
+      by comparing the two archive **paths** — the collision is created by the
+      sanitizer, so only the sanitized form can see it — and failing closed with
+      a message naming both versions and the directory. Refusing a revert is
+      recoverable; emptying `rules.d` is not.
+    - **A crash journal, so a kill between the two loops is recoverable
+      (U-2 adjacent).** Without one, the next `activate` recomputed the archive
+      path from the unchanged `installed_version` and `wipe_dir`'d it,
+      destroying the only surviving copy of the old bundle — an interruption
+      that cost coverage until the next check became permanent loss.
+      `detection-updates/activation.json` records `{component, phase, archive,
+      dest}` before each loop and is cleared when the swap completes or undoes
+      itself; `run` and `revert` finish any recorded swap under the run lock
+      before touching anything. The `phase` is the point: an interrupted
+      *archive* loop is restore-only, an interrupted *move* loop must clear the
+      destination first or recovery leaves an old-plus-some-new set no curation
+      step ever validated. A journal naming an unknown component, or a
+      destination that is not this layout's, is discarded rather than acted on.
+      The journal is cleared **before** the state write on the success path, so
+      a crash in that gap re-applies the same bundle (idempotent) rather than
+      undoing an update the state already claims.
+    - **A failed reload silently disarmed the signature layer (HIGH, D-2).**
+      `signature::reload` overwrote the live slot unconditionally, so when
+      `compile_sources` returned `None` — rules directory unreadable, or every
+      file broken — the previously compiled rules were **dropped** and `scan`
+      returned empty for the rest of the process's life. Every subsequent page
+      reported clean. All four signal channels asserted the opposite: the three
+      detection Advisor rules are fed by `updater::advisor_signals` and none
+      reads `signature::status()` (the stall card says in so many words
+      *"Nothing is degraded — the data you have is still live and still
+      scanning"*); the reduced-protection badge is derived from settings
+      toggles, so a disarmed layer with the toggle ON rendered **full
+      protection**; no activity row is written on reload; the only signal was
+      `files_loaded: 0` in a Settings panel nobody had open. It also chained
+      with U-2 — a partial `rules.d` compiles into a permanently reduced
+      scanner on the next launch. Both halves fixed, because the first alone is
+      a fix with no consumer:
+      1. **Never trade a live rule set for nothing.** A new `signature::install`
+         is the one place the slot is swapped: a compile that produces no rule
+         set keeps the rules that are already live and records the new, failed
+         status honestly.
+      2. **A consumer:** a fourth Advisor rule,
+         `detection.signature_down.v1`, warn-only, fired from
+         `signature::advisor_signal` when the layer is switched on and
+         `files_loaded == 0 || rules == 0`; and `latch.ts`'s
+         `withSignatureHealth` folds the same fact into the injection hierarchy
+         as an extra reduced-protection row, so the status-bar chip and the tab
+         badge both see it. The row is added only to scopes where the detection
+         feature applies *and* resolves on — a scope that does not screen is not
+         reduced by a rules directory it never reads — and it carries its own
+         `reason`, because the three `decided_by` levels answer "who flipped
+         this switch", which is the wrong question for a fact about data on
+         disk. Decision 13's sentence — *"A failed validation surfaces an
+         Advisor card and keeps the old data — never silently degrades to
+         no-detection"* — was true on the updater path and false on the plain
+         reload path; it is now true on both.
+    - **The seam.** `live_reload` judges a freshly activated bundle with
+      `health_from_rules`, so keeping old rules must not make a bad bundle look
+      healthy. It cannot, structurally: `reload` returns the report of what the
+      **directory** compiled to, never what is in the live slot, so a bundle
+      that produced no rule set still arrives as `files_loaded: 0, rules: 0` and
+      still fails the gate, and activation still rolls back. Keeping the old
+      rules changes what is screening *while* the rollback runs; it changes
+      nothing about the verdict. `files_loaded == 0 || rules == 0` remains a
+      hard failure there — that is the never-degrade-to-nothing gate.
+    - **N-3 — one health predicate, not two.** Settings derived its green dot
+      as `files_failed === 0 && files_loaded > 0` in TypeScript, **omitting
+      `rules`**, which the updater requires: a `.yar` file that parsed and
+      defined no rules rendered green beside the literal text
+      "1 file(s) loaded, 0 rule(s)" while `scan` returned empty.
+      `signature::Status` now carries two derived booleans — `armed`
+      (`files_loaded > 0 && rules > 0`, the layer can match something at all)
+      and `healthy` (`armed && files_failed == 0`) — sealed in one place;
+      `health_from_rules` reads `healthy` rather than restating it, and the
+      Settings dot binds the same field.
   - **Known residuals.** (a) The compile ceiling is measured *around* the
     compile, not enforced inside it — yara-x exposes no compile deadline, so a
     pathological bundle is reliably *rejected* but still costs its own wall time
@@ -793,7 +1021,23 @@ declares its class AND its mutation capability in one reviewed place.
     `Rejected`, not `Unavailable`: the network answered a moment earlier, so a
     missing or unreachable asset is a broken published bundle. A connection that
     drops in exactly that window therefore cards once; the next successful check
-    clears it.
+    clears it. (f) `activate` still `wipe_dir`s the archive directory *before*
+    the archive loop, so a failure inside that loop leaves `rules.d` intact
+    (amendment (d)) but a previously retained bundle gone; `previous_version`
+    then names a directory whose files are not there and Revert refuses with
+    "empty or missing" — `RevertFailed`, non-destructive, and cleared by the
+    next successful update. Archiving into a temp directory and swapping would
+    close it and was judged not worth a third path through the same code.
+    (g) The `InjectionBadge` chip's tooltip counts `in_scope && !effective`
+    rows, so the synthetic signature row from amendment (d) is counted as a
+    "control switched off". The chip's own count rule is review finding G-2 and
+    is owned separately; the count is one high either way, and the popover the
+    click leads to names the row correctly. (h) **U-4 is still open**: a broken
+    user rule in `rules.d/local/` still vetoes every update, because validation
+    compiles the staged bundle alone while the post-activation health check
+    compiles staged **plus** `local/`. Staged separately and deliberately not
+    touched by amendment (d); `local/` remains unwritten and unenumerated for
+    moves.
 - **C2 — memory quarantine (decision 10).** `tainted` flag on `mem_note`
   rows written under latch; recall/auto-injection exclusion; Memory UI
   promote-or-discard; spotlighting envelope on all recalled memory at
@@ -1353,6 +1597,64 @@ declares its class AND its mutation capability in one reviewed place.
       `a_flag_rows_origin_reaches_the_wire_payload_verbatim`, with the "every
       row" half attributed to the mechanism that actually holds it (the
       required field).
+
+  - **Phase F amendment 2026-08-07 (#48, review finding C-2) — a forged session
+    rotation could clear the latch AND `contaminated`.** Decision 15 locks
+    *"contamination is a property of the conversation, not of the latch
+    position"*, and `/latch/override` deliberately cannot clear it. But
+    `TabLatch::observe` treats a **changed session id** as a new conversation
+    and resets `latch = Open`, `budget.reset()`, `latch_flagged = false`,
+    `beacon_flagged = false` and **`contaminated = false`** — and it is called
+    from all three state paths (`gate`, `beacon`, `view_for`), so even a
+    `/latch/state` poll applies it. Its doc comment defended the easy attack
+    ("keep calling until the registry blinks" — `None` is not a rotation) and
+    not the strictly easier one: make the registry report a *different* id.
+    Two writers could, and **both are closed, because neither fix alone is
+    sufficient — they are two independent writers into one registry**:
+    - **Filesystem variant.** A Claude tab's session id is the file stem of the
+      newest `*.jsonl` in `~/.claude/projects/<encoded-root>/`; `newest_jsonl`
+      ranks purely by mtime and the poll is 200 ms; and `oob/claude.rs` marked a
+      post-attach file live **immediately, with no growth check**
+      (`live_confirmed = !first_attach`). So
+      `type nul > %USERPROFILE%\.claude\projects\<enc>\aaaa.jsonl` from Bash —
+      a zero-byte file — cleared contamination within one poll, after which the
+      next `context_note` stores **clean** and the injected conclusion
+      auto-injects into every future clean session: exactly the persistence
+      decision 10 exists to prevent. **Fix: growth is the only proof.** The
+      decision is now a named type (`oob::claude::LiveSessionGate`) rather than
+      a flag inside a loop, because the chain spans three modules and needed a
+      test: `rotated()` drops confirmation unconditionally, and only
+      `observed(before, after)` — new bytes since the drain started — restores
+      it. `first_attach` still decides the backlog seek, and only that.
+    - **Token variant.** `handle_memory_event` keyed `mark_live_session` on
+      body-supplied strings at three sites, with `agent` defaulting to
+      `"opencode"` and **no tab validation of any kind** (#45's check is on the
+      read side only). `live_sessions` is one map with two key spaces — the
+      Claude tap keys by TAB id, OpenCode's loopback path keys by SESSION id —
+      so an authenticated POST could repoint a configured tab's entry and flap
+      the latch clear in a loop; the real tap re-stamping the true id within
+      200 ms produced a *second* rotation, so the race helped the attacker.
+      Side effect: V28 memory scoping corrupted. **Fix: reject the collision.**
+      All three sites funnel through `mark_live_session_from_event`, which
+      refuses any key that exactly names a configured AI tab
+      (`names_a_configured_ai_tab` — `is_configured_tab` **without** its
+      empty-list escape, because "settings not loaded yet" must mean "collides
+      with nothing", not "refuse everything"). Namespacing the OpenCode key
+      space was the other option; it would rewrite keys V24's usage and
+      permission consumers already read, for a hazard that exists only at the
+      collision. A real OpenCode session id is a UUID and a cImp tab id is
+      config-derived, so the two never legitimately meet.
+
+    **What is deliberately NOT changed:** `observe` still reopens the latch and
+    resets the budget on a rotation. Decision 15's line is that clearing
+    `contaminated` requires proof of a genuinely new conversation — the proof is
+    what was missing, not the consequence. Cost of the fix: a genuinely new
+    session is reported live one 200 ms poll later, once its first line lands.
+    Tests: `a_rotation_with_no_observed_growth_does_not_clear_contamination`,
+    `a_rotation_with_observed_growth_does_clear_contamination` and
+    `a_memory_event_cannot_key_the_registry_with_a_tab_id`, each asserted
+    *through* the enforcement point and each demonstrated red by reverting the
+    rule it names.
   - **`/status`** rows grew `contaminated`, `can_flip_local`, `can_unlatch` via
     a flattened `LatchView`, so `latch` stays a top-level key for the Phase B
     readers. Availability is published by the backend rather than re-derived in
@@ -1612,8 +1914,11 @@ declares its class AND its mutation capability in one reviewed place.
     above describes the code as it stands.
   - **Never reachable, by either route: clearing `contaminated`.** Decision 15
     holds — contamination is a property of the conversation, not of the latch
-    position. (The separate finding C-2, that a forged session rotation does
-    clear it, is tracked on its own and is not addressed here.)
+    position. (The separate finding C-2 — that a forged session *rotation* did
+    clear it, by two routes neither of which is `/latch/override` — is closed;
+    see the Phase F #48 C-2 amendment. A rotation must now be proved by observed
+    transcript growth, and a `/memory/event` body can no longer key the
+    live-session registry with a configured tab id.)
   - This is not a containment regression and never was one: decision 3 already
     says a model with a shell has the capabilities the latch withholds. What
     #45 restores is the *audit trail's* meaning — the difference between a feed

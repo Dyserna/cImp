@@ -395,19 +395,49 @@ pub async fn run_audit(
 /// Set once at startup (mirrors `offload/mcp.rs`).
 static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The cImp TAB this child was spawned for (`--tab <id>`), forwarded on every
+/// `/audit/run` — V32 C-1b.
+///
+/// **This child deliberately had no tab identity until 2026-08-07**, and a test
+/// (`tabs::config::tests::the_code_audit_child_gets_no_tab_id`) pinned that: the
+/// audit tools take no arguments and the scan always runs against the app's own
+/// launch root, so there was nothing per-tab to resolve. The 2026-08-07
+/// re-verification sweep found what that cost. `security_audit`/`quality_audit`
+/// were demoted to LOCAL-CAPABILITY by `b80f5b8`, but the demotion only reached
+/// the offload worker's def-filtering path — the audit tools do not arrive
+/// through the offload child at all, they arrive here, and `/audit/run` held no
+/// `latches()` call of any kind. A contaminated tab could ask for a gitleaks
+/// report and put the findings in its next search query.
+///
+/// A latch is keyed by `(agent, tab)`, so gating that route needs an identity
+/// the child never carried. Hence this. Absent (a hand-run child, or one spawned
+/// before the upgrade) ⇒ the route's fail-open `Anonymous` scope, the same
+/// discipline every other identity-taking route follows.
+static TAB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The configured consumer name, lowercased; `"claude"` when unset.
 fn consumer() -> &'static str {
     CONSUMER.get().map(String::as_str).unwrap_or("claude")
 }
 
-/// Entry point for `cimp --code-audit-mcp [--consumer <name>]`. Builds a
-/// current-thread tokio runtime and drives the shared stdio JSON-RPC loop
-/// ([`crate::mcp_stdio::serve`] — panic capture, shutdown-on-broken-stdout,
+/// This child's tab id, or `None` when it was spawned without one.
+fn tab() -> Option<&'static str> {
+    TAB.get().map(String::as_str)
+}
+
+/// Entry point for `cimp --code-audit-mcp [--consumer <name>] [--tab <id>]`.
+/// Builds a current-thread tokio runtime and drives the shared stdio JSON-RPC
+/// loop ([`crate::mcp_stdio::serve`] — panic capture, shutdown-on-broken-stdout,
 /// UTF-8 tolerance) until stdin closes. Much smaller than `offload/mcp.rs::run`
 /// — no backends, no SSE relay, no headless fallback. Never panics: a crash
 /// here would garble the host agent's MCP session.
-pub fn run(consumer: &str) {
+pub fn run(consumer: &str, tab: Option<&str>) {
     let _ = CONSUMER.set(consumer.trim().to_ascii_lowercase());
+    // Defence in depth at the parse boundary (mirrors `graph/mcp.rs`): `--tab ""`
+    // or a whitespace id is no identity at all, and must not become one.
+    if let Some(t) = tab.map(str::trim).filter(|t| !t.is_empty()) {
+        let _ = TAB.set(t.to_string());
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -442,6 +472,21 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
         "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
         "tools/call" => handle_tools_call(params).await,
         _ => Err((-32601, format!("method not found: {method}"))),
+    }
+}
+
+/// The MCP tool name one [`Category`] is served by — the inverse of the
+/// `tools/call` mapping in [`handle_tools_call`], kept beside it so the two
+/// spellings of the same pair cannot drift.
+///
+/// Its second consumer is the loopback's `/audit/run` taint gate (V32 C-1b):
+/// the route receives a `Category` on the wire and has to classify the *tool*
+/// (`toolclass::classify`), which is keyed by name. Deriving the name here is
+/// what stops the gate from carrying a hand-written copy of this pair.
+pub fn tool_name_for(category: Category) -> &'static str {
+    match category {
+        Category::Security => "security_audit",
+        Category::Quality => "quality_audit",
     }
 }
 
@@ -486,8 +531,12 @@ fn http_client() -> Result<reqwest::Client, String> {
 /// the streamed NDJSON reply.
 ///
 /// **Contract with the Stage-3 loopback route:**
-/// - Request body: `{"category": ..., "consumer": "<name>", "cwd": "<dir>"}`
-///   (bearer-authenticated). The scan root is the app's own launch project;
+/// - Request body:
+///   `{"category": ..., "consumer": "<name>", "cwd": "<dir>", "tab": "<id>"}`
+///   (bearer-authenticated). `tab` is omitted entirely when this child has no
+///   tab identity, so the body stays byte-identical to the pre-C-1b shape; the
+///   route resolves it to the calling tab's taint latch (see [`TAB`]). The scan
+///   root is the app's own launch project;
 ///   `cwd` (this child's working dir — the agent's project) is sent for
 ///   VERIFICATION only: the route rejects a request whose cwd falls outside
 ///   its root, so a misrouted child (stale/foreign discovery entry) gets a
@@ -513,11 +562,16 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
     // `category` serializes through its own `#[serde(rename_all = "lowercase")]`
     // derive — the exact serde the route's `AuditRunBody` deserializes with, so
     // the two ends agree by construction (no hand-maintained wire words).
-    let body = json!({
+    let mut body = json!({
         "category": category,
         "consumer": consumer(),
         "cwd": cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
     });
+    // V32 C-1b: the tab whose latch gates this scan. Inserted rather than
+    // always-present so a child with no identity sends the pre-C-1b body.
+    if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
+        map.insert("tab".to_string(), Value::String(t.to_string()));
+    }
     let mut resp = match client
         .post(format!("{base}/audit/run"))
         .bearer_auth(&token)

@@ -601,6 +601,43 @@ declares its class AND its mutation capability in one reviewed place.
     only needed if full Claude-side gating is ever pursued (the Phase F
     sensor matches web tools only, so the per-call tax does not apply to
     Read/Grep/Bash).
+  - **USER DECISION 2026-08-07 — the E split is resolved (decision 17).**
+    - **E1 (Claude) is DEFERRED, not cancelled.** Its `PreToolUse` gate would
+      spawn a process per `Read`/`Grep`/`Bash` — the whole tool surface, not
+      Phase F's two web tools — so its latency gate is the expensive one and
+      remains unspiked; Claude's own training plus the permission system is a
+      real (if probabilistic) backstop meanwhile. Revisit only if V33 slips
+      or evidence says the backstop is insufficient.
+    - **E2 (OpenCode) SHIPS as Phase H**: a settings-gated toggle,
+      **default OFF**, because OpenCode has no injection-resistance of its
+      own AND Phase F already built the delivery mechanism — the plugin's
+      `tool.execute.before` handler exists and fires today, so denying is a
+      branch rather than a new system.
+    - **Containment stays V33's job.** Phase H is a policy control and says
+      so: it runs inside the agent's own process, `OPENCODE_PURE=1` and
+      spawning an ungated `opencode` walk around it, and user-typed
+      `!shell`/PTY never reach the hook.
+    - Companion decision (locked, 3b): the pinned OpenCode permission block
+      **stays at today's effective `allow` values**. `webfetch: "ask"` was
+      considered and rejected for now — it only applies in `sensor`/`off`
+      mode (in `deny` webfetch is already refused), and Phase F's badge
+      already reports a fetch after the fact. Revisit if the badge surfaces
+      fetches the user did not expect.
+- **H — OpenCode native-tool taint gating (decision 17; user-decided
+  2026-08-07).** Extend the existing Phase F plugin handler from beacon-only
+  to beacon-and-gate, behind a settings toggle **defaulting off**, joining
+  the Phase G hierarchy as a first-class feature (L2 + per-tab L3).
+  **Whole-surface within its class or nothing** — the E2 spike watched the
+  model reroute a blocked `write` through `bash`, so a partial gate is
+  worse than none: under an EXTERNAL latch every LOCAL-CAPABILITY native
+  (`bash`/`edit`/`write`/`patch`/`apply_patch`/`read`/`glob`/`grep`) is
+  denied, and under a LOCAL latch the native web tools are. Deny by
+  `throw` (the only mechanism the hook has); **never** rewrite args (the
+  buggy upstream path). Fail-OPEN on any error, unreachable loopback or
+  unknown state — consistent with every other V32 control, and the reason
+  the toggle can default off without a second failure mode. The Phase F
+  manual override moves this gate with it: a user who flips to local gets
+  the native local tools back, which is the whole point of decision 15.
 - **F — native-web visibility modes + manual latch override (decisions 14
   + 15; user-decided 2026-08-07).** `native_web_visibility` setting
   (`off | sensor | deny`, default `sensor`): report-only beacon hooks
@@ -956,3 +993,15 @@ declares its class AND its mutation capability in one reviewed place.
     master ON and the taint latch feature OFF app-wide, set one tab's
     latch override to `On`: that tab latches, a second tab does not, and
     `/status` names which level decided each.
+15. Phase H (OpenCode native gating, decision 17): with the toggle OFF
+    (default) an OpenCode tab behaves exactly as it does today — a
+    latched tab still runs `bash`/`read` natively. Turn it ON, restart
+    the tab, fetch a page through the proxied `ddg` so the tab latches
+    EXTERNAL: a native `read` and a native `bash` are both refused with
+    the model-visible message, `webfetch` still runs, and the refusal
+    does NOT stop the turn. Then use the decision-15 "switch to local"
+    override: the native `read`/`bash` work again and `webfetch` is now
+    the refused side. Stop the app entirely and repeat with the toggle
+    on — every native tool still runs (fail-open on an unreachable
+    loopback is the locked behavior, not a bug). Control: with the
+    toggle on and the tab UNLATCHED, nothing is refused.

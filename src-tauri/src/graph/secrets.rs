@@ -184,7 +184,10 @@ mod tests {
         let names: Vec<String> = rules.iter().map(|r| r.identifier().to_string()).collect();
         assert!(names.len() >= 10, "thin ruleset: {names:?}");
         for n in &names {
-            assert!(n.starts_with("secret_"), "rule `{n}` breaks the prefix rule");
+            assert!(
+                n.starts_with("secret_"),
+                "rule `{n}` breaks the prefix rule"
+            );
         }
     }
 
@@ -224,10 +227,7 @@ mod tests {
                 "secret_google_api_key",
                 "AIzaSyB1234567890abcdefghijklmnopqrstuv",
             ),
-            (
-                "secret_stripe_key",
-                "sk_live_0123456789abcdefghijklmnop",
-            ),
+            ("secret_stripe_key", "sk_live_0123456789abcdefghijklmnop"),
             (
                 "secret_json_web_token",
                 "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",

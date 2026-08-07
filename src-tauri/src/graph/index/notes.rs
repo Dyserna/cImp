@@ -483,7 +483,8 @@ pub(super) const FIXTURE_CREATE_PRE_C2: &str =
 
 /// Insert `$rows` in the pre-C2 column set.
 #[cfg(test)]
-pub(super) const FIXTURE_PUT_PRE_C2: &str = "?[note_id, session_id, text, ts_ms, pinned] <- $rows\n\
+pub(super) const FIXTURE_PUT_PRE_C2: &str =
+    "?[note_id, session_id, text, ts_ms, pinned] <- $rows\n\
      :put mem_note {note_id => session_id, text, ts_ms, pinned}";
 
 /// Insert `$rows` into the migration stage, in the C2 column set — what an

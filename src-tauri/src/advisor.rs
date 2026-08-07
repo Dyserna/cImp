@@ -408,8 +408,7 @@ pub struct Signals {
     /// here it is matching fine and a file the user wrote is being skipped. It
     /// only became a silent condition once U-4 stopped letting it veto the
     /// update channel — before that it was loud, and wrong about why.
-    pub detection_local_rules_broken:
-        Option<crate::offload::detection::updater::BrokenLocalRules>,
+    pub detection_local_rules_broken: Option<crate::offload::detection::updater::BrokenLocalRules>,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -936,7 +935,11 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     // suppression at the source, so the two can never both fire.
     if let Some(b) = &sig.detection_local_rules_broken {
         let signature = b.failed.join(",");
-        if !is_dismissed(&sig.dismissed, RULE_DETECTION_LOCAL_RULES_BROKEN, &signature) {
+        if !is_dismissed(
+            &sig.dismissed,
+            RULE_DETECTION_LOCAL_RULES_BROKEN,
+            &signature,
+        ) {
             out.push(Proposal {
                 setting: String::new(),
                 current: format!(
@@ -2585,11 +2588,7 @@ mod tests {
             "the card must not read as an outage: {}",
             p.current
         );
-        assert!(
-            p.rationale.contains("do not compile"),
-            "{}",
-            p.rationale
-        );
+        assert!(p.rationale.contains("do not compile"), "{}", p.rationale);
         // The identifier-collision cause is named, because it is the one an
         // update can introduce without the user's file changing at all.
         assert!(p.rationale.contains("IDENTIFIER"), "{}", p.rationale);
@@ -2616,7 +2615,10 @@ mod tests {
                 .any(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN)
         };
         assert!(!fires(&["local/mine.yar"]), "dismissed for what it named");
-        assert!(fires(&["local/other.yar"]), "a different file is a new fact");
+        assert!(
+            fires(&["local/other.yar"]),
+            "a different file is a new fact"
+        );
         assert!(
             fires(&["local/mine.yar", "local/other.yar"]),
             "a widened set is a new fact"

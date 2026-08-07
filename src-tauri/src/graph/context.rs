@@ -1572,7 +1572,10 @@ mod tests {
             .filter(|l| l.starts_with('x') || l.contains('…'))
             .map(|l| l.chars().count())
             .sum::<usize>();
-        assert!(inner_len <= COMPACTION_CAP_CHARS, "content cap: {inner_len}");
+        assert!(
+            inner_len <= COMPACTION_CAP_CHARS,
+            "content cap: {inner_len}"
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

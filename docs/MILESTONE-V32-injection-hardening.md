@@ -267,6 +267,51 @@ declares its class AND its mutation capability in one reviewed place.
       HEALTH (did dailies happen, did anything fail validation) and
       curates the upstream bundle — it is no longer the update mechanism
       itself.
+14. **Native-web visibility modes (user decision 2026-08-07).** The latch
+    only sees web access that flows through cImp; the harnesses' OWN web
+    tools (Claude WebFetch/WebSearch, OpenCode webfetch/websearch) are
+    invisible to it. A three-way setting `native_web_visibility`, applied
+    per consumer at spawn time:
+    - `off` — pre-V32 behavior, no interference, no visibility. The
+      documented escape hatch when hooks misbehave.
+    - `sensor` (**default** — we cannot assume what MCP setup a user runs,
+      and silent-open is worse than a beacon): report-only hooks. Claude:
+      a PreToolUse hook MATCHED ONLY on the web tools (so no latency tax
+      on Read/Grep/Bash) POSTs a beacon to the loopback; OpenCode: the
+      existing plugin gains a `tool.execute.before` handler that beacons
+      on webfetch/websearch and NEVER throws. A beacon engages the tab's
+      EXTERNAL latch (proxied side) + the decision-15 badge. Hooks never
+      deny; a hook/loopback failure is silently fail-open (sensor mode
+      must never break a tab).
+    - `deny` — close the native web route by config: Claude `--settings`
+      overlay permission-denies WebFetch/WebSearch; OpenCode pinned
+      `permission` block sets webfetch/websearch to "deny". All web then
+      flows through the proxied `ddg`/MCP tools, where the existing latch
+      is fully effective. The long-term desired posture, paired with the
+      native-tool-alternatives document (all web capability provided by
+      local/proxied MCP servers).
+    Honest limits, all modes: native LOCAL tools (Read/bash/edit) are NOT
+    gated by sensor/deny — that remains optional full Phase E gating and
+    V33 OS containment; shell-level net access (`curl` in Bash) is
+    invisible in every mode (V33 egress control).
+15. **Manual latch override (user decision 2026-08-07 — amends decision
+    1's stickiness for USER-initiated action only; automatic resets stay
+    rejected).** Per-tab UI surfaced from `/status`: a taint badge plus:
+    - **"Switch to local"** (the workflow button: research done, output
+      reviewed, now apply it) — flips an EXTERNAL latch to Local:
+      restores proxied local-capability tools and CLOSES the external
+      side. At no moment does the session hold read + web simultaneously.
+    - **"Full unlatch"** — restores both sides; explicit at-own-risk
+      confirmation (this recreates the trifecta with injected content
+      still in context).
+    - Restart-tab guidance shown beside both (the only truly clean exit).
+    **Contamination outlives the override:** a contaminated bit survives
+    every flip/unlatch — post-override `context_note` writes stay
+    quarantined and EXTERNAL results stay enveloped. Contamination is a
+    property of the conversation, not of the latch position. Overrides go
+    through an authenticated loopback endpoint; every override writes an
+    `injection_flag` row (`screen=latch_override`, ok:true) so the feed
+    records who opened what.
 
 ## Phases
 
@@ -492,6 +537,34 @@ declares its class AND its mutation capability in one reviewed place.
   - Spike E2: OpenCode plugin `tool.execute.before` (existence/stability in
     1.18.x is UNVERIFIED) doing the same. Negative verdict ⇒ document the gap
     in ARCHITECTURE.md; Claude-side may still land alone.
+  - **E2 spike VERDICT (2026-08-07, on #37): GO-with-caveats** — the hook is
+    real, stable since v0.4.0, denies via `throw` (model-visible), covers
+    sub-agents; but a live probe showed PARTIAL gating is routed around by
+    the model (write blocked ⇒ it used bash), so full E means whole-surface
+    deny-by-default; the plugin file is currently deleted when
+    `graph.enabled` is off (fail-open trap to fix before any gate rides it);
+    `permission.ask` is a dead hook in 1.18.13; policy-not-containment
+    (`OPENCODE_PURE` escape hatches; user-typed `!shell`/PTY never fire it).
+    Full deny-by-default E remains OPTIONAL and unscheduled; the sensor
+    subset ships as Phase F (decision 14). E1 latency spike still pending —
+    only needed if full Claude-side gating is ever pursued (the Phase F
+    sensor matches web tools only, so the per-call tax does not apply to
+    Read/Grep/Bash).
+- **F — native-web visibility modes + manual latch override (decisions 14
+  + 15; user-decided 2026-08-07).** `native_web_visibility` setting
+  (`off | sensor | deny`, default `sensor`): report-only beacon hooks
+  (Claude PreToolUse matched on web tools only, riding the `--settings`
+  overlay; a second handler in the existing OpenCode plugin — whose
+  write-out must first be DECOUPLED from `graph.enabled`, the E2 spike's
+  fail-open trap) engaging the tab's EXTERNAL latch on native web use, or
+  config-level denial of the native web tools (Claude settings overlay +
+  OpenCode pinned permission block). Per-tab taint badge + "Switch to
+  local" / "Full unlatch" (confirm) / restart guidance, contamination bit
+  surviving overrides (quarantine + envelope stay), authenticated loopback
+  override endpoint, `latch_override` activity rows. Companion deliverable:
+  a harness-native-tool coverage document (what Claude/OpenCode native
+  tools provide vs. what local/proxied MCP equivalents cover, gaps, and a
+  recommended all-local configuration for `deny` mode).
 
 ## Accepted residuals (documented, not solved)
 
@@ -573,3 +646,17 @@ declares its class AND its mutation capability in one reviewed place.
     a deliberately broken staged bundle (bad checksum, then non-compiling
     rule) is REJECTED, old rules stay active, Advisor card raised; revert
     button restores the previous bundle.
+12. Sensor mode (default): in a Claude tab, use the NATIVE WebFetch tool —
+    the tab's badge appears, `/status` shows the latch engaged, and a
+    proxied `graph_snippet` is refused; same via OpenCode's native
+    webfetch. Set `native_web_visibility: off`, restart the tab, repeat —
+    no badge, no latch (and no hook injected at all). `deny` mode: the
+    native web tools are refused by the harness itself; a proxied
+    `ddg__fetch_content` still works and latches as in (3).
+13. Override: with a tab EXTERNAL-latched, "Switch to local" restores
+    `graph_snippet` and refuses `ddg__*` (flip, not unlatch); a
+    `context_note pin=true` written AFTER the flip still lands quarantined
+    (contamination survives the override); "Full unlatch" (after its
+    confirmation) restores both sides; both actions show as
+    `latch_override` rows in Tool Activity; a tab restart still resets
+    everything.

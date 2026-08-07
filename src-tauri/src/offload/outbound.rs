@@ -661,6 +661,43 @@ pub enum Screen {
     LatchBeacon,
 }
 
+/// Declare [`Origin`] and [`Origin::ALL`] from one variant list, so the array
+/// cannot drift from the enum (#48).
+///
+/// The same move `declare_features!` makes for `Feature::ALL` (#47), taken here
+/// for the same reason it was taken there: the test that guards the set —
+/// `flag_origins_are_distinct_wire_values` — iterated a hand-written array, so
+/// a fourth variant would have been invisible to its own coverage. #47 fixed
+/// that one file over and left this one, which is the shape of defect a
+/// mechanism applied by hand always has.
+macro_rules! declare_origins {
+    (
+        $(#[$enum_attr:meta])*
+        pub enum $name:ident {
+            $( $(#[$variant_attr:meta])* $variant:ident ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $( $(#[$variant_attr])* $variant, )+
+        }
+
+        impl $name {
+            /// Every origin, in declaration order (least to most claimed).
+            /// Derived from the variant list above, not written beside it.
+            ///
+            /// Test-only today — unlike `Feature::ALL` there is no report or
+            /// settings matrix that renders origins — so it carries the same
+            /// `cfg_attr` as `LatchStatus::latch`. It exists so the tests that
+            /// guard the set iterate the ENUM rather than a hand-written array
+            /// a new variant would be invisible to (#48).
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
+        }
+    };
+}
+
+declare_origins! {
 /// Who asked for the state change a flag row records (#45).
 ///
 /// The V32 review's sharpest finding about the audit trail was not that a row
@@ -690,8 +727,12 @@ pub enum Origin {
     /// one.
     Http,
 }
+}
 
 impl Origin {
+    /// The row's wire value, and the word a caller composing the row's prose
+    /// interpolates so the two halves cannot disagree (#48 — see
+    /// `loopback::FlagRow`).
     pub fn as_str(self) -> &'static str {
         match self {
             Origin::Internal => "internal",
@@ -1244,28 +1285,42 @@ mod tests {
         assert!(Screen::Ssrf.is_denial());
     }
 
-    /// #45: the provenance column. Its whole value is that the three cases are
+    /// #45: the provenance column. Its whole value is that the cases are
     /// *distinguishable* — a shared spelling would put "the user clicked" and
     /// "a local process POSTed" back in the same bucket, which is the finding.
+    ///
+    /// #48: iterates [`Origin::ALL`], which the `declare_origins!` macro emits
+    /// from the enum, instead of the hand-written `[Internal, Ipc, Http]` array
+    /// it used to. That array was the exact defect #47 fixed for `Feature::ALL`
+    /// and left uncorrected one file over: a fourth variant was invisible to
+    /// the test that was supposed to guard the set. The literal list below is
+    /// now the *assertion* rather than the input, so adding a variant fails
+    /// here until someone gives it a wire value and names it.
     #[test]
     fn flag_origins_are_distinct_wire_values() {
-        let all = [Origin::Internal, Origin::Ipc, Origin::Http];
-        let labels: Vec<&str> = all.iter().map(|o| o.as_str()).collect();
+        let labels: Vec<&str> = Origin::ALL.iter().map(|o| o.as_str()).collect();
         assert_eq!(labels, ["internal", "ipc", "http"]);
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Origin::ALL.len(),
+            "two origins share a wire value, so the feed cannot tell them apart: {labels:?}"
+        );
     }
 
-    /// #45: every flag row carries its origin. #47 makes the field **required**
-    /// on [`Flag`] rather than defaulted by the recorder, so a row that omitted
-    /// it — and would therefore be read as "cImp decided this, no reason to
-    /// doubt it", the reading the original finding says is unearned — no longer
-    /// compiles. This pins the wire values the reader depends on.
+    /// A row's `origin` reaches the wire payload verbatim, for every origin.
+    ///
+    /// #48 renamed this from `every_flag_row_states_who_asked`, which claimed a
+    /// property over *every row* while building exactly one `Flag` and checking
+    /// the echo. "Every row states who asked" is real, but it is enforced by
+    /// the type, not here: #47 made [`Flag::origin`] a required field, so a row
+    /// that omits it does not compile — there is no runtime observation of
+    /// "every row" that a test could make short of a source scan. What this
+    /// pins is the part a reader depends on: the value a call site states is
+    /// the value the payload carries, unmapped and unmangled.
     #[test]
-    fn every_flag_row_states_who_asked() {
-        for (origin, expected) in [
-            (Origin::Internal, "internal"),
-            (Origin::Ipc, "ipc"),
-            (Origin::Http, "http"),
-        ] {
+    fn a_flag_rows_origin_reaches_the_wire_payload_verbatim() {
+        for origin in Origin::ALL.iter().copied() {
             let flag = Flag {
                 screen: Screen::LatchOverride,
                 origin,
@@ -1280,7 +1335,7 @@ mod tests {
                 detail: "detail",
             };
             let req = flag_request(&flag);
-            assert_eq!(req["origin"], expected);
+            assert_eq!(req["origin"], origin.as_str());
             assert_eq!(req["screen"], "latch_override");
             assert_eq!(req["scope"], "claude:claude-1");
         }

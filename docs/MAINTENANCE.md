@@ -991,6 +991,17 @@ boundary, which is the only remaining legitimate use — see
   *wrong answers* rather than missing ones. If a scan needs either, it needs
   an AST query instead (rule 3) — or the property belongs in rule 1 or 2.
 
+  **The narrow exception, and why it is one (#48).** What makes a heuristic
+  unacceptable here is the *direction* of its wrong answer: `in_comment` read a
+  real hit as a comment and **skipped** it, so an offender went unreported and
+  the invariant was quietly weaker. A guard that can only ever *add* failures is
+  a different object. `graph/index/notes.rs`'s fourth self-guard fails on any
+  match sitting behind a `//` on its line — it recognizes a subset of comment
+  placements and turns each into a red test; a placement it does not recognize
+  leaves the scan exactly where it stood. Read it before copying the shape: the
+  test is "can this heuristic's wrong answer make the suite green when it should
+  be red?", not "is a substring involved?".
+
 ---
 
 ## Open spikes & unverified contracts

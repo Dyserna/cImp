@@ -44,9 +44,31 @@
 //!
 //! **House rule for this file:** never write the relation's datalog atom form
 //! (a `*` immediately followed by the relation name and a `{`) inside a comment
-//! or a string that is not a real query. The scan's self-guard counts
-//! occurrences in this file and cannot tell prose from code — a comment that
-//! satisfies the guard is precisely the vacuity bug this module replaces.
+//! or a string that is not a real query. A comment that satisfies the "the
+//! guarded thing still exists" self-guard is precisely the vacuity bug this
+//! module replaces — and #48 found the rule already broken, by `atom()`'s own
+//! doc comment, one commit after it was written. The rule is therefore
+//! **executable** now: the scan's fourth self-guard fails on any match that
+//! sits behind a `//` on its line, so prose satisfying the count is a red test
+//! rather than a silent hole. Write "the atom form" in words instead.
+//!
+//! # What this scan does NOT see (stated, not fixed)
+//!
+//! It is a literal scan over one spelling, so two shapes are outside it:
+//!
+//! - **A query whose relation name is interpolated.**
+//!   [`GraphIndex::mem_note_row_count`] builds its atom with a `format!` over a
+//!   `name` parameter, so no literal atom appears in the source at all. It is
+//!   in this file (the boundary holds) and it is migration-only, but a future
+//!   parameterized *read* elsewhere would be invisible here. The module
+//!   boundary, not the scan, is what covers that.
+//! - **Statements that name the relation without an atom.** `graph/index.rs`'s
+//!   `#[cfg(test)] mod tests` still runs four — `::remove mem_note`,
+//!   a pre-C2 `:create`, and two `:put`s — to build the fixtures the migration
+//!   tests need. None of them can *read* a row (they are DDL and writes), so
+//!   none can bypass the quarantine filter, which is why the scan is green with
+//!   them present and why widening the pattern to catch them would only add
+//!   noise.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -456,46 +478,102 @@ mod tests {
     /// the named form (`{a, b}`) this codebase uses and the positional form
     /// (`[a, b]`) it does not, with whitespace tolerated between every part.
     ///
-    /// The retired version of this scan matched the fixed string `*mem_note{`,
+    /// The retired version of this scan matched a fixed star-name-brace string,
     /// so both a space and the positional form evaded it entirely. The trailing
     /// delimiter is required, which is also what keeps the stage relation
     /// (`mem_note_v32`) and any future suffixed sibling from matching here: a
-    /// name that continues past `mem_note` has neither `{` nor `[` next.
+    /// name that continues past the relation name has neither `{` nor `[` next.
+    ///
+    /// This doc comment used to spell the retired pattern out, in breach of the
+    /// file's house rule — and that one comment was enough to satisfy
+    /// [`note_queries_live_only_in_this_module`]'s third self-guard all by
+    /// itself, so renaming the relation left the suite fully green with **zero**
+    /// production queries matched (#48). Guard 4 below now makes that shape a
+    /// test failure instead of a comment nobody re-reads.
     fn atom() -> regex::Regex {
         regex::Regex::new(r"\*\s*mem_note\s*[\{\[]").expect("a static pattern compiles")
     }
+
+    /// The text preceding byte offset `at` on its own line, plus that line's
+    /// 1-based number — the two facts guard 4 reports a violation with.
+    fn line_prefix(text: &str, at: usize) -> (usize, &str) {
+        let bol = text[..at].rfind('\n').map_or(0, |i| i + 1);
+        (text[..bol].matches('\n').count() + 1, &text[bol..at])
+    }
+
+    /// Every real note query in this module, counted by hand so a deletion
+    /// fails here instead of thinning the guarded set quietly (#48).
+    ///
+    /// MAINTENANCE.md's § *Cross-module invariants* requires "a per-file floor
+    /// for every known site" of any surviving scan, and this one shipped
+    /// without it: `mine > 0` alone tolerated eight of the nine vanishing. The
+    /// nine, in file order: `RM_BY_SESSION`, `RM_ALL`,
+    /// `RM_UNPINNED_BY_SESSION`, the migration's read, `mem_delete_note`,
+    /// `rewrite_note`'s read, `mem_notes`, `mem_quarantined_notes`,
+    /// `mem_quarantined_count`.
+    ///
+    /// Raise it when a query is added; lowering it is a decision that belongs
+    /// in a commit message, which is the point of it being a constant.
+    const NOTE_QUERIES: usize = 9;
 
     /// The cross-module half of locked decision 10, as a backstop to the module
     /// boundary above: no file outside this one queries the note relation, so
     /// the quarantine filter in `mem_notes` cannot be bypassed by a reader that
     /// writes its own datalog.
     ///
-    /// Three self-guards, all of which the retired version lacked (#47):
+    /// Four self-guards. Three were added by #47, and #48 added the fourth
+    /// after the third turned out to be satisfiable by prose one commit later:
     ///
     /// 1. **`SELF` is excluded**, so this file's own regex and prose cannot
     ///    satisfy the assertion the way `graph/index.rs` satisfied the old one.
     /// 2. **The scan must find its own file**, so a rename or a move of this
     ///    module fails here instead of silently scanning nothing.
-    /// 3. **The guarded thing must still exist**: at least one real query left
-    ///    in this module. Renaming the relation (say to a `_v2`) makes every
-    ///    atom vanish everywhere; without this the scan would then pass while
-    ///    guarding nothing at all, which is exactly how the old one would have
-    ///    failed. Note what this guard deliberately does NOT try to check: that
-    ///    the filter still *works*. That is behaviour, and behaviour is pinned
-    ///    by a behavioural test — see
+    /// 3. **The guarded thing must still exist**: [`NOTE_QUERIES`] real queries
+    ///    left in this module, not merely one. Renaming the relation (say to a
+    ///    `_v2`) makes every atom vanish everywhere; without this the scan would
+    ///    then pass while guarding nothing at all, which is exactly how the old
+    ///    one would have failed. Note what this guard deliberately does NOT try
+    ///    to check: that the filter still *works*. That is behaviour, and
+    ///    behaviour is pinned by a behavioural test — see
     ///    `quarantined_notes_are_hidden_from_reads_until_promoted` in
     ///    `graph/index.rs`. A source scan asserting that its own file contains
     ///    some substring is satisfied by its own error message.
+    /// 4. **Every match here must be a real query** — the file's house rule,
+    ///    made executable (#48). Guard 3 counts occurrences and cannot tell
+    ///    prose from code; when it shipped, `atom()`'s own doc comment spelled
+    ///    the retired pattern out and satisfied guard 3 on its own, so renaming
+    ///    the relation identifier left the whole suite green with zero
+    ///    production queries matched. A match sitting behind a `//` on its line
+    ///    now fails.
+    ///
+    ///    **Why this is not the banned line heuristic** (MAINTENANCE.md §
+    ///    *Cross-module invariants*). The ban is on heuristics whose wrong
+    ///    answer *weakens* the invariant: the retired `in_comment` read a real
+    ///    hit as a comment and SKIPPED it, so an offender went unreported. This
+    ///    one only ever moves in the failing direction — it recognizes a subset
+    ///    of comment placements and turns each into a red test. A placement it
+    ///    does not recognize (a block comment, an atom inside a non-query
+    ///    string) leaves the scan exactly where it stands today, covered by the
+    ///    house rule as before. It answers "is there a line-comment opener
+    ///    before this match", not "is this byte inside a comment"; the second is
+    ///    the parsing question, and nothing here asks it.
     #[test]
     fn note_queries_live_only_in_this_module() {
         let files = source_files();
         let re = atom();
         let mut mine: Option<usize> = None;
+        let mut prose: Vec<String> = Vec::new();
         let mut offenders: Vec<String> = Vec::new();
         for (rel, text) in &files {
             let hits = re.find_iter(text).count();
             if rel == SELF {
                 mine = Some(hits);
+                for m in re.find_iter(text) {
+                    let (line, before) = line_prefix(text, m.start());
+                    if before.contains("//") {
+                        prose.push(format!("{rel}:{line}"));
+                    }
+                }
             } else if hits > 0 {
                 offenders.push(format!("{rel} ({hits})"));
             }
@@ -508,10 +586,20 @@ mod tests {
             )
         });
         assert!(
-            mine > 0,
-            "no note query left in `{SELF}` — if the relation was renamed, update the pattern in \
-             `atom()` and this message; until then locked decision 10's read exclusion is \
-             unguarded and every assertion below is vacuous."
+            prose.is_empty(),
+            "HOUSE RULE (see this file's module docs) — the note relation's atom form is written \
+             behind a `//` at: {prose:?}\n\n\
+             A comment satisfies the count guard below without guarding anything, which is how \
+             `atom()`'s own doc comment kept this whole scan green through a relation rename \
+             (#48). Say \"the atom form\" in words instead."
+        );
+        assert!(
+            mine >= NOTE_QUERIES,
+            "expected at least {NOTE_QUERIES} note queries in `{SELF}`, found {mine} — if the \
+             relation was renamed, update the pattern in `atom()` and this message; if a query \
+             was deliberately removed, lower `NOTE_QUERIES` in the same commit. Until then \
+             locked decision 10's read exclusion is guarded over a thinner set than it was, or \
+             not at all."
         );
         assert!(
             offenders.is_empty(),

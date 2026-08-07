@@ -357,9 +357,22 @@ impl PushNotice {
     /// `template` is `&'static str` and the interpolation happens in here: that
     /// is the whole enforcement mechanism for locked decision 9 (see the type
     /// docs). Each `{}` is replaced by the corresponding entry of `args`, in
-    /// order. A count mismatch is a producer bug — it warns and fills what it
-    /// can rather than panicking, because a malformed notice must not take down
-    /// the scan or index that was only announcing itself.
+    /// order.
+    ///
+    /// **A count mismatch is a producer bug, and it now has a consumer (#48).**
+    /// In release it still warns and fills what it can, because a malformed
+    /// notice must not take down the scan or index that was only announcing
+    /// itself. But "warn and ship it anyway" was the whole of it, and the three
+    /// failure shapes are all silent to a reader: too few args leaves a hole in
+    /// a sentence, a surplus arg is dropped, and a leftover *named* slot
+    /// (`{done}`, `{project}` — both real templates used those spellings before
+    /// #47 rewrote them) is emitted literally, since only the bare `{}` is a
+    /// slot here. The `debug_assert!` makes every one of them a test failure at
+    /// zero production cost.
+    ///
+    /// It lives here rather than in [`interpolate`] so that function stays a
+    /// pure, lenient primitive its own degradation test can still exercise in
+    /// both profiles.
     ///
     /// `meta` lands in a `BTreeMap` so the rendered attribute order is stable —
     /// a push is user-visible text, and a wobbling attribute order would make
@@ -382,8 +395,17 @@ impl PushNotice {
                 );
             }
         }
+        let (content, slots) = interpolate(template, args);
+        debug_assert_eq!(
+            slots,
+            args.len(),
+            "offload push: template slot/argument count mismatch — `{template}` has {slots} `{{}}` \
+             slot(s) and was given {} argument(s), so the notice text is malformed. Fix the \
+             producer (a leftover NAMED slot like `{{done}}` is not a slot here).",
+            args.len()
+        );
         Self {
-            content: interpolate(template, args),
+            content,
             meta: kept,
         }
     }
@@ -412,13 +434,17 @@ fn keep_valid_meta(meta: BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Fill `template`'s `{}` slots from `args`, in order.
+/// Fill `template`'s `{}` slots from `args`, in order. Returns the filled text
+/// and the number of slots the template actually had.
 ///
 /// Deliberately lenient on a count mismatch (a missing arg leaves the slot
 /// empty, a surplus arg is dropped) and loud about it: this runs on the
 /// announce path of a finished index or scan, and a producer's formatting bug
-/// must not become that operation's failure.
-fn interpolate(template: &'static str, args: &[&str]) -> String {
+/// must not become that operation's failure. The slot count rides out (#48) so
+/// [`PushNotice::new`] can turn the same mismatch into a `debug_assert!` — a
+/// signal with a consumer — while this stays a pure function whose degradation
+/// behaviour is testable in both build profiles.
+fn interpolate(template: &'static str, args: &[&str]) -> (String, usize) {
     let mut out =
         String::with_capacity(template.len() + args.iter().map(|a| a.len()).sum::<usize>());
     let mut rest = template;
@@ -439,7 +465,7 @@ fn interpolate(template: &'static str, args: &[&str]) -> String {
             "offload push: template slot/argument count mismatch — the notice text is malformed"
         );
     }
-    out
+    (out, slots)
 }
 
 /// One live `/events` subscriber — a per-tab `--offload-mcp` child holding an
@@ -2170,20 +2196,53 @@ mod tests {
     }
 
     /// The template fills left to right, and a producer's count mistake
-    /// degrades rather than panics — this runs on the announce path of a
-    /// finished scan.
+    /// degrades rather than panics in a release build — this runs on the
+    /// announce path of a finished scan.
+    ///
+    /// Asserted against [`interpolate`] rather than [`PushNotice::new`] for the
+    /// mismatch cases, because `new` now `debug_assert!`s on them (#48) and the
+    /// lenient behaviour is what ships when assertions are compiled out.
     #[test]
     fn push_notice_fills_template_slots_in_order() {
         let n = PushNotice::new("{} of {} in {}s", &["3 files", "/proj", "12"], no_meta());
         assert_eq!(n.content(), "3 files of /proj in 12s");
         // No slots, no args: the template is the content verbatim.
         assert_eq!(PushNotice::new("plain", &[], no_meta()).content(), "plain");
-        // Surplus slot ⇒ empty; surplus arg ⇒ dropped. Both warn.
-        assert_eq!(PushNotice::new("a{}b{}", &["X"], no_meta()).content(), "aXb");
+        // Surplus slot ⇒ empty; surplus arg ⇒ dropped. Both warn, and both
+        // report the slot count the assertion in `new` checks against.
+        assert_eq!(interpolate("a{}b{}", &["X"]), ("aXb".to_string(), 2));
+        assert_eq!(interpolate("a{}b", &["X", "Y"]), ("aXb".to_string(), 1));
+        // A leftover NAMED slot is not a slot: it survives verbatim, which is
+        // the shape a reader never notices and the assertion below catches.
         assert_eq!(
-            PushNotice::new("a{}b", &["X", "Y"], no_meta()).content(),
-            "aXb"
+            interpolate("done: {done}", &[]),
+            ("done: {done}".to_string(), 0)
         );
+    }
+
+    /// #48: the slot/argument mismatch finally has a consumer. It warned and
+    /// shipped the malformed notice, so a producer bug reached the model's
+    /// transcript and nothing failed — the repo's "every quality signal needs a
+    /// consumer" principle, applied at zero production cost.
+    ///
+    /// `cfg(debug_assertions)` because that is exactly the condition under
+    /// which the assertion exists; a release test run must not demand a panic
+    /// the build compiled out.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "slot/argument count mismatch")]
+    fn a_push_template_with_the_wrong_argument_count_fails_the_suite() {
+        let _ = PushNotice::new("a{}b{}", &["X"], no_meta());
+    }
+
+    /// The other direction, and the one a rename actually produces: a template
+    /// whose slots were renamed to `{done}`-style names takes zero arguments
+    /// and silently emits the braces.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "slot/argument count mismatch")]
+    fn a_push_template_with_a_leftover_named_slot_fails_the_suite() {
+        let _ = PushNotice::new("done: {done}", &["yes"], no_meta());
     }
 
     /// V32 locked decision 9, the half a type CAN state: the deserialize path

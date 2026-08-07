@@ -870,6 +870,7 @@ struct McpCallBody {
 /// the consumer differently — `/graph_run` from the body, `/mcp/call` from the
 /// `?consumer=` query — and one tab MUST key identically from either, or its
 /// web fetches and its graph reads would latch two separate scopes.
+#[derive(Debug, PartialEq, Eq)]
 struct LatchScope {
     agent: &'static str,
     tab: String,
@@ -945,23 +946,62 @@ fn is_configured_tab(settings: &crate::settings::Settings, tab: &str) -> bool {
     !saw_ai_tab
 }
 
-/// Resolve the calling tab's latch scope, or `None` when the call carries no
-/// **usable** tab identity.
+/// Which of three cases a request body's `tab` falls into, decided **without**
+/// the `AppHandle` [`latch_scope`]'s session lookup needs.
 ///
-/// `None` is the **fail-open** case (locked, and V28's existing discipline): a
-/// child spawned before `--tab` existed sends nothing, and a tool call must
-/// never fail for lack of identity. It is deliberately NOT promoted to a
-/// global latch — one identityless call would then latch every consumer at
-/// once. Such calls still get the spotlighting envelope on EXTERNAL results,
-/// which needs no identity.
+/// Split out (#48) for two reasons. It is the enforcement point for the
+/// registry bound, and a bound asserted by calling [`is_configured_tab`] beside
+/// `latch_scope` rather than through it survives deleting the call from
+/// `latch_scope` — which is what
+/// `tests::only_configured_ai_tab_ids_can_ever_key_a_latch` did. And it names
+/// the distinction #45 collapsed: "no tab id" and "an id that names no
+/// configured tab" are the same for the *registry* and not the same for a
+/// *verdict*.
+#[derive(Debug, PartialEq, Eq)]
+enum TabIdentity<'a> {
+    /// No `tab` at all (absent, empty, or whitespace) — a child spawned before
+    /// `--tab` existed.
+    Anonymous,
+    /// A non-empty id naming no configured AI tab. The trimmed id is carried
+    /// for the log lines and error messages that have to quote it back.
+    Unknown(&'a str),
+    /// A configured AI tab id, trimmed.
+    Configured(&'a str),
+}
+
+fn tab_identity<'a>(settings: &crate::settings::Settings, tab: Option<&'a str>) -> TabIdentity<'a> {
+    let Some(tab) = tab.map(str::trim).filter(|t| !t.is_empty()) else {
+        return TabIdentity::Anonymous;
+    };
+    if is_configured_tab(settings, tab) {
+        TabIdentity::Configured(tab)
+    } else {
+        TabIdentity::Unknown(tab)
+    }
+}
+
+/// Resolve the calling tab's latch scope, keeping the two identity-less cases
+/// apart (#48).
 ///
-/// #45 widens "no identity" to include **an id that is not a configured tab**
+/// [`LatchScoping::scope`] is `None` for both, which is the **fail-open** case
+/// (locked, and V28's existing discipline): a child spawned before `--tab`
+/// existed sends nothing, and a tool call must never fail for lack of identity.
+/// It is deliberately NOT promoted to a global latch — one identityless call
+/// would then latch every consumer at once. Such calls still get the
+/// spotlighting envelope on EXTERNAL results, which needs no identity.
+///
+/// #45 widened "no identity" to include **an id that is not a configured tab**
 /// ([`is_configured_tab`]). This is the single funnel every entry-creating path
 /// resolves through — `/graph_run` and `/mcp/call` via `gate`, `/latch/beacon`
 /// via `beacon` — so validating here is what bounds the registry, rather than
-/// three route-local checks that can drift apart. An unknown id therefore
-/// creates no row and gates nothing; a caller that invents ids only ever talks
-/// to a scope that does not exist, which is where it started.
+/// three route-local checks that can drift apart. An unknown id creates no row
+/// and gates nothing; a caller that invents ids only ever talks to a scope that
+/// does not exist, which is where it started. **That part is unchanged.**
+///
+/// What #48 changes is only that the two cases are now *distinguishable* by the
+/// caller. Folding them into one `Option::None` also folded them into
+/// `handle_latch_state`'s hard-off verdict, which was a Phase H regression: see
+/// [`LatchScoping::Unknown`].
 ///
 /// Takes the settings snapshot rather than reading its own, so a handler
 /// resolves identity and policy under the SAME snapshot (the "ONE settings read
@@ -971,19 +1011,74 @@ fn latch_scope(
     settings: &crate::settings::Settings,
     agent: &'static str,
     tab: Option<&str>,
-) -> Option<LatchScope> {
-    let tab = tab.map(str::trim).filter(|t| !t.is_empty())?;
-    if !is_configured_tab(settings, tab) {
-        return None;
+) -> LatchScoping {
+    match tab_identity(settings, tab) {
+        TabIdentity::Anonymous => LatchScoping::Anonymous,
+        TabIdentity::Unknown(tab) => LatchScoping::Unknown(tab.to_string()),
+        TabIdentity::Configured(tab) => {
+            let session = app
+                .try_state::<Arc<crate::graph::GraphService>>()
+                .and_then(|g| g.live_session_for_tab(tab, agent));
+            LatchScoping::Scoped(LatchScope {
+                agent,
+                tab: tab.to_string(),
+                session,
+            })
+        }
     }
-    let session = app
-        .try_state::<Arc<crate::graph::GraphService>>()
-        .and_then(|g| g.live_session_for_tab(tab, agent));
-    Some(LatchScope {
-        agent,
-        tab: tab.to_string(),
-        session,
-    })
+}
+
+/// The outcome of [`latch_scope`] — [`TabIdentity`] with the session folded in.
+#[derive(Debug, PartialEq, Eq)]
+enum LatchScoping {
+    /// No tab identity at all. Fail-open everywhere.
+    Anonymous,
+    /// An id that names no configured AI tab — a forged one, or (the case that
+    /// makes this worth a variant) a **stale real one**: the OpenCode plugin is
+    /// written per working *directory* with one tab id baked in (the unfixed
+    /// H-2), so removing or re-id'ing that tab leaves the file on disk still
+    /// naming an id the settings no longer have.
+    ///
+    /// It keys no registry entry — that is #45's bound and it is untouched —
+    /// but it must not be read as "containment is off" either, because the two
+    /// look identical to the plugin and only one of them is a decision anyone
+    /// took. See `handle_latch_state`.
+    Unknown(String),
+    /// A configured AI tab. The only variant that can key the registry.
+    Scoped(LatchScope),
+}
+
+impl LatchScoping {
+    /// The scope, when there is one. `None` for both identity-less variants —
+    /// the fail-open reading `gate`, `beacon` and `budget_gate` take, and the
+    /// reason an unknown id still creates no registry entry.
+    fn scope(&self) -> Option<&LatchScope> {
+        match self {
+            LatchScoping::Scoped(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Consume into the scope, for the callers that need to keep it.
+    fn into_scope(self) -> Option<LatchScope> {
+        match self {
+            LatchScoping::Scoped(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The injection-hierarchy scope this call resolves features against.
+    /// Both identity-less variants resolve **app-wide** (`Scope::App`), the
+    /// same fail-open reading [`GatePolicy::resolve`] has always taken for a
+    /// scope-less call: a feature's app-wide answer is the honest one when
+    /// there is no tab to ask about, and it is what an unrecognized id
+    /// resolved to before #45 (L3 not found ⇒ `Inherit` ⇒ L2 ⇒ L1).
+    fn injection(&self) -> crate::settings::injection::Scope<'_> {
+        self.scope().map_or(
+            crate::settings::injection::Scope::App,
+            LatchScope::injection,
+        )
+    }
 }
 
 /// One tab's latch, together with the session identity it was engaged for.
@@ -999,6 +1094,20 @@ struct TabLatch {
     /// the Tool Activity feed. One row per scope: the latch is sticky, so every
     /// later refusal restates the same fact.
     latch_flagged: bool,
+    /// Whether this session's native-web BEACON has already been reported
+    /// (#48). Same one-row-per-scope bound and the same reset as
+    /// [`latch_flagged`](Self::latch_flagged), and it exists for the same
+    /// reason: a caller that POSTs `/latch/beacon` in a loop must produce one
+    /// row, not one per request, or it floods a capped feed and evicts the rows
+    /// the audit trail exists to keep.
+    ///
+    /// It is a separate bit from "the latch moved" because #45 keyed the row on
+    /// the latch transition alone, and a beacon can change this conversation's
+    /// state **without** moving the latch: a tab already latched `Local`
+    /// (Phase A's other direction) takes the contamination bit and keeps its
+    /// latch, which then quarantines every later `context_note` — silently,
+    /// under the old condition.
+    beacon_flagged: bool,
     /// V32 Phase F (locked decision 15): whether external content has entered
     /// this conversation *at all* — set the moment an EXTERNAL call is admitted
     /// (proxied, or beaconed from a harness-native web tool) and **never
@@ -1025,6 +1134,7 @@ impl TabLatch {
             latch: Latch::Open,
             budget: Budget::default(),
             latch_flagged: false,
+            beacon_flagged: false,
             contaminated: false,
         }
     }
@@ -1073,6 +1183,7 @@ impl TabLatch {
                 // fresh right to report — same scope, same reset.
                 self.budget.reset();
                 self.latch_flagged = false;
+                self.beacon_flagged = false;
                 // V32 Phase F: the ONE place contamination is cleared. A tab
                 // restart is the only clean exit the decision-15 UI offers, and
                 // this is what makes that true rather than advisory.
@@ -1164,18 +1275,40 @@ struct OverrideOutcome {
     view: LatchView,
 }
 
-/// The result of a native-web beacon (#45): the tab's resulting view, plus
-/// whether the latch actually MOVED.
+/// The result of a native-web beacon (#45): the tab's resulting view, which of
+/// the two state changes it caused, and whether it is this tab-session's
+/// reportable one (#48).
 ///
-/// `engaged` is what makes the beacon's audit row bounded. The latch is sticky,
-/// so a tab goes Open → External once per session no matter how many beacons
-/// arrive; recording only the transition means a caller that POSTs the route in
-/// a loop produces one row per tab-session, not one per request. A feed a
-/// caller can flood is a feed that evicts the rows it exists to keep.
+/// `report` is what makes the beacon's audit row bounded, and it is a stored
+/// bit ([`TabLatch::beacon_flagged`]) rather than a derived one. A caller that
+/// POSTs the route in a loop produces one row per tab-session, not one per
+/// request; a feed a caller can flood is a feed that evicts the rows it exists
+/// to keep.
+///
+/// #45 derived that bound from `engaged` alone, which silently dropped a whole
+/// class of beacon — see [`contaminated_now`](Self::contaminated_now).
 #[derive(Debug, PartialEq, Eq)]
 struct BeaconOutcome {
     view: LatchView,
+    /// The latch itself MOVED: Open → External. False when it was already
+    /// External (sticky, and the fact is unchanged) **and** when the tab was
+    /// latched `Local`, where the beacon cannot move it at all.
     engaged: bool,
+    /// This beacon is what made the conversation contaminated — the bit went
+    /// `false` → `true` here.
+    ///
+    /// #45 wrote a row only `if engaged`, so a beacon aimed at a `Local`-latched
+    /// tab set `contaminated` unconditionally and recorded **nothing**: no row,
+    /// no `warn!`, no `info!`. From that moment every `context_note` in the tab
+    /// is quarantined and every external result enveloped, with the only
+    /// evidence being the quarantine rows of the *later* writes. Locked decision
+    /// 15 is unmoved — this records that the bit was SET, and nothing here or
+    /// anywhere else clears it.
+    contaminated_now: bool,
+    /// Whether the handler should write this beacon's `injection_flag` row:
+    /// something changed (`engaged || contaminated_now`) **and** this
+    /// tab-session has not reported a beacon yet.
+    report: bool,
 }
 
 impl BeaconOutcome {
@@ -1184,6 +1317,8 @@ impl BeaconOutcome {
         BeaconOutcome {
             view: LatchView::default(),
             engaged: false,
+            contaminated_now: false,
+            report: false,
         }
     }
 }
@@ -1470,16 +1605,17 @@ impl LatchRegistry {
     ///   tab id — or, since #45, with an id that is not a configured tab — has
     ///   no scope to engage.
     ///
-    /// It reports whether the latch actually MOVED ([`BeaconOutcome::engaged`])
-    /// rather than writing the row itself: the row's honesty depends on the
-    /// [`outbound::Origin`] of the request that caused it, and the registry
-    /// cannot see that. The handler owns it (#45).
+    /// It reports what changed ([`BeaconOutcome`]) rather than writing the row
+    /// itself: the row's honesty depends on the [`outbound::Origin`] of the
+    /// request that caused it, and the registry cannot see that. The handler
+    /// owns it (#45).
     ///
     /// The one asymmetry with `gate`: a beacon arriving while the tab is
     /// LOCAL-latched cannot refuse the fetch (it already happened), so it
     /// records the contamination and leaves the latch where it is — the honest
     /// reading of "this conversation has now seen external content, and its
-    /// proxied external side stays closed".
+    /// proxied external side stays closed". That case is exactly the one #45
+    /// left unaudited; see [`BeaconOutcome::contaminated_now`] (#48).
     ///
     /// V32 Phase G: gated by the same [`GatePolicy`] a proxied call resolves.
     /// An inert policy answers with the default view and records nothing — a
@@ -1494,8 +1630,16 @@ impl LatchRegistry {
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = tabs.entry(scope.key()).or_insert_with(TabLatch::fresh);
         entry.observe(scope.session.as_deref());
-        entry.contaminated = true;
+        // Unchanged, deliberately: contamination is set on every beacon and
+        // nothing here or elsewhere clears it (locked decision 15). What #48
+        // adds is only that the TRANSITION is observable, so it can be recorded.
+        let contaminated_now = !std::mem::replace(&mut entry.contaminated, true);
         let moved = policy.latch && entry.latch.engage(ToolClass::External);
+        // One row per tab-session over BOTH transitions, rather than one per
+        // transition kind: a policy change mid-session could otherwise produce a
+        // second row for the same conversation.
+        let report =
+            (moved || contaminated_now) && !std::mem::replace(&mut entry.beacon_flagged, true);
         let view = entry.view();
         drop(tabs);
         if moved {
@@ -1507,10 +1651,24 @@ impl LatchRegistry {
                 latch = view.latch,
                 "loopback: V32 session taint latch engaged by a native-web beacon"
             );
+        } else if contaminated_now {
+            // The case #45 left entirely silent: the latch did not move (the tab
+            // is latched `Local`, or the latch feature is off) but this
+            // conversation is contaminated from here on.
+            info!(
+                target: "offload",
+                agent = scope.agent,
+                tab = %scope.tab,
+                tool = %tool,
+                latch = view.latch,
+                "loopback: V32 conversation marked contaminated by a native-web beacon (latch unmoved)"
+            );
         }
         BeaconOutcome {
             view,
             engaged: moved,
+            contaminated_now,
+            report,
         }
     }
 
@@ -1777,25 +1935,57 @@ pub fn latch_snapshot() -> Vec<LatchStatus> {
     latches().snapshot()
 }
 
-/// The human-readable body of an override's `injection_flag` row.
+/// The caller-composed parts of one Phase F `injection_flag` row: its
+/// provenance, its `tool` column and the prose an incident reviewer reads.
 ///
-/// Split out of [`apply_latch_override`] (#45) so the row's content is
-/// assertable without an `AppHandle`, which this crate has no mock for — every
-/// Phase F test called [`LatchRegistry::apply_override`] directly and stopped
-/// short of the row, leaving the one artifact an incident review actually reads
+/// **They are built together on purpose (#48).** #45 shipped them apart — the
+/// detail functions spelled `Origin::Ipc` / `Origin::Http` into their own
+/// format strings while `Flag.origin` was set independently at the call site.
+/// #47 then made `origin` a required field precisely so provenance could not be
+/// taken by omission, but the sentence a human actually reads was still not
+/// derived from it: re-expose an HTTP path into the override and the row's
+/// `origin` key would say `http` while its text went on asserting that a human
+/// clicked, with nothing to catch it. One struct, one origin, both consumers.
+struct FlagRow {
+    /// Copied verbatim into [`outbound::Flag::origin`], and interpolated into
+    /// [`detail`](Self::detail) by the same function that received it.
+    origin: outbound::Origin,
+    /// The row's at-a-glance `tool` column.
+    tool: String,
+    /// The row's human-readable body.
+    detail: String,
+}
+
+/// An override's `injection_flag` row (#45), composed from the origin the
+/// caller states rather than one baked in here (#48).
+///
+/// Split out of [`apply_latch_override`] so the row's content is assertable
+/// without an `AppHandle`, which this crate has no mock for — every Phase F
+/// test called [`LatchRegistry::apply_override`] directly and stopped short of
+/// the row, leaving the one artifact an incident review actually reads
 /// uncovered.
-fn override_flag_detail(action: LatchOverride, outcome: &OverrideOutcome) -> String {
-    format!(
-        "USER OVERRIDE ({}, origin: {}): taint latch {} → {}. Contamination is NOT cleared by an \
-         override (contaminated={}): memory writes stay quarantined and external results keep \
-         their envelope, because the injected content is still in the conversation. Restarting \
-         the tab is the only clean reset.",
-        action.as_str(),
-        outbound::Origin::Ipc.as_str(),
-        outcome.prior.label(),
-        outcome.view.latch,
-        outcome.view.contaminated,
-    )
+fn override_row(
+    origin: outbound::Origin,
+    action: LatchOverride,
+    outcome: &OverrideOutcome,
+) -> FlagRow {
+    FlagRow {
+        origin,
+        // The action is the row's at-a-glance "tool": these rows have no tool
+        // call behind them, and what the user DID is the fact worth reading.
+        tool: action.as_str().to_string(),
+        detail: format!(
+            "USER OVERRIDE ({}, origin: {}): taint latch {} → {}. Contamination is NOT cleared by \
+             an override (contaminated={}): memory writes stay quarantined and external results \
+             keep their envelope, because the injected content is still in the conversation. \
+             Restarting the tab is the only clean reset.",
+            action.as_str(),
+            origin.as_str(),
+            outcome.prior.label(),
+            outcome.view.latch,
+            outcome.view.contaminated,
+        ),
+    }
 }
 
 /// V32 Phase F (locked decision 15): apply a user-initiated latch move to one
@@ -1818,12 +2008,15 @@ pub fn apply_latch_override(
     let agent = crate::graph::source_for_consumer(consumer);
     // One settings snapshot, shared with the tab-id check inside `latch_scope`.
     let settings = live_settings(app);
-    let scope = latch_scope(app, &settings, agent, Some(tab)).ok_or_else(|| {
-        // #45 folded "not a configured tab" into this `None`, so the message
-        // has to cover both — a popover that said "needs a tab id" about a tab
-        // id it was given would send the user looking in the wrong place.
-        format!("a latch override needs a configured tab id (got {tab:?})")
-    })?;
+    let scope = latch_scope(app, &settings, agent, Some(tab))
+        .into_scope()
+        .ok_or_else(|| {
+            // #45 folded "not a configured tab" into this refusal, so the
+            // message has to cover both — a popover that said "needs a tab id"
+            // about a tab id it was given would send the user looking in the
+            // wrong place.
+            format!("a latch override needs a configured tab id (got {tab:?})")
+        })?;
     let outcome = latches().apply_override(&scope, action)?;
 
     // Locked decision 15: "every override writes an `injection_flag` row … so
@@ -1832,23 +2025,26 @@ pub fn apply_latch_override(
     // is rather than as a failure. The prior latch is in the detail because
     // "restored full access" from `external` and from `local` are very
     // different events.
-    let detail = override_flag_detail(action, &outcome);
+    //
+    // The origin is stated ONCE, here (#48): `override_row` puts it in the
+    // row's `origin` key and in the sentence the reviewer reads, so the two
+    // cannot come apart. `Ipc` is the one origin that means a human acted, and
+    // it is a fact rather than an assumption only because no HTTP path into
+    // this function survives (#45) — re-expose one and this constant is what
+    // has to change.
+    let row = override_row(outbound::Origin::Ipc, action, &outcome);
     outbound::record_flag(outbound::Flag {
         screen: outbound::Screen::LatchOverride,
-        // The one origin that means a human acted (#45).
-        origin: outbound::Origin::Ipc,
+        origin: row.origin,
         consumer: agent,
         scope: &scope.label(),
-        // The action is the row's at-a-glance "tool": these rows have no
-        // tool call behind them, and what the user DID is the fact worth
-        // reading.
-        tool: action.as_str(),
+        tool: &row.tool,
         host: None,
         url: None,
         resolved_ip: None,
         canary: false,
         root: String::new(),
-        detail: &detail,
+        detail: &row.detail,
     });
     Ok(outcome.view)
 }
@@ -1906,7 +2102,8 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         &settings,
         crate::graph::source_for_consumer(consumer),
         body.tab.as_deref(),
-    );
+    )
+    .into_scope();
     let session = scope.as_ref().and_then(|s| s.session.clone());
 
     // V32 Phase B: the session taint latch over the tools THIS route serves —
@@ -3143,7 +3340,7 @@ async fn handle_mcp_call(
     // by one posture and wrapped by another. #45 adds the tab-id check inside
     // `latch_scope` to that list, which is why the read precedes it.
     let settings = live_settings(app);
-    let scope = latch_scope(app, &settings, agent, body.tab.as_deref());
+    let scope = latch_scope(app, &settings, agent, body.tab.as_deref()).into_scope();
     let inj_scope = crate::settings::injection::Scope::for_tab(agent, body.tab.as_deref());
     let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
     // The gate's V32 Phase C2 `WriteTaint` is discarded here, and can only ever
@@ -3356,44 +3553,50 @@ async fn handle_latch_beacon(
     // evict the genuine rows this issue exists to preserve. The signal's
     // consumer is the enforcement itself (the request is refused) plus the
     // ABSENCE of the engagement row a real beacon leaves.
-    if let Some(tab) = body.tab.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        if !is_configured_tab(&settings, tab) {
-            warn!(
-                target: "offload",
-                agent,
-                tab = %tab,
-                tool = body.tool.as_deref().unwrap_or("(unnamed)"),
-                "loopback: /latch/beacon rejected — not a configured tab id"
-            );
-            let r = RunResult {
-                ok: false,
-                text: None,
-                error: Some(format!(
-                    "unknown tab id {tab:?} — /latch/beacon accepts configured AI tabs only"
-                )),
-            };
-            return write_json(stream, 400, &r).await;
-        }
+    //
+    // #48: the check reads the SAME resolution the scope does, rather than a
+    // second `is_configured_tab` call beside it — two spellings of one rule are
+    // two things to keep in step.
+    let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
+    let tool = bounded_tool(body.tool.as_deref());
+    if let LatchScoping::Unknown(tab) = &scoping {
+        warn!(
+            target: "offload",
+            agent,
+            tab = %tab,
+            tool = %tool,
+            "loopback: /latch/beacon rejected — not a configured tab id"
+        );
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(format!(
+                "unknown tab id {tab:?} — /latch/beacon accepts configured AI tabs only"
+            )),
+        };
+        return write_json(stream, 400, &r).await;
     }
-    let scope = latch_scope(app, &settings, agent, body.tab.as_deref());
-    let tool = body.tool.as_deref().unwrap_or("(native web tool)");
-    let policy = GatePolicy::resolve(&settings, scope.as_ref());
-    let out = latches().beacon(scope.as_ref(), tool, policy);
-    if out.engaged {
-        if let Some(scope) = scope.as_ref() {
-            let detail = beacon_flag_detail(tool, &out.view);
+    let scope = scoping.scope();
+    let policy = GatePolicy::resolve(&settings, scope);
+    let out = latches().beacon(scope, &tool, policy);
+    // #48: keyed on `report`, not on `engaged`. A beacon that contaminates a
+    // `Local`-latched tab moves no latch and used to leave no trace at all,
+    // while quarantining every `context_note` the tab made afterwards.
+    if out.report {
+        if let Some(scope) = scope {
+            let row = beacon_row(outbound::Origin::Http, &tool, &out);
             outbound::record_flag(outbound::Flag {
                 screen: outbound::Screen::LatchBeacon,
-                origin: outbound::Origin::Http,
+                origin: row.origin,
                 consumer: scope.agent,
                 scope: &scope.label(),
-                tool,
+                tool: &row.tool,
                 host: None,
                 url: None,
                 resolved_ip: None,
                 canary: false,
                 root: String::new(),
-                detail: &detail,
+                detail: &row.detail,
             });
         }
     }
@@ -3405,26 +3608,69 @@ async fn handle_latch_beacon(
     .await
 }
 
-/// The human-readable body of a beacon's `injection_flag` row (#45).
+/// The upper bound on a caller-supplied tool name before it reaches an activity
+/// row, a log line or the TTS surface (#48). Long enough for every real
+/// harness tool name (`WebFetch`, `websearch`) with room to spare.
+const BEACON_TOOL_MAX: usize = 64;
+
+/// `/latch/beacon`'s `tool`, bounded (#48).
+///
+/// The field is an arbitrary unbounded string from a request body and it lands
+/// in the row's `tool` column and its `detail`. Svelte escapes on render and
+/// the row is bounded to one per tab-session, so this is not an injection or a
+/// flood — what it is is a caller choosing how many bytes of the feed, the
+/// `tracing` output and the TTS surface one beacon occupies. Truncated by
+/// **chars**, not bytes, so a multi-byte name cannot be cut mid-codepoint.
+///
+/// Control-sequence hygiene is a separate concern with its own owner (Phase D,
+/// at the surfaces that render); this only bounds length.
+fn bounded_tool(raw: Option<&str>) -> String {
+    let raw = raw.map(str::trim).filter(|t| !t.is_empty());
+    let Some(raw) = raw else {
+        return "(native web tool)".to_string();
+    };
+    let mut out: String = raw.chars().take(BEACON_TOOL_MAX).collect();
+    if raw.chars().nth(BEACON_TOOL_MAX).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// A beacon's `injection_flag` row (#45), composed from the origin the caller
+/// states rather than one baked in here (#48).
 ///
 /// Pure, so what an incident reader is told is assertable without an
-/// `AppHandle` — the same seam [`override_flag_detail`] exists for. The text
-/// states the origin limit in words rather than leaving it to the `origin`
-/// key, because the person reading this after the fact needs to know that "the
-/// expected shim sent it" is an assumption, not a finding.
-fn beacon_flag_detail(tool: &str, view: &LatchView) -> String {
-    format!(
-        "NATIVE-WEB BEACON ({}, origin: {}): the harness's own web tool is about to run, so this \
-         tab is now EXTERNAL-latched (latch={}, contaminated={}) and its proxied local-capability \
-         tools will refuse. This row records an authenticated POST to /latch/beacon from a local \
-         process — the cImp beacon shim is the expected sender, but the launch token is readable \
-         by anything running as this user, so this is NOT evidence of a user action. Restarting \
-         the tab is the only clean reset.",
-        tool,
-        outbound::Origin::Http.as_str(),
-        view.latch,
-        view.contaminated,
-    )
+/// `AppHandle` — the same seam [`override_row`] exists for. The text states the
+/// origin limit in words rather than leaving it to the `origin` key, because
+/// the person reading this after the fact needs to know that "the expected shim
+/// sent it" is an assumption, not a finding.
+///
+/// The first sentence follows the outcome rather than asserting the engagement
+/// case (#48): a beacon that contaminates a `Local`-latched tab, or one that
+/// arrives with the latch feature off, moves no latch and refuses nothing —
+/// saying it did would be the row lying about the one fact it exists to record.
+fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> FlagRow {
+    let what = if out.engaged {
+        "so this tab is now EXTERNAL-latched and its proxied local-capability tools will refuse"
+    } else {
+        "and this conversation is now CONTAMINATED — the taint latch did not move (it is not \
+         Open, or the latch control is off), so nothing is refused, but every memory write from \
+         here on is quarantined and every external result keeps its envelope"
+    };
+    FlagRow {
+        origin,
+        tool: tool.to_string(),
+        detail: format!(
+            "NATIVE-WEB BEACON ({tool}, origin: {}): the harness's own web tool is about to run, \
+             {what} (latch={}, contaminated={}). This row records an authenticated POST to \
+             /latch/beacon from a local process — the cImp beacon shim is the expected sender, \
+             but the launch token is readable by anything running as this user, so this is NOT \
+             evidence of a user action. Restarting the tab is the only clean reset.",
+            origin.as_str(),
+            out.view.latch,
+            out.view.contaminated,
+        ),
+    }
 }
 
 /// V32 Phase H (locked decision 17): whether the OpenCode native-tool gate is
@@ -3444,10 +3690,16 @@ fn beacon_flag_detail(tool: &str, view: &LatchView) -> String {
 /// latch a LIVE feature: the gate's own flag is spawn-baked into the plugin
 /// file, but this AND is recomputed on every query, so switching the latch off
 /// stops the denials without a tab restart.
-fn native_gate_verdict(settings: &crate::settings::Settings, scope: &LatchScope) -> bool {
+/// Takes the resolved injection scope rather than a [`LatchScope`] (#48), so
+/// the app-wide answer — the one a call with no *usable* tab identity gets — is
+/// expressible. See [`LatchScoping::injection`].
+fn native_gate_verdict(
+    settings: &crate::settings::Settings,
+    s: crate::settings::injection::Scope<'_>,
+) -> bool {
     use crate::settings::injection::{effective, Feature};
-    let s = scope.injection();
-    effective(Feature::OpencodeNativeGate, s, settings) && effective(Feature::TaintLatch, s, settings)
+    effective(Feature::OpencodeNativeGate, s, settings)
+        && effective(Feature::TaintLatch, s, settings)
 }
 
 /// `POST /latch/state`: the resolved containment state of one tab (V32 Phase H).
@@ -3463,11 +3715,26 @@ fn native_gate_verdict(settings: &crate::settings::Settings, scope: &LatchScope)
 /// Behind the same bearer check as every other route (it precedes dispatch in
 /// [`handle_conn`]), because the reply describes a tab's containment posture.
 ///
-/// **Always 200, and always fail-open in shape**: an unknown tab, a tab the
-/// proxy has never served, or a body with no identity at all all answer
-/// `{"gate": false, "latch": "open"}` — the values that deny nothing. The
-/// plugin's own error paths land on the same verdict, so "the app is down" and
-/// "the app says no gate" are the same behaviour rather than two.
+/// **Always 200, and always fail-open in shape**: a tab the proxy has never
+/// served, or a body with no identity at all, answer `latch: "open"` — the
+/// value that denies nothing. The plugin's own error paths land on the same
+/// verdict, so "the app is down" and "the app says no gate" are the same
+/// behaviour rather than two.
+///
+/// **The `gate` half is NOT hard-coded off for an unusable tab id (#48).** It
+/// resolves the feature hierarchy at whatever scope the body earns — the tab's
+/// own when the id is configured, app-wide otherwise. An id that names no
+/// configured tab is very often a real tab that was removed or re-id'd while
+/// its per-*directory* OpenCode plugin file kept the old id (the unfixed H-2),
+/// and "the gate is switched off" and "the gate cannot find your tab" must not
+/// be the same answer.
+///
+/// Known residual, stated rather than papered over: because an unknown id keys
+/// no registry entry (#45's bound, deliberately kept), its `latch` is always
+/// `open`, and the plugin denies only on `external`/`local`. So the practical
+/// effect for a stale plugin file is still "nothing is refused" — what changes
+/// is that the verdict now reflects a decision someone took instead of a
+/// collapsed `Option`. Closing it properly needs H-2: a per-tab plugin file.
 async fn handle_latch_state(
     stream: &mut TcpStream,
     app: &AppHandle,
@@ -3486,29 +3753,47 @@ async fn handle_latch_state(
     };
     let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("opencode"));
     let settings = live_settings(app);
-    let (gate, view) = match latch_scope(app, &settings, agent, body.tab.as_deref()) {
-        Some(scope) => (
-            native_gate_verdict(&settings, &scope),
-            latches().view_for(&scope),
-        ),
-        // No identity ⇒ nothing to resolve and nothing to enforce against.
-        None => (false, LatchView::default()),
-    };
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({
-            "ok": true,
-            // The RESOLVED verdict, not the stored switch: the plugin holds no
-            // part of the hierarchy.
-            "gate": gate,
-            // Flattened rather than nested so the hook reads one string. The
-            // full view rides along for a human reading a trace.
-            "latch": view.latch,
-            "contaminated": view.contaminated,
-        }),
-    )
-    .await
+    let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
+    // #48: the verdict comes from the resolved injection scope, which is
+    // app-wide for both identity-less cases — NOT a hard `false`. #45 folded
+    // "an id that names no configured tab" into `latch_scope`'s `None`, and
+    // this arm read that `None` as "off", so a stale plugin file (see
+    // `LatchScoping::Unknown`) turned the Phase H gate off with only a `warn!`
+    // on the sibling beacon route to say so. The registry is untouched either
+    // way: `view_for` needs a real scope and never creates one.
+    let view = scoping
+        .scope()
+        .map_or_else(LatchView::default, |scope| latches().view_for(scope));
+    write_json(stream, 200, &latch_state_reply(&settings, &scoping, view)).await
+}
+
+/// `POST /latch/state`'s reply body, given a resolved scoping and this tab's
+/// view.
+///
+/// Split out of [`handle_latch_state`] (#48) because the regression this issue
+/// fixes lived in a `match` arm *here* — `None => (false, …)` — and this crate
+/// has no `tauri::test` `AppHandle` mock, so the handler itself is unreachable
+/// from a test. Everything that decides the reply is in this function now; the
+/// handler's remaining work is the registry lookup, which needs the process
+/// global. Re-adding "an unusable tab id means the gate is off" therefore means
+/// writing it where `an_unknown_tab_id_resolves_the_app_wide_gate_verdict_not_a_hard_off`
+/// can see it.
+fn latch_state_reply(
+    settings: &crate::settings::Settings,
+    scoping: &LatchScoping,
+    view: LatchView,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        // The RESOLVED verdict, not the stored switch: the plugin holds no
+        // part of the hierarchy. Deliberately NOT branched on whether the
+        // scoping named a usable tab — see `LatchScoping::injection`.
+        "gate": native_gate_verdict(settings, scoping.injection()),
+        // Flattened rather than nested so the hook reads one string. The
+        // full view rides along for a human reading a trace.
+        "latch": view.latch,
+        "contaminated": view.contaminated,
+    })
 }
 
 /// `GET /status`: the proxy's V32 Phase B debug view — one row per tab it has
@@ -4722,34 +5007,132 @@ mod tests {
         let (mut s, id) = oc_settings();
         let scope = oc_scope(&id, Some("ses"));
         assert!(
-            !native_gate_verdict(&s, &scope),
+            !native_gate_verdict(&s, scope.injection()),
             "locked decision 17: the gate ships OFF"
         );
 
         // The app-wide L2.
         s.set_l2_for_test(Feature::OpencodeNativeGate, true);
-        assert!(native_gate_verdict(&s, &scope));
+        assert!(native_gate_verdict(&s, scope.injection()));
 
         // The taint latch is what this gate enforces — with that feature off
         // there is no boundary to enforce, so the gate reports off LIVE (no tab
         // restart), even though its own flag stays baked in the plugin.
         s.set_l2_for_test(Feature::TaintLatch, false);
-        assert!(!native_gate_verdict(&s, &scope));
+        assert!(!native_gate_verdict(&s, scope.injection()));
         s.set_l2_for_test(Feature::TaintLatch, true);
 
         // The usual way in: L2 off app-wide, one tab's L3 `On`.
         s.set_l2_for_test(Feature::OpencodeNativeGate, false);
         s.set_tab_override_for_test(&id, Feature::OpencodeNativeGate, Override::On)
             .expect("the OpenCode tab carries a native-gate cell");
-        assert!(native_gate_verdict(&s, &scope), "an L3 On enables one tab");
         assert!(
-            !native_gate_verdict(&s, &oc_scope("some-other-tab", Some("ses"))),
+            native_gate_verdict(&s, scope.injection()),
+            "an L3 On enables one tab"
+        );
+        assert!(
+            !native_gate_verdict(&s, oc_scope("some-other-tab", Some("ses")).injection()),
             "and only that tab"
         );
 
         // Nothing re-enables past the master.
         s.set_master_for_test(false);
-        assert!(!native_gate_verdict(&s, &scope));
+        assert!(!native_gate_verdict(&s, scope.injection()));
+    }
+
+    /// **#48 (A2-1): a tab id the settings no longer carry is not a hard OFF.**
+    ///
+    /// #45 folded "not a configured tab" into `latch_scope`'s `None`, and
+    /// `handle_latch_state` mapped that `None` to `(false, default)` — so the
+    /// Phase H gate reported OFF for an id that had simply gone stale. That is
+    /// the ordinary case, not an exotic one: the OpenCode plugin is written per
+    /// working *directory* with one tab id baked in (the unfixed H-2), so
+    /// removing or re-id'ing a tab leaves the file naming an id settings no
+    /// longer have — and "the user switched containment off" and "cImp could
+    /// not find your tab" then rendered identically to the plugin.
+    ///
+    /// The verdict now follows the resolved scope, which is app-wide for both
+    /// identity-less shapes. Asserted as the *equality* the fix is about: an
+    /// unknown id answers what the app answers, whatever that is.
+    #[test]
+    fn an_unknown_tab_id_resolves_the_app_wide_gate_verdict_not_a_hard_off() {
+        use crate::settings::injection::{Feature, Scope};
+        let (mut s, _id) = oc_settings();
+        let stale = LatchScoping::Unknown("opencode-removed".to_string());
+        let anon = LatchScoping::Anonymous;
+        assert!(matches!(stale.injection(), Scope::App));
+        assert!(matches!(anon.injection(), Scope::App));
+
+        // Off app-wide ⇒ off for a stale id. (The regression was invisible in
+        // this direction, which is why #45 shipped.)
+        assert!(!native_gate_verdict(&s, stale.injection()));
+
+        // ON app-wide ⇒ ON for a stale id. This is the assertion that fails if
+        // the hard-off comes back.
+        s.set_l2_for_test(Feature::OpencodeNativeGate, true);
+        assert!(
+            native_gate_verdict(&s, stale.injection()),
+            "a stale tab id must inherit the app-wide verdict, not report off"
+        );
+        assert_eq!(
+            native_gate_verdict(&s, stale.injection()),
+            native_gate_verdict(&s, Scope::App),
+            "and it must be the SAME answer the app gives, by construction"
+        );
+
+        // Through the reply the plugin actually reads, which is where the
+        // regression lived: a `match` arm mapping "no usable identity" to a
+        // hard-off verdict. The `latch` stays `open` because an unknown id keys
+        // no registry entry — that part is #45's bound and is deliberate.
+        let reply = latch_state_reply(&s, &stale, LatchView::default());
+        assert_eq!(reply["gate"], true, "{reply}");
+        assert_eq!(reply["latch"], "open", "{reply}");
+        assert_eq!(reply["contaminated"], false, "{reply}");
+        assert_eq!(
+            latch_state_reply(&s, &anon, LatchView::default())["gate"],
+            true,
+            "an identity-less body resolves the same app-wide verdict"
+        );
+
+        // #45's actual goal is untouched: an unusable id yields no scope, so
+        // nothing can key a registry entry off it.
+        assert!(stale.scope().is_none());
+        assert!(anon.scope().is_none());
+        assert!(stale.into_scope().is_none());
+
+        // The latch still ANDs in, live — a stale id cannot resurrect a gate
+        // whose boundary nobody is maintaining.
+        s.set_l2_for_test(Feature::TaintLatch, false);
+        assert!(!native_gate_verdict(
+            &s,
+            LatchScoping::Unknown("x".into()).injection()
+        ));
+    }
+
+    /// #48 (A2-6): `/latch/beacon`'s `tool` is an arbitrary unbounded string
+    /// from a request body and it lands in an activity row, a `tracing` line
+    /// and (through the feed) the TTS surface. Bounded before any of them.
+    #[test]
+    fn a_beacon_tool_name_is_bounded_before_it_reaches_a_row() {
+        assert_eq!(bounded_tool(Some("WebFetch")), "WebFetch");
+        assert_eq!(bounded_tool(Some("  webfetch  ")), "webfetch");
+        // Absent, empty and whitespace all take the same honest placeholder.
+        for empty in [None, Some(""), Some("   ")] {
+            assert_eq!(bounded_tool(empty), "(native web tool)", "{empty:?}");
+        }
+        let long = "A".repeat(5_000);
+        let bounded = bounded_tool(Some(&long));
+        assert_eq!(bounded.chars().count(), BEACON_TOOL_MAX + 1);
+        assert!(bounded.ends_with('…'), "truncation is visible to a reader");
+        // Truncated by CHARS: a multi-byte name cannot be cut mid-codepoint,
+        // which would panic on a byte slice and produce mojibake in the feed.
+        let wide = "→".repeat(200);
+        let bounded = bounded_tool(Some(&wide));
+        assert_eq!(bounded.chars().count(), BEACON_TOOL_MAX + 1);
+        assert!(bounded.starts_with('→'));
+        // Exactly at the bound: no ellipsis, nothing lost.
+        let exact = "b".repeat(BEACON_TOOL_MAX);
+        assert_eq!(bounded_tool(Some(&exact)), exact);
     }
 
     /// `view_for` is the gate's read path: it must answer for a tab the proxy
@@ -5367,24 +5750,38 @@ mod tests {
     /// one entry per tab per agent no matter what a caller POSTs — which
     /// matters because every entry is serialized into every `/status` response
     /// and every 4 s `latch_status` poll, with no TTL, cap or eviction.
+    /// **#48 rewrote this test too.** It named a registry bound and exercised
+    /// [`is_configured_tab`] directly — a predicate *beside* the enforcement
+    /// point, not through it. Deleting the `is_configured_tab` call from
+    /// `latch_scope` left it green, so the one thing the issue actually changed
+    /// was untested. It now asserts through [`tab_identity`], which is the
+    /// decision `latch_scope` delegates to (its remaining work is the session
+    /// lookup, which needs an `AppHandle` this crate cannot mock), and then
+    /// through the registry itself.
     #[test]
     fn only_configured_ai_tab_ids_can_ever_key_a_latch() {
         let s = settings_with_tabs(&["claude", "opencode-2"]);
-        assert!(is_configured_tab(&s, "claude"));
-        assert!(is_configured_tab(&s, "opencode-2"));
+        assert_eq!(
+            tab_identity(&s, Some("claude")),
+            TabIdentity::Configured("claude")
+        );
+        assert_eq!(
+            tab_identity(&s, Some(" opencode-2 ")),
+            TabIdentity::Configured("opencode-2"),
+            "surrounding whitespace is trimmed, not treated as a different tab"
+        );
 
-        for forged in [
-            "claude-1",
-            "claude ",
-            "Claude",
-            "",
-            "../claude",
-            "graph-monitor",
-        ] {
-            assert!(
-                !is_configured_tab(&s, forged),
+        for forged in ["claude-1", "Claude", "../claude", "graph-monitor"] {
+            assert_eq!(
+                tab_identity(&s, Some(forged)),
+                TabIdentity::Unknown(forged),
                 "{forged:?} is not a configured AI tab and must not key a latch"
             );
+        }
+        // The two identity-less shapes are distinct (#48): "no tab id" is not
+        // "an id I do not recognize", and `handle_latch_state` reads them apart.
+        for anon in [None, Some(""), Some("   ")] {
+            assert_eq!(tab_identity(&s, anon), TabIdentity::Anonymous, "{anon:?}");
         }
 
         // The bound stated as a bound: whatever a caller sends, the set of ids
@@ -5400,9 +5797,42 @@ mod tests {
         let admitted: Vec<&str> = attempts
             .iter()
             .copied()
-            .filter(|t| is_configured_tab(&s, t))
+            .filter(|t| matches!(tab_identity(&s, Some(t)), TabIdentity::Configured(_)))
             .collect();
         assert_eq!(admitted, ["claude", "opencode-2"]);
+
+        // And the bound where it is actually load-bearing: the registry. A
+        // forged id resolves to no scope, and the two methods that insert are
+        // the only ones that ever receive one — so `/status` and the 4 s
+        // `latch_status` poll cannot be grown by a caller inventing ids.
+        let reg = LatchRegistry::default();
+        for forged in attempts
+            .iter()
+            .copied()
+            .filter(|t| !matches!(tab_identity(&s, Some(t)), TabIdentity::Configured(_)))
+        {
+            let scope = match tab_identity(&s, Some(forged)) {
+                TabIdentity::Configured(t) => Some(LatchScope {
+                    agent: "claude",
+                    tab: t.to_string(),
+                    session: None,
+                }),
+                _ => None,
+            };
+            assert!(reg
+                .gate(scope.as_ref(), LatchRoute::Proxied, "ddg__search", ON)
+                .is_ok());
+            let _ = reg.beacon(scope.as_ref(), "WebFetch", ON);
+        }
+        assert!(
+            reg.snapshot().is_empty(),
+            "forged tab ids keyed {} registry entries: {:?}",
+            reg.snapshot().len(),
+            reg.snapshot()
+                .iter()
+                .map(|r| r.tab.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The empty-list escape, stated as a test so it is a decision rather than
@@ -5436,11 +5866,16 @@ mod tests {
         let out = reg
             .apply_override(&s, LatchOverride::FlipLocal)
             .expect("flip applies");
-        let detail = override_flag_detail(LatchOverride::FlipLocal, &out);
+        let row = override_row(outbound::Origin::Ipc, LatchOverride::FlipLocal, &out);
+        let detail = &row.detail;
         assert!(detail.contains("USER OVERRIDE (flip_local"), "{detail}");
         assert!(detail.contains("external → local"), "{detail}");
         assert!(detail.contains("contaminated=true"), "{detail}");
         assert!(detail.contains("Restarting the tab"), "{detail}");
+        assert_eq!(
+            row.tool, "flip_local",
+            "the action is the row's tool column"
+        );
 
         // A row that granted capability back must not be painted as a denial.
         assert!(!outbound::Screen::LatchOverride.is_denial());
@@ -5450,42 +5885,141 @@ mod tests {
     /// arrive over IPC (the HTTP route is gone), and a beacon can only arrive
     /// over HTTP — so the two rows must carry different origins, and the beacon
     /// row must not imply a user acted.
+    ///
+    /// **#48 rewrote this test, because it could not fail.** It asserted
+    /// `detail.contains("origin: ipc")` against a function that spelled
+    /// `Origin::Ipc` into its own format string — swapping `Flag.origin` at
+    /// both call sites left it green, so the one thing it named (the two rows
+    /// are told apart) was untested. The property is that the prose and the
+    /// `origin` key have a single source, so it is asserted over EVERY origin
+    /// the enum has: whatever a call site states, both halves of the row say
+    /// it, and a row whose two halves could disagree fails here.
     #[test]
-    fn an_override_row_and_a_beacon_row_are_told_apart_by_origin() {
+    fn a_flag_rows_prose_and_its_origin_key_have_one_source() {
+        for origin in outbound::Origin::ALL.iter().copied() {
+            let reg = LatchRegistry::default();
+            let s = scope("claude-1", Some("sess-a"));
+
+            let beacon = reg.beacon(Some(&s), "WebFetch", ON);
+            assert!(beacon.engaged);
+            let brow = beacon_row(origin, "WebFetch", &beacon);
+            assert_eq!(brow.origin, origin);
+            assert!(
+                brow.detail
+                    .contains(&format!("origin: {}", origin.as_str())),
+                "{:?}: {}",
+                origin,
+                brow.detail
+            );
+            // Independent of the origin: a beacon row never implies a human.
+            assert!(
+                brow.detail.contains("NOT evidence of a user action"),
+                "{}",
+                brow.detail
+            );
+
+            let out = reg
+                .apply_override(&s, LatchOverride::Unlatch)
+                .expect("unlatch applies");
+            let orow = override_row(origin, LatchOverride::Unlatch, &out);
+            assert_eq!(orow.origin, origin);
+            assert!(
+                orow.detail
+                    .contains(&format!("origin: {}", origin.as_str())),
+                "{:?}: {}",
+                origin,
+                orow.detail
+            );
+
+            // And the machine-readable half agrees with the prose, because it
+            // is the same field: this is the assertion that fails if a future
+            // call site ever sets `Flag.origin` from anything but `row.origin`.
+            for row in [&brow, &orow] {
+                let request = outbound::flag_request(&outbound::Flag {
+                    screen: outbound::Screen::LatchBeacon,
+                    origin: row.origin,
+                    consumer: s.agent,
+                    scope: &s.label(),
+                    tool: &row.tool,
+                    host: None,
+                    url: None,
+                    resolved_ip: None,
+                    canary: false,
+                    root: String::new(),
+                    detail: &row.detail,
+                });
+                assert_eq!(request["origin"], origin.as_str());
+                assert_eq!(request["scope"], "claude:claude-1");
+            }
+        }
+
+        // The two live call sites still differ, which is the fact #45 bought:
+        // an override can only arrive over IPC (the HTTP route is gone) and a
+        // beacon only over HTTP.
+        assert_ne!(outbound::Origin::Ipc, outbound::Origin::Http);
+    }
+
+    /// #48 (A2-2): a beacon that contaminates a conversation **without** moving
+    /// the latch writes a row too.
+    ///
+    /// #45 keyed the row on `engaged` — the latch transition — while
+    /// `LatchRegistry::beacon` set `contaminated` unconditionally. A tab already
+    /// latched `Local` (Phase A's other direction: a local-capability call came
+    /// first) therefore took the contamination bit and left NO trace: no row, no
+    /// `warn!`, no `info!`. From that point every `context_note` is quarantined
+    /// and every external result enveloped, and the accepted-residuals entry
+    /// #45 wrote called the beacon "bounded, audited … and recoverable".
+    #[test]
+    fn a_beacon_that_only_contaminates_is_recorded_too() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
-        let beacon = reg.beacon(Some(&s), "WebFetch", ON);
-        assert!(beacon.engaged);
-        let beacon_detail = beacon_flag_detail("WebFetch", &beacon.view);
-        assert!(beacon_detail.contains("origin: http"), "{beacon_detail}");
+        // A local-capability call first: the tab latches LOCAL, uncontaminated.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch(), "local");
+        assert!(!reg.snapshot()[0].view.contaminated);
+
+        let out = reg.beacon(Some(&s), "WebFetch", ON);
+        assert!(!out.engaged, "the beacon cannot move a LOCAL latch");
+        assert!(out.contaminated_now, "but it did contaminate the session");
+        assert!(out.report, "and that is a reportable transition");
+        assert_eq!(out.view.latch, "local", "decision 15: the latch is unmoved");
+        assert!(out.view.contaminated);
+
+        // The row's prose must not claim the latch moved.
+        let row = beacon_row(outbound::Origin::Http, "WebFetch", &out);
+        assert!(row.detail.contains("CONTAMINATED"), "{}", row.detail);
         assert!(
-            beacon_detail.contains("NOT evidence of a user action"),
-            "{beacon_detail}"
+            !row.detail.contains("now EXTERNAL-latched"),
+            "the row must not assert an engagement that did not happen: {}",
+            row.detail
         );
 
-        let out = reg
-            .apply_override(&s, LatchOverride::Unlatch)
-            .expect("unlatch applies");
-        let override_detail = override_flag_detail(LatchOverride::Unlatch, &out);
-        assert!(override_detail.contains("origin: ipc"), "{override_detail}");
+        // Still one row per tab-session: a caller in a loop produces no more.
+        for _ in 0..5 {
+            let again = reg.beacon(Some(&s), "WebFetch", ON);
+            assert!(!again.report, "the feed must not be floodable");
+            assert!(!again.contaminated_now, "and the bit is set only once");
+        }
+        // …and it is the SESSION that bounds it: a rotation re-arms the report,
+        // because a new conversation's contamination is a new fact.
+        let rotated = scope("claude-1", Some("sess-b"));
+        let after = reg.beacon(Some(&rotated), "WebFetch", ON);
+        assert!(after.report, "a rotated session reports again");
+    }
 
-        // The machine-readable half of the same fact.
-        let request = outbound::flag_request(&outbound::Flag {
-            screen: outbound::Screen::LatchBeacon,
-            origin: outbound::Origin::Http,
-            consumer: s.agent,
-            scope: &s.label(),
-            tool: "WebFetch",
-            host: None,
-            url: None,
-            resolved_ip: None,
-            canary: false,
-            root: String::new(),
-            detail: &beacon_detail,
-        });
-        assert_eq!(request["origin"], "http");
-        assert_eq!(request["screen"], "latch_beacon");
-        assert_eq!(request["scope"], "claude:claude-1");
+    /// The engagement case keeps its single row, and the two transitions do not
+    /// double-report: an engaging beacon contaminates and latches at once.
+    #[test]
+    fn an_engaging_beacon_reports_exactly_once_per_tab_session() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        let first = reg.beacon(Some(&s), "WebFetch", ON);
+        assert!(first.engaged && first.contaminated_now && first.report);
+        for _ in 0..5 {
+            assert!(!reg.beacon(Some(&s), "WebSearch", ON).report);
+        }
     }
 
     /// `/status`'s Phase F shape: the Phase B keys are unchanged (`latch` stays

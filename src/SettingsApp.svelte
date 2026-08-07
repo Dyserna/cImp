@@ -4121,6 +4121,43 @@
             </small>
           </label>
 
+          <h3>Native web tools</h3>
+          <small class="hint top">
+            cImp's containment latch only sees web access that goes through its
+            own proxy. Claude's <code>WebFetch</code>/<code>WebSearch</code> and
+            OpenCode's <code>webfetch</code>/<code>websearch</code> bypass it
+            entirely, so without one of the modes below a tab can read a hostile
+            page while cImp still believes it is clean. Takes effect when an AI
+            tab is <strong>restarted</strong>.
+          </small>
+          <label>
+            <span>Native web visibility</span>
+            <select
+              value={snapshot.offload.native_web_visibility}
+              onchange={(e) => {
+                const v = (e.currentTarget as HTMLSelectElement).value;
+                patch((s) => (s.offload.native_web_visibility = v));
+              }}
+            >
+              <option value="off">Off — no interference, no visibility</option>
+              <option value="sensor">Sensor — report only (default)</option>
+              <option value="deny">Deny — the harness refuses its own web tools</option>
+            </select>
+            <small class="hint">
+              <strong>Sensor</strong> installs a report-only hook on the two web
+              tools (nothing else — no cost on Read/Grep/Bash): using one engages
+              that tab's external latch and raises its taint badge, exactly as a
+              proxied fetch would. It never blocks a call, and a failure is
+              silent.
+              <strong>Deny</strong> closes the route by configuration, so all web
+              flows through the proxied <code>ddg</code>/MCP tools where the latch
+              is fully effective — pair it with local/proxied web servers.
+              <strong>Off</strong> is the escape hatch if a hook misbehaves.
+              In every mode, shell-level access (<code>curl</code> in Bash) stays
+              invisible.
+            </small>
+          </label>
+
           <h3>Injection detection</h3>
           <small class="hint top">
             Screens the text every external tool brings back (fetched pages, docs

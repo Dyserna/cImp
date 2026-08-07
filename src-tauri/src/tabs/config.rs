@@ -307,6 +307,61 @@ pub(crate) fn advertises_audit_to_opencode(s: &Settings) -> bool {
     s.code_audit.enabled && s.code_audit.expose_opencode
 }
 
+// ── V32 Phase F — native-web visibility (locked decision 14) ───────────────
+
+/// The Claude `PreToolUse` matcher and the OpenCode tool names for the two
+/// harness-native web tools, in one reviewed place.
+///
+/// The matcher is deliberately NARROW. A `PreToolUse` hook costs a process
+/// spawn per matched call, so a wide (or empty) matcher would tax every
+/// `Read`/`Grep`/`Bash` in the session for a signal only the web tools can
+/// produce — which is also why the E1 latency spike is irrelevant to this
+/// phase (see the milestone's Phase E note).
+const CLAUDE_WEB_TOOL_MATCHER: &str = "WebFetch|WebSearch";
+
+/// The Claude `permissions.deny` rules for `deny` mode. Bare tool names, not
+/// glob forms: Claude Code 2.1.214's narrowing of single-segment permission
+/// globs applies to *path* patterns (`Edit(src/**)`), and a bare name is the
+/// documented "every use of this tool" spelling — nothing to narrow.
+const CLAUDE_WEB_DENY_RULES: [&str; 2] = ["WebFetch", "WebSearch"];
+
+/// V32 Phase F: what cImp does about the harness's OWN web tools, applied per
+/// consumer at TAB SPAWN (locked decision 14).
+///
+/// All three modes act only at spawn, which is why
+/// [`spawn_inject_sig`] carries this value: a running tab keeps whatever it
+/// launched with, and the user is owed the restart hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeWebVisibility {
+    /// Nothing injected: no beacon hook, no permission denial. Pre-V32.
+    Off,
+    /// Report-only beacons that engage the tab's EXTERNAL latch. Never deny.
+    Sensor,
+    /// The native web tools are refused by the harness itself.
+    Deny,
+}
+
+impl NativeWebVisibility {
+    /// Parse the settings string. An unrecognized value reads as
+    /// [`Sensor`](Self::Sensor) — the default — for the same reason C3's
+    /// updater `Mode::parse` falls back to `check`: a typo must neither blind
+    /// the latch (`off`) nor silently take a tool away from a working tab
+    /// (`deny`). Validated post-hoc here because the settings field is a plain
+    /// string that a hand-edited config can carry anything in.
+    pub(crate) fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "off" => NativeWebVisibility::Off,
+            "deny" => NativeWebVisibility::Deny,
+            _ => NativeWebVisibility::Sensor,
+        }
+    }
+
+    /// The mode in force for these settings.
+    pub(crate) fn of(s: &Settings) -> Self {
+        Self::parse(&s.offload.native_web_visibility)
+    }
+}
+
 /// Per-consumer spawn-injection signature — `[claude, opencode]`. Captures
 /// every Settings-derived input that reaches an AI tab only at spawn (the
 /// `--mcp-config` server set, the `compose_capability_guidance` gates, the
@@ -386,14 +441,27 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // `session_push` flip changes no argv and must not nag every tab to
         // restart for nothing.
         "channels": s.offload.session_push && advertises_offload_to_claude(s),
+        // V32 Phase F (locked decision 14): the native-web visibility mode.
+        // Every mode acts at spawn — `sensor` installs a `PreToolUse` beacon
+        // hook, `deny` writes `permissions.deny`, `off` writes neither — so a
+        // flip changes how a FRESH tab launches while the running one keeps its
+        // old posture. The RAW string, not the parsed mode: two spellings that
+        // both parse to `sensor` produce identical argv, and comparing the raw
+        // value only over-reports (a nag), never under-reports (a silent
+        // divergence), which is the safe direction for this signature.
+        "native_web": s.offload.native_web_visibility,
     });
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
         "guidance": guidance,
         // `write_opencode_plugin` inputs: plugin presence + its baked
         // CIMP_INJECT_ENABLED / CIMP_AUTO_CHECK_ENABLED flags.
+        //
+        // V32 Phase F: plugin PRESENCE is no longer `graph.enabled` alone —
+        // sensor mode needs the plugin too (`opencode_plugin_wanted`), and the
+        // beacon handler's own gate rides the `native_web` entry below.
         "plugin": [
-            s.graph.enabled,
+            opencode_plugin_wanted(s),
             s.graph.enabled && s.graph.context_injection,
             post_edit,
         ],
@@ -402,6 +470,10 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
             .offload
             .resolve_opencode_provider()
             .map(|p| serde_json::json!([p.base_url, p.model, p.api_key])),
+        // V32 Phase F: `sensor` bakes the beacon handler's flag into the
+        // plugin, `deny` writes `permission.webfetch/websearch = "deny"` into
+        // `OPENCODE_CONFIG_CONTENT` — both spawn-time, like the Claude half.
+        "native_web": s.offload.native_web_visibility,
     });
     [claude, opencode]
 }
@@ -450,6 +522,9 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
     // and it layers over the user's own settings without touching `~/.claude`.
     {
         let mut overlay = serde_json::Map::new();
+        // V32 Phase F: read once — the mode gates both the beacon hook and the
+        // permission denial below, and the two must never disagree.
+        let native_web = NativeWebVisibility::of(settings);
         if settings.statusline.enabled {
             if let Some(command) = crate::statusline::launch_command() {
                 // `refreshInterval` (seconds) re-runs the command on a timer in
@@ -473,6 +548,12 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
         // one `hooks` object — each entry is installed only when its gate is on.
         {
             let mut hooks = serde_json::Map::new();
+            // V32 Phase F: `PreToolUse` now has TWO independent producers (the
+            // V11 read advisor and the Phase F web beacon), so its entries
+            // accumulate here and are inserted once. Claude Code evaluates every
+            // matching entry, so a beacon on `WebFetch|WebSearch` and an advisor
+            // on `Read|Bash` never interfere.
+            let mut pre_tool_use: Vec<serde_json::Value> = Vec::new();
             // V13 Phase C: widened from `context_injection` alone so the
             // prompt-tap checkpoint trigger (`workbench::on_prompt`, called
             // from the `/context/retrieve` handler BEFORE its own injection
@@ -525,22 +606,79 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
                 && !settings.harness_versions.e1_blocked()
             {
                 if let Some(command) = crate::statusline::hook_command("--read-hook") {
-                    let mut entries = vec![serde_json::json!({
+                    pre_tool_use.push(serde_json::json!({
                         "matcher": "Read",
                         "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
-                    })];
+                    }));
                     // V17 Phase B: a second matcher intercepts a whole-file shell
                     // read (`cat FILE`) of an already-read file via the SAME
                     // `--read-hook` shim (which dispatches on `tool_name`). Gated
                     // on the sub-toggle, so it's a zero overlay delta when off.
                     if settings.graph.read_advisor_shell {
-                        entries.push(serde_json::json!({
+                        pre_tool_use.push(serde_json::json!({
                             "matcher": "Bash",
                             "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
                         }));
                     }
-                    hooks.insert("PreToolUse".to_string(), serde_json::Value::Array(entries));
                 }
+            }
+            // V32 Phase F (locked decision 14), `sensor` mode: a report-only
+            // `PreToolUse` beacon on the harness's OWN web tools. Claude's
+            // `WebFetch`/`WebSearch` never route through cImp, so the proxy
+            // latch cannot see them — without this the session can ingest a
+            // hostile page while `/status` still reads `open`. The shim POSTs to
+            // the loopback's `/latch/beacon`, which engages the tab's EXTERNAL
+            // latch exactly as a proxied fetch would.
+            //
+            // Report-only by construction: `--taint-beacon` prints nothing and
+            // always exits 0, and a PreToolUse hook only denies by *saying so*
+            // (exit 2, or a `permissionDecision` verdict on stdout). A dead app,
+            // a bad token or a timeout therefore lets the call proceed — locked
+            // decision 14's "sensor mode must never break a tab".
+            //
+            // GATED ON `loopback_needed()` for the H2 reason the NC-2 hooks are
+            // (see the long note below): the shim's only delivery path is the
+            // loopback, and injecting it without one spawns a process per web
+            // call whose POST has nowhere to land. Consequence, stated honestly:
+            // on an install with offload, graph and Code-Audit-MCP all off there
+            // is no proxy latch to engage either, so the beacon has nothing to
+            // report to — inert, not silently broken.
+            //
+            // `--tab` is baked in because a hook payload carries no tab identity
+            // (the E2 spike's finding on the OpenCode side applies here too);
+            // the tab id is the key the whole latch registry is built on.
+            if native_web == NativeWebVisibility::Sensor && settings.loopback_needed() {
+                if let Some(command) = crate::statusline::hook_command("--taint-beacon") {
+                    pre_tool_use.push(serde_json::json!({
+                        "matcher": CLAUDE_WEB_TOOL_MATCHER,
+                        "hooks": [ {
+                            "type": "command",
+                            "command": format!("{command} --tab {tab}"),
+                            // An explicit short ceiling (the sibling shims'
+                            // value; the harness default is 600 s) as
+                            // defence-in-depth — NOT as the fail-open
+                            // mechanism. What a TIMED-OUT hook does is
+                            // undocumented: the hooks reference specifies the
+                            // exit-code table and the `timeout` field's unit
+                            // and default, but never says whether a timeout is
+                            // treated as the blocking case or the non-blocking
+                            // one. Decision 14 forbids this hook from being
+                            // able to affect a call, so `--taint-beacon` never
+                            // waits on anything the app controls (it dispatches
+                            // its POST with an 80 ms deadline and never reads
+                            // the reply — see `taint_beacon`'s module doc).
+                            // This ceiling therefore covers only a pathological
+                            // process spawn, and should never be reached.
+                            "timeout": 5
+                        } ]
+                    }));
+                }
+            }
+            if !pre_tool_use.is_empty() {
+                hooks.insert(
+                    "PreToolUse".to_string(),
+                    serde_json::Value::Array(pre_tool_use),
+                );
             }
             // V12 Phase F (6a/6b): PostToolUse auto-check after an edit — opt-in
             // (behavior hook), needs the graph AND at least one configured check
@@ -619,6 +757,26 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             if !hooks.is_empty() {
                 overlay.insert("hooks".to_string(), serde_json::Value::Object(hooks));
             }
+        }
+        // V32 Phase F (locked decision 14), `deny` mode: close the native web
+        // route by CONFIG rather than by hook. A `permissions.deny` rule is
+        // enforced by Claude Code itself before the tool runs — no shim, no
+        // latency, nothing for a compromised model to talk its way past — and
+        // it rides the same session-scoped `--settings` overlay as everything
+        // else, so `~/.claude` is still never touched.
+        //
+        // Bare tool names (see [`CLAUDE_WEB_DENY_RULES`]). No `allow`/`ask`
+        // keys: the overlay states one intent and leaves the user's own
+        // permission configuration otherwise intact.
+        //
+        // Ungated by `loopback_needed()`, unlike the sensor hook — a denial
+        // needs no app to talk to, and its whole point is to hold on the
+        // installs where the proxy is not carrying the web traffic.
+        if native_web == NativeWebVisibility::Deny {
+            overlay.insert(
+                "permissions".to_string(),
+                serde_json::json!({ "deny": CLAUDE_WEB_DENY_RULES }),
+            );
         }
         if !overlay.is_empty() {
             args.push("--settings".to_string());
@@ -1082,7 +1240,10 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 ///   * `tool.execute.after` → POST to `/memory/event` (the sole memory ingress
 ///     for OpenCode, whose OOB SSE stream carries no tool events).
 ///
-/// Removed when the graph is off (nothing to inject or record). Also adds
+/// V32 Phase F adds a third: `tool.execute.before` → POST to `/latch/beacon`
+/// when the model reaches for OpenCode's OWN `webfetch`/`websearch`.
+///
+/// Removed when nothing wants it ([`opencode_plugin_wanted`]). Also adds
 /// `.opencode/` to the project's `.git/info/exclude` so the generated plugin and
 /// OpenCode's own `.opencode/.gitignore` don't dirty `git status`.
 fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
@@ -1091,8 +1252,8 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
         .join("plugin")
         .join("cimp-inject.js");
 
-    // No graph → nothing to inject or record; clean up a stale plugin.
-    if !settings.graph.enabled {
+    // Nothing to inject, record OR watch → clean up a stale plugin.
+    if !opencode_plugin_wanted(settings) {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     }
@@ -1105,11 +1266,19 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
         return;
     };
 
-    let inject_enabled = settings.graph.context_injection;
+    let inject_enabled = settings.graph.enabled && settings.graph.context_injection;
     // V12 Phase F (6a/6b): same gate as the Claude PostToolUse hook — auto-check
     // needs the graph AND at least one configured check.
-    let auto_check_enabled = settings.graph.auto_check && !settings.checks.is_empty();
-    let js = opencode_plugin_source(disc.port, &disc.token, inject_enabled, auto_check_enabled);
+    let auto_check_enabled =
+        settings.graph.enabled && settings.graph.auto_check && !settings.checks.is_empty();
+    let beacon_enabled = NativeWebVisibility::of(settings) == NativeWebVisibility::Sensor;
+    let js = opencode_plugin_source(
+        disc.port,
+        &disc.token,
+        inject_enabled,
+        auto_check_enabled,
+        beacon_enabled,
+    );
 
     if let Some(dir) = plugin_path.parent() {
         if std::fs::create_dir_all(dir).is_err() {
@@ -1120,13 +1289,37 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
     git_exclude_opencode(working_dir);
 }
 
+/// V32 Phase F: whether the generated OpenCode plugin should exist at all.
+///
+/// **This is the E2 spike's fail-open trap, closed.** Until Phase F the plugin
+/// was written if and only if `graph.enabled`, and DELETED otherwise — so any
+/// security-relevant handler riding it would vanish the moment a user turned
+/// the code graph off, with no error and no UI trace. A gate that disappears
+/// when an unrelated feature is toggled is worse than no gate, because the
+/// `/status` view would still show the tab as `open` while its native web tool
+/// ran unobserved. The write condition is therefore the OR of every consumer's
+/// need, and each handler carries its own baked flag inside the file.
+///
+/// Pure (settings in, bool out) so both `write_opencode_plugin` and
+/// [`spawn_inject_sig`] read the same predicate and the restart hint can never
+/// disagree with what a fresh tab would write.
+pub(crate) fn opencode_plugin_wanted(s: &Settings) -> bool {
+    // V10/V12/V24: context injection, the memory/usage tap and auto-check.
+    s.graph.enabled
+        // V32 Phase F: the native-web beacon (sensor mode only — `deny` needs
+        // no plugin, the pinned permission block does that work, and `off`
+        // wants nothing installed at all).
+        || NativeWebVisibility::of(s) == NativeWebVisibility::Sensor
+}
+
 /// The dependency-free OpenCode plugin source, with the loopback port + token
-/// and the inject/auto-check flags baked in.
+/// and the inject/auto-check/beacon flags baked in.
 fn opencode_plugin_source(
     port: u16,
     token: &str,
     inject_enabled: bool,
     auto_check_enabled: bool,
+    beacon_enabled: bool,
 ) -> String {
     format!(
         r#"// Generated by cImp (V10 Code Intelligence). Do not edit — regenerated each launch.
@@ -1135,6 +1328,18 @@ const CIMP_TOKEN = "{token}";
 const CIMP_INJECT_ENABLED = {inject};
 const CIMP_AUTO_CHECK_ENABLED = {auto_check};
 const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);
+// V32 Phase F (locked decision 14): report-only visibility of OpenCode's OWN
+// web tools, which never route through cImp and are therefore invisible to the
+// proxy's taint latch. `false` in `off`/`deny` mode — in `deny` the pinned
+// `agent.build.permission` block refuses them outright, so there is nothing to
+// observe.
+const CIMP_BEACON_ENABLED = {beacon};
+const CIMP_WEB_TOOLS = new Set(["webfetch", "websearch"]);
+// The cImp TAB this OpenCode process was spawned for, from the env
+// (`compose_ai_env`). The hook input carries no tab or cwd identity — the E2
+// spike's finding — and the tab id is the key the whole latch registry uses,
+// so without it a beacon has nothing to engage.
+const CIMP_TAB_ID = (typeof process !== "undefined" && process.env && process.env.CIMP_TAB_ID) || "";
 
 // V24 Phase F: child session id -> parent session id, learned from
 // `session.created` events. Sub-agent (task-tool) sessions are always created
@@ -1160,6 +1365,32 @@ export default async (input) => ({{
       }});
       const j = await r.json();
       if (CIMP_INJECT_ENABLED && j && j.ok && j.text) p.text += "\n\n" + j.text;
+    }} catch (_e) {{}}
+  }},
+  // V32 Phase F: the native-web beacon. Fires BEFORE the tool runs so the
+  // latch is engaged by the time the fetched bytes exist, and NEVER throws or
+  // rejects — `tool.execute.before` denies by throwing (the E2 spike verdict),
+  // so any escaping error here would turn a report-only sensor into a silent
+  // deny of the user's own web tool. Everything is inside one try/catch, the
+  // fetch is awaited only to keep the ordering honest, and its own rejection is
+  // caught by the same block. A dead app, a rotated token or a 2s stall all end
+  // as "unreported", never as "refused".
+  "tool.execute.before": async (inp) => {{
+    try {{
+      if (!CIMP_BEACON_ENABLED || !CIMP_TAB_ID) return;
+      if (!inp || !CIMP_WEB_TOOLS.has(inp.tool)) return;
+      await fetch(CIMP_LOOPBACK + "/latch/beacon", {{
+        method: "POST",
+        headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
+        body: JSON.stringify({{
+          tab: CIMP_TAB_ID,
+          consumer: "opencode",
+          tool: inp.tool,
+          cwd: input.directory,
+          session_id: inp.sessionID,
+        }}),
+        signal: AbortSignal.timeout(2000),
+      }});
     }} catch (_e) {{}}
   }},
   "tool.execute.after": async (inp) => {{
@@ -1255,6 +1486,7 @@ export default async (input) => ({{
         token = token,
         inject = if inject_enabled { "true" } else { "false" },
         auto_check = if auto_check_enabled { "true" } else { "false" },
+        beacon = if beacon_enabled { "true" } else { "false" },
     )
 }
 
@@ -1289,6 +1521,12 @@ const OPENCODE_PINNED_BASH: &str = "allow";
 const OPENCODE_PINNED_EDIT: &str = "allow";
 const OPENCODE_PINNED_WEBFETCH: &str = "allow";
 const OPENCODE_PINNED_WEBSEARCH: &str = "allow";
+
+/// V32 Phase F (locked decision 14): the value the two web permissions take in
+/// `deny` mode. OpenCode's permission vocabulary is `allow`/`ask`/`deny`, and
+/// the block is already pinned per-agent — so the mode is a one-value swap on
+/// the two keys Phase D deliberately left at their upstream defaults.
+const OPENCODE_DENIED: &str = "deny";
 
 /// V19: synthesize OpenCode's session-scoped config — the JSON document that
 /// `OPENCODE_CONFIG_CONTENT` carries (the env-var analog of Claude's
@@ -1413,6 +1651,20 @@ fn build_opencode_config(
     // Deliberately a CONSTANT, not a setting — same argument as
     // `subagent_depth` above: `spawn_inject_sig` only needs entries for
     // Settings-derived spawn injections.
+    //
+    // ── V32 Phase F (locked decision 14) ───────────────────────────────────
+    // `native_web_visibility: "deny"` flips the two WEB values — and only
+    // those two — to `"deny"`, closing OpenCode's own route to the network so
+    // every fetch has to go through the proxied `ddg`/MCP tools, where the
+    // taint latch actually works. `bash` and `edit` keep their pinned values in
+    // every mode: shell-level egress (`curl`) is V33's problem (documented
+    // honest limit), and taking `edit` away would gut the tab.
+    let native_web = NativeWebVisibility::of(settings);
+    let (webfetch, websearch) = if native_web == NativeWebVisibility::Deny {
+        (OPENCODE_DENIED, OPENCODE_DENIED)
+    } else {
+        (OPENCODE_PINNED_WEBFETCH, OPENCODE_PINNED_WEBSEARCH)
+    };
     config.insert(
         "agent".to_string(),
         serde_json::json!({
@@ -1420,8 +1672,8 @@ fn build_opencode_config(
                 "permission": {
                     "bash": OPENCODE_PINNED_BASH,
                     "edit": OPENCODE_PINNED_EDIT,
-                    "webfetch": OPENCODE_PINNED_WEBFETCH,
-                    "websearch": OPENCODE_PINNED_WEBSEARCH,
+                    "webfetch": webfetch,
+                    "websearch": websearch,
                 }
             }
         }),
@@ -1567,6 +1819,17 @@ fn compose_ai_env(
     if command_is(&cfg.command, "opencode") {
         let config = build_opencode_config(cfg, settings, tab);
         env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string());
+        // V32 Phase F: the generated plugin's only channel to its own tab
+        // identity. OpenCode's `tool.execute.before` input carries a session id
+        // but no tab and no cwd (the E2 spike's finding), and the latch registry
+        // is keyed by (agent, tab) — so without this the beacon has nothing to
+        // engage. Claude's side needs no equivalent: its hook command bakes
+        // `--tab <id>` into argv.
+        //
+        // Unconditional and NOT Settings-derived (the tab id is config-derived
+        // and stable), so it needs no `spawn_inject_sig` entry of its own —
+        // same reasoning as the `--tab` MCP child argument.
+        env.insert("CIMP_TAB_ID".to_string(), tab.to_string());
         env.insert(
             "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT".to_string(),
             "1".to_string(),
@@ -1737,6 +2000,10 @@ mod tests {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
         settings.graph.read_advisor = true;
+        // The read advisor is the only `PreToolUse` producer under test here;
+        // V32 Phase F's sensor beacon is a second one, turned off so
+        // "no PreToolUse hook" keeps meaning "no read advisor".
+        settings.offload.native_web_visibility = "off".to_string();
         let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         let cmd = overlay["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
@@ -2083,14 +2350,20 @@ mod tests {
     /// CD-4 (maintenance 2026-08-04) — the Claude Code `--settings` contract.
     /// Two guarantees, asserted against the largest overlay we can emit:
     ///
-    ///   * **No permission rules, no plugins.** Claude Code 2.1.214 narrowed
-    ///     single-segment permission globs (`Edit(src/**)` now matches only
-    ///     `<cwd>/src` depth) and deprecated the `Write(path)` / `Glob(path)` /
-    ///     `NotebookEdit(path)` rule forms in favor of `Edit(path)` /
-    ///     `Read(path)`; plugins delivered through `--settings` were broken in
-    ///     2.1.181–2.1.214. cImp's overlay carries neither, so none of that
-    ///     applies — pinning the key set makes the negative durable: a future
-    ///     `permissions`/`plugins` key has to come past this note.
+    ///   * **No PATH permission rules, no plugins.** Claude Code 2.1.214
+    ///     narrowed single-segment permission globs (`Edit(src/**)` now matches
+    ///     only `<cwd>/src` depth) and deprecated the `Write(path)` /
+    ///     `Glob(path)` / `NotebookEdit(path)` rule forms in favor of
+    ///     `Edit(path)` / `Read(path)`; plugins delivered through `--settings`
+    ///     were broken in 2.1.181–2.1.214. cImp's overlay carries no plugins at
+    ///     all, and — since V32 Phase F — exactly one kind of permission rule:
+    ///     the bare tool names `WebFetch`/`WebSearch` under `permissions.deny`,
+    ///     in `deny` mode only. A bare name carries no path segment, so the
+    ///     glob-narrowing and the deprecated rule forms do not reach it.
+    ///     Pinning the key set keeps the negative durable: any further
+    ///     `permissions` content (paths, `allow`, `ask`) or a `plugins` key has
+    ///     to come past this note. The `deny`-mode shape is asserted separately
+    ///     by `deny_mode_permission_denies_the_native_web_tools`.
     ///   * **Size.** Settings over 2 MiB hard-fail at startup (2.1.214). The
     ///     overlay is bounded by construction — fixed-shape JSON whose only
     ///     variable part is this binary's own path, repeated once per hook
@@ -2141,8 +2414,8 @@ mod tests {
         }
         assert_eq!(
             overlay["hooks"]["PreToolUse"].as_array().map(Vec::len),
-            Some(2),
-            "Read + Bash read-advisor matchers",
+            Some(3),
+            "Read + Bash read-advisor matchers, plus the V32 Phase F web beacon",
         );
 
         // The whole overlay is exactly these two keys.
@@ -2173,7 +2446,7 @@ mod tests {
 
     #[test]
     fn opencode_plugin_source_bakes_endpoint_and_flag() {
-        let js = opencode_plugin_source(54321, "deadbeef00", true, true);
+        let js = opencode_plugin_source(54321, "deadbeef00", true, true, true);
         assert!(js.contains("127.0.0.1:54321"));
         assert!(js.contains("deadbeef00"));
         assert!(js.contains("CIMP_INJECT_ENABLED = true"));
@@ -2186,7 +2459,7 @@ mod tests {
         // V24 Phase F: the usage-forwarding `event` hook + its POST body shape.
         assert!(js.contains("event: async"));
         assert!(js.contains(r#"kind: "usage""#));
-        let off = opencode_plugin_source(1, "x", false, false);
+        let off = opencode_plugin_source(1, "x", false, false, false);
         assert!(off.contains("CIMP_INJECT_ENABLED = false"));
         assert!(off.contains("CIMP_AUTO_CHECK_ENABLED = false"));
     }
@@ -2198,7 +2471,7 @@ mod tests {
     /// flags (usage is always recorded).
     #[test]
     fn opencode_plugin_source_forwards_usage_on_completed_turn() {
-        let js = opencode_plugin_source(54321, "tok", true, true);
+        let js = opencode_plugin_source(54321, "tok", true, true, true);
         // Gates on an assistant turn that has completed.
         assert!(
             js.contains(r#"info.role !== "assistant""#),
@@ -2228,7 +2501,7 @@ mod tests {
         // The usage `event` hook must NOT be gated on the inject/auto-check
         // flags — usage is recorded regardless. The hook body (from `event:`
         // to the end) references neither flag.
-        let off = opencode_plugin_source(1, "x", false, false);
+        let off = opencode_plugin_source(1, "x", false, false, false);
         let event_start = off.find("event: async").expect("event hook present");
         let hook = &off[event_start..];
         assert!(
@@ -2243,7 +2516,7 @@ mod tests {
     /// sidechain parity) and roll activity up to the parent.
     #[test]
     fn opencode_tool_event_stamps_parent_session_for_children() {
-        let js = opencode_plugin_source(1, "x", true, true);
+        let js = opencode_plugin_source(1, "x", true, true, true);
         let start = js
             .find(r#""tool.execute.after""#)
             .expect("tool hook present");
@@ -2271,7 +2544,7 @@ mod tests {
     /// attributable.
     #[test]
     fn opencode_chat_message_posts_retrieve_even_when_injection_disabled() {
-        let js = opencode_plugin_source(1, "x", false, false);
+        let js = opencode_plugin_source(1, "x", false, false, false);
         assert!(
             js.contains(r#"agent: "opencode""#),
             "missing agent field: {js}"
@@ -2983,6 +3256,273 @@ mod tests {
                  rationale comment in `build_opencode_config` in the same edit.",
             );
         }
+    }
+
+    // ── V32 Phase F — native-web visibility modes (locked decision 14) ──────
+
+    /// The locked default and the post-hoc validation of a hand-editable
+    /// string. `sensor` is the default because we cannot assume what MCP setup
+    /// a user runs and a silent side channel is worse than a beacon; an
+    /// unrecognized value must land on that same default rather than blinding
+    /// the latch (`off`) or taking a tool away (`deny`).
+    #[test]
+    fn native_web_visibility_defaults_to_sensor_and_validates_post_hoc() {
+        assert_eq!(Settings::default().offload.native_web_visibility, "sensor");
+        assert_eq!(
+            NativeWebVisibility::of(&Settings::default()),
+            NativeWebVisibility::Sensor
+        );
+        assert_eq!(NativeWebVisibility::parse("off"), NativeWebVisibility::Off);
+        assert_eq!(
+            NativeWebVisibility::parse(" sensor "),
+            NativeWebVisibility::Sensor
+        );
+        assert_eq!(NativeWebVisibility::parse("deny"), NativeWebVisibility::Deny);
+        for junk in ["", "OFF", "Deny", "denied", "sensr", "true"] {
+            assert_eq!(
+                NativeWebVisibility::parse(junk),
+                NativeWebVisibility::Sensor,
+                "{junk:?} must fall back to the default, not to off/deny"
+            );
+        }
+    }
+
+    /// Spawn-baked ⇒ `spawn_inject_sig` entry ⇒ restart hint. All three modes
+    /// act only at tab launch, so flipping one while tabs are running must move
+    /// BOTH consumers' signatures — a tab that launched in `off` stays blind
+    /// until it restarts, and the user is owed that hint.
+    #[test]
+    fn native_web_visibility_moves_the_spawn_inject_signature() {
+        let base = spawn_inject_sig(&Settings::default());
+        for mode in ["off", "deny"] {
+            let mut s = Settings::default();
+            s.offload.native_web_visibility = mode.to_string();
+            let sig = spawn_inject_sig(&s);
+            assert_ne!(sig[0], base[0], "claude signature must move for {mode}");
+            assert_ne!(sig[1], base[1], "opencode signature must move for {mode}");
+            assert_eq!(sig[0]["native_web"], serde_json::json!(mode));
+            assert_eq!(sig[1]["native_web"], serde_json::json!(mode));
+        }
+    }
+
+    /// Sensor mode injects a `PreToolUse` beacon matched ONLY on the two web
+    /// tools — the narrowness is the point (no per-call tax on Read/Grep/Bash)
+    /// — with the tab id baked into argv, since a hook payload carries none.
+    /// `off` and `deny` inject no hook at all.
+    #[test]
+    fn sensor_mode_injects_a_web_only_beacon_hook() {
+        let pre_tool_use = |mode: &str| -> Vec<serde_json::Value> {
+            let mut s = Settings::default();
+            s.graph.enabled = true; // the loopback the beacon POSTs into
+            s.offload.native_web_visibility = mode.to_string();
+            let args = build_pre_args(&claude_cfg(), &s, "claude-2");
+            settings_overlay(&args)
+                .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
+                .unwrap_or_default()
+        };
+
+        let sensor = pre_tool_use("sensor");
+        let beacon = sensor
+            .iter()
+            .find(|e| e["matcher"] == CLAUDE_WEB_TOOL_MATCHER)
+            .unwrap_or_else(|| panic!("sensor must install the beacon: {sensor:?}"));
+        let cmd = beacon["hooks"][0]["command"]
+            .as_str()
+            .expect("beacon command is a string");
+        assert!(cmd.contains(" --taint-beacon "), "got: {cmd}");
+        assert!(cmd.ends_with(" --tab claude-2"), "got: {cmd}");
+        assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+
+        for mode in ["off", "deny"] {
+            assert!(
+                !pre_tool_use(mode)
+                    .iter()
+                    .any(|e| e["matcher"] == CLAUDE_WEB_TOOL_MATCHER),
+                "{mode} must inject no beacon hook"
+            );
+        }
+    }
+
+    /// H2 discipline (`every_advertised_mcp_server_gets_a_loopback`): the
+    /// beacon's only delivery path is the loopback, so it must not be injected
+    /// when none runs — a process spawn per web call POSTing into a closed
+    /// socket is worse than no sensor.
+    #[test]
+    fn the_beacon_hook_is_not_injected_without_a_loopback() {
+        let settings = Settings::default(); // offload + graph + audit all off
+        assert!(!settings.loopback_needed());
+        assert_eq!(
+            NativeWebVisibility::of(&settings),
+            NativeWebVisibility::Sensor,
+            "the default mode is what makes this case worth pinning"
+        );
+        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        if let Some(overlay) = settings_overlay(&args) {
+            assert!(
+                overlay.get("hooks").is_none(),
+                "no loopback ⇒ no beacon: {overlay}"
+            );
+        }
+    }
+
+    /// Deny mode adds `permissions.deny` for the two web tools — and only in
+    /// deny mode. Bare tool names, no path globs (see the
+    /// `settings_overlay_matches_claude_settings_contract` note), and the rest
+    /// of the overlay is untouched.
+    #[test]
+    fn deny_mode_permission_denies_the_native_web_tools() {
+        let overlay_for = |mode: &str| -> Option<serde_json::Value> {
+            let mut s = Settings::default();
+            s.graph.enabled = true;
+            s.offload.native_web_visibility = mode.to_string();
+            settings_overlay(&build_pre_args(&claude_cfg(), &s, "claude"))
+        };
+        let deny = overlay_for("deny").expect("overlay present");
+        assert_eq!(
+            deny["permissions"],
+            serde_json::json!({ "deny": ["WebFetch", "WebSearch"] }),
+            "got: {deny}"
+        );
+        // Nothing else moved: the hooks object is still there and no
+        // allow/ask lists were invented.
+        assert!(deny["hooks"].is_object());
+        assert!(deny["permissions"].get("allow").is_none());
+        assert!(deny["permissions"].get("ask").is_none());
+        for mode in ["off", "sensor"] {
+            assert!(
+                overlay_for(mode).is_some_and(|o| o.get("permissions").is_none()),
+                "{mode} must carry no permission rules"
+            );
+        }
+    }
+
+    /// The OpenCode half of `deny`: the Phase D pinned block flips the two WEB
+    /// values and nothing else. `bash`/`edit` keep their pins in every mode —
+    /// shell egress is V33's honest limit, and taking `edit` away would gut the
+    /// tab.
+    #[test]
+    fn deny_mode_flips_only_the_web_keys_of_the_pinned_opencode_block() {
+        let perm_for = |mode: &str| -> serde_json::Value {
+            let mut s = Settings::default();
+            s.offload.native_web_visibility = mode.to_string();
+            build_opencode_config(&opencode_cfg(), &s, "opencode")["agent"]["build"]["permission"]
+                .clone()
+        };
+        assert_eq!(
+            perm_for("deny"),
+            serde_json::json!({
+                "bash": OPENCODE_PINNED_BASH,
+                "edit": OPENCODE_PINNED_EDIT,
+                "webfetch": "deny",
+                "websearch": "deny",
+            })
+        );
+        for mode in ["off", "sensor", "nonsense"] {
+            assert_eq!(
+                perm_for(mode),
+                serde_json::json!({
+                    "bash": OPENCODE_PINNED_BASH,
+                    "edit": OPENCODE_PINNED_EDIT,
+                    "webfetch": OPENCODE_PINNED_WEBFETCH,
+                    "websearch": OPENCODE_PINNED_WEBSEARCH,
+                }),
+                "{mode} must leave the Phase D pins alone"
+            );
+        }
+    }
+
+    /// **The E2 spike's fail-open trap, closed.** Until Phase F the plugin was
+    /// written iff `graph.enabled` and DELETED otherwise, so a security handler
+    /// riding it vanished when an unrelated feature was toggled off. The write
+    /// condition is now the OR of every consumer's need.
+    #[test]
+    fn the_opencode_plugin_is_written_for_the_beacon_with_the_graph_off() {
+        let with = |graph: bool, mode: &str| -> bool {
+            let mut s = Settings::default();
+            s.graph.enabled = graph;
+            s.offload.native_web_visibility = mode.to_string();
+            opencode_plugin_wanted(&s)
+        };
+        // The case the trap was: graph off, sensor on ⇒ still written.
+        assert!(with(false, "sensor"), "graph off must not delete the sensor");
+        assert!(with(true, "sensor"));
+        assert!(with(true, "off"), "the graph alone still wants it");
+        assert!(with(true, "deny"));
+        // Nothing wants it ⇒ removed, as before. `deny` needs no plugin: the
+        // pinned permission block does that work.
+        assert!(!with(false, "off"));
+        assert!(!with(false, "deny"));
+        // And the predicate the restart hint compares is the same one.
+        let mut s = Settings::default();
+        s.offload.native_web_visibility = "off".to_string();
+        assert_eq!(
+            spawn_inject_sig(&s)[1]["plugin"][0],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            spawn_inject_sig(&Settings::default())[1]["plugin"][0],
+            serde_json::json!(true)
+        );
+    }
+
+    /// The plugin's only channel to its own identity. OpenCode's
+    /// `tool.execute.before` input carries a session id but no tab and no cwd
+    /// (the E2 spike's finding), and the latch registry is keyed by
+    /// (agent, tab) — so without this env var a beacon has nothing to engage.
+    /// Unconditional: it is not settings-derived, so it needs no restart hint.
+    #[test]
+    fn opencode_env_carries_the_tab_id_for_the_plugin() {
+        for mode in ["off", "sensor", "deny"] {
+            let mut s = Settings::default();
+            s.offload.native_web_visibility = mode.to_string();
+            let env = compose_ai_env(&opencode_cfg(), &s, "opencode-3");
+            assert_eq!(
+                env.get("CIMP_TAB_ID").map(String::as_str),
+                Some("opencode-3"),
+                "{mode}"
+            );
+        }
+        // Claude tabs need no equivalent — their hook command bakes `--tab`
+        // into argv — so nothing is synthesized there.
+        let env = compose_ai_env(&claude_cfg(), &Settings::default(), "claude");
+        assert!(!env.contains_key("CIMP_TAB_ID"), "got: {env:?}");
+    }
+
+    /// The plugin's beacon handler: present and flagged on only in sensor mode,
+    /// reads its tab from `CIMP_TAB_ID`, fires on the two web tool names, and —
+    /// the property that makes a report-only sensor safe on a hook that denies
+    /// by throwing — is wrapped so nothing can escape it.
+    #[test]
+    fn opencode_plugin_beacon_handler_is_flagged_and_never_throws() {
+        let on = opencode_plugin_source(1, "t", false, false, true);
+        assert!(on.contains("CIMP_BEACON_ENABLED = true"));
+        assert!(on.contains("tool.execute.before"));
+        assert!(on.contains("/latch/beacon"));
+        assert!(on.contains("process.env.CIMP_TAB_ID"));
+        assert!(on.contains(r#"new Set(["webfetch", "websearch"])"#));
+
+        // Never-throws: the whole handler body from `tool.execute.before` to
+        // its terminating catch is inside one try/catch, and the awaited fetch
+        // is inside it too.
+        let start = on
+            .find("\"tool.execute.before\"")
+            .expect("handler present");
+        let body = &on[start..];
+        let end = body.find("\"tool.execute.after\"").expect("handler ends");
+        let body = &body[..end];
+        assert!(body.contains("try {"), "handler must be wrapped: {body}");
+        assert!(body.contains("catch (_e) {}"), "got: {body}");
+        assert!(
+            body.find("await fetch").is_some_and(|f| f > body
+                .find("try {")
+                .expect("try present")),
+            "the fetch must be inside the try: {body}"
+        );
+
+        // Off/deny bake the flag false, so the handler is inert even though the
+        // file may still be written for the graph's sake.
+        let off = opencode_plugin_source(1, "t", false, false, false);
+        assert!(off.contains("CIMP_BEACON_ENABLED = false"));
     }
 
     #[test]

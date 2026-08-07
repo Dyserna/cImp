@@ -597,6 +597,14 @@ pub enum Screen {
     /// true). See
     /// [`detection::updater`](super::detection::updater)`::record_row`.
     Updater,
+    /// V32 Phase F (locked decision 15): the USER moved a tab's taint latch —
+    /// "switch to local" or "restore full access". Like the quarantine and the
+    /// detection screens it denied nothing; unlike them it *granted* something,
+    /// which is exactly why it must be in the feed. The latch is the boundary
+    /// every other row in this enum reports against, so a record of who opened
+    /// it, when, and from which prior state is what makes the rest legible
+    /// after the fact.
+    LatchOverride,
 }
 
 impl Screen {
@@ -610,6 +618,7 @@ impl Screen {
             Screen::Signature => "signature",
             Screen::Classifier => "classifier",
             Screen::Updater => "updater",
+            Screen::LatchOverride => "latch_override",
         }
     }
 
@@ -618,7 +627,8 @@ impl Screen {
     /// quarantine (the note was stored) — a row that painted any of them as a
     /// denial would misreport what happened. [`Screen::Updater`] is not a
     /// screen over a call at all, so it is likewise never a denial; its rows
-    /// carry their own `ok`.
+    /// carry their own `ok`. Nor is [`Screen::LatchOverride`], which records
+    /// the user *granting* capability back.
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
@@ -626,6 +636,7 @@ impl Screen {
                 | Screen::Classifier
                 | Screen::MemoryQuarantine
                 | Screen::Updater
+                | Screen::LatchOverride
         )
     }
 }
@@ -1022,6 +1033,7 @@ mod tests {
             Screen::Signature,
             Screen::Classifier,
             Screen::Updater,
+            Screen::LatchOverride,
         ];
         let labels: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
         assert_eq!(
@@ -1034,7 +1046,8 @@ mod tests {
                 "memory_quarantine",
                 "signature",
                 "classifier",
-                "updater"
+                "updater",
+                "latch_override"
             ]
         );
         // Denial vs. flagged: the quarantine STORED the note, the two detection
@@ -1044,6 +1057,9 @@ mod tests {
         assert!(!Screen::Signature.is_denial());
         assert!(!Screen::Classifier.is_denial());
         assert!(!Screen::Updater.is_denial());
+        // V32 Phase F: an override GRANTS capability back — a denial-shaped row
+        // would read as "cImp blocked something", the opposite of what happened.
+        assert!(!Screen::LatchOverride.is_denial());
         assert!(Screen::LatchRefusal.is_denial());
         assert!(Screen::Ssrf.is_denial());
     }

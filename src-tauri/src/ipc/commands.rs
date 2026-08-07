@@ -1258,6 +1258,45 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
         .map_err(|e| AppError::Settings(format!("open folder: {e}")))
 }
 
+/// V32 Phase F (locked decision 15): every tab's taint-latch state — the input
+/// to the per-tab badge and its override popover.
+///
+/// **IPC, not HTTP, deliberately.** The same rows are served by the loopback's
+/// `GET /status`, but every loopback route is bearer-token authenticated so
+/// that only cImp-spawned children can reach it; handing that token to the
+/// webview to save one command would widen the trust boundary the token exists
+/// to draw. The Tauri backend owns the registry in-process, so this reads it
+/// directly.
+///
+/// Cheap by construction — one mutex, a handful of `(agent, tab)` entries, no
+/// I/O — which is what makes the UI's short poll interval acceptable.
+#[tauri::command]
+pub async fn latch_status() -> AppResult<Vec<crate::offload::loopback::LatchStatus>> {
+    Ok(crate::offload::loopback::latch_snapshot())
+}
+
+/// V32 Phase F (locked decision 15): apply a user-initiated latch move
+/// (`"flip_local"` or `"unlatch"`) to one tab and return its new view.
+///
+/// Errors carry a human-readable reason (unknown action, no latch to move, an
+/// illegal transition) that the popover shows verbatim — a security control
+/// that silently does nothing when clicked teaches the user to distrust it.
+///
+/// The `AppHandle` is needed because the latch scope is resolved through the
+/// V28 live-session registry, exactly as a gated tool call resolves it: an
+/// override must apply to the conversation the tab is running NOW, not to a
+/// stale row left by a previous session.
+#[tauri::command]
+pub async fn latch_override(
+    app: tauri::AppHandle,
+    tab: String,
+    consumer: String,
+    action: String,
+) -> AppResult<crate::offload::loopback::LatchView> {
+    crate::offload::loopback::apply_latch_override(&app, &consumer, &tab, &action)
+        .map_err(AppError::Offload)
+}
+
 /// V8-03: buffered `llama-server` output for a backend (primary when `name`
 /// is omitted) — the read-only Settings log panel's initial fill. Live lines
 /// arrive separately via the `offload-server-output` event.

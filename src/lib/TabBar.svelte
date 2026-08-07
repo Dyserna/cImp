@@ -1,6 +1,8 @@
 <script lang="ts">
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
+  import TaintMenu from './TaintMenu.svelte';
+  import { fetchLatchStatus, isTainted, latchByTab, type LatchRow } from './latch';
   import { tabs } from './tabs/store';
   import { switchTab } from './tabs/state';
   import {
@@ -46,6 +48,33 @@
     y: number;
     tab: { id: TabId; builtin: boolean } | null;
   } | null>(null);
+
+  // V32 Phase F: the taint-override popover. Anchored at the badge the user
+  // clicked, carrying that tab's latch row. Separate state from `menu` so the
+  // two can never be open at once for different reasons.
+  let taintMenu = $state<{ x: number; y: number; row: LatchRow } | null>(null);
+
+  function onTaintBadge(row: LatchRow, e: MouseEvent): void {
+    menu = null;
+    taintMenu = { x: e.clientX, y: e.clientY, row };
+  }
+
+  /// Refresh the latch snapshot immediately after an override, instead of
+  /// leaving the badge showing a stale state until the next poll tick.
+  function refreshLatches(): void {
+    void fetchLatchStatus()
+      .then((rows) => {
+        const next: Partial<Record<TabId, LatchRow>> = {};
+        for (const row of rows) {
+          const prev = next[row.tab];
+          if (!prev || (!isTainted(prev) && isTainted(row))) next[row.tab] = row;
+        }
+        latchByTab.set(next);
+      })
+      .catch(() => {
+        /* the poll will catch up */
+      });
+  }
 
   // The tab bar's root element, registered with the DOM registry so
   // the M2 drop-target hit-tester can distinguish "drop on tab bar"
@@ -233,6 +262,7 @@
     <div class="tab-list" bind:this={listEl}>
       {#each pane.tab_ids as id (id)}
         {@const meta = $tabs.find((m) => m.id === id)}
+        {@const latchRow = $latchByTab[id]}
         {#if meta}
           <Tab
             tabId={id}
@@ -244,6 +274,8 @@
             avatarState={$perTabAvatarState[id] ?? 'Idle'}
             awaitingPermission={$perTabAwaitingPermission[id] ?? false}
             doneWhileAway={$perTabDoneWhileAway[id] ?? false}
+            taint={isTainted(latchRow) ? (latchRow ?? null) : null}
+            ontaint={latchRow ? (e) => onTaintBadge(latchRow, e) : undefined}
             bind:renaming={
               () => renamingTab === id,
               (v) => {
@@ -339,6 +371,16 @@
     onNewWorktreeTab={t && !isShell && !isPreview ? () => openNewWorktreeTabDialog(t.id, pane.id) : undefined}
     onNewPreviewTab={onNewPreviewTabAction}
     onDismiss={dismissMenu}
+  />
+{/if}
+
+{#if taintMenu}
+  <TaintMenu
+    x={taintMenu.x}
+    y={taintMenu.y}
+    row={taintMenu.row}
+    onDismiss={() => (taintMenu = null)}
+    onApplied={refreshLatches}
   />
 {/if}
 

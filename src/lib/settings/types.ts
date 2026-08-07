@@ -1348,6 +1348,11 @@ export interface OffloadSettings {
   /// Artifact URLs must live under whichever manifest URL is in force, so an
   /// override relocates the whole bundle.
   detection_update_manifest_url: string;
+  /// V32 Phase F: how cImp treats the harness's OWN web tools (Claude
+  /// WebFetch/WebSearch, OpenCode webfetch/websearch) — `"off"` | `"sensor"` |
+  /// `"deny"`. Default `sensor` (report-only beacons that engage the tab's
+  /// EXTERNAL latch). Spawn-baked: a change needs an AI-tab restart.
+  native_web_visibility: string;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1672,6 +1677,7 @@ export function defaultSettings(): Settings {
       detection_update_classifier_mode: 'check',
       detection_update_interval_hours: 24,
       detection_update_manifest_url: '',
+      native_web_visibility: 'sensor',
     },
     graph: {
       enabled: false,

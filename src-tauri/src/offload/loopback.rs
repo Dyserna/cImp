@@ -644,6 +644,8 @@ async fn handle_conn(
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
         ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
+        ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
+        ("POST", "/latch/override") => handle_latch_override(&mut stream, &app, &req).await,
         ("POST", "/mcp/list") => handle_mcp_list(&mut stream, &service, &req).await,
         ("POST", "/mcp/call") => handle_mcp_call(&mut stream, &service, &app, &req).await,
         ("GET", "/describe") => {
@@ -920,9 +922,50 @@ struct TabLatch {
     /// the Tool Activity feed. One row per scope: the latch is sticky, so every
     /// later refusal restates the same fact.
     latch_flagged: bool,
+    /// V32 Phase F (locked decision 15): whether external content has entered
+    /// this conversation *at all* — set the moment an EXTERNAL call is admitted
+    /// (proxied, or beaconed from a harness-native web tool) and **never
+    /// cleared by an override**.
+    ///
+    /// It exists because decision 15 lets the USER move the latch, and the two
+    /// facts then come apart: the latch says what the session may do NEXT,
+    /// while contamination says what is already in its context window. A note
+    /// written after "switch to local" was still composed by a model that read
+    /// an attacker's page, so persistence must stay quarantined — contamination
+    /// is a property of the conversation, not of the latch position. Only a
+    /// session rotation ([`TabLatch::observe`]) ends it, because only a new
+    /// conversation has a clean context.
+    contaminated: bool,
 }
 
 impl TabLatch {
+    /// A brand-new, uncontaminated entry. One constructor so a field added
+    /// later cannot be initialized two different ways at the two sites that
+    /// create rows (`gate` and the Phase F `beacon`).
+    fn fresh() -> Self {
+        TabLatch {
+            session: None,
+            latch: Latch::Open,
+            budget: Budget::default(),
+            latch_flagged: false,
+            contaminated: false,
+        }
+    }
+
+    /// The user-facing projection of this entry (Phase F): what the badge
+    /// shows and which override buttons the popover may enable.
+    fn view(&self) -> LatchView {
+        LatchView {
+            latch: self.latch.label(),
+            contaminated: self.contaminated,
+            // Decision 15's two moves, as availability rather than as UI
+            // knowledge: the frontend must not re-derive "when is flip legal"
+            // from the label, or the rule would live in two places and drift.
+            can_flip_local: self.latch == Latch::External,
+            can_unlatch: self.latch != Latch::Open,
+        }
+    }
+
     /// Fold the currently-observed session id into this entry, resetting the
     /// latch when the tab's session has demonstrably **rotated**.
     ///
@@ -953,6 +996,10 @@ impl TabLatch {
                 // fresh right to report — same scope, same reset.
                 self.budget.reset();
                 self.latch_flagged = false;
+                // V32 Phase F: the ONE place contamination is cleared. A tab
+                // restart is the only clean exit the decision-15 UI offers, and
+                // this is what makes that true rather than advisory.
+                self.contaminated = false;
             }
             // First sighting: the same scope, only now identified. The latch
             // carries over — calls made before the registry knew the session
@@ -960,6 +1007,84 @@ impl TabLatch {
             None => self.session = Some(s.to_string()),
         }
     }
+}
+
+/// V32 Phase F: the containment state of one tab, as the badge and the
+/// override popover need it. Shared by `/status`, the `latch_status` IPC
+/// command and the two Phase F endpoints' replies so all four describe a tab
+/// with the same four facts.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatchView {
+    /// [`Latch::label`]: `open` / `external` / `local`.
+    pub latch: &'static str,
+    /// Locked decision 15: has external content entered this conversation at
+    /// all? Survives every override; only a session rotation clears it.
+    pub contaminated: bool,
+    /// Whether "switch to local" applies right now (EXTERNAL-latched only).
+    pub can_flip_local: bool,
+    /// Whether "restore full access" applies right now (anything but open).
+    pub can_unlatch: bool,
+}
+
+impl Default for LatchView {
+    /// The view of a tab the proxy has never served: nothing latched, nothing
+    /// contaminated, no override available.
+    fn default() -> Self {
+        LatchView {
+            latch: Latch::Open.label(),
+            contaminated: false,
+            can_flip_local: false,
+            can_unlatch: false,
+        }
+    }
+}
+
+/// V32 Phase F (locked decision 15): the two USER-initiated latch moves.
+///
+/// Deliberately only two, and both narrowing or explicit: there is no
+/// "latch external" (the system does that) and no "clear contamination"
+/// (nothing outside a session rotation may).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatchOverride {
+    /// EXTERNAL → Local. Restores the proxied local-capability tools and closes
+    /// the external side in the same move.
+    FlipLocal,
+    /// Anything → Open. Restores both sides; the UI puts a confirmation in
+    /// front of it because it recreates the trifecta with injected content
+    /// still in the context window.
+    Unlatch,
+}
+
+impl LatchOverride {
+    /// Parse a wire value. An unrecognized action is an **error**, never a
+    /// benign default: the two actions differ in exactly how much capability
+    /// they hand back, so a typo must not pick one.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "flip_local" => Ok(LatchOverride::FlipLocal),
+            "unlatch" => Ok(LatchOverride::Unlatch),
+            other => Err(format!(
+                "invalid latch override `{other}` — expected \"flip_local\" or \"unlatch\""
+            )),
+        }
+    }
+
+    /// The canonical wire value, and the `tool` column of the activity row.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LatchOverride::FlipLocal => "flip_local",
+            LatchOverride::Unlatch => "unlatch",
+        }
+    }
+}
+
+/// The result of an applied override: what the latch was, and what the tab
+/// looks like now. The prior state is carried because it is the fact the
+/// activity row exists to record — "restored full access" means something very
+/// different from `external` than from `local`.
+struct OverrideOutcome {
+    prior: Latch,
+    view: LatchView,
 }
 
 /// Which tool-serving route a gate call is running for. The two differ in one
@@ -1031,14 +1156,26 @@ impl LatchRegistry {
             return Ok(WriteTaint::Clean);
         }
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = tabs.entry(scope.key()).or_insert(TabLatch {
-            session: None,
-            latch: Latch::Open,
-            budget: Budget::default(),
-            latch_flagged: false,
-        });
+        let entry = tabs.entry(scope.key()).or_insert_with(TabLatch::fresh);
         entry.observe(scope.session.as_deref());
-        let refusal = match entry.latch.proxy_gate(class) {
+        // V32 Phase F: quarantine keys on CONTAMINATION, not on the latch
+        // position. `Latch::External` always implies `contaminated` (both are
+        // set by the same admitted call, a few lines below), so this only ever
+        // WIDENS the pure-latch verdict `proxy_gate` computes — to the one case
+        // decision 15 creates, where a user override moved the latch off
+        // External on a conversation that has already read external content.
+        // The pure function stays the single definition of the latch's own
+        // semantics; the bit is layered over it here, at the only site that
+        // owns per-conversation state.
+        let decision = match entry.latch.proxy_gate(class) {
+            ProxyGate::Proceed(WriteTaint::Clean)
+                if class == ToolClass::PersistentWrite && entry.contaminated =>
+            {
+                ProxyGate::Proceed(WriteTaint::Quarantined)
+            }
+            other => other,
+        };
+        let refusal = match decision {
             ProxyGate::Proceed(WriteTaint::Quarantined) => {
                 // Locked decision 10: store it, flag it, hold it for the user.
                 // The write itself never latches (PERSISTENT-WRITE is not a
@@ -1103,6 +1240,15 @@ impl LatchRegistry {
             }
             return Err(refusal);
         }
+        // V32 Phase F: the call is admitted, so if it is EXTERNAL its content is
+        // about to enter this conversation. Set the contamination bit HERE
+        // rather than deriving it from the latch, because the latch is now
+        // user-movable and the bit is not. (A refused call never reaches this
+        // point, so a hallucinated call to the blocked side cannot contaminate
+        // a clean session — the same property `engage` has.)
+        if class == ToolClass::External {
+            entry.contaminated = true;
+        }
         if entry.latch.engage(class) {
             info!(
                 target: "offload",
@@ -1114,6 +1260,127 @@ impl LatchRegistry {
             );
         }
         Ok(WriteTaint::Clean)
+    }
+
+    /// V32 Phase F (locked decision 14): engage this tab's EXTERNAL latch on
+    /// behalf of a HARNESS-NATIVE web tool that never routed through cImp.
+    ///
+    /// The beacon is the sensor mode's whole mechanism: Claude's `WebFetch` /
+    /// `WebSearch` and OpenCode's `webfetch` / `websearch` bypass the proxy, so
+    /// without this a tab could read an attacker's page while `/status` still
+    /// says `open` and every proxied local-capability tool stays available
+    /// beside it. It does exactly what an admitted proxied EXTERNAL call does —
+    /// engage the latch, set the contamination bit — and deliberately nothing
+    /// more:
+    ///
+    /// - **No refusal, ever.** The tool has already been permitted by the
+    ///   harness by the time the hook runs (and in `deny` mode it never runs at
+    ///   all). Returning "blocked" here would be a lie the caller cannot act on.
+    /// - **No `injection_flag` row.** Engagement is not a denial, and a proxied
+    ///   EXTERNAL call writes no row either; the badge and `/status` are the
+    ///   consumers decision 15 gives this signal. A row per web fetch would also
+    ///   drown the feed the *real* denials live in.
+    /// - **Fail-open on identity**, like every other gate here: a beacon with no
+    ///   tab id has no scope to engage.
+    ///
+    /// The one asymmetry with `gate`: a beacon arriving while the tab is
+    /// LOCAL-latched cannot refuse the fetch (it already happened), so it
+    /// records the contamination and leaves the latch where it is — the honest
+    /// reading of "this conversation has now seen external content, and its
+    /// proxied external side stays closed".
+    fn beacon(&self, scope: Option<&LatchScope>, tool: &str) -> LatchView {
+        let Some(scope) = scope else {
+            return LatchView::default();
+        };
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = tabs.entry(scope.key()).or_insert_with(TabLatch::fresh);
+        entry.observe(scope.session.as_deref());
+        entry.contaminated = true;
+        let moved = entry.latch.engage(ToolClass::External);
+        let view = entry.view();
+        drop(tabs);
+        if moved {
+            info!(
+                target: "offload",
+                agent = scope.agent,
+                tab = %scope.tab,
+                tool = %tool,
+                latch = view.latch,
+                "loopback: V32 session taint latch engaged by a native-web beacon"
+            );
+        }
+        view
+    }
+
+    /// V32 Phase F (locked decision 15): apply a USER-initiated latch move.
+    ///
+    /// Decision 1 rejected automatic resets and still does — an injected context
+    /// stays injected, so nothing the model can reach may move this. What
+    /// decision 15 adds is a human, who knows something the system cannot infer:
+    /// that the research is done and its output has been read.
+    ///
+    /// Errors (rather than silently no-op'ing) when the move does not apply, so
+    /// the UI can say why instead of appearing to have worked.
+    fn apply_override(
+        &self,
+        scope: &LatchScope,
+        action: LatchOverride,
+    ) -> Result<OverrideOutcome, String> {
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = tabs.get_mut(&scope.key()) else {
+            return Err(format!(
+                "no taint latch is engaged for {} — nothing to override",
+                scope.label()
+            ));
+        };
+        entry.observe(scope.session.as_deref());
+        let prior = entry.latch;
+        match action {
+            // The workflow button: research finished, now apply it. EXTERNAL
+            // only — from `Open` there is nothing to flip and from `Local` this
+            // would be a no-op that reads like an action. At no instant does the
+            // session hold web AND local capability: the flip closes the
+            // external side in the same assignment that opens the local one.
+            LatchOverride::FlipLocal => {
+                if prior != Latch::External {
+                    return Err(format!(
+                        "\"switch to local\" applies only to an EXTERNAL-latched tab ({} is {})",
+                        scope.label(),
+                        prior.label()
+                    ));
+                }
+                entry.latch = Latch::Local;
+            }
+            // The at-own-risk button: both sides open again. Valid from any
+            // state except a latch that is already open, which would be a
+            // no-op.
+            LatchOverride::Unlatch => {
+                if prior == Latch::Open {
+                    return Err(format!(
+                        "{} is not latched — nothing to unlatch",
+                        scope.label()
+                    ));
+                }
+                entry.latch = Latch::Open;
+            }
+        }
+        // Deliberately NOT touched: `contaminated`, and the session's spent
+        // budget. The override changes what the session may reach next; it
+        // cannot un-read what the model has already read, and letting a click
+        // refill the fetch budget would make the budget advisory.
+        let view = entry.view();
+        drop(tabs);
+        warn!(
+            target: "offload",
+            agent = scope.agent,
+            tab = %scope.tab,
+            action = action.as_str(),
+            prior = prior.label(),
+            latch = view.latch,
+            contaminated = view.contaminated,
+            "loopback: V32 taint latch moved by explicit user override"
+        );
+        Ok(OverrideOutcome { prior, view })
     }
 
     /// V32 Phase C (locked decision 11): whether this tab's session may make
@@ -1186,7 +1453,7 @@ impl LatchRegistry {
                 consumer: agent,
                 tab: tab.clone(),
                 session: st.session.clone(),
-                latch: st.latch.label(),
+                view: st.view(),
             })
             .collect();
         rows.sort_by(|a, b| (a.consumer, &a.tab).cmp(&(b.consumer, &b.tab)));
@@ -1196,12 +1463,29 @@ impl LatchRegistry {
 
 /// One `/status` latch row.
 #[derive(Serialize, Debug)]
-struct LatchStatus {
-    consumer: &'static str,
-    tab: String,
-    session: Option<String>,
-    /// [`Latch::label`]: `open` / `external` / `local`.
-    latch: &'static str,
+pub struct LatchStatus {
+    pub consumer: &'static str,
+    pub tab: String,
+    pub session: Option<String>,
+    /// V32 Phase F: the latch label plus the contamination bit and per-row
+    /// override availability. **Flattened**, so the wire shape is unchanged for
+    /// the Phase B readers (`latch` stays a top-level key of the row) and the
+    /// new facts sit beside it rather than in a nested object — one row per
+    /// tab, as `/status` has always been.
+    #[serde(flatten)]
+    pub view: LatchView,
+}
+
+impl LatchStatus {
+    /// [`Latch::label`] for this row: `open` / `external` / `local`.
+    ///
+    /// Read by the tests (and by anyone holding a snapshot); the wire form goes
+    /// through `view`'s flattened `latch` key, so the running app never calls
+    /// this — same `cfg_attr` shape as `toolclass::mutates_fs`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn latch(&self) -> &'static str {
+        self.view.latch
+    }
 }
 
 /// The process-wide registry. Latch state is intentionally in-memory and
@@ -1212,6 +1496,70 @@ struct LatchStatus {
 fn latches() -> &'static LatchRegistry {
     static LATCHES: OnceLock<LatchRegistry> = OnceLock::new();
     LATCHES.get_or_init(LatchRegistry::default)
+}
+
+/// V32 Phase F: the `/status` latch rows, read **in process**.
+///
+/// The per-tab taint badge and its override popover live in the webview, which
+/// has no bearer token and no business acquiring one — every loopback route is
+/// authenticated precisely so only cImp-spawned children can reach it. The
+/// Tauri backend already owns the registry, so the UI goes through an IPC
+/// command ([`crate::ipc::commands::latch_status`]) that calls this, and the
+/// token never leaves the processes that need it.
+pub fn latch_snapshot() -> Vec<LatchStatus> {
+    latches().snapshot()
+}
+
+/// V32 Phase F (locked decision 15): apply a user-initiated latch move to one
+/// tab, write its `injection_flag` row, and return the tab's new view.
+///
+/// The single entry point for both callers — the `POST /latch/override` route
+/// (for a child or a script) and the `latch_override` IPC command (the badge
+/// popover) — so the state machine, the audit row and the error strings cannot
+/// diverge between them.
+pub fn apply_latch_override(
+    app: &AppHandle,
+    consumer: &str,
+    tab: &str,
+    action: &str,
+) -> Result<LatchView, String> {
+    let action = LatchOverride::parse(action)?;
+    let agent = crate::graph::source_for_consumer(consumer);
+    let scope = latch_scope(app, agent, Some(tab))
+        .ok_or_else(|| "a latch override needs a tab id".to_string())?;
+    let outcome = latches().apply_override(&scope, action)?;
+
+    // Locked decision 15: "every override writes an `injection_flag` row … so
+    // the feed records who opened what." `ok: true` — nothing was denied; this
+    // is a capability GRANT, and the feed must show it as the deliberate act it
+    // is rather than as a failure. The prior latch is in the detail because
+    // "restored full access" from `external` and from `local` are very
+    // different events.
+    let detail = format!(
+        "USER OVERRIDE ({}): taint latch {} → {}. Contamination is NOT cleared by an override \
+         (contaminated={}): memory writes stay quarantined and external results keep their \
+         envelope, because the injected content is still in the conversation. Restarting the tab \
+         is the only clean reset.",
+        action.as_str(),
+        outcome.prior.label(),
+        outcome.view.latch,
+        outcome.view.contaminated,
+    );
+    outbound::record_flag(outbound::Flag {
+        screen: outbound::Screen::LatchOverride,
+        consumer: agent,
+        scope: &scope.label(),
+        // The action is the row's at-a-glance "tool": these rows have no tool
+        // call behind them, and what the user DID is the fact worth reading.
+        tool: action.as_str(),
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: false,
+        root: String::new(),
+        detail: &detail,
+    });
+    Ok(outcome.view)
 }
 
 /// `POST /graph_run`: run one `graph_*` tool against the app's WARM graph index
@@ -2570,6 +2918,119 @@ async fn handle_mcp_call(
     write_json(stream, 200, &r).await
 }
 
+/// A `POST /latch/beacon` body — V32 Phase F (locked decision 14).
+///
+/// Posted by the `cimp --taint-beacon` Claude `PreToolUse` shim and by the
+/// OpenCode plugin's `tool.execute.before` handler when the model reaches for a
+/// HARNESS-NATIVE web tool. Every field except `tab` is descriptive; `tab` is
+/// the only one the latch actually needs.
+#[derive(Deserialize)]
+struct LatchBeaconBody {
+    /// The cImp tab id the reporting harness was spawned for. Absent ⇒
+    /// fail-open, exactly like [`GraphRunBody::tab`].
+    #[serde(default)]
+    tab: Option<String>,
+    /// `claude` / `opencode`, normalized through `source_for_consumer` so one
+    /// tab keys the same latch from every route.
+    #[serde(default)]
+    consumer: Option<String>,
+    /// The native tool that is about to run (`WebFetch`, `webfetch`, …). Log
+    /// and diagnostics only.
+    #[serde(default)]
+    tool: Option<String>,
+}
+
+/// A `POST /latch/override` body — V32 Phase F (locked decision 15).
+#[derive(Deserialize)]
+struct LatchOverrideBody {
+    tab: String,
+    #[serde(default)]
+    consumer: Option<String>,
+    /// `"flip_local"` or `"unlatch"`. Validated post-hoc by
+    /// [`LatchOverride::parse`] — an unrecognized action is rejected, never
+    /// resolved to the more permissive of the two.
+    action: String,
+}
+
+/// `POST /latch/beacon`: engage a tab's EXTERNAL latch because the HARNESS's
+/// own web tool is about to run (locked decision 14, sensor mode).
+///
+/// Behind the same bearer token as every other route — an unauthenticated
+/// caller must not be able to latch a tab out of its local tools, which would
+/// be a denial-of-service on the user's session dressed as containment.
+///
+/// Always answers 200 with the tab's resulting view, including for a beacon
+/// with no tab identity (nothing engaged, `latch: "open"`). The reporter is a
+/// fail-open shim that discards the body; the status code exists for a human
+/// reading a trace, not for control flow.
+async fn handle_latch_beacon(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: LatchBeaconBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    let agent =
+        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
+    let scope = latch_scope(app, agent, body.tab.as_deref());
+    let tool = body.tool.as_deref().unwrap_or("(native web tool)");
+    let view = latches().beacon(scope.as_ref(), tool);
+    write_json(stream, 200, &serde_json::json!({ "ok": true, "latch": view })).await
+}
+
+/// `POST /latch/override`: apply a user-initiated latch move (locked decision
+/// 15). The in-app badge popover uses the `latch_override` IPC command instead
+/// (no token in the webview); this route exists so the same action is
+/// reachable from a child or a live-verification script, through the one
+/// implementation in [`apply_latch_override`].
+///
+/// 400 on an invalid action or a tab with no latch to move — the caller is a
+/// human or a script that should be told why, not left to infer it.
+async fn handle_latch_override(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: LatchOverrideBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    match apply_latch_override(
+        app,
+        body.consumer.as_deref().unwrap_or("claude"),
+        &body.tab,
+        &body.action,
+    ) {
+        Ok(view) => {
+            write_json(stream, 200, &serde_json::json!({ "ok": true, "latch": view })).await
+        }
+        Err(msg) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(msg),
+            };
+            write_json(stream, 400, &r).await
+        }
+    }
+}
+
 /// `GET /status`: the proxy's V32 Phase B debug view — one row per tab it has
 /// served, with that tab's resolved session and latch state
 /// ([`Latch::label`]). Read by hand (and by the live-verification recipes) to
@@ -3450,7 +3911,7 @@ mod tests {
         assert!(reg
             .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
             .is_ok());
-        assert_eq!(reg.snapshot()[0].latch, "external");
+        assert_eq!(reg.snapshot()[0].latch(), "external");
     }
 
     /// Direction 2: the tab reads source text first, so the proxied servers
@@ -3478,7 +3939,7 @@ mod tests {
         assert!(reg
             .gate(Some(&s), LatchRoute::Native, "context_note")
             .is_ok());
-        assert_eq!(reg.snapshot()[0].latch, "local");
+        assert_eq!(reg.snapshot()[0].latch(), "local");
     }
 
     /// TRUSTED tools are immune in both directions and never latch anything:
@@ -3499,7 +3960,7 @@ mod tests {
                 "{trusted}"
             );
         }
-        assert!(reg.snapshot().is_empty() || reg.snapshot()[0].latch == "open");
+        assert!(reg.snapshot().is_empty() || reg.snapshot()[0].latch() == "open");
 
         // And under a latch of either kind they still answer.
         for (route, first) in [
@@ -3528,7 +3989,7 @@ mod tests {
         assert!(reg
             .gate(Some(&s), LatchRoute::Proxied, "somenewserver__anything")
             .is_ok());
-        assert_eq!(reg.snapshot()[0].latch, "external");
+        assert_eq!(reg.snapshot()[0].latch(), "external");
         assert_eq!(
             reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
             Err(REFUSAL_LOCAL_BLOCKED)
@@ -3550,7 +4011,7 @@ mod tests {
             reg.gate(Some(&s), LatchRoute::Native, "context_note"),
             Ok(WriteTaint::Clean)
         );
-        assert_eq!(reg.snapshot()[0].latch, "open");
+        assert_eq!(reg.snapshot()[0].latch(), "open");
 
         assert!(reg
             .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
@@ -3561,7 +4022,7 @@ mod tests {
             Ok(WriteTaint::Quarantined)
         );
         // ...and the quarantined write still does not move the latch.
-        assert_eq!(reg.snapshot()[0].latch, "external");
+        assert_eq!(reg.snapshot()[0].latch(), "external");
         // Reads of the same store stay open — quarantine is about persistence.
         assert_eq!(
             reg.gate(Some(&s), LatchRoute::Native, "context_recall"),
@@ -3579,7 +4040,7 @@ mod tests {
         assert!(reg
             .gate(Some(&s), LatchRoute::Native, "graph_snippet")
             .is_ok());
-        assert_eq!(reg.snapshot()[0].latch, "local");
+        assert_eq!(reg.snapshot()[0].latch(), "local");
         assert_eq!(
             reg.gate(Some(&s), LatchRoute::Native, "context_note"),
             Ok(WriteTaint::Clean)
@@ -3628,7 +4089,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows.iter()
-                .map(|r| (r.consumer, r.tab.as_str(), r.latch))
+                .map(|r| (r.consumer, r.tab.as_str(), r.latch()))
                 .collect::<Vec<_>>(),
             [
                 ("claude", "claude-1", "external"),
@@ -3661,7 +4122,7 @@ mod tests {
         let rows = reg.snapshot();
         assert_eq!(rows.len(), 1, "the restart reuses the tab's row: {rows:?}");
         assert_eq!(rows[0].session.as_deref(), Some("sess-b"));
-        assert_eq!(rows[0].latch, "local");
+        assert_eq!(rows[0].latch(), "local");
     }
 
     /// A withheld session id is absence of evidence, not evidence of a
@@ -3743,12 +4204,12 @@ mod tests {
                 reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
                 Err(REFUSAL_LOCAL_BLOCKED)
             );
-            assert_eq!(reg.snapshot()[0].latch, "external");
+            assert_eq!(reg.snapshot()[0].latch(), "external");
         }
         assert!(reg
             .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
             .is_ok());
-        assert_eq!(reg.snapshot()[0].latch, "external");
+        assert_eq!(reg.snapshot()[0].latch(), "external");
     }
 
     /// `/graph_run` cannot serve a proxied server's content, so a name that
@@ -3773,11 +4234,16 @@ mod tests {
         assert!(reg
             .gate(Some(&s), LatchRoute::Native, "graph_snippet")
             .is_ok());
-        assert_eq!(reg.snapshot()[0].latch, "local");
+        assert_eq!(reg.snapshot()[0].latch(), "local");
     }
 
-    /// `/status`'s shape: the `Latch::label()` vocabulary plus the identity
-    /// needed to tell whose latch it is.
+    /// `/status`'s Phase B shape: the `Latch::label()` vocabulary plus the
+    /// identity needed to tell whose latch it is. Asserted key-by-key (rather
+    /// than as a whole-object equality) so V32 Phase F's additions — which
+    /// flatten alongside these — cannot break the guarantee this test exists
+    /// for: `latch` stays a TOP-LEVEL key with the three-label vocabulary.
+    /// The full Phase F object is pinned by
+    /// `status_snapshot_carries_contamination_and_override_availability`.
     #[test]
     fn status_snapshot_serializes_the_latch_labels() {
         let reg = LatchRegistry::default();
@@ -3786,15 +4252,11 @@ mod tests {
             .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
             .is_ok());
         let json = serde_json::to_value(reg.snapshot()).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!([{
-                "consumer": "claude",
-                "tab": "claude-1",
-                "session": "sess-a",
-                "latch": "external",
-            }])
-        );
+        let row = &json[0];
+        assert_eq!(row["consumer"], "claude");
+        assert_eq!(row["tab"], "claude-1");
+        assert_eq!(row["session"], "sess-a");
+        assert_eq!(row["latch"], "external");
     }
 
     // ── V32 Phase C — the proxy's per-session EXTERNAL fetch budget ─────────
@@ -3890,6 +4352,324 @@ mod tests {
             .gate(Some(&a2), LatchRoute::Proxied, "ddg__search")
             .is_ok());
         assert!(reg.budget_gate(Some(&a2), TEST_LIMITS, "ddg__search").is_ok());
+    }
+
+    // ── V32 Phase F — native-web beacons + the manual override ──────────────
+
+    /// Locked decision 14: a beacon does exactly what an admitted proxied
+    /// EXTERNAL call does — engages the tab's latch and contaminates the
+    /// conversation — so the harness's own web tool stops being invisible to
+    /// containment. The proxied local-capability side closes as a result.
+    #[test]
+    fn a_native_web_beacon_engages_the_external_latch_like_a_proxied_fetch() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        let view = reg.beacon(Some(&s), "WebFetch");
+        assert_eq!(view.latch, "external");
+        assert!(view.contaminated);
+        assert!(view.can_flip_local);
+        assert!(view.can_unlatch);
+        assert_eq!(reg.snapshot()[0].latch(), "external");
+        // ...and the containment that follows is the ordinary Phase B one.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Quarantined)
+        );
+    }
+
+    /// Fail-open on identity, like every other gate here: a beacon with no tab
+    /// id has nothing to engage and must not crash, latch anything globally, or
+    /// invent a row. A beacon for a tab the proxy has never served creates that
+    /// tab's row, exactly as its first gated call would have.
+    #[test]
+    fn a_beacon_without_tab_identity_is_a_no_op_and_an_unknown_tab_is_created() {
+        let reg = LatchRegistry::default();
+        let view = reg.beacon(None, "WebSearch");
+        assert_eq!(view, LatchView::default());
+        assert!(
+            reg.snapshot().is_empty(),
+            "an identityless beacon must not create a row"
+        );
+        // First contact for this tab is the beacon itself.
+        let fresh = scope("claude-9", Some("sess-z"));
+        assert_eq!(reg.beacon(Some(&fresh), "WebFetch").latch, "external");
+        let rows = reg.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tab, "claude-9");
+    }
+
+    /// A beacon arriving while the tab is LOCAL-latched cannot refuse the fetch
+    /// — the harness already ran it — so it records the contamination and
+    /// leaves the latch where it is. That is the honest reading: this
+    /// conversation has now seen external content, and its proxied external
+    /// side stays closed.
+    #[test]
+    fn a_beacon_under_a_local_latch_contaminates_without_flipping() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        let view = reg.beacon(Some(&s), "WebFetch");
+        assert_eq!(view.latch, "local", "sticky: a beacon never flips a latch");
+        assert!(view.contaminated);
+        // The contamination is what bites: the memory write is quarantined even
+        // though the latch says `local`.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Quarantined)
+        );
+    }
+
+    /// Locked decision 15's state machine. `flip_local` applies ONLY from
+    /// External (there is nothing to flip from Open, and from Local it would be
+    /// a no-op that reads like an action); `unlatch` applies from either
+    /// latched state and not from Open.
+    #[test]
+    fn flip_local_applies_only_from_external_and_unlatch_from_any_latch() {
+        // Open: neither move applies.
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_outline")
+            .is_ok());
+        assert!(reg
+            .apply_override(&s, LatchOverride::FlipLocal)
+            .is_err_and(|e| e.contains("EXTERNAL-latched")));
+        assert!(reg
+            .apply_override(&s, LatchOverride::Unlatch)
+            .is_err_and(|e| e.contains("not latched")));
+
+        // Local: flip is refused (it is already there), unlatch works.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        assert!(reg.apply_override(&s, LatchOverride::FlipLocal).is_err());
+        let out = reg
+            .apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch applies from local");
+        assert_eq!(out.prior, Latch::Local);
+        assert_eq!(out.view.latch, "open");
+
+        // External: the flip is the workflow button.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+        let out = reg
+            .apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip applies from external");
+        assert_eq!(out.prior, Latch::External);
+        assert_eq!(out.view.latch, "local");
+        assert!(out.view.contaminated);
+        assert!(!out.view.can_flip_local, "no second flip to offer");
+        assert!(out.view.can_unlatch);
+
+        // A tab the proxy has never served has no latch to override at all.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .apply_override(&s, LatchOverride::Unlatch)
+            .is_err_and(|e| e.contains("nothing to override")));
+    }
+
+    /// The flip is the decision-15 workflow: research done, now apply it. It
+    /// restores the proxied local-capability tools and CLOSES the external side
+    /// in the same move — at no instant does the session hold both.
+    #[test]
+    fn flip_local_reopens_local_tools_and_closes_the_external_side() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+            Err(REFUSAL_LOCAL_BLOCKED)
+        );
+        reg.apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip");
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search"),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+    }
+
+    /// **The core Phase F invariant.** Contamination is a property of the
+    /// CONVERSATION, not of the latch position: a note written after any
+    /// override was still composed by a model that read an attacker's page, so
+    /// persistence stays quarantined through both moves. Only a session
+    /// rotation — a tab restart, the one clean exit the UI names — clears it.
+    #[test]
+    fn contamination_survives_every_override_and_only_a_restart_clears_it() {
+        for action in [LatchOverride::FlipLocal, LatchOverride::Unlatch] {
+            let reg = LatchRegistry::default();
+            let s = scope("claude-1", Some("sess-a"));
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+                .is_ok());
+            let out = reg.apply_override(&s, action).expect("override applies");
+            assert!(out.view.contaminated, "{action:?}");
+            // The latch moved; the quarantine did not.
+            assert_ne!(out.view.latch, "external", "{action:?}");
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+                Ok(WriteTaint::Quarantined),
+                "{action:?}: a post-override write must still be quarantined"
+            );
+            assert!(reg.snapshot()[0].view.contaminated, "{action:?}");
+
+            // Tab restart ⇒ new session ⇒ clean scope, and only then.
+            let after = scope("claude-1", Some("sess-b"));
+            assert_eq!(
+                reg.gate(Some(&after), LatchRoute::Native, "context_note"),
+                Ok(WriteTaint::Clean),
+                "{action:?}"
+            );
+            let rows = reg.snapshot();
+            assert!(!rows[0].view.contaminated, "{action:?}");
+            assert_eq!(rows[0].latch(), "open", "{action:?}");
+        }
+    }
+
+    /// Full unlatch restores both sides — the at-own-risk move — while the
+    /// contamination bit keeps persistence closed. Both facts matter: the
+    /// button must actually work, and it must not silently undo the quarantine.
+    #[test]
+    fn full_unlatch_restores_both_sides_but_not_persistence() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .is_ok());
+        reg.apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
+        // Both sides answer again... (the local call re-latches Local, so probe
+        // the external side first).
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Quarantined),
+            "unlatching must not un-contaminate the conversation"
+        );
+    }
+
+    /// The wire vocabulary. An unrecognized action is an ERROR, never resolved
+    /// to a default — the two moves differ in exactly how much capability they
+    /// hand back, so a typo must not pick one.
+    #[test]
+    fn latch_override_parses_exactly_two_actions() {
+        assert_eq!(
+            LatchOverride::parse("flip_local"),
+            Ok(LatchOverride::FlipLocal)
+        );
+        assert_eq!(LatchOverride::parse(" unlatch "), Ok(LatchOverride::Unlatch));
+        for junk in ["", "unlatch_all", "flip", "FLIP_LOCAL", "open"] {
+            assert!(LatchOverride::parse(junk).is_err(), "{junk}");
+        }
+        assert_eq!(LatchOverride::FlipLocal.as_str(), "flip_local");
+        assert_eq!(LatchOverride::Unlatch.as_str(), "unlatch");
+    }
+
+    /// `/status`'s Phase F shape: the Phase B keys are unchanged (`latch` stays
+    /// a top-level key — the flattened view provides it) and the three new
+    /// facts sit beside them, so the badge and the override popover read one
+    /// row per tab.
+    #[test]
+    fn status_snapshot_carries_contamination_and_override_availability() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .is_ok());
+        assert_eq!(
+            serde_json::to_value(reg.snapshot()).unwrap(),
+            serde_json::json!([{
+                "consumer": "claude",
+                "tab": "claude-1",
+                "session": "sess-a",
+                "latch": "external",
+                "contaminated": true,
+                "can_flip_local": true,
+                "can_unlatch": true,
+            }])
+        );
+        // After the flip: still contaminated, no further flip on offer.
+        reg.apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip");
+        assert_eq!(
+            serde_json::to_value(reg.snapshot()).unwrap(),
+            serde_json::json!([{
+                "consumer": "claude",
+                "tab": "claude-1",
+                "session": "sess-a",
+                "latch": "local",
+                "contaminated": true,
+                "can_flip_local": false,
+                "can_unlatch": true,
+            }])
+        );
+    }
+
+    /// A LOCAL-only session is never contaminated: only *external* content can
+    /// contaminate, and a clean session must not be dragged into quarantine by
+    /// the Phase F bit.
+    #[test]
+    fn a_purely_local_session_is_never_contaminated() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        for name in ["graph_snippet", "graph_outline", "context_recall"] {
+            assert!(reg.gate(Some(&s), LatchRoute::Native, name).is_ok(), "{name}");
+        }
+        assert!(!reg.snapshot()[0].view.contaminated);
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            Ok(WriteTaint::Clean)
+        );
+        // A REFUSED external call must not contaminate either — otherwise a
+        // hallucinated (or injected) call to the blocked side could quarantine
+        // a clean session's memory writes.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search"),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+        assert!(!reg.snapshot()[0].view.contaminated);
+    }
+
+    /// The two Phase F request bodies parse the shapes the beacon shim and the
+    /// plugin actually send, and fail open on a missing tab exactly like
+    /// `/graph_run` and `/mcp/call` do.
+    #[test]
+    fn phase_f_bodies_parse_the_shapes_the_reporters_send() {
+        let claude: LatchBeaconBody = serde_json::from_slice(
+            br#"{"tab":"claude-2","consumer":"claude","tool":"WebFetch","cwd":"P:\\proj","session_id":"s"}"#,
+        )
+        .expect("claude shim body parses");
+        assert_eq!(claude.tab.as_deref(), Some("claude-2"));
+        assert_eq!(claude.tool.as_deref(), Some("WebFetch"));
+
+        let bare: LatchBeaconBody =
+            serde_json::from_slice(br#"{"consumer":"opencode"}"#).expect("bare body parses");
+        assert!(bare.tab.is_none(), "no tab ⇒ fail open, not a 400");
+
+        let ov: LatchOverrideBody =
+            serde_json::from_slice(br#"{"tab":"claude","action":"flip_local"}"#)
+                .expect("override body parses");
+        assert_eq!(ov.action, "flip_local");
+        assert!(ov.consumer.is_none(), "consumer defaults to claude");
+        // `tab` and `action` are REQUIRED: an override with no target or no
+        // verb is a 400, never a guess.
+        assert!(serde_json::from_slice::<LatchOverrideBody>(br#"{"action":"unlatch"}"#).is_err());
+        assert!(serde_json::from_slice::<LatchOverrideBody>(br#"{"tab":"claude"}"#).is_err());
     }
 
     /// Fail-open, exactly like the latch: a call with no tab identity has no

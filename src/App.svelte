@@ -23,6 +23,7 @@
   import { dialogState, openNewShellTabDialog } from './lib/dialog/store';
   import { closeTab as closeTabIpc } from './lib/ipc';
   import { showToast } from './lib/toast';
+  import { startLatchPolling } from './lib/latch';
   import {
     seedPerTabEntries,
     startAvatarStateListener,
@@ -95,6 +96,9 @@
   let removeDebugKeys: (() => void) | undefined;
   let unsubLayoutSave: (() => void) | undefined;
   let unsubFollowAvatar: (() => void) | undefined;
+  /// V32 Phase F: stops the per-tab taint-latch poll that feeds the tab-chrome
+  /// badge (see `lib/latch.ts`).
+  let stopLatchPoll: (() => void) | undefined;
   let unlistenRestartHint: (() => void) | undefined;
 
   // Set to true by the cleanup returned from onMount. Checked at the
@@ -113,6 +117,7 @@
     removeDebugKeys?.();
     unsubLayoutSave?.();
     unsubFollowAvatar?.();
+    stopLatchPoll?.();
     unlistenRestartHint?.();
     unlistenRestartHint = undefined;
     unsubSettings = undefined;
@@ -122,6 +127,7 @@
     removeDebugKeys = undefined;
     unsubLayoutSave = undefined;
     unsubFollowAvatar = undefined;
+    stopLatchPoll = undefined;
   }
 
   onMount(() => {
@@ -197,6 +203,11 @@
         console.error('startAvatarStateListener failed:', e),
       );
       installDispatcher();
+      // V32 Phase F: keep the per-tab taint badge current. Polled rather than
+      // evented — the latch moves inside loopback request handlers that hold no
+      // AppHandle to emit from — and the read is an in-process mutex over a
+      // handful of entries, so the cost is nil.
+      stopLatchPoll = startLatchPolling();
       // V6-01: register the STT event listeners (state + transcript →
       // compose overlay). Idempotent; safe even when STT is disabled —
       // the backend simply never emits until the user records.

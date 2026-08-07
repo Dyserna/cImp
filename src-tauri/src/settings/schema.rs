@@ -1631,6 +1631,36 @@ pub struct OffloadSettings {
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
     pub detection_update_manifest_url: String,
+    /// V32 Phase F (locked decision 14): how cImp treats the harnesses' **own**
+    /// web tools (Claude `WebFetch`/`WebSearch`, OpenCode `webfetch`/
+    /// `websearch`) — `"off"` / `"sensor"` / `"deny"`.
+    ///
+    /// The taint latch only sees web access that flows through cImp's proxy;
+    /// a native web tool is invisible to it, which means a session can ingest
+    /// untrusted content with the latch still reading `open`. The three modes:
+    ///
+    /// - `off` — pre-V32 behaviour: nothing injected, nothing seen. The
+    ///   documented escape hatch when a hook misbehaves.
+    /// - `sensor` (**default**) — report-only beacons. A Claude `PreToolUse`
+    ///   hook matched on the web tools ONLY, and a `tool.execute.before`
+    ///   handler in the OpenCode plugin, POST to the loopback and engage that
+    ///   tab's EXTERNAL latch. Neither ever denies; a failure is silent.
+    /// - `deny` — close the native route by config (Claude `permissions.deny`,
+    ///   OpenCode `permission.webfetch/websearch = "deny"`) so all web flows
+    ///   through the proxied tools, where the latch is fully effective.
+    ///
+    /// Default `sensor` because we cannot assume what MCP setup a user runs and
+    /// a silently-open side channel is worse than a beacon. An unrecognized
+    /// string also reads as `sensor` (see
+    /// `crate::tabs::config::NativeWebVisibility::parse`): a typo must neither
+    /// blind the latch nor silently take a tool away.
+    ///
+    /// **Spawn-baked**: all three modes act only when a tab launches, so this
+    /// field carries a `spawn_inject_sig` entry and flipping it raises the
+    /// "restart the AI tab" hint.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub native_web_visibility: String,
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1695,6 +1725,7 @@ impl std::fmt::Debug for OffloadSettings {
                 "detection_update_manifest_url",
                 &self.detection_update_manifest_url,
             )
+            .field("native_web_visibility", &self.native_web_visibility)
             .finish()
     }
 }
@@ -1768,6 +1799,11 @@ impl Default for OffloadSettings {
             detection_update_interval_hours: 24,
             // Empty = the pinned manifest URL.
             detection_update_manifest_url: String::new(),
+            // Locked decision 14: report-only visibility by default. Not
+            // `deny` — taking a tool away from a working tab is a behaviour
+            // change; not `off` — an unseen web route is exactly the hole
+            // this exists to close.
+            native_web_visibility: "sensor".into(),
         }
     }
 }

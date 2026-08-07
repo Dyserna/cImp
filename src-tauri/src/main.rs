@@ -39,6 +39,7 @@ mod statusline;
 mod stt;
 mod sysmon;
 mod tabs;
+mod taint_beacon;
 mod theming;
 mod tts;
 mod usage;
@@ -69,7 +70,8 @@ use crate::ipc::commands::{
     graph_note_review, graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
     graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
     graph_test_embedder, graph_usage, graph_usage_advice, graph_viz_ego, graph_viz_file_status,
-    graph_viz_snapshot, harness_mark_verified, harness_versions_get, list_tabs, list_voices,
+    graph_viz_snapshot, harness_mark_verified, harness_versions_get, latch_override, latch_status,
+    list_tabs, list_voices,
     llm_pricing_get, llm_pricing_set, offload_backend_restart, offload_backend_start,
     offload_backend_stop, offload_derive_opencode_provider, offload_enable_readonly_commands,
     offload_reload_mcp, offload_server_log, offload_server_metrics, offload_server_restart,
@@ -134,6 +136,7 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --read-hook                            PreToolUse read-advisor hook shim
   --postedit-hook                        PostToolUse checks hook shim
   --notify-hook                          Notification / PermissionDenied hook shim
+  --taint-beacon --tab <id>              PreToolUse native-web beacon shim (report-only)
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>]   stdio MCP server (security_audit / quality_audit)
@@ -255,6 +258,19 @@ fn main() {
     // Claude's permission flow.
     if std::env::args().skip(1).any(|a| a == "--notify-hook") {
         notify_hook::run();
+        return;
+    }
+
+    // V32 Phase F (locked decision 14): Claude Code invokes
+    // `cimp --taint-beacon --tab <id>` as a `PreToolUse` hook matched on
+    // `WebFetch|WebSearch` only. It POSTs to the app's loopback
+    // `/latch/beacon`, engaging that tab's EXTERNAL taint latch — the harness's
+    // own web tools bypass cImp's proxy entirely and would otherwise be
+    // invisible to containment. Report-only: like `--notify-hook` it is
+    // GUI-free, never writes to stdout/stderr, and always returns normally, so
+    // it cannot deny a tool call however badly the app is behaving.
+    if std::env::args().skip(1).any(|a| a == "--taint-beacon") {
+        taint_beacon::run();
         return;
     }
 
@@ -985,6 +1001,9 @@ fn main() {
             detection_check_now,
             detection_revert,
             detection_open_rules_folder,
+            // V32 Phase F: the per-tab taint badge + its override popover.
+            latch_status,
+            latch_override,
             offload_server_log,
             offload_server_metrics,
             graph_status,

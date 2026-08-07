@@ -616,6 +616,96 @@ declares its class AND its mutation capability in one reviewed place.
   a harness-native-tool coverage document (what Claude/OpenCode native
   tools provide vs. what local/proxied MCP equivalents cover, gaps, and a
   recommended all-local configuration for `deny` mode).
+  **Phase F amendment 2026-08-07 (as built).**
+  - **Setting**: `offload.native_web_visibility` (`off|sensor|deny`, default
+    `sensor`), additive `#[serde(default)]`, no schema bump.
+    `tabs::config::NativeWebVisibility::parse` validates it post-hoc and reads
+    an unrecognized value as `sensor` — the C3 `Mode::parse` discipline: a typo
+    must neither blind the latch (`off`) nor silently take a tool away
+    (`deny`). It carries a `"native_web"` entry in BOTH halves of
+    `spawn_inject_sig` (all three modes act only at spawn).
+  - **Claude sensor** = a `PreToolUse` entry in the existing `--settings`
+    overlay, matcher `WebFetch|WebSearch` (nothing else — no per-call tax on
+    Read/Grep/Bash, which is why E1's latency gate does not apply here),
+    command `cimp --taint-beacon --tab <id>`, `timeout: 5`. The shim
+    (`src/taint_beacon.rs`) POSTs `/latch/beacon` and is *structurally* unable
+    to deny: a `PreToolUse` hook denies only via exit 2 or a stdout
+    `permissionDecision: "deny"` (verified against the current hooks reference,
+    2026-08-07; any other non-zero exit is non-blocking), and the shim writes
+    nothing and always returns normally.
+    **Spec constraint recorded while building — an undocumented harness
+    behaviour:** the hooks reference specifies the exit-code table and
+    `timeout`'s unit and default, but does NOT state what a *timed-out* hook
+    does — blocking or non-blocking, one command or the whole event. Decision
+    14's fail-open property must therefore not rest on it. The shim consequently
+    waits on nothing the app controls: it dispatches its POST with an 80 ms
+    connect/write deadline and **never reads the reply**, so its duration is not
+    a function of app health and the hook entry's `timeout` (kept at the
+    siblings' 5 s) is a backstop that should never be reached. Accepted
+    consequence, by design: a beacon can be LOST when the app is briefly down —
+    a missed engagement understates taint for one call, where a blocked
+    `WebFetch` would break the tab. Chosen over
+    an inline PowerShell POST because `pwsh` startup dominates the whole budget
+    and the shim reuses the discovery-file + Bearer framing already proven by
+    the four sibling hooks. **GATED on `loopback_needed()`**, like the NC-2
+    hooks (H2): the beacon's only delivery path is the loopback, and on an
+    install where no proxy runs there is no latch to engage either — inert, not
+    broken. `PreToolUse` now has two producers, so its entries accumulate into
+    one array.
+  - **Claude deny** = `{"permissions": {"deny": ["WebFetch","WebSearch"]}}` in
+    the same overlay. Bare tool names, no path globs, so the CD-4
+    permission-glob narrowing does not reach it; the overlay key-set tripwire
+    was widened with that reasoning recorded.
+  - **OpenCode**: `tool.execute.before` handler in the existing plugin, gated
+    on a baked `CIMP_BEACON_ENABLED`, wrapped so nothing can escape (the hook
+    denies by *throwing* — an escaping error would turn a sensor into a silent
+    deny). Tab identity via a new `CIMP_TAB_ID` env var from `compose_ai_env`:
+    the hook input carries a session id but no tab and no cwd (E2 finding).
+    Deny mode flips `agent.build.permission.webfetch/websearch` to `"deny"`,
+    leaving the Phase D `bash`/`edit` pins alone.
+  - **The E2 fail-open trap is closed.** `write_opencode_plugin`'s condition is
+    now the pure predicate `opencode_plugin_wanted(settings)` =
+    `graph.enabled || mode == sensor`, shared with `spawn_inject_sig`. It was
+    `graph.enabled` alone, with an unconditional delete otherwise — a security
+    handler riding it vanished when an unrelated feature was toggled off. The
+    existing handlers were deliberately NOT re-gated (the V24 contract is that
+    usage is always recorded); every graph-touching backend path already
+    early-returns when the graph is off, so the wider write adds no disk side
+    effects.
+  - **Contamination** is a new `TabLatch.contaminated` bit set the moment an
+    EXTERNAL call is *admitted* (proxied or beaconed) and cleared ONLY by
+    `observe`'s session rotation. `gate` layers it over `Latch::proxy_gate`:
+    quarantine now keys on contamination, with `latch == External` still
+    implying it, so the pure latch function stays the single definition of the
+    latch's own semantics and the bit only ever widens the verdict. EXTERNAL
+    results keep their envelope with no change — `wrap_external_result` runs
+    unconditionally on `/mcp/call`, independent of latch and identity
+    (verified, not assumed).
+  - **Override state machine**: `flip_local` from External only, `unlatch` from
+    any non-open latch, both erroring (not no-op'ing) otherwise; neither
+    touches `contaminated` or the spent fetch budget. Reachable two ways
+    through one implementation — authenticated `POST /latch/override` and the
+    `latch_override` IPC command — and every application writes an
+    `injection_flag` row under a new `Screen::LatchOverride` (`latch_override`,
+    `ok: true`, detail naming action + prior latch + contamination).
+  - **`/status`** rows grew `contaminated`, `can_flip_local`, `can_unlatch` via
+    a flattened `LatchView`, so `latch` stays a top-level key for the Phase B
+    readers. Availability is published by the backend rather than re-derived in
+    the UI, so the state machine lives in one place.
+  - **UI**: an always-visible ⛨ badge on AI tab chrome (`Tab.svelte`, shown
+    when latched OR contaminated) opening `TaintMenu.svelte` — state summary,
+    "Switch to local — closes web access", "Restore full access (at your own
+    risk)" behind an inline confirm that states the injected content is still
+    in the conversation, and the static "Restarting the tab is the only clean
+    reset." Fed by a 4 s poll of the **`latch_status` IPC command**, not HTTP:
+    the webview has no bearer token and must not acquire one, and the backend
+    owns the registry in-process. Polled rather than evented because the latch
+    moves inside loopback handlers that hold no `AppHandle` to emit from.
+  - **Known residual:** in `sensor` mode a beacon fires *before* the harness's
+    web tool runs, so a call the user then denies at the permission prompt
+    still latches the tab. Fail-safe direction (over- rather than
+    under-reporting), and `PreToolUse` is the only pre-execution hook that
+    carries the tool name; the manual override exists partly for this.
 
 ## Accepted residuals (documented, not solved)
 

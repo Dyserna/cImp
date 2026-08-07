@@ -5,6 +5,7 @@
   // (Close? Yes / No); clicking × on an already-closed shell skips the
   // confirm and calls close_tab immediately.
   import type { AvatarState } from './avatarState';
+  import type { LatchRow } from './latch';
 
   let {
     tabId,
@@ -17,12 +18,14 @@
     avatarState = 'Idle' as AvatarState,
     awaitingPermission = false,
     doneWhileAway = false,
+    taint = null,
     onclick,
     onclose,
     onnew,
     oncontextmenu,
     onpointerdowndrag,
     onrename,
+    ontaint,
   }: {
     /// Stable tab id, surfaced as `data-tab-id` so the M2 drop-target
     /// hit-tester can resolve reorder insertion indices by walking
@@ -46,6 +49,11 @@
     avatarState?: AvatarState;
     awaitingPermission?: boolean;
     doneWhileAway?: boolean;
+    /// V32 Phase F: this tab's taint-latch row, or null when the tab is
+    /// clean (or has never made a gated call). Non-null renders the badge.
+    /// Kept as the whole row rather than a boolean so the badge's tooltip
+    /// can state WHICH boundary is in force without a second lookup.
+    taint?: LatchRow | null;
     onclick: () => void;
     /// Invoked when the user confirms the close (or skips the confirm).
     /// Optional because builtin tabs render no close button.
@@ -66,6 +74,10 @@
     /// strings are filtered upstream — by the time this fires the parent
     /// can call rename_tab directly.
     onrename?: (newName: string) => void;
+    /// V32 Phase F: the taint badge was activated. Receives the event so the
+    /// caller can anchor the override popover at the badge, the same way
+    /// `oncontextmenu` anchors the tab menu.
+    ontaint?: (e: MouseEvent) => void;
   } = $props();
 
   type Indicator = 'error' | 'awaiting' | 'done' | 'working' | null;
@@ -143,6 +155,25 @@
       return;
     }
     confirming = true;
+  }
+
+  /// V32 Phase F: the badge's tooltip. States the boundary in force, because
+  /// a shield glyph alone says "something happened" and the user's next
+  /// question is always "so what can this tab still do?".
+  let taintTitle = $derived(
+    !taint
+      ? ''
+      : taint.latch === 'external'
+        ? 'This session has used web / external content: local file and source-text tools are closed for it.'
+        : taint.latch === 'local'
+          ? 'This session has used local file / source-text tools: web and other external tools are closed for it.'
+          : 'This session has read external content. Memory writes stay quarantined until the tab is restarted.',
+  );
+
+  function onTaintClick(e: MouseEvent): void {
+    // Don't let the click also activate or drag the tab.
+    e.stopPropagation();
+    ontaint?.(e);
   }
 
   function onNewClick(e: MouseEvent): void {
@@ -244,6 +275,32 @@
       ></span>
     {/if}
     <span class="label" class:label-left={!showIndicator}>{label}</span>
+    {#if taint}
+      <!--
+        V32 Phase F taint badge. Always visible while the tab is latched or
+        contaminated (unlike × / +, which reveal on hover): it reports a
+        containment state the user needs to see without going looking, and
+        clicking it opens the override popover.
+      -->
+      <span
+        class="taint"
+        class:taint-contaminated={taint.contaminated}
+        role="button"
+        tabindex="0"
+        aria-label="Containment state for this tab"
+        title={taintTitle}
+        onclick={onTaintClick}
+        onpointerdown={(e) => e.stopPropagation()}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onTaintClick(e as unknown as MouseEvent);
+          }
+        }}
+      >
+        ⛨
+      </span>
+    {/if}
     {#if onnew}
       <span
         class="spawn"
@@ -370,6 +427,35 @@
   }
   .indicator-error {
     background: var(--danger);
+  }
+  /* V32 Phase F taint badge. Warning-coloured and always opaque — this is a
+     security state, not an affordance that should hide until hovered. */
+  .taint {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--radius-sm);
+    color: var(--awaiting);
+    font-size: 13px;
+    line-height: 1;
+    margin-left: var(--space-1);
+    cursor: pointer;
+    user-select: none;
+  }
+  /* Contamination outlives the latch, so it gets the stronger colour: the
+     latch may read `open` again after an override while the conversation is
+     still carrying whatever it read. */
+  .taint-contaminated {
+    color: var(--danger);
+  }
+  .taint:hover {
+    background: var(--surface-3);
+  }
+  .taint:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
   .close {
     display: inline-flex;

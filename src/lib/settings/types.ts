@@ -306,6 +306,69 @@ export interface AiToolTabConfig {
   /// `claude_local` settings group. Per-tab `env` entries override
   /// synthesized values.
   use_local_provider: boolean;
+  /// V32 Phase G (locked decision 16): this tab's **L3** row — a tri-state per
+  /// injection-protection feature, defaulting to `'inherit'` so an untouched
+  /// tab behaves exactly as before. Only the features that HAVE a tab scope
+  /// have a cell; the worker-only canary and the app-wide terminal-escape
+  /// hygiene are structurally absent.
+  injection_overrides: TabInjectionOverrides;
+}
+
+/// V32 Phase G: one L3 cell. `'inherit'` takes the app-wide per-feature value;
+/// `'on'` / `'off'` state one for this scope (and `'on'` CAN re-enable a
+/// feature its app-wide flag disabled — that is what an override means).
+/// Nothing overrides the global master upward.
+export type InjectionOverride = 'inherit' | 'on' | 'off';
+
+/// V32 Phase G: the per-TAB override row (mirror of Rust
+/// `TabInjectionOverrides`).
+export interface TabInjectionOverrides {
+  taint_latch: InjectionOverride;
+  spotlighting: InjectionOverride;
+  detection: InjectionOverride;
+  ssrf_guard: InjectionOverride;
+  fetch_budgets: InjectionOverride;
+  memory_quarantine: InjectionOverride;
+  native_web: InjectionOverride;
+  consumer_hygiene: InjectionOverride;
+}
+
+/// V32 Phase G: the `offload-worker` pseudo-scope's override row (mirror of
+/// Rust `WorkerInjectionOverrides`). The worker is a task-scoped service with
+/// no tab, so its row lives on the app-wide settings block.
+export interface WorkerInjectionOverrides {
+  taint_latch: InjectionOverride;
+  spotlighting: InjectionOverride;
+  detection: InjectionOverride;
+  ssrf_guard: InjectionOverride;
+  fetch_budgets: InjectionOverride;
+  canary: InjectionOverride;
+}
+
+/// V32 Phase G (locked decision 16): the app-wide half of the injection enable
+/// hierarchy — the L1 master, the L2 per-feature flags, and the worker's L3 row.
+///
+/// There is deliberately no `native_web_enabled`: `native_web_visibility`'s
+/// `'off'` value already IS that feature's disabled state, and a second boolean
+/// beside it would make a contradictory state representable.
+export interface InjectionSettings {
+  /// **L1** — the global master. Off disables every V32 control everywhere,
+  /// all tabs AND the offload worker.
+  protection: boolean;
+  taint_latch_enabled: boolean;
+  spotlighting_enabled: boolean;
+  /// Parent of `detection_signature_enabled` / `detection_classifier_enabled`:
+  /// off ⇒ both layers off regardless of them.
+  detection_enabled: boolean;
+  ssrf_guard_enabled: boolean;
+  /// The on/off above the `external_fetch_max_*` tuning knobs.
+  fetch_budgets_enabled: boolean;
+  canary_enabled: boolean;
+  memory_quarantine_enabled: boolean;
+  consumer_hygiene_enabled: boolean;
+  /// App-wide, no per-scope row — TTS and toasts are global surfaces.
+  terminal_escape_hygiene_enabled: boolean;
+  worker: WorkerInjectionOverrides;
 }
 
 export interface ShellTabConfig {
@@ -1352,7 +1415,14 @@ export interface OffloadSettings {
   /// WebFetch/WebSearch, OpenCode webfetch/websearch) — `"off"` | `"sensor"` |
   /// `"deny"`. Default `sensor` (report-only beacons that engage the tab's
   /// EXTERNAL latch). Spawn-baked: a change needs an AI-tab restart.
+  ///
+  /// V32 Phase G: this tri-mode IS the native-web feature's L2 in the enable
+  /// hierarchy — `'off'` is the feature's disabled state, which is why there
+  /// is no `native_web_enabled` flag beside it.
   native_web_visibility: string;
+  /// V32 Phase G (locked decision 16): the three-level enable hierarchy's
+  /// app-wide switches plus the offload worker's override row.
+  injection: InjectionSettings;
 }
 
 /// V21: a derived OpenCode custom-provider entry (always id `local-llama`)
@@ -1538,7 +1608,19 @@ export function defaultSettings(): Settings {
         first_launch_notice_dismissed: true,
         theme_override: null,
         background_override: null,
-        use_local_provider: false,      },
+        use_local_provider: false,
+        // V32 Phase G: an untouched tab inherits every injection control.
+        injection_overrides: {
+          taint_latch: "inherit",
+          spotlighting: "inherit",
+          detection: "inherit",
+          ssrf_guard: "inherit",
+          fetch_budgets: "inherit",
+          memory_quarantine: "inherit",
+          native_web: "inherit",
+          consumer_hygiene: "inherit",
+        },
+      },
       {
         kind: 'ai_tool',
         id: CLAUDE_LOCAL_TAB_ID,
@@ -1564,7 +1646,19 @@ export function defaultSettings(): Settings {
         first_launch_notice_dismissed: true,
         theme_override: null,
         background_override: null,
-        use_local_provider: true,      },
+        use_local_provider: true,
+        // V32 Phase G: an untouched tab inherits every injection control.
+        injection_overrides: {
+          taint_latch: "inherit",
+          spotlighting: "inherit",
+          detection: "inherit",
+          ssrf_guard: "inherit",
+          fetch_budgets: "inherit",
+          memory_quarantine: "inherit",
+          native_web: "inherit",
+          consumer_hygiene: "inherit",
+        },
+      },
     ],
     processing: { stability_timeout_ms: 200, max_hold_ms: 500 },
     session: { active_tab_id: null },
@@ -1678,6 +1772,29 @@ export function defaultSettings(): Settings {
       detection_update_interval_hours: 24,
       detection_update_manifest_url: '',
       native_web_visibility: 'sensor',
+      // V32 Phase G: every control on, every override neutral — the fallback
+      // must reproduce the Rust default, which is what makes an untouched
+      // config behave exactly as the app did before the hierarchy existed.
+      injection: {
+        protection: true,
+        taint_latch_enabled: true,
+        spotlighting_enabled: true,
+        detection_enabled: true,
+        ssrf_guard_enabled: true,
+        fetch_budgets_enabled: true,
+        canary_enabled: true,
+        memory_quarantine_enabled: true,
+        consumer_hygiene_enabled: true,
+        terminal_escape_hygiene_enabled: true,
+        worker: {
+          taint_latch: 'inherit',
+          spotlighting: 'inherit',
+          detection: 'inherit',
+          ssrf_guard: 'inherit',
+          fetch_budgets: 'inherit',
+          canary: 'inherit',
+        },
+      },
     },
     graph: {
       enabled: false,

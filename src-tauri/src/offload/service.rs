@@ -49,6 +49,14 @@ use super::toolclass::{Profile, PROFILE_TOOL_NOTE};
 use super::tools::{self, ToolCtx};
 use super::Backend;
 
+/// V32 Phase G: the offload worker's injection scope (locked decision 16's
+/// `offload-worker` pseudo-scope). A const so every worker-side resolution names
+/// the same scope — the worker is a task-scoped service with no tab, and a
+/// resolution that reached for `Scope::App` instead would silently ignore the
+/// worker's own override row.
+const WORKER: crate::settings::injection::Scope<'static> =
+    crate::settings::injection::Scope::OffloadWorker;
+
 /// Per-backend cap on retained offload run records (newest first).
 const RUN_LOG_CAP: usize = 30;
 
@@ -695,6 +703,14 @@ impl OffloadService {
     /// carve-out [`Policy`](super::outbound::Policy) is derived from the live
     /// settings snapshot here — the endpoints the user configured are the only
     /// private addresses an external tool may be pointed at.
+    ///
+    /// V32 Phase G: `tab` is the calling tab's id (absent on a pre-V28 child),
+    /// which is what turns `scope`'s human label into a resolvable
+    /// [`Scope`](crate::settings::injection::Scope) for the SSRF guard's
+    /// three-level switch. Without it the call resolves at
+    /// [`Scope::App`](crate::settings::injection::Scope::App) — the app-wide
+    /// answer, the same fail-open shape the latch takes for an identity-less
+    /// call.
     pub async fn mcp_call(
         &self,
         consumer: Consumer,
@@ -702,6 +718,7 @@ impl OffloadService {
         args: serde_json::Value,
         cwd: Option<&Path>,
         scope: &str,
+        tab: Option<&str>,
     ) -> Result<String, String> {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
         // this proxy; fall back to the Claude-guarded set.
@@ -709,32 +726,26 @@ impl OffloadService {
             Consumer::Opencode => Consumer::Opencode,
             Consumer::Claude | Consumer::Offload => Consumer::Claude,
         };
-        let policy = outbound::Policy::from_settings(&self.settings.current());
+        let snap = self.settings.current();
+        let agent = crate::graph::source_for_consumer(consumer.source());
+        let policy = outbound::Policy::from_settings(
+            &snap,
+            crate::settings::injection::Scope::for_tab(agent, tab),
+        );
         self.host
             .call_recorded(consumer, cwd, name, args, scope, &policy)
             .await
     }
 
-    /// The configured EXTERNAL-call budget for one contaminated scope. Read by
-    /// the loopback proxy for its per-tab-session budget and by
-    /// [`Self::run`] for the worker's per-task one, so both halves of locked
-    /// decision 11 read the same two settings.
-    pub fn external_budget_limits(&self) -> outbound::BudgetLimits {
-        let snap = self.settings.current().offload;
-        outbound::BudgetLimits {
-            max_calls: snap.external_fetch_max_calls,
-            max_bytes: snap.external_fetch_max_bytes,
-        }
-    }
-
-    /// V32 Phase C (locked decision 7): which detection layers screen EXTERNAL
-    /// results, from settings. Read by the loopback proxy for the results it
-    /// returns to a tab; the worker's copy is snapshotted into its
-    /// [`HostRouter`](super::agent::HostRouter) at task start, so a task is
-    /// screened under one consistent configuration for its whole run.
-    pub fn detection_config(&self) -> super::detection::Config {
-        super::detection::Config::from_settings(&self.settings.current())
-    }
+    // V32 Phase G removed the `external_budget_limits` / `detection_config`
+    // accessors that used to live here. The loopback's `/mcp/call` handler now
+    // takes ONE settings snapshot per call and resolves the latch, the budget,
+    // the SSRF policy, the detection config and the envelope from it — because a
+    // mid-call settings save must not leave a result screened under one posture
+    // and wrapped under another, which is exactly what four independent
+    // `settings.current()` reads through this service made possible. The
+    // worker's copies are still snapshotted in [`Self::run`], from the `cur`
+    // read it already takes.
 
     /// Run one offload task end-to-end against the live pool and return the
     /// synthesized answer. Acquires the global permit *and* the chosen
@@ -1258,8 +1269,13 @@ impl OffloadService {
             allow_graph,
             allow_audit,
             task_scope.clone(),
-            outbound::Policy::from_settings(&cur),
-            super::detection::Config::from_settings(&cur),
+            outbound::Policy::from_settings(&cur, WORKER),
+            super::detection::Config::from_settings(&cur, WORKER),
+            crate::settings::injection::effective(
+                crate::settings::injection::Feature::Spotlighting,
+                WORKER,
+                &cur,
+            ),
         );
         let cfg = AgentConfig {
             base_url: entry.base_url.clone(),
@@ -1272,10 +1288,21 @@ impl OffloadService {
             auth_token: entry.auth_token.clone(),
             per_call_timeout: Duration::from_secs(snap.offload_timeout_secs.max(30)),
             task_scope,
-            external_budget: outbound::BudgetLimits {
-                max_calls: snap.external_fetch_max_calls,
-                max_bytes: snap.external_fetch_max_bytes,
-            },
+            // V32 Phase G: every worker-side control resolves at the
+            // `offload-worker` pseudo-scope, from the SAME settings snapshot as
+            // the policy and detection config above — one task, one posture, for
+            // the run's whole life.
+            external_budget: crate::settings::injection::budget_limits(&cur, WORKER),
+            latch_active: crate::settings::injection::effective(
+                crate::settings::injection::Feature::TaintLatch,
+                WORKER,
+                &cur,
+            ),
+            canary_active: crate::settings::injection::effective(
+                crate::settings::injection::Feature::Canary,
+                WORKER,
+                &cur,
+            ),
         };
         let task = OffloadTask {
             instructions: instructions.to_string(),

@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) coded 2026-08-07; E (#37) pending; live-verifies pending, and C3's release-asset publishing is a blocking deploy follow-up (see its amendment). GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F + G coded 2026-08-07; E (#37) pending; live-verifies pending, and C3's release-asset publishing is a blocking deploy follow-up (see its amendment). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -706,6 +706,150 @@ declares its class AND its mutation capability in one reviewed place.
     still latches the tab. Fail-safe direction (over- rather than
     under-reporting), and `PreToolUse` is the only pre-execution hook that
     carries the tool name; the manual override exists partly for this.
+
+- **G — the three-level enable hierarchy (decision 16; user-decided
+  2026-08-07).** One resolver (`settings::injection`) behind every V32
+  enforcement site; L1 master + L2 per feature + L3 per scope (tabs and the
+  `offload-worker` pseudo-scope); `/status` + an `injection_status` IPC command
+  reporting the resolved value and the deciding level; a Settings matrix; a
+  reduced-protection indicator outside Settings; and a source-scanning tripwire
+  that no enforcement site reads a raw switch.
+  **Phase G amendment 2026-08-07 (as built).**
+  - **The resolver** is `settings::injection`
+    (`decide(feature, scope, settings) -> Decision { effective, decided_by }`,
+    with `effective(...) -> bool` as the shorthand every gate calls). `Feature`
+    and `Scope` are enums, never strings: `Scope::Tab { agent, tab }` |
+    `Scope::OffloadWorker` | `Scope::App`, with `Scope::for_tab(agent, tab_opt)`
+    resolving an identity-less call to `App` — the app-wide answer, matching
+    V28's fail-open discipline rather than downgrading to "off".
+  - **Three small resolved-value helpers** exist beside it, and they are the
+    only other legal readers of the raw fields: `budget_limits` (returns `0/0`,
+    the *existing* no-cap spelling, when the feature is off — so the two budget
+    gates needed no second code path), `detection_config` (where the parent
+    switch wins over the two per-layer sub-toggles, in one place), and
+    `native_web_mode`.
+  - **Native-web reconciliation.** The tri-mode `native_web_visibility` **is**
+    the feature's L2 — its `off` already was this feature's off — so there is
+    deliberately **no `native_web_enabled` flag**. Storing both would make a
+    contradictory state representable, which is the one thing a three-level
+    hierarchy cannot afford. Consequence, spelled out because it is the only
+    non-obvious cell in the table: an L3 `On` over an app-wide `off` re-enables
+    at the mode's own default, `sensor` — `deny` would take a tool away from one
+    tab because the user disabled the feature everywhere else. The Settings UI
+    shows ONE control: the existing tri-mode select is the feature's app-wide
+    switch (its checkbox in the matrix is derived and read-only), with per-tab
+    overrides beside it. `NativeWebVisibility` moved into the resolver as
+    `NativeWebMode`; `tabs::config` re-exports the old name.
+  - **Structural scoping.** `TabInjectionOverrides` and
+    `WorkerInjectionOverrides` are separate structs carrying only their own
+    scope's features, so "the canary has no per-tab row" and "terminal escape
+    hygiene has no row anywhere" are facts about the types rather than rules
+    someone has to remember. `set()` returns `Option<()>` so a write to a cell
+    that does not exist cannot be mistaken for one that worked.
+    **Memory quarantine has no WORKER row**, deliberately: the worker cannot
+    dispatch `context_*` at all (#38) and serves a hard refusal, so a worker
+    quarantine switch would be a control with no enforcement site behind it.
+  - **Storage, all additive `#[serde(default)]`, NO schema bump** (the V8/V16/
+    V23/F precedent): L1+L2+the worker's L3 row in
+    `offload.injection: InjectionSettings`; each tab's L3 row in
+    `AiToolTabConfig::injection_overrides`. Every default is on/`Inherit`, so an
+    untouched or pre-Phase-G file resolves exactly as the app behaved before —
+    pinned by `an_untouched_config_resolves_every_feature_on`.
+    `Override` serializes as a lowercase string and is parsed **post-hoc**
+    (unknown ⇒ `Inherit`, the neutral cell): a hand-edited typo must neither
+    grant protection nor remove it, and must not quarantine the settings file.
+  - **The no-raw-reads invariant** is pinned by `src/injection_tripwire.rs`, a
+    source scan in the Phase D channel-tripwire style. For each guarded field it
+    fails the build on any occurrence outside comments and `#[cfg(test)]` items
+    that is not in a reviewed `allowed` list (today: the schema that declares it
+    and the resolver), with a per-field note recording why each reader is not an
+    enforcement decision — and it fails if a guarded field vanishes from the
+    tree, since a scan that watches nothing passes for the wrong reason. A
+    second test asserts every `Feature` has a guarded L2 field, so a control
+    cannot be added to the hierarchy without being added to the scan.
+    The run-scoped verdicts are deliberately named differently from the stored
+    switches (`AgentConfig::latch_active` / `canary_active`, `GatePolicy::latch`)
+    so the scan cannot be satisfied by a read of the resolved value.
+    **Fixed while building:** the shared scanner's `balanced()` did not skip
+    `'…'` char literals, so `offload/outbound.rs`'s test module (which contains
+    `assert!(!s.contains('{'))`) came back with *no* `#[cfg(test)]` span — the
+    whole module read as production code. A mis-parsing scanner is worse than an
+    absent one: the failure is a wrong answer, not a missing one.
+  - **Spawn-baked vs live.** `injection::spawn_sig` contributes the master
+    switch, the two spawn-baked L2 inputs and every AI tab's resolved
+    native-web mode + consumer-hygiene value to BOTH halves of
+    `spawn_inject_sig`, driven by `Feature::spawn_baked` rather than a
+    hand-written pair. Live features are absent by construction — a restart nag
+    for a change that takes effect on the next call is how a hint stops being
+    read. The Settings window's own `restartShape` gained the same two cells.
+    The OpenCode `plugin[0]` signature entry narrowed to `graph.enabled` alone,
+    because its sensor half is now per-tab and is carried by the new fragment.
+  - **Enforcement sites, complete list.** Worker: `AgentConfig::latch_active`
+    (skips `Latch::from_profile` + `latch_gate`, so the latch stays `Open` and
+    `filter_defs` is the identity) and `canary_active` (an EMPTY canary is the
+    disabled canary — `system_context` plants nothing, and `contains_canary` /
+    `redact_canary` already no-op on it, so one mint site is the whole switch).
+    Proxy: a `GatePolicy { latch, quarantine }` resolved once per request and
+    passed into `LatchRegistry::gate` / `beacon`; an inert policy returns before
+    touching any state, so `/status` never shows a latch the user switched off.
+    The two switches compose asymmetrically on purpose — latch off + quarantine
+    on still tracks contamination, so a note written after a fetch is still
+    held. SSRF: `outbound::Policy::enabled`, checked before any URL is even
+    extracted (the screen resolves DNS; a disabled guard must cost nothing, not
+    merely deny nothing). Budgets: `injection::budget_limits` at all four
+    construction sites (proxy, worker, supervisor self-test, app-down child
+    fallback). Detection + envelope: `detection::ResultCtx::spotlight` at both
+    EXTERNAL boundaries; recalled memory via a widened
+    `toolclass::CallGuards { taint, spotlight_recall }` threaded through
+    `run_graph_tool` → `dispatch_recorded` → `run_tool` (replacing the bare
+    `WriteTaint` — a growing tail of positional booleans across five module
+    boundaries is how a call site transposes two of them). Consumer hygiene:
+    `injection_hygiene_applies` and `build_opencode_config`. Native web:
+    `build_pre_args`, `write_opencode_plugin`, `opencode_plugin_wanted`,
+    `build_opencode_config`, all per tab. Escape hygiene: `OobContext::speak`.
+  - **The warning header grew a second suffix.** With spotlighting off and
+    detection on, the old header pointed the model at "the UNTRUSTED-DATA block"
+    that no longer exists — a factual error the model can check, and a standing
+    instruction it can catch out is one it learns to discount.
+    `WARNING_HEADER_SUFFIX_UNWRAPPED` describes what is actually there.
+  - **The OpenCode permission block is now assembled from two decisions**, not
+    emitted wholesale: the `bash`/`edit` pins are consumer hygiene, the web
+    denials are native-web `deny`. Hygiene off + `deny` on writes the two
+    denials and nothing else; both off writes no `agent` key at all. Turning off
+    "pin upstream defaults" must not also turn off a deliberate denial.
+  - **Deliberately NOT gated: the memory-quarantine READ exclusion.** Switching
+    the feature off stops new writes being held; notes already held stay hidden
+    until the user promotes them in the Memory view. Releasing a review queue as
+    a side effect of a settings flip would be a silent trust elevation, and the
+    promote button is the path that exists for it.
+  - **Introspection.** `injection::report(settings, scope)` yields one row per
+    feature — `{feature, label, effective, decided_by, override_value,
+    in_scope}` — and `loopback::injection_status` assembles the app scope, the
+    `offload-worker` scope and every AI tab into `GET /status`'s new `injection`
+    object and the new `injection_status` IPC command. Out-of-scope rows are
+    reported rather than omitted: "this control does not apply here" is
+    sometimes the answer to "why is this tab not latching?". There is
+    deliberately no `set_injection_override` command — the switches are ordinary
+    settings and go through the one `apply_settings` write path, so the Settings
+    window cannot race its own full-object save.
+  - **Surfaces.** Settings → Tools grew an *Injection protection* block ahead of
+    the other V32 blocks (master switch with an explicit off-state warning, ten
+    per-feature rows, per-scope override selects showing `Inherit (on/off)` plus
+    the resolved value and which level decided it). Outside Settings: the Phase F
+    tab badge now also appears — in its own muted colour — when a tab's controls
+    are switched off, its tooltip and the `TaintMenu` popover name which and why,
+    and a new `⛨ reduced` / `⛨ off` chip sits in the bottom-right status cluster,
+    silent while everything is on. The frontend re-uses the backend's resolution
+    (one extra IPC per 4 s poll) rather than reimplementing the rule in
+    TypeScript.
+  - **Known residuals.** (a) The Settings matrix's resolved column reflects
+    *saved* settings, so it lags an unsaved flip by the 500 ms debounce; the raw
+    switches beside it are live. (b) `Scope::Tab`'s `agent` is carried for the
+    scope key and the activity vocabulary only — override lookup keys on the tab
+    id alone (ids are unique across agents), which is why `Scope::tab_only`
+    exists for callers with no agent in hand. (c) Terminal escape hygiene's
+    enforcement site is the TTS composition path only; the Phase D audit's other
+    conclusion (xterm.js does not honour OSC 52) is structural and has no switch.
 
 ## Accepted residuals (documented, not solved)
 

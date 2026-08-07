@@ -438,6 +438,57 @@ impl WriteTaint {
     }
 }
 
+/// V32 Phase G — the resolved injection-protection verdicts one graph/memory
+/// call carries **from its gate into the tool**.
+///
+/// Phase C2 threaded a bare [`WriteTaint`] along this path. Phase G adds a
+/// second resolved fact ([`spotlight_recall`](Self::spotlight_recall)) and
+/// bundles both, for the reason the enum replaced a `bool` in the first place:
+/// this value crosses five module boundaries, and a growing tail of positional
+/// booleans is exactly how a call site ends up silently transposing two of them.
+///
+/// Both fields are *resolved verdicts*, never raw settings — the caller owns the
+/// [`settings::injection`](crate::settings::injection) lookup because only the
+/// caller knows the scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallGuards {
+    /// Whether a PERSISTENT-WRITE must be stored quarantined
+    /// ([`Latch::proxy_gate`], widened by the proxy's contamination bit and
+    /// gated by `Feature::MemoryQuarantine`).
+    pub taint: WriteTaint,
+    /// Whether recalled memory is delivered inside the spotlighting envelope
+    /// (`Feature::Spotlighting`). Locked decision 10's complement: past sessions
+    /// may have been contaminated before this milestone existed, so untainted
+    /// notes are wrapped too — which is also why this is a switch a user might
+    /// legitimately want off, and therefore a resolved verdict rather than a
+    /// constant.
+    pub spotlight_recall: bool,
+}
+
+impl CallGuards {
+    /// Nothing tainted, everything on — the value every entry point with **no
+    /// gate to consult** passes (the headless fallback, the worker's own graph
+    /// route, tests).
+    ///
+    /// The two halves fail in opposite directions on purpose, and both are the
+    /// safe one: `Clean` because quarantining every write made while the app is
+    /// closed is neither evidence of taint nor something a user could
+    /// anticipate; `spotlight_recall: true` because an unwrapped replay of an
+    /// older session's words into a fresh context is the exact hole the envelope
+    /// exists to close.
+    ///
+    /// Test-only today: every production caller builds the struct field-by-field
+    /// from its own resolved verdicts, which is the point — a constructor that
+    /// says "everything on" must not become the easy default at a real gate.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn clean() -> Self {
+        CallGuards {
+            taint: WriteTaint::Clean,
+            spotlight_recall: true,
+        }
+    }
+}
+
 /// The outcome of [`Latch::proxy_gate`]: proceed (with the taint the write must
 /// carry) or refuse with a fixed string. Deliberately not a
 /// `Result<WriteTaint, &str>` at the *decision* layer — the taint is not an

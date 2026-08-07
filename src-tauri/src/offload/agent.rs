@@ -193,6 +193,10 @@ pub struct HostRouter {
     /// snapshotted from the same settings read as `policy` so a mid-run edit
     /// cannot change the rules a task is being screened under halfway through.
     detection: super::detection::Config,
+    /// V32 Phase G: whether EXTERNAL results are spotlight-enveloped for the
+    /// `offload-worker` scope. Snapshotted with `policy` and `detection` from
+    /// the same settings read, for the same reason: one task, one posture.
+    spotlight: bool,
 }
 
 impl HostRouter {
@@ -214,6 +218,7 @@ impl HostRouter {
         task_scope: String,
         policy: super::outbound::Policy,
         detection: super::detection::Config,
+        spotlight: bool,
     ) -> Self {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
@@ -230,6 +235,7 @@ impl HostRouter {
             task_scope,
             policy,
             detection,
+            spotlight,
         }
     }
 }
@@ -305,6 +311,7 @@ impl ToolRouter for HostRouter {
                     url,
                     host,
                     cfg: self.detection,
+                    spotlight: self.spotlight,
                 },
             )
             .await)
@@ -360,8 +367,20 @@ pub struct AgentConfig {
     /// writes and the budget/canary rows the loop writes correlate.
     pub task_scope: String,
     /// V32 Phase C (locked decision 11): this task's EXTERNAL call/byte
-    /// budget, from settings.
+    /// budget, from settings. V32 Phase G resolves it through
+    /// [`settings::injection::budget_limits`](crate::settings::injection::budget_limits),
+    /// which yields `0`/`0` — the existing "no cap" spelling — when the feature
+    /// is off, so the gate below needs no second code path.
     pub external_budget: super::outbound::BudgetLimits,
+    /// V32 Phase G: whether the **taint latch** applies to this run
+    /// (`Feature::TaintLatch` at the `offload-worker` scope). Off ⇒ no
+    /// profile pre-latch, no def filtering, no refusals — the pre-V32 tool
+    /// surface, for the whole task.
+    pub latch_active: bool,
+    /// V32 Phase G: whether the in-band **canary** applies to this run
+    /// (`Feature::Canary`, worker-only). Off ⇒ no marker is minted, so nothing
+    /// is planted in the system context and no outbound/answer screen can fire.
+    pub canary_active: bool,
 }
 
 /// The task to run.
@@ -1244,6 +1263,14 @@ fn system_context(schema_run: bool, canary: &str) -> String {
     } else {
         SYSTEM_PROMPT
     };
+    // V32 Phase G: an EMPTY canary is the disabled state (`Feature::Canary` off
+    // at the `offload-worker` scope). Nothing is planted, so there is no marker
+    // for the screens to find and no instruction about one the model could be
+    // steered into violating. Checked here rather than at the call site because
+    // this function is the canary's only planting point.
+    if canary.is_empty() {
+        return base.to_string();
+    }
     format!("{base}\n\n{}", outbound::canary_system_line(canary))
 }
 
@@ -1301,7 +1328,15 @@ pub async fn run(
     trace: Option<&mut RunTrace>,
     cancel: &CancellationToken,
 ) -> AppResult<String> {
-    let canary = outbound::new_canary();
+    // V32 Phase G: the empty string is the disabled canary. Every consumer of
+    // it — `system_context`, `outbound::contains_canary`, `redact_canary` —
+    // already treats empty as "no marker", so the switch is one mint site
+    // rather than a flag threaded through four screens.
+    let canary = if cfg.canary_active {
+        outbound::new_canary()
+    } else {
+        String::new()
+    };
     let answer = run_inner(client, cfg, router, task, deadline, trace, cancel, &canary).await?;
     let Some(cleaned) = screen_answer_canary(&answer, &canary) else {
         return Ok(answer);
@@ -1368,7 +1403,17 @@ async fn run_inner(
     // it so a research task never sees a local-capability def and a code task
     // never sees an external one; an undeclared task starts open and latches on
     // its first EXTERNAL / LOCAL-CAPABILITY call.
-    let mut latch = Latch::from_profile(task.profile);
+    //
+    // V32 Phase G: with `latch_active` off the latch is never *engaged* and
+    // never pre-applied, so it stays `Open` for the run — which makes
+    // `filter_defs` an identity and `latch_gate` (skipped below) unable to
+    // refuse. The state is left in place rather than removed so a disabled
+    // latch is one branch, not a second tool-assembly path that could drift.
+    let mut latch = if cfg.latch_active {
+        Latch::from_profile(task.profile)
+    } else {
+        Latch::Open
+    };
     // V32 Phase C: this task's EXTERNAL spend, and the one-row-per-task claim
     // for taint-latch refusals. Both are plain locals because a task IS the
     // scope — there is no registry to key, and a new task starts fresh by
@@ -1647,7 +1692,11 @@ async fn run_inner(
             // V32 Phase A: the latch gate, at the call site so it covers BOTH
             // the native route and the MCP-host route (`router.call` dispatches
             // on the name; a check inside either router would miss the other).
-            if let Err(refusal) = latch_gate(&mut latch, name) {
+            if let Err(refusal) = if cfg.latch_active {
+                latch_gate(&mut latch, name)
+            } else {
+                Ok(())
+            } {
                 // V32 Phase C: give the Phase A refusal a consumer — without a
                 // row the user only sees a task that mysteriously gave up. ONE
                 // row per task: the latch is sticky, so every later refusal
@@ -2528,7 +2577,60 @@ mod tests {
                 max_calls: 40,
                 max_bytes: 4 * 1024 * 1024,
             },
+            // V32 Phase G: the default posture — every control on, which is what
+            // these pre-Phase-G tests have always assumed.
+            latch_active: true,
+            canary_active: true,
         }
+    }
+
+    /// V32 Phase G: an empty canary is the DISABLED canary. Nothing is planted
+    /// in the system context, so there is no marker for the outbound screen or
+    /// the answer screen to find — and no instruction about one that an injected
+    /// page could steer the model into violating.
+    #[test]
+    fn a_disabled_canary_plants_nothing_and_screens_nothing() {
+        for schema_run in [false, true] {
+            let sys = system_context(schema_run, "");
+            assert!(
+                !sys.contains("Internal marker"),
+                "no canary line: {sys:.120}"
+            );
+            assert!(!sys.contains(outbound::CANARY_PREFIX));
+            // With a canary it IS planted — the contrast is the point.
+            let with = system_context(schema_run, "cimp-canary-abc");
+            assert!(with.contains("cimp-canary-abc"));
+            assert!(with.starts_with(&sys));
+        }
+        // Neither screen can fire on an empty marker.
+        assert!(!canary_in_outbound(
+            r#"{"url":"http://x/?q=cimp-canary-abc"}"#,
+            &serde_json::json!({"url":"http://x/?q=cimp-canary-abc"}),
+            ""
+        ));
+        assert!(screen_answer_canary("answer mentioning cimp-canary-abc", "").is_none());
+    }
+
+    /// V32 Phase G: with the latch feature off the worker's advertised surface
+    /// is the FULL surface. The latch stays `Open` for the run (nothing engages
+    /// it), and `filter_defs` at `Open` is the identity — which is why the
+    /// disabled path is one branch rather than a second assembly path.
+    #[test]
+    fn a_disabled_latch_leaves_the_worker_surface_whole() {
+        let all: Vec<ToolDef> = ["read_file", "ddg__fetch_content", "graph_outline"]
+            .into_iter()
+            .map(|n| ToolDef::function(n, "", serde_json::json!({ "type": "object" })))
+            .collect();
+        let kept = toolclass::filter_defs(&all, Latch::Open);
+        assert_eq!(kept.len(), all.len());
+        // A `research` profile only pre-latches when the feature is on — with it
+        // off, `run_inner` never calls `Latch::from_profile` at all.
+        assert_eq!(Latch::from_profile(Some(Profile::Research)), Latch::External);
+        assert_ne!(
+            toolclass::filter_defs(&all, Latch::External).len(),
+            all.len(),
+            "the ON path must still remove the blocked class"
+        );
     }
 
     #[test]

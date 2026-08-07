@@ -279,16 +279,51 @@ fn scan_string(s: &str, out: &mut Vec<String>) {
 /// (it is a command line), it is never a legitimate fetch target for a research
 /// task, and an unauthenticated inference API on `127.0.0.1` is precisely the
 /// internal service decision 11 exists to protect.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Policy {
     allowed: HashSet<String>,
+    /// V32 Phase G: whether the screen runs at all for this scope
+    /// ([`Feature::SsrfGuard`](crate::settings::injection::Feature::SsrfGuard),
+    /// resolved through the three-level hierarchy).
+    ///
+    /// The switch lives on the policy rather than at the call site because the
+    /// policy is *already* the snapshot the screen carries to the boundary —
+    /// one object holding "what may this call reach", resolved once from one
+    /// settings read. A second, separate boolean threaded beside it would be
+    /// one more thing a future path could forget.
+    enabled: bool,
+}
+
+impl Default for Policy {
+    /// No carve-outs and the screen **on**.
+    ///
+    /// Hand-written rather than derived since V32 Phase G: a derived `Default`
+    /// would put `enabled: false` in it, so any caller that reached for
+    /// `Policy::default()` — a test, a future path with no settings in hand —
+    /// would silently get an SSRF guard that screens nothing. The default of a
+    /// security screen has to be "screening".
+    fn default() -> Self {
+        Policy {
+            allowed: HashSet::new(),
+            enabled: true,
+        }
+    }
 }
 
 impl Policy {
     /// Derive the carve-out set from a settings snapshot: every HTTP MCP server
     /// URL, every Remote offload backend base URL, and the code-graph embedding
     /// endpoint.
-    pub fn from_settings(s: &Settings) -> Self {
+    ///
+    /// V32 Phase G: `scope` resolves the SSRF guard's three-level switch. A
+    /// disabled screen still carries its carve-outs — the object stays
+    /// meaningful, and re-enabling is a settings read away, not a code path.
+    pub fn from_settings(s: &Settings, scope: crate::settings::injection::Scope<'_>) -> Self {
+        let enabled = crate::settings::injection::effective(
+            crate::settings::injection::Feature::SsrfGuard,
+            scope,
+            s,
+        );
         let mut allowed = HashSet::new();
         let mut add = |raw: &str| {
             if let Some(key) = endpoint_key(raw) {
@@ -304,7 +339,7 @@ impl Policy {
             }
         }
         add(&s.graph.embedding_endpoint);
-        Self { allowed }
+        Self { allowed, enabled }
     }
 
     /// Whether `key` (a normalized `host:port`) is a configured endpoint.
@@ -316,6 +351,7 @@ impl Policy {
     fn from_endpoints(urls: &[&str]) -> Self {
         Self {
             allowed: urls.iter().filter_map(|u| endpoint_key(u)).collect(),
+            enabled: true,
         }
     }
 }
@@ -358,6 +394,13 @@ pub struct Denial {
 /// do with security. The screen exists to stop a *reachable* internal target;
 /// an unresolvable name is not one.
 pub async fn screen_urls(args: &Value, policy: &Policy) -> Result<(), Denial> {
+    // V32 Phase G: the feature switch, checked before any URL is even
+    // extracted — a disabled guard must cost nothing, not merely deny nothing
+    // (the screen resolves DNS, and a resolution per argument is not a free
+    // no-op).
+    if !policy.enabled {
+        return Ok(());
+    }
     for raw in extract_urls(args) {
         if let Some(denial) = screen_one(&raw, policy).await {
             return Err(denial);
@@ -880,6 +923,56 @@ mod tests {
     /// The carve-out is by exact `host:port`, from the user's own config — a
     /// configured LAN MCP endpoint keeps working, and its neighbours on the
     /// same host do not become reachable.
+    /// V32 Phase G: with `Feature::SsrfGuard` resolved off, the screen is a
+    /// no-op — a literal private address goes through, which is the pre-V32
+    /// behaviour the escape hatch promises.
+    #[tokio::test]
+    async fn a_disabled_ssrf_guard_lets_private_addresses_through() {
+        let mut s = crate::settings::Settings::default();
+        s.offload.injection.ssrf_guard_enabled = false;
+        let policy = Policy::from_settings(&s, crate::settings::injection::Scope::App);
+        for bad in [
+            "http://192.168.0.1/",
+            "http://127.0.0.1:17800/status",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            assert!(
+                screen_urls(&json!({ "url": bad }), &policy).await.is_ok(),
+                "{bad} must pass an off screen"
+            );
+        }
+        // …and the master switch alone is enough, with the feature flag left on.
+        let mut s = crate::settings::Settings::default();
+        s.offload.injection.protection = false;
+        let policy = Policy::from_settings(&s, crate::settings::injection::Scope::App);
+        assert!(screen_urls(&json!({ "url": "http://10.1.2.3/" }), &policy)
+            .await
+            .is_ok());
+        // The default posture still screens (`Policy::default` is on).
+        assert!(
+            screen_urls(&json!({ "url": "http://10.1.2.3/" }), &Policy::default())
+                .await
+                .is_err()
+        );
+    }
+
+    /// V32 Phase G: budgets off ⇒ `0`/`0`, which the existing `exhausted`
+    /// predicate already reads as "no cap" — so a loop is never refused and the
+    /// gate needs no second code path.
+    #[test]
+    fn disabled_budgets_never_exhaust() {
+        let mut s = crate::settings::Settings::default();
+        s.offload.injection.fetch_budgets_enabled = false;
+        let limits =
+            crate::settings::injection::budget_limits(&s, crate::settings::injection::Scope::App);
+        assert_eq!((limits.max_calls, limits.max_bytes), (0, 0));
+        let mut b = Budget::default();
+        for _ in 0..10_000 {
+            b.charge(1024 * 1024);
+            assert!(!b.exhausted(limits));
+        }
+    }
+
     #[tokio::test]
     async fn configured_endpoints_are_carved_out_by_exact_host_and_port() {
         let policy = Policy::from_endpoints(&[

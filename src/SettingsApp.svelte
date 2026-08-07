@@ -64,6 +64,8 @@
     type DetectionStatus,
   } from './lib/offload';
   import { graphIgnorePick, graphRebuild, graphStatus, type GraphStatus } from './lib/graph';
+  // V32 Phase G: the resolved enable hierarchy, from the backend's one resolver.
+  import { fetchInjectionStatus, type InjectionStatus } from './lib/latch';
   import ArrayEditor from './lib/settings/ArrayEditor.svelte';
   import type {
     OffloadBackend,
@@ -75,6 +77,7 @@
     RemoteBackendTemplate,
     PromptTemplate,
     LlmPricingModel,
+    InjectionSettings,
   } from './lib/settings/types';
   import {
     composeTemplatesGlobalGet,
@@ -422,6 +425,198 @@
       detectionBusy = null;
     }
   }
+  // ── V32 Phase G — the injection enable hierarchy ─────────────────────────
+  //
+  // The RESOLVED view, from the backend's single resolver. The Settings matrix
+  // renders the raw switches from `snapshot` (they are ordinary settings) but
+  // the "what is actually in force, and which level decided it" column comes
+  // from here — reimplementing the resolution rule in TypeScript would put the
+  // locked decision-16 rule in two places, which is the one thing it cannot
+  // survive.
+  let injection = $state<InjectionStatus | null>(null);
+
+  /// The feature rows the matrix renders, in the backend's `Feature::ALL` order.
+  /// `field` is the L2 settings key; `scopes` names which override rows the
+  /// feature HAS (mirroring `Feature::has_tab_scope` / `has_worker_scope` —
+  /// worker-only and app-wide controls must not offer rows they cannot store).
+  type InjectionFeatureRow = {
+    key: string;
+    /// The L2 settings key on `offload.injection`. Typed as a keyof rather than
+    /// a bare string so a renamed flag is a compile error here, not a silently
+    /// dead checkbox.
+    field: keyof InjectionSettings;
+    label: string;
+    spawnBaked: boolean;
+    /// Which override rows this feature HAS: `worker` for the offload-worker
+    /// pseudo-scope, `tabs` for every AI tab. Empty for the app-wide control.
+    /// Mirrors `Feature::has_tab_scope` / `has_worker_scope` — the UI must not
+    /// offer a cell the backend has nowhere to store.
+    scopes: string[];
+    hint: string;
+  };
+
+  const INJECTION_FEATURES: InjectionFeatureRow[] = [
+    {
+      key: 'taint_latch',
+      field: 'taint_latch_enabled',
+      label: 'Taint latch',
+      spawnBaked: false,
+      scopes: ['worker', 'tabs'],
+      hint: 'Bidirectional mutual exclusion between external (web/MCP) tools and local file/source-text tools, per task and per tab session. Off: no latching, no refusals, and the offload worker advertises its whole tool surface all run.',
+    },
+    {
+      key: 'spotlighting',
+      field: 'spotlighting_enabled',
+      label: 'Spotlighting envelope',
+      spawnBaked: false,
+      scopes: ['worker', 'tabs'],
+      hint: 'Wraps every external tool result and every recalled memory in nonced data-not-instructions markers. Off: results arrive as raw text, with no standing instruction around them.',
+    },
+    {
+      key: 'detection',
+      field: 'detection_enabled',
+      label: 'Injection detection',
+      spawnBaked: false,
+      scopes: ['worker', 'tabs'],
+      hint: 'Parent of the signature and classifier layers below — off here disables both regardless of their own toggles.',
+    },
+    {
+      key: 'ssrf_guard',
+      field: 'ssrf_guard_enabled',
+      label: 'SSRF guard',
+      spawnBaked: false,
+      scopes: ['worker', 'tabs'],
+      hint: 'Screens every outbound fetch URL against the private/loopback/link-local ranges before the call leaves the machine. Off: an injected page can point a fetch at your LAN.',
+    },
+    {
+      key: 'fetch_budgets',
+      field: 'fetch_budgets_enabled',
+      label: 'Fetch budgets',
+      spawnBaked: false,
+      scopes: ['worker', 'tabs'],
+      hint: 'The on/off above the call/byte caps below. Off: neither cap applies, whatever their numbers say.',
+    },
+    {
+      key: 'canary',
+      field: 'canary_enabled',
+      label: 'Canary (offload worker)',
+      spawnBaked: false,
+      scopes: ['worker'],
+      hint: 'A per-task marker planted in the worker’s system context; seeing it leave in a tool argument aborts the task. Worker-only — a Claude/OpenCode system prompt is not ours to mark.',
+    },
+    {
+      key: 'memory_quarantine',
+      field: 'memory_quarantine_enabled',
+      label: 'Memory quarantine',
+      spawnBaked: false,
+      scopes: ['tabs'],
+      hint: 'Notes written by a conversation that has read external content are stored held-for-review instead of entering project memory. Off: they are stored normally. Notes ALREADY held stay held — turning this off never releases them.',
+    },
+    {
+      key: 'native_web',
+      field: 'protection',
+      label: 'Native-web visibility',
+      spawnBaked: true,
+      scopes: ['tabs'],
+      hint: 'Set by the Native web tools mode below, which is this feature’s app-wide switch — its "off" IS this control off. Use the per-tab overrides here to exempt or force one tab.',
+    },
+    {
+      key: 'consumer_hygiene',
+      field: 'consumer_hygiene_enabled',
+      label: 'Consumer hygiene',
+      spawnBaked: true,
+      scopes: ['tabs'],
+      hint: 'The pinned OpenCode permission block and the data-not-instructions paragraph in the session guidance. Off: OpenCode inherits its upstream defaults and the session is never told how to read cImp’s markers.',
+    },
+    {
+      key: 'terminal_escape_hygiene',
+      field: 'terminal_escape_hygiene_enabled',
+      label: 'Terminal escape hygiene',
+      spawnBaked: false,
+      scopes: [],
+      hint: 'Strips ANSI/OSC control sequences (including OSC 52 clipboard writes) out of external text cImp composes into spoken/toast output. Off: a fetched page’s escape sequences travel with the text.',
+    },
+  ];
+
+
+  /// One override cell, resolved for display.
+  function injectionScopeRows(f: InjectionFeatureRow): Array<{
+    scope: string;
+    label: string;
+    value: string;
+    inherited: boolean;
+    resolved: string;
+  }> {
+    if (!snapshot) return [];
+    const out: Array<{
+      scope: string;
+      label: string;
+      value: string;
+      inherited: boolean;
+      resolved: string;
+    }> = [];
+    // The app-wide value a cell inherits. Native-web's L2 is its tri-mode, not
+    // a boolean (the Phase G reconciliation), so it is read from there.
+    const inherited =
+      f.key === 'native_web'
+        ? snapshot.offload.native_web_visibility !== 'off'
+        : (snapshot.offload.injection[f.field] as boolean);
+    const push = (scope: string, label: string, value: string): void => {
+      const row = injection?.scopes
+        .find((s) => s.scope === scope)
+        ?.features.find((x) => x.feature === f.key);
+      const why =
+        row?.decided_by === 'global'
+          ? 'master'
+          : row?.decided_by === 'scope'
+            ? 'this scope'
+            : 'app-wide';
+      out.push({
+        scope,
+        label,
+        value,
+        inherited,
+        resolved: row ? `→ ${row.effective ? 'on' : 'off'} (${why})` : '',
+      });
+    };
+    if (f.scopes.includes('worker')) {
+      push(
+        'offload-worker',
+        'Offload worker',
+        (snapshot.offload.injection.worker as unknown as Record<string, string>)[f.key] ?? 'inherit',
+      );
+    }
+    if (f.scopes.includes('tabs')) {
+      for (const t of snapshot.tabs) {
+        if (t.kind !== 'ai_tool') continue;
+        push(
+          t.id,
+          t.name,
+          (t.injection_overrides as unknown as Record<string, string>)?.[f.key] ?? 'inherit',
+        );
+      }
+    }
+    return out;
+  }
+
+  /// Write one L3 cell. Goes through the ordinary `patch` save path like every
+  /// other setting — there is deliberately no side-channel command, so the
+  /// Settings window has one write path and cannot race its own full-object
+  /// save.
+  function setInjectionOverride(scope: string, key: string, value: string): void {
+    patch((s) => {
+      if (scope === 'offload-worker') {
+        (s.offload.injection.worker as unknown as Record<string, string>)[key] = value;
+        return;
+      }
+      for (const t of s.tabs) {
+        if (t.kind === 'ai_tool' && t.id === scope) {
+          (t.injection_overrides as unknown as Record<string, string>)[key] = value;
+        }
+      }
+    });
+  }
+
   let backendStatusTimer: ReturnType<typeof setInterval> | null = null;
   async function refreshBackendStatuses(): Promise<void> {
     try {
@@ -435,6 +630,17 @@
     // overwrite the button row with a half-applied snapshot, and the run's own
     // return value is the authoritative one.
     if (!detectionBusy) detection = await detectionStatus();
+    // V32 Phase G: the RESOLVED hierarchy, from the backend's one resolver.
+    // Deliberately not recomputed in TypeScript from `snapshot`: a second
+    // implementation of the resolution rule is exactly the drift the
+    // one-resolver invariant exists to prevent, and the cost of asking is one
+    // in-process mutex read. It reflects SAVED settings, so a just-flipped
+    // switch shows its new resolved value once the debounced save lands.
+    try {
+      injection = await fetchInjectionStatus();
+    } catch (e) {
+      console.warn('injection_status failed', e);
+    }
   }
   function startBackendStatusPolling(): void {
     if (backendStatusTimer) return;
@@ -1214,6 +1420,16 @@
       cwd: t.cwd,
       env: t.env,
       use_local_provider: t.use_local_provider,
+      // V32 Phase G: two of this tab's injection overrides are SPAWN-BAKED
+      // (native-web visibility and consumer hygiene), so flipping either needs
+      // the tab restarted before it means anything. The other six resolve per
+      // call and are deliberately excluded — a restart hint for a change that
+      // takes effect immediately is how a hint stops being read. This mirrors
+      // `spawn_inject_sig`'s split on the backend.
+      injection_spawn_baked: [
+        t.injection_overrides?.native_web ?? 'inherit',
+        t.injection_overrides?.consumer_hygiene ?? 'inherit',
+      ],
     };
   }
 
@@ -4077,6 +4293,102 @@
               auto-sizes from the summed per-backend slot counts.
             </small>
           </label>
+          <!--
+            V32 Phase G (locked decision 16): the three-level enable hierarchy.
+            Placed AHEAD of the individual V32 blocks below (budgets, native
+            web, detection) because it governs all of them: a user who has come
+            here to turn something off should meet the master switch before the
+            tuning knobs.
+          -->
+          <h3>Injection protection</h3>
+          <small class="hint top">
+            Every V32 containment control has three levels of switch: this master,
+            a per-feature switch app-wide, and a per-scope override. A control is
+            on when the master is on <em>and</em> either the scope says so or the
+            feature does. An override can re-enable a feature its app-wide switch
+            disabled; nothing re-enables anything past the master.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.injection.protection}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.injection.protection = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Injection protection (master switch)</span>
+          </label>
+          {#if !snapshot.offload.injection.protection}
+            <small class="hint down">
+              ⚠ <strong>Every V32 control is off</strong> — for every tab and the
+              offload worker. No taint latch, no spotlighting envelope, no SSRF
+              screen, no fetch budgets, no canary, no memory quarantine, no
+              native-web visibility, no consumer hygiene, no escape stripping.
+              Fetched pages reach the model as raw text and a research session can
+              read your files and call out to the web in the same turn. This is the
+              documented escape hatch for when a control misfires on real work; the
+              per-feature switches below are the smaller instrument.
+            </small>
+          {/if}
+          {#each INJECTION_FEATURES as f (f.key)}
+            <div class="updater-row">
+              <label class="checkbox">
+                <input
+                  type="checkbox"
+                  disabled={!snapshot.offload.injection.protection || f.key === 'native_web'}
+                  checked={f.key === 'native_web'
+                    ? snapshot.offload.native_web_visibility !== 'off'
+                    : (snapshot.offload.injection[f.field] as boolean)}
+                  onchange={(e) => {
+                    // Native-web's L2 IS the tri-mode select in "Native web
+                    // tools" below (its `off` is this feature's off), so this
+                    // row shows the derived value read-only. Guarded as well as
+                    // `disabled` because a checkbox that could write here would
+                    // put the same decision in two controls — the contradictory
+                    // state the Phase G reconciliation exists to prevent.
+                    if (f.key === 'native_web') return;
+                    const on = (e.currentTarget as HTMLInputElement).checked;
+                    patch((s) => ((s.offload.injection[f.field] as boolean) = on));
+                  }}
+                />
+                <span>{f.label}{f.spawnBaked ? ' (needs a tab restart)' : ''}</span>
+              </label>
+              <small class="hint">{f.hint}</small>
+              {#if f.scopes.length > 0}
+                <div class="row">
+                  {#each injectionScopeRows(f) as sc (sc.scope)}
+                    <label class="inline-override">
+                      <span>{sc.label}</span>
+                      <select
+                        value={sc.value}
+                        onchange={(e) =>
+                          setInjectionOverride(
+                            sc.scope,
+                            f.key,
+                            (e.currentTarget as HTMLSelectElement).value,
+                          )}
+                      >
+                        <option value="inherit">Inherit ({sc.inherited ? 'on' : 'off'})</option>
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                      </select>
+                      <span class="mcp-detail">{sc.resolved}</span>
+                    </label>
+                  {/each}
+                </div>
+              {:else}
+                <small class="hint">
+                  App-wide only — TTS and toasts are global surfaces, so this
+                  control has no per-tab or per-worker override.
+                </small>
+              {/if}
+            </div>
+          {/each}
+
           <label>
             <span>External fetch budget — calls (0 = unlimited)</span>
             <input
@@ -6464,6 +6776,21 @@
   }
   .updater-row .mcp-detail {
     font-size: var(--font-size-xs);
+  }
+  /* V32 Phase G — one per-scope override cell inside a feature row. Laid out
+     inline so a feature's scopes read as a short matrix row rather than as a
+     column of full-width selects, which at ten features would bury the
+     per-feature switches they hang off. */
+  .inline-override {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+  .inline-override select {
+    font-size: var(--font-size-xs);
+    padding: 1px 4px;
   }
   /* A rejected update: the old data is still live, so this is a warning the
      user should act on, not an error state for the whole section. */

@@ -96,7 +96,7 @@ fn build_ai_tool_spec(
         // V10: drop the dependency-free injection/memory plugin into the
         // project's `.opencode/plugin/`, baking in the current loopback port +
         // token. Uses `working_dir` (the project root the TUI opens).
-        write_opencode_plugin(&working_dir, settings);
+        write_opencode_plugin(&working_dir, settings, tab.as_str());
     }
     // V20: resolve the out-of-band TTS source. For OpenCode this also injects
     // the `--port`/`--hostname` the fullscreen TUI hosts its event server on
@@ -331,35 +331,36 @@ const CLAUDE_WEB_DENY_RULES: [&str; 2] = ["WebFetch", "WebSearch"];
 /// All three modes act only at spawn, which is why
 /// [`spawn_inject_sig`] carries this value: a running tab keeps whatever it
 /// launched with, and the user is owed the restart hint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeWebVisibility {
-    /// Nothing injected: no beacon hook, no permission denial. Pre-V32.
-    Off,
-    /// Report-only beacons that engage the tab's EXTERNAL latch. Never deny.
-    Sensor,
-    /// The native web tools are refused by the harness itself.
-    Deny,
+/// V32 Phase G moved the type itself into
+/// [`settings::injection`](crate::settings::injection) — the mode IS the
+/// native-web feature's L2, so parsing it and resolving the hierarchy over it
+/// had to live together or the two would drift. The alias keeps this module's
+/// (and its tests') vocabulary unchanged.
+pub(crate) use crate::settings::injection::NativeWebMode as NativeWebVisibility;
+
+/// The native-web mode in force **for one tab**.
+///
+/// V32 Phase G: no longer a plain settings read. The mode is resolved through
+/// the three-level hierarchy at this tab's scope, so the master switch and a
+/// per-tab override both reach it — see
+/// [`injection::native_web_mode`](crate::settings::injection::native_web_mode)
+/// for the composition, including what an L3 `On` means over an app-wide `off`.
+fn native_web_for(s: &Settings, agent: &str, tab: &str) -> NativeWebVisibility {
+    crate::settings::injection::native_web_mode(
+        s,
+        crate::settings::injection::Scope::Tab { agent, tab },
+    )
 }
 
-impl NativeWebVisibility {
-    /// Parse the settings string. An unrecognized value reads as
-    /// [`Sensor`](Self::Sensor) — the default — for the same reason C3's
-    /// updater `Mode::parse` falls back to `check`: a typo must neither blind
-    /// the latch (`off`) nor silently take a tool away from a working tab
-    /// (`deny`). Validated post-hoc here because the settings field is a plain
-    /// string that a hand-edited config can carry anything in.
-    pub(crate) fn parse(raw: &str) -> Self {
-        match raw.trim() {
-            "off" => NativeWebVisibility::Off,
-            "deny" => NativeWebVisibility::Deny,
-            _ => NativeWebVisibility::Sensor,
-        }
-    }
-
-    /// The mode in force for these settings.
-    pub(crate) fn of(s: &Settings) -> Self {
-        Self::parse(&s.offload.native_web_visibility)
-    }
+/// V32 Phase G: whether Phase D's consumer-hygiene injections apply to one tab
+/// (the pinned OpenCode permission block and the injection-hygiene guidance
+/// paragraph). Both are spawn-baked, so both ride `spawn_inject_sig`.
+fn consumer_hygiene_for(s: &Settings, agent: &str, tab: &str) -> bool {
+    crate::settings::injection::effective(
+        crate::settings::injection::Feature::ConsumerHygiene,
+        crate::settings::injection::Scope::Tab { agent, tab },
+        s,
+    )
 }
 
 /// Per-consumer spawn-injection signature — `[claude, opencode]`. Captures
@@ -441,15 +442,18 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // `session_push` flip changes no argv and must not nag every tab to
         // restart for nothing.
         "channels": s.offload.session_push && advertises_offload_to_claude(s),
-        // V32 Phase F (locked decision 14): the native-web visibility mode.
-        // Every mode acts at spawn — `sensor` installs a `PreToolUse` beacon
-        // hook, `deny` writes `permissions.deny`, `off` writes neither — so a
-        // flip changes how a FRESH tab launches while the running one keeps its
-        // old posture. The RAW string, not the parsed mode: two spellings that
-        // both parse to `sensor` produce identical argv, and comparing the raw
-        // value only over-reports (a nag), never under-reports (a silent
-        // divergence), which is the safe direction for this signature.
-        "native_web": s.offload.native_web_visibility,
+        // V32 Phase F (locked decision 14) + Phase G (locked decision 16): the
+        // native-web visibility mode AND the consumer-hygiene switch, both
+        // spawn-baked, both resolved PER TAB through the three-level hierarchy.
+        //
+        // `injection::spawn_sig` carries the master switch, the two spawn-baked
+        // L2 flags and every AI tab's L3 cells plus its resolved mode, so a flip
+        // at any of the three levels moves this signature and raises the restart
+        // hint. Live features (latch, spotlighting, detection, SSRF, budgets,
+        // canary, quarantine) are deliberately absent: they take effect on the
+        // next call, and a restart nag for a change that needs no restart is
+        // how a hint stops being read.
+        "injection": crate::settings::injection::spawn_sig(s),
     });
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
@@ -458,10 +462,12 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // CIMP_INJECT_ENABLED / CIMP_AUTO_CHECK_ENABLED flags.
         //
         // V32 Phase F: plugin PRESENCE is no longer `graph.enabled` alone —
-        // sensor mode needs the plugin too (`opencode_plugin_wanted`), and the
-        // beacon handler's own gate rides the `native_web` entry below.
+        // sensor mode needs the plugin too (`opencode_plugin_wanted`).
+        // V32 Phase G: that predicate is now per-tab, and its native-web half is
+        // fully covered by the `"injection"` entry below (which carries every
+        // tab's resolved mode), so only the app-wide graph half belongs here.
         "plugin": [
-            opencode_plugin_wanted(s),
+            s.graph.enabled,
             s.graph.enabled && s.graph.context_injection,
             post_edit,
         ],
@@ -473,7 +479,10 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // V32 Phase F: `sensor` bakes the beacon handler's flag into the
         // plugin, `deny` writes `permission.webfetch/websearch = "deny"` into
         // `OPENCODE_CONFIG_CONTENT` — both spawn-time, like the Claude half.
-        "native_web": s.offload.native_web_visibility,
+        // V32 Phase G: same per-tab fragment as the Claude object; the OpenCode
+        // side additionally reads consumer hygiene for its pinned permission
+        // block, which the fragment already carries.
+        "injection": crate::settings::injection::spawn_sig(s),
     });
     [claude, opencode]
 }
@@ -524,7 +533,9 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
         let mut overlay = serde_json::Map::new();
         // V32 Phase F: read once — the mode gates both the beacon hook and the
         // permission denial below, and the two must never disagree.
-        let native_web = NativeWebVisibility::of(settings);
+        // V32 Phase G: resolved for THIS tab, so a per-tab override reaches
+        // both halves together for the same reason.
+        let native_web = native_web_for(settings, "claude", tab);
         if settings.statusline.enabled {
             if let Some(command) = crate::statusline::launch_command() {
                 // `refreshInterval` (seconds) re-runs the command on a timer in
@@ -926,7 +937,12 @@ fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> St
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        if let Some(block) = fact_promotion_block(&root, settings) {
+        let agent = if command_is(&cfg.command, "claude") {
+            "claude"
+        } else {
+            "opencode"
+        };
+        if let Some(block) = fact_promotion_block(&root, settings, agent, &cfg.id) {
             if !addendum.is_empty() {
                 addendum.push_str("\n\n");
             }
@@ -947,8 +963,19 @@ fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> St
 /// make an OpenCode tab claim a vocabulary it never sees. Non-Claude commands
 /// are treated as OpenCode, matching how `build_pre_args` (Claude-only) and
 /// `build_opencode_config` (everything else) already split.
+///
+/// V32 Phase G adds the feature gate above that: consumer hygiene is one of the
+/// ten switchable controls, and the paragraph is spawn-baked, so its L2 and L3
+/// both ride `spawn_inject_sig`. The advertise gate stays *underneath* the
+/// switch — with no cImp tool surface there is no marker vocabulary to teach,
+/// whatever the switch says.
 fn injection_hygiene_applies(cfg: &AiToolTabConfig, settings: &Settings) -> bool {
-    if command_is(&cfg.command, "claude") {
+    let claude = command_is(&cfg.command, "claude");
+    let agent = if claude { "claude" } else { "opencode" };
+    if !consumer_hygiene_for(settings, agent, &cfg.id) {
+        return false;
+    }
+    if claude {
         advertises_offload_to_claude(settings)
     } else {
         advertises_offload_to_opencode(settings)
@@ -977,7 +1004,12 @@ fn injection_hygiene_applies(cfg: &AiToolTabConfig, settings: &Settings) -> bool
 ///   Phase D guidance addendum (composed just above, in
 ///   [`compose_capability_guidance`]) already names "recalled memory" as a
 ///   marker-wrapped source, so the session knows how to read it.
-fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
+fn fact_promotion_block(
+    root: &Path,
+    settings: &Settings,
+    agent: &str,
+    tab: &str,
+) -> Option<String> {
     const CAP_CHARS: usize = 1500;
     let sub = settings.graph.effective_db_subdir();
     let idx = crate::graph::GraphIndex::open_existing(root, &sub).ok()?;
@@ -1007,6 +1039,18 @@ fn fact_promotion_block(root: &Path, settings: &Settings) -> Option<String> {
     // proxy's EXTERNAL results follow. The cap above is applied to the FACTS,
     // before wrapping, so the envelope can never be the thing that gets
     // truncated away.
+    //
+    // V32 Phase G: unless spotlighting resolves off for this tab. The block
+    // itself is NOT gated by the switch — the facts are the user's own memory
+    // and withholding them would be a feature switch quietly disabling an
+    // unrelated feature; only the envelope around them is.
+    if !crate::settings::injection::effective(
+        crate::settings::injection::Feature::Spotlighting,
+        crate::settings::injection::Scope::Tab { agent, tab },
+        settings,
+    ) {
+        return Some(out);
+    }
     Some(crate::offload::spotlight::recall_envelope(&out))
 }
 
@@ -1246,14 +1290,14 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 /// Removed when nothing wants it ([`opencode_plugin_wanted`]). Also adds
 /// `.opencode/` to the project's `.git/info/exclude` so the generated plugin and
 /// OpenCode's own `.opencode/.gitignore` don't dirty `git status`.
-fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
+fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab: &str) {
     let plugin_path = working_dir
         .join(".opencode")
         .join("plugin")
         .join("cimp-inject.js");
 
     // Nothing to inject, record OR watch → clean up a stale plugin.
-    if !opencode_plugin_wanted(settings) {
+    if !opencode_plugin_wanted(settings, tab) {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     }
@@ -1271,7 +1315,7 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
     // needs the graph AND at least one configured check.
     let auto_check_enabled =
         settings.graph.enabled && settings.graph.auto_check && !settings.checks.is_empty();
-    let beacon_enabled = NativeWebVisibility::of(settings) == NativeWebVisibility::Sensor;
+    let beacon_enabled = native_web_for(settings, "opencode", tab) == NativeWebVisibility::Sensor;
     let js = opencode_plugin_source(
         disc.port,
         &disc.token,
@@ -1303,13 +1347,16 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings) {
 /// Pure (settings in, bool out) so both `write_opencode_plugin` and
 /// [`spawn_inject_sig`] read the same predicate and the restart hint can never
 /// disagree with what a fresh tab would write.
-pub(crate) fn opencode_plugin_wanted(s: &Settings) -> bool {
+///
+/// V32 Phase G: per-TAB, because the sensor half is now resolved per tab. The
+/// graph half is app-wide and stays so.
+pub(crate) fn opencode_plugin_wanted(s: &Settings, tab: &str) -> bool {
     // V10/V12/V24: context injection, the memory/usage tap and auto-check.
     s.graph.enabled
         // V32 Phase F: the native-web beacon (sensor mode only — `deny` needs
         // no plugin, the pinned permission block does that work, and `off`
         // wants nothing installed at all).
-        || NativeWebVisibility::of(s) == NativeWebVisibility::Sensor
+        || native_web_for(s, "opencode", tab) == NativeWebVisibility::Sensor
 }
 
 /// The dependency-free OpenCode plugin source, with the loopback port + token
@@ -1659,25 +1706,39 @@ fn build_opencode_config(
     // taint latch actually works. `bash` and `edit` keep their pinned values in
     // every mode: shell-level egress (`curl`) is V33's problem (documented
     // honest limit), and taking `edit` away would gut the tab.
-    let native_web = NativeWebVisibility::of(settings);
-    let (webfetch, websearch) = if native_web == NativeWebVisibility::Deny {
-        (OPENCODE_DENIED, OPENCODE_DENIED)
-    } else {
-        (OPENCODE_PINNED_WEBFETCH, OPENCODE_PINNED_WEBSEARCH)
-    };
-    config.insert(
-        "agent".to_string(),
-        serde_json::json!({
-            "build": {
-                "permission": {
-                    "bash": OPENCODE_PINNED_BASH,
-                    "edit": OPENCODE_PINNED_EDIT,
-                    "webfetch": webfetch,
-                    "websearch": websearch,
-                }
-            }
-        }),
-    );
+    //
+    // ── V32 Phase G (locked decision 16) ───────────────────────────────────
+    // Two independent switches meet on this one block, so it is assembled from
+    // two independent decisions rather than emitted wholesale:
+    //   * the PINS (`bash`/`edit`, and the web keys at their upstream values)
+    //     are consumer hygiene — locked decision 8's drift-immunity;
+    //   * the DENIALS are native-web visibility — locked decision 14's `deny`.
+    // With hygiene off and `deny` on, the block carries the two denials and
+    // nothing else: turning off "pin upstream defaults" must not also turn off
+    // a deliberate denial, which is a different feature the user did not touch.
+    // With both off, no `agent` key is written at all and OpenCode's own
+    // defaults apply — exactly the pre-V32 posture the escape hatch promises.
+    let native_web = native_web_for(settings, "opencode", tab);
+    let hygiene = consumer_hygiene_for(settings, "opencode", tab);
+    let denied = native_web == NativeWebVisibility::Deny;
+    if hygiene || denied {
+        let mut permission = serde_json::Map::new();
+        if hygiene {
+            permission.insert("bash".into(), OPENCODE_PINNED_BASH.into());
+            permission.insert("edit".into(), OPENCODE_PINNED_EDIT.into());
+        }
+        if denied {
+            permission.insert("webfetch".into(), OPENCODE_DENIED.into());
+            permission.insert("websearch".into(), OPENCODE_DENIED.into());
+        } else if hygiene {
+            permission.insert("webfetch".into(), OPENCODE_PINNED_WEBFETCH.into());
+            permission.insert("websearch".into(), OPENCODE_PINNED_WEBSEARCH.into());
+        }
+        config.insert(
+            "agent".to_string(),
+            serde_json::json!({ "build": { "permission": permission } }),
+        );
+    }
 
     // Build the `mcp` object from up to two stdio children, each under its own
     // gate (mirrors the two-server `--mcp-config` map in `build_pre_args`):
@@ -3269,7 +3330,7 @@ mod tests {
     fn native_web_visibility_defaults_to_sensor_and_validates_post_hoc() {
         assert_eq!(Settings::default().offload.native_web_visibility, "sensor");
         assert_eq!(
-            NativeWebVisibility::of(&Settings::default()),
+            NativeWebVisibility::parse(&Settings::default().offload.native_web_visibility),
             NativeWebVisibility::Sensor
         );
         assert_eq!(NativeWebVisibility::parse("off"), NativeWebVisibility::Off);
@@ -3300,9 +3361,142 @@ mod tests {
             let sig = spawn_inject_sig(&s);
             assert_ne!(sig[0], base[0], "claude signature must move for {mode}");
             assert_ne!(sig[1], base[1], "opencode signature must move for {mode}");
-            assert_eq!(sig[0]["native_web"], serde_json::json!(mode));
-            assert_eq!(sig[1]["native_web"], serde_json::json!(mode));
+            // V32 Phase G: the mode moved out of a top-level `native_web` key
+            // and into the `injection` fragment, where it sits as the
+            // native-web feature's L2 alongside the master switch, the
+            // consumer-hygiene flag and every tab's resolved posture.
+            assert_eq!(sig[0]["injection"]["l2"][0], serde_json::json!(mode));
+            assert_eq!(sig[1]["injection"]["l2"][0], serde_json::json!(mode));
         }
+    }
+
+    /// V32 Phase G: consumer hygiene OFF removes BOTH of its injections — the
+    /// pinned OpenCode permission block and the data-not-instructions paragraph
+    /// — and nothing else. Its two halves come from different features, so the
+    /// `deny` denials must survive it.
+    #[test]
+    fn consumer_hygiene_off_drops_the_pins_and_the_paragraph() {
+        let base = || {
+            let mut s = Settings {
+                tabs: vec![default_opencode_tab()],
+                ..Settings::default()
+            };
+            // The paragraph's own precondition: a cImp tool surface is
+            // advertised, so there is marker vocabulary worth teaching.
+            s.offload.enabled = true;
+            s
+        };
+        let cfg = |s: &Settings| {
+            let TabConfig::AiTool(c) = &s.tabs[0] else {
+                unreachable!()
+            };
+            build_opencode_config(c, s, &c.id)
+        };
+        let guidance = |s: &Settings| {
+            let TabConfig::AiTool(c) = &s.tabs[0] else {
+                unreachable!()
+            };
+            compose_capability_guidance(c, s)
+        };
+
+        // ON (the default): pins present, paragraph present.
+        let on = base();
+        assert_eq!(cfg(&on)["agent"]["build"]["permission"]["bash"], "allow");
+        assert_eq!(cfg(&on)["agent"]["build"]["permission"]["webfetch"], "allow");
+        assert!(guidance(&on).contains("Untrusted-content handling"));
+
+        // OFF app-wide: no `agent` key at all, no paragraph.
+        let mut off = base();
+        off.offload.injection.consumer_hygiene_enabled = false;
+        assert!(cfg(&off)["agent"].is_null(), "{}", cfg(&off));
+        assert!(!guidance(&off).contains("Untrusted-content handling"));
+
+        // OFF per tab (L3) does the same for that tab.
+        let mut per_tab = base();
+        if let TabConfig::AiTool(c) = &mut per_tab.tabs[0] {
+            c.injection_overrides.set(
+                crate::settings::injection::Feature::ConsumerHygiene,
+                crate::settings::injection::Override::Off,
+            );
+        }
+        assert!(cfg(&per_tab)["agent"].is_null());
+
+        // Hygiene off + native-web `deny`: the DENIALS survive, because they are
+        // a different feature the user did not touch. The pins do not come back.
+        let mut denied = off;
+        denied.offload.native_web_visibility = "deny".into();
+        let c = cfg(&denied);
+        assert_eq!(c["agent"]["build"]["permission"]["webfetch"], "deny");
+        assert_eq!(c["agent"]["build"]["permission"]["websearch"], "deny");
+        assert!(c["agent"]["build"]["permission"]["bash"].is_null());
+    }
+
+    /// V32 Phase G: the master switch alone restores the pre-V32 spawn posture —
+    /// no beacon hook, no permission denial, no pinned block, no paragraph.
+    #[test]
+    fn the_master_switch_restores_the_pre_v32_spawn_posture() {
+        let mut s = Settings {
+            tabs: vec![default_claude_tab(), default_opencode_tab()],
+            ..Settings::default()
+        };
+        s.offload.enabled = true;
+        s.offload.native_web_visibility = "deny".into();
+        s.offload.injection.protection = false;
+
+        let TabConfig::AiTool(claude) = &s.tabs[0] else {
+            unreachable!()
+        };
+        let args = build_pre_args(claude, &s, &claude.id);
+        let overlay = settings_overlay(&args);
+        assert!(
+            overlay.is_none_or(|o| o["permissions"].is_null() && o["hooks"]["PreToolUse"].is_null()),
+            "no denial and no beacon hook with the master off"
+        );
+        assert!(!compose_capability_guidance(claude, &s).contains("Untrusted-content handling"));
+
+        let TabConfig::AiTool(oc) = &s.tabs[1] else {
+            unreachable!()
+        };
+        assert!(build_opencode_config(oc, &s, &oc.id)["agent"].is_null());
+        assert!(!opencode_plugin_wanted(&s, &oc.id), "no beacon plugin either");
+    }
+
+    /// V32 Phase G: the OTHER two levels of the same spawn-baked features move
+    /// the signature too — a per-tab override and the global master, neither of
+    /// which existed when the test above was written.
+    #[test]
+    fn the_injection_hierarchy_moves_the_spawn_inject_signature_at_every_level() {
+        let with_tab = || Settings {
+            tabs: vec![default_claude_tab()],
+            ..Settings::default()
+        };
+        let base = spawn_inject_sig(&with_tab());
+        // L1.
+        let mut s = with_tab();
+        s.offload.injection.protection = false;
+        assert_ne!(spawn_inject_sig(&s)[0], base[0], "the master switch");
+        // L2 for consumer hygiene (native-web's L2 is covered above).
+        let mut s = with_tab();
+        s.offload.injection.consumer_hygiene_enabled = false;
+        assert_ne!(spawn_inject_sig(&s)[1], base[1], "consumer hygiene L2");
+        // L3, per tab, for both spawn-baked features.
+        for feature in [
+            crate::settings::injection::Feature::NativeWeb,
+            crate::settings::injection::Feature::ConsumerHygiene,
+        ] {
+            let mut s = with_tab();
+            if let TabConfig::AiTool(c) = &mut s.tabs[0] {
+                c.injection_overrides
+                    .set(feature, crate::settings::injection::Override::Off);
+            }
+            assert_ne!(spawn_inject_sig(&s)[0], base[0], "{feature:?} L3");
+        }
+        // A LIVE feature must not move it — the restart hint is only honest if
+        // it fires for changes that actually need a restart.
+        let mut s = with_tab();
+        s.offload.injection.taint_latch_enabled = false;
+        s.offload.injection.detection_enabled = false;
+        assert_eq!(spawn_inject_sig(&s), base, "live features must not nag");
     }
 
     /// Sensor mode injects a `PreToolUse` beacon matched ONLY on the two web
@@ -3352,7 +3546,7 @@ mod tests {
         let settings = Settings::default(); // offload + graph + audit all off
         assert!(!settings.loopback_needed());
         assert_eq!(
-            NativeWebVisibility::of(&settings),
+            NativeWebVisibility::parse(&settings.offload.native_web_visibility),
             NativeWebVisibility::Sensor,
             "the default mode is what makes this case worth pinning"
         );
@@ -3441,7 +3635,7 @@ mod tests {
             let mut s = Settings::default();
             s.graph.enabled = graph;
             s.offload.native_web_visibility = mode.to_string();
-            opencode_plugin_wanted(&s)
+            opencode_plugin_wanted(&s, "opencode")
         };
         // The case the trap was: graph off, sensor on ⇒ still written.
         assert!(with(false, "sensor"), "graph off must not delete the sensor");
@@ -3452,16 +3646,24 @@ mod tests {
         // pinned permission block does that work.
         assert!(!with(false, "off"));
         assert!(!with(false, "deny"));
-        // And the predicate the restart hint compares is the same one.
-        let mut s = Settings::default();
-        s.offload.native_web_visibility = "off".to_string();
-        assert_eq!(
-            spawn_inject_sig(&s)[1]["plugin"][0],
-            serde_json::json!(false)
-        );
-        assert_eq!(
-            spawn_inject_sig(&Settings::default())[1]["plugin"][0],
-            serde_json::json!(true)
+        // And a mode flip still raises the restart hint. V32 Phase G moved WHERE
+        // it does: `plugin[0]` is now the app-wide graph half alone, because the
+        // predicate went per-tab, and the sensor half is carried — per tab, with
+        // its resolved mode — by the `injection` fragment. The property the
+        // trap-closing test cares about is unchanged: flipping the mode makes a
+        // fresh OpenCode tab launch differently, and the signature says so.
+        let mut off = Settings {
+            tabs: vec![default_opencode_tab()],
+            ..Settings::default()
+        };
+        off.graph.enabled = false;
+        off.offload.native_web_visibility = "off".to_string();
+        let mut sensor = off.clone();
+        sensor.offload.native_web_visibility = "sensor".to_string();
+        assert_ne!(
+            spawn_inject_sig(&off)[1],
+            spawn_inject_sig(&sensor)[1],
+            "a mode flip with the graph off must still raise the restart hint"
         );
     }
 
@@ -3911,7 +4113,7 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.promote_pinned_facts = true;
 
-        let block = fact_promotion_block(&dir, &settings).expect("block present");
+        let block = fact_promotion_block(&dir, &settings, "claude", "claude").expect("block present");
         // V32 Phase C2: the injected block is spotlight-enveloped at delivery —
         // it lands in a system-prompt addendum, so the facts inside must be
         // marked as replayed data before the session reads them.
@@ -3955,7 +4157,7 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.promote_pinned_facts = true;
 
-        let block = fact_promotion_block(&dir, &settings).expect("block present");
+        let block = fact_promotion_block(&dir, &settings, "claude", "claude").expect("block present");
         // The cap bounds the FACTS; the V32 Phase C2 envelope is fixed overhead
         // added afterwards (preamble + two nonced markers), so it is measured
         // out of the budget rather than allowed to eat into it — a per-tab
@@ -3980,7 +4182,7 @@ mod tests {
         settings.graph.promote_pinned_facts = true;
 
         // No graph ever built at this root — best-effort `None`, no panic.
-        assert!(fact_promotion_block(&dir, &settings).is_none());
+        assert!(fact_promotion_block(&dir, &settings, "claude", "claude").is_none());
 
         {
             let idx = crate::graph::GraphIndex::open(&dir, ".cimp").expect("open");
@@ -3988,7 +4190,7 @@ mod tests {
                 .unwrap();
         }
         // A built graph with only unpinned facts is still `None`.
-        assert!(fact_promotion_block(&dir, &settings).is_none());
+        assert!(fact_promotion_block(&dir, &settings, "claude", "claude").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

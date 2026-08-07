@@ -461,7 +461,12 @@ impl Consumer {
 
     /// The activity-feed `source` badge for this consumer — the same
     /// `claude`/`opencode`/`offload` vocabulary graph entries use.
-    fn source(self) -> &'static str {
+    ///
+    /// `pub(crate)` since V32 Phase G: `OffloadService::mcp_call` keys the
+    /// injection scope off the same vocabulary the latch registry uses, and
+    /// re-deriving the agent name from anything else would let a tab's latch and
+    /// its override row disagree.
+    pub(crate) fn source(self) -> &'static str {
         match self {
             Consumer::Claude => "claude",
             Consumer::Offload => "offload",

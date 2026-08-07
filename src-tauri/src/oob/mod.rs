@@ -114,11 +114,28 @@ impl OobContext {
     /// Stripping here rather than at each tap keeps it one decision in one
     /// place, and it happens BEFORE markdown reduction so a control sequence
     /// cannot alter how `to_speakable` sees fences or list markers.
+    ///
+    /// V32 Phase G (locked decision 16): the strip is one of the ten switchable
+    /// controls, resolved at [`Scope::App`] — TTS and toasts are global surfaces
+    /// (the global-only avatar/TTS decision), so this feature has an L1 and an
+    /// L2 and deliberately no per-scope row. Resolved per burst rather than
+    /// cached: the settings handle is already read here for `tts_enabled`, and a
+    /// user who turns hygiene off wants the next thing spoken to reflect it.
+    ///
+    /// [`Scope::App`]: crate::settings::injection::Scope::App
     pub async fn speak(&self, text: &str) {
         if !self.tts_enabled() {
             return;
         }
-        let text = crate::processing::strip_terminal_escapes(text);
+        let text = if crate::settings::injection::effective(
+            crate::settings::injection::Feature::TerminalEscapeHygiene,
+            crate::settings::injection::Scope::App,
+            &self.settings.current(),
+        ) {
+            crate::processing::strip_terminal_escapes(text)
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
         let prose = prose::to_speakable(&text);
         if prose.trim().is_empty() {
             return;

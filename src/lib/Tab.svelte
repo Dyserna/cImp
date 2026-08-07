@@ -5,7 +5,7 @@
   // (Close? Yes / No); clicking × on an already-closed shell skips the
   // confirm and calls close_tab immediately.
   import type { AvatarState } from './avatarState';
-  import type { LatchRow } from './latch';
+  import type { FeatureState, LatchRow } from './latch';
 
   let {
     tabId,
@@ -19,6 +19,7 @@
     awaitingPermission = false,
     doneWhileAway = false,
     taint = null,
+    reduced = [],
     onclick,
     onclose,
     onnew,
@@ -54,6 +55,12 @@
     /// Kept as the whole row rather than a boolean so the badge's tooltip
     /// can state WHICH boundary is in force without a second lookup.
     taint?: LatchRow | null;
+    /// V32 Phase G: the injection controls resolved OFF for this tab. Renders
+    /// the badge even on a clean tab, because "this tab's containment is
+    /// switched off" is exactly as much a containment state as "this tab is
+    /// latched" — and locked decision 16 requires a reduced-protection state to
+    /// be visible outside Settings.
+    reduced?: FeatureState[];
     onclick: () => void;
     /// Invoked when the user confirms the close (or skips the confirm).
     /// Optional because builtin tabs render no close button.
@@ -160,15 +167,30 @@
   /// V32 Phase F: the badge's tooltip. States the boundary in force, because
   /// a shield glyph alone says "something happened" and the user's next
   /// question is always "so what can this tab still do?".
+  ///
+  /// V32 Phase G appends the reduced-protection line. The two facts sit
+  /// together because they answer the same question from opposite directions:
+  /// the latch says what this tab may no longer do, the reduced line says which
+  /// protections are not watching it in the first place.
   let taintTitle = $derived(
-    !taint
-      ? ''
-      : taint.latch === 'external'
-        ? 'This session has used web / external content: local file and source-text tools are closed for it.'
-        : taint.latch === 'local'
-          ? 'This session has used local file / source-text tools: web and other external tools are closed for it.'
-          : 'This session has read external content. Memory writes stay quarantined until the tab is restarted.',
+    [
+      !taint
+        ? ''
+        : taint.latch === 'external'
+          ? 'This session has used web / external content: local file and source-text tools are closed for it.'
+          : taint.latch === 'local'
+            ? 'This session has used local file / source-text tools: web and other external tools are closed for it.'
+            : 'This session has read external content. Memory writes stay quarantined until the tab is restarted.',
+      reduced.length === 0
+        ? ''
+        : `Injection protection reduced for this tab: ${reduced.map((f) => f.label).join(', ')} off.`,
+    ]
+      .filter(Boolean)
+      .join(' '),
   );
+
+  /// Whether the badge renders at all. Either containment state counts.
+  let showTaintBadge = $derived(!!taint || reduced.length > 0);
 
   function onTaintClick(e: MouseEvent): void {
     // Don't let the click also activate or drag the tab.
@@ -275,16 +297,22 @@
       ></span>
     {/if}
     <span class="label" class:label-left={!showIndicator}>{label}</span>
-    {#if taint}
+    {#if showTaintBadge}
       <!--
         V32 Phase F taint badge. Always visible while the tab is latched or
         contaminated (unlike × / +, which reveal on hover): it reports a
         containment state the user needs to see without going looking, and
         clicking it opens the override popover.
+
+        V32 Phase G: it also appears when one of this tab's injection controls
+        is switched off, in its own colour — a tab whose protections are off is
+        a state the user must be able to notice without opening Settings, and
+        it is not the same state as a latched tab.
       -->
       <span
         class="taint"
-        class:taint-contaminated={taint.contaminated}
+        class:taint-contaminated={taint?.contaminated}
+        class:taint-reduced={!taint && reduced.length > 0}
         role="button"
         tabindex="0"
         aria-label="Containment state for this tab"
@@ -449,6 +477,12 @@
      still carrying whatever it read. */
   .taint-contaminated {
     color: var(--danger);
+  }
+  /* V32 Phase G: a CLEAN tab whose protections are switched off. Muted rather
+     than warning-coloured — nothing has happened to this session; a control the
+     user turned off is a configuration fact, not an event. */
+  .taint-reduced {
+    color: var(--text-tertiary);
   }
   .taint:hover {
     background: var(--surface-3);

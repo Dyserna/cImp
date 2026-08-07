@@ -12,6 +12,12 @@ mod context_hook;
 mod error;
 mod fsutil;
 mod graph;
+/// V32 Phase G (locked decision 16): the no-raw-reads tripwire — a
+/// source-scanning test that no V32 enforcement site reads a raw injection
+/// switch instead of resolving it through `settings::injection`. Test-only,
+/// like its Phase D sibling `push_tripwire`.
+#[cfg(test)]
+mod injection_tripwire;
 mod ipc;
 mod logging;
 mod mcp_stdio;
@@ -70,7 +76,7 @@ use crate::ipc::commands::{
     graph_note_review, graph_note_set_pinned, graph_path, graph_rebuild, graph_rebuild_embeddings,
     graph_session_usage, graph_set_language_enabled, graph_set_watch_paused, graph_status,
     graph_test_embedder, graph_usage, graph_usage_advice, graph_viz_ego, graph_viz_file_status,
-    graph_viz_snapshot, harness_mark_verified, harness_versions_get, latch_override, latch_status,
+    graph_viz_snapshot, harness_mark_verified, harness_versions_get, injection_status, latch_override, latch_status,
     list_tabs, list_voices,
     llm_pricing_get, llm_pricing_set, offload_backend_restart, offload_backend_start,
     offload_backend_stop, offload_derive_opencode_provider, offload_enable_readonly_commands,
@@ -1004,6 +1010,7 @@ fn main() {
             // V32 Phase F: the per-tab taint badge + its override popover.
             latch_status,
             latch_override,
+            injection_status,
             offload_server_log,
             offload_server_metrics,
             graph_status,

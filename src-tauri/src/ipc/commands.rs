@@ -1275,6 +1275,34 @@ pub async fn latch_status() -> AppResult<Vec<crate::offload::loopback::LatchStat
     Ok(crate::offload::loopback::latch_snapshot())
 }
 
+/// V32 Phase G (locked decision 16): the RESOLVED state of every injection
+/// control at every scope, plus which of the three levels decided each one.
+///
+/// The same object the loopback's `GET /status` carries under `injection`, so
+/// the Settings matrix, the per-tab badge popover, the status-bar indicator and
+/// a live-verification `curl` all read one description of what is in force.
+/// Introspection is part of the feature, not a debug affordance: with three
+/// levels, "why is this tab not latching?" must be answerable without reading
+/// code.
+#[tauri::command]
+pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    Ok(crate::offload::loopback::injection_status(
+        &state.settings.current(),
+    ))
+}
+
+// There is deliberately no `set_injection_override` command: the L1/L2 switches
+// and the L3 override cells are ordinary settings fields, written through the
+// normal `apply_settings` save path, so the Settings window keeps ONE write path
+// and cannot race its own full-object save against a side channel. What has no
+// ordinary path — and is therefore what `injection_status` exists for — is the
+// RESOLVED view: it is derived, not stored.
+//
+// The "this feature has no cell at that scope" case is guarded structurally
+// rather than at an IPC boundary: `TabInjectionOverrides` and
+// `WorkerInjectionOverrides` carry only their own scope's fields, so the illegal
+// write does not typecheck in Rust and has no key to target in JSON.
+
 /// V32 Phase F (locked decision 15): apply a user-initiated latch move
 /// (`"flip_local"` or `"unlatch"`) to one tab and return its new view.
 ///

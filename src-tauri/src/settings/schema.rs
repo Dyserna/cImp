@@ -964,6 +964,20 @@ pub struct AiToolTabConfig {
     /// `claude_local` settings group. Per-tab `env` entries override
     /// synthesized values.
     pub use_local_provider: bool,
+    /// V32 Phase G (locked decision 16): this tab's **L3** row — a tri-state
+    /// `Inherit | On | Off` per injection-protection feature, defaulting to
+    /// `Inherit` everywhere so an untouched tab behaves exactly as before.
+    ///
+    /// Only the features that HAVE a tab scope have a cell (see
+    /// [`TabInjectionOverrides`](crate::settings::injection::TabInjectionOverrides)):
+    /// the worker-only canary and the app-wide terminal-escape hygiene are
+    /// structurally absent rather than present-and-ignored.
+    ///
+    /// Two of the cells (native-web visibility, consumer hygiene) are
+    /// spawn-baked and therefore ride `spawn_inject_sig`, so flipping them
+    /// raises the "restart the AI tab" hint; the rest take effect on the next
+    /// call.
+    pub injection_overrides: crate::settings::injection::TabInjectionOverrides,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -1661,6 +1675,91 @@ pub struct OffloadSettings {
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
     pub native_web_visibility: String,
+    /// V32 Phase G (locked decision 16): the three-level enable hierarchy's
+    /// **L1 + L2** switches, plus the L3 row for the `offload-worker`
+    /// pseudo-scope (which has no tab config to hang one off).
+    ///
+    /// Every field here is read through [`crate::settings::injection`] and
+    /// nowhere else — the cross-module invariant a source tripwire
+    /// (`crate::injection_tripwire`) pins. See that module for the resolution
+    /// rule and for why native-web visibility has no flag in this block.
+    ///
+    /// Additive `#[serde(default)]`; no schema-version bump.
+    pub injection: InjectionSettings,
+}
+
+/// V32 Phase G (locked decision 16) — the app-wide half of the injection
+/// enable hierarchy.
+///
+/// **L1** is [`protection`](Self::protection): off disables every V32 control
+/// everywhere, all tabs AND the offload worker, and nothing overrides it upward.
+/// **L2** is one `<feature>_enabled` flag per control, app-wide. **L3** lives
+/// per scope — [`worker`](Self::worker) here for the `offload-worker`
+/// pseudo-scope, and `AiToolTabConfig::injection_overrides` for tabs.
+///
+/// There is deliberately **no `native_web_enabled`**: locked decision 14's
+/// tri-mode `native_web_visibility` already carries an `off` value, and that
+/// `off` IS the feature's L2. A second boolean beside it would make a
+/// contradictory state representable. See
+/// [`injection`](crate::settings::injection) for the full reconciliation.
+///
+/// Every default is `true`, so an untouched (or pre-Phase-G) settings file
+/// resolves exactly as the app behaved before this block existed — the
+/// migration-safety property, pinned by a test in the resolver.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct InjectionSettings {
+    /// **L1 — the global master** (spec decision 16's `injection_protection`).
+    /// Default `true`. Off = pre-V32 behaviour at every layer at once.
+    pub protection: bool,
+    /// L2: the bidirectional taint latch (worker + proxy).
+    pub taint_latch_enabled: bool,
+    /// L2: the spotlighting envelope on EXTERNAL results and recalled memory.
+    pub spotlighting_enabled: bool,
+    /// L2: the detection surface. Parent of the existing
+    /// `detection_signature_enabled` / `detection_classifier_enabled`
+    /// sub-toggles — parent off ⇒ both layers off regardless of them.
+    pub detection_enabled: bool,
+    /// L2: the outbound URL range screen at `McpHost::call_recorded`.
+    pub ssrf_guard_enabled: bool,
+    /// L2: per-scope EXTERNAL call/byte caps. The `external_fetch_max_*`
+    /// numerics stay the tuning knobs; this is the on/off above them.
+    pub fetch_budgets_enabled: bool,
+    /// L2: the worker's in-band canary (worker-scoped feature).
+    pub canary_enabled: bool,
+    /// L2: quarantine of `context_note` writes from a contaminated session.
+    pub memory_quarantine_enabled: bool,
+    /// L2: the pinned OpenCode permission block + the injection-hygiene
+    /// guidance addendum. Spawn-baked.
+    pub consumer_hygiene_enabled: bool,
+    /// L2: stripping terminal control sequences out of external text cImp
+    /// composes into non-HTML sinks. App-wide — no per-scope row, because TTS
+    /// and toasts are global surfaces (the global-only avatar/TTS decision).
+    pub terminal_escape_hygiene_enabled: bool,
+    /// **L3 for the `offload-worker` pseudo-scope.** The worker is a
+    /// task-scoped service with no tab, so its override row lives here beside
+    /// the app-wide flags rather than on a tab config.
+    pub worker: crate::settings::injection::WorkerInjectionOverrides,
+}
+
+impl Default for InjectionSettings {
+    fn default() -> Self {
+        Self {
+            // Every control on, every override neutral: an untouched config
+            // behaves exactly as the app did before the hierarchy existed.
+            protection: true,
+            taint_latch_enabled: true,
+            spotlighting_enabled: true,
+            detection_enabled: true,
+            ssrf_guard_enabled: true,
+            fetch_budgets_enabled: true,
+            canary_enabled: true,
+            memory_quarantine_enabled: true,
+            consumer_hygiene_enabled: true,
+            terminal_escape_hygiene_enabled: true,
+            worker: Default::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for OffloadSettings {
@@ -1726,6 +1825,7 @@ impl std::fmt::Debug for OffloadSettings {
                 &self.detection_update_manifest_url,
             )
             .field("native_web_visibility", &self.native_web_visibility)
+            .field("injection", &self.injection)
             .finish()
     }
 }
@@ -1804,6 +1904,9 @@ impl Default for OffloadSettings {
             // change; not `off` — an unseen web route is exactly the hole
             // this exists to close.
             native_web_visibility: "sensor".into(),
+            // V32 Phase G: every control on, every override neutral — see
+            // `InjectionSettings::default`.
+            injection: InjectionSettings::default(),
         }
     }
 }
@@ -3021,6 +3124,9 @@ pub fn default_claude_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
+        // V32 Phase G: no per-tab injection overrides on a fresh builtin — the
+        // whole hierarchy inherits, which is exactly the pre-Phase-G behaviour.
+        injection_overrides: Default::default(),
     })
 }
 
@@ -3047,6 +3153,8 @@ pub fn default_claude_local_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: true,
+        // V32 Phase G: see `default_claude_tab`.
+        injection_overrides: Default::default(),
     })
 }
 
@@ -3078,6 +3186,9 @@ pub fn default_opencode_tab() -> TabConfig {
         theme_override: None,
         background_override: None,
         use_local_provider: false,
+        // V32 Phase G: no per-tab injection overrides on a fresh builtin — the
+        // whole hierarchy inherits, which is exactly the pre-Phase-G behaviour.
+        injection_overrides: Default::default(),
     })
 }
 

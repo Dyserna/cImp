@@ -14,6 +14,7 @@
   import ToolLaunchButton from './status/ToolLaunchButton.svelte';
   import NoteButton from './status/NoteButton.svelte';
   import WorkbenchDiffBadge from './status/WorkbenchDiffBadge.svelte';
+  import InjectionBadge from './status/InjectionBadge.svelte';
   import { settings } from './settings/store';
 </script>
 
@@ -25,6 +26,10 @@
     <ToolLaunchButton tool="rustnet" glyph="🌐" label="New rustnet tab" />
     <NoteButton />
     <WorkbenchDiffBadge />
+    <!-- V32 Phase G: silent while every injection control is on; a ⛨ chip when
+         the master switch or any feature is off, so a reduced-protection state
+         cannot be off and forgotten (locked decision 16). -->
+    <InjectionBadge />
     {#if $settings.stt.enabled}
       <span class="sep" aria-hidden="true"></span>
       <RecordButton />

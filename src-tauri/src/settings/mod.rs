@@ -11,6 +11,12 @@
 //! global. See `persistence` for details.
 
 mod broadcaster;
+/// V32 Phase G (locked decision 16): the three-level injection-protection
+/// enable hierarchy and the ONE resolver every enforcement site calls. Public
+/// because half the crate's V32 code depends on it — and because "no
+/// enforcement site reads a raw settings field" only works if there is a
+/// visible, obvious place for them to read instead.
+pub mod injection;
 mod migration;
 mod persistence;
 mod schema;

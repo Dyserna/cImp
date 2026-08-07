@@ -1099,6 +1099,13 @@ impl GraphService {
     /// is stored with the `tainted` flag instead of entering project memory. It
     /// is threaded rather than re-derived here because only the proxy holds the
     /// per-tab latch state; the graph layer must never guess it.
+    ///
+    /// V32 Phase G widens that one verdict into
+    /// [`CallGuards`](crate::offload::toolclass::CallGuards) — the taint plus
+    /// whether recalled memory is spotlight-enveloped — for the same reason:
+    /// both are resolved at the proxy, which is the only layer that knows the
+    /// calling TAB and can therefore resolve the three-level hierarchy at the
+    /// right scope.
     pub async fn run_graph_tool(
         &self,
         cwd: &Path,
@@ -1106,7 +1113,7 @@ impl GraphService {
         args: &serde_json::Value,
         consumer: &str,
         session: Option<&str>,
-        taint: crate::offload::toolclass::WriteTaint,
+        guards: crate::offload::toolclass::CallGuards,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
@@ -1126,7 +1133,7 @@ impl GraphService {
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session, taint)
+        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session, guards)
             .await
     }
 

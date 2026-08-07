@@ -34,6 +34,75 @@ export interface LatchRow {
 /// The two user-initiated moves. Mirror of Rust `LatchOverride`.
 export type LatchAction = 'flip_local' | 'unlatch';
 
+// ── V32 Phase G — the enable hierarchy, introspected ───────────────────────
+
+/// Which of the three levels decided a feature's value. Mirror of Rust
+/// `DecidedBy`. This is the whole reason introspection is part of the feature:
+/// with three levels, "why is this tab not latching?" has to be answerable
+/// without reading code.
+export type DecidedBy = 'global' | 'feature' | 'scope';
+
+/// One feature's resolved state at one scope. Mirror of Rust `FeatureState`.
+export interface FeatureState {
+  /// Stable key (`taint_latch`, `spotlighting`, …) — also the settings field
+  /// stem and the override-row key.
+  feature: string;
+  label: string;
+  /// The value actually in force.
+  effective: boolean;
+  decided_by: DecidedBy;
+  /// This scope's own tri-state cell.
+  override_value: 'inherit' | 'on' | 'off';
+  /// Whether this scope has a row for the feature at all. `false` rows are
+  /// still reported — "this control does not apply here" is sometimes the
+  /// answer to "why is this tab not latching?".
+  in_scope: boolean;
+}
+
+/// One scope's rows. `scope` is `app`, `offload-worker`, or a tab id.
+export interface InjectionScope {
+  scope: string;
+  label: string;
+  features: FeatureState[];
+}
+
+/// Mirror of the backend's `injection_status` object (also served on the
+/// loopback's `GET /status`).
+export interface InjectionStatus {
+  /// The L1 master switch.
+  protection: boolean;
+  /// True when the master is off OR any feature resolves off at any scope —
+  /// the predicate behind the out-of-Settings indicator, so protection cannot
+  /// be off and forgotten.
+  reduced: boolean;
+  scopes: InjectionScope[];
+}
+
+export async function fetchInjectionStatus(): Promise<InjectionStatus> {
+  return invoke<InjectionStatus>('injection_status');
+}
+
+/// The last known hierarchy state. `null` until the first poll lands (the app
+/// may still be starting) — consumers render nothing rather than guessing.
+export const injectionStatus = writable<InjectionStatus | null>(null);
+
+/// Whether protection is reduced anywhere. Drives the status-bar indicator.
+export const protectionReduced: Readable<boolean> = derived(
+  injectionStatus,
+  ($s) => !!$s?.reduced,
+);
+
+/// The features resolved OFF for one tab, for the tab badge and its popover.
+/// Only rows the scope actually has are considered — a tab is not "reduced"
+/// because the worker-only canary does not apply to it.
+export function reducedFeaturesFor(
+  status: InjectionStatus | null,
+  tab: TabId,
+): FeatureState[] {
+  const scope = status?.scopes.find((s) => s.scope === tab);
+  return (scope?.features ?? []).filter((f) => f.in_scope && !f.effective);
+}
+
 export async function fetchLatchStatus(): Promise<LatchRow[]> {
   return invoke<LatchRow[]>('latch_status');
 }
@@ -85,6 +154,17 @@ const POLL_MS = 4000;
 export function startLatchPolling(): () => void {
   let stopped = false;
   const tick = async (): Promise<void> => {
+    // V32 Phase G rides the same tick. Settings changes are rarer than latch
+    // moves, but the two are read together everywhere they are shown (the tab
+    // badge means one thing when the latch is engaged and another when the
+    // latch feature is switched off), so fetching them apart would let the
+    // badge and its explanation disagree for up to a poll interval.
+    try {
+      const status = await fetchInjectionStatus();
+      if (!stopped) injectionStatus.set(status);
+    } catch {
+      /* app still starting — keep the last known hierarchy state */
+    }
     try {
       const rows = await fetchLatchStatus();
       if (stopped) return;

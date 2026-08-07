@@ -2,7 +2,15 @@
   import Tab from './Tab.svelte';
   import TabContextMenu from './TabContextMenu.svelte';
   import TaintMenu from './TaintMenu.svelte';
-  import { fetchLatchStatus, isTainted, latchByTab, type LatchRow } from './latch';
+  import {
+    fetchLatchStatus,
+    injectionStatus,
+    isTainted,
+    latchByTab,
+    reducedFeaturesFor,
+    type FeatureState,
+    type LatchRow,
+  } from './latch';
   import { tabs } from './tabs/store';
   import { switchTab } from './tabs/state';
   import {
@@ -52,11 +60,45 @@
   // V32 Phase F: the taint-override popover. Anchored at the badge the user
   // clicked, carrying that tab's latch row. Separate state from `menu` so the
   // two can never be open at once for different reasons.
-  let taintMenu = $state<{ x: number; y: number; row: LatchRow } | null>(null);
+  //
+  // V32 Phase G: it also carries the tab's reduced-protection rows, because the
+  // badge can now open on a CLEAN tab whose controls are switched off — and a
+  // popover that then said only "not latched" would be answering a question
+  // nobody asked.
+  let taintMenu = $state<{
+    x: number;
+    y: number;
+    row: LatchRow;
+    reduced: FeatureState[];
+  } | null>(null);
 
-  function onTaintBadge(row: LatchRow, e: MouseEvent): void {
+  /// The row a badge click carries. A tab with no gated call yet has no latch
+  /// row at all, so synthesize the "nothing latched" one rather than making the
+  /// popover handle a null: the state it describes is real (open, uncontaminated,
+  /// nothing to override), and the backend publishes exactly that shape for a tab
+  /// it has never served.
+  function rowFor(tab: TabId, row: LatchRow | undefined): LatchRow {
+    return (
+      row ?? {
+        consumer: 'claude',
+        tab,
+        session: null,
+        latch: 'open',
+        contaminated: false,
+        can_flip_local: false,
+        can_unlatch: false,
+      }
+    );
+  }
+
+  function onTaintBadge(tab: TabId, row: LatchRow | undefined, e: MouseEvent): void {
     menu = null;
-    taintMenu = { x: e.clientX, y: e.clientY, row };
+    taintMenu = {
+      x: e.clientX,
+      y: e.clientY,
+      row: rowFor(tab, row),
+      reduced: reducedFeaturesFor($injectionStatus, tab),
+    };
   }
 
   /// Refresh the latch snapshot immediately after an override, instead of
@@ -275,7 +317,8 @@
             awaitingPermission={$perTabAwaitingPermission[id] ?? false}
             doneWhileAway={$perTabDoneWhileAway[id] ?? false}
             taint={isTainted(latchRow) ? (latchRow ?? null) : null}
-            ontaint={latchRow ? (e) => onTaintBadge(latchRow, e) : undefined}
+            reduced={reducedFeaturesFor($injectionStatus, id)}
+            ontaint={(e) => onTaintBadge(id, latchRow, e)}
             bind:renaming={
               () => renamingTab === id,
               (v) => {
@@ -379,6 +422,7 @@
     x={taintMenu.x}
     y={taintMenu.y}
     row={taintMenu.row}
+    reduced={taintMenu.reduced}
     onDismiss={() => (taintMenu = null)}
     onApplied={refreshLatches}
   />

@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use super::index::{ArchReport, DocHit, GraphIndex, PathHit, RefHit, SymbolHit};
 use super::memory::{MemNote, ProjectFact, WorkingSetEntry};
 use super::model::EdgeKind;
-use crate::offload::toolclass::{WriteTaint, QUARANTINE_WRITE_NOTICE};
+use crate::offload::toolclass::{CallGuards, WriteTaint, QUARANTINE_WRITE_NOTICE};
 
 /// One graph tool's identity, description, and JSON-Schema parameters — the
 /// shared definition both surfaces render into their own shape.
@@ -516,6 +516,11 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
     // the alternative would quarantine every note written while the app is
     // closed, which is neither evidence of taint nor something a user could
     // anticipate.
+    //
+    // V32 Phase G: the recall envelope, unlike the latch, needs no registry —
+    // only settings, which this path already read. It therefore resolves for
+    // real, at `Scope::App` (there is no tab identity here to key an override
+    // on), so the master switch reaches the headless path too.
     let result = dispatch_recorded(
         &root,
         &idx,
@@ -524,7 +529,14 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
         name,
         &args,
         None,
-        WriteTaint::Clean,
+        CallGuards {
+            taint: WriteTaint::Clean,
+            spotlight_recall: crate::settings::injection::effective(
+                crate::settings::injection::Feature::Spotlighting,
+                crate::settings::injection::Scope::App,
+                &settings,
+            ),
+        },
     )
     .await;
 
@@ -562,7 +574,7 @@ pub(crate) async fn dispatch_recorded(
     name: &str,
     args: &Value,
     session: Option<&str>,
-    taint: WriteTaint,
+    guards: CallGuards,
 ) -> Result<String, String> {
     let (max_rows, max_snippet) = limits(settings);
     let started = crate::activity::now_ms();
@@ -617,7 +629,7 @@ pub(crate) async fn dispatch_recorded(
             max_snippet,
             mem_agent(source),
             session,
-            taint,
+            guards,
         )
     };
     crate::activity::record_bg(crate::activity::ActivityRecord {
@@ -718,6 +730,19 @@ fn scoped_session(
         .map_err(|e| e.to_string())
 }
 
+/// V32 Phase G: apply the delivery-time recall envelope, or don't.
+///
+/// One helper for both memory-read tools so the switch cannot be honoured at
+/// `context_recall` and forgotten at `context_notes` — the two are read by the
+/// same session and an inconsistency between them would be invisible.
+fn maybe_recall_envelope(out: String, guards: CallGuards) -> String {
+    if guards.spotlight_recall {
+        crate::offload::spotlight::recall_envelope(&out)
+    } else {
+        out
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_tool(
     idx: &GraphIndex,
@@ -735,7 +760,7 @@ pub fn run_tool(
     session: Option<&str>,
     // V32 Phase C2: the taint-latch verdict for this call — `context_note`'s
     // only input beyond its arguments.
-    taint: WriteTaint,
+    guards: CallGuards,
 ) -> Result<String, String> {
     let arg = |key: &str| -> String {
         args.get(key)
@@ -853,7 +878,12 @@ pub fn run_tool(
             // handles the ones we cannot know about — every pre-V32 session, and
             // any future write path that lands outside the latch's reach.
             // Wrapped here, at delivery, so each result carries a fresh nonce.
-            Ok(crate::offload::spotlight::recall_envelope(&out))
+            //
+            // V32 Phase G: unless the caller resolved spotlighting off for its
+            // scope. The verdict is threaded in (never resolved here) because
+            // this function has no scope to resolve against — the tab that asked
+            // is known at the gate, four frames up.
+            Ok(maybe_recall_envelope(out, guards))
         }
         "context_notes" => {
             let sid = scoped_session(idx, agent, session)?.unwrap_or_default();
@@ -872,7 +902,7 @@ pub fn run_tool(
                      withheld from this listing until promoted in cImp's Memory view."
                 ));
             }
-            Ok(crate::offload::spotlight::recall_envelope(&out))
+            Ok(maybe_recall_envelope(out, guards))
         }
         "context_note" => {
             let text = req("text")?;
@@ -902,7 +932,7 @@ pub fn run_tool(
             // promotes it. The Phase A/B behaviour was a hard refusal, which
             // threw away the legitimate conclusions a research session exists to
             // produce; the model is told the difference in the result below.
-            let quarantined = taint.is_quarantined();
+            let quarantined = guards.taint.is_quarantined();
             idx.mem_add_note(&note_id, &sid, &text, ts, pin, quarantined)
                 .map(|_| {
                     let scope = if pin {
@@ -1312,6 +1342,19 @@ pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Resul
                 // If that dispatch gap is ever closed, the worker's refusal is
                 // the thing to convert to quarantine, and this argument is where
                 // its verdict would arrive.
+                //
+                // V32 Phase G: the recall half IS resolved, at the
+                // `offload-worker` pseudo-scope — the worker reads memory even
+                // though it cannot write it, so its envelope has a live switch
+                // where its quarantine has none.
+                let guards = CallGuards {
+                    taint: WriteTaint::Clean,
+                    spotlight_recall: crate::settings::injection::effective(
+                        crate::settings::injection::Feature::Spotlighting,
+                        crate::settings::injection::Scope::OffloadWorker,
+                        &settings,
+                    ),
+                };
                 return dispatch_recorded(
                     &resolved,
                     &idx,
@@ -1320,7 +1363,7 @@ pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Resul
                     name,
                     args,
                     None,
-                    WriteTaint::Clean,
+                    guards,
                 )
                 .await;
             }
@@ -2758,7 +2801,7 @@ mod tests_for_tool_tests {
 
 #[cfg(test)]
 mod recall_facts_tests {
-    use super::{run_tool, GraphIndex, WriteTaint};
+    use super::{run_tool, CallGuards, GraphIndex};
     use serde_json::json;
 
     #[test]
@@ -2780,7 +2823,7 @@ mod recall_facts_tests {
             200,
             Some("claude"),
             None,
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("run_tool");
         assert!(out.contains("## Project facts"), "{out}");
@@ -2810,7 +2853,7 @@ mod recall_facts_tests {
             200,
             Some("claude"),
             None,
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("run_tool");
         assert!(!out.contains("## Project facts"), "{out}");
@@ -2824,7 +2867,7 @@ mod recall_facts_tests {
 /// most-recent-session-for-this-agent behavior when they get none.
 #[cfg(test)]
 mod session_scope_tests {
-    use super::{run_tool, GraphIndex, WriteTaint};
+    use super::{run_tool, CallGuards, GraphIndex, WriteTaint};
     use serde_json::json;
 
     struct Tmp(std::path::PathBuf);
@@ -2875,7 +2918,7 @@ mod session_scope_tests {
                 200,
                 Some("claude"),
                 session,
-                WriteTaint::Clean,
+                CallGuards::clean(),
             )
             .expect("context_notes"),
         )
@@ -2894,7 +2937,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             Some("ses_a"),
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("context_note");
         assert!(ack.starts_with("Noted"), "{ack}");
@@ -2933,7 +2976,10 @@ mod session_scope_tests {
                 200,
                 Some("claude"),
                 Some("ses_a"),
-                taint,
+                CallGuards {
+                    taint,
+                    ..CallGuards::clean()
+                },
             )
             .expect("context_note")
         };
@@ -2976,7 +3022,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             Some("ses_a"),
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("context_note");
 
@@ -2989,7 +3035,7 @@ mod session_scope_tests {
                 200,
                 Some("claude"),
                 Some("ses_a"),
-                WriteTaint::Clean,
+                CallGuards::clean(),
             )
             .expect(tool);
             assert!(
@@ -3010,7 +3056,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             Some("ses_a"),
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("context_note");
         assert!(!ack.contains("UNTRUSTED-DATA"), "{ack}");
@@ -3027,7 +3073,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             Some("ses_a"),
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("recall");
         assert!(a.contains("alpha.rs"), "{a}");
@@ -3041,7 +3087,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             Some("ses_b"),
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("recall");
         assert!(b.contains("beta.rs"), "{b}");
@@ -3062,7 +3108,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             None,
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("context_note");
 
@@ -3080,7 +3126,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             None,
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("recall");
         assert!(recall.contains("beta.rs"), "{recall}");
@@ -3119,7 +3165,7 @@ mod session_scope_tests {
             200,
             Some("claude"),
             Some("ses_never_seen"),
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("recall must not error");
         assert!(!recall.contains("alpha.rs"), "{recall}");
@@ -3144,7 +3190,7 @@ mod session_scope_tests {
                 200,
                 None,
                 None,
-                WriteTaint::Clean,
+                CallGuards::clean(),
             ).expect("recall");
         assert!(out.contains("gamma.rs"), "{out}");
     }
@@ -3244,7 +3290,7 @@ mod surface_tests {
             200,
             None,
             None,
-            WriteTaint::Clean,
+            CallGuards::clean(),
         )
         .expect("hidden tool still dispatches");
         assert!(!out.starts_with("unknown graph tool"), "{out}");

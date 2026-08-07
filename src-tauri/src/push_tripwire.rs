@@ -112,7 +112,7 @@ const ALLOWED_CONTENT_HELPERS: &[AllowedSite] = &[AllowedSite {
 /// allowlist so adding an indirection means adding it here too.
 const CONTENT_HELPER_FNS: &[(&str, &str)] = &[("audit/runner.rs", "audit_push_content")];
 
-fn src_root() -> PathBuf {
+pub(crate) fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
@@ -145,7 +145,7 @@ fn fingerprint(text: &str) -> u64 {
 }
 
 /// Every `.rs` file under `src/`, as `(relative-slash-path, contents)`.
-fn source_files() -> Vec<(String, String)> {
+pub(crate) fn source_files() -> Vec<(String, String)> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -182,7 +182,7 @@ const SELF: &str = "push_tripwire.rs";
 /// block comment. Enough for this repo, where the constructor is named in doc
 /// comments (`oob/opencode.rs`, `offload/service.rs`) but never in a string
 /// literal outside [`SELF`].
-fn in_comment(text: &str, at: usize) -> bool {
+pub(crate) fn in_comment(text: &str, at: usize) -> bool {
     let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
     let before = &text[line_start..at];
     before.contains("//") || before.trim_start().starts_with('*')
@@ -200,7 +200,7 @@ fn in_comment(text: &str, at: usize) -> bool {
 /// names — and the suite still went green because the other producer matched.
 /// Every `#[cfg(test)]` item in this crate is brace-delimited (`mod`, `fn`,
 /// `impl`), so taking each attribute's item span is both exact and general.
-fn test_spans(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn test_spans(text: &str) -> Vec<(usize, usize)> {
     const ATTR: &str = "#[cfg(test)]";
     let mut spans = Vec::new();
     let mut from = 0usize;
@@ -218,19 +218,36 @@ fn test_spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-fn in_test_code(spans: &[(usize, usize)], at: usize) -> bool {
+pub(crate) fn in_test_code(spans: &[(usize, usize)], at: usize) -> bool {
     spans.iter().any(|(s, e)| at >= *s && at < *e)
 }
 
 /// The source text of a balanced-delimiter run starting at `open_idx` (the
-/// index OF the opening delimiter), including both delimiters. Ignores
-/// delimiters inside `"…"` string literals so a template containing a brace or
-/// paren cannot end the scan early.
+/// index OF the opening delimiter), including both delimiters.
+///
+/// Ignores delimiters inside `"…"` string literals **and inside `'…'` char
+/// literals**, so neither a template containing a brace nor an
+/// `assert!(!s.contains('{'))` can end the scan early. The char-literal case is
+/// not hypothetical: `offload/outbound.rs`'s own test module contains exactly
+/// that assertion, and without this the module's span came back `None`, which
+/// silently exempted nothing and made every read in it look like production
+/// code. A scanner that mis-parses is worse than one that does not exist,
+/// because the failure is a *wrong answer*, not an absent one.
+///
+/// Lifetimes (`'static`, `'a`) are distinguished from char literals by looking
+/// for the closing quote within the two positions a literal can put it.
 fn balanced(text: &str, open_idx: usize, open: char, close: char) -> Option<&str> {
     let mut depth = 0usize;
     let mut in_str = false;
     let mut escaped = false;
-    for (i, c) in text[open_idx..].char_indices() {
+    // Byte offsets (relative to `open_idx`) covered by a char literal already
+    // consumed by the look-ahead below.
+    let mut skip_until = 0usize;
+    let rest = &text[open_idx..];
+    for (i, c) in rest.char_indices() {
+        if i < skip_until {
+            continue;
+        }
         if in_str {
             if escaped {
                 escaped = false;
@@ -241,16 +258,51 @@ fn balanced(text: &str, open_idx: usize, open: char, close: char) -> Option<&str
             }
             continue;
         }
-        if c == '"' {
-            in_str = true;
-        } else if c == open {
-            depth += 1;
-        } else if c == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(&text[open_idx..open_idx + i + c.len_utf8()]);
+        match c {
+            '"' => in_str = true,
+            '\'' => {
+                if let Some(len) = char_literal_len(&rest[i..]) {
+                    skip_until = i + len;
+                }
+                // Otherwise it is a lifetime: nothing to skip, and a lifetime
+                // name can never contain a delimiter.
             }
+            _ if c == open => depth += 1,
+            _ if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[open_idx..open_idx + i + c.len_utf8()]);
+                }
+            }
+            _ => {}
         }
+    }
+    None
+}
+
+/// The byte length of the char literal starting at `s` (which begins with `'`),
+/// or `None` when `s` starts a lifetime instead.
+///
+/// Handles the three forms that appear in this tree: `'x'`, `'\n'`-style escapes
+/// and `'\''`/`'\\'`. Unicode escapes (`'\u{1b}'`) are covered by scanning to
+/// the first unescaped closing quote within a short bound — long enough for
+/// `'\u{10ffff}'`, short enough that a lifetime followed by an apostrophe
+/// elsewhere on the line cannot be mistaken for one.
+fn char_literal_len(s: &str) -> Option<usize> {
+    let bytes: Vec<(usize, char)> = s.char_indices().take(16).collect();
+    let mut i = 1; // past the opening quote
+    if bytes.get(i).map(|(_, c)| *c) == Some('\\') {
+        i += 1; // the escape marker
+    }
+    while let Some((off, c)) = bytes.get(i).copied() {
+        if c == '\'' {
+            return Some(off + 1);
+        }
+        // A newline inside what looked like a literal means it was a lifetime.
+        if c == '\n' {
+            return None;
+        }
+        i += 1;
     }
     None
 }

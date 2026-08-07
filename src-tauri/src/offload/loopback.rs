@@ -660,7 +660,7 @@ async fn handle_conn(
         }
         ("GET", "/events") => handle_events(stream, service, &req).await,
         ("GET", "/health") => write_simple(&mut stream, 200, "text/plain", b"ok").await,
-        ("GET", "/status") => handle_status(&mut stream).await,
+        ("GET", "/status") => handle_status(&mut stream, &app).await,
         _ => write_simple(&mut stream, 404, "text/plain", b"not found").await,
     }
 }
@@ -878,6 +878,16 @@ impl LatchScope {
     /// containing the separator could collide with another agent's tab.
     fn key(&self) -> (&'static str, String) {
         (self.agent, self.tab.clone())
+    }
+
+    /// V32 Phase G: this scope as the injection resolver addresses it. The two
+    /// vocabularies are deliberately the same pair (`agent`, `tab`) so a tab's
+    /// latch and a tab's override row can never key differently.
+    fn injection(&self) -> crate::settings::injection::Scope<'_> {
+        crate::settings::injection::Scope::Tab {
+            agent: self.agent,
+            tab: &self.tab,
+        }
     }
 
     /// The human-readable scope label carried by V32 `injection_flag` activity
@@ -1125,6 +1135,58 @@ struct LatchRegistry {
     tabs: Mutex<HashMap<(&'static str, String), TabLatch>>,
 }
 
+/// V32 Phase G (locked decision 16): the two feature switches one gated call
+/// resolves, snapshotted by the handler that owns the settings read.
+///
+/// They are separate because they *are* separate features and can be switched
+/// independently — and the interesting combination is the asymmetric one:
+/// latch off + quarantine on still tracks contamination (so a note written
+/// after a fetch is still held for review) while refusing nothing. The registry
+/// takes them as data rather than reading settings itself, so the whole gate
+/// stays a pure decision over one lock and one snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GatePolicy {
+    /// [`Feature::TaintLatch`](crate::settings::injection::Feature::TaintLatch)
+    /// — engagement, refusals and the latch shown in `/status`.
+    latch: bool,
+    /// [`Feature::MemoryQuarantine`](crate::settings::injection::Feature::MemoryQuarantine)
+    /// — whether a PERSISTENT-WRITE from a contaminated conversation is stored
+    /// held-for-review.
+    quarantine: bool,
+}
+
+impl GatePolicy {
+    /// Resolve both switches for one tab scope. `None` scope ⇒ the app-wide
+    /// answer, the same fail-open reading `Scope::for_tab` takes.
+    fn resolve(settings: &crate::settings::Settings, scope: Option<&LatchScope>) -> Self {
+        use crate::settings::injection::{effective, Feature, Scope};
+        let s = scope.map_or(Scope::App, LatchScope::injection);
+        GatePolicy {
+            latch: effective(Feature::TaintLatch, s, settings),
+            quarantine: effective(Feature::MemoryQuarantine, s, settings),
+        }
+    }
+
+    /// Neither control applies — nothing to decide, nothing to record.
+    fn inert(self) -> bool {
+        !self.latch && !self.quarantine
+    }
+}
+
+/// V32 Phase G: read the app's live settings from managed state.
+///
+/// Every gated loopback handler already holds an `AppHandle`; this is the one
+/// place that turns it into a `Settings`, so a handler cannot accidentally
+/// resolve the hierarchy against a different snapshot than its neighbour. The
+/// fallback is `Settings::default()` — all protection ON — because a request
+/// arriving before managed state is up must not be the moment containment
+/// silently lapses.
+fn live_settings(app: &AppHandle) -> crate::settings::Settings {
+    app.try_state::<crate::ipc::AppState>()
+        .map(|s| s.settings.current())
+        .unwrap_or_default()
+}
+
 impl LatchRegistry {
     /// Decide one call, and engage the latch when it may proceed.
     ///
@@ -1141,12 +1203,21 @@ impl LatchRegistry {
     /// turns into a quarantined write — and `Clean` for everything else. The
     /// caller must thread it into the call it is about to make; ignoring it
     /// would store an externally-influenced note as ordinary memory.
+    ///
+    /// V32 Phase G: `policy` carries the two feature switches (locked decision
+    /// 16). With both off the gate returns immediately without touching any
+    /// state — a disabled control must leave no trace, not merely no verdict,
+    /// or `/status` would keep showing latches the user turned off.
     fn gate(
         &self,
         scope: Option<&LatchScope>,
         route: LatchRoute,
         name: &str,
+        policy: GatePolicy,
     ) -> Result<WriteTaint, &'static str> {
+        if policy.inert() {
+            return Ok(WriteTaint::Clean);
+        }
         // Fail-open: no tab identity ⇒ no latch (see [`latch_scope`]).
         let Some(scope) = scope else {
             return Ok(WriteTaint::Clean);
@@ -1167,11 +1238,29 @@ impl LatchRegistry {
         // The pure function stays the single definition of the latch's own
         // semantics; the bit is layered over it here, at the only site that
         // owns per-conversation state.
-        let decision = match entry.latch.proxy_gate(class) {
+        //
+        // V32 Phase G layers the two switches over the same expression, and the
+        // order is the whole point: the latch's verdict is computed only when
+        // the latch feature is on, and the quarantine verdict only when the
+        // quarantine feature is on. So "latch off, quarantine on" still holds a
+        // note written after a fetch (contamination is tracked below regardless
+        // of the latch), and "latch on, quarantine off" refuses the same calls
+        // it always did while storing writes clean.
+        let latched = if policy.latch {
+            entry.latch.proxy_gate(class)
+        } else {
             ProxyGate::Proceed(WriteTaint::Clean)
-                if class == ToolClass::PersistentWrite && entry.contaminated =>
+        };
+        let decision = match latched {
+            ProxyGate::Proceed(WriteTaint::Clean)
+                if policy.quarantine
+                    && class == ToolClass::PersistentWrite
+                    && entry.contaminated =>
             {
                 ProxyGate::Proceed(WriteTaint::Quarantined)
+            }
+            ProxyGate::Proceed(WriteTaint::Quarantined) if !policy.quarantine => {
+                ProxyGate::Proceed(WriteTaint::Clean)
             }
             other => other,
         };
@@ -1246,10 +1335,18 @@ impl LatchRegistry {
         // user-movable and the bit is not. (A refused call never reaches this
         // point, so a hallucinated call to the blocked side cannot contaminate
         // a clean session — the same property `engage` has.)
+        //
+        // V32 Phase G: tracked whenever EITHER switch is on (an inert policy
+        // returned above), because contamination is the quarantine's input as
+        // much as the latch's — a user who keeps quarantine but drops the latch
+        // still needs "this conversation read a page" to be true.
         if class == ToolClass::External {
             entry.contaminated = true;
         }
-        if entry.latch.engage(class) {
+        // Engagement is the LATCH's own state, so it moves only while the latch
+        // feature is on: a latch shown as engaged in `/status` while the feature
+        // is off would describe a boundary that is not being enforced.
+        if policy.latch && entry.latch.engage(class) {
             info!(
                 target: "offload",
                 agent = scope.agent,
@@ -1288,7 +1385,14 @@ impl LatchRegistry {
     /// records the contamination and leaves the latch where it is — the honest
     /// reading of "this conversation has now seen external content, and its
     /// proxied external side stays closed".
-    fn beacon(&self, scope: Option<&LatchScope>, tool: &str) -> LatchView {
+    ///
+    /// V32 Phase G: gated by the same [`GatePolicy`] a proxied call resolves.
+    /// An inert policy answers with the default view and records nothing — a
+    /// beacon whose latch and quarantine are both off has nothing to report to.
+    fn beacon(&self, scope: Option<&LatchScope>, tool: &str, policy: GatePolicy) -> LatchView {
+        if policy.inert() {
+            return LatchView::default();
+        }
         let Some(scope) = scope else {
             return LatchView::default();
         };
@@ -1296,7 +1400,7 @@ impl LatchRegistry {
         let entry = tabs.entry(scope.key()).or_insert_with(TabLatch::fresh);
         entry.observe(scope.session.as_deref());
         entry.contaminated = true;
-        let moved = entry.latch.engage(ToolClass::External);
+        let moved = policy.latch && entry.latch.engage(ToolClass::External);
         let view = entry.view();
         drop(tabs);
         if moved {
@@ -1623,7 +1727,13 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // compaction carry-over/the fact distiller (and so out of auto-injection),
     // and held for explicit user promote-or-discard. That preserves the
     // legitimate research conclusion the Phase B refusal dropped.
-    let taint = match latches().gate(scope.as_ref(), LatchRoute::Native, &body.name) {
+    //
+    // V32 Phase G: both halves resolve through the three-level hierarchy at this
+    // tab's scope, from ONE settings read — so a tab with the latch overridden
+    // off still quarantines, and a tab with the master switch off does neither.
+    let settings = live_settings(app);
+    let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
+    let taint = match latches().gate(scope.as_ref(), LatchRoute::Native, &body.name, gate_policy) {
         Ok(t) => t,
         Err(refusal) => {
             let r = RunResult {
@@ -1644,7 +1754,21 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
             &body.args,
             consumer,
             session.as_deref(),
-            taint,
+            // V32 Phase G: the second resolved verdict this route carries — the
+            // memory-read tools it serves (`context_recall` / `context_notes`)
+            // are the recall envelope's delivery point, and only this frame
+            // knows the tab whose scope decides it.
+            toolclass::CallGuards {
+                taint,
+                spotlight_recall: crate::settings::injection::effective(
+                    crate::settings::injection::Feature::Spotlighting,
+                    crate::settings::injection::Scope::for_tab(
+                        crate::graph::source_for_consumer(consumer),
+                        body.tab.as_deref(),
+                    ),
+                    &settings,
+                ),
+            },
         )
         .await
     {
@@ -2821,12 +2945,24 @@ async fn handle_mcp_call(
     let agent =
         crate::graph::source_for_consumer(query_param(&req.path, "consumer").unwrap_or("claude"));
     let scope = latch_scope(app, agent, body.tab.as_deref());
+    // V32 Phase G: ONE settings read for the whole call, so the latch, the
+    // budget, the SSRF screen, detection and the envelope all resolve under the
+    // same snapshot — a mid-call settings save must not leave a result screened
+    // by one posture and wrapped by another.
+    let settings = live_settings(app);
+    let inj_scope = crate::settings::injection::Scope::for_tab(agent, body.tab.as_deref());
+    let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
     // The gate's V32 Phase C2 `WriteTaint` is discarded here, and can only ever
     // be `Clean`: this route serves proxied `<server>__<tool>` ids, every one of
     // which classifies EXTERNAL by the unknown-⇒-EXTERNAL invariant, so no
     // PERSISTENT-WRITE can arrive on it. Memory writes reach cImp through
     // `/graph_run` alone.
-    if let Err(refusal) = latches().gate(scope.as_ref(), LatchRoute::Proxied, &body.name) {
+    if let Err(refusal) = latches().gate(
+        scope.as_ref(),
+        LatchRoute::Proxied,
+        &body.name,
+        gate_policy,
+    ) {
         let r = RunResult {
             ok: false,
             text: None,
@@ -2837,9 +2973,11 @@ async fn handle_mcp_call(
     // V32 Phase C: the session's EXTERNAL budget, checked after the latch (a
     // latched-out call was never going to run, and must not consume the one
     // budget report) and before the call leaves the process.
-    if let Err(refusal) =
-        latches().budget_gate(scope.as_ref(), service.external_budget_limits(), &body.name)
-    {
+    if let Err(refusal) = latches().budget_gate(
+        scope.as_ref(),
+        crate::settings::injection::budget_limits(&settings, inj_scope),
+        &body.name,
+    ) {
         let r = RunResult {
             ok: false,
             text: None,
@@ -2861,7 +2999,12 @@ async fn handle_mcp_call(
     // they are moved into the call — the result alone cannot say which page it
     // came from, and that is the first thing a user reads off the row.
     let (flag_url, flag_host) = detection::origin_of(&body.arguments);
-    let detection_cfg = service.detection_config();
+    let detection_cfg = detection::Config::from_settings(&settings, inj_scope);
+    let spotlight_on = crate::settings::injection::effective(
+        crate::settings::injection::Feature::Spotlighting,
+        inj_scope,
+        &settings,
+    );
     let root_key = cwd
         .as_deref()
         .map(crate::activity::root_key)
@@ -2873,6 +3016,7 @@ async fn handle_mcp_call(
             body.arguments,
             cwd.as_deref(),
             &scope_label,
+            body.tab.as_deref(),
         )
         .await
     {
@@ -2900,6 +3044,7 @@ async fn handle_mcp_call(
                     url: flag_url,
                     host: flag_host,
                     cfg: detection_cfg,
+                    spotlight: spotlight_on,
                 },
             )
             .await;
@@ -2983,7 +3128,8 @@ async fn handle_latch_beacon(
         crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
     let scope = latch_scope(app, agent, body.tab.as_deref());
     let tool = body.tool.as_deref().unwrap_or("(native web tool)");
-    let view = latches().beacon(scope.as_ref(), tool);
+    let policy = GatePolicy::resolve(&live_settings(app), scope.as_ref());
+    let view = latches().beacon(scope.as_ref(), tool, policy);
     write_json(stream, 200, &serde_json::json!({ "ok": true, "latch": view })).await
 }
 
@@ -3038,13 +3184,61 @@ async fn handle_latch_override(
 ///
 /// Behind the same bearer token as every other route; it exposes no fetched
 /// content, only cImp's own identifiers and three fixed labels.
-async fn handle_status(stream: &mut TcpStream) -> AppResult<()> {
+/// V32 Phase G (locked decision 16) adds the `injection` object: the RESOLVED
+/// value of every control at every scope, and which of the three levels decided
+/// it. With three levels, "why is this tab not latching?" has to be answerable
+/// without reading code — and `/status` is where the live-verification recipes
+/// already look.
+async fn handle_status(stream: &mut TcpStream, app: &AppHandle) -> AppResult<()> {
     write_json(
         stream,
         200,
-        &serde_json::json!({ "latches": latches().snapshot() }),
+        &serde_json::json!({
+            "latches": latches().snapshot(),
+            "injection": injection_status(&live_settings(app)),
+        }),
     )
     .await
+}
+
+/// The `/status` + `latch_status` introspection view of the enable hierarchy:
+/// the master switch, whether protection is reduced anywhere, and one row per
+/// scope naming every feature's resolved value and deciding level.
+///
+/// Scopes reported, always all of them: `app` (the app-wide controls), the
+/// `offload-worker` pseudo-scope, and every configured AI tab. Reporting a scope
+/// even when nothing is overridden there is the point — the question this
+/// answers is "what is in force", and an absent row reads as "off" to exactly
+/// the user who is trying to find out.
+pub fn injection_status(settings: &crate::settings::Settings) -> serde_json::Value {
+    use crate::settings::injection::{self as inj, Scope};
+    let mut scopes = vec![
+        serde_json::json!({
+            "scope": Scope::App.key(),
+            "label": "Application-wide",
+            "features": inj::report(settings, Scope::App),
+        }),
+        serde_json::json!({
+            "scope": Scope::OffloadWorker.key(),
+            "label": "Offload worker",
+            "features": inj::report(settings, Scope::OffloadWorker),
+        }),
+    ];
+    for t in &settings.tabs {
+        if let crate::settings::TabConfig::AiTool(c) = t {
+            let scope = Scope::tab_only(&c.id);
+            scopes.push(serde_json::json!({
+                "scope": c.id,
+                "label": c.name,
+                "features": inj::report(settings, scope),
+            }));
+        }
+    }
+    serde_json::json!({
+        "protection": inj::master_enabled(settings),
+        "reduced": inj::protection_reduced(settings),
+        "scopes": scopes,
+    })
 }
 
 /// Read one `?key=value` query parameter off a request path.
@@ -3230,6 +3424,14 @@ async fn write_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V32 Phase G: the default posture — both feature switches on. Every
+    /// pre-Phase-G latch test asserted this implicitly, so it is the value they
+    /// keep asserting; the switched-off behaviour has its own tests below.
+    const ON: GatePolicy = GatePolicy {
+        latch: true,
+        quarantine: true,
+    };
 
     #[test]
     fn find_subslice_locates_header_end() {
@@ -3859,6 +4061,102 @@ mod tests {
         }
     }
 
+    // ── V32 Phase G — the two switches over this gate ──────────────────────
+
+    /// The taint latch OFF: nothing latches, nothing is refused, and — because
+    /// an inert policy must leave no trace — `/status` does not sprout a row
+    /// showing a boundary that is not being enforced.
+    #[test]
+    fn a_disabled_latch_refuses_nothing_and_records_nothing() {
+        let off = GatePolicy {
+            latch: false,
+            quarantine: false,
+        };
+        let reg = LatchRegistry::default();
+        let s = scope("claude-off", Some("ses"));
+        // The classic fetch-then-read sequence, which under ON closes the local
+        // side after the first EXTERNAL call.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", off)
+            .is_ok());
+        for name in ["graph_snippet", "read_file", "context_note", "ddg__search"] {
+            assert!(
+                reg.gate(Some(&s), LatchRoute::Native, name, off).is_ok(),
+                "{name} must not be refused with the latch off"
+            );
+        }
+        assert!(
+            reg.snapshot().is_empty(),
+            "an inert gate must not create a latch row"
+        );
+    }
+
+    /// Memory quarantine OFF: a write from a conversation that HAS read external
+    /// content is stored clean. (The read-side exclusion is deliberately not
+    /// gated — already-held notes stay held; see the Phase G amendment.)
+    #[test]
+    fn a_disabled_quarantine_stores_a_contaminated_write_clean() {
+        let no_quarantine = GatePolicy {
+            latch: true,
+            quarantine: false,
+        };
+        let reg = LatchRegistry::default();
+        let s = scope("claude-q", Some("ses"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", no_quarantine)
+            .is_ok());
+        // The latch still engaged (that is a different feature)…
+        assert_eq!(reg.snapshot()[0].latch(), "external");
+        // …but the write is not held.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", no_quarantine),
+            Ok(WriteTaint::Clean)
+        );
+    }
+
+    /// The asymmetric combination the two switches exist to allow: latch OFF,
+    /// quarantine ON. Nothing is refused, but contamination is still tracked, so
+    /// a note written after a fetch is still held for review.
+    #[test]
+    fn quarantine_survives_a_disabled_latch_via_the_contamination_bit() {
+        let quarantine_only = GatePolicy {
+            latch: false,
+            quarantine: true,
+        };
+        let reg = LatchRegistry::default();
+        let s = scope("claude-mix", Some("ses"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", quarantine_only)
+            .is_ok());
+        // The latch itself never moved — it is off.
+        assert_eq!(reg.snapshot()[0].latch(), "open");
+        assert!(reg.snapshot()[0].view.contaminated);
+        // Local tools stay open (no latch)…
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", quarantine_only)
+            .is_ok());
+        // …and the write is held anyway.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", quarantine_only),
+            Ok(WriteTaint::Quarantined)
+        );
+    }
+
+    /// A beacon under an inert policy engages nothing and creates no row — the
+    /// sensor hook may still be installed on a tab whose latch was switched off
+    /// after spawn, and it must not resurrect the feature.
+    #[test]
+    fn a_beacon_under_an_inert_policy_is_a_no_op() {
+        let off = GatePolicy {
+            latch: false,
+            quarantine: false,
+        };
+        let reg = LatchRegistry::default();
+        let s = scope("claude-beacon-off", Some("ses"));
+        assert_eq!(reg.beacon(Some(&s), "WebFetch", off), LatchView::default());
+        assert!(reg.snapshot().is_empty());
+    }
+
     #[test]
     fn mcp_call_body_carries_the_v32_tab_field_and_tolerates_its_absence() {
         // V32 Phase B: the per-tab child now tags `/mcp/call` too, so the
@@ -3891,7 +4189,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
 
         for blocked in [
@@ -3901,7 +4199,7 @@ mod tests {
             "graph_semantic_code",
         ] {
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, blocked),
+                reg.gate(Some(&s), LatchRoute::Native, blocked, ON),
                 Err(REFUSAL_LOCAL_BLOCKED),
                 "{blocked}"
             );
@@ -3909,7 +4207,7 @@ mod tests {
         // The external side itself stays usable — the latch is exclusion, not
         // a kill switch.
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
     }
@@ -3921,12 +4219,12 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
 
         for blocked in ["ddg__search", "ddg__fetch_content", "context7__query-docs"] {
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Proxied, blocked),
+                reg.gate(Some(&s), LatchRoute::Proxied, blocked, ON),
                 Err(REFUSAL_EXTERNAL_BLOCKED),
                 "{blocked}"
             );
@@ -3934,10 +4232,10 @@ mod tests {
         // Local work continues, including the memory write (only an EXTERNAL
         // latch gates persistence).
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "context_note")
+            .gate(Some(&s), LatchRoute::Native, "context_note", ON)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
     }
@@ -3956,7 +4254,7 @@ mod tests {
             "run_check",
         ] {
             assert!(
-                reg.gate(Some(&s), LatchRoute::Native, trusted).is_ok(),
+                reg.gate(Some(&s), LatchRoute::Native, trusted, ON).is_ok(),
                 "{trusted}"
             );
         }
@@ -3969,10 +4267,10 @@ mod tests {
         ] {
             let reg = LatchRegistry::default();
             let s = scope("t", Some("s"));
-            assert!(reg.gate(Some(&s), route, first).is_ok());
+            assert!(reg.gate(Some(&s), route, first, ON).is_ok());
             for trusted in ["graph_outline", "context_recall", "context_notes"] {
                 assert!(
-                    reg.gate(Some(&s), LatchRoute::Native, trusted).is_ok(),
+                    reg.gate(Some(&s), LatchRoute::Native, trusted, ON).is_ok(),
                     "{trusted} under {first}"
                 );
             }
@@ -3987,11 +4285,11 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "somenewserver__anything")
+            .gate(Some(&s), LatchRoute::Proxied, "somenewserver__anything", ON)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
     }
@@ -4008,24 +4306,24 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         // Unlatched: clean, and the write itself does not latch.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Clean)
         );
         assert_eq!(reg.snapshot()[0].latch(), "open");
 
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         // EXTERNAL-latched: proceeds, tainted — NOT `Err(REFUSAL_WRITE_BLOCKED)`.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Quarantined)
         );
         // ...and the quarantined write still does not move the latch.
         assert_eq!(reg.snapshot()[0].latch(), "external");
         // Reads of the same store stay open — quarantine is about persistence.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_recall"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_recall", ON),
             Ok(WriteTaint::Clean)
         );
     }
@@ -4038,16 +4336,16 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Clean)
         );
         // No tab identity ⇒ no scope to latch and none to taint.
         assert_eq!(
-            reg.gate(None, LatchRoute::Native, "context_note"),
+            reg.gate(None, LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Clean)
         );
     }
@@ -4066,23 +4364,23 @@ mod tests {
         };
 
         assert!(reg
-            .gate(Some(&a), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&a), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&a), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&a), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         // Tab B is untouched, and may latch the OTHER way.
         assert!(reg
-            .gate(Some(&b), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&b), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search"),
+            reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search", ON),
             Err(REFUSAL_EXTERNAL_BLOCKED)
         );
         // Same tab STRING, different agent ⇒ its own scope.
         assert!(reg
-            .gate(Some(&opencode), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&opencode), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
 
         let rows = reg.snapshot();
@@ -4107,17 +4405,17 @@ mod tests {
         let reg = LatchRegistry::default();
         let before = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&before), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&before), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&before), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&before), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
 
         // Tab restarted: same tab id, new session.
         let after = scope("claude-1", Some("sess-b"));
         assert!(reg
-            .gate(Some(&after), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&after), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         let rows = reg.snapshot();
         assert_eq!(rows.len(), 1, "the restart reuses the tab's row: {rows:?}");
@@ -4135,24 +4433,24 @@ mod tests {
         // Latched before the registry knew any session at all.
         let unknown = scope("claude-1", None);
         assert!(reg
-            .gate(Some(&unknown), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&unknown), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
 
         // The session becomes known: same conversation, so the latch carries.
         let known = scope("claude-1", Some("sess-a"));
         assert_eq!(
-            reg.gate(Some(&known), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&known), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         assert_eq!(reg.snapshot()[0].session.as_deref(), Some("sess-a"));
 
         // The registry blinks again: still no reset.
         assert_eq!(
-            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         assert_eq!(
@@ -4176,7 +4474,7 @@ mod tests {
             (LatchRoute::Proxied, "ddg__search"),
             (LatchRoute::Native, "context_note"),
         ] {
-            assert!(reg.gate(None, route, name).is_ok(), "{name}");
+            assert!(reg.gate(None, route, name, ON).is_ok(), "{name}");
         }
         assert!(
             reg.snapshot().is_empty(),
@@ -4185,7 +4483,7 @@ mod tests {
         // And it does not leak into a tab that DOES have identity.
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
     }
 
@@ -4197,17 +4495,17 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         for _ in 0..3 {
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+                reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
                 Err(REFUSAL_LOCAL_BLOCKED)
             );
             assert_eq!(reg.snapshot()[0].latch(), "external");
         }
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
     }
@@ -4222,7 +4520,7 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         for junk in ["graph_", "graph_nosuchtool", "ddg__search", ""] {
             assert!(
-                reg.gate(Some(&s), LatchRoute::Native, junk).is_ok(),
+                reg.gate(Some(&s), LatchRoute::Native, junk, ON).is_ok(),
                 "{junk}"
             );
         }
@@ -4232,7 +4530,7 @@ mod tests {
         );
         // The real local-capability call that follows still latches normally.
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
     }
@@ -4249,7 +4547,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         let json = serde_json::to_value(reg.snapshot()).unwrap();
         let row = &json[0];
@@ -4275,7 +4573,7 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         for _ in 0..3 {
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
                 .is_ok());
             assert!(reg
                 .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
@@ -4297,7 +4595,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
         assert!(reg
             .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
@@ -4324,7 +4622,7 @@ mod tests {
         let b = scope("claude-2", Some("sess-b"));
         for _ in 0..3 {
             assert!(reg
-                .gate(Some(&a), LatchRoute::Proxied, "ddg__search")
+                .gate(Some(&a), LatchRoute::Proxied, "ddg__search", ON)
                 .is_ok());
             reg.charge(Some(&a), 1);
         }
@@ -4333,13 +4631,13 @@ mod tests {
             Err(outbound::REFUSAL_BUDGET)
         );
         // A different tab is untouched.
-        assert!(reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search").is_ok());
+        assert!(reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search", ON).is_ok());
         assert!(reg.budget_gate(Some(&b), TEST_LIMITS, "ddg__search").is_ok());
 
         // The registry withholding a session must NOT reset the budget.
         let a_silent = scope("claude-1", None);
         assert!(reg
-            .gate(Some(&a_silent), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&a_silent), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert_eq!(
             reg.budget_gate(Some(&a_silent), TEST_LIMITS, "ddg__search"),
@@ -4349,7 +4647,7 @@ mod tests {
         // A genuinely new session does.
         let a2 = scope("claude-1", Some("sess-a2"));
         assert!(reg
-            .gate(Some(&a2), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&a2), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert!(reg.budget_gate(Some(&a2), TEST_LIMITS, "ddg__search").is_ok());
     }
@@ -4364,7 +4662,7 @@ mod tests {
     fn a_native_web_beacon_engages_the_external_latch_like_a_proxied_fetch() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
-        let view = reg.beacon(Some(&s), "WebFetch");
+        let view = reg.beacon(Some(&s), "WebFetch", ON);
         assert_eq!(view.latch, "external");
         assert!(view.contaminated);
         assert!(view.can_flip_local);
@@ -4372,11 +4670,11 @@ mod tests {
         assert_eq!(reg.snapshot()[0].latch(), "external");
         // ...and the containment that follows is the ordinary Phase B one.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Quarantined)
         );
     }
@@ -4388,7 +4686,7 @@ mod tests {
     #[test]
     fn a_beacon_without_tab_identity_is_a_no_op_and_an_unknown_tab_is_created() {
         let reg = LatchRegistry::default();
-        let view = reg.beacon(None, "WebSearch");
+        let view = reg.beacon(None, "WebSearch", ON);
         assert_eq!(view, LatchView::default());
         assert!(
             reg.snapshot().is_empty(),
@@ -4396,7 +4694,7 @@ mod tests {
         );
         // First contact for this tab is the beacon itself.
         let fresh = scope("claude-9", Some("sess-z"));
-        assert_eq!(reg.beacon(Some(&fresh), "WebFetch").latch, "external");
+        assert_eq!(reg.beacon(Some(&fresh), "WebFetch", ON).latch, "external");
         let rows = reg.snapshot();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tab, "claude-9");
@@ -4412,15 +4710,15 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
-        let view = reg.beacon(Some(&s), "WebFetch");
+        let view = reg.beacon(Some(&s), "WebFetch", ON);
         assert_eq!(view.latch, "local", "sticky: a beacon never flips a latch");
         assert!(view.contaminated);
         // The contamination is what bites: the memory write is quarantined even
         // though the latch says `local`.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Quarantined)
         );
     }
@@ -4435,7 +4733,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_outline")
+            .gate(Some(&s), LatchRoute::Native, "graph_outline", ON)
             .is_ok());
         assert!(reg
             .apply_override(&s, LatchOverride::FlipLocal)
@@ -4447,7 +4745,7 @@ mod tests {
         // Local: flip is refused (it is already there), unlatch works.
         let reg = LatchRegistry::default();
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         assert!(reg.apply_override(&s, LatchOverride::FlipLocal).is_err());
         let out = reg
@@ -4459,7 +4757,7 @@ mod tests {
         // External: the flip is the workflow button.
         let reg = LatchRegistry::default();
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
         let out = reg
             .apply_override(&s, LatchOverride::FlipLocal)
@@ -4485,19 +4783,19 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet"),
+            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         reg.apply_override(&s, LatchOverride::FlipLocal)
             .expect("flip");
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet")
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search"),
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
             Err(REFUSAL_EXTERNAL_BLOCKED)
         );
     }
@@ -4513,14 +4811,14 @@ mod tests {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
                 .is_ok());
             let out = reg.apply_override(&s, action).expect("override applies");
             assert!(out.view.contaminated, "{action:?}");
             // The latch moved; the quarantine did not.
             assert_ne!(out.view.latch, "external", "{action:?}");
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+                reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
                 Ok(WriteTaint::Quarantined),
                 "{action:?}: a post-override write must still be quarantined"
             );
@@ -4529,7 +4827,7 @@ mod tests {
             // Tab restart ⇒ new session ⇒ clean scope, and only then.
             let after = scope("claude-1", Some("sess-b"));
             assert_eq!(
-                reg.gate(Some(&after), LatchRoute::Native, "context_note"),
+                reg.gate(Some(&after), LatchRoute::Native, "context_note", ON),
                 Ok(WriteTaint::Clean),
                 "{action:?}"
             );
@@ -4547,17 +4845,17 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
             .is_ok());
         reg.apply_override(&s, LatchOverride::Unlatch)
             .expect("unlatch");
         // Both sides answer again... (the local call re-latches Local, so probe
         // the external side first).
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Quarantined),
             "unlatching must not un-contaminate the conversation"
         );
@@ -4589,7 +4887,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search")
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
             .is_ok());
         assert_eq!(
             serde_json::to_value(reg.snapshot()).unwrap(),
@@ -4628,18 +4926,18 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         for name in ["graph_snippet", "graph_outline", "context_recall"] {
-            assert!(reg.gate(Some(&s), LatchRoute::Native, name).is_ok(), "{name}");
+            assert!(reg.gate(Some(&s), LatchRoute::Native, name, ON).is_ok(), "{name}");
         }
         assert!(!reg.snapshot()[0].view.contaminated);
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note"),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
             Ok(WriteTaint::Clean)
         );
         // A REFUSED external call must not contaminate either — otherwise a
         // hallucinated (or injected) call to the blocked side could quarantine
         // a clean session's memory writes.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search"),
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
             Err(REFUSAL_EXTERNAL_BLOCKED)
         );
         assert!(!reg.snapshot()[0].view.contaminated);

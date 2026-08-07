@@ -533,7 +533,12 @@ impl OffloadSupervisor {
         instructions: String,
         thinking: super::agent::ThinkingMode,
     ) -> AppResult<String> {
-        let snap = self.settings.current().offload;
+        // V32 Phase G: the whole snapshot is kept (not just its `offload` half)
+        // because the injection resolver reads across it — the per-tab L3 rows
+        // live on `tabs`, and one settings read must answer every question this
+        // run asks.
+        let settings = self.settings.current();
+        let snap = settings.offload.clone();
         let server = {
             let guard = self.running.lock().await;
             guard
@@ -576,10 +581,24 @@ impl OffloadSupervisor {
             // no EXTERNAL tool is reachable and the budget is inert — filled
             // from settings anyway so the paths cannot drift.
             task_scope: super::outbound::new_task_scope(),
-            external_budget: super::outbound::BudgetLimits {
-                max_calls: snap.external_fetch_max_calls,
-                max_bytes: snap.external_fetch_max_bytes,
-            },
+            // V32 Phase G: resolved at the `offload-worker` pseudo-scope like
+            // every other worker-side control, even though this router reaches
+            // no EXTERNAL tool — the self-test must not become the one path
+            // whose posture is hardcoded.
+            external_budget: crate::settings::injection::budget_limits(
+                &settings,
+                crate::settings::injection::Scope::OffloadWorker,
+            ),
+            latch_active: crate::settings::injection::effective(
+                crate::settings::injection::Feature::TaintLatch,
+                crate::settings::injection::Scope::OffloadWorker,
+                &settings,
+            ),
+            canary_active: crate::settings::injection::effective(
+                crate::settings::injection::Feature::Canary,
+                crate::settings::injection::Scope::OffloadWorker,
+                &settings,
+            ),
         };
         let task = super::agent::OffloadTask {
             instructions,

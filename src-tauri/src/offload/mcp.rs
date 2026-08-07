@@ -1606,7 +1606,12 @@ async fn run_offload(
     profile: Option<Profile>,
 ) -> Result<String, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let settings = current_offload_settings();
+    // V32 Phase G: the WHOLE layered snapshot, not just its offload block — the
+    // injection resolver reads across it (per-tab L3 rows live on `tabs`), and
+    // this fallback path must resolve the same three-level hierarchy the app
+    // process does rather than quietly running unswitched.
+    let full = crate::settings::load_readonly(&cwd);
+    let settings = full.offload.clone();
 
     if !settings.enabled {
         return Err("offload is disabled — enable it in cImp settings".into());
@@ -1699,6 +1704,7 @@ async fn run_offload(
     let result = run_on_backend(
         &client,
         &settings,
+        &full,
         &cwd,
         &resolved[chosen],
         &views[chosen],
@@ -1729,6 +1735,7 @@ async fn run_offload(
                     let r = run_on_backend(
                         &client,
                         &settings,
+                        &full,
                         &cwd,
                         &resolved[next],
                         &views[next],
@@ -1768,6 +1775,7 @@ async fn run_offload(
             let esc = run_on_backend(
                 &client,
                 &settings,
+                &full,
                 &cwd,
                 &resolved[q],
                 &views[q],
@@ -1792,6 +1800,11 @@ async fn run_offload(
 async fn run_on_backend(
     client: &reqwest::Client,
     settings: &OffloadSettings,
+    // V32 Phase G: the full settings snapshot `settings` was taken from, for
+    // the injection resolver (which reads across blocks). Passed beside the
+    // offload half rather than replacing it so the existing `settings.…` reads
+    // in this function stay as they were.
+    all: &crate::settings::Settings,
     cwd: &std::path::Path,
     backend: &ResolvedBackend,
     view: &BackendView,
@@ -1828,10 +1841,22 @@ async fn run_on_backend(
         // hardcoded value, so the two paths can never disagree if this one ever
         // grows a host.
         task_scope: crate::offload::outbound::new_task_scope(),
-        external_budget: crate::offload::outbound::BudgetLimits {
-            max_calls: settings.external_fetch_max_calls,
-            max_bytes: settings.external_fetch_max_bytes,
-        },
+        // V32 Phase G: resolved at the `offload-worker` pseudo-scope, like the
+        // in-app path, so the master switch reaches this fallback too.
+        external_budget: crate::settings::injection::budget_limits(
+            all,
+            crate::settings::injection::Scope::OffloadWorker,
+        ),
+        latch_active: crate::settings::injection::effective(
+            crate::settings::injection::Feature::TaintLatch,
+            crate::settings::injection::Scope::OffloadWorker,
+            all,
+        ),
+        canary_active: crate::settings::injection::effective(
+            crate::settings::injection::Feature::Canary,
+            crate::settings::injection::Scope::OffloadWorker,
+            all,
+        ),
     };
     let task = OffloadTask {
         instructions: instructions.to_string(),

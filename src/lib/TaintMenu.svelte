@@ -20,13 +20,25 @@
   //
   // Positioning / dismissal mirror TabContextMenu: fixed at the click coords,
   // clamped into the viewport, dismissed by Escape or a mousedown outside.
+  //
+  // V32 Phase G adds a fourth thing, above the actions: which injection
+  // controls are switched OFF for this tab, and which of the three levels
+  // decided each. That is the "why is this tab not latching?" question locked
+  // decision 16 requires answerable without reading code — and the badge is
+  // where a user looks first, long before Settings.
   import { onMount } from 'svelte';
-  import { applyLatchOverride, type LatchAction, type LatchRow } from './latch';
+  import {
+    applyLatchOverride,
+    type FeatureState,
+    type LatchAction,
+    type LatchRow,
+  } from './latch';
 
   let {
     x,
     y,
     row,
+    reduced = [],
     onDismiss,
     onApplied,
   }: {
@@ -37,6 +49,10 @@
     /// publishes it as `can_flip_local` / `can_unlatch`; re-deriving it here
     /// from the label would put the state machine in two places).
     row: LatchRow;
+    /// V32 Phase G: this tab's injection controls that resolve OFF, each
+    /// carrying the level that decided it. Empty on a fully protected tab, in
+    /// which case the section renders nothing at all.
+    reduced?: FeatureState[];
     onDismiss: () => void;
     /// Fired after a successful override so the caller can refresh its
     /// snapshot without waiting for the next poll tick.
@@ -73,6 +89,20 @@
         ? 'Local file / source-text tools in use — web and other external tools are closed.'
         : 'Not latched.',
   );
+
+  /// Which level switched a control off, in the user's words. This is the
+  /// whole point of the backend publishing `decided_by`: "off" alone sends the
+  /// user hunting through three levels of Settings for the one that did it.
+  function whyOff(f: FeatureState): string {
+    switch (f.decided_by) {
+      case 'global':
+        return 'the global master switch is off';
+      case 'scope':
+        return 'this tab overrides it off';
+      default:
+        return 'switched off app-wide';
+    }
+  }
 
   async function run(action: LatchAction): Promise<void> {
     if (busy) return;
@@ -131,6 +161,20 @@
       This conversation has read external content. Memory writes stay
       quarantined and external results stay wrapped — whatever the latch says.
     </div>
+  {/if}
+
+  {#if reduced.length > 0}
+    <div class="separator"></div>
+    <div class="state warn">Injection protection is reduced for this tab:</div>
+    <ul class="reduced">
+      {#each reduced as f (f.feature)}
+        <li>
+          {f.label} — off
+          <span class="why">({whyOff(f)})</span>
+        </li>
+      {/each}
+    </ul>
+    <div class="state">Change it in Settings → Tools → Injection protection.</div>
   {/if}
 
   <div class="separator"></div>
@@ -206,6 +250,16 @@
   }
   .warn {
     color: var(--awaiting);
+  }
+  .reduced {
+    margin: 0;
+    padding: 0 var(--space-3) 6px calc(var(--space-3) + 14px);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    line-height: 1.4;
+  }
+  .why {
+    color: var(--text-tertiary);
   }
   .err {
     color: var(--text-danger-soft);

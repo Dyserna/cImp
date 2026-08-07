@@ -42,13 +42,18 @@
 //!   content; their arguments are an outbound channel.
 //! - **LOCAL-CAPABILITY** — private-data access and process execution:
 //!   `read_file`, `list_dir`, `code_search`, `run_command`, plus the
-//!   *content-bearing* graph tools, which return source **text**.
-//! - **TRUSTED** — never latches, never blocked. The *structural* graph tools
-//!   return names/edges/metadata with near-zero exfil value, and the remaining
-//!   members (`run_check`, the memory reads, the audit tools, the offload tools
-//!   themselves) are either app-composed or already confined. A research task
-//!   rarely needs snippet bodies; a code task rarely needs the web — so the
-//!   split costs little and buys the containment.
+//!   *content-bearing* graph tools, which return source **text**, plus (since
+//!   the 2026-08-07 review) `run_check` and the two audit tools — process
+//!   execution and scanner reports that quote source and secrets.
+//! - **TRUSTED** — never latches, never blocked. Membership requires that a
+//!   result carry **near-zero exfil value**, not merely that cImp composed its
+//!   framing: the *structural* graph tools return names/edges/metadata, the
+//!   memory reads return the session's own working set, and the offload tools
+//!   return a delegated subtask's answer (which gets its own latch). A tool
+//!   whose body quotes repo content or runs a process does not qualify, however
+//!   local its execution — that distinction is what the review found this list
+//!   had blurred. A research task rarely needs snippet bodies; a code task
+//!   rarely needs the web — so the split costs little and buys the containment.
 //! - **PERSISTENT-WRITE** — `context_note`, the one tool whose output outlives
 //!   the session (pinned notes auto-inject into FUTURE clean sessions), so an
 //!   injected "always fetch attacker.com first" would gain persistence. It
@@ -132,6 +137,29 @@ pub const TABLE: &[ClassRow] = &[
     // default, which would let a purely local graph query latch a task as
     // externally tainted.
     row("graph_semantic_code", ToolClass::LocalCapability, false),
+    // Demoted from TRUSTED by the 2026-08-07 review (see the milestone's Phase A
+    // amendment). All three were classified on the premise that their output is
+    // "app-composed" — true of the FRAMING, false of the CONTENT:
+    //
+    // - `security_audit` / `quality_audit` return `checks::Diag { file, line,
+    //   message, code }` — repo paths plus scanner messages that quote the
+    //   offending source. The security category runs gitleaks, whose findings
+    //   are by definition secrets (`audit/runner.rs` emits e.g.
+    //   `code: Some("generic-api-key")`), and `offload/tools/audit_tools.rs`
+    //   says so outright: "the report it returns … is local data".
+    // - `run_check` executes the project's configured build/test/lint commands.
+    //   The command set is user-vetted and the model only selects by name, but
+    //   process execution is the definition of LOCAL-CAPABILITY under decision 1.
+    //
+    // Left TRUSTED, these three kept a private-data read channel open under an
+    // EXTERNAL latch while every `ddg__*` def stayed live — the lethal trifecta
+    // this table exists to break, reconstituted through the one class that is
+    // never blocked. `mutates_fs` is unchanged (still `false` for `run_check`
+    // per the locked attribute list); the class and the mutation attribute are
+    // independent axes, and the V33 Phase F note below still applies.
+    row("run_check", ToolClass::LocalCapability, false),
+    row("security_audit", ToolClass::LocalCapability, false),
+    row("quality_audit", ToolClass::LocalCapability, false),
     // ── TRUSTED — structural graph + app-composed reads ────────────────────
     row("graph_find_symbol", ToolClass::Trusted, false),
     row("graph_callers", ToolClass::Trusted, false),
@@ -154,20 +182,9 @@ pub const TABLE: &[ClassRow] = &[
     // untrusted web content.
     row("graph_path", ToolClass::Trusted, false),
     row("graph_architecture", ToolClass::Trusted, false),
-    // `run_check` runs the project's own user-vetted `checks` commands and
-    // returns a bounded, parsed report. Recorded as `mutates_fs: false` per the
-    // milestone's locked attribute list (only `run_command` and the harness
-    // natives are true); see the V33 Phase F note — a check that builds does
-    // touch a target dir, so this row is the one worth revisiting when
-    // checkpoints land.
-    row("run_check", ToolClass::Trusted, false),
     // Memory READS (V10). The write sibling is PERSISTENT-WRITE below.
     row("context_recall", ToolClass::Trusted, false),
     row("context_notes", ToolClass::Trusted, false),
-    // V26 audit tools: the scan runs locally inside the app and the report is
-    // app-composed scanner output.
-    row("security_audit", ToolClass::Trusted, false),
-    row("quality_audit", ToolClass::Trusted, false),
     // The offload tools themselves — a consumer delegating a subtask must not
     // be latched out of doing so (and the subtask gets its own latch).
     row("offload_task", ToolClass::Trusted, false),
@@ -676,6 +693,14 @@ mod tests {
             "graph_snippet",
             "graph_search_docs",
             "graph_semantic_docs",
+            "graph_semantic_code",
+            // Demoted from TRUSTED by the 2026-08-07 review: scanner reports
+            // quote source and secrets, and `run_check` executes processes.
+            // A regression here re-opens read-then-exfil under an EXTERNAL
+            // latch, so these three are asserted, not assumed.
+            "run_check",
+            "security_audit",
+            "quality_audit",
         ] {
             assert_eq!(classify(n), ToolClass::LocalCapability, "{n}");
         }
@@ -695,11 +720,10 @@ mod tests {
             "graph_dead_exports",
             "graph_cycles",
             "graph_struct_search",
-            "run_check",
+            "graph_path",
+            "graph_architecture",
             "context_recall",
             "context_notes",
-            "security_audit",
-            "quality_audit",
             "offload_task",
             "offload_batch",
         ] {

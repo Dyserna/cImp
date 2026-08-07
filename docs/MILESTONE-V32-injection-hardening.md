@@ -50,8 +50,8 @@ by the worker loop, the loopback proxy, and tests.
 | Class | Members | Latch behavior |
 |---|---|---|
 | **EXTERNAL** | everything proxied from configured MCP servers: `ddg_*`, `context7_*`, and **any unknown/future server by default** | first call latches the task/session: LOCAL-CAPABILITY becomes unavailable |
-| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code` | first call latches the other way: EXTERNAL becomes unavailable |
-| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `run_check`, `context_recall`/`context_notes` (reads), `security_audit`/`quality_audit`, `offload_task`/`offload_batch` themselves | never latches, never blocked |
+| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, plus `run_check` and `security_audit`/`quality_audit` (see the 2026-08-07 amendment below) | first call latches the other way: EXTERNAL becomes unavailable |
+| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `context_recall`/`context_notes` (reads), `offload_task`/`offload_batch` themselves | never latches, never blocked |
 | **PERSISTENT-WRITE** | `context_note` (the one tool whose output outlives the session) | never latches; **write-gated while EXTERNAL-latched** (decision 10) |
 
 Rationale for the graph split: structural tools return names/edges/metadata
@@ -62,6 +62,33 @@ rarely needs snippet *bodies*; a code task rarely needs the web.
 `graph_semantic_code` were shipped but missing from the original table; they
 were classified by this same rationale — first two structural ⇒ TRUSTED,
 the code-body search content-bearing ⇒ LOCAL-CAPABILITY.)
+
+**Phase A amendment 2026-08-07 (code review, user-decided): `run_check`,
+`security_audit` and `quality_audit` are DEMOTED from TRUSTED to
+LOCAL-CAPABILITY.** All three were admitted to TRUSTED on the premise that their
+output is "app-composed" — true of the framing, false of the content:
+- `security_audit`/`quality_audit` return `checks::Diag { file, line, message,
+  code }`, i.e. repo paths plus scanner messages that quote the offending
+  source. The security category runs **gitleaks**, whose findings are by
+  definition secrets; `offload/tools/audit_tools.rs` already said so ("the
+  report it returns … is local data").
+- `run_check` executes the project's configured build/test/lint commands.
+  User-vetted and name-selected, but process execution is what decision 1 puts
+  in LOCAL-CAPABILITY.
+
+Left TRUSTED, these three kept a private-data channel open under an EXTERNAL
+latch while every `ddg__*` def stayed live — the lethal trifecta this table
+exists to break, reconstituted through the one class that is never blocked, on
+a default install (`code_audit.expose_offload` defaults true). The membership
+rule is therefore restated: TRUSTED requires **near-zero exfil value in the
+result**, not merely that cImp composed the wrapper.
+
+Consequence, accepted: a research-profile task can no longer run a check or an
+audit, and a task that runs one first is latched LOCAL and loses the web. That
+is the intended shape of the split, and both tools remain fully available to
+unlatched tasks and to the local/code profile. `mutates_fs` is unchanged —
+class and mutation capability are independent axes, and the V33 Phase F note on
+`run_check` still stands.
 
 **Invariant (cross-module): unknown = EXTERNAL.** A newly configured MCP
 server must never default into TRUSTED or LOCAL-CAPABILITY. Reclassification

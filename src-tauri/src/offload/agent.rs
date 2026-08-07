@@ -3432,7 +3432,9 @@ mod tests {
             "code_search",
             "graph_snippet",
             "graph_outline",
+            "graph_repo_map",
             "run_check",
+            "security_audit",
             "context_note",
             "ddg__search",
             "ddg__fetch_content",
@@ -3485,14 +3487,30 @@ mod tests {
         // Def removal (decision 2): the NEXT request no longer advertises the
         // local-capability class at all — nor the persistent memory write.
         let after = advertised_names(&all, latch);
-        for gone in ["read_file", "code_search", "graph_snippet", "context_note"] {
+        // `run_check`/`security_audit` are in this list because the 2026-08-07
+        // review demoted them out of TRUSTED: a scanner report quotes source and
+        // secrets, and a check runs processes, so both must vanish alongside
+        // `read_file` rather than staying live next to `ddg__*`.
+        for gone in [
+            "read_file",
+            "code_search",
+            "graph_snippet",
+            "run_check",
+            "security_audit",
+            "context_note",
+        ] {
             assert!(
                 !after.contains(&gone.to_string()),
                 "`{gone}` must be absent from the advertised list under an EXTERNAL latch: {after:?}"
             );
         }
         // The external side and TRUSTED survive.
-        for kept in ["ddg__search", "ddg__fetch_content", "graph_outline", "run_check"] {
+        for kept in [
+            "ddg__search",
+            "ddg__fetch_content",
+            "graph_outline",
+            "graph_repo_map",
+        ] {
             assert!(after.contains(&kept.to_string()), "`{kept}` missing: {after:?}");
         }
 
@@ -3544,16 +3562,16 @@ mod tests {
         // graph query must not cost the task either capability.
         let mut latch = Latch::default();
         assert!(latch_gate(&mut latch, "graph_outline").is_ok());
-        assert!(latch_gate(&mut latch, "run_check").is_ok());
+        assert!(latch_gate(&mut latch, "graph_repo_map").is_ok());
         assert_eq!(latch, Latch::Open);
 
         for latched in [Latch::External, Latch::Local] {
             let mut l = latched;
             assert!(latch_gate(&mut l, "graph_outline").is_ok());
-            assert!(latch_gate(&mut l, "run_check").is_ok());
+            assert!(latch_gate(&mut l, "graph_repo_map").is_ok());
             assert_eq!(l, latched, "a TRUSTED call must not move the latch");
             let names = advertised_names(&all, latched);
-            for kept in ["graph_outline", "run_check"] {
+            for kept in ["graph_outline", "graph_repo_map"] {
                 assert!(
                     names.contains(&kept.to_string()),
                     "TRUSTED `{kept}` missing under {latched:?}: {names:?}"

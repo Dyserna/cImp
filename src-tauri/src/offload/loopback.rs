@@ -4377,7 +4377,7 @@ mod tests {
             "graph_outline",
             "graph_repo_map",
             "context_recall",
-            "run_check",
+            "context_notes",
         ] {
             assert!(
                 reg.gate(Some(&s), LatchRoute::Native, trusted, ON).is_ok(),

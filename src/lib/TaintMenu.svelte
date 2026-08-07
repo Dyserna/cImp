@@ -94,6 +94,11 @@
   /// whole point of the backend publishing `decided_by`: "off" alone sends the
   /// user hunting through three levels of Settings for the one that did it.
   function whyOff(f: FeatureState): string {
+    // A row that carries its own reason is not a setting anyone flipped — see
+    // `latch.ts`'s `withSignatureHealth` (#48, D-2). The three `decided_by`
+    // levels answer "who decided this switch", which is the wrong question for
+    // a fact about data on disk.
+    if (f.reason) return f.reason;
     switch (f.decided_by) {
       case 'global':
         return 'the global master switch is off';

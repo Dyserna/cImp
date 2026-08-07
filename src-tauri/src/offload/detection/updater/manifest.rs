@@ -67,15 +67,60 @@
 //!
 //! **Every artifact URL must live under the manifest's own directory.** The
 //! manifest is fetched from a pinned URL ([`DEFAULT_MANIFEST_URL`]); an asset
-//! URL is accepted only if it starts with that URL minus its last path segment
-//! ([`asset_prefix`]). So a manifest served from the `detection-v1` release can
-//! only ever name assets on the `detection-v1` release. This is what makes the
-//! curated channel actually curated: whoever can rewrite the manifest still
-//! cannot redirect the download to a host of their choosing.
+//! URL is accepted only if it resolves, *after normalization*, under that URL
+//! minus its last path segment ([`AssetAnchor`]). So a manifest served from the
+//! `detection-v1` release can only ever name assets on the `detection-v1`
+//! release. This is what makes the curated channel actually curated: whoever
+//! can rewrite the manifest still cannot redirect the download to a host — or a
+//! path — of their choosing.
 //!
 //! It also composes with the settings override: pointing
 //! `detection_update_manifest_url` at a local test bundle relocates the assets
 //! with it, with no special case and no way to mix origins.
+//!
+//! ## Why this is a URL comparison and not a string comparison (#48, U-1)
+//!
+//! As first built the check was `url.starts_with(prefix)` on the raw manifest
+//! text, and `reqwest` then handed the string to the WHATWG parser, which
+//! resolves dot segments **after** the check has passed. Every one of these
+//! passed a `starts_with` against the `detection-v1` prefix and fetched an
+//! arbitrary same-host path:
+//!
+//! ```text
+//! …/detection-v1/../../../../../attacker/repo/releases/download/v1/x.yar
+//! …/detection-v1/%2e%2e/%2e%2e/…/attacker/x.yar     (%2e%2e IS a dot segment)
+//! …/detection-v1/..\..\..\..\..\attacker\x.yar      (\ IS a separator here)
+//! ```
+//!
+//! Popping past the root clamps rather than erroring, so an attacker does not
+//! even have to count segments. On `github.com` an arbitrary path is any
+//! GitHub user's published release assets — and a bundle of one rule that
+//! matches exactly the shipped hostile controls and nothing else passes the
+//! whole validation gauntlet, silently reducing the signature layer to a
+//! corpus echo. That is the silent degradation locked decision 13 forbids,
+//! reached with no card raised anywhere.
+//!
+//! So both sides are **parsed** and compared structurally: scheme, [`url::Host`]
+//! (not `host_str`, so an IDN or IP literal cannot spell the same host two
+//! ways), `port_or_known_default`, an empty username and password, and a prefix
+//! compare of the parser's already-normalized paths. An artifact URL carrying a
+//! query or a fragment is refused outright — a release asset has neither, and
+//! accepting one would be a channel out of a URL that is otherwise fully
+//! determined by the manifest's own location.
+//!
+//! ## Plaintext is loopback-only
+//!
+//! `http` is accepted **only** for a loopback host (`127.0.0.0/8`, `::1`,
+//! `localhost`), which is exactly what the local-bundle live-verification
+//! recipe needs and nothing more. It used to be accepted for any host, which
+//! made `detection_update_manifest_url` a whole-channel downgrade: the manifest
+//! is the document the SHA-256s that gate every artifact come from, so carrying
+//! it in plaintext hands the entire supply chain to anyone on the path.
+//!
+//! Redirects are refused for the same reason ([`HttpFetcher::client`] sets
+//! [`reqwest::redirect::Policy::none`]): a parsed-prefix comparison on the
+//! *requested* URL is worth nothing if the response may point somewhere else,
+//! and reqwest's default is to follow up to ten of them to any host.
 
 use std::collections::BTreeMap;
 
@@ -243,7 +288,7 @@ impl Manifest {
                 raw.schema
             ));
         }
-        let prefix = asset_prefix(manifest_url)?;
+        let anchor = AssetAnchor::parse(manifest_url)?;
         let mut components: BTreeMap<Component, ComponentEntry> = BTreeMap::new();
         for rc in raw.components {
             // Unknown component: the one forward-compatible skip. A newer
@@ -277,7 +322,7 @@ impl Manifest {
             let mut files = Vec::with_capacity(rc.files.len());
             let mut seen: Vec<String> = Vec::new();
             for rf in rc.files {
-                let entry = parse_file(&rc.component, rf, component, &prefix)?;
+                let entry = parse_file(&rc.component, rf, component, &anchor)?;
                 if seen.contains(&entry.name) {
                     return Err(format!(
                         "component `{}` lists `{}` twice",
@@ -342,7 +387,7 @@ fn parse_file(
     label: &str,
     rf: RawFile,
     component: Component,
-    prefix: &str,
+    anchor: &AssetAnchor,
 ) -> Result<FileEntry, String> {
     // NOT trimmed: `is_safe_name` rejects trailing spaces and dots precisely
     // because the Win32 path layer strips them, so `evil.yar ` would land on
@@ -382,7 +427,12 @@ fn parse_file(
         ));
     }
     let url = rf.url.trim().to_string();
-    if !url.starts_with(prefix) {
+    // Parsed on both sides, never `starts_with` (#48, U-1): the fetch layer
+    // normalizes `..`, `%2e%2e` and `\` *after* a string check would have
+    // passed, so a raw prefix compare contains the host and leaves the path
+    // wide open. See the module header.
+    if !anchor.accepts(&url) {
+        let prefix = anchor.as_str();
         return Err(format!(
             "component `{label}` file `{name}` points outside the manifest's own directory \
              (`{url}` is not under `{prefix}`) — artifacts may only come from the same curated \
@@ -397,28 +447,129 @@ fn parse_file(
     })
 }
 
-/// The directory portion of `manifest_url`, which every artifact URL must start
-/// with. Requires an `https` (or, for a local test server, `http`) URL with a
-/// path — a bare origin has no directory to anchor to.
-pub fn asset_prefix(manifest_url: &str) -> Result<String, String> {
-    let scheme_end = manifest_url
-        .find("://")
-        .ok_or_else(|| format!("manifest URL `{manifest_url}` has no scheme"))?;
-    let scheme = &manifest_url[..scheme_end];
-    if scheme != "https" && scheme != "http" {
-        return Err(format!(
-            "manifest URL scheme `{scheme}` is not supported (expected https)"
-        ));
+/// The manifest's own directory, parsed — the origin every artifact URL must
+/// resolve under.
+///
+/// Constructing one is the second parse boundary in this module (the first is
+/// [`Manifest::parse`] itself): a value of this type is a *validated* anchor —
+/// a supported scheme, a host plaintext is allowed against, and a path with a
+/// directory to hang assets off. [`AssetAnchor::accepts`] is then the only
+/// containment check anyone performs, so there is no second, weaker copy of the
+/// rule anywhere.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetAnchor {
+    /// The normalized directory URL, rendered — what the rejection message
+    /// quotes back to the curator, and what [`asset_prefix`] returns.
+    display: String,
+    /// The same value as a parsed URL whose path is the directory (always
+    /// ending in `/`), with query and fragment dropped.
+    base: url::Url,
+}
+
+impl AssetAnchor {
+    /// Parse `manifest_url` and reduce it to its directory.
+    ///
+    /// Requires `https` — or `http` **only against a loopback host**, which is
+    /// what live-verification recipe 11's local bundle server needs and the
+    /// only case where a plaintext manifest cannot be tampered with in transit.
+    /// A bare origin is refused: it has no directory to anchor to, so "under
+    /// the manifest's own directory" would mean "anywhere on the host".
+    pub fn parse(manifest_url: &str) -> Result<Self, String> {
+        let parsed = url::Url::parse(manifest_url.trim())
+            .map_err(|_| format!("manifest URL `{manifest_url}` has no scheme"))?;
+        let scheme = parsed.scheme();
+        if scheme != "https" && scheme != "http" {
+            return Err(format!(
+                "manifest URL scheme `{scheme}` is not supported (expected https)"
+            ));
+        }
+        if scheme == "http" && !is_loopback_host(parsed.host()) {
+            return Err(format!(
+                "manifest URL `{manifest_url}` is plaintext http against a non-loopback host — \
+                 http is accepted only for a local test server (127.0.0.0/8, ::1, localhost). \
+                 The SHA-256 of every artifact comes from this document, so serving it in \
+                 plaintext hands the whole update channel to anyone on the path"
+            ));
+        }
+        // The directory: everything up to and including the last `/` of the
+        // parser's already-normalized path. A path of `/` (a bare origin) has
+        // no directory and is refused rather than anchoring assets to the
+        // entire host.
+        let path = parsed.path();
+        let cut = path.rfind('/').filter(|i| *i > 0).ok_or_else(|| {
+            format!("manifest URL `{manifest_url}` has no path to anchor assets to")
+        })?;
+        let mut base = parsed.clone();
+        base.set_path(&path[..=cut]);
+        base.set_query(None);
+        base.set_fragment(None);
+        // Credentials in the anchor would make "the same origin" depend on who
+        // is asking. `set_username`/`set_password` return `Err` only for a
+        // cannot-be-a-base URL, which `http`/`https` never is.
+        let _ = base.set_username("");
+        let _ = base.set_password(None);
+        Ok(Self {
+            display: base.to_string(),
+            base,
+        })
     }
-    // Everything up to and including the last `/`. Searching from `scheme_end +
-    // 3` keeps the scheme's own slashes out of the answer for an origin-only
-    // URL, which then fails the "no path" check below rather than yielding
-    // `https:/` as a prefix.
-    let after_scheme = scheme_end + 3;
-    let cut = manifest_url[after_scheme..]
-        .rfind('/')
-        .ok_or_else(|| format!("manifest URL `{manifest_url}` has no path to anchor assets to"))?;
-    Ok(manifest_url[..after_scheme + cut + 1].to_string())
+
+    /// The normalized directory URL as text — the prefix the rejection message
+    /// names.
+    pub fn as_str(&self) -> &str {
+        &self.display
+    }
+
+    /// Whether `artifact_url` lives under this anchor.
+    ///
+    /// Structural, not textual (#48, U-1). Every component is compared on the
+    /// *parsed* value, which is the same value `reqwest` will resolve when it
+    /// fetches — so there is no normalization step left between the check and
+    /// the request for a `..`, a `%2e%2e` or a `\` to happen in.
+    pub fn accepts(&self, artifact_url: &str) -> bool {
+        let Ok(u) = url::Url::parse(artifact_url.trim()) else {
+            return false;
+        };
+        u.scheme() == self.base.scheme()
+            // `Host`, not `host_str`: an IP literal and an IDN each have more
+            // than one spelling, and only the parsed form compares them.
+            && u.host() == self.base.host()
+            && u.port_or_known_default() == self.base.port_or_known_default()
+            // Credentials would let one URL name two identities; a release
+            // asset has none.
+            && u.username().is_empty()
+            && u.password().is_none()
+            // A release asset has neither, and either would be a channel out of
+            // a URL the manifest's own location is supposed to determine.
+            && u.query().is_none()
+            && u.fragment().is_none()
+            && u.path().starts_with(self.base.path())
+    }
+}
+
+/// Whether `host` is a loopback address — the only place plaintext `http` is
+/// tolerated. `localhost` is matched exactly: a `localhost` *subdomain*
+/// resolves wherever its owner points it.
+fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        // The whole 127.0.0.0/8 block, not just 127.0.0.1.
+        Some(url::Host::Ipv4(a)) => a.octets()[0] == 127,
+        Some(url::Host::Ipv6(a)) => a.is_loopback(),
+        None => false,
+    }
+}
+
+/// The directory portion of `manifest_url` as text — the tests' spelling of
+/// [`AssetAnchor::as_str`].
+///
+/// Deliberately test-only. It used to be the containment check itself, and a
+/// `starts_with` against this string is exactly the defect #48 closed: leaving
+/// a public string-prefix accessor in place would be leaving the loaded gun on
+/// the table. Every caller compares through [`AssetAnchor::accepts`].
+#[cfg(test)]
+fn asset_prefix(manifest_url: &str) -> Result<String, String> {
+    AssetAnchor::parse(manifest_url).map(|a| a.display)
 }
 
 /// A bare file name: no separators, no parent traversal, no drive prefix, not a
@@ -540,6 +691,15 @@ impl HttpFetcher {
         C.get_or_init(|| {
             reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
+                // **No redirects** (#48, U-1). reqwest's default follows up to
+                // ten, to any host — which makes the asset-origin invariant
+                // decorative: every artifact URL could pass
+                // `AssetAnchor::accepts` and every response could still come
+                // from somewhere else. A curated channel that answers with a
+                // 302 has been reconfigured and should say so, so a redirect
+                // surfaces as `HTTP 302` in the outcome rather than being
+                // followed silently.
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!("cImp/", env!("CARGO_PKG_VERSION"), " detection-updater"))
                 .build()
                 .unwrap_or_else(|e| {
@@ -806,6 +966,134 @@ mod tests {
         }
     }
 
+    /// #48/U-1 — the six evasions a `starts_with` on the raw string accepted.
+    ///
+    /// Each one passed the old check and then had `reqwest`'s WHATWG parser
+    /// resolve it into an arbitrary same-host path — `github.com/<anyone>/…`,
+    /// i.e. any GitHub user's published release assets. Popping past the root
+    /// clamps rather than erroring, so the attacker does not even have to count
+    /// segments: ten `../` reaches the origin root deterministically.
+    ///
+    /// Table-driven and pinned here rather than left to the parser's behaviour
+    /// because "does the fetch layer normalize this?" is exactly the question
+    /// the old code answered wrong.
+    #[test]
+    fn dot_segment_and_encoded_traversal_cannot_escape_the_curated_directory() {
+        let anchor = AssetAnchor::parse(DEFAULT_MANIFEST_URL).expect("the pinned URL anchors");
+        for (bad, why) in [
+            (
+                "https://github.com/Dyserna/cImp/releases/download/detection-v1/../../../../../attacker/repo/releases/download/v1/x.yar",
+                "literal dot segments",
+            ),
+            (
+                "https://github.com/Dyserna/cImp/releases/download/detection-v1/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/attacker/x.yar",
+                "percent-encoded dot segments",
+            ),
+            (
+                "https://github.com/Dyserna/cImp/releases/download/detection-v1/%2E%2E/%2E%2E/%2E%2E/%2E%2E/%2E%2E/attacker/x.yar",
+                "percent-encoded dot segments, upper case",
+            ),
+            (
+                "https://github.com/Dyserna/cImp/releases/download/detection-v1/..\\..\\..\\..\\..\\attacker\\x.yar",
+                "backslash is a path separator for a special scheme",
+            ),
+            (
+                "https://github.com/Dyserna/cImp/releases/download/detection-v1/./../../../../../attacker/x.yar",
+                "single-dot segments mixed in",
+            ),
+            (
+                "https://github.com/Dyserna/cImp/releases/download/detection-v1/../../../../../../../../../../attacker/x.yar",
+                "over-popping clamps at the root instead of erroring, so the segment count is \
+                 not a defence",
+            ),
+        ] {
+            // The old check, kept in the test so the evasion is visible rather
+            // than asserted about: every one of these DID start with the
+            // prefix.
+            let started_with_the_prefix = bad.starts_with(anchor.as_str());
+            assert!(
+                started_with_the_prefix,
+                "{why}: the string prefix check must be the thing that was defeated ({bad})"
+            );
+            assert!(!anchor.accepts(bad), "{why} must be rejected: {bad}");
+            let f = file_json("a.yar", &"a".repeat(64), 10, bad);
+            assert!(
+                Manifest::parse(&manifest_json(&f), DEFAULT_MANIFEST_URL).is_err(),
+                "{why} must be rejected at the parse boundary: {bad}"
+            );
+        }
+    }
+
+    /// The positive control for the table above: an ordinary sibling asset on
+    /// the curated release still passes, so the fix contains the escape without
+    /// breaking the channel. Plus the two shapes that are *not* traversal but
+    /// are still refused — a query and a fragment, neither of which a release
+    /// asset has.
+    #[test]
+    fn an_ordinary_sibling_asset_still_passes_and_a_query_does_not() {
+        let anchor = AssetAnchor::parse(DEFAULT_MANIFEST_URL).expect("the pinned URL anchors");
+        for good in [
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1/rules-2026.08.07-injection_core.yar",
+            // A `.` segment that resolves back to the same directory is not an
+            // escape and must not be collateral damage.
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1/./rules.yar",
+            // Down is fine; only up is not.
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1/sub/rules.yar",
+        ] {
+            assert!(anchor.accepts(good), "sibling asset must pass: {good}");
+        }
+        let f = file_json(
+            "injection_core.yar",
+            &"a".repeat(64),
+            10,
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1/rules-2026.08.07-injection_core.yar",
+        );
+        assert!(Manifest::parse(&manifest_json(&f), DEFAULT_MANIFEST_URL).is_ok());
+
+        for bad in [
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1/x.yar?token=1",
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1/x.yar#frag",
+            "https://user:pw@github.com/Dyserna/cImp/releases/download/detection-v1/x.yar",
+            // A sibling DIRECTORY whose name merely starts with the anchor's
+            // last segment — the classic prefix-compare false accept.
+            "https://github.com/Dyserna/cImp/releases/download/detection-v1-evil/x.yar",
+        ] {
+            assert!(!anchor.accepts(bad), "must be rejected: {bad}");
+        }
+    }
+
+    /// Plaintext is loopback-only: the manifest carries the digests that gate
+    /// every artifact, so an `http` channel to anyone else is the whole supply
+    /// chain in the clear. Live-verification recipe 11's local server keeps
+    /// working unchanged.
+    #[test]
+    fn plaintext_http_is_accepted_only_against_loopback() {
+        for ok in [
+            "http://127.0.0.1:8099/bundle/manifest.json",
+            "http://127.9.9.9/bundle/manifest.json",
+            "http://localhost:8099/bundle/manifest.json",
+            "http://LOCALHOST:8099/bundle/manifest.json",
+            "http://[::1]:8099/bundle/manifest.json",
+        ] {
+            assert!(
+                AssetAnchor::parse(ok).is_ok(),
+                "loopback http must work: {ok}"
+            );
+        }
+        for bad in [
+            "http://github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json",
+            "http://evil.example/bundle/manifest.json",
+            // Not loopback: someone else's DNS name that merely ends in it.
+            "http://localhost.evil.example/bundle/manifest.json",
+            "http://10.0.0.5/bundle/manifest.json",
+        ] {
+            let e = AssetAnchor::parse(bad).expect_err("plaintext to a remote host is refused");
+            assert!(e.contains("plaintext"), "{bad}: {e}");
+        }
+        // …and https to those same hosts is untouched.
+        assert!(AssetAnchor::parse("https://evil.example/bundle/manifest.json").is_ok());
+    }
+
     /// The override composes with the same rule and needs no special case: a
     /// local test manifest relocates its own assets with it.
     #[test]
@@ -901,6 +1189,53 @@ mod tests {
     }
 
     // ── The test fetcher ────────────────────────────────────────────────
+
+    /// #48/U-1, the third part: the origin check is worth nothing if the
+    /// response may point somewhere else. reqwest's default policy follows up
+    /// to ten redirects to any host, so a curated manifest URL answering `302
+    /// Location: https://attacker/…` would have fetched the attacker's bytes
+    /// with every containment check already passed.
+    ///
+    /// Driven against a one-shot loopback listener rather than a mock, because
+    /// the thing under test is the CLIENT's configuration and only a real
+    /// response exercises it. No outbound network: the listener is on
+    /// 127.0.0.1 and the `Location` it advertises is never fetched — which is
+    /// the assertion.
+    #[tokio::test]
+    async fn the_real_fetcher_refuses_to_follow_a_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let served = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\n\
+                      Location: https://attacker.invalid/rules.yar\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            let _ = sock.shutdown().await;
+        });
+
+        let url = format!("http://{addr}/bundle/manifest.json");
+        let err = HttpFetcher
+            .get(&url, MAX_MANIFEST_BYTES)
+            .await
+            .expect_err("a redirect is reported, never followed");
+        assert!(
+            err.contains("302"),
+            "the redirect must surface as its own status, not be chased: {err}"
+        );
+        served.await.ok();
+    }
 
     #[tokio::test]
     async fn the_test_fetcher_enforces_the_same_ceiling_as_the_real_one() {

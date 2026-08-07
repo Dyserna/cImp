@@ -170,6 +170,10 @@ pub fn managed_rule_files(dir: &Path) -> Vec<PathBuf> {
 /// not an error: the content is where it needs to be, and the leftover is
 /// swept by the next staging wipe.
 pub fn move_file(from: &Path, to: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(e) = fault::injected_failure(to) {
+        return Err(e);
+    }
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -193,6 +197,72 @@ pub fn move_file(from: &Path, to: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Test-only fault injection for [`move_file`] (#48, U-2).
+///
+/// The failure this guards against is the most ordinary one Windows has — AV
+/// real-time scanning, or the user having a rule file open through the panel's
+/// own *Open rules folder* button, holding a handle so both `rename` and `copy`
+/// fail with a sharing violation. Reproducing that for real in a test means
+/// racing the OS; what actually needs testing is what the ACTIVATION does when
+/// a move fails partway through a multi-file directory, so the move is the seam
+/// and the fault is injected there.
+///
+/// Lives in the production module beside [`super::manifest::MapFetcher`], and
+/// for the same reason: the point is to drive the *real* pipeline, which a
+/// fault defined in a test module could not reach.
+///
+/// Keyed on an exact destination **file name** rather than a global switch,
+/// because `cargo test` runs these on threads of one process and a global
+/// switch would fail whatever move another test happened to be making. A test
+/// arms a name only it uses.
+#[cfg(test)]
+pub mod fault {
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    fn armed() -> &'static Mutex<Vec<String>> {
+        static A: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        A.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Make every [`super::move_file`] whose destination is named `file_name`
+    /// fail, until the returned guard drops.
+    pub fn fail_moves_to(file_name: &str) -> Guard {
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(file_name.to_string());
+        Guard(file_name.to_string())
+    }
+
+    /// Disarms on drop, so a panicking test cannot poison the ones after it.
+    pub struct Guard(String);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            armed()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|n| n != &self.0);
+        }
+    }
+
+    pub(super) fn injected_failure(to: &Path) -> Option<String> {
+        let name = to.file_name()?.to_string_lossy().to_string();
+        let hit = armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|n| n == &name);
+        hit.then(|| {
+            format!(
+                "copy -> {}: injected fault (the shape of a sharing violation)",
+                to.display()
+            )
+        })
+    }
 }
 
 /// Delete `dir` and everything under it, ignoring "it was not there".
@@ -423,6 +493,120 @@ fn heal_pre_split_failure(cs: &mut ComponentState, c: Component) {
     cs.last_failure.clear();
     cs.last_failure_version.clear();
     cs.last_failure_signature.clear();
+}
+
+// ── The activation journal ─────────────────────────────────────────────────
+
+/// The journal file, beside `state.json` under the same root.
+pub const JOURNAL_FILE: &str = "activation.json";
+
+/// Which half of a two-loop swap was in flight, and therefore how to undo it
+/// (#48, U-2).
+///
+/// The two halves need **opposite** recoveries, and that is the whole reason
+/// this is recorded rather than inferred from what is on disk:
+///
+/// - [`Phase::Archiving`]: the destination still holds every file that has not
+///   been archived yet. Restoring the archive on top of it is right; *wiping*
+///   the destination first would destroy the only copy of the files the loop
+///   had not reached.
+/// - [`Phase::Moving`]: the destination holds however many staged files landed
+///   before the interruption, and the archive holds the complete outgoing set.
+///   Here the destination MUST be cleared first, or recovery leaves a mixture
+///   of old and new that no curation step ever validated as a set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Archiving,
+    Moving,
+}
+
+/// A swap that was in flight when the process stopped.
+///
+/// # Why a journal exists at all
+///
+/// Activation moves files out of the live directory and other files in. A kill
+/// between the two loops — a crash, a reboot, task manager — leaves the live
+/// directory short with nothing in memory that knows it. Worse, the *next*
+/// activation recomputes the archive path from the unchanged `installed_version`
+/// and [`wipe_dir`]s it, which destroys the only surviving copy of the old
+/// bundle: an interruption that cost coverage until the next check turns into
+/// permanent data loss.
+///
+/// So the swap writes down what it is about to do, before it does it, and the
+/// next run reads that note and finishes the undo. Deliberately a plain file
+/// with three fields and no schema version: it lives for the duration of one
+/// swap, an unreadable one is treated as absent, and anything more elaborate
+/// would be a second state machine to keep in sync with the first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Journal {
+    /// The component's wire name, so an unknown one (a state file from a newer
+    /// build) is ignored rather than guessed at.
+    pub component: String,
+    pub phase: Phase,
+    /// Where the outgoing files were being archived.
+    pub archive: PathBuf,
+    /// The live directory being swapped.
+    pub dest: PathBuf,
+}
+
+fn journal_path(root: &Path) -> PathBuf {
+    root.join(JOURNAL_FILE)
+}
+
+/// Record an in-flight swap. A failure to write is logged, not fatal: losing
+/// the ability to recover from a crash that has not happened must not abort an
+/// update that is otherwise fine.
+pub fn write_journal(root: &Path, j: &Journal) {
+    if let Err(e) = std::fs::create_dir_all(root)
+        .map_err(|e| e.to_string())
+        .and_then(|()| serde_json::to_string_pretty(j).map_err(|e| e.to_string()))
+        .and_then(|s| std::fs::write(journal_path(root), s).map_err(|e| e.to_string()))
+    {
+        warn!(
+            target: "offload",
+            root = %root.display(),
+            error = %e,
+            "detection updater: could not write the activation journal; a crash mid-swap would \
+             not be recoverable"
+        );
+    }
+}
+
+/// Clear the journal — the swap finished, one way or the other.
+pub fn clear_journal(root: &Path) {
+    let path = journal_path(root);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!(
+                target: "offload",
+                path = %path.display(),
+                error = %e,
+                "detection updater: could not clear the activation journal"
+            );
+        }
+    }
+}
+
+/// The in-flight swap recorded under `root`, if any. An unreadable or
+/// unparseable journal reads as absent and is removed: it cannot be acted on,
+/// and leaving it would make every future run try again.
+pub fn read_journal(root: &Path) -> Option<Journal> {
+    let path = journal_path(root);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Journal>(&raw) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            warn!(
+                target: "offload",
+                path = %path.display(),
+                error = %e,
+                "detection updater: the activation journal is unreadable; discarding it"
+            );
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
 }
 
 /// Persist `state`. Written whole, via a temp file and a rename, so a crash

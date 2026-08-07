@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { writable, derived, type Readable } from 'svelte/store';
 import type { TabId } from './tabs/types';
+import { detectionStatus } from './offload';
 
 /// V32 Phase F (locked decisions 14 + 15): the per-tab taint-latch state that
 /// drives the tab-chrome badge and its override popover.
@@ -62,6 +63,13 @@ export interface FeatureState {
   /// a control that ships off (the OpenCode native gate) being off is the
   /// baseline, not a reduction.
   default_on: boolean;
+  /// Why this row is off, when `decided_by` cannot say.
+  ///
+  /// Absent on every row the backend publishes — those are settings, and the
+  /// three `decided_by` values name the level that decided them. Present only
+  /// on the frontend-composed row below, whose "off" is a fact about data on
+  /// disk rather than a switch anyone flipped.
+  reason?: string;
 }
 
 /// One scope's rows. `scope` is `app`, `offload-worker`, or a tab id.
@@ -114,6 +122,58 @@ export function reducedFeaturesFor(
 ): FeatureState[] {
   const scope = status?.scopes.find((s) => s.scope === tab);
   return (scope?.features ?? []).filter((f) => f.in_scope && !f.effective && f.default_on);
+}
+
+// ── V32 Phase C / #48 D-2 — a disarmed signature layer is reduced protection ─
+
+/// The synthetic row's feature key.
+///
+/// Deliberately not a `Feature::key` from the backend: there is no switch here
+/// to resolve. It is composed in the frontend because it is the one
+/// reduced-protection fact that is not a setting, and every surface that
+/// already asks "what is reduced here?" should get it without a second
+/// question.
+export const SIGNATURE_RULES_FEATURE = 'signature_rules_live';
+
+/// Fold "the signature layer is on and has no rules to match with" into the
+/// injection hierarchy as an extra row.
+///
+/// **Why this exists (#48, D-2).** The reduced-protection surfaces are derived
+/// entirely from settings toggles, so a signature layer that had been disarmed
+/// — a rules directory that compiles to nothing, after which `scan` returns
+/// empty and every page reports clean — rendered *full protection* as long as
+/// the toggle was on. Decision 16 gives these surfaces one job ("protection
+/// cannot be off and forgotten"), and a layer that is switched on and doing
+/// nothing is the clearest case of exactly that.
+///
+/// Added **only to scopes where the detection feature both applies and
+/// resolves on**: a scope that never screens, or one the user switched off, is
+/// not reduced by a rules directory it does not read. `reduced` follows the
+/// same rule, so it can never be raised by a row nobody got.
+export function withSignatureHealth(
+  status: InjectionStatus | null,
+  rules: { armed: boolean } | null,
+): InjectionStatus | null {
+  if (!status || !rules || rules.armed) return status;
+  const row: FeatureState = {
+    feature: SIGNATURE_RULES_FEATURE,
+    label: 'Signature rules loaded',
+    effective: false,
+    decided_by: 'feature',
+    override_value: 'inherit',
+    in_scope: true,
+    // It ships loaded, so "not loaded" is a reduction and not a baseline.
+    default_on: true,
+    reason: 'the rules directory compiled to no usable rules',
+  };
+  let anywhere = false;
+  const scopes = status.scopes.map((s) => {
+    const detection = s.features.find((f) => f.feature === 'detection');
+    if (!detection?.in_scope || !detection.effective) return s;
+    anywhere = true;
+    return { ...s, features: [...s.features, row] };
+  });
+  return { ...status, reduced: status.reduced || anywhere, scopes };
 }
 
 export async function fetchLatchStatus(): Promise<LatchRow[]> {
@@ -174,7 +234,13 @@ export function startLatchPolling(): () => void {
     // badge and its explanation disagree for up to a poll interval.
     try {
       const status = await fetchInjectionStatus();
-      if (!stopped) injectionStatus.set(status);
+      // #48/D-2: the signature layer's actual armed-ness rides the same tick as
+      // the toggles, for the same reason the latch does — a badge and its
+      // explanation disagreeing for a poll interval is how a badge stops being
+      // read. `detectionStatus` swallows its own failure and returns null,
+      // which leaves the hierarchy exactly as the backend published it.
+      const detection = await detectionStatus();
+      if (!stopped) injectionStatus.set(withSignatureHealth(status, detection?.rules ?? null));
     } catch {
       /* app still starting — keep the last known hierarchy state */
     }

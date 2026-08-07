@@ -205,6 +205,19 @@ export interface DetectionStatus {
     failed: string[];
     /// Where cImp looked, so "0 files" is diagnosable.
     dir: string;
+    /// `files_loaded > 0 && rules > 0` — this rule set can match something at
+    /// all. **False is the disarmed layer**: every page it screens comes back
+    /// clean because there is nothing to compare against, not because it is.
+    armed: boolean;
+    /// `armed && files_failed === 0` — the whole rule set on disk is live.
+    ///
+    /// Computed in Rust and read here, never restated (#48, N-3). This panel
+    /// used to derive its own green dot as `files_failed === 0 &&
+    /// files_loaded > 0`, omitting `rules` — which the updater's own health
+    /// check requires — so a `.yar` file that parsed and defined no rules
+    /// showed GREEN beside the literal text "1 file(s) loaded, 0 rule(s)"
+    /// while `scan` returned empty.
+    healthy: boolean;
   };
   classifier: {
     /// Weights found AND the ONNX session built.

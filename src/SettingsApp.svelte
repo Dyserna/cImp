@@ -4508,12 +4508,20 @@
           </small>
           {#if detection}
             <ul class="mcp-health">
-              <li class:healthy={detection.rules.files_failed === 0 && detection.rules.files_loaded > 0} class:down={detection.rules.files_failed > 0 || detection.rules.files_loaded === 0}>
+              <!-- #48/N-3: the dot binds the BACKEND's predicate. Deriving it
+                   here as `files_failed === 0 && files_loaded > 0` omitted
+                   `rules`, which the updater's own health check requires, so a
+                   .yar file that parsed and defined nothing rendered green
+                   beside "1 file(s) loaded, 0 rule(s)" while scan returned
+                   empty. One predicate, in one language. -->
+              <li class:healthy={detection.rules.healthy} class:down={!detection.rules.healthy}>
                 <span class="mcp-dot" aria-hidden="true"></span>
                 <span class="mcp-name">Signature rules</span>
                 <span class="mcp-detail" title={detection.rules.dir}>
                   {detection.rules.files_loaded} file(s) loaded, {detection.rules.rules} rule(s){detection.rules.files_failed > 0
                     ? ` — ${detection.rules.files_failed} failed: ${detection.rules.failed.join(', ')}`
+                    : ''}{!detection.rules.armed
+                    ? ' — the signature layer has nothing to match with'
                     : ''}
                 </span>
               </li>

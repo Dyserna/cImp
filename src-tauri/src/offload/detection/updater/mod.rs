@@ -325,8 +325,24 @@ pub fn live_reload(c: Component, dir: &Path) -> Result<String, String> {
 /// the summary" or "unhealthy, and here is why". One definition, shared by the
 /// live reloader and the tests' directory-scoped one, so both judge health the
 /// same way.
+///
+/// # The seam with D-2's fix (#48)
+///
+/// [`signature::reload`](super::signature::reload) now KEEPS the previously
+/// compiled rules when a directory compiles to nothing, rather than disarming
+/// the layer. That must not make a bad bundle look healthy — and it cannot,
+/// structurally: the `Status` it returns describes what the DIRECTORY compiled
+/// to, never what is in the live slot, so a bundle that produced no rule set
+/// still arrives here as `files_loaded: 0, rules: 0` and still fails. Keeping
+/// old rules changes what is screening while the rollback runs; it changes
+/// nothing about the verdict on the bundle.
+///
+/// The predicate itself is [`Status::healthy`](super::signature::Status::healthy)
+/// — read, not restated (#48, N-3). `files_loaded == 0 || rules == 0` staying a
+/// hard failure here is the never-degrade-to-nothing gate, so it must have
+/// exactly one definition and every surface must bind that one.
 pub fn health_from_rules(s: &super::signature::Status, dir: &Path) -> Result<String, String> {
-    if s.files_loaded == 0 || s.rules == 0 || s.files_failed > 0 {
+    if !s.healthy {
         return Err(format!(
             "{} file(s) loaded, {} rule(s), {} rejected ({}) from {}",
             s.files_loaded,
@@ -976,14 +992,34 @@ fn validate_and_activate_classifier(
 /// The ordering is what "atomic-as-possible" means here. A directory swap has
 /// no all-or-nothing primitive across two multi-file directories, so instead:
 /// the outgoing files are archived FIRST, the incoming ones moved in second,
-/// and a failure at any point in the second step restores the archive. The
-/// window in which the destination is short of files is the move loop itself,
-/// and the only way out of it is "new set live and healthy" or "old set back".
+/// and a failure at **any** point in either step is undone before returning.
+/// The window in which the destination is short of files is the move loop
+/// itself, and the only way out of it is "new set live and healthy" or "old set
+/// back".
 ///
 /// The hot-reload is part of the transaction, not a follow-up: a set that moved
 /// perfectly but does not LOAD (an identifier collision with a `local/` rule, a
 /// file quarantined by antivirus between validation and activation) is rolled
 /// back exactly like a failed move.
+///
+/// # The two loops need opposite undos (#48, U-2)
+///
+/// As first built only the *second* loop rolled back; the archive loop
+/// propagated its first error with a bare `?`, so the most ordinary Windows
+/// failure there is — AV real-time scanning, or the user holding a rule file
+/// open through the panel's own *Open rules folder* button, making both
+/// `rename` and `copy` fail with a sharing violation — left `rules.d` holding a
+/// subset of its files, with no reload, no rollback and no `previous_version`
+/// recorded, so Revert stayed disabled. The signature layer then ran at reduced
+/// coverage across every restart: exactly the silent degradation decision 13
+/// forbids.
+///
+/// The undos are **not** the same, which is why there are two of them:
+/// [`roll_back`] clears the destination before restoring, because after the
+/// move loop started the destination holds staged files that must not survive;
+/// [`restore_archived`] alone is what the archive loop needs, because at that
+/// point the destination still holds every file the loop has not reached and
+/// clearing it would destroy the only copy of them.
 fn activate(
     c: Component,
     staging: &Path,
@@ -1011,27 +1047,46 @@ fn activate(
 
     // Archive the current managed set. For rules this is the top level of
     // `rules.d` only, so `local/` is untouched by construction.
+    journal(root, c, store::Phase::Archiving, &archive, dest);
     let mut archived: Vec<(PathBuf, PathBuf)> = Vec::new();
     for p in store::managed_files(dest, c) {
         let name = p.file_name().unwrap_or_default().to_os_string();
         let to = archive.join(&name);
-        store::move_file(&p, &to)?;
+        if let Err(e) = store::move_file(&p, &to) {
+            // Restore-only: the files this loop has NOT reached are still at
+            // `dest` and are the only copy of themselves.
+            restore_archived(&archived);
+            let note = reload_note(c, dest, reload);
+            store::clear_journal(root);
+            return Err(format!(
+                "archiving the current bundle failed ({e}); nothing was replaced and the previous \
+                 version is still live{note}"
+            ));
+        }
         archived.push((to, p.clone()));
     }
 
     // Move the staged set in. On any failure, put the archive back.
+    journal(root, c, store::Phase::Moving, &archive, dest);
     for p in store::managed_files(staging, c) {
         let name = p.file_name().unwrap_or_default().to_os_string();
         if let Err(e) = store::move_file(&p, &dest.join(&name)) {
-            roll_back(c, dest, &archived, layout, reload);
+            let note = roll_back(c, dest, &archived, reload);
+            store::clear_journal(root);
             return Err(format!(
-                "activating the staged bundle failed ({e}); the previous version was restored"
+                "activating the staged bundle failed ({e}); the previous version was restored{note}"
             ));
         }
     }
 
     match reload(c, dest) {
         Ok(live) => {
+            // Cleared BEFORE the state write, deliberately. A crash in the gap
+            // leaves the new files live and the state still naming the old
+            // version, so the next check simply applies the same bundle again —
+            // idempotent. The other order would let a crash leave a journal
+            // that undoes an update the state already claims.
+            store::clear_journal(root);
             update_state_at(root, |s| {
                 let cs = s.get_mut(c);
                 cs.previous_version = outgoing_version.clone();
@@ -1047,12 +1102,111 @@ fn activate(
             Ok(())
         }
         Err(why) => {
-            roll_back(c, dest, &archived, layout, reload);
+            let note = roll_back(c, dest, &archived, reload);
+            store::clear_journal(root);
             Err(format!(
                 "the activated bundle did not load cleanly ({why}); the previous version was \
-                 restored"
+                 restored{note}"
             ))
         }
+    }
+}
+
+/// Record an in-flight swap so a crash between the two loops is recoverable
+/// ([`store::Journal`]).
+fn journal(root: &Path, c: Component, phase: store::Phase, archive: &Path, dest: &Path) {
+    store::write_journal(
+        root,
+        &store::Journal {
+            component: c.as_str().to_string(),
+            phase,
+            archive: archive.to_path_buf(),
+            dest: dest.to_path_buf(),
+        },
+    );
+}
+
+/// Finish an interrupted swap, once, before this run touches anything.
+///
+/// The recovery decision 13's "old data stays live on any failure" needs to
+/// survive a **kill**, not just an error return (#48, U-2). Without it a crash
+/// between the two loops left `rules.d` short, and the next activation then
+/// recomputed the archive path from the unchanged `installed_version` and
+/// [`store::wipe_dir`]'d it — turning a recoverable interruption into the
+/// permanent loss of the only surviving copy of the old bundle.
+///
+/// Called from [`run`] and [`revert`] under the run lock, so it can never race
+/// the swap it is repairing. A journal whose recorded destination is not this
+/// layout's is discarded untouched: the exe moved, and those paths are not
+/// ours to write to.
+fn recover_interrupted(layout: &Layout, reload: Reloader<'_>) {
+    let root = &layout.state_root;
+    let Some(j) = store::read_journal(root) else {
+        return;
+    };
+    let Some(c) = Component::parse(&j.component) else {
+        warn!(
+            target: "offload",
+            component = %j.component,
+            "detection updater: an activation journal names a component this build does not know; \
+             discarding it"
+        );
+        store::clear_journal(root);
+        return;
+    };
+    let dest = layout.dest(c);
+    if j.dest != dest {
+        warn!(
+            target: "offload",
+            recorded = %j.dest.display(),
+            current = %dest.display(),
+            "detection updater: an activation journal points at a different destination than this \
+             layout; discarding it rather than writing to a path we no longer own"
+        );
+        store::clear_journal(root);
+        return;
+    }
+    let archived: Vec<(PathBuf, PathBuf)> = store::managed_files(&j.archive, c)
+        .into_iter()
+        .map(|p| {
+            let name = p.file_name().unwrap_or_default().to_os_string();
+            (p, dest.join(&name))
+        })
+        .collect();
+    if archived.is_empty() {
+        // Nothing was archived before the interruption (or the archive is
+        // already back). There is nothing to undo and nothing to lose.
+        store::clear_journal(root);
+        return;
+    }
+    match j.phase {
+        // The destination still holds every file the archive loop did not
+        // reach; clearing it would destroy them.
+        store::Phase::Archiving => restore_archived(&archived),
+        // The destination holds however many staged files landed. They must go:
+        // old-plus-some-new is a set no curation step ever validated.
+        store::Phase::Moving => {
+            for p in store::managed_files(dest, c) {
+                let _ = std::fs::remove_file(&p);
+            }
+            restore_archived(&archived);
+        }
+    }
+    store::clear_journal(root);
+    warn!(
+        target: "offload",
+        component = c.as_str(),
+        phase = ?j.phase,
+        files = archived.len(),
+        "detection updater: an update was interrupted mid-swap; the previous version was restored"
+    );
+    if let Err(e) = reload(c, dest) {
+        warn!(
+            target: "offload",
+            component = c.as_str(),
+            error = %e,
+            "detection updater: the recovered version did not reload cleanly"
+        );
     }
 }
 
@@ -1061,18 +1215,13 @@ fn activate(
 /// target, so it has to read as something a user recognizes.
 pub const SHIPPED_VERSION: &str = "(shipped)";
 
-/// Remove whatever is at `dest` for this component, put the archive back, and
-/// reload. Used by both failure paths in [`activate`].
-fn roll_back(
-    c: Component,
-    dest: &Path,
-    archived: &[(PathBuf, PathBuf)],
-    layout: &Layout,
-    reload: Reloader<'_>,
-) {
-    for p in store::managed_files(dest, c) {
-        let _ = std::fs::remove_file(&p);
-    }
+/// Put archived files back where they came from.
+///
+/// The half of a rollback that is safe at **any** point of a swap, because it
+/// only ever writes files the archive already holds. [`roll_back`] adds the
+/// destructive half on top of it, and the archive loop's undo deliberately does
+/// not (see [`activate`]).
+fn restore_archived(archived: &[(PathBuf, PathBuf)]) {
     for (from, to) in archived {
         if let Err(e) = store::move_file(from, to) {
             warn!(
@@ -1084,14 +1233,45 @@ fn roll_back(
             );
         }
     }
-    let _ = layout;
-    if let Err(e) = reload(c, dest) {
-        warn!(
-            target: "offload",
-            component = c.as_str(),
-            error = %e,
-            "detection updater: the restored version did not reload cleanly"
-        );
+}
+
+/// Remove whatever is at `dest` for this component, put the archive back, and
+/// reload. The undo for a failure **after** the staged set started landing.
+///
+/// Returns the note the caller appends to its own error: a rollback that put
+/// the files back but could not recompile them is a second, separate problem,
+/// and it used to be visible only as a `warn!` in a log nobody was reading
+/// (#48). Empty on the ordinary path, so the existing messages are unchanged.
+#[must_use]
+fn roll_back(
+    c: Component,
+    dest: &Path,
+    archived: &[(PathBuf, PathBuf)],
+    reload: Reloader<'_>,
+) -> String {
+    for p in store::managed_files(dest, c) {
+        let _ = std::fs::remove_file(&p);
+    }
+    restore_archived(archived);
+    reload_note(c, dest, reload)
+}
+
+/// Reload after a rollback and turn a failure into a sentence the caller can
+/// append. Warned as well as returned: the return reaches the Advisor card and
+/// the activity row, the log reaches whoever is diagnosing the machine.
+#[must_use]
+fn reload_note(c: Component, dest: &Path, reload: Reloader<'_>) -> String {
+    match reload(c, dest) {
+        Ok(_) => String::new(),
+        Err(e) => {
+            warn!(
+                target: "offload",
+                component = c.as_str(),
+                error = %e,
+                "detection updater: the restored version did not reload cleanly"
+            );
+            format!(" — but the restored version did not reload cleanly either ({e})")
+        }
     }
 }
 
@@ -1261,7 +1441,24 @@ pub async fn run(
     // skipped: a click that has to wait for a tick still does what the user
     // asked, whereas a click that silently no-ops does not.
     let _run_guard = run_lock().lock().await;
+    // Finish any swap a crash interrupted before this run can wipe the archive
+    // it would have been recovered from (#48, U-2).
+    recover_interrupted(layout, reload);
     let root = layout.state_root.clone();
+    // Validate the manifest URL BEFORE fetching it (#48, U-1). The parse
+    // boundary in `manifest.rs` already refuses a plaintext or unusable
+    // channel, but it only runs on the response — by which time the document
+    // whose SHA-256s gate every artifact has already travelled in the clear.
+    // `detection_update_manifest_url` is a user-editable setting and the only
+    // other validation site, so this is where an unusable override stops.
+    //
+    // `Rejected` rather than `Unavailable`: nothing was unreachable, a check
+    // refused to run, and the person who typed the override is exactly who the
+    // card is for. The pinned default always passes, so this is silent on
+    // every install that has not set one.
+    if let Err(e) = manifest::AssetAnchor::parse(manifest_url) {
+        return fail_all(components, sched, &root, Outcome::Rejected, &e);
+    }
     let raw = match fetcher.get(manifest_url, manifest::MAX_MANIFEST_BYTES).await {
         Ok(b) => b,
         // Transport. Nothing was refused; the channel did not answer (#46).
@@ -1382,6 +1579,9 @@ fn fail_all(
 /// version they represent, so a revert is itself revertible.
 pub fn revert(c: Component, layout: &Layout, reload: Reloader<'_>) -> RunResult {
     let now = crate::activity::now_ms();
+    // Same reason as in `run`: a revert also wipes an archive directory, so an
+    // interrupted swap has to be finished first (#48, U-2).
+    recover_interrupted(layout, reload);
     let root = layout.state_root.clone();
     let st = state_at(&root);
     let cs = st.get(c);
@@ -1456,6 +1656,37 @@ fn revert_inner(
     let dest = layout.dest(c);
     let root = &layout.state_root;
     let archive = store::previous_dir(root, c, previous_version);
+    // Where the currently-live set will be archived, so this revert is itself
+    // revertible.
+    let keep = store::previous_dir(root, c, current_version);
+
+    // **Revert must never wipe its own source (#48, U-2).**
+    //
+    // `store::sanitize_version` is lossy — every character outside
+    // `[A-Za-z0-9._-]` becomes `_` and the result is trimmed — so two different
+    // version strings can name one directory. The reachable case is not exotic:
+    // on a fresh install `outgoing_version` is the literal `(shipped)`, which
+    // sanitizes to `shipped`, so a manifest publishing a rules version of
+    // `shipped` makes `keep` and `archive` THE SAME PATH. The `wipe_dir(&keep)`
+    // below would then delete the very files being restored, the live directory
+    // would be emptied into a directory that no longer exists, and a second
+    // Revert — still enabled, because the state write never happened — would
+    // destroy the surviving copy.
+    //
+    // Compared as PATHS, not as strings, because the collision is created by
+    // the sanitizer and only the sanitized form can see it. Fail closed:
+    // refusing a revert costs the user a click and a message, emptying
+    // `rules.d` costs them the layer.
+    if keep == archive {
+        return Err(format!(
+            "the retained `{previous_version}` and the installed `{current_version}` are archived \
+             under the same directory (`{}`), so restoring one would destroy the other — refusing \
+             rather than risking an empty rules directory. Re-publish the bundle under a version \
+             that does not collide, or reinstall from Settings → Tools → Detection (Check now)",
+            archive.display()
+        ));
+    }
+
     let restoring = store::managed_files(&archive, c);
     if restoring.is_empty() {
         return Err(format!(
@@ -1464,17 +1695,51 @@ fn revert_inner(
         ));
     }
     // Archive what is live now under ITS version, so this revert can be undone.
-    let keep = store::previous_dir(root, c, current_version);
     store::wipe_dir(&keep);
+    // The same two-loop shape as `activate`, and therefore the same two undos
+    // and the same journal (#48, U-2): a bare `?` in either loop left the live
+    // directory holding a subset with nothing put back, and this path is the
+    // one a user triggers by hand.
+    journal(root, c, store::Phase::Archiving, &keep, dest);
+    let mut archived: Vec<(PathBuf, PathBuf)> = Vec::new();
     for p in store::managed_files(dest, c) {
         let name = p.file_name().unwrap_or_default().to_os_string();
-        store::move_file(&p, &keep.join(&name))?;
+        let to = keep.join(&name);
+        if let Err(e) = store::move_file(&p, &to) {
+            restore_archived(&archived);
+            let note = reload_note(c, dest, reload);
+            store::clear_journal(root);
+            return Err(format!(
+                "archiving the current `{current_version}` files failed ({e}); nothing was \
+                 restored and the current version is still live{note}"
+            ));
+        }
+        archived.push((to, p.clone()));
     }
+    journal(root, c, store::Phase::Moving, &keep, dest);
     for p in &restoring {
         let name = p.file_name().unwrap_or_default().to_os_string();
-        store::move_file(p, &dest.join(&name))?;
+        if let Err(e) = store::move_file(p, &dest.join(&name)) {
+            let note = roll_back(c, dest, &archived, reload);
+            store::clear_journal(root);
+            return Err(format!(
+                "restoring `{previous_version}` failed ({e}); `{current_version}` was put \
+                 back{note}"
+            ));
+        }
     }
-    let live = reload(c, dest)?;
+    let live = match reload(c, dest) {
+        Ok(live) => live,
+        Err(why) => {
+            let note = roll_back(c, dest, &archived, reload);
+            store::clear_journal(root);
+            return Err(format!(
+                "the restored `{previous_version}` version did not load cleanly ({why}); \
+                 `{current_version}` was put back{note}"
+            ));
+        }
+    };
+    store::clear_journal(root);
     update_state_at(root, |s| {
         let cs = s.get_mut(c);
         cs.installed_version = previous_version.to_string();

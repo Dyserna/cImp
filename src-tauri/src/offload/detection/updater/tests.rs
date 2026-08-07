@@ -1026,3 +1026,303 @@ async fn a_missing_smoke_corpus_rejects_the_update() {
     assert!(r.detail.contains("smoke corpus is missing"), "{}", r.detail);
     assert!(tree.live_rule_text("core.yar").contains("IgnorePrevious"));
 }
+
+// ── #48/U-1, U-2 — containment and the two failure windows ─────────────────
+
+/// A second, independently-identified rule, so a two-file live bundle is
+/// distinguishable file by file.
+const SECOND_RULE: &str = r#"rule Upd_Test_Second {
+    strings:
+        $a = "second_marker"
+    condition:
+        $a
+}"#;
+
+/// Seed a two-file live bundle: the archive loop then has a first file it can
+/// move and a second one it cannot.
+fn seed_two(tree: &Tree) {
+    tree.seed_rules("core.yar", GOOD_RULE);
+    std::fs::write(
+        tree.layout.rules_dest.join("zz_fault_hold.yar"),
+        SECOND_RULE,
+    )
+    .unwrap();
+}
+
+/// **#48/U-2 — a failure inside the ARCHIVE loop must leave `rules.d` intact.**
+///
+/// The archive loop used to propagate its first error with a bare `?`: files
+/// already moved out were not put back, `reload` was never called, and
+/// `previous_version` is written only on the success path, so Revert stayed
+/// disabled too. `rules.d` was left holding a subset and the signature layer
+/// ran at reduced coverage across every restart — the silent degradation
+/// decision 13 forbids.
+///
+/// The trigger is the most ordinary Windows failure there is (AV real-time
+/// scanning, or the user holding a file open through the panel's own "Open
+/// rules folder" button), so the fault is INJECTED at `store::move_file`
+/// rather than raced against the OS.
+#[tokio::test]
+async fn a_failure_mid_archive_puts_every_file_back_and_leaves_the_bundle_live() {
+    let tree = Tree::new();
+    seed_two(&tree);
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+
+    // The SECOND file of the archive loop fails to move; the first has already
+    // left `rules.d` by then.
+    let _fault = store::fault::fail_moves_to("zz_fault_hold.yar");
+    let r = run_rules(&tree, Mode::Auto, &fetcher).await;
+
+    assert_eq!(r.outcome, Outcome::Rejected, "{}", r.detail);
+    assert!(
+        r.detail.contains("archiving the current bundle failed"),
+        "the message names the loop that failed: {}",
+        r.detail
+    );
+    assert!(
+        r.detail.contains("nothing was replaced"),
+        "and says what it cost: {}",
+        r.detail
+    );
+
+    // The whole live bundle is back — this is the assertion the finding is
+    // about. A subset here is the defect.
+    assert_eq!(
+        tree.live_rule_names(),
+        vec!["core.yar".to_string(), "zz_fault_hold.yar".to_string()],
+        "every file must be back in rules.d"
+    );
+    assert!(tree.live_rule_text("core.yar").contains("IgnorePrevious"));
+    assert!(!tree.live_rule_text("core.yar").contains("RoleForgery"));
+    assert!(tree
+        .live_rule_text("zz_fault_hold.yar")
+        .contains("second_marker"));
+    assert!(tree.local_sentinel_survives());
+
+    // Nothing was installed, and the journal that guards the crash case is
+    // cleared — the run completed, it just completed by undoing itself.
+    let cs = tree.state().get(Component::Rules).clone();
+    assert!(cs.installed_version.is_empty(), "{}", cs.installed_version);
+    assert!(cs.previous_version.is_empty(), "{}", cs.previous_version);
+    assert!(
+        store::read_journal(&tree.layout.state_root).is_none(),
+        "a completed run leaves no journal"
+    );
+}
+
+/// The same injection one loop later: a failure while the STAGED set is moving
+/// in still rolls back, which is the path that always worked — kept as the
+/// control that the new archive-loop undo did not weaken it.
+#[tokio::test]
+async fn a_failure_mid_move_still_restores_the_previous_bundle() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let (_, fetcher) = rules_manifest(
+        "2026.08.07",
+        &[
+            ("core.yar", GOOD_RULE_V2),
+            ("zz_fault_new.yar", SECOND_RULE),
+        ],
+    );
+
+    let _fault = store::fault::fail_moves_to("zz_fault_new.yar");
+    let r = run_rules(&tree, Mode::Auto, &fetcher).await;
+
+    assert_eq!(r.outcome, Outcome::Rejected, "{}", r.detail);
+    assert!(
+        r.detail.contains("previous version was restored"),
+        "{}",
+        r.detail
+    );
+    assert_eq!(tree.live_rule_names(), vec!["core.yar".to_string()]);
+    assert!(tree.live_rule_text("core.yar").contains("IgnorePrevious"));
+    assert!(!tree.live_rule_text("core.yar").contains("RoleForgery"));
+    assert!(tree.local_sentinel_survives());
+    assert!(store::read_journal(&tree.layout.state_root).is_none());
+}
+
+/// **#48/U-2 — Revert must never wipe its own source.**
+///
+/// `store::sanitize_version` is lossy, and `sanitize_version("(shipped)")` is
+/// `"shipped"`. So on a fresh install — where the outgoing label IS
+/// `(shipped)` — a manifest publishing a rules version of `shipped` makes
+/// Revert's archive and its `wipe_dir` target the same directory: `rules.d`
+/// ends up empty, the run reports a failure with no rollback, and a second
+/// Revert (still enabled, because the state write never happened) destroys the
+/// surviving copy. Refusing is recoverable; wiping `rules.d` is not.
+#[tokio::test]
+async fn revert_refuses_when_the_two_versions_archive_to_the_same_directory() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    // A manifest version that collides with SHIPPED_VERSION after sanitizing.
+    let (_, fetcher) = rules_manifest("shipped", &[("core.yar", GOOD_RULE_V2)]);
+    assert_eq!(
+        run_rules(&tree, Mode::Auto, &fetcher).await.outcome,
+        Outcome::Applied
+    );
+    let cs = tree.state().get(Component::Rules).clone();
+    assert_eq!(cs.installed_version, "shipped");
+    assert_eq!(cs.previous_version, SHIPPED_VERSION);
+    assert_eq!(
+        store::previous_dir(
+            &tree.layout.state_root,
+            Component::Rules,
+            &cs.installed_version
+        ),
+        store::previous_dir(
+            &tree.layout.state_root,
+            Component::Rules,
+            &cs.previous_version
+        ),
+        "the premise: two different versions, one directory"
+    );
+
+    for attempt in 1..=2 {
+        let r = revert(Component::Rules, &tree.layout, &scoped_reload);
+        assert_eq!(
+            r.outcome,
+            Outcome::RevertFailed,
+            "attempt {attempt}: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("same directory"),
+            "attempt {attempt} must say why: {}",
+            r.detail
+        );
+        // Nothing moved, on either attempt.
+        assert_eq!(tree.live_rule_names(), vec!["core.yar".to_string()]);
+        assert!(tree.live_rule_text("core.yar").contains("RoleForgery"));
+        assert!(
+            !store::managed_files(
+                &store::previous_dir(&tree.layout.state_root, Component::Rules, SHIPPED_VERSION),
+                Component::Rules
+            )
+            .is_empty(),
+            "attempt {attempt}: the retained bundle must survive a refused revert"
+        );
+    }
+    // A refusal to act is not a bundle refusal: no card either way.
+    let (available, failed, _) = signals_from(&tree.state());
+    assert!(available.is_empty() && failed.is_empty());
+}
+
+/// **#48/U-2 — a kill between the two loops is recoverable.**
+///
+/// Without a journal the next `activate` recomputes the archive path from the
+/// unchanged `installed_version` and `wipe_dir`s it, destroying the only
+/// surviving copy of the old bundle: an interruption that cost coverage until
+/// the next check becomes permanent loss. Both phases are exercised, because
+/// they need OPPOSITE undos — restoring on top of the destination after an
+/// interrupted archive loop, and clearing it first after an interrupted move
+/// loop.
+#[tokio::test]
+async fn an_interrupted_swap_is_finished_on_the_next_run() {
+    // Phase 1: killed mid-ARCHIVE. `rules.d` holds the file the loop had not
+    // reached; the archive holds the one it had.
+    let tree = Tree::new();
+    seed_two(&tree);
+    let archive = store::previous_dir(&tree.layout.state_root, Component::Rules, SHIPPED_VERSION);
+    store::move_file(
+        &tree.layout.rules_dest.join("core.yar"),
+        &archive.join("core.yar"),
+    )
+    .unwrap();
+    store::write_journal(
+        &tree.layout.state_root,
+        &store::Journal {
+            component: "rules".into(),
+            phase: store::Phase::Archiving,
+            archive: archive.clone(),
+            dest: tree.layout.rules_dest.clone(),
+        },
+    );
+    assert_eq!(
+        tree.live_rule_names(),
+        vec!["zz_fault_hold.yar".to_string()]
+    );
+
+    // Any run does the recovery on the way in — here the quietest one there is.
+    let dead = MapFetcher::new(HashMap::new());
+    run_rules(&tree, Mode::Auto, &dead).await;
+    assert_eq!(
+        tree.live_rule_names(),
+        vec!["core.yar".to_string(), "zz_fault_hold.yar".to_string()],
+        "the file the archive loop had taken must come back, and the one it had not reached must \
+         not be touched"
+    );
+    assert!(store::read_journal(&tree.layout.state_root).is_none());
+
+    // Phase 2: killed mid-MOVE. The archive holds the complete outgoing set and
+    // the destination holds a partially landed new one; recovery must clear the
+    // destination first, or the result is a mixture nobody validated.
+    let tree = Tree::new();
+    seed_two(&tree);
+    let archive = store::previous_dir(&tree.layout.state_root, Component::Rules, SHIPPED_VERSION);
+    for name in ["core.yar", "zz_fault_hold.yar"] {
+        store::move_file(&tree.layout.rules_dest.join(name), &archive.join(name)).unwrap();
+    }
+    std::fs::write(tree.layout.rules_dest.join("core.yar"), GOOD_RULE_V2).unwrap();
+    std::fs::write(tree.layout.rules_dest.join("newcomer.yar"), SECOND_RULE).unwrap();
+    store::write_journal(
+        &tree.layout.state_root,
+        &store::Journal {
+            component: "rules".into(),
+            phase: store::Phase::Moving,
+            archive,
+            dest: tree.layout.rules_dest.clone(),
+        },
+    );
+
+    let dead = MapFetcher::new(HashMap::new());
+    run_rules(&tree, Mode::Auto, &dead).await;
+    assert_eq!(
+        tree.live_rule_names(),
+        vec!["core.yar".to_string(), "zz_fault_hold.yar".to_string()],
+        "the half-landed set must be gone, not merged"
+    );
+    assert!(tree.live_rule_text("core.yar").contains("IgnorePrevious"));
+    assert!(!tree.live_rule_text("core.yar").contains("RoleForgery"));
+    assert!(tree.local_sentinel_survives());
+    assert!(store::read_journal(&tree.layout.state_root).is_none());
+}
+
+/// **#48/U-1 — an unusable manifest URL stops BEFORE the fetch.**
+///
+/// `detection_update_manifest_url` is the only place the channel's scheme and
+/// host are user-controlled, and the parse boundary in `manifest.rs` only sees
+/// the response — by which time the document carrying the SHA-256 of every
+/// artifact has already travelled in plaintext. So the override is validated
+/// where the request is made, and a bad one costs zero requests.
+#[tokio::test]
+async fn a_plaintext_manifest_override_is_refused_without_fetching_anything() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let fetcher = MapFetcher::new(HashMap::new());
+
+    let mut results = run(
+        &[Component::Rules],
+        tree.schedule(Mode::Auto),
+        "http://evil.example/bundle/manifest.json",
+        false,
+        &fetcher,
+        &tree.layout,
+        &scoped_reload,
+    )
+    .await;
+    let r = results.pop().expect("one component ran");
+    assert_eq!(r.outcome, Outcome::Rejected, "{}", r.detail);
+    assert!(r.detail.contains("plaintext"), "{}", r.detail);
+    assert!(
+        fetcher
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
+        "nothing may be requested over a channel we have already refused"
+    );
+    assert!(tree.live_rule_text("core.yar").contains("IgnorePrevious"));
+
+    // …and the loopback form live-verification recipe 11 uses still runs.
+    assert!(manifest::AssetAnchor::parse("http://127.0.0.1:8099/bundle/manifest.json").is_ok());
+}

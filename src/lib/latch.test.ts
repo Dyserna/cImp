@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { reducedFeaturesFor, isTainted, type FeatureState, type InjectionStatus } from './latch';
+import {
+  reducedFeaturesFor,
+  isTainted,
+  withSignatureHealth,
+  SIGNATURE_RULES_FEATURE,
+  type FeatureState,
+  type InjectionStatus,
+} from './latch';
 import type { TabId } from './tabs/types';
 
 /// V32 Phase G/H — the tab badge's "what is switched off here?" filter.
@@ -67,6 +74,52 @@ describe('reducedFeaturesFor', () => {
   it('reports nothing for an unknown tab or a missing status', () => {
     expect(reducedFeaturesFor(null, TAB)).toEqual([]);
     expect(reducedFeaturesFor(status([]), 'claude' as TabId)).toEqual([]);
+  });
+});
+
+/// V32 Phase C / #48 D-2 — a disarmed signature layer is reduced protection.
+///
+/// The finding: every reduced-protection surface is derived from settings
+/// toggles, so a rules directory that compiled to nothing rendered FULL
+/// protection while `scan` returned empty for every page. The layer being on
+/// and doing nothing is the exact state decision 16's indicator exists for.
+describe('withSignatureHealth', () => {
+  const detection = (over: Partial<FeatureState> = {}) =>
+    feature({ feature: 'detection', label: 'Injection detection', ...over });
+
+  it('adds a reduced row where detection applies and is on, and raises `reduced`', () => {
+    const s = withSignatureHealth(status([detection()]), { armed: false });
+    expect(s?.reduced).toBe(true);
+    const rows = reducedFeaturesFor(s, TAB);
+    expect(rows.map((f) => f.feature)).toEqual([SIGNATURE_RULES_FEATURE]);
+    // It carries its own explanation: the three `decided_by` levels answer
+    // "who flipped this switch", which is the wrong question here.
+    expect(rows[0].reason).toContain('no usable rules');
+  });
+
+  it('says nothing when the layer is armed', () => {
+    const s = withSignatureHealth(status([detection()]), { armed: true });
+    expect(s?.reduced).toBe(false);
+    expect(reducedFeaturesFor(s, TAB)).toEqual([]);
+  });
+
+  it('says nothing for a scope where detection is switched off or does not apply', () => {
+    for (const off of [detection({ effective: false }), detection({ in_scope: false })]) {
+      const s = withSignatureHealth(status([off]), { armed: false });
+      expect(
+        reducedFeaturesFor(s, TAB).some((f) => f.feature === SIGNATURE_RULES_FEATURE),
+      ).toBe(false);
+    }
+    // …and a scope that switched detection off is not "reduced" by a rules
+    // directory it never reads, so the chip stays silent too.
+    const s = withSignatureHealth(status([detection({ effective: false })]), { armed: false });
+    expect(s?.reduced).toBe(false);
+  });
+
+  it('passes the backend status through untouched when detection status is unavailable', () => {
+    const base = status([detection()]);
+    expect(withSignatureHealth(base, null)).toBe(base);
+    expect(withSignatureHealth(null, { armed: false })).toBeNull();
   });
 });
 

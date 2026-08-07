@@ -2454,6 +2454,12 @@ pub async fn graph_usage_advice(
     // project the user happens to have open.
     let (detection_updates, detection_update_failures, detection_update_stalled) =
         crate::offload::detection::updater::advisor_signals();
+    // #48/D-2: the fourth detection canary, and the only one about the data on
+    // disk rather than the channel — the signature layer switched on with
+    // nothing to match against. Reads the cached compile report (no disk, no
+    // clock) and resolves the layer's own switch through the injection
+    // hierarchy, so a layer the user turned off says nothing.
+    let detection_signature_down = crate::offload::detection::signature::advisor_signal(&settings);
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -2497,6 +2503,7 @@ pub async fn graph_usage_advice(
         detection_updates,
         detection_update_failures,
         detection_update_stalled,
+        detection_signature_down,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not

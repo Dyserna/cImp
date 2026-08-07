@@ -202,6 +202,28 @@ pub const RULE_DETECTION_UPDATE_FAILED: &str = "detection.update_failed.v1";
 /// then re-raises, and any check that comes back current resets the streak and
 /// starts the count over.
 pub const RULE_DETECTION_UPDATE_STALLED: &str = "detection.update_stalled.v1";
+/// The signature layer is switched ON and has **nothing to match with** — the
+/// rules directory is unreadable, or every file in it was rejected, so
+/// `files_loaded == 0 || rules == 0` (#48, D-2).
+///
+/// The fourth rule, and the one that was missing. The other three all speak
+/// about the update CHANNEL; none of them reads
+/// [`signature::status`](crate::offload::detection::signature::status), so a
+/// disarmed layer had no consumer anywhere: the reduced-protection badge is
+/// derived from settings toggles and rendered full protection, no activity row
+/// is written on reload, and `detection.update_stalled.v1` says in so many
+/// words *"Nothing is degraded — the data you have is still live and still
+/// scanning."* The only signal was `files_loaded: 0` in a Settings panel nobody
+/// had open, while every screened page came back clean.
+///
+/// Decision 13: *"A failed validation surfaces an Advisor card and keeps the
+/// old data — never silently degrades to no-detection."* The updater's path
+/// honoured that; the plain reload path did not, and this rule is what makes
+/// the sentence true on both.
+///
+/// Warn-only, and signed by the directory plus the file count, so a dismissal
+/// holds for the state the user looked at and re-raises when it changes.
+pub const RULE_DETECTION_SIGNATURE_DOWN: &str = "detection.signature_down.v1";
 
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
@@ -358,6 +380,13 @@ pub struct Signals {
     /// non-empty entry here already means "long enough to mean it, and nothing
     /// else is saying it".
     pub detection_update_stalled: Vec<crate::offload::detection::updater::StalledUpdate>,
+    /// The signature layer switched on with no rules to match against — the
+    /// consumer for `signature::reload` failing (#48, D-2). `None` is both
+    /// healthy states: rules are live, or the user switched the layer off.
+    /// Unlike the three above this is a fact about the DATA ON DISK rather than
+    /// about the update channel, which is why nothing else here could stand in
+    /// for it.
+    pub detection_signature_down: Option<crate::offload::detection::signature::SignatureDown>,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -829,6 +858,52 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             warn_only: true,
             action: None,
         });
+    }
+
+    // V32 Phase C / #48 — detection.signature_down.v1: the signature layer is
+    // ON and has nothing to match with. The one detection card that is about
+    // the DATA rather than the channel, and the consumer decision 13's
+    // "never silently degrades to no-detection" was missing: without it a
+    // rules directory that compiles to nothing reports every page clean while
+    // the badge, the activity feed and the three cards above all say the layer
+    // is fine. Warn-only — the fix is a file on disk (or Reload rules), not a
+    // settings write.
+    if let Some(d) = &sig.detection_signature_down {
+        // Signed by what the user would look at: the directory plus the counts.
+        // A dismissal holds for that state and re-raises when it changes, which
+        // includes the case where a partial recovery leaves the layer still
+        // disarmed for a different reason.
+        let signature = format!("{}:{}:{}", d.dir, d.files_loaded, d.files_failed);
+        if !is_dismissed(&sig.dismissed, RULE_DETECTION_SIGNATURE_DOWN, &signature) {
+            out.push(Proposal {
+                setting: String::new(),
+                current: format!(
+                    "{} file(s) loaded, {} rule(s){}",
+                    d.files_loaded,
+                    d.rules,
+                    if d.failed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {} rejected: {}", d.files_failed, d.failed.join(", "))
+                    }
+                ),
+                proposed: "a rules directory that compiles".to_string(),
+                rationale: format!(
+                    "The injection-detection SIGNATURE layer is switched on and has no rules to \
+                     match against, so every external result it screens comes back clean because \
+                     there is nothing to compare it with — not because it is. cImp looked in {}. \
+                     If a previously loaded set is still in memory it keeps screening with that, \
+                     but it will not survive a restart. Fix or remove the rejected file(s) — a \
+                     broken rule in `rules.d/local/` is the usual cause — then press Reload rules \
+                     in Settings → Tools → Detection.",
+                    d.dir
+                ),
+                rule_id: RULE_DETECTION_SIGNATURE_DOWN,
+                signature,
+                warn_only: true,
+                action: None,
+            });
+        }
     }
 
     // Feature 4 — drift.read_bypass.v1: the agent routes around the advisor
@@ -2320,5 +2395,98 @@ mod tests {
         assert!(!ids.contains(&RULE_DETECTION_UPDATE_AVAILABLE));
         assert!(!ids.contains(&RULE_DETECTION_UPDATE_FAILED));
         assert!(!ids.contains(&RULE_DETECTION_UPDATE_STALLED));
+        assert!(!ids.contains(&RULE_DETECTION_SIGNATURE_DOWN));
+    }
+
+    // ── V32 Phase C / #48 D-2 — the disarmed signature layer ────────────
+
+    use crate::offload::detection::signature::SignatureDown;
+
+    /// The consumer half of D-2. Before this rule existed, a rules directory
+    /// that compiled to nothing had NO consumer: `scan` returned empty for the
+    /// rest of the process's life, every page reported clean, and all four
+    /// signal channels said the opposite — the badge is derived from settings
+    /// toggles, no activity row is written on reload, and the stall card
+    /// literally says "Nothing is degraded".
+    #[test]
+    fn a_disarmed_signature_layer_raises_a_warn_only_card() {
+        let sig = Signals {
+            detection_signature_down: Some(SignatureDown {
+                dir: r"C:\cimp\detection\rules.d".into(),
+                files_loaded: 0,
+                files_failed: 3,
+                rules: 0,
+                failed: vec!["injection_core.yar".into(), "local/mine.yar".into()],
+            }),
+            ..Signals::default()
+        };
+        let p = evaluate(&sig)
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_SIGNATURE_DOWN)
+            .expect("a layer with no rules must say so");
+        assert!(
+            p.warn_only,
+            "the fix is a file on disk, not a settings write"
+        );
+        assert!(p.setting.is_empty());
+        assert!(p.action.is_none());
+        // The card must not read as reassurance: the whole defect was surfaces
+        // claiming a disarmed layer was fine.
+        assert!(
+            p.rationale.contains("no rules to match against"),
+            "{}",
+            p.rationale
+        );
+        assert!(
+            p.rationale.contains(r"C:\cimp\detection\rules.d"),
+            "names where to look: {}",
+            p.rationale
+        );
+        assert!(p.current.contains("injection_core.yar"), "{}", p.current);
+        assert_eq!(p.signature, r"C:\cimp\detection\rules.d:0:3");
+    }
+
+    /// The signature is the state the user looked at, so a dismissal holds for
+    /// that state and re-raises when the directory changes underneath it — a
+    /// half-repaired directory that is still disarmed is a new fact.
+    #[test]
+    fn a_dismissed_signature_down_card_refires_when_the_directory_changes() {
+        let down = |loaded: usize, failed: usize| Signals {
+            detection_signature_down: Some(SignatureDown {
+                dir: "/rules.d".into(),
+                files_loaded: loaded,
+                files_failed: failed,
+                rules: 0,
+                failed: vec!["a.yar".into()],
+            }),
+            dismissed: vec![DismissedRule {
+                rule_id: RULE_DETECTION_SIGNATURE_DOWN.to_string(),
+                signature: "/rules.d:0:3".to_string(),
+            }],
+            ..Signals::default()
+        };
+        let fires = |s: &Signals| {
+            evaluate(s)
+                .iter()
+                .any(|p| p.rule_id == RULE_DETECTION_SIGNATURE_DOWN)
+        };
+        assert!(!fires(&down(0, 3)), "dismissed for the state it described");
+        assert!(
+            fires(&down(1, 2)),
+            "one file repaired and the layer is STILL disarmed — a new fact"
+        );
+    }
+
+    /// `None` is both healthy states — rules are live, or the user switched the
+    /// layer off — and the producer resolves the switch, so nothing here has to
+    /// know about settings.
+    #[test]
+    fn no_signature_signal_means_no_signature_card() {
+        assert!(!evaluate(&Signals {
+            detection_signature_down: None,
+            ..Signals::default()
+        })
+        .iter()
+        .any(|p| p.rule_id == RULE_DETECTION_SIGNATURE_DOWN));
     }
 }

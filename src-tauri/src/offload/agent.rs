@@ -1348,6 +1348,7 @@ pub async fn run(
     );
     outbound::record_flag(outbound::Flag {
         screen: outbound::Screen::Canary,
+        origin: outbound::Origin::Internal,
         consumer: "offload",
         scope: &cfg.task_scope,
         tool: "(final answer)",
@@ -1705,6 +1706,7 @@ async fn run_inner(
                 if !std::mem::replace(&mut latch_flagged, true) {
                     outbound::record_flag(outbound::Flag {
                         screen: outbound::Screen::LatchRefusal,
+                        origin: outbound::Origin::Internal,
                         consumer: "offload",
                         scope: &cfg.task_scope,
                         tool: name,
@@ -1743,6 +1745,7 @@ async fn run_inner(
                     );
                     outbound::record_flag(outbound::Flag {
                         screen: outbound::Screen::Canary,
+                        origin: outbound::Origin::Internal,
                         consumer: "offload",
                         scope: &cfg.task_scope,
                         tool: name,
@@ -1769,6 +1772,7 @@ async fn run_inner(
                         );
                         outbound::record_flag(outbound::Flag {
                             screen: outbound::Screen::Budget,
+                            origin: outbound::Origin::Internal,
                             consumer: "offload",
                             scope: &cfg.task_scope,
                             tool: name,

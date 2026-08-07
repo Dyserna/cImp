@@ -939,6 +939,58 @@ addon). What to know on any `@xterm/*` bump:
   fallback warn, terminals still render); then the milestone doc's § Live
   verification list.
 
+### Cross-module invariants — how to enforce a new one (#47)
+
+Some invariants span modules: "no enforcement site reads a raw settings
+switch", "only one function applies the quarantine filter", "push content is
+never LLM output". Agents and reviewers implement their *local* contract
+faithfully, so nobody defends a rule that lives between modules unless
+something makes them. V32 answered that with source-scanning tripwire tests,
+and the 2026-08-07 deep review found five defects across three of them — one
+heuristic bug in a shared scanner weakened several unrelated invariants at
+once, and one scan passed **vacuously** for its whole life.
+
+The mechanisms below are **not alternatives to rank**. They apply or they do
+not, keyed on the invariant's shape. Work down the list and stop at the first
+that fits:
+
+1. **Can it be phrased "only module X may touch Y"?** → a module boundary plus
+   Rust visibility. `pub(in crate::…)` turns the violation into a compile
+   error and relocates it into the file a reviewer is already looking at.
+   (#44: every V32 injection switch. #47: the note relation's queries.)
+2. **Can the bad state be made unrepresentable?** → types. Newtypes, private
+   fields with one constructor, a validating `TryFrom` on every deserialize
+   path, required struct fields instead of a defaulting helper, an array
+   *derived* from an enum rather than written beside it. (#47: `PushNotice`
+   takes a `&'static str` template plus its values, so composed content is a
+   type error; `Feature::ALL` comes from the macro that declares the enum;
+   `Flag::origin` is required, so a row cannot inherit "cImp decided this".)
+3. **Is it a property of an expression's *shape* that survives 1–2?** → an
+   **AST query**, via the tree-sitter already linked into the binary
+   (`graph_struct_search` exposes exactly this). Never a line grep.
+4. **Nothing applies?** → treat it as a design smell first. An invariant no
+   mechanism can express usually means the boundary is in the wrong place.
+
+`clippy.toml`'s `disallowed_methods` / `disallowed_types` was considered and
+carries no weight for this class: it bans call paths, not field reads.
+
+If a scan survives anyway (as a cheap backstop over an already-structural
+boundary, which is the only remaining legitimate use — see
+`graph/index/notes.rs`), it must have **all** of:
+
+- a `SELF` exclusion, so the scan's own literals and prose cannot satisfy it;
+- a *"the guarded thing still exists"* self-guard, so a rename cannot make it
+  pass while watching nothing;
+- a per-file floor for every known site, so a heuristic that stops seeing one
+  file fails instead of going quietly green;
+- `env!("CARGO_MANIFEST_DIR")` resolution and a loud failure on a missing
+  source tree, so it is cwd-independent and cannot no-op;
+- **no line heuristics.** "Is this byte inside a comment?" and "is this item
+  under `#[cfg(test)]`?" are parsing questions; the retired `push_tripwire`
+  answered both with substring tests and got both wrong in ways that produced
+  *wrong answers* rather than missing ones. If a scan needs either, it needs
+  an AST query instead (rule 3) — or the property belongs in rule 1 or 2.
+
 ---
 
 ## Open spikes & unverified contracts

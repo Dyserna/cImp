@@ -1307,24 +1307,23 @@ impl SseParser {
 /// Turn a `push` frame's `data` payload into `notifications/claude/channel`
 /// params, or `None` when it is unusable.
 ///
-/// Re-validates the meta keys the app already checked at the write boundary:
-/// the two halves are different processes and can be different builds (a child
-/// outlives a settings change, and an old exe can be talking to a new app), and
-/// an invalid key would be dropped *silently* by the client. Empty content is
-/// rejected outright — an empty `<channel>` message would cost the session a
-/// turn and say nothing ("empty is not absent").
+/// Both checks the parse itself now makes (#47): `PushNotice`'s `Deserialize`
+/// runs a validating `TryFrom`, which rejects empty content outright — an empty
+/// `<channel>` message would cost the session a turn and say nothing ("empty is
+/// not absent") — and drops any meta key the client would silently discard. The
+/// two halves of this wire are different processes and can be different builds
+/// (a child outlives a settings change, and an old exe can be talking to a new
+/// app), so this stays a *parse-boundary* guarantee rather than an assumption
+/// about the sender. A rejected payload lands here as `None`.
 fn channel_params(data: &str) -> Option<Value> {
     let notice: crate::offload::service::PushNotice = serde_json::from_str(data).ok()?;
-    if notice.content.trim().is_empty() {
-        return None;
-    }
+    let content = notice.content().to_string();
     let meta: serde_json::Map<String, Value> = notice
         .meta
         .into_iter()
-        .filter(|(k, _)| crate::offload::service::valid_meta_key(k))
         .map(|(k, v)| (k, Value::String(v)))
         .collect();
-    Some(json!({ "content": notice.content, "meta": Value::Object(meta) }))
+    Some(json!({ "content": content, "meta": Value::Object(meta) }))
 }
 
 /// Relay one parsed SSE frame to the host agent. Unknown event names are
@@ -2226,6 +2225,7 @@ mod tests {
     fn app_push_frame_round_trips_through_the_parser() {
         let notice = crate::offload::service::PushNotice::new(
             "multi\nline\ncontent",
+            &[],
             [("kind", "audit_done"), ("seq", "3")],
         );
         let bytes = crate::offload::loopback::push_frame(&notice);

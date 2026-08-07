@@ -878,6 +878,7 @@ impl McpHost {
                 );
                 outbound::record_flag(outbound::Flag {
                     screen: outbound::Screen::Ssrf,
+                    origin: outbound::Origin::Internal,
                     consumer: consumer.source(),
                     scope,
                     tool: namespaced,

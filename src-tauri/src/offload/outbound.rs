@@ -746,6 +746,13 @@ pub struct Flag<'a> {
     /// denial row it is the fact worth reading at a glance, and the issuing
     /// consumer is already implicit in `scope`.
     pub screen: Screen,
+    /// Who asked for the state change this row records. **Required** (#47):
+    /// #45 added the column behind a defaulting `record_flag` that stamped
+    /// [`Origin::Internal`], which meant a new call site inherited "cImp
+    /// decided this" by writing nothing — the exact shape of omission this
+    /// row exists to make impossible. A struct literal must name every field,
+    /// so the provenance of a new row is now a decision rather than a default.
+    pub origin: Origin,
     /// The activity-feed consumer badge: `claude` / `opencode` / `offload`.
     /// Carried in the row's request payload, not its `source` column.
     pub consumer: &'a str,
@@ -769,25 +776,20 @@ pub struct Flag<'a> {
     pub detail: &'a str,
 }
 
-/// Write one `injection_flag` Tool Activity row, attributed to
-/// [`Origin::Internal`] — cImp's own dispatch deciding something about a call it
-/// was already executing.
+/// Write one `injection_flag` Tool Activity row, with its provenance
+/// ([`Flag::origin`]) stated by the caller.
 ///
 /// This is the consumer for every denial Phase C adds: without it a refusal is
 /// a silent failure the user only notices as a task that inexplicably gave up.
 /// Uses `record_bg` like every other recorder — the store does synchronous file
 /// I/O and these fire from async paths.
 ///
-/// **A caller that is *applying a request from outside cImp's own dispatch* —
-/// an IPC command, or a loopback route — must use [`record_flag_from`]
-/// instead.** `Internal` is the safe default only because it claims the least:
-/// it never asserts that a human acted.
+/// Picking the origin: [`Origin::Internal`] is cImp's own dispatch deciding
+/// something about a call it was already executing (a screen, a refusal, a
+/// quarantine). A caller *applying a request from outside that dispatch* — an
+/// IPC command, or a loopback route — must say so instead; `Internal` claims
+/// the least, but claiming it wrongly is what makes a row lie by omission.
 pub fn record_flag(flag: Flag<'_>) {
-    record_flag_from(Origin::Internal, flag);
-}
-
-/// [`record_flag`] with the row's provenance stated explicitly (#45).
-pub fn record_flag_from(origin: Origin, flag: Flag<'_>) {
     let ts = crate::activity::now_ms();
     // The at-a-glance column: the offending host when the screen had one,
     // otherwise the scope that hit its limit.
@@ -795,7 +797,7 @@ pub fn record_flag_from(origin: Origin, flag: Flag<'_>) {
         Some(h) => format!("{h} ({})", flag.scope),
         None => flag.scope.to_string(),
     };
-    let request = flag_request(origin, &flag);
+    let request = flag_request(&flag);
     crate::activity::record_bg(ActivityRecord {
         entry: ActivityEntry::new(
             ActivityKind::InjectionFlag,
@@ -820,17 +822,17 @@ pub fn record_flag_from(origin: Origin, flag: Flag<'_>) {
 
 /// The row's request payload — the JSON the Tool Activity detail pane shows.
 ///
-/// Split out of [`record_flag_from`] as a pure function so the fields a reader
+/// Split out of [`record_flag`] as a pure function so the fields a reader
 /// depends on after an incident (the screen, the scope, and since #45 the
 /// [`Origin`]) are assertable in a unit test. The write itself needs the
 /// activity store, which is process-global file I/O; this does not.
-pub fn flag_request(origin: Origin, flag: &Flag<'_>) -> serde_json::Value {
+pub fn flag_request(flag: &Flag<'_>) -> serde_json::Value {
     serde_json::json!({
         "screen": flag.screen.as_str(),
         // Who asked. Deliberately adjacent to `screen`, because the two are
         // only useful together: "the latch moved" is not a finding, "the latch
         // moved and nobody clicked anything" is.
-        "origin": origin.as_str(),
+        "origin": flag.origin.as_str(),
         "consumer": flag.consumer,
         "scope": flag.scope,
         "tool": flag.tool,
@@ -1252,30 +1254,32 @@ mod tests {
         assert_eq!(labels, ["internal", "ipc", "http"]);
     }
 
-    /// #45: every flag row carries its origin, and `record_flag`'s convenience
-    /// default is the claim-nothing one. A row that omitted the field would be
-    /// read as "no reason to doubt it", which is exactly the reading the finding
-    /// says is unearned.
+    /// #45: every flag row carries its origin. #47 makes the field **required**
+    /// on [`Flag`] rather than defaulted by the recorder, so a row that omitted
+    /// it — and would therefore be read as "cImp decided this, no reason to
+    /// doubt it", the reading the original finding says is unearned — no longer
+    /// compiles. This pins the wire values the reader depends on.
     #[test]
     fn every_flag_row_states_who_asked() {
-        let flag = Flag {
-            screen: Screen::LatchOverride,
-            consumer: "claude",
-            scope: "claude:claude-1",
-            tool: "unlatch",
-            host: None,
-            url: None,
-            resolved_ip: None,
-            canary: false,
-            root: String::new(),
-            detail: "detail",
-        };
         for (origin, expected) in [
             (Origin::Internal, "internal"),
             (Origin::Ipc, "ipc"),
             (Origin::Http, "http"),
         ] {
-            let req = flag_request(origin, &flag);
+            let flag = Flag {
+                screen: Screen::LatchOverride,
+                origin,
+                consumer: "claude",
+                scope: "claude:claude-1",
+                tool: "unlatch",
+                host: None,
+                url: None,
+                resolved_ip: None,
+                canary: false,
+                root: String::new(),
+                detail: "detail",
+            };
+            let req = flag_request(&flag);
             assert_eq!(req["origin"], expected);
             assert_eq!(req["screen"], "latch_override");
             assert_eq!(req["scope"], "claude:claude-1");

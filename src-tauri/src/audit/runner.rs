@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord};
 use crate::checks::{parsers, Diag};
+use crate::offload::service::PushNotice;
 use crate::settings::{AuditToolConfig, AuditToolId, SettingsHandle};
 
 use super::adapters::{self, Adapter, Category, ExitClass, Transport};
@@ -749,10 +750,7 @@ impl AuditState {
         if !scan_push_worthy(session_push, initiator, cancelled, elapsed_ms) {
             return;
         }
-        let notice = crate::offload::service::PushNotice::new(
-            audit_push_content(snap, category),
-            [("kind", "audit")],
-        );
+        let notice = audit_push_notice(snap, category);
         let delivered = pushes.push_broadcast(notice);
         tracing::debug!(
             root = %snap.root,
@@ -995,12 +993,21 @@ fn effective_tool_timeout(tool_secs: Option<u64>, global: Duration) -> Duration 
         .unwrap_or(global)
 }
 
-/// V30 Phase C: the one-line `<channel>` body for a finished GUI scan. Pure
-/// (snapshot in, string out) so the wording and the counts are testable without
+/// V30 Phase C: the one-line `<channel>` notice for a finished GUI scan. Pure
+/// (snapshot in, notice out) so the wording and the counts are testable without
 /// a runner, an `AppHandle`, or a push bus. Deliberately short and factual —
 /// this text costs a model turn in every armed tab that receives it — and it
 /// names its pull twin so the receiving agent knows where the full report is.
-fn audit_push_content(snap: &AuditSnapshot, category: Category) -> String {
+///
+/// Locked decision 9 (as a type since #47): the two shapes below are `&'static
+/// str` templates and every slot carries an app-owned value — counts of
+/// done/failed tools, the category word, the configured scan root and the fixed
+/// pull-twin tool name. **No finding message is ever quoted**: a finding's text
+/// is scanner output about attacker-influenced source, and a push starts a turn
+/// on an idle session. The conditional clause is a second template rather than
+/// a `push_str`, because `PushNotice::new` will not take a composed `String` at
+/// all — which is the point.
+fn audit_push_notice(snap: &AuditSnapshot, category: Category) -> PushNotice {
     let done = snap
         .tools
         .iter()
@@ -1015,19 +1022,29 @@ fn audit_push_content(snap: &AuditSnapshot, category: Category) -> String {
         Category::Security => "security_audit",
         Category::Quality => "quality_audit",
     };
-    let mut line = format!(
-        "cImp finished a {} audit of {} (started from the cImp UI): {} findings from {done} tool(s)",
-        category_label(category),
-        snap.root,
-        snap.total_findings,
-    );
+    let findings = snap.total_findings.to_string();
+    let done = done.to_string();
+    let meta = [("kind", "audit")];
     if failed > 0 {
-        line.push_str(&format!(", {failed} tool(s) failed"));
+        PushNotice::new(
+            "cImp finished a {} audit of {} (started from the cImp UI): {} findings from {} tool(s), {} tool(s) failed. Call {} for the full report (it re-runs the same scan).",
+            &[
+                category_label(category),
+                &snap.root,
+                &findings,
+                &done,
+                &failed.to_string(),
+                tool,
+            ],
+            meta,
+        )
+    } else {
+        PushNotice::new(
+            "cImp finished a {} audit of {} (started from the cImp UI): {} findings from {} tool(s). Call {} for the full report (it re-runs the same scan).",
+            &[category_label(category), &snap.root, &findings, &done, tool],
+            meta,
+        )
     }
-    line.push_str(&format!(
-        ". Call {tool} for the full report (it re-runs the same scan)."
-    ));
-    line
 }
 
 /// The lowercase category word used in the "no … tools are enabled" error.
@@ -2189,7 +2206,7 @@ mod tests {
     /// The pushed line is short, factual, and names its pull twin (milestone
     /// invariant 2) rather than inlining the report.
     #[test]
-    fn audit_push_content_states_counts_and_its_pull_twin() {
+    fn audit_push_notice_states_counts_and_its_pull_twin() {
         let snap = done_snapshot(
             &[
                 (AuditToolId::Gitleaks, ToolStatus::Done),
@@ -2197,7 +2214,13 @@ mod tests {
             ],
             7,
         );
-        let line = audit_push_content(&snap, Category::Security);
+        let notice = audit_push_notice(&snap, Category::Security);
+        let line = notice.content();
+        assert_eq!(
+            notice.meta.get("kind").map(String::as_str),
+            Some("audit"),
+            "the notice keeps its channel attribute"
+        );
         assert!(line.contains("security"), "names the category: {line}");
         assert!(line.contains("/proj/root"), "names the scope: {line}");
         assert!(line.contains("7 findings"), "carries the count: {line}");
@@ -2216,7 +2239,7 @@ mod tests {
     /// A failed tool is surfaced, so "0 findings" from a broken scan can't read
     /// as a clean bill of health, and a Quality scan points at `quality_audit`.
     #[test]
-    fn audit_push_content_reports_failures_and_the_quality_twin() {
+    fn audit_push_notice_reports_failures_and_the_quality_twin() {
         let snap = done_snapshot(
             &[
                 (AuditToolId::Ruff, ToolStatus::Done),
@@ -2225,7 +2248,8 @@ mod tests {
             ],
             0,
         );
-        let line = audit_push_content(&snap, Category::Quality);
+        let notice = audit_push_notice(&snap, Category::Quality);
+        let line = notice.content();
         assert!(line.contains("quality"), "names the category: {line}");
         assert!(line.contains("0 findings"), "carries the count: {line}");
         assert!(

@@ -248,24 +248,123 @@ pub fn valid_meta_key(key: &str) -> bool {
 /// This is the wire type of the SSE `event: push` frame's `data` — serialized
 /// by the app ([`crate::offload::loopback`]) and deserialized by the child
 /// ([`crate::offload::mcp`]), so both halves share one definition and cannot
-/// drift. Construct it with [`PushNotice::new`], which enforces the meta-key
-/// contract.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// drift.
+///
+/// # The channel-content invariant (V32 locked decision 9), as a type
+///
+/// Push content may only ever carry **text this application composed itself**.
+/// Never LLM output, never a scanner finding message, never fetched page
+/// content, never a tool result. It is not "just another injection surface":
+/// every other path by which untrusted text reaches a model is *pull* — the
+/// model asked, and the answer lands inside a turn a user started. A push
+/// delivers a `<channel source="cimp-offload">` message that **starts** a turn
+/// on an idle session. Untrusted text there stops being ordinary indirect
+/// injection and becomes autonomous, turn-starting injection.
+///
+/// `offload.session_push` is OFF by decision (2026-08-06) and the V30 code is
+/// released but dormant, so nothing exercises these producers today — a future
+/// one that started interpolating a tool result would break no test, produce no
+/// symptom, and ship.
+///
+/// The invariant is therefore carried by this type's **shape** (#47) rather
+/// than by a source scan over its call sites, which is what watched it until
+/// then:
+///
+/// - [`content`](Self::content) is private and [`new`](Self::new) is its only
+///   constructor. No struct literal, no `Default`, no `Deserialize` shortcut.
+/// - `new` takes a `&'static str` **template** plus its runtime values and
+///   interpolates them itself. A producer cannot hand it a `String` at all, so
+///   `PushNotice::new(format!("…{answer}"), …)` — the failure mode decision 9
+///   names — is a compile error rather than something a reviewer has to catch.
+/// - Deserialization goes through [`PushNoticeWire`] and a validating
+///   `TryFrom`, so the SSE path cannot mint one the constructor would have
+///   refused.
+///
+/// What the type does **not** decide is whether an individual interpolated
+/// value is app-owned: `args` are runtime `&str`, and "this count came from our
+/// own indexer" is a judgement about provenance, not a property of a type. The
+/// sentence a push makes is pinned; the values in its slots are still a
+/// reviewer's call. Keep them to counts, durations, configured paths and fixed
+/// tool names.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "PushNoticeWire")]
 pub struct PushNotice {
     /// The message text the model sees inside `<channel source="…">…</channel>`.
-    pub content: String,
+    /// Private: see the type docs.
+    content: String,
     /// String attributes rendered onto the `<channel>` tag. Keys are guaranteed
-    /// valid by [`PushNotice::new`].
+    /// valid by [`PushNotice::new`] and re-checked on the deserialize path.
     #[serde(default)]
     pub meta: BTreeMap<String, String>,
 }
 
+/// The on-the-wire shape of a [`PushNotice`], and the only door into one that
+/// does not run [`PushNotice::new`].
+///
+/// It exists so the deserialize path has somewhere to be validated. The two
+/// halves of the push wire are different processes and can be different builds
+/// (a child outlives a settings change; an old exe can be talking to a new
+/// app), so what arrives is checked here rather than assumed — the repo
+/// principle "validate at the parse boundary anyway".
+#[derive(serde::Deserialize)]
+pub struct PushNoticeWire {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    meta: BTreeMap<String, String>,
+}
+
+/// Why a wire payload could not become a [`PushNotice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushNoticeError {
+    /// Content was absent, empty, or whitespace only. "Empty is not absent": an
+    /// empty `<channel>` message would cost the session a turn and say nothing,
+    /// so a blank notice is rejected at the parse boundary rather than
+    /// delivered and ignored somewhere downstream.
+    EmptyContent,
+}
+
+impl std::fmt::Display for PushNoticeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushNoticeError::EmptyContent => f.write_str("push notice carries no content"),
+        }
+    }
+}
+
+impl TryFrom<PushNoticeWire> for PushNotice {
+    type Error = PushNoticeError;
+
+    fn try_from(wire: PushNoticeWire) -> Result<Self, Self::Error> {
+        if wire.content.trim().is_empty() {
+            return Err(PushNoticeError::EmptyContent);
+        }
+        Ok(Self {
+            content: wire.content,
+            meta: keep_valid_meta(wire.meta),
+        })
+    }
+}
+
+/// The slot [`PushNotice::new`] fills from `args`, left to right.
+const PUSH_SLOT: &str = "{}";
+
 impl PushNotice {
-    /// Build a notice, dropping (with a warn) any meta key the client would
-    /// silently discard. `BTreeMap` so the rendered attribute order is stable —
+    /// Build a notice from a **static template** and the runtime values that go
+    /// in its slots, dropping (with a warn) any meta key the client would
+    /// silently discard.
+    ///
+    /// `template` is `&'static str` and the interpolation happens in here: that
+    /// is the whole enforcement mechanism for locked decision 9 (see the type
+    /// docs). Each `{}` is replaced by the corresponding entry of `args`, in
+    /// order. A count mismatch is a producer bug — it warns and fills what it
+    /// can rather than panicking, because a malformed notice must not take down
+    /// the scan or index that was only announcing itself.
+    ///
+    /// `meta` lands in a `BTreeMap` so the rendered attribute order is stable —
     /// a push is user-visible text, and a wobbling attribute order would make
     /// transcripts diff-noisy for no reason.
-    pub fn new<I, K, V>(content: impl Into<String>, meta: I) -> Self
+    pub fn new<I, K, V>(template: &'static str, args: &[&str], meta: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
@@ -284,10 +383,63 @@ impl PushNotice {
             }
         }
         Self {
-            content: content.into(),
+            content: interpolate(template, args),
             meta: kept,
         }
     }
+
+    /// The `<channel>` body. Read-only by construction — [`new`](Self::new) is
+    /// the only way to set it.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+/// Drop every meta key the client would silently discard. Shared by the
+/// constructor and the deserialize path so both halves of the wire agree.
+fn keep_valid_meta(meta: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    meta.into_iter()
+        .filter(|(k, _)| {
+            let ok = valid_meta_key(k);
+            if !ok {
+                warn!(
+                    key = %k,
+                    "offload push: dropping channel meta key — must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
+                );
+            }
+            ok
+        })
+        .collect()
+}
+
+/// Fill `template`'s `{}` slots from `args`, in order.
+///
+/// Deliberately lenient on a count mismatch (a missing arg leaves the slot
+/// empty, a surplus arg is dropped) and loud about it: this runs on the
+/// announce path of a finished index or scan, and a producer's formatting bug
+/// must not become that operation's failure.
+fn interpolate(template: &'static str, args: &[&str]) -> String {
+    let mut out =
+        String::with_capacity(template.len() + args.iter().map(|a| a.len()).sum::<usize>());
+    let mut rest = template;
+    let mut slots = 0usize;
+    while let Some(at) = rest.find(PUSH_SLOT) {
+        out.push_str(&rest[..at]);
+        if let Some(arg) = args.get(slots) {
+            out.push_str(arg);
+        }
+        slots += 1;
+        rest = &rest[at + PUSH_SLOT.len()..];
+    }
+    out.push_str(rest);
+    if slots != args.len() {
+        warn!(
+            slots,
+            args = args.len(),
+            "offload push: template slot/argument count mismatch — the notice text is malformed"
+        );
+    }
+    out
 }
 
 /// One live `/events` subscriber — a per-tab `--offload-mcp` child holding an
@@ -1982,6 +2134,12 @@ mod tests {
 
     // ── V30 Phase B: the push bus ────────────────────────────────────────
 
+    /// The empty meta list, named so the turbofish-free call sites below stay
+    /// readable (`[]` alone cannot infer `K`/`V`).
+    fn no_meta() -> [(&'static str, &'static str); 0] {
+        []
+    }
+
     /// The client silently drops meta keys outside `^[a-zA-Z_][a-zA-Z0-9_]*$`,
     /// so the constructor rejects them at the write boundary instead.
     #[test]
@@ -1995,6 +2153,7 @@ mod tests {
 
         let notice = PushNotice::new(
             "audit finished",
+            &[],
             [
                 ("kind", "audit_done"),
                 ("run-id", "7"), // hyphen → dropped
@@ -2002,12 +2161,65 @@ mod tests {
                 ("_ok", "yes"),  // leading underscore → kept
             ],
         );
-        assert_eq!(notice.content, "audit finished");
+        assert_eq!(notice.content(), "audit finished");
         assert_eq!(
             notice.meta.keys().collect::<Vec<_>>(),
             vec!["_ok", "kind"],
             "only contract-valid keys survive, in stable (BTreeMap) order"
         );
+    }
+
+    /// The template fills left to right, and a producer's count mistake
+    /// degrades rather than panics — this runs on the announce path of a
+    /// finished scan.
+    #[test]
+    fn push_notice_fills_template_slots_in_order() {
+        let n = PushNotice::new("{} of {} in {}s", &["3 files", "/proj", "12"], no_meta());
+        assert_eq!(n.content(), "3 files of /proj in 12s");
+        // No slots, no args: the template is the content verbatim.
+        assert_eq!(PushNotice::new("plain", &[], no_meta()).content(), "plain");
+        // Surplus slot ⇒ empty; surplus arg ⇒ dropped. Both warn.
+        assert_eq!(PushNotice::new("a{}b{}", &["X"], no_meta()).content(), "aXb");
+        assert_eq!(
+            PushNotice::new("a{}b", &["X", "Y"], no_meta()).content(),
+            "aXb"
+        );
+    }
+
+    /// V32 locked decision 9, the half a type CAN state: the deserialize path
+    /// is not a second constructor. It runs `TryFrom`, which rejects a notice
+    /// with nothing to say ("empty is not absent" — an empty `<channel>`
+    /// message costs the receiving session a turn) and drops the meta keys the
+    /// client would silently discard, exactly as `new` does.
+    #[test]
+    fn push_notice_deserialization_is_validated() {
+        let ok: PushNotice =
+            serde_json::from_str(r#"{"content":"c","meta":{"ok_1":"a","bad-key":"b"}}"#)
+                .expect("a well-formed notice deserializes");
+        assert_eq!(ok.content(), "c");
+        assert_eq!(
+            ok.meta.keys().collect::<Vec<_>>(),
+            vec!["ok_1"],
+            "the parse boundary applies the same meta-key contract as the constructor"
+        );
+
+        for rejected in [
+            r#"{"content":""}"#,
+            r#"{"content":"   "}"#,
+            r#"{"meta":{"kind":"x"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PushNotice>(rejected).is_err(),
+                "a notice with no content must not deserialize: {rejected}"
+            );
+        }
+
+        // A real notice still round-trips byte-identically — the wire format is
+        // shared with the child process and did not change.
+        let n = PushNotice::new("hello {}", &["world"], [("kind", "t")]);
+        let json = serde_json::to_string(&n).unwrap();
+        assert_eq!(json, r#"{"content":"hello world","meta":{"kind":"t"}}"#);
+        assert_eq!(serde_json::from_str::<PushNotice>(&json).unwrap(), n);
     }
 
     /// Registration is explicit; deregistration is RAII — the entry goes away
@@ -2042,8 +2254,8 @@ mod tests {
             reg.register(Some("claude-3".into()), "claude".into(), false);
         let (_g_anon, mut rx_anon) = reg.register(None, "claude".into(), true);
 
-        assert!(reg.push_to_tab("claude", PushNotice::new("hi", [("kind", "t")])));
-        assert_eq!(rx_a.recv().await.map(|n| n.content), Some("hi".to_string()));
+        assert!(reg.push_to_tab("claude", PushNotice::new("hi", &[], [("kind", "t")])));
+        assert_eq!(rx_a.recv().await.map(|n| n.content().to_string()), Some("hi".to_string()));
         assert!(rx_b.try_recv().is_err(), "sibling tab must not receive it");
         assert!(
             rx_anon.try_recv().is_err(),
@@ -2051,11 +2263,11 @@ mod tests {
         );
 
         // The channels flag is respected even when the tab matches.
-        assert!(!reg.push_to_tab("claude-3", PushNotice::new("x", [] as [(&str, &str); 0])));
+        assert!(!reg.push_to_tab("claude-3", PushNotice::new("x", &[], [] as [(&str, &str); 0])));
         assert!(rx_nochan.try_recv().is_err());
 
         // An unknown tab delivers to nobody and says so.
-        assert!(!reg.push_to_tab("ghost", PushNotice::new("x", [] as [(&str, &str); 0])));
+        assert!(!reg.push_to_tab("ghost", PushNotice::new("x", &[], [] as [(&str, &str); 0])));
     }
 
     /// Broadcast hits every channel-capable subscriber (tab-less ones included)
@@ -2068,7 +2280,7 @@ mod tests {
         let (_g_nochan, mut rx_nochan) = reg.register(Some("oc".into()), "opencode".into(), false);
 
         assert_eq!(
-            reg.push_broadcast(PushNotice::new("all", [] as [(&str, &str); 0])),
+            reg.push_broadcast(PushNotice::new("all", &[], [] as [(&str, &str); 0])),
             2
         );
         assert!(rx_a.recv().await.is_some());
@@ -2082,7 +2294,7 @@ mod tests {
     fn push_drops_when_the_subscriber_queue_is_full() {
         let reg = PushRegistry::new();
         let (_g, _rx) = reg.register(Some("claude".into()), "claude".into(), true);
-        let notice = || PushNotice::new("x", [] as [(&str, &str); 0]);
+        let notice = || PushNotice::new("x", &[], [] as [(&str, &str); 0]);
         for i in 0..PUSH_QUEUE_CAP {
             assert!(reg.push_to_tab("claude", notice()), "push {i} should queue");
         }

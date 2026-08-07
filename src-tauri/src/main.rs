@@ -24,12 +24,6 @@ mod preview;
 mod process_guard;
 mod processing;
 mod procutil;
-/// V32 Phase D (locked decision 9): the channel-content tripwire — a
-/// source-scanning test that no production `PushNotice` producer may compose
-/// its text from LLM output, scanner findings or fetched content. Test-only:
-/// it holds no runtime code, only the reviewed allowlist and the scan.
-#[cfg(test)]
-mod push_tripwire;
 mod pty;
 mod read_hook;
 mod settings;

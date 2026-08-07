@@ -110,6 +110,45 @@ use super::schema::{Settings, TabConfig};
 
 // ── Features ───────────────────────────────────────────────────────────────
 
+/// Declare [`Feature`] and [`Feature::ALL`] from one list, so the array cannot
+/// drift from the enum (#47).
+///
+/// It used to be hand-written beside the enum, and a variant left out of it was
+/// invisible to `report`, [`protection_reduced`], [`spawn_sig`], the Settings
+/// matrix **and** the test that was supposed to guard it — which iterated the
+/// array rather than the enum, so an omission removed the feature from its own
+/// coverage. The exhaustive matches below would still have caught the addition,
+/// but "the compiler makes you name it somewhere" is not the same property as
+/// "every surface that enumerates features sees it".
+///
+/// The invocation reads exactly like the enum declaration it replaces —
+/// attributes, doc comments and all — because the alternative (a bespoke
+/// list-of-variants syntax) trades one drift risk for a worse readability one.
+macro_rules! declare_features {
+    (
+        $(#[$enum_attr:meta])*
+        pub enum $name:ident {
+            $( $(#[$variant_attr:meta])* $variant:ident ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $( $(#[$variant_attr])* $variant, )+
+        }
+
+        impl $name {
+            /// Every feature, in declaration order — which is the order the
+            /// Settings UI and the introspection report render them
+            /// (cheapest/most-structural first, spawn-baked last).
+            ///
+            /// Derived from the variant list above, not written out: see
+            /// [`declare_features`].
+            pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
+        }
+    };
+}
+
+declare_features! {
 /// One V32 control, as the hierarchy addresses it.
 ///
 /// The enum — rather than a string key — is what makes "every feature is
@@ -158,24 +197,9 @@ pub enum Feature {
     /// into non-HTML sinks. App-wide: TTS and toasts are global surfaces.
     TerminalEscapeHygiene,
 }
+}
 
 impl Feature {
-    /// Every feature, in the order the Settings UI and the introspection report
-    /// render them (cheapest/most-structural first, spawn-baked last).
-    pub const ALL: &'static [Feature] = &[
-        Feature::TaintLatch,
-        Feature::Spotlighting,
-        Feature::Detection,
-        Feature::SsrfGuard,
-        Feature::FetchBudgets,
-        Feature::Canary,
-        Feature::MemoryQuarantine,
-        Feature::NativeWeb,
-        Feature::ConsumerHygiene,
-        Feature::OpencodeNativeGate,
-        Feature::TerminalEscapeHygiene,
-    ];
-
     /// The stable wire/UI key. Fixed strings, pinned by a test: they key the
     /// Settings matrix and the `/status` rows, so a rename is a wire change.
     pub fn key(self) -> &'static str {
@@ -227,25 +251,42 @@ impl Feature {
     /// So "reduced" is measured against the DEFAULT, not against `true`: a
     /// default-off control that is off is the baseline, and one switched on is
     /// *more* protection, never less.
+    ///
+    /// An exhaustive `match` rather than a `matches!` (#47): a new control's
+    /// shipping default is a decision, and falling through to `true` would let
+    /// it be taken by omission.
     pub fn default_enabled(self) -> bool {
-        !matches!(self, Feature::OpencodeNativeGate)
+        match self {
+            Feature::OpencodeNativeGate => false,
+            Feature::TaintLatch
+            | Feature::Spotlighting
+            | Feature::Detection
+            | Feature::SsrfGuard
+            | Feature::FetchBudgets
+            | Feature::Canary
+            | Feature::MemoryQuarantine
+            | Feature::NativeWeb
+            | Feature::ConsumerHygiene
+            | Feature::TerminalEscapeHygiene => true,
+        }
     }
 
     /// Whether this feature carries a per-TAB L3 row. Mirrors
-    /// [`TabInjectionOverrides`]'s field set (pinned by a test).
+    /// [`TabInjectionOverrides`]'s field set (pinned by a test). Exhaustive so
+    /// a new feature must state its scopes rather than inherit them (#47).
     pub fn has_tab_scope(self) -> bool {
-        matches!(
-            self,
+        match self {
             Feature::TaintLatch
-                | Feature::Spotlighting
-                | Feature::Detection
-                | Feature::SsrfGuard
-                | Feature::FetchBudgets
-                | Feature::MemoryQuarantine
-                | Feature::NativeWeb
-                | Feature::ConsumerHygiene
-                | Feature::OpencodeNativeGate
-        )
+            | Feature::Spotlighting
+            | Feature::Detection
+            | Feature::SsrfGuard
+            | Feature::FetchBudgets
+            | Feature::MemoryQuarantine
+            | Feature::NativeWeb
+            | Feature::ConsumerHygiene
+            | Feature::OpencodeNativeGate => true,
+            Feature::Canary | Feature::TerminalEscapeHygiene => false,
+        }
     }
 
     /// Whether this feature carries the `offload-worker` L3 row. Mirrors
@@ -258,15 +299,19 @@ impl Feature {
     /// native gate are absent because the worker is not a harness — it has no
     /// native tools and no spawn config.
     pub fn has_worker_scope(self) -> bool {
-        matches!(
-            self,
+        match self {
             Feature::TaintLatch
-                | Feature::Spotlighting
-                | Feature::Detection
-                | Feature::SsrfGuard
-                | Feature::FetchBudgets
-                | Feature::Canary
-        )
+            | Feature::Spotlighting
+            | Feature::Detection
+            | Feature::SsrfGuard
+            | Feature::FetchBudgets
+            | Feature::Canary => true,
+            Feature::MemoryQuarantine
+            | Feature::NativeWeb
+            | Feature::ConsumerHygiene
+            | Feature::OpencodeNativeGate
+            | Feature::TerminalEscapeHygiene => false,
+        }
     }
 
     /// Whether this feature is applied at TAB SPAWN rather than per call.
@@ -280,10 +325,17 @@ impl Feature {
     /// baked into the generated OpenCode plugin, and the plugin is written at
     /// tab spawn.
     pub fn spawn_baked(self) -> bool {
-        matches!(
-            self,
-            Feature::NativeWeb | Feature::ConsumerHygiene | Feature::OpencodeNativeGate
-        )
+        match self {
+            Feature::NativeWeb | Feature::ConsumerHygiene | Feature::OpencodeNativeGate => true,
+            Feature::TaintLatch
+            | Feature::Spotlighting
+            | Feature::Detection
+            | Feature::SsrfGuard
+            | Feature::FetchBudgets
+            | Feature::Canary
+            | Feature::MemoryQuarantine
+            | Feature::TerminalEscapeHygiene => false,
+        }
     }
 }
 
@@ -1457,7 +1509,12 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", f.key()));
             assert_eq!(serde_json::from_str::<Feature>(&json).unwrap(), *f);
         }
-        assert_eq!(seen.len(), Feature::ALL.len());
+        // No `seen.len() == Feature::ALL.len()` line here any more: it was
+        // tautological (the loop pushes once per entry, and the uniqueness
+        // assert above is what actually rules out a repeat), and the thing it
+        // *looked* like it checked — that `ALL` covers the enum — is now
+        // guaranteed by construction, since `declare_features!` builds the
+        // array from the variant list (#47).
     }
 
     /// Overrides tolerate a hand-edited settings file: unknown ⇒ `Inherit`, and

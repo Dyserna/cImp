@@ -369,6 +369,7 @@ pub async fn wrap_external_result(name: &str, text: String, ctx: ResultCtx<'_>) 
     };
     outbound::record_flag(outbound::Flag {
         screen: screen_kind,
+        origin: outbound::Origin::Internal,
         consumer: ctx.consumer,
         scope: ctx.scope,
         tool: name,

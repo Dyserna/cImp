@@ -543,11 +543,12 @@ fn escape_attr(value: &str) -> String {
 /// (`<channel source="cimp-offload" kind="audit">…</channel>`, verified live in
 /// the Phase 0 spike), so a notice reads identically in both agents.
 ///
-/// Meta keys are re-checked against [`valid_meta_key`] even though
-/// [`PushNotice::new`] already enforces it: a notice can also arrive by
-/// `Deserialize` (the SSE wire type), which bypasses the constructor — validate
-/// at the parse boundary anyway. `meta` is a `BTreeMap`, so attribute order is
-/// stable across pushes.
+/// Meta keys are re-checked against [`valid_meta_key`] even though both doors
+/// into a [`PushNotice`] now enforce it ([`PushNotice::new`] and, since #47, the
+/// validating `TryFrom` on the deserialize path): this is the last boundary
+/// before model-visible markup, and a key that reaches it invalid means one of
+/// those doors regressed. `meta` is a `BTreeMap`, so attribute order is stable
+/// across pushes.
 ///
 /// Content is otherwise passed through verbatim (Claude renders it that way, and
 /// the two agents must read identically) EXCEPT for the envelope's own closing
@@ -565,7 +566,7 @@ fn render_channel_envelope(notice: &PushNotice) -> String {
         out.push('"');
     }
     out.push_str(">\n");
-    out.push_str(&neutralize_closing_tag(&notice.content));
+    out.push_str(&neutralize_closing_tag(notice.content()));
     out.push_str("\n</channel>");
     out
 }
@@ -630,7 +631,7 @@ async fn forward_push(
     };
     let session = match forward_target(
         ctx.session_push_enabled(),
-        !notice.content.trim().is_empty(),
+        !notice.content().trim().is_empty(),
         candidate.as_deref(),
         known_child,
     ) {
@@ -1609,8 +1610,11 @@ mod push_tests {
     use crate::state::TabId;
     use tokio_util::sync::CancellationToken;
 
-    fn notice<'a>(content: &str, meta: impl IntoIterator<Item = (&'a str, &'a str)>) -> PushNotice {
-        PushNotice::new(content, meta)
+    fn notice<'a>(
+        content: &'static str,
+        meta: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> PushNotice {
+        PushNotice::new(content, &[], meta)
     }
 
     /// A tap context whose `offload.session_push` is `enabled`.

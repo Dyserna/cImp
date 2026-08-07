@@ -654,12 +654,32 @@ declares its class AND its mutation capability in one reviewed place.
     tainted rows, so every reader inherits it: `context_notes`, the compaction
     carry-over (`context::compaction_block`), the fact distiller (and therefore
     the launch-time `fact_promotion_block` auto-injection, which is built from
-    `project_fact`), and the Memory UI's clean list. A tripwire test
-    (`mem_note_is_queried_only_from_this_file`) fails the build if any module
-    other than `graph/index.rs` writes a `*mem_note{…}` atom, which is what
-    keeps the single filter from being bypassed by a future call site.
+    `project_fact`), and the Memory UI's clean list.
     `context_recall` never read notes at all — it returns the working set plus
     project facts — so its exclusion is structural.
+  - **Amendment 2026-08-07 (#47): the single-filter property is a module
+    boundary, not a scan.** As shipped, that half was watched by a tripwire
+    test (`mem_note_is_queried_only_from_this_file`) asserting the relation was
+    queried from `graph/index.rs` alone. It passed **vacuously**: it lived in
+    the file it allowed and self-matched on its own doc comment and its own
+    search literal, with no `SELF` exclusion and no "the guarded thing still
+    exists" self-guard, so renaming the relation would have deleted every
+    production query and left the suite green with decision 10 unguarded (V32
+    review Part 4 item 1). It was also restating something already structural —
+    `run`/`run_mut`/`put`/`with_write_txn`/`tx_run` are private to
+    `graph::index`, so no other module can execute a script by any spelling.
+    The half that was NOT structural is "only ONE query applies the filter",
+    inside an 8,800-line file. All note storage moved into
+    `graph/index/notes.rs`: the relation's DDL, its migration, the accessors
+    and the delete scripts the transaction cascades use, in one short file
+    where a reviewer sees every one of them at once. The remaining scan
+    (`notes::tests::note_queries_live_only_in_this_module`) is a backstop over
+    that boundary, not the enforcement — the parent still owns the executor and
+    a CozoScript is a `&str` — and it now carries the three self-guards the old
+    one lacked plus a whitespace- and positional-form-tolerant pattern
+    (`\*\s*mem_note\s*[\{\[]`; the old fixed `*mem_note{` missed both). Both
+    failure modes are mutation-checked: an atom added to another file fails,
+    and renaming the relation fails on the non-empty self-guard.
   - `context_notes` reports a **count** of withheld notes, never their text: a
     quarantine that echoed its contents back would be a read channel for
     exactly what it is holding.
@@ -688,6 +708,51 @@ declares its class AND its mutation capability in one reviewed place.
   the xterm.js config to confirm OSC 52 clipboard WRITES from displayed
   output are disabled (clipboard hijack via escape sequence in fetched
   content echoed to a terminal).
+  **Phase D amendment 2026-08-07 (#47, user-decided) — decision 9 is a type,
+  not a tripwire.**
+  - **What shipped and why it was not enough.** The channel-content invariant
+    was watched by `src/push_tripwire.rs`, a source scan anchored on
+    `PushNotice::new(` call sites with an FNV fingerprint of each content
+    argument and of `audit_push_content`'s whole body, so adding a producer or
+    editing a template failed the build until a human re-read it. The type had
+    **three other construction paths the scan could not see** (V32 review Part 4
+    item 2): a struct literal over `pub content: String`, a `..Default::default()`
+    update, and `Deserialize` — which `offload/mcp.rs` already uses on untrusted
+    input. A future `PushNotice { content: format!("{worker_answer}"), meta }`
+    would have stayed green, and `offload.session_push` — dormant today,
+    releasable tomorrow — would have carried LLM output into a message that
+    starts a turn on an idle session.
+  - **The mechanism, chosen over "port the scan to an AST query".** `content` is
+    private with `new` the sole constructor; `Default` is gone; deserialization
+    goes through `PushNoticeWire` and a validating `TryFrom` (rejects blank
+    content — "empty is not absent" — and applies the same meta-key contract as
+    the constructor). The fourth path, "the argument is a static template", is
+    closed by the signature itself: `new(template: &'static str, args: &[&str],
+    meta)` interpolates `{}` slots internally, so a composed `String` cannot be
+    passed at all. All four shapes were verified as compile errors on a scratch
+    commit — `E0451`/`E0616` (private field), `E0277` (no `Default`), `E0716`/
+    `E0597` (a non-`'static` template) — then reverted.
+  - **What the type deliberately does NOT decide**, stated so nobody reads more
+    into it: `args` are runtime `&str`, so *which values* go in the slots is
+    still a reviewer's judgement. The **sentence** a push makes is now pinned;
+    provenance of a count or a path is not a property a type can hold. Both live
+    producers interpolate only app-owned values (the project directory name and
+    the indexer's counts; the audit's tool counts, category word, configured
+    scan root and fixed pull-twin tool name), and `audit_push_content` became
+    `audit_push_notice` returning the notice, with its conditional
+    "N tool(s) failed" clause as a **second template** rather than a `push_str`
+    — because `new` will not take a composed `String`, which is the point.
+  - **`push_tripwire.rs` is deleted**, and with it the shared scanner (`src_root`,
+    `source_files`, `in_comment`, `test_spans`, `in_test_code`, `balanced`,
+    `char_literal_len`, `first_argument`) whose line heuristics were three of the
+    review's five defects. What is genuinely lost is the **FNV fingerprint**: the
+    templates and the helper body were pinned byte-for-byte, so *any* edit to
+    push wording summoned a reviewer. That is now unpinned — an edit that swaps
+    one app-owned value for another app-owned value passes silently. Judged an
+    acceptable trade because the fingerprint's real job was catching a producer
+    that started interpolating untrusted text, and that shape no longer compiles;
+    what remains uncovered is a semantic misjudgement about a value, which the
+    fingerprint only ever mitigated by making someone look.
 - **E — hook-based native-tool gating (OPTIONAL, spike-gated).**
   - Spike E1: Claude PreToolUse hook queries loopback for the session's taint
     state and denies Read/Grep/Bash while EXTERNAL-latched. Gate: added
@@ -969,9 +1034,16 @@ declares its class AND its mutation capability in one reviewed place.
       tab id may belong to a different tab sharing that directory. The stricter
       form would reject legitimate beacons today.
     - **Rows state their origin.** `outbound::Origin` (`internal` / `ipc` /
-      `http`) is a new key on every `injection_flag` row's request payload,
-      written by `record_flag_from`; `record_flag` keeps the claim-nothing
-      `internal` default for cImp's own screens. `ipc` is the only value that
+      `http`) is a new key on every `injection_flag` row's request payload.
+      #45 shipped it as a `record_flag_from(origin, flag)` beside a defaulting
+      `record_flag(flag)` that stamped `internal`, because one call site was
+      contended at the time; **#47 promoted it to a required field on
+      `outbound::Flag`** and deleted the two-function split. A struct literal
+      must name every field, so a new row's provenance is now a decision rather
+      than something inherited by writing nothing — which is the same
+      "unrepresentable, not watched" move as the rest of that issue. All nine
+      call sites state it: eight `internal`, the override route `ipc`, the
+      beacon route `http`. `ipc` is the only value that
       means a human acted. A beacon that actually MOVES a latch now also writes
       its own row (`Screen::LatchBeacon`, `ok: true` — it engaged containment,
       it denied nothing) marked `http`, whose detail says in words that the
@@ -1088,12 +1160,35 @@ declares its class AND its mutation capability in one reviewed place.
     one level above the fields and is the part privacy cannot express. It is now
     stated against behaviour rather than against field names: flipping a
     feature's L2 must move that feature's resolved value and no other's.
-    **Fixed while the scan existed, and kept because `push_tripwire` still uses
-    it:** the shared scanner's `balanced()` did not skip `'…'` char literals, so
-    `offload/outbound.rs`'s test module (which contains
-    `assert!(!s.contains('{'))`) came back with *no* `#[cfg(test)]` span — the
+    **The shared scanner outlived it by one issue and is now gone too (#47).**
+    `push_tripwire.rs`, its only other consumer, was retired when decision 9
+    became a type (see the Phase D amendment), taking `in_comment`, `test_spans`
+    and `balanced` with it. Worth recording what it taught, because the lesson
+    outlives the code: `balanced()` originally did not skip `'…'` char literals,
+    so `offload/outbound.rs`'s test module (which contains
+    `assert!(!s.contains('{'))`) came back with *no* `#[cfg(test)]` span and the
     whole module read as production code. A mis-parsing scanner is worse than an
-    absent one: the failure is a wrong answer, not a missing one.
+    absent one: the failure is a wrong answer, not a missing one. That is why
+    the rule in `MAINTENANCE.md` § *Cross-module invariants* now says a scan
+    needing to know "is this a comment" or "is this test code" needs an AST
+    query — or, better, does not need to be a scan.
+  - **`Feature::ALL` is derived, not written (#47).** It was a hand-written
+    `const` beside the enum, and a variant omitted from it was invisible to
+    `report`, `protection_reduced`, `spawn_sig`, the Settings matrix **and** to
+    `every_feature_has_a_guarded_l2_field`, which iterates the array rather than
+    the enum — so the omission removed the feature from its own coverage.
+    (`feature_keys_are_unique_and_round_trip`'s `seen.len() == Feature::ALL.len()`
+    was tautological for the same reason, and is gone.) A `declare_features!`
+    macro now emits the enum and the array from one variant list; the invocation
+    reads exactly like the enum declaration it replaced, attributes and doc
+    comments included. In the same pass `default_enabled`, `has_tab_scope`,
+    `has_worker_scope` and `spawn_baked` became **exhaustive matches** instead of
+    `matches!`: each is a decision a new control must state, and falling through
+    to `true`/`false` is how one gets taken by omission. Adding a `Feature` now
+    fails to compile until its default, both scopes, its spawn timing, its key,
+    its label and its L2 storage are all named. `strum::EnumIter` was the other
+    option and was not taken: a macro already in the file beats a new dependency
+    for eleven variants.
   - **Spawn-baked vs live.** `injection::spawn_sig` contributes the master
     switch, the two spawn-baked L2 inputs and every AI tab's resolved
     native-web mode + consumer-hygiene value to BOTH halves of

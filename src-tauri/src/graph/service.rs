@@ -3480,15 +3480,21 @@ impl GraphService {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("project");
+        // Locked decision 9: a static template plus app-owned values. Every
+        // slot below is cImp's own — the project directory name, the indexer's
+        // counts, an elapsed time — never model output, a finding message or
+        // fetched content. `PushNotice::new` takes `&'static str`, so
+        // interpolating anything else here would not compile (#47).
         let notice = crate::offload::service::PushNotice::new(
-            format!(
-                "cImp finished a full code-graph index of {project} ({}): {} files, {} symbols, {} edges in {}s. The index is live — the graph_* tools now see the current tree.",
-                root.display(),
-                stats.files,
-                stats.symbols,
-                stats.edges,
-                elapsed_ms / 1000,
-            ),
+            "cImp finished a full code-graph index of {} ({}): {} files, {} symbols, {} edges in {}s. The index is live — the graph_* tools now see the current tree.",
+            &[
+                project,
+                &root.display().to_string(),
+                &stats.files.to_string(),
+                &stats.symbols.to_string(),
+                &stats.edges.to_string(),
+                &(elapsed_ms / 1000).to_string(),
+            ],
             [("kind", "graph_index")],
         );
         let delivered = pushes.push_broadcast(notice);

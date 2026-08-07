@@ -1375,6 +1375,7 @@ impl LatchRegistry {
                 drop(tabs);
                 outbound::record_flag(outbound::Flag {
                     screen: outbound::Screen::MemoryQuarantine,
+                    origin: outbound::Origin::Internal,
                     consumer: scope.agent,
                     scope: &scope.label(),
                     tool: name,
@@ -1407,6 +1408,7 @@ impl LatchRegistry {
             if first {
                 outbound::record_flag(outbound::Flag {
                     screen: outbound::Screen::LatchRefusal,
+                    origin: outbound::Origin::Internal,
                     consumer: scope.agent,
                     scope: &scope.label(),
                     tool: name,
@@ -1670,6 +1672,7 @@ impl LatchRegistry {
             );
             outbound::record_flag(outbound::Flag {
                 screen: outbound::Screen::Budget,
+                origin: outbound::Origin::Internal,
                 consumer: scope.agent,
                 scope: &scope.label(),
                 tool,
@@ -1830,25 +1833,23 @@ pub fn apply_latch_override(
     // "restored full access" from `external` and from `local` are very
     // different events.
     let detail = override_flag_detail(action, &outcome);
-    outbound::record_flag_from(
+    outbound::record_flag(outbound::Flag {
+        screen: outbound::Screen::LatchOverride,
         // The one origin that means a human acted (#45).
-        outbound::Origin::Ipc,
-        outbound::Flag {
-            screen: outbound::Screen::LatchOverride,
-            consumer: agent,
-            scope: &scope.label(),
-            // The action is the row's at-a-glance "tool": these rows have no
-            // tool call behind them, and what the user DID is the fact worth
-            // reading.
-            tool: action.as_str(),
-            host: None,
-            url: None,
-            resolved_ip: None,
-            canary: false,
-            root: String::new(),
-            detail: &detail,
-        },
-    );
+        origin: outbound::Origin::Ipc,
+        consumer: agent,
+        scope: &scope.label(),
+        // The action is the row's at-a-glance "tool": these rows have no
+        // tool call behind them, and what the user DID is the fact worth
+        // reading.
+        tool: action.as_str(),
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: false,
+        root: String::new(),
+        detail: &detail,
+    });
     Ok(outcome.view)
 }
 
@@ -3381,21 +3382,19 @@ async fn handle_latch_beacon(
     if out.engaged {
         if let Some(scope) = scope.as_ref() {
             let detail = beacon_flag_detail(tool, &out.view);
-            outbound::record_flag_from(
-                outbound::Origin::Http,
-                outbound::Flag {
-                    screen: outbound::Screen::LatchBeacon,
-                    consumer: scope.agent,
-                    scope: &scope.label(),
-                    tool,
-                    host: None,
-                    url: None,
-                    resolved_ip: None,
-                    canary: false,
-                    root: String::new(),
-                    detail: &detail,
-                },
-            );
+            outbound::record_flag(outbound::Flag {
+                screen: outbound::Screen::LatchBeacon,
+                origin: outbound::Origin::Http,
+                consumer: scope.agent,
+                scope: &scope.label(),
+                tool,
+                host: None,
+                url: None,
+                resolved_ip: None,
+                canary: false,
+                root: String::new(),
+                detail: &detail,
+            });
         }
     }
     write_json(
@@ -3828,6 +3827,7 @@ mod tests {
     fn push_frame_is_a_single_line_sse_data_payload() {
         let notice = PushNotice::new(
             "line one\nline two\r\nline three",
+            &[],
             [("kind", "audit_done"), ("seq", "3")],
         );
         let frame = String::from_utf8(push_frame(&notice)).unwrap();
@@ -5470,21 +5470,19 @@ mod tests {
         assert!(override_detail.contains("origin: ipc"), "{override_detail}");
 
         // The machine-readable half of the same fact.
-        let request = outbound::flag_request(
-            outbound::Origin::Http,
-            &outbound::Flag {
-                screen: outbound::Screen::LatchBeacon,
-                consumer: s.agent,
-                scope: &s.label(),
-                tool: "WebFetch",
-                host: None,
-                url: None,
-                resolved_ip: None,
-                canary: false,
-                root: String::new(),
-                detail: &beacon_detail,
-            },
-        );
+        let request = outbound::flag_request(&outbound::Flag {
+            screen: outbound::Screen::LatchBeacon,
+            origin: outbound::Origin::Http,
+            consumer: s.agent,
+            scope: &s.label(),
+            tool: "WebFetch",
+            host: None,
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: String::new(),
+            detail: &beacon_detail,
+        });
         assert_eq!(request["origin"], "http");
         assert_eq!(request["screen"], "latch_beacon");
         assert_eq!(request["scope"], "claude:claude-1");

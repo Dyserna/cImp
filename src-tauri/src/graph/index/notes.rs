@@ -1,0 +1,527 @@
+//! V32 Phase C2 (locked decision 10) — the `mem_note` relation and **the one
+//! quarantine filter**.
+//!
+//! # The invariant
+//!
+//! A quarantined (`tainted`) note must not reach any recall or injection path.
+//! It is enforced at the storage layer, once: [`GraphIndex::mem_notes`] drops
+//! quarantined rows, and every consumer inherits that — `context_notes`, the
+//! compaction carry-over, the fact distiller (and therefore the launch-time
+//! `fact_promotion_block`), the Memory UI's clean list. The review UI opts
+//! *in*, through [`GraphIndex::mem_quarantined_notes`].
+//!
+//! # Why this is a module and not a comment (#47)
+//!
+//! The invariant has two halves and they need different mechanisms.
+//!
+//! **"Only `graph::index` may execute a Cozo script"** is already structural:
+//! `GraphIndex::run`, `run_mut`, `put`, `with_write_txn` and the free `tx_run`
+//! are private to `graph::index`, so no other module can reach the relation by
+//! any spelling. Nothing here adds to that half.
+//!
+//! **"Only ONE query applies the filter"** was not. `graph/index.rs` is ~8,800
+//! lines, "the second note query in this file is the bug" is not a property a
+//! reviewer can hold in their head, and the test that claimed to hold it passed
+//! **vacuously**: it lived in the very file it allowed and self-matched on its
+//! own doc comment and its own search literal, so renaming the relation would
+//! have left decision 10 unguarded with a green suite (V32 review, Part 4
+//! item 1).
+//!
+//! This module is the answer to that half. Every statement naming the relation
+//! lives here, in one short file, and the parent cannot add one without adding
+//! it *here* — where a reviewer opening the file sees all of them at once. It
+//! is encapsulation, not a compile error: `graph/index.rs` still owns the
+//! executor, and a CozoScript is a `&str`, so privacy cannot stop the parent
+//! from writing a raw query. That residue is what
+//! `tests::note_queries_live_only_in_this_module` backstops — the same idea as
+//! the retired scan, but over a few hundred lines instead of 8,800, and with
+//! the three self-guards the old one lacked.
+//!
+//! Deletes live here too, as the `RM_*` script constants `graph/index.rs`'s
+//! transaction paths use. They cannot leak a quarantined note (they remove
+//! rows), but keeping their text here is what lets the scan assert "**no**
+//! query outside this module" instead of maintaining an exception list.
+//!
+//! **House rule for this file:** never write the relation's datalog atom form
+//! (a `*` immediately followed by the relation name and a `{`) inside a comment
+//! or a string that is not a real query. The scan's self-guard counts
+//! occurrences in this file and cannot tell prose from code — a comment that
+//! satisfies the guard is precisely the vacuity bug this module replaces.
+
+use std::collections::{BTreeMap, HashSet};
+
+use cozo::{DataValue, Num, ScriptMutability};
+
+use crate::error::{AppError, AppResult};
+use crate::graph::memory::MemNote;
+
+use super::{cell_bool, cell_i64, cell_str, GraphIndex};
+
+// ── Delete scripts used by `graph/index.rs`'s transaction cascades ─────────
+//
+// `session_id` is a VALUE column on this relation (the key is `note_id`), so
+// unlike the session-keyed relations there is no prefix bind to inline and the
+// post-filter stays. Exported as constants rather than moved wholesale because
+// each is one step of a multi-relation cascade that must stay in its
+// transaction.
+
+/// Remove every note belonging to session `$sid` — `mem_clear(Some(sid))`.
+pub(super) const RM_BY_SESSION: &str =
+    "?[note_id] := *mem_note{note_id, session_id}, session_id == $sid\n:rm mem_note {note_id}";
+
+/// Remove every note in the project — `mem_clear(None)`.
+pub(super) const RM_ALL: &str = "?[note_id] := *mem_note{note_id}\n:rm mem_note {note_id}";
+
+/// Remove session `$sid`'s UNPINNED notes — the count-cap eviction and the
+/// retention sweep. Pinned notes survive project-wide by definition: they
+/// outlive the session that wrote them.
+pub(super) const RM_UNPINNED_BY_SESSION: &str =
+    "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n\
+     :rm mem_note {note_id}";
+
+impl GraphIndex {
+    /// Ensure the relation exists. Called from
+    /// [`GraphIndex::ensure_memory_relations`] with the relation set it already
+    /// read, so this costs no extra query.
+    ///
+    /// V32 Phase C2: same posture as `usage_stat` — additive, survives a graph
+    /// rebuild, and its DDL is shared with the migration stage so the two
+    /// shapes cannot drift.
+    pub(super) fn ensure_mem_note_relation(&self, existing: &HashSet<String>) -> AppResult<()> {
+        if !existing.contains("mem_note") {
+            self.run_mut(&Self::mem_note_create_ddl("mem_note"), BTreeMap::new())?;
+        }
+        Ok(())
+    }
+
+    /// The `mem_note` relation's `:create` DDL, parameterized by relation `name`
+    /// so the live relation ([`Self::ensure_memory_relations`]) and the V32
+    /// Phase C2 migration stage ([`Self::migrate_mem_note_tainted`]) share one
+    /// source of truth — the C2 shape, carrying the `tainted` column.
+    ///
+    /// `tainted` is declared `default false` so a `:put` that predates the
+    /// column (or a future partial write) lands as *not quarantined* rather than
+    /// failing — the same honest-default posture as `ref.confidence`. Every
+    /// writer in this file still passes it explicitly; the default is the
+    /// backstop, not the contract.
+    pub(super) fn mem_note_create_ddl(name: &str) -> String {
+        format!(
+            ":create {name} {{note_id: String => session_id: String, text: String, ts_ms: Int, \
+                pinned: Bool, tainted: Bool default false}}"
+        )
+    }
+
+    /// The migration stage relation used by [`Self::migrate_mem_note_tainted`].
+    /// Same contract as [`Self::USAGE_STAT_STAGE`]: a fully-populated new-shape
+    /// copy built atomically before the old `mem_note` is ever dropped, so its
+    /// presence on open always means "a prior migration was interrupted
+    /// mid-swap; adopt me".
+    pub(super) const MEM_NOTE_STAGE: &'static str = "mem_note_v32";
+
+    /// V32 Phase C2: add the `tainted` column to a pre-C2 `mem_note` relation,
+    /// defaulting existing rows to **not quarantined**.
+    ///
+    /// Defaulting old rows to `false` is the only defensible choice and is
+    /// deliberately NOT a security claim: pre-V32 notes are unauditable (locked
+    /// decision 10 says so), and marking every one of them quarantined would
+    /// dump a user's entire note history into a review queue they cannot
+    /// meaningfully triage. The compensating control for unauditable memory is
+    /// the delivery-time spotlighting envelope, which wraps clean notes too.
+    ///
+    /// Mechanically identical to [`Self::migrate_usage_stat_origin`] — see that
+    /// method for why the crash-safe stage-and-swap is shaped this way (CozoDB
+    /// autocommits each script, so a naive remove→create→put loses data if the
+    /// process dies mid-sequence). Called from the writable [`Self::open`]
+    /// migration path only; `open_existing` consumers are read-only and are
+    /// protected instead by the [`super::GRAPH_SCHEMA_VERSION`] gate, which refuses a
+    /// store whose `mem_note` has not been migrated yet.
+    pub(super) fn migrate_mem_note_tainted(&self) -> AppResult<()> {
+        let existing = self.existing_relations()?;
+        // Recovery: a leftover stage means a prior migration was interrupted
+        // after the stage was durably populated. Adopt the stage over whatever
+        // `mem_note` currently is — never the reverse, so no notes are lost.
+        if existing.contains(Self::MEM_NOTE_STAGE) {
+            return self.promote_mem_note_stage();
+        }
+        if !existing.contains("mem_note") {
+            return Ok(());
+        }
+        if self.relation_has_column("mem_note", "tainted")? {
+            return Ok(());
+        }
+        let rows = self.run(
+            "?[note_id, session_id, text, ts_ms, pinned] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let expected = rows.rows.len();
+        let migrated: Vec<DataValue> = rows
+            .rows
+            .into_iter()
+            .map(|mut r| {
+                r.push(DataValue::Bool(false));
+                DataValue::List(r)
+            })
+            .collect();
+        if migrated.is_empty() {
+            self.run_mut(
+                &Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE),
+                BTreeMap::new(),
+            )?;
+        } else {
+            let mut p = BTreeMap::new();
+            p.insert("rows".to_string(), DataValue::List(migrated));
+            self.run_mut(
+                &format!(
+                    "?[note_id, session_id, text, ts_ms, pinned, tainted] <- $rows\n{}",
+                    Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE)
+                ),
+                p,
+            )?;
+        }
+        // Verify the stage captured every old row before dropping the original.
+        let staged = self.mem_note_row_count(Self::MEM_NOTE_STAGE)?;
+        if staged != expected {
+            self.run_mut(&format!("::remove {}", Self::MEM_NOTE_STAGE), BTreeMap::new())?;
+            return Err(AppError::Graph(format!(
+                "mem_note migration stage captured {staged} of {expected} rows; aborting"
+            )));
+        }
+        self.promote_mem_note_stage()
+    }
+
+    /// Promote a fully-populated [`Self::MEM_NOTE_STAGE`] to `mem_note`.
+    /// Idempotent on retry, exactly like [`Self::promote_usage_stat_stage`].
+    fn promote_mem_note_stage(&self) -> AppResult<()> {
+        if self.existing_relations()?.contains("mem_note") {
+            self.run_mut("::remove mem_note", BTreeMap::new())?;
+        }
+        self.run_mut(
+            &format!("::rename {} -> mem_note", Self::MEM_NOTE_STAGE),
+            BTreeMap::new(),
+        )?;
+        Ok(())
+    }
+
+    /// Row count of a `mem_note`-shaped relation, counted by its `note_id`
+    /// primary key so CozoScript's set semantics cannot dedupe distinct rows
+    /// into an undercount. Migration verification only.
+    fn mem_note_row_count(&self, name: &str) -> AppResult<usize> {
+        let rows = self.run(
+            &format!("?[note_id] := *{name}{{note_id}}"),
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.len())
+    }
+
+    /// Record a note (a decision/fact) for a session.
+    ///
+    /// V32 Phase C2: `tainted` marks the note **quarantined** — stored, but
+    /// invisible to every read path until a human promotes it
+    /// ([`Self::mem_promote_note`]). It is decided by the loopback taint latch
+    /// (`Latch::proxy_gate`) and threaded here through `run_graph_tool` →
+    /// `dispatch_recorded` → `run_tool`; nothing in this layer infers it, so a
+    /// caller that forgets it writes a clean note — which is why the parameter
+    /// is a `WriteTaint` at every layer above rather than a bare `bool`.
+    pub fn mem_add_note(
+        &self,
+        note_id: &str,
+        session_id: &str,
+        text: &str,
+        ts_ms: i64,
+        pinned: bool,
+        tainted: bool,
+    ) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("nid".to_string(), DataValue::Str(note_id.into()));
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        p.insert("text".to_string(), DataValue::Str(text.into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
+        p.insert("pin".to_string(), DataValue::Bool(pinned));
+        p.insert("taint".to_string(), DataValue::Bool(tainted));
+        self.run_mut(
+            "?[note_id, session_id, text, ts_ms, pinned, tainted] <- \
+                [[$nid, $sid, $text, $ts, $pin, $taint]]\n\
+             :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Set/clear the pinned flag on a note.
+    pub fn mem_set_note_pinned(&self, note_id: &str, pinned: bool) -> AppResult<()> {
+        self.rewrite_note(note_id, |n| n.pinned = pinned)
+    }
+
+    /// V32 Phase C2: release a quarantined note into normal memory. Clears
+    /// `tainted` only — the pinned state is preserved, because the model's
+    /// `pin: true` was a statement about the note's *scope*, and re-deciding it
+    /// on the user's behalf would either lose a durable finding or silently
+    /// promote a session note to project-wide.
+    pub fn mem_promote_note(&self, note_id: &str) -> AppResult<()> {
+        self.rewrite_note(note_id, |n| n.tainted = false)
+    }
+
+    /// V32 Phase C2: permanently delete one note (the quarantine review's
+    /// DISCARD action). Tolerant of a missing id, like every other single-row
+    /// mutation here — a stale UI row must not raise an error toast.
+    pub fn mem_delete_note(&self, note_id: &str) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("nid".to_string(), DataValue::Str(note_id.into()));
+        self.run_mut(
+            "?[note_id] := *mem_note{note_id}, note_id == $nid\n:rm mem_note {note_id}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Read-modify-write one note's row, applying `mutate` to the in-memory
+    /// copy — the same shape (and the same tolerant-missing-id posture) as
+    /// [`Self::rewrite_fact`]. Reading every column back and writing it whole is
+    /// what keeps a future column from being silently dropped by a partial
+    /// `:put`; `tainted` was exactly such a column when C2 added it.
+    fn rewrite_note(&self, note_id: &str, mutate: impl FnOnce(&mut MemNote)) -> AppResult<()> {
+        let mut p = BTreeMap::new();
+        p.insert("nid".to_string(), DataValue::Str(note_id.into()));
+        let rows = self.run(
+            "?[session_id, text, ts_ms, pinned, tainted] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted}, note_id == $nid",
+            p.clone(),
+            ScriptMutability::Immutable,
+        )?;
+        let Some(r) = rows.rows.first() else {
+            return Ok(());
+        };
+        let mut note = MemNote {
+            note_id: note_id.to_string(),
+            session_id: cell_str(r, 0),
+            text: cell_str(r, 1),
+            ts_ms: cell_i64(r, 2),
+            pinned: cell_bool(r, 3),
+            tainted: cell_bool(r, 4),
+        };
+        mutate(&mut note);
+        p.insert(
+            "sid".to_string(),
+            DataValue::Str(note.session_id.as_str().into()),
+        );
+        p.insert("text".to_string(), DataValue::Str(note.text.as_str().into()));
+        p.insert("ts".to_string(), DataValue::Num(Num::Int(note.ts_ms)));
+        p.insert("pin".to_string(), DataValue::Bool(note.pinned));
+        p.insert("taint".to_string(), DataValue::Bool(note.tainted));
+        self.run_mut(
+            "?[note_id, session_id, text, ts_ms, pinned, tainted] <- \
+                [[$nid, $sid, $text, $ts, $pin, $taint]]\n\
+             :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// A session's notes plus every pinned note in the project, pinned first
+    /// then newest.
+    ///
+    /// **V32 Phase C2: quarantined (`tainted`) notes are excluded here**, at the
+    /// storage layer, rather than in each caller. That is deliberate — this one
+    /// method backs *every* consumer of session notes (`context_notes`, the
+    /// compaction carry-over, the fact distiller, the Memory UI), and locked
+    /// decision 10's invariant is "no read path leaks a tainted note except the
+    /// review UI". A filter each caller had to remember to apply would be one
+    /// forgotten call site away from re-opening the persistence channel; the
+    /// review UI opts *in* instead, via [`Self::mem_quarantined_notes`].
+    pub fn mem_notes(&self, session_id: &str) -> AppResult<Vec<MemNote>> {
+        let mut p = BTreeMap::new();
+        p.insert("sid".to_string(), DataValue::Str(session_id.into()));
+        let rows = self.run(
+            "?[note_id, session_id, text, ts_ms, pinned] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted}, \
+                tainted == false, (session_id == $sid or pinned == true)",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        let mut notes: Vec<MemNote> = rows
+            .rows
+            .iter()
+            .map(|r| MemNote {
+                note_id: cell_str(r, 0),
+                session_id: cell_str(r, 1),
+                text: cell_str(r, 2),
+                ts_ms: cell_i64(r, 3),
+                pinned: cell_bool(r, 4),
+                tainted: false,
+            })
+            .collect();
+        notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.ts_ms.cmp(&a.ts_ms)));
+        Ok(notes)
+    }
+
+    /// V32 Phase C2: every quarantined note in the project, newest first.
+    ///
+    /// Project-wide and session-independent on purpose: a quarantined note's
+    /// own session is by definition a contaminated one, often already finished,
+    /// so scoping the review queue to "the current session" would hide exactly
+    /// the notes that need a decision. This is the one read path allowed to
+    /// return tainted rows, and its only consumer is the Memory UI
+    /// (`GraphService::memory_snapshot`).
+    pub fn mem_quarantined_notes(&self) -> AppResult<Vec<MemNote>> {
+        let rows = self.run(
+            "?[note_id, session_id, text, ts_ms, pinned] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted}, tainted == true",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let mut notes: Vec<MemNote> = rows
+            .rows
+            .iter()
+            .map(|r| MemNote {
+                note_id: cell_str(r, 0),
+                session_id: cell_str(r, 1),
+                text: cell_str(r, 2),
+                ts_ms: cell_i64(r, 3),
+                pinned: cell_bool(r, 4),
+                tainted: true,
+            })
+            .collect();
+        notes.sort_by_key(|n| std::cmp::Reverse(n.ts_ms));
+        Ok(notes)
+    }
+
+    /// How many notes are quarantined project-wide. Feeds the `context_notes`
+    /// tool's count-only footer — the model is told *that* its write landed in
+    /// review, never the withheld text, so a compromised session cannot use the
+    /// quarantine as a side channel to read back what it planted.
+    pub fn mem_quarantined_count(&self) -> AppResult<usize> {
+        let rows = self.run(
+            "?[note_id] := *mem_note{note_id, tainted}, tainted == true",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows.rows.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// This module's own file — the one place in `src/` a note query may
+    /// appear. Slash-separated, matching what [`source_files`] produces.
+    const SELF: &str = "graph/index/notes.rs";
+
+    /// The source tree, resolved from the manifest rather than the process cwd
+    /// so the scan gives the same answer from any working directory (verified
+    /// by running the suite from `C:\`).
+    fn src_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every `.rs` file under `src/`, as `(relative-slash-path, contents)`.
+    /// Panics on a missing or unreadable tree: a scan that silently returns
+    /// nothing is indistinguishable from a green suite.
+    fn source_files() -> Vec<(String, String)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, root, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p)
+                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, text));
+                }
+            }
+        }
+        let root = src_root();
+        assert!(
+            root.is_dir(),
+            "the source tree is missing at {} — this scan cannot run",
+            root.display()
+        );
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// A datalog atom over the note relation, in **either** CozoScript spelling:
+    /// the named form (`{a, b}`) this codebase uses and the positional form
+    /// (`[a, b]`) it does not, with whitespace tolerated between every part.
+    ///
+    /// The retired version of this scan matched the fixed string `*mem_note{`,
+    /// so both a space and the positional form evaded it entirely. The trailing
+    /// delimiter is required, which is also what keeps the stage relation
+    /// (`mem_note_v32`) and any future suffixed sibling from matching here: a
+    /// name that continues past `mem_note` has neither `{` nor `[` next.
+    fn atom() -> regex::Regex {
+        regex::Regex::new(r"\*\s*mem_note\s*[\{\[]").expect("a static pattern compiles")
+    }
+
+    /// The cross-module half of locked decision 10, as a backstop to the module
+    /// boundary above: no file outside this one queries the note relation, so
+    /// the quarantine filter in `mem_notes` cannot be bypassed by a reader that
+    /// writes its own datalog.
+    ///
+    /// Three self-guards, all of which the retired version lacked (#47):
+    ///
+    /// 1. **`SELF` is excluded**, so this file's own regex and prose cannot
+    ///    satisfy the assertion the way `graph/index.rs` satisfied the old one.
+    /// 2. **The scan must find its own file**, so a rename or a move of this
+    ///    module fails here instead of silently scanning nothing.
+    /// 3. **The guarded thing must still exist**: at least one real query left
+    ///    in this module. Renaming the relation (say to a `_v2`) makes every
+    ///    atom vanish everywhere; without this the scan would then pass while
+    ///    guarding nothing at all, which is exactly how the old one would have
+    ///    failed. Note what this guard deliberately does NOT try to check: that
+    ///    the filter still *works*. That is behaviour, and behaviour is pinned
+    ///    by a behavioural test — see
+    ///    `quarantined_notes_are_hidden_from_reads_until_promoted` in
+    ///    `graph/index.rs`. A source scan asserting that its own file contains
+    ///    some substring is satisfied by its own error message.
+    #[test]
+    fn note_queries_live_only_in_this_module() {
+        let files = source_files();
+        let re = atom();
+        let mut mine: Option<usize> = None;
+        let mut offenders: Vec<String> = Vec::new();
+        for (rel, text) in &files {
+            let hits = re.find_iter(text).count();
+            if rel == SELF {
+                mine = Some(hits);
+            } else if hits > 0 {
+                offenders.push(format!("{rel} ({hits})"));
+            }
+        }
+
+        let mine = mine.unwrap_or_else(|| {
+            panic!(
+                "the scan did not find its own source at `{SELF}` — this module moved and the \
+                 scan is now watching nothing. Point SELF at the new path."
+            )
+        });
+        assert!(
+            mine > 0,
+            "no note query left in `{SELF}` — if the relation was renamed, update the pattern in \
+             `atom()` and this message; until then locked decision 10's read exclusion is \
+             unguarded and every assertion below is vacuous."
+        );
+        assert!(
+            offenders.is_empty(),
+            "MEMORY QUARANTINE INVARIANT (V32 locked decision 10) — these files query the note \
+             relation directly: {offenders:?}\n\n\
+             A quarantined note is one a contaminated conversation wrote; a reader that writes \
+             its own datalog gets the tainted rows too, and no unit test of that call site would \
+             notice. Route the read through `GraphIndex::mem_notes` (quarantine-filtered) or \
+             `GraphIndex::mem_quarantined_notes` (the review UI's explicit opt-in), or move the \
+             query into `{SELF}` beside the others."
+        );
+    }
+}

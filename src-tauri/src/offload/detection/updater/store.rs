@@ -52,6 +52,15 @@ pub const STATE_DIR: &str = "detection-updates";
 pub const STATE_FILE: &str = "state.json";
 /// Schema of [`State`]. Bumped only for an incompatible change; an unknown
 /// version is treated as "no state" (see [`load_state`]).
+///
+/// **Still 1 after #46 and #48**, on purpose. Every field either side of those
+/// issues added is additive `#[serde(default)]`, and a bump is not free: it
+/// takes [`load_state`]'s unknown-schema path, which throws away
+/// `installed_version` and `previous_version` — the install history Revert and
+/// the "is this newer?" comparison are built on. The one thing a pre-#46 file
+/// carries that MUST NOT be trusted verbatim is its failure record, and that is
+/// repaired in place by [`heal_pre_split_failure`] rather than paid for with
+/// everything else in the file.
 pub const STATE_SCHEMA: u32 = 1;
 
 /// `<exe-dir>/detection-updates`. `None` only when `current_exe` has no usable
@@ -235,12 +244,26 @@ pub struct ComponentState {
     #[serde(default)]
     pub last_outcome_kind: String,
     /// Consecutive checks that ended `unavailable` — the update channel could
-    /// not be reached at all. Reset to 0 by ANY check that reached it, refusal
-    /// included. One 404 is weather; a long run of them is the component
-    /// quietly ceasing to get fresher, which is the state decision 13 exists to
-    /// surface (`updater::STALLED_AFTER_CHECKS`).
+    /// not be reached at all. Reset to 0 by any check that REACHED it, refusal
+    /// included; a revert reaches nothing and leaves it alone (#48). Read by
+    /// Settings, which says how long the silence has lasted rather than
+    /// repeating one 404 forever.
     #[serde(default)]
     pub unreachable_streak: u32,
+    /// Consecutive checks that did not leave this component fresher — i.e.
+    /// everything except [`Outcome::Applied`](super::Outcome::Applied) and
+    /// [`Outcome::UpToDate`](super::Outcome::UpToDate), the only two outcomes
+    /// that prove the installed data IS the currently published data.
+    ///
+    /// The freshness canary decision 13 actually asks for, and deliberately
+    /// **outcome-agnostic**: `unreachable_streak` cannot see a channel that is
+    /// perfectly reachable and refuses every bundle it serves, which is a
+    /// component frozen just as hard and — once its failure card is dismissed —
+    /// with no signal at all (#48). Reverts touch it in neither direction: they
+    /// are not checks and say nothing about what is published.
+    /// Consumed by `updater::signals_from` at `updater::STALLED_AFTER_CHECKS`.
+    #[serde(default)]
+    pub stale_streak: u32,
     /// A newer version the last check found but did not apply — set in
     /// `check-only` mode, and cleared on a successful apply. This is the field
     /// the "update available" Advisor card and the Apply button read.
@@ -318,7 +341,12 @@ pub fn load_state(root: &Path) -> State {
         return State::default();
     };
     match serde_json::from_str::<State>(&raw) {
-        Ok(s) if s.schema == STATE_SCHEMA => s,
+        Ok(mut s) if s.schema == STATE_SCHEMA => {
+            for c in Component::ALL {
+                heal_pre_split_failure(s.get_mut(c), c);
+            }
+            s
+        }
         Ok(s) => {
             warn!(
                 target: "offload",
@@ -338,6 +366,63 @@ pub fn load_state(root: &Path) -> State {
             State::default()
         }
     }
+}
+
+/// Drop a failure record written by a build that predates the #46 outcome
+/// split, in which a transport failure was recorded as a bundle refusal.
+///
+/// # Why this exists at all
+///
+/// #46 was **forward-only**, and on an upgrading install that made its symptom
+/// worse rather than better (#48). A pre-#46 state file carries a `last_failure`
+/// recorded from a 404 against a release that does not exist yet;
+/// `signals_from` raises the refusal card from that field alone, and `finish`
+/// clears it only on `Applied`/`UpToDate`/`Reverted` — none of which can happen
+/// while the channel is unreachable, which it is by construction until
+/// `detection-v1` is published. So the two "update REJECTED" cards #46 removed
+/// for new installs would have fired **forever** on every existing one — and
+/// re-fired even if previously dismissed, because #46 moved the dismissal key
+/// off `component:version`.
+///
+/// # The predicate, and why it is exact
+///
+/// A failure with **no version and no signature** can only have been written by
+/// a pre-#46 build: since #46, `finish` derives the signature inside itself and
+/// [`super::failure_signature`] never returns an empty string, so every refusal
+/// this build records carries one. And a pre-#46 *versionless* failure was
+/// always either `fail_all`'s manifest-level failure (a 404, an unparseable
+/// body, an unknown schema) or `revert`'s "nothing to revert to" — every one of
+/// them an event that #46/#48 reclassify as **not a refusal**.
+///
+/// A pre-#46 failure that HAS a version is left exactly as it is: that was a
+/// real bundle-level refusal (checksum, gauntlet, reload), its dismissal key is
+/// still `component:version`, and both the card and the dismissal keep working.
+///
+/// Nothing is invented and nothing is hidden: if the condition is still true,
+/// the next check re-records it within one interval with an honest outcome —
+/// which is the same self-healing property "a card outliving its condition is
+/// worse than no card" (decision 13) asks for in the other direction.
+///
+/// `last_outcome` / `last_ok` are deliberately NOT rewritten. They are the
+/// verbatim record of what that build reported for that check, they are display
+/// only, and the first check after launch overwrites them.
+fn heal_pre_split_failure(cs: &mut ComponentState, c: Component) {
+    if cs.last_failure.is_empty()
+        || !cs.last_failure_version.is_empty()
+        || !cs.last_failure_signature.is_empty()
+    {
+        return;
+    }
+    info!(
+        target: "offload",
+        component = c.as_str(),
+        failure = %cs.last_failure,
+        "detection updater: dropping a pre-#46 failure record (a transport failure recorded as a \
+         bundle refusal); the next check records what is actually true"
+    );
+    cs.last_failure.clear();
+    cs.last_failure_version.clear();
+    cs.last_failure_signature.clear();
 }
 
 /// Persist `state`. Written whole, via a temp file and a rename, so a crash
@@ -455,5 +540,102 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         // An absent directory is the cold-start case.
         assert_eq!(load_state(&dir), State::default());
+    }
+
+    /// #48/A1-1: the upgrade case, which no other test covers because every
+    /// other one starts from a fresh `Tree`.
+    ///
+    /// A state file written by a build that predates the #46 split carries a
+    /// 404 recorded as a bundle refusal. Loaded verbatim it would card
+    /// "REJECTED" forever — nothing clears `last_failure` while the channel
+    /// stays unreachable — and #46's new dismissal key means a prior dismissal
+    /// would not even hold. So the failure record is dropped on load, and
+    /// everything else in the file (which a `STATE_SCHEMA` bump would have
+    /// thrown away) survives.
+    #[test]
+    fn a_pre_split_transport_failure_is_dropped_on_load_and_the_history_kept() {
+        let dir = tmp();
+        // Exactly the shape f645af4's predecessor wrote: no `last_outcome_kind`,
+        // no `unreachable_streak`, no `last_failure_signature`, and a manifest
+        // level failure signed with an empty version.
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{
+              "schema": 1,
+              "rules": {
+                "installed_version": "2026.08.07",
+                "previous_version": "(shipped)",
+                "last_check_ms": 1770000000000,
+                "last_outcome": "update check failed: GET https://…/manifest.json: HTTP 404",
+                "last_ok": false,
+                "last_failure": "update check failed: GET https://…/manifest.json: HTTP 404",
+                "last_failure_version": ""
+              },
+              "classifier": {
+                "last_check_ms": 1770000000000,
+                "last_outcome": "update check failed: GET https://…/manifest.json: HTTP 404",
+                "last_ok": false,
+                "last_failure": "update check failed: GET https://…/manifest.json: HTTP 404",
+                "last_failure_version": ""
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let st = load_state(&dir);
+        for c in Component::ALL {
+            let cs = st.get(c);
+            assert!(
+                cs.last_failure.is_empty(),
+                "{c:?} still carries the pre-split failure: {}",
+                cs.last_failure
+            );
+            assert!(cs.last_failure_signature.is_empty());
+        }
+        // The install history — what a schema bump would have cost — is intact.
+        let rules = st.get(Component::Rules);
+        assert_eq!(rules.installed_version, "2026.08.07");
+        assert_eq!(rules.previous_version, "(shipped)");
+        assert_eq!(rules.last_check_ms, 1_770_000_000_000);
+        // …and the verbatim record of that check is untouched: it is display
+        // only, and the next check overwrites it.
+        assert!(rules.last_outcome.contains("HTTP 404"));
+        // Nothing reaches the Advisor from a healed file.
+        let (available, failed, stalled) = super::super::signals_from(&st);
+        assert!(available.is_empty() && failed.is_empty() && stalled.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the predicate: a pre-split failure that HAS a version
+    /// was a real bundle refusal, its dismissal key is unchanged, and it must
+    /// survive the load untouched.
+    #[test]
+    fn a_pre_split_bundle_refusal_keeps_its_record_and_its_dismissal_key() {
+        let dir = tmp();
+        std::fs::write(
+            dir.join(STATE_FILE),
+            r#"{
+              "schema": 1,
+              "rules": {
+                "last_check_ms": 1770000000000,
+                "last_ok": false,
+                "last_failure": "checksum mismatch on `core.yar`",
+                "last_failure_version": "2026.08.08"
+              },
+              "classifier": {}
+            }"#,
+        )
+        .unwrap();
+
+        let st = load_state(&dir);
+        let rules = st.get(Component::Rules);
+        assert_eq!(rules.last_failure, "checksum mismatch on `core.yar`");
+        let (_, failed, _) = super::super::signals_from(&st);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].signature, "2026.08.08",
+            "the pre-#46 key was the version, and it still is"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

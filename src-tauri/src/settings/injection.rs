@@ -927,9 +927,16 @@ pub fn report(s: &Settings, scope: Scope<'_>) -> Vec<FeatureState> {
 /// no-raw-reads invariant is only enforceable if it has no exceptions worth
 /// arguing about — and since #44 there is no other option: `protection` is
 /// `pub(in crate::settings)`, so this accessor is the ONLY way an outside module
-/// can see the master. Callers outside the crate's settings module today:
-/// `offload::detection::updater::tick_once` (#46 — the update scheduler is
-/// gated under L1) and the surfaces that render it as a switch. Keep it `pub`.
+/// can see the master. Its only caller outside this module is
+/// `offload::loopback::injection_status`, which renders the master as a switch
+/// beside the resolved features. Keep it `pub`.
+///
+/// **Not for gating.** An enforcement site asking "may I do this?" wants
+/// [`effective`] for its own [`Feature`], which folds L1 in already; gating on
+/// L1 alone answers a different question and misses L2. The detection updater's
+/// scheduler did exactly that between #46 and #48 — protection on, detection
+/// off, and it still made a daily request and swapped bundles for a surface
+/// that was switched off.
 pub fn master_enabled(s: &Settings) -> bool {
     s.offload.injection.protection
 }

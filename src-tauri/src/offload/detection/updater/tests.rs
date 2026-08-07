@@ -416,14 +416,121 @@ async fn revert_restores_the_previous_bundle_and_can_itself_be_undone() {
 
 /// With nothing retained there is nothing to revert to, and saying so is
 /// better than a no-op that looks like success.
+///
+/// #48/A1-2 + A1-3: saying so is NOT saying "a bundle was rejected". Nothing
+/// was fetched, so nothing was refused; the card must not fire, and a pending
+/// offer must survive a click that changed nothing.
 #[tokio::test]
-async fn revert_with_nothing_retained_reports_that_rather_than_pretending() {
+async fn revert_with_nothing_retained_is_a_local_failure_not_a_bundle_refusal() {
     let tree = Tree::new();
     tree.seed_rules("core.yar", GOOD_RULE);
+    // A standing check-only offer, which the click must leave alone.
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    assert_eq!(
+        run_rules(&tree, Mode::Check, &fetcher).await.outcome,
+        Outcome::Available
+    );
+
     let r = revert(Component::Rules, &tree.layout, &scoped_reload);
-    assert_eq!(r.outcome, Outcome::Rejected);
+    assert_eq!(r.outcome, Outcome::RevertFailed);
     assert!(r.detail.contains("nothing to revert to"), "{}", r.detail);
     assert!(tree.live_rule_text("core.yar").contains("IgnorePrevious"));
+
+    let cs = tree.state().get(Component::Rules).clone();
+    assert!(
+        cs.last_failure.is_empty(),
+        "no document was refused, so no refusal is recorded: {}",
+        cs.last_failure
+    );
+    assert_eq!(
+        cs.available_version, "2026.08.07",
+        "a click that did nothing must not withdraw a legitimate offer"
+    );
+    let (available, failed, _) = signals_from(&tree.state());
+    assert_eq!(available.len(), 1, "the offer still cards");
+    assert!(failed.is_empty(), "and nothing claims a bundle was refused");
+}
+
+/// The other revert failure: something WAS retained and the restore itself
+/// failed. Still local, still not a refusal — and the previous version must not
+/// land in the offer slot, where Settings would advertise a downgrade as
+/// "a newer bundle is available" (#48/A1-3).
+#[tokio::test]
+async fn a_failed_revert_never_offers_the_previous_version_as_an_update() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    assert_eq!(
+        run_rules(&tree, Mode::Auto, &fetcher).await.outcome,
+        Outcome::Applied
+    );
+    // Retained per state, gone from disk — the "empty or missing" branch.
+    store::wipe_dir(&store::previous_dir(
+        &tree.layout.state_root,
+        Component::Rules,
+        SHIPPED_VERSION,
+    ));
+
+    let r = revert(Component::Rules, &tree.layout, &scoped_reload);
+    assert_eq!(r.outcome, Outcome::RevertFailed, "{}", r.detail);
+    assert!(!r.outcome.ok(), "a user action that failed is not healthy");
+    assert!(r.detail.contains("revert failed"), "{}", r.detail);
+
+    let cs = tree.state().get(Component::Rules).clone();
+    assert!(
+        cs.available_version.is_empty(),
+        "the PREVIOUS version must never be offered as an update: {}",
+        cs.available_version
+    );
+    assert!(cs.last_failure.is_empty(), "{}", cs.last_failure);
+    let (available, failed, _) = signals_from(&tree.state());
+    assert!(available.is_empty() && failed.is_empty(), "no cards at all");
+    // The live data is exactly what it was: the restore never started.
+    assert!(tree.live_rule_text("core.yar").contains("RoleForgery"));
+}
+
+/// #48/A1-6: a revert reaches no channel, so it cannot end a run of silence.
+/// As a plain `!= Unavailable` reset, clicking Revert on a machine behind a
+/// blocking proxy zeroed the streak — and clicking it weekly suppressed the
+/// stall card indefinitely.
+#[tokio::test]
+async fn a_revert_leaves_the_unreachable_streak_where_it_was() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let dead = MapFetcher::new(HashMap::new());
+    for _ in 0..3 {
+        run_rules(&tree, Mode::Auto, &dead).await;
+    }
+    assert_eq!(tree.state().get(Component::Rules).unreachable_streak, 3);
+
+    // A failed revert (nothing retained)…
+    assert_eq!(
+        revert(Component::Rules, &tree.layout, &scoped_reload).outcome,
+        Outcome::RevertFailed
+    );
+    assert_eq!(tree.state().get(Component::Rules).unreachable_streak, 3);
+
+    // …and a successful one. Apply a bundle first so there is something to
+    // restore; that reaches the channel and legitimately resets the streak, so
+    // rebuild it before the revert.
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    assert_eq!(
+        run_rules(&tree, Mode::Auto, &fetcher).await.outcome,
+        Outcome::Applied
+    );
+    for _ in 0..2 {
+        run_rules(&tree, Mode::Auto, &dead).await;
+    }
+    assert_eq!(tree.state().get(Component::Rules).unreachable_streak, 2);
+    assert_eq!(
+        revert(Component::Rules, &tree.layout, &scoped_reload).outcome,
+        Outcome::Reverted
+    );
+    assert_eq!(
+        tree.state().get(Component::Rules).unreachable_streak,
+        2,
+        "restoring a local file says nothing about the network"
+    );
 }
 
 /// A second run over the same manifest is a no-op: the daily check must not
@@ -463,14 +570,26 @@ async fn an_unreachable_channel_is_a_quiet_non_event_not_a_rejection() {
     assert_eq!(r.outcome, Outcome::Unavailable, "{}", r.detail);
     assert!(r.outcome.ok(), "the activity row must not be red");
     assert!(
-        r.detail.contains("could not reach the update channel"),
-        "{}",
-        r.detail
-    );
-    assert!(
         !r.detail.to_ascii_lowercase().contains("rejected"),
         "nothing was rejected: {}",
         r.detail
+    );
+    // #48/A1-7: Settings renders this line under its own "Could not reach the
+    // update channel:" label (SettingsApp.svelte, the `unavailable` branch), so
+    // what matters is the COMPOSITION, not that either half contains the words.
+    // The stored detail carried the label too, and every unavailable check read
+    // "Could not reach the update channel: could not reach the update channel:".
+    let rendered = format!("Could not reach the update channel: {}", r.detail);
+    assert_eq!(
+        rendered.to_ascii_lowercase().matches("could not reach").count(),
+        1,
+        "the label is the surface's, not the detail's: {rendered}"
+    );
+    assert!(rendered.contains("HTTP 404"), "{rendered}");
+    assert!(
+        rendered.ends_with("Nothing was checked and nothing changed; the current detection data \
+                            is still live."),
+        "{rendered}"
     );
 
     // The live data is untouched, and nothing reaches the Advisor.
@@ -596,7 +715,7 @@ async fn the_unreachable_streak_raises_a_stall_signal_and_a_success_resets_it() 
     assert_eq!(stalled.len(), 1, "the threshold raises exactly one signal");
     assert_eq!(stalled[0].component, "rules");
     assert_eq!(stalled[0].streak, STALLED_AFTER_CHECKS);
-    assert!(stalled[0].reason.contains("could not reach"));
+    assert!(stalled[0].reason.contains("HTTP 404"), "{}", stalled[0].reason);
 
     // A channel that comes back ends the run immediately.
     let (_, alive) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
@@ -629,6 +748,154 @@ async fn a_refusal_resets_the_unreachable_streak_because_the_channel_answered() 
     let r = run_rules(&tree, Mode::Auto, &fetcher).await;
     assert_eq!(r.outcome, Outcome::Rejected, "{}", r.detail);
     assert_eq!(tree.state().get(Component::Rules).unreachable_streak, 0);
+}
+
+/// #48/A1-4: a bundle that was REFUSED sits in the offer slot so Settings can
+/// name it and Apply can retry it — but it must not also fire the "a newer
+/// bundle is available" card, whose rationale blames the user's own check-only
+/// setting for something the updater refused in `auto` mode. One event, one
+/// card.
+#[tokio::test]
+async fn a_refused_bundle_is_not_also_advertised_as_an_available_update() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let (json, _) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    let mut map = HashMap::new();
+    map.insert(
+        manifest::DEFAULT_MANIFEST_URL.to_string(),
+        json.into_bytes(),
+    );
+    map.insert(
+        format!("{BASE}2026.08.07-core.yar"),
+        vec![b'x'; GOOD_RULE_V2.len()],
+    );
+
+    let r = run_rules(&tree, Mode::Auto, &MapFetcher::new(map)).await;
+    assert_eq!(r.outcome, Outcome::Rejected, "{}", r.detail);
+    let cs = tree.state().get(Component::Rules).clone();
+    assert_eq!(
+        cs.available_version, "2026.08.07",
+        "Settings still names the refused version, and Apply can retry it"
+    );
+
+    let (available, failed, _) = signals_from(&tree.state());
+    assert_eq!(failed.len(), 1, "the refusal cards");
+    assert!(
+        available.is_empty(),
+        "and nothing offers the same bundle as a pending update: {available:?}"
+    );
+}
+
+/// #48/A1-5: the case `unreachable_streak` could not see. A channel that
+/// answers every single time and refuses every bundle it serves leaves the
+/// streak at 0 forever, and the refusal card's signature never ages — so one
+/// dismissal froze the component with NO signal at all. The freshness canary is
+/// outcome-agnostic precisely so this reaches the Advisor.
+#[tokio::test]
+async fn a_channel_that_answers_and_refuses_everything_still_raises_the_stall_card() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let (json, _) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    let mut map = HashMap::new();
+    map.insert(
+        manifest::DEFAULT_MANIFEST_URL.to_string(),
+        json.into_bytes(),
+    );
+    map.insert(
+        format!("{BASE}2026.08.07-core.yar"),
+        vec![b'x'; GOOD_RULE_V2.len()],
+    );
+    let refusing = MapFetcher::new(map);
+
+    for n in 1..STALLED_AFTER_CHECKS {
+        assert_eq!(
+            run_rules(&tree, Mode::Auto, &refusing).await.outcome,
+            Outcome::Rejected
+        );
+        assert_eq!(tree.state().get(Component::Rules).stale_streak, n);
+        assert!(
+            signals_from(&tree.state()).2.is_empty(),
+            "below the threshold the refusal card carries it alone (n={n})"
+        );
+    }
+    run_rules(&tree, Mode::Auto, &refusing).await;
+
+    let cs = tree.state().get(Component::Rules).clone();
+    assert_eq!(
+        cs.unreachable_streak, 0,
+        "the channel answered every time — this is exactly what the old counter missed"
+    );
+    let (_, failed, stalled) = signals_from(&tree.state());
+    assert_eq!(failed.len(), 1, "the refusal still cards");
+    assert_eq!(stalled.len(), 1, "and so does the freshness canary");
+    assert_eq!(stalled[0].streak, STALLED_AFTER_CHECKS);
+    assert!(
+        stalled[0].reason.contains("checksum mismatch"),
+        "the card quotes the cause rather than guessing at one: {}",
+        stalled[0].reason
+    );
+
+    // A bundle that finally lands ends the run.
+    let (_, good) = rules_manifest("2026.08.08", &[("core.yar", GOOD_RULE_V2)]);
+    assert_eq!(
+        run_rules(&tree, Mode::Auto, &good).await.outcome,
+        Outcome::Applied
+    );
+    assert_eq!(tree.state().get(Component::Rules).stale_streak, 0);
+    assert!(signals_from(&tree.state()).2.is_empty());
+}
+
+/// The stall card is suppressed while a takeable offer stands: check-only mode
+/// declining bundles for a week is a decision the user is making, and
+/// `detection.update_available.v1` already names the version and the button.
+/// Two cards for one state is the defect class #48 exists to close.
+#[tokio::test]
+async fn a_standing_offer_carries_the_signal_instead_of_a_second_stall_card() {
+    let tree = Tree::new();
+    tree.seed_rules("core.yar", GOOD_RULE);
+    let (_, fetcher) = rules_manifest("2026.08.07", &[("core.yar", GOOD_RULE_V2)]);
+    for _ in 0..STALLED_AFTER_CHECKS {
+        assert_eq!(
+            run_rules(&tree, Mode::Check, &fetcher).await.outcome,
+            Outcome::Available
+        );
+    }
+    let (available, _, stalled) = signals_from(&tree.state());
+    assert_eq!(
+        tree.state().get(Component::Rules).stale_streak,
+        STALLED_AFTER_CHECKS,
+        "the component IS stale — nothing has landed"
+    );
+    assert_eq!(available.len(), 1, "and the offer says so, actionably");
+    assert!(stalled.is_empty(), "so nothing says it twice: {stalled:?}");
+}
+
+// ── The gate (#48, user decisions A1-8/A1-9) ───────────────────────────────
+
+/// One predicate for the scheduler tick and all three Settings buttons, and it
+/// resolves the FEATURE, not the master alone: "protection on, detection off"
+/// is a supported state in which #46's L1-only gate still made a daily request
+/// and hot-swapped bundles for a surface that does nothing with them.
+#[test]
+fn the_updater_gate_resolves_the_detection_feature_not_just_the_master() {
+    use crate::settings::injection::Feature;
+    let mut s = crate::settings::Settings::default();
+    assert!(updates_enabled(&s), "the shipped default is on");
+
+    s.set_l2_for_test(Feature::Detection, false);
+    assert!(
+        !updates_enabled(&s),
+        "detection off ⇒ its data is not worth a daily request"
+    );
+
+    s.set_l2_for_test(Feature::Detection, true);
+    s.set_master_for_test(false);
+    assert!(!updates_enabled(&s), "nothing runs past an L1 off");
+
+    // And the resolver folds L1 in, so the master alone cannot re-enable it.
+    s.set_l2_for_test(Feature::Detection, false);
+    s.set_master_for_test(true);
+    assert!(!updates_enabled(&s));
 }
 
 // ── The scheduler's policy (previously untested — review U/notes) ──────────

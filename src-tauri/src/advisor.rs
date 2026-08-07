@@ -184,16 +184,23 @@ pub const RULE_DETECTION_UPDATE_AVAILABLE: &str = "detection.update_available.v1
 /// This rule fires ONLY for refusals. A channel that cannot be reached is
 /// [`RULE_DETECTION_UPDATE_STALLED`]'s business, and only after a week of it.
 pub const RULE_DETECTION_UPDATE_FAILED: &str = "detection.update_failed.v1";
-/// A component has not been able to reach the update channel for
+/// A component has not got any fresher for
 /// [`updater::STALLED_AFTER_CHECKS`](crate::offload::detection::updater::STALLED_AFTER_CHECKS)
-/// consecutive checks — a week at the default interval.
+/// consecutive checks — a week at the default interval — **whatever the
+/// reason**.
 ///
-/// The honest version of what #46's rejection cards were trying to say. One 404
-/// is weather and says nothing; a week of them means this component has stopped
-/// getting fresher, which is the failure decision 13 exists to prevent and the
-/// only part of an outage worth a card. Signature buckets the streak by the
-/// threshold, so a dismissal holds for roughly another week and then re-raises,
-/// and a channel that recovers resets the streak and starts the count over.
+/// The honest version of what #46's rejection cards were trying to say. One
+/// failed check is weather and says nothing; a week of them means this
+/// component has stopped getting fresher, which is the failure decision 13
+/// exists to prevent.
+///
+/// Outcome-agnostic since #48, and that is the point: the two rules above both
+/// stop firing once dismissed for their condition, so a channel that is
+/// reachable and refuses every bundle it serves could otherwise freeze a
+/// component permanently with no signal at all. This signature buckets the
+/// streak by the threshold, so a dismissal holds for roughly another week and
+/// then re-raises, and any check that comes back current resets the streak and
+/// starts the count over.
 pub const RULE_DETECTION_UPDATE_STALLED: &str = "detection.update_stalled.v1";
 
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
@@ -344,10 +351,12 @@ pub struct Signals {
     /// freezing, not one that broke. A channel that could not be reached is
     /// deliberately NOT here (#46): nothing was refused, so nothing to report.
     pub detection_update_failures: Vec<crate::offload::detection::updater::FailedUpdate>,
-    /// Components that have failed to reach the update channel for
-    /// `updater::STALLED_AFTER_CHECKS` consecutive checks. The updater applies
-    /// the threshold; a non-empty entry here already means "long enough to
-    /// mean it".
+    /// Components that have not got any fresher for
+    /// `updater::STALLED_AFTER_CHECKS` consecutive checks, for whatever reason
+    /// — unreachable, refusing, or offered nothing takeable. The updater applies
+    /// the threshold and suppresses the entry while a takeable offer stands; a
+    /// non-empty entry here already means "long enough to mean it, and nothing
+    /// else is saying it".
     pub detection_update_stalled: Vec<crate::offload::detection::updater::StalledUpdate>,
 }
 
@@ -777,13 +786,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         });
     }
 
-    // V32 C3 / #46 — detection.update_stalled.v1: the channel has been
-    // unreachable for a week of checks. Nothing was refused and nothing is
-    // broken, so this is NOT a rejection card; it is the freshness canary
-    // decision 13 asks for, firing at the point where "offline for a moment"
-    // has become "this component has stopped getting fresher". Every check
-    // that reaches the channel — up-to-date, available, applied, even refused
-    // — resets the streak, so this cannot fire on a working install.
+    // V32 C3 / #46, #48 — detection.update_stalled.v1: a week of checks has
+    // left this component no fresher. Nothing is broken, so this is NOT a
+    // rejection card; it is the freshness canary decision 13 asks for, firing
+    // at the point where "one bad check" has become "this component has stopped
+    // getting fresher". It says nothing about the CAUSE — an outage and a
+    // channel that refuses everything it serves are the same event from here —
+    // because the cause is in the last outcome, quoted verbatim, and because
+    // the two rules that do speak to cause can both be dismissed away.
+    // Any check that comes back current resets the streak, so this cannot fire
+    // on a working install.
     for s in &sig.detection_update_stalled {
         // Bucketed by the threshold: dismissing holds for roughly another
         // week's worth of failures rather than forever, and a recovery resets
@@ -799,15 +811,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         }
         out.push(Proposal {
             setting: String::new(),
-            current: format!("{} update channel unreachable", s.component),
-            proposed: "a reachable update channel".to_string(),
+            current: format!("{} updates have stalled", s.component),
+            proposed: "a component that is getting fresher".to_string(),
             rationale: format!(
-                "The injection-detection {} component has not been able to reach its update \
-                 channel for {} checks in a row, so it is no longer getting fresher. Nothing is \
-                 degraded — the data you have is still live and still scanning — but signatures \
-                 and weights decay, so a channel that stays unreachable eventually means missing \
-                 what attackers have started sending. Last error: {}. Check network/proxy access \
-                 to the manifest URL shown in Settings → Tools → Detection, or set the component \
+                "The injection-detection {} component has not taken an update for {} checks in a \
+                 row, so it is no longer getting fresher. Nothing is degraded — the data you have \
+                 is still live and still scanning — but signatures and weights decay, so a \
+                 component that stays frozen eventually means missing what attackers have started \
+                 sending. The last check said: {}. If that is a network or proxy problem, check \
+                 access to the manifest URL shown in Settings → Tools → Detection; if a bundle is \
+                 being refused, see MAINTENANCE.md → \"Detection updater\"; or set the component \
                  to `off` if this machine is deliberately offline.",
                 s.component, s.streak, s.reason
             ),
@@ -2203,6 +2216,33 @@ mod tests {
         assert!(p.rationale.contains("not getting fresher") || p.rationale.contains("fresher"));
         assert!(p.rationale.contains("HTTP 404"), "the reason is diagnosable");
         assert_eq!(p.signature, "rules:1");
+    }
+
+    /// #48/A1-5: the same card carries a channel that is perfectly REACHABLE
+    /// and refuses everything it serves. The rule must not claim an outage it
+    /// knows nothing about — the cause is whatever the last outcome says, and
+    /// this signal's job is only "nothing is landing".
+    #[test]
+    fn the_stall_card_does_not_diagnose_the_cause_it_quotes_the_last_outcome() {
+        let sig = Signals {
+            detection_update_stalled: vec![StalledUpdate {
+                component: "rules".into(),
+                streak: STALLED_AFTER_CHECKS,
+                reason: "checksum mismatch on `core.yar` (expected ab…, got cd…)".into(),
+            }],
+            ..Signals::default()
+        };
+        let p = evaluate(&sig)
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_UPDATE_STALLED)
+            .expect("fires for a refusing channel too");
+        let lower = p.rationale.to_ascii_lowercase();
+        assert!(
+            !lower.contains("unreachable") && !lower.contains("could not reach"),
+            "nothing here knows the channel is unreachable: {}",
+            p.rationale
+        );
+        assert!(p.rationale.contains("checksum mismatch"), "{}", p.rationale);
     }
 
     /// The dismissal re-fires after another threshold's worth of failures, so a

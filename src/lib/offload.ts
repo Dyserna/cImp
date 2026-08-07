@@ -242,13 +242,17 @@ export interface DetectionComponentStatus {
   last_outcome: string;
   last_ok: boolean;
   /// The outcome's machine name: `up-to-date` | `available` | `applied` |
-  /// `rejected` | `unavailable` | `reverted`. `unavailable` means the channel
-  /// could not be REACHED — not that a bundle was refused — and must never be
-  /// rendered as a failure (#46). Empty on state written before this existed.
+  /// `rejected` | `unavailable` | `reverted` | `revert-failed`. `unavailable`
+  /// means the channel could not be REACHED — not that a bundle was refused —
+  /// and must never be rendered as a failure (#46); `revert-failed` is a local
+  /// revert that did not complete and says nothing about any bundle (#48).
+  /// Empty on state written before this existed.
   last_outcome_kind: string;
-  /// Consecutive checks that could not reach the channel. 0 once one does.
+  /// Consecutive checks that could not reach the channel. 0 once one does; a
+  /// revert leaves it alone, having reached nothing either way.
   unreachable_streak: number;
-  /// Non-empty when the last attempt was rejected. The old data is still live.
+  /// Non-empty when the last attempt was refused — a document arrived and a
+  /// check said no. The old data is still live.
   last_failure: string;
 }
 

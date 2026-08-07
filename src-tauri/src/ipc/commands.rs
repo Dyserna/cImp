@@ -1190,6 +1190,11 @@ pub async fn detection_status(
 ///
 /// The whole run (network + validation + swap) is awaited, because the caller
 /// is a button whose next action is to re-render the result.
+///
+/// Refused outright when the detection feature does not resolve on (#48). The
+/// gate lives HERE and not only in the Svelte `disabled` attribute: a disabled
+/// button is a courtesy, and an IPC command is a capability — one is a hint,
+/// the other is the enforcement.
 #[tauri::command]
 pub async fn detection_check_now(
     state: State<'_, AppState>,
@@ -1197,6 +1202,8 @@ pub async fn detection_check_now(
     apply: bool,
 ) -> AppResult<crate::offload::detection::DetectionStatus> {
     use crate::offload::detection::updater::{self, manifest::Component};
+    let settings = state.settings.current();
+    updates_allowed(&settings)?;
     let components: Vec<Component> = match component.as_deref() {
         None | Some("") => Component::ALL.to_vec(),
         Some(name) => vec![Component::parse(name).ok_or_else(|| {
@@ -1205,7 +1212,6 @@ pub async fn detection_check_now(
             ))
         })?],
     };
-    let settings = state.settings.current();
     updater::run_live(&components, &settings, apply).await;
     Ok(crate::offload::detection::status(&settings))
 }
@@ -1213,12 +1219,17 @@ pub async fn detection_check_now(
 /// V32 Phase C3: restore a component's retained previous version — the Settings
 /// Revert button. Blocking (file moves plus a YARA recompile or an `ort`
 /// session rebuild), so it runs on the blocking pool.
+///
+/// Gated exactly like [`detection_check_now`] (#48): with the detection feature
+/// off, the updater does not swap bundles in either direction.
 #[tauri::command]
 pub async fn detection_revert(
     state: State<'_, AppState>,
     component: String,
 ) -> AppResult<crate::offload::detection::DetectionStatus> {
     use crate::offload::detection::updater::{self, manifest::Component};
+    let settings = state.settings.current();
+    updates_allowed(&settings)?;
     let c = Component::parse(&component).ok_or_else(|| {
         AppError::Offload(format!(
             "unknown detection component `{component}` (expected \"rules\" or \"classifier\")"
@@ -1227,8 +1238,27 @@ pub async fn detection_revert(
     tokio::task::spawn_blocking(move || updater::revert_live(c))
         .await
         .map_err(|e| AppError::Offload(format!("detection revert task failed: {e}")))?;
-    let settings = state.settings.current();
     Ok(crate::offload::detection::status(&settings))
+}
+
+/// The updater's gate for the two manual commands above, resolved through the
+/// same [`updater::updates_enabled`](crate::offload::detection::updater::updates_enabled)
+/// the scheduler tick uses — one predicate, so a button and a tick can never
+/// disagree about whether the feature is on.
+///
+/// An `Err` rather than a silently unchanged status: a security control that
+/// does nothing when clicked, and says nothing about it, teaches the user to
+/// distrust it (the same reasoning as `latch_override`'s verbatim errors).
+fn updates_allowed(settings: &crate::settings::Settings) -> AppResult<()> {
+    if crate::offload::detection::updater::updates_enabled(settings) {
+        return Ok(());
+    }
+    Err(AppError::Settings(
+        "injection detection is switched off, so the detection updater will not check, apply or \
+         revert anything. Turn it (and the injection-protection master above it) back on in \
+         Settings → Tools → Injection protection."
+            .to_string(),
+    ))
 }
 
 /// V32 Phase C3: open `<exe-dir>/detection/rules.d/` in the host file manager,

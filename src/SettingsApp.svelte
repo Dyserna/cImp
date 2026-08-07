@@ -435,6 +435,23 @@
   // survive.
   let injection = $state<InjectionStatus | null>(null);
 
+  /// Whether the detection updater may run at all — the same question the
+  /// backend's `updater::updates_enabled` answers, read from the backend's own
+  /// resolved view rather than recomputed from `snapshot`: `app` scope +
+  /// `detection` IS `effective(Feature::Detection, Scope::App)`, master switch
+  /// folded in. (That row's `in_scope` is false — detection's override cells
+  /// live on tabs and the worker — which says there is no app-level OVERRIDE to
+  /// set, not that the feature is unresolvable here.)
+  ///
+  /// Defaults to `true` while the first poll is in flight: this only disables
+  /// buttons, and the enforcement is in the IPC command. Greying out three
+  /// controls for a second at startup would be the more visible bug.
+  const detectionUpdatesEnabled = $derived(
+    injection?.scopes
+      .find((s) => s.scope === 'app')
+      ?.features.find((f) => f.feature === 'detection')?.effective ?? true,
+  );
+
   /// The feature rows the matrix renders, in the backend's `Feature::ALL` order.
   /// `field` is the L2 settings key; `scopes` names which override rows the
   /// feature HAS (mirroring `Feature::has_tab_scope` / `has_worker_scope` —
@@ -4592,8 +4609,10 @@
             simply cannot be reached — offline, a proxy, a release that is not
             published yet — that is reported here and nowhere else, until it has
             been unreachable long enough to mean this component has stopped
-            getting fresher. Scheduled checks follow the injection-protection
-            master switch: with protection off, nothing is polled or swapped.
+            getting fresher. Every check follows the <em>Injection detection</em>
+            switch above (and the master switch above that): with detection off,
+            nothing is polled or swapped — not on the daily schedule and not from
+            the buttons below.
           </small>
           {#if detection}
             {#each detection.updater.components as comp (comp.component)}
@@ -4631,25 +4650,51 @@
                     <option value="auto">Auto — validate and apply</option>
                   </select>
                 </label>
-                <div class="row">
+                <!--
+                  #48: all three are gated on the resolved detection feature,
+                  not only on `detectionBusy`. The IPC commands refuse too — a
+                  disabled attribute is a courtesy, not a control — and the
+                  tooltip sits on the ROW as well as on each button, because a
+                  disabled button does not reliably raise one.
+                -->
+                <div
+                  class="row"
+                  title={detectionUpdatesEnabled
+                    ? undefined
+                    : 'Injection detection is off — turn it, and the injection-protection ' +
+                      'master switch above it, back on to check or swap bundles.'}
+                >
                   <button
                     type="button"
                     onclick={() => void checkDetectionUpdate(comp.component, false)}
-                    disabled={detectionBusy !== null}
+                    disabled={detectionBusy !== null || !detectionUpdatesEnabled}
+                    title={detectionUpdatesEnabled
+                      ? undefined
+                      : 'Injection detection is off — nothing is polled or swapped.'}
                   >
                     {detectionBusy === comp.component ? 'Checking…' : 'Check now'}
                   </button>
                   <button
                     type="button"
                     onclick={() => void checkDetectionUpdate(comp.component, true)}
-                    disabled={detectionBusy !== null || !comp.available_version}
+                    disabled={detectionBusy !== null ||
+                      !detectionUpdatesEnabled ||
+                      !comp.available_version}
+                    title={detectionUpdatesEnabled
+                      ? undefined
+                      : 'Injection detection is off — nothing is polled or swapped.'}
                   >
                     Apply update
                   </button>
                   <button
                     type="button"
                     onclick={() => void revertDetection(comp.component)}
-                    disabled={detectionBusy !== null || !comp.can_revert}
+                    disabled={detectionBusy !== null ||
+                      !detectionUpdatesEnabled ||
+                      !comp.can_revert}
+                    title={detectionUpdatesEnabled
+                      ? undefined
+                      : 'Injection detection is off — nothing is polled or swapped.'}
                   >
                     Revert to {comp.previous_version || 'previous'}
                   </button>

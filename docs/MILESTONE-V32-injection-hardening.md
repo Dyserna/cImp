@@ -590,22 +590,130 @@ declares its class AND its mutation capability in one reviewed place.
       unchanged at 1): `last_outcome_kind`, `unreachable_streak`,
       `last_failure_signature`. Each has exactly one consumer — the Settings
       rendering branch, the stall rule + the Settings streak note, and the
-      failure card's dismissal key respectively.
+      failure card's dismissal key respectively. (Amended by (c) below: the
+      stall rule moved to a fourth field, `stale_streak`, and
+      `unreachable_streak` kept the Settings note.)
     - **Scheduler now under the Phase G L1 master.** `tick_once` returns early
-      when `settings::injection::master_enabled` is false, so with protection
-      off there is no polling, no network and no bundle swap. Checked **per
-      tick, through the resolver** (never a raw field — decision 16 / #44), so a
-      flip takes effect within one `POLL_TICK`; it is therefore NOT spawn-baked
-      and owes no `spawn_inject_sig` entry. `main.rs` still spawns the task
-      unconditionally, which is what makes the runtime flip-on work. Manual
-      *Check now* / *Apply* / *Revert* are deliberately **not** gated: they are
-      explicit user intent, not background behaviour.
+      when protection is off, so there is no polling, no network and no bundle
+      swap. Checked **per tick, through the resolver** (never a raw field —
+      decision 16 / #44), so a flip takes effect within one `POLL_TICK`; it is
+      therefore NOT spawn-baked and owes no `spawn_inject_sig` entry. `main.rs`
+      still spawns the task unconditionally, which is what makes the runtime
+      flip-on work. (Amended by (c): the gate is `Feature::Detection` at
+      `Scope::App`, not the L1 master alone, and the manual buttons — which this
+      pass deliberately left ungated as "explicit user intent" — are under it
+      too.)
     - **Run lock.** A process-wide `tokio::sync::Mutex` around `run` (and
       `revert_live`, which the IPC command already calls on the blocking pool)
       closes the review's "no run lock" MEDIUM: a scheduler tick concurrent with
       a *Check now* click otherwise had one `wipe_dir`-ing the staging
       directory the other had just validated. Serialized rather than skipped, so
       a click that waits still does what the user asked.
+  - **Phase C3 amendment 2026-08-07 (c) — what (b) got wrong, and two user
+    decisions (#48, re-verification sweep).** (b) was correct about the taxonomy
+    and wrong about everything downstream of it that already had state on disk.
+    - **The fix was forward-only, and made the symptom WORSE on upgrade
+      (HIGH).** `STATE_SCHEMA` stayed at 1, so `load_state` accepted a pre-#46
+      state file verbatim — including a `last_failure` recorded from a transport
+      404. `signals_from` raises the refusal card off that field alone, and
+      `finish` clears it only on `Applied`/`UpToDate`/`Reverted`, none of which
+      can happen while the channel is unreachable (which it is, by construction,
+      until `detection-v1` is published). So both "REJECTED" cards would have
+      fired **forever** on every upgrading install, and re-fired even if
+      dismissed, because (b) moved the dismissal key off `component:version`.
+      Fixed by `store::heal_pre_split_failure`: a **one-shot clear on load** of
+      any failure with no version AND no signature — a combination only a
+      pre-#46 build can write, and one that on such a build always meant
+      `fail_all`'s manifest-level failure or `revert`'s "nothing to revert to",
+      i.e. exactly the events (b)/(c) reclassify as not-refusals. A pre-#46
+      failure WITH a version was a real bundle refusal, keeps its record and
+      keeps its unchanged `component:version` dismissal key. A `STATE_SCHEMA`
+      bump was rejected as the more expensive option: it takes `load_state`'s
+      unknown-schema path, which discards `installed_version` /
+      `previous_version` — the install history Revert and the newer-than
+      comparison are built on — to fix one field. Tested against a synthesized
+      pre-#46 state file, which is the test shape (b) lacked: every other case
+      builds from a fresh `Tree`, so no test could see the upgrade.
+    - **`revert`'s local failures were `Rejected` (MEDIUM).** "Nothing to revert
+      to" and "revert failed: {e}" fetch nothing, so nothing was refused —
+      yet both raised a security card claiming a bundle refusal. New
+      `Outcome::RevertFailed`: unhealthy row (`ok:false` — a user action that
+      did not do what it said), `warn!`, **no card**, and it records nothing
+      about the data. `Rejected` keeps meaning *validated and refused*.
+    - **A revert failure lit a false "update available" card (MEDIUM).**
+      `finish`'s `Rejected` arm set `available_version = version`
+      unconditionally, so the revert path wrote the **previous** version into
+      the offer slot and Settings advertised a downgrade as "a newer bundle is
+      available"; and "nothing to revert to" passed `String::new()`, which
+      silently withdrew a legitimate pending offer. Splitting `RevertFailed` out
+      removes the conflation at its root (`version` in a `Rejected` finish is now
+      always a bundle version from a manifest), and the arm no longer writes an
+      EMPTY version into the offer slot — a manifest-level refusal never got as
+      far as a version and has nothing to say about what is offered.
+    - **A refused bundle also fired "update available" (MEDIUM, pre-existing).**
+      `signals_from` could not tell "offered because check-only" from "offered
+      because it was refused", so one refusal produced two cards, one of which
+      blamed the user's own settings ("this component is set to check-only, or
+      the bundle needs a newer cImp") for something the updater refused in
+      `auto`. The offer is now suppressed when
+      `available_version == last_failure_version`. The version stays in the slot
+      — Settings names it and Apply retries it — it simply is not a second card.
+    - **No freshness canary for a channel that is reachable and always refusing
+      (MEDIUM).** `unreachable_streak` never leaves 0 on such a channel, the
+      refusal card's signature does not age, and `last_check_ms` keeps
+      refreshing — so one dismissal froze a component with **zero** signal,
+      exactly the state decision 13 exists to prevent. The stall card now keys
+      on a new **outcome-agnostic** counter, `stale_streak`: consecutive checks
+      that were not `Applied`/`UpToDate` (the only two outcomes that prove the
+      installed data IS the published data). Reverts touch neither counter —
+      they are not checks. Chosen over bucketing the failure card's signature
+      because it is the invariant rather than a mitigation, and it subsumes both
+      branches: an outage and a refusing channel are the same event from here,
+      and the card quotes the last outcome instead of guessing at the cause.
+      Expressed as *checks* rather than *days* deliberately: the check interval
+      is configurable from 1 h to 30 d, so a wall-clock threshold would either
+      fire before a user's own interval elapsed or need a settings read inside a
+      pure function; and a laptop that is rarely switched on should not be
+      carded at launch for time it spent powered off. Suppressed while a
+      takeable offer stands — `detection.update_available.v1` already names the
+      version and the button, and two cards for one state is the defect class
+      this pass exists to close.
+    - **`Reverted` and the local `Rejected` reset `unreachable_streak` (LOW).**
+      The reset was `if outcome != Outcome::Unavailable`, whose negated form
+      silently counted both revert outcomes as proof of reachability: a user
+      behind a blocking proxy could zero a six-check streak by clicking Revert,
+      and clicking it weekly suppressed the stall card indefinitely. Now an
+      exhaustive `match` over the outcomes that genuinely prove the channel
+      answered, so a future variant must answer the question. Same shape for
+      `stale_streak`.
+    - **The user saw the same sentence twice.** Settings renders `Could not
+      reach the update channel: {last_outcome}` and `fail_all`'s detail opened
+      with the same clause. The label belongs to the surface; the stored detail
+      is now the reason plus what it cost. Its test asserts the **rendered
+      composition** rather than a substring, which either half satisfied.
+    - **User decision (a) — the scheduler gate is the FEATURE, not the master.**
+      `tick_once` now resolves `effective(Feature::Detection, Scope::App)`
+      through the new `updater::updates_enabled`. (b)'s L1-only gate left
+      "protection on, detection off" — a supported state — making a daily
+      network request and hot-swapping bundles for a surface that does nothing
+      with them, which is the exact case (b)'s own comment claimed to cover. The
+      resolver folds L1 in, so one gate at the right level covers both levels.
+      Still per tick, so still not spawn-baked.
+    - **User decision (b) — the manual buttons are under the same rule.** *Check
+      now* / *Apply* / *Revert* were gated on `detectionBusy` alone and ran with
+      protection off, which made the panel's own sentence ("with protection off,
+      nothing is polled or swapped") false. The gate is in the **IPC commands**
+      (`detection_check_now`, `detection_revert`, via one `updates_allowed`
+      helper over the same predicate) — a `disabled` attribute is a courtesy,
+      not a control — and the buttons are disabled with a tooltip naming the
+      switch. The panel text now says every check follows the *Injection
+      detection* switch, scheduled and manual alike.
+    - **State additions** (again additive, `STATE_SCHEMA` still 1):
+      `stale_streak`, consumed by the stall signal in `signals_from`.
+      `unreachable_streak` keeps its Settings "N checks in a row" note as its
+      consumer; the two are separate because they answer different questions
+      (*is the channel silent* vs *is this component frozen*) and only the
+      second is a card.
   - **Known residuals.** (a) The compile ceiling is measured *around* the
     compile, not enforced inside it — yara-x exposes no compile deadline, so a
     pathological bundle is reliably *rejected* but still costs its own wall time
@@ -677,9 +785,47 @@ declares its class AND its mutation capability in one reviewed place.
     that boundary, not the enforcement — the parent still owns the executor and
     a CozoScript is a `&str` — and it now carries the three self-guards the old
     one lacked plus a whitespace- and positional-form-tolerant pattern
-    (`\*\s*mem_note\s*[\{\[]`; the old fixed `*mem_note{` missed both). Both
-    failure modes are mutation-checked: an atom added to another file fails,
-    and renaming the relation fails on the non-empty self-guard.
+    (whitespace- and positional-form-tolerant; the old fixed star-name-brace
+    literal missed both). Both failure modes are mutation-checked: an atom
+    added to another file fails, and renaming the relation fails on the
+    non-empty self-guard.
+  - **Amendment 2026-08-07 (#48): that replacement scan was itself vacuous at
+    the commit that shipped it.** The file states a house rule — never write the
+    relation's atom form in prose here, because the "guarded thing still exists"
+    self-guard counts occurrences and cannot tell prose from code — and
+    `atom()`'s own doc comment broke it in the same commit, by quoting the
+    retired fixed string it was replacing. That one comment satisfied guard 3 by
+    itself. Verified two ways: the regex finds ten matches in the file, nine
+    real and one in that comment; and renaming **only the CozoScript relation
+    identifier** (leaving the Rust method names, which is what makes #47's own
+    `perl -pi -e` mutation-check invalid — it fails to compile with 19 errors)
+    left the suite **fully green with zero production queries matched**. Three
+    changes:
+    - the doc comment no longer spells the atom (the honest fix; the rule
+      already existed);
+    - **a fourth self-guard** makes the rule executable — every match in `SELF`
+      must sit in a real query, failing on any that sits behind a `//` on its
+      line. This is not the line heuristic MAINTENANCE.md bans: that ban is on
+      heuristics whose wrong answer *weakens* the invariant (the retired
+      `in_comment` read a real hit as a comment and skipped it, so an offender
+      went unreported). This one only ever adds failures — a placement it does
+      not recognize leaves the scan exactly where it stands, covered by the
+      house rule as before;
+    - **a per-file floor** (`NOTE_QUERIES = 9`) replaces `mine > 0`, which is
+      one of the five properties MAINTENANCE.md already requires of any
+      surviving scan and which this one shipped without: `mine > 0` tolerated
+      eight of the nine queries vanishing.
+    Re-mutation-checked with the guards in place: the same rename now fails with
+    `expected at least 9 note queries in graph/index/notes.rs, found 0`.
+  - **Two weaknesses recorded rather than fixed** (now in the module docs). The
+    scan is literal-only, so `GraphIndex::mem_note_row_count`'s
+    `format!("?[note_id] := *{name}{{note_id}}")` is invisible to it — it is in
+    this file and migration-only, and the *module boundary* rather than the scan
+    is what covers a future parameterized read. And four CozoScript statements
+    in `graph/index.rs`'s `#[cfg(test)] mod tests` still name the relation
+    (`::remove`, a pre-C2 `:create`, two `:put`s) to build migration fixtures;
+    none is in `*` atom form and none can read a row, so none can bypass the
+    quarantine filter and the scan is deliberately green with them present.
   - `context_notes` reports a **count** of withheld notes, never their text: a
     quarantine that echoed its contents back would be a read channel for
     exactly what it is holding.
@@ -753,6 +899,21 @@ declares its class AND its mutation capability in one reviewed place.
     that started interpolating untrusted text, and that shape no longer compiles;
     what remains uncovered is a semantic misjudgement about a value, which the
     fingerprint only ever mitigated by making someone look.
+  - **Phase D amendment 2026-08-07 (#48) — the slot/argument mismatch has a
+    consumer.** `PushNotice::new` pins the *sentence*, but `interpolate` warned
+    on a slot/argument count mismatch and shipped the malformed notice anyway —
+    a quality signal with no consumer, which this repo's principles call a
+    silent failure with extra steps. All three shapes are invisible to a reader:
+    too few args leaves a hole in a sentence, a surplus arg is dropped, and a
+    leftover **named** slot (`{done}`, `{project}` — both real templates used
+    those spellings before #47 rewrote them into `{}`) is emitted literally,
+    with no compile error, because only the bare `{}` is a slot. `interpolate`
+    now returns its slot count and `new` carries a `debug_assert_eq!` over it:
+    a producer bug is a test failure at zero production cost, and the lenient
+    warn-and-degrade behaviour is exactly what still ships in release. The
+    degradation test moved onto `interpolate` (so it still runs in both
+    profiles) and two `#[cfg(debug_assertions)] #[should_panic]` tests cover the
+    assertion itself.
 - **E — hook-based native-tool gating (OPTIONAL, spike-gated).**
   - Spike E1: Claude PreToolUse hook queries loopback for the session's taint
     state and denies Read/Grep/Bash while EXTERNAL-latched. Gate: added
@@ -1054,6 +1215,87 @@ declares its class AND its mutation capability in one reviewed place.
       entirely caller-supplied, so a row per rejection would be an unbounded
       write into a capped feed — it would evict the genuine rows this fix exists
       to preserve. The signal's consumer is the enforcement itself.
+
+  - **Phase F amendment 2026-08-07 (#48, deep re-verification of #45) — three
+    defects the previous amendment introduced.** The re-verification sweep over
+    `09dc7ec` found that folding the tab-id check into `latch_scope` widened one
+    `None` into two meanings, that the beacon's row missed a whole class of
+    beacon, and that the row's origin had two unlinked sources of truth.
+    - **A2-1 — an unconfigured tab id no longer forces the Phase H gate OFF.**
+      `latch_scope`'s `None` went from "no tab identity" to "no *usable* tab
+      identity", and `handle_latch_state` maps `None` to `(gate: false, latch:
+      "open")`. Before #45 an unknown-but-non-empty id produced a scope whose L3
+      lookup missed and therefore resolved `Inherit` → L2 → L1, i.e. the
+      app-wide verdict; after it, the gate was unconditionally off. That is not
+      an exotic input: the OpenCode plugin is written per working **directory**
+      with one tab id baked in (the unfixed H-2), so removing or re-id'ing an
+      OpenCode tab leaves the file on disk naming an id settings no longer
+      have — and "the user switched containment off" then rendered identically
+      to "cImp could not find your tab", with only a `warn!` on the sibling
+      beacon route. `latch_scope` now returns `LatchScoping`
+      (`Anonymous` / `Unknown(tab)` / `Scoped`); `native_gate_verdict` takes a
+      resolved `injection::Scope` so both identity-less variants can answer
+      **app-wide**. #45's actual goal is untouched: an unknown id still yields
+      no `LatchScope`, so it still keys no registry entry — only the *verdict*
+      changed. **Residual, stated rather than papered over:** with no registry
+      entry the reported `latch` is always `open`, and the plugin denies only on
+      `external`/`local`, so a stale plugin file still refuses nothing. What is
+      fixed is that the verdict reflects a decision instead of a collapsed
+      `Option`; closing it properly needs H-2 (a per-tab plugin file).
+    - **A2-2 — a beacon that only CONTAMINATES is now recorded.**
+      `LatchRegistry::beacon` set `contaminated = true` unconditionally, but the
+      row was written only `if out.engaged`, and `engaged` is false when the tab
+      is already External (fine — sticky) **and** when the tab is latched
+      `Local` (Phase A's other direction, reached by a local-capability call
+      arriving first). A beacon aimed at such a tab therefore contaminated it
+      permanently — quarantining every later `context_note`, enveloping its
+      results — with no row, no `warn!` and no `info!`, while the accepted
+      residual below called the beacon "bounded, audited … and recoverable".
+      `BeaconOutcome` now reports `contaminated_now` beside `engaged`, an
+      `info!` covers the latch-unmoved case, and the row is keyed on a stored
+      `TabLatch::beacon_flagged` bit — the same one-row-per-tab-session bound
+      and the same session-rotation reset as `latch_flagged`, so a caller
+      POSTing in a loop still produces one row and a mid-session policy change
+      cannot produce a second. Locked decision 15 is unmoved: this records that
+      the bit was SET, and no path clears it. The row's first sentence follows
+      the outcome instead of asserting an engagement that may not have happened.
+    - **A2-3 — the row's origin has one source now.** `override_flag_detail` and
+      `beacon_flag_detail` spelled `Origin::Ipc` / `Origin::Http` into their own
+      format strings while `Flag.origin` was set independently at the call site.
+      #47 made the field required precisely so provenance could not be taken by
+      omission, but the prose an incident reviewer actually reads was not
+      derived from it — re-expose an HTTP path and the `origin` key would say
+      `http` while the text went on asserting a human acted. Both are now
+      `override_row(origin, …)` / `beacon_row(origin, …)` returning a `FlagRow`
+      carrying the origin, the `tool` column and the prose together; the handler
+      states the constant once and reads both halves off the struct.
+    - **A2-6 — the beacon's `tool` is bounded** (`bounded_tool`, 64 chars, cut
+      by chars not bytes, ellipsis on truncation). It is an arbitrary unbounded
+      string from a request body that lands in the row's `tool` column, its
+      `detail`, the `tracing` output and — through the feed — the TTS surface.
+      Bounded to one row per tab-session and Svelte-escaped on render, so this
+      is row/log bloat rather than injection; bounded anyway.
+    - **Vacuous tests fixed in the same pass.**
+      `an_override_row_and_a_beacon_row_are_told_apart_by_origin` asserted
+      `detail.contains("origin: ipc")` against a function that hardcoded that
+      constant inside itself — swapping `Flag.origin` at both call sites left it
+      green. It is now
+      `a_flag_rows_prose_and_its_origin_key_have_one_source`, asserted over
+      every `Origin::ALL` variant.
+      `only_configured_ai_tab_ids_can_ever_key_a_latch` named a registry bound
+      and exercised `is_configured_tab` *beside* the enforcement point;
+      deleting the call from `latch_scope` left it green. It now asserts through
+      `tab_identity` (the decision `latch_scope` delegates to) and then through
+      `LatchRegistry::snapshot()` after forged-id `gate`/`beacon` calls.
+      `flag_origins_are_distinct_wire_values` iterated a hand-written
+      `[Internal, Ipc, Http]` array — the exact defect #47 fixed for
+      `Feature::ALL` and left uncorrected one file over; `Origin` is now
+      declared by a `declare_origins!` macro that emits `Origin::ALL` from the
+      variant list. `every_flag_row_states_who_asked` claimed a property over
+      every row while building one `Flag`; renamed to
+      `a_flag_rows_origin_reaches_the_wire_payload_verbatim`, with the "every
+      row" half attributed to the mechanism that actually holds it (the
+      required field).
   - **`/status`** rows grew `contaminated`, `can_flip_local`, `can_unlatch` via
     a flattened `LatchView`, so `latch` stays a top-level key for the Phase B
     readers. Availability is published by the backend rather than re-derived in
@@ -1136,7 +1378,11 @@ declares its class AND its mutation capability in one reviewed place.
     in the declaring module) and the Settings window never touches Rust fields —
     it round-trips whole `Settings` objects through `apply_settings`.
     `injection::master_enabled` is therefore the ONLY way an outside module can
-    see L1, which is what `offload::detection::updater::tick_once` (#46) uses.
+    see L1 — used by `loopback::injection_status`, which renders the master as a
+    switch beside the resolved features, and by nothing that GATES: an
+    enforcement site wants `effective` for its own `Feature`, which folds L1 in
+    already. (The detection updater's scheduler gated on L1 alone between #46
+    and #48, and so ran with `Feature::Detection` switched off.)
     Test code outside the boundary writes switches through the enum-keyed
     `#[cfg(test)] Settings::set_master_for_test` / `set_l2_for_test` /
     `set_tab_override_for_test` / `set_worker_override_for_test`: keyed on
@@ -1292,11 +1538,21 @@ declares its class AND its mutation capability in one reviewed place.
     residual is a **cross-tab denial of service**: a shell-capable model in
     tab A can beacon tab B (or every tab) into EXTERNAL + contaminated, and
     every proxied local-capability tool there refuses until that tab is
-    restarted. Bounded (configured tabs only), audited (one row per
-    tab-session, honestly attributed), and recoverable (a restart), but not
+    restarted. It is also a **cross-tab memory quarantine**: the contamination
+    bit alone holds every later `context_note` in tab B for review, whether or
+    not the latch moved. Bounded (configured tabs only), audited (one row per
+    tab-session, honestly attributed) and recoverable (a restart), but not
     closed. Closing it needs a per-tab secret the beacon proves possession
     of, which the OpenCode plugin cannot hold while it is written per
     *working directory* rather than per tab (finding H-2).
+
+    **Correction, 2026-08-07 (#48).** "Audited" was not true as #45 shipped it:
+    the row was written only when the *latch* moved, while contamination was
+    set on every beacon. A beacon aimed at a `Local`-latched tab therefore
+    quarantined that tab's whole memory stream with no row, no `warn!` and no
+    `info!` — the residual claimed a property the code did not have. Both
+    transitions are recorded now (see the Phase F #48 amendment); the sentence
+    above describes the code as it stands.
   - **Never reachable, by either route: clearing `contaminated`.** Decision 15
     holds — contamination is a property of the conversation, not of the latch
     position. (The separate finding C-2, that a forged session rotation does
@@ -1373,6 +1629,23 @@ declares its class AND its mutation capability in one reviewed place.
     a deliberately broken staged bundle (bad checksum, then non-compiling
     rule) is REJECTED, old rules stay active, Advisor card raised; revert
     button restores the previous bundle.
+11b. #48's four checks, all in Settings → Tools → Detection:
+    - With the manifest URL pointing nowhere (today's shipped state), the
+      component line reads *"Could not reach the update channel: GET …:
+      HTTP 404. Nothing was checked…"* — the clause exactly **once**, in the
+      ordinary colour — and the Advisor raises nothing.
+    - Click **Revert** on a component with nothing retained (reachable by
+      calling `detection_revert` directly, since the button is disabled):
+      the row says "nothing to revert to", the Tool Activity row reads
+      `revert-failed`, and **no** Advisor card appears claiming a bundle was
+      rejected. Any pending "available" version is still shown.
+    - Refuse a bundle (bad checksum, as in 11): exactly **one** card — the
+      refusal — and not also "a newer bundle is available".
+    - Turn *Injection detection* off (or the master switch): Check now /
+      Apply / Revert grey out with a tooltip naming the switch, `tick_once`
+      makes no request (nothing in the log at `RUST_LOG=offload=info`), and
+      invoking `detection_check_now` anyway returns the refusal error rather
+      than running.
 12. Sensor mode (default): in a Claude tab, use the NATIVE WebFetch tool —
     the tab's badge appears, `/status` shows the latch engaged, and a
     proxied `graph_snippet` is refused; same via OpenCode's native

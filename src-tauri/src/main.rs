@@ -882,13 +882,17 @@ fn main() {
 
             // V32 Phase C3 (locked decision 13): keep the detection data fresh
             // — a debounced launch check plus a periodic due-ness poll, per
-            // component, against a curated manifest. Spawned unconditionally:
-            // the task re-reads settings on every tick, so turning a component
-            // on later needs no restart, and with both components `off` a tick
-            // returns before touching the network or the disk. Deliberately
-            // NOT gated on `offload.enabled` — detection guards content that
-            // reaches Claude/OpenCode tabs through the proxy too, so its data
-            // must stay current whatever the worker is doing.
+            // component, against a curated manifest. Spawned unconditionally,
+            // and gated INSIDE the tick rather than here (#46): the task
+            // re-reads settings every tick, so the Phase G L1 master switch and
+            // the per-component modes both take effect at the next tick with no
+            // restart, and a tick under a disabled master (or with both
+            // components `off`) returns before touching the network or the
+            // disk. A spawn-time gate would have made protection a spawn-baked
+            // setting for no gain. Deliberately NOT gated on `offload.enabled`
+            // — detection guards content that reaches Claude/OpenCode tabs
+            // through the proxy too, so its data must stay current whatever the
+            // worker is doing.
             offload::detection::updater::spawn_scheduler(settings_for_setup.clone());
 
             // Apply the project-derived window title. The hardcoded

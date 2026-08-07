@@ -514,11 +514,12 @@ declares its class AND its mutation capability in one reviewed place.
   - **Consumers:** `injection_flag` activity rows with a new
     `outbound::Screen::Updater` (`source = "updater"`), the one screen whose row
     `ok` is its outcome rather than `is_denial()` — so it composes its own row
-    instead of bending `record_flag`'s every-flag-is-a-denial shape. Plus two
-    Advisor rules, `detection.update_available.v1` and
-    `detection.update_failed.v1`, both warn-only and signed
-    `component:version` so a dismissal holds for one bundle and re-fires on the
-    next. Settings → Tools → Detection grew a *Detection updates* block:
+    instead of bending `record_flag`'s every-flag-is-a-denial shape. Plus three
+    Advisor rules (two as first built, a third added by the #46 fix below):
+    `detection.update_available.v1`, `detection.update_failed.v1` and
+    `detection.update_stalled.v1`, all warn-only and all signed so a dismissal
+    holds for one condition and re-fires on the next.
+    Settings → Tools → Detection grew a *Detection updates* block:
     per-component mode select, installed/available versions, last check +
     verbatim outcome, Check now / Apply / Revert, plus Open rules folder and the
     manifest URL in force.
@@ -541,6 +542,70 @@ declares its class AND its mutation capability in one reviewed place.
        `models/CHECKSUMS.txt`) — an entry with no assets behind it turns every
        daily check into a rejected-update card.
     The checklist is also recorded in `detection/manifest.example.json`.
+  - **Phase C3 amendment 2026-08-07 (b) — outcome taxonomy split (#46, review
+    finding U-3).** As first built, *every* manifest-level failure — including a
+    404 on a release that does not exist yet — funnelled through `fail_all` as
+    `Outcome::Rejected`. On a fresh install that produced two permanent
+    "the … update was REJECTED before activation" Advisor cards and two red
+    activity rows a day, describing an event that had not happened. Fixed by
+    splitting the outcome, not by publishing the release (publishing fixes
+    today's symptom; an offline user, a GitHub outage or a corporate proxy
+    reproduces the class).
+    - **`Outcome::Unavailable`** — the channel did not produce our index:
+      transport error (404/DNS/offline/timeout/oversize), a non-UTF-8 body, or a
+      body that is not shaped like a manifest (`manifest::looks_like_manifest`
+      = a JSON object with a `schema` key — a GitHub 404 page, a captive-portal
+      login and a proxy error all fail it). Writes a **neutral** (`ok:true`)
+      activity row, logs at `info`, shows in Settings as *"Could not reach the
+      update channel: …"* in the ordinary colour, and raises **no** card.
+      Records nothing about the DATA: a standing offer stays offered and a
+      standing refusal stays refused, because a check that never happened
+      resolves neither.
+    - **`Outcome::Rejected` keeps its meaning** — a document reached us and a
+      check refused it: unknown schema, an artifact URL outside the curated
+      directory, a duplicate component, a checksum/size mismatch, a failed
+      gauntlet, a set that would not reload. Immediate card, `ok:false` row,
+      `warn!`. The manifest-parse boundary is therefore split by
+      `looks_like_manifest`, not by "did `parse` succeed".
+    - **The consumer for a persistent outage** is
+      `detection.update_stalled.v1`, fired from a new `unreachable_streak`
+      counter after `STALLED_AFTER_CHECKS = 7` consecutive `Unavailable` checks
+      (one week at the default interval — un-producible by a weekend offline, a
+      GitHub incident or a flight; a channel that stays dead for a week has
+      genuinely stopped making this component fresher, which is the staleness
+      decision 13 forbids leaving silent). **Any** check that reaches the
+      channel resets the streak, a refusal included — being told no proves
+      reachability. Signature is `component:<streak / threshold>`, so a
+      dismissal holds for roughly another week and then re-raises, and a
+      recovery restarts the count.
+    - **Dismissal signatures made honest.** `fail_all` passed
+      `String::new()` as the version, so every manifest-level failure signed
+      itself `rules:` and one dismissal permanently silenced every future
+      refusal — containment violations included. `ComponentState` now carries
+      `last_failure_signature`, derived by `updater::failure_signature`: the
+      bundle version when there is one, else `reason:<16 hex of sha256(reason)>`.
+      Derived inside `finish` rather than passed in, so no call site can
+      reintroduce an empty key.
+    - **State additions** (all additive `#[serde(default)]`, `STATE_SCHEMA`
+      unchanged at 1): `last_outcome_kind`, `unreachable_streak`,
+      `last_failure_signature`. Each has exactly one consumer — the Settings
+      rendering branch, the stall rule + the Settings streak note, and the
+      failure card's dismissal key respectively.
+    - **Scheduler now under the Phase G L1 master.** `tick_once` returns early
+      when `settings::injection::master_enabled` is false, so with protection
+      off there is no polling, no network and no bundle swap. Checked **per
+      tick, through the resolver** (never a raw field — decision 16 / #44), so a
+      flip takes effect within one `POLL_TICK`; it is therefore NOT spawn-baked
+      and owes no `spawn_inject_sig` entry. `main.rs` still spawns the task
+      unconditionally, which is what makes the runtime flip-on work. Manual
+      *Check now* / *Apply* / *Revert* are deliberately **not** gated: they are
+      explicit user intent, not background behaviour.
+    - **Run lock.** A process-wide `tokio::sync::Mutex` around `run` (and
+      `revert_live`, which the IPC command already calls on the blocking pool)
+      closes the review's "no run lock" MEDIUM: a scheduler tick concurrent with
+      a *Check now* click otherwise had one `wipe_dir`-ing the staging
+      directory the other had just validated. Serialized rather than skipped, so
+      a click that waits still does what the user asked.
   - **Known residuals.** (a) The compile ceiling is measured *around* the
     compile, not enforced inside it — yara-x exposes no compile deadline, so a
     pathological bundle is reliably *rejected* but still costs its own wall time
@@ -551,6 +616,19 @@ declares its class AND its mutation capability in one reviewed place.
     survives `build.rs`, but a rule file the updater installs into
     `target/{profile}/detection/rules.d/` is pruned by the next build, since the
     repo is the source of truth there — installed layouts are unaffected.
+    (d) **Before the `detection-v1` release exists** — the state cImp ships in
+    today — every scheduled check ends `Unavailable`. That is now a quiet,
+    logged non-event with a neutral row and a truthful Settings line, and after
+    a week of it one `detection.update_stalled.v1` card per enabled component
+    says so honestly. Publishing the release is a deploy follow-up, not a
+    precondition for the code being correct; it is deferred until the U-1/U-2/
+    U-4 fixes have settled the containment check and the activation gauntlet, so
+    the first bundle is validated against the fixed gauntlet. (e) An artifact
+    fetch that fails *after* the manifest fetched successfully is still
+    `Rejected`, not `Unavailable`: the network answered a moment earlier, so a
+    missing or unreachable asset is a broken published bundle. A connection that
+    drops in exactly that window therefore cards once; the next successful check
+    clears it.
 - **C2 — memory quarantine (decision 10).** `tainted` flag on `mem_note`
   rows written under latch; recall/auto-injection exclusion; Memory UI
   promote-or-discard; spotlighting envelope on all recalled memory at

@@ -2415,12 +2415,14 @@ pub async fn graph_usage_advice(
     };
     let e1_pass = hv.e1_status.trim().eq_ignore_ascii_case("pass");
 
-    // V32 Phase C3: the detection updater's two canaries. Read from its
-    // in-memory state cache — no disk and no clock, so this is safe on the
-    // advice poll's cadence — and unlike every other signal here they are not
-    // per-root: the detection data is process-wide, so the same card shows in
-    // whichever project the user happens to have open.
-    let (detection_updates, detection_update_failures) =
+    // V32 Phase C3: the detection updater's three canaries (a newer bundle
+    // offered, a bundle refused, a channel that has been unreachable for a week
+    // — #46 split the last one out of the second). Read from its in-memory
+    // state cache — no disk and no clock, so this is safe on the advice poll's
+    // cadence — and unlike every other signal here they are not per-root: the
+    // detection data is process-wide, so the same card shows in whichever
+    // project the user happens to have open.
+    let (detection_updates, detection_update_failures, detection_update_stalled) =
         crate::offload::detection::updater::advisor_signals();
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
@@ -2464,6 +2466,7 @@ pub async fn graph_usage_advice(
         e1_pass,
         detection_updates,
         detection_update_failures,
+        detection_update_stalled,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not

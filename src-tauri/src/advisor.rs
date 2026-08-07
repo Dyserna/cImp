@@ -169,12 +169,32 @@ pub const RULE_DRIFT_SUBAGENT: &str = "drift.subagent_transcripts.v1";
 /// `min_app_version` is ahead of this build. Signature = `component:version`,
 /// so a dismissal holds for THAT bundle and re-fires on the next one.
 pub const RULE_DETECTION_UPDATE_AVAILABLE: &str = "detection.update_available.v1";
-/// The last update attempt was rejected — bad checksum, a bundle that would not
-/// compile, a failed smoke control. The old data is still live (the updater
-/// never degrades to no-detection), but a component that keeps refusing every
-/// bundle is silently freezing, which is exactly what a card is for.
-/// Signature = `component:version`, same re-fire boundary.
+/// The last update attempt was **refused** — bad checksum, a bundle that would
+/// not compile, a failed smoke control, an artifact pointing outside the
+/// curated directory. The old data is still live (the updater never degrades to
+/// no-detection), but a component that keeps refusing every bundle is silently
+/// freezing, which is exactly what a card is for.
+///
+/// Signature = `component:<the updater's failure signature>` — the bundle
+/// version when the refusal had one, else a digest of the reason. It used to be
+/// `component:version` with an empty version on every manifest-level failure,
+/// so one dismissal silenced every later refusal including a containment
+/// violation (#46).
+///
+/// This rule fires ONLY for refusals. A channel that cannot be reached is
+/// [`RULE_DETECTION_UPDATE_STALLED`]'s business, and only after a week of it.
 pub const RULE_DETECTION_UPDATE_FAILED: &str = "detection.update_failed.v1";
+/// A component has not been able to reach the update channel for
+/// [`updater::STALLED_AFTER_CHECKS`](crate::offload::detection::updater::STALLED_AFTER_CHECKS)
+/// consecutive checks — a week at the default interval.
+///
+/// The honest version of what #46's rejection cards were trying to say. One 404
+/// is weather and says nothing; a week of them means this component has stopped
+/// getting fresher, which is the failure decision 13 exists to prevent and the
+/// only part of an outage worth a card. Signature buckets the streak by the
+/// threshold, so a dismissal holds for roughly another week and then re-raises,
+/// and a channel that recovers resets the streak and starts the count over.
+pub const RULE_DETECTION_UPDATE_STALLED: &str = "detection.update_stalled.v1";
 
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
@@ -319,10 +339,16 @@ pub struct Signals {
     /// (`auto` applies and clears it, so a standing entry means a decision is
     /// waiting).
     pub detection_updates: Vec<crate::offload::detection::updater::AvailableUpdate>,
-    /// Components whose last update attempt was rejected, with the reason. The
-    /// old data is still live either way — this reports a component that is
-    /// freezing, not one that broke.
+    /// Components whose last update attempt was **refused**, with the reason.
+    /// The old data is still live either way — this reports a component that is
+    /// freezing, not one that broke. A channel that could not be reached is
+    /// deliberately NOT here (#46): nothing was refused, so nothing to report.
     pub detection_update_failures: Vec<crate::offload::detection::updater::FailedUpdate>,
+    /// Components that have failed to reach the update channel for
+    /// `updater::STALLED_AFTER_CHECKS` consecutive checks. The updater applies
+    /// the threshold; a non-empty entry here already means "long enough to
+    /// mean it".
+    pub detection_update_stalled: Vec<crate::offload::detection::updater::StalledUpdate>,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -720,7 +746,10 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     // no-detection), but a component whose every candidate is rejected is
     // frozen, and freezing quietly is the failure this rule exists to prevent.
     for f in &sig.detection_update_failures {
-        let signature = format!("{}:{}", f.component, f.version);
+        // `f.signature`, not `f.version`: a manifest-level refusal has no
+        // version, and signing those `component:` made one dismissal a
+        // permanent mute on every later refusal (#46).
+        let signature = format!("{}:{}", f.component, f.signature);
         if is_dismissed(&sig.dismissed, RULE_DETECTION_UPDATE_FAILED, &signature) {
             continue;
         }
@@ -742,6 +771,47 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 f.reason
             ),
             rule_id: RULE_DETECTION_UPDATE_FAILED,
+            signature,
+            warn_only: true,
+            action: None,
+        });
+    }
+
+    // V32 C3 / #46 — detection.update_stalled.v1: the channel has been
+    // unreachable for a week of checks. Nothing was refused and nothing is
+    // broken, so this is NOT a rejection card; it is the freshness canary
+    // decision 13 asks for, firing at the point where "offline for a moment"
+    // has become "this component has stopped getting fresher". Every check
+    // that reaches the channel — up-to-date, available, applied, even refused
+    // — resets the streak, so this cannot fire on a working install.
+    for s in &sig.detection_update_stalled {
+        // Bucketed by the threshold: dismissing holds for roughly another
+        // week's worth of failures rather than forever, and a recovery resets
+        // the streak so a fresh outage starts the count (and the signature)
+        // over.
+        let signature = format!(
+            "{}:{}",
+            s.component,
+            s.streak / crate::offload::detection::updater::STALLED_AFTER_CHECKS
+        );
+        if is_dismissed(&sig.dismissed, RULE_DETECTION_UPDATE_STALLED, &signature) {
+            continue;
+        }
+        out.push(Proposal {
+            setting: String::new(),
+            current: format!("{} update channel unreachable", s.component),
+            proposed: "a reachable update channel".to_string(),
+            rationale: format!(
+                "The injection-detection {} component has not been able to reach its update \
+                 channel for {} checks in a row, so it is no longer getting fresher. Nothing is \
+                 degraded — the data you have is still live and still scanning — but signatures \
+                 and weights decay, so a channel that stays unreachable eventually means missing \
+                 what attackers have started sending. Last error: {}. Check network/proxy access \
+                 to the manifest URL shown in Settings → Tools → Detection, or set the component \
+                 to `off` if this machine is deliberately offline.",
+                s.component, s.streak, s.reason
+            ),
+            rule_id: RULE_DETECTION_UPDATE_STALLED,
             signature,
             warn_only: true,
             action: None,
@@ -2002,7 +2072,9 @@ mod tests {
 
     // ── V32 Phase C3 — detection-updater canaries ───────────────────────
 
-    use crate::offload::detection::updater::{AvailableUpdate, FailedUpdate};
+    use crate::offload::detection::updater::{
+        AvailableUpdate, FailedUpdate, StalledUpdate, STALLED_AFTER_CHECKS,
+    };
 
     /// The consumer for check-only mode: a recorded offer becomes a card that
     /// names both versions and points at where to take it.
@@ -2039,6 +2111,7 @@ mod tests {
             detection_update_failures: vec![FailedUpdate {
                 component: "rules".into(),
                 version: "2026.08.07".into(),
+                signature: "2026.08.07".into(),
                 reason: "false-positive smoke failed: readme.txt matched Foo".into(),
             }],
             ..Signals::default()
@@ -2051,6 +2124,117 @@ mod tests {
         assert!(p.rationale.contains("previous data is still live"));
         assert!(p.rationale.contains("false-positive smoke failed"));
         assert_eq!(p.signature, "rules:2026.08.07");
+    }
+
+    /// #46's compounding defect: two DIFFERENT manifest-level refusals used to
+    /// share the signature `rules:` (both versionless), so dismissing a 404
+    /// permanently muted a containment violation. The updater now hands the
+    /// rule a per-reason signature, and the rule must key on it.
+    #[test]
+    fn dismissing_one_versionless_refusal_does_not_mute_a_different_one() {
+        let refusal = |sig_key: &str, reason: &str| FailedUpdate {
+            component: "rules".into(),
+            version: String::new(),
+            signature: sig_key.into(),
+            reason: reason.into(),
+        };
+        let dismissed = vec![DismissedRule {
+            rule_id: RULE_DETECTION_UPDATE_FAILED.to_string(),
+            signature: "rules:reason:aaaaaaaaaaaaaaaa".to_string(),
+        }];
+        let same = Signals {
+            detection_update_failures: vec![refusal(
+                "reason:aaaaaaaaaaaaaaaa",
+                "manifest schema 2 is not supported",
+            )],
+            dismissed: dismissed.clone(),
+            ..Signals::default()
+        };
+        assert!(
+            !evaluate(&same)
+                .iter()
+                .any(|p| p.rule_id == RULE_DETECTION_UPDATE_FAILED),
+            "the dismissed refusal stays dismissed"
+        );
+        let other = Signals {
+            detection_update_failures: vec![refusal(
+                "reason:bbbbbbbbbbbbbbbb",
+                "file points outside the manifest's own directory",
+            )],
+            dismissed,
+            ..Signals::default()
+        };
+        let p = evaluate(&other)
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_UPDATE_FAILED)
+            .expect("a containment violation still fires");
+        assert!(p.rationale.contains("outside the manifest"), "{}", p.rationale);
+    }
+
+    /// A week of unreachable checks is a card — and it says the channel is
+    /// unreachable, NOT that a bundle was rejected. That distinction is the
+    /// whole of #46.
+    #[test]
+    fn a_stalled_update_channel_raises_its_own_card_not_a_rejection() {
+        let sig = Signals {
+            detection_update_stalled: vec![StalledUpdate {
+                component: "rules".into(),
+                streak: STALLED_AFTER_CHECKS,
+                reason: "could not reach the update channel: GET https://…: HTTP 404".into(),
+            }],
+            ..Signals::default()
+        };
+        let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
+        assert!(
+            !ids.contains(&RULE_DETECTION_UPDATE_FAILED),
+            "an outage must never render as a refusal: {ids:?}"
+        );
+        let p = evaluate(&sig)
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_UPDATE_STALLED)
+            .expect("fires");
+        assert!(p.warn_only);
+        assert!(p.setting.is_empty(), "nothing here is a settings write");
+        assert!(
+            !p.rationale.to_ascii_lowercase().contains("rejected"),
+            "{}",
+            p.rationale
+        );
+        assert!(p.rationale.contains("not getting fresher") || p.rationale.contains("fresher"));
+        assert!(p.rationale.contains("HTTP 404"), "the reason is diagnosable");
+        assert_eq!(p.signature, "rules:1");
+    }
+
+    /// The dismissal re-fires after another threshold's worth of failures, so a
+    /// permanently dead channel is raised roughly weekly rather than once.
+    #[test]
+    fn a_dismissed_stall_card_refires_after_another_threshold_of_failures() {
+        let stalled = |streak: u32| Signals {
+            detection_update_stalled: vec![StalledUpdate {
+                component: "rules".into(),
+                streak,
+                reason: "offline".into(),
+            }],
+            dismissed: vec![DismissedRule {
+                rule_id: RULE_DETECTION_UPDATE_STALLED.to_string(),
+                signature: "rules:1".to_string(),
+            }],
+            ..Signals::default()
+        };
+        let fires = |s: &Signals| {
+            evaluate(s)
+                .iter()
+                .any(|p| p.rule_id == RULE_DETECTION_UPDATE_STALLED)
+        };
+        assert!(!fires(&stalled(STALLED_AFTER_CHECKS)), "dismissed");
+        assert!(
+            !fires(&stalled(STALLED_AFTER_CHECKS * 2 - 1)),
+            "still inside the dismissed bucket"
+        );
+        assert!(
+            fires(&stalled(STALLED_AFTER_CHECKS * 2)),
+            "another threshold's worth of silence re-raises it"
+        );
     }
 
     /// Dismissal is keyed to the VERSION, so declining one bundle does not
@@ -2095,5 +2279,6 @@ mod tests {
             .collect();
         assert!(!ids.contains(&RULE_DETECTION_UPDATE_AVAILABLE));
         assert!(!ids.contains(&RULE_DETECTION_UPDATE_FAILED));
+        assert!(!ids.contains(&RULE_DETECTION_UPDATE_STALLED));
     }
 }

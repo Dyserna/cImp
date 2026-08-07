@@ -4587,8 +4587,13 @@
             interval. A candidate bundle is verified by SHA-256, compiled, and
             run against shipped control documents — it must catch the known
             attacks and must NOT flag the benign ones — before it goes live. If
-            anything fails, the old data stays active and you get a card;
-            detection never silently degrades to nothing.
+            a candidate bundle is refused, the old data stays active and you get
+            a card; detection never silently degrades to nothing. If the channel
+            simply cannot be reached — offline, a proxy, a release that is not
+            published yet — that is reported here and nowhere else, until it has
+            been unreachable long enough to mean this component has stopped
+            getting fresher. Scheduled checks follow the injection-protection
+            master switch: with protection off, nothing is polled or swapped.
           </small>
           {#if detection}
             {#each detection.updater.components as comp (comp.component)}
@@ -4649,7 +4654,24 @@
                     Revert to {comp.previous_version || 'previous'}
                   </button>
                 </div>
-                {#if comp.last_outcome}
+                {#if comp.last_outcome_kind === 'unavailable'}
+                  <!--
+                    #46: the channel could not be REACHED. Nothing was refused,
+                    so this is deliberately NOT the unhealthy colour — a 404, a
+                    proxy or an offline laptop is not a security event, and
+                    painting it red is what made the real rejection colour
+                    meaningless. The streak is shown because "for how long" is
+                    the part that eventually matters.
+                  -->
+                  <small class="hint">
+                    Could not reach the update channel: {comp.last_outcome}
+                    {#if comp.unreachable_streak > 1}
+                      ({comp.unreachable_streak} checks in a row — the installed
+                      data is still live, but this component is not getting
+                      fresher.)
+                    {/if}
+                  </small>
+                {:else if comp.last_outcome}
                   <small class="hint" class:down={!comp.last_ok}>
                     Last check: {comp.last_outcome}
                   </small>

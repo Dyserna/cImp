@@ -45,16 +45,24 @@
 //! - **Old data stays live on any failure.** There is no path from "the new
 //!   bundle is bad" to "no bundle": the live set changes in exactly one place,
 //!   after the gauntlet passed, and is restored if the hot-reload disagrees.
-//! - **Inert when off.** With both modes `off` the scheduler tick returns
-//!   before touching the network, the disk, or anything but the two mode
-//!   fields.
+//! - **Inert when off.** With the Phase G L1 master off, or with both modes
+//!   `off`, the scheduler tick returns before touching the network, the disk,
+//!   or anything but those switches.
+//! - **A refusal and an outage are different events.** [`Outcome::Rejected`]
+//!   means a document reached us and a check said no; [`Outcome::Unavailable`]
+//!   means the channel never answered. Collapsing them made every install
+//!   report a permanent bundle rejection for a release that simply did not
+//!   exist yet (#46), which is how a security-relevant card stops being read.
 //!
 //! # Every signal has its consumer
 //!
 //! Every outcome writes an `injection_flag` Tool Activity row (screen
-//! `updater`, `ok` reflecting the outcome), and the two that need a decision
-//! also reach the Advisor: `detection.update_available.v1` (check-only found
-//! something newer) and `detection.update_failed.v1` (a bundle was rejected).
+//! `updater`, `ok` reflecting the outcome), and the three that need a decision
+//! reach the Advisor: `detection.update_available.v1` (check-only found
+//! something newer), `detection.update_failed.v1` (a bundle was refused) and
+//! `detection.update_stalled.v1` ([`STALLED_AFTER_CHECKS`] consecutive checks
+//! could not reach the channel — the "this component has stopped getting
+//! fresher" signal, which is the one worth raising about an outage).
 //! Versions, last-check time and outcome live in Settings → Tools → Detection,
 //! next to Check now, Apply, Revert and Open rules folder.
 //!
@@ -308,6 +316,19 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, State>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The process-wide **run lock**: at most one check/apply/revert at a time.
+///
+/// `staging/<component>/` is a single fixed path that [`run_component`] wipes
+/// on the way in and on the way out, and `previous/<component>/<version>/` is
+/// wiped by both [`activate`] and [`revert_inner`]. Two overlapping runs — a
+/// scheduler tick and a Settings click is the realistic pair — would therefore
+/// have one deleting what the other had just written. Async rather than a
+/// `std::sync::Mutex` because [`run`] holds it across the download `await`.
+fn run_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// The state under `root`, hydrating from disk on first use.
 pub fn state_at(root: &Path) -> State {
     let mut g = cache().lock().unwrap_or_else(PoisonError::into_inner);
@@ -360,6 +381,13 @@ pub struct ComponentStatus {
     pub last_check_ms: u64,
     pub last_outcome: String,
     pub last_ok: bool,
+    /// [`Outcome::as_str`] for that check. Settings branches on `unavailable`
+    /// to say "could not reach the update channel" instead of "an update was
+    /// refused" — the distinction #46 is about, which `last_ok` cannot carry.
+    pub last_outcome_kind: String,
+    /// Consecutive unreachable checks, so Settings can say how long this has
+    /// been going on rather than repeating one 404 forever.
+    pub unreachable_streak: u32,
     pub last_failure: String,
 }
 
@@ -398,6 +426,8 @@ pub fn status(settings: &Settings) -> UpdaterStatus {
                     last_check_ms: cs.last_check_ms,
                     last_outcome: cs.last_outcome.clone(),
                     last_ok: cs.last_ok,
+                    last_outcome_kind: cs.last_outcome_kind.clone(),
+                    unreachable_streak: cs.unreachable_streak,
                     last_failure: cs.last_failure.clone(),
                 }
             })
@@ -426,7 +456,24 @@ pub enum Outcome {
     /// Downloaded, validated and activated.
     Applied,
     /// Rejected before activation, or rolled back after it. Old data still live.
+    ///
+    /// **This means a document reached us and a check refused it**: a manifest
+    /// that violates a parse invariant (unknown schema, an artifact URL outside
+    /// the curated directory), a bundle whose checksum or size disagrees with
+    /// the manifest, a bundle the gauntlet failed, a set that would not reload.
+    /// Every one of those is a decision someone should look at, so this is the
+    /// only outcome that cards immediately and writes an `ok:false` row.
     Rejected,
+    /// The update channel could not be reached, so nothing was checked (#46).
+    ///
+    /// A 404 on a release that does not exist yet, DNS failure, an offline
+    /// laptop, a corporate proxy serving a login page — none of these are a
+    /// bundle being refused, and painting them as one made a rejection card
+    /// mean nothing. Deliberately quiet: a neutral activity row, a distinct
+    /// line in Settings, and **no** card until [`STALLED_AFTER_CHECKS`]
+    /// consecutive checks say the same thing, which is the point at which "this
+    /// component has stopped getting fresher" becomes true and worth saying.
+    Unavailable,
     /// The previous bundle was restored.
     Reverted,
 }
@@ -438,16 +485,32 @@ impl Outcome {
             Outcome::Available => "available",
             Outcome::Applied => "applied",
             Outcome::Rejected => "rejected",
+            Outcome::Unavailable => "unavailable",
             Outcome::Reverted => "reverted",
         }
     }
 
     /// `Rejected` is the only unhealthy outcome. "Available" is check-only mode
-    /// working exactly as configured and must not paint the feed red.
+    /// working exactly as configured and must not paint the feed red — and
+    /// neither must `Unavailable`, which reports the network, not the bundle.
     pub const fn ok(self) -> bool {
         !matches!(self, Outcome::Rejected)
     }
 }
+
+/// Consecutive `Unavailable` checks before the Advisor says anything.
+///
+/// Seven, i.e. exactly one week at the default 24 h interval. The number is
+/// chosen to be un-producible by any ordinary transient: a weekend offline, a
+/// multi-hour GitHub incident, a laptop on a long flight and a hotel captive
+/// portal all clear well inside it, and each of them resets the streak on the
+/// first check that reaches the channel. What survives seven consecutive
+/// failures is a channel that is genuinely not answering — a dead URL, a proxy
+/// that blocks it, a machine that never has network — and *that* is the
+/// staleness decision 13 forbids leaving silent. Lower would re-create the
+/// noise #46 is about; much higher would let a component freeze for a month
+/// before anyone heard.
+pub const STALLED_AFTER_CHECKS: u32 = 7;
 
 /// Write one updater row into the Tool Activity feed.
 ///
@@ -501,25 +564,51 @@ pub struct AvailableUpdate {
     pub notes: String,
 }
 
-/// A component whose last update attempt was rejected.
+/// A component whose last update attempt was **refused** — a document arrived
+/// and a check said no.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FailedUpdate {
     pub component: String,
+    /// The bundle version, when the refusal happened at bundle level. Empty for
+    /// a manifest-level refusal — display only.
     pub version: String,
+    /// The dismissal key. Never empty (see [`failure_signature`]): keying the
+    /// card on `version` alone let one dismissal of an unversioned failure
+    /// silence every later refusal, containment violations included (#46).
+    pub signature: String,
     pub reason: String,
 }
 
-/// The two Advisor inputs, read from the cached state — no disk, no clock, so
+/// A component that has stopped being able to reach the update channel at all.
+///
+/// Distinct from [`FailedUpdate`] on purpose: nothing was refused and nothing
+/// is wrong with the data — the component simply is not getting fresher, and
+/// only says so once the run of failures is long enough to mean it
+/// ([`STALLED_AFTER_CHECKS`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StalledUpdate {
+    pub component: String,
+    /// Consecutive unreachable checks, ≥ [`STALLED_AFTER_CHECKS`].
+    pub streak: u32,
+    /// The most recent transport error, verbatim — the thing that makes this
+    /// diagnosable rather than merely worrying.
+    pub reason: String,
+}
+
+/// The three Advisor inputs, read from the cached state — no disk, no clock, so
 /// they are safe on the advice poll's cadence.
-pub fn advisor_signals() -> (Vec<AvailableUpdate>, Vec<FailedUpdate>) {
+pub fn advisor_signals() -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<StalledUpdate>) {
     signals_from(&state())
 }
 
 /// The pure half, so the rules that consume these can be tested from a state
 /// value.
-pub fn signals_from(st: &State) -> (Vec<AvailableUpdate>, Vec<FailedUpdate>) {
+pub fn signals_from(
+    st: &State,
+) -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<StalledUpdate>) {
     let mut available = Vec::new();
     let mut failed = Vec::new();
+    let mut stalled = Vec::new();
     for c in Component::ALL {
         let cs = st.get(c);
         if !cs.available_version.is_empty() {
@@ -534,11 +623,49 @@ pub fn signals_from(st: &State) -> (Vec<AvailableUpdate>, Vec<FailedUpdate>) {
             failed.push(FailedUpdate {
                 component: c.as_str().to_string(),
                 version: cs.last_failure_version.clone(),
+                // A state file written before `last_failure_signature` existed
+                // still has to key on something non-empty, so fall back to the
+                // same derivation `finish` would have used.
+                signature: if cs.last_failure_signature.is_empty() {
+                    failure_signature(&cs.last_failure_version, &cs.last_failure)
+                } else {
+                    cs.last_failure_signature.clone()
+                },
                 reason: cs.last_failure.clone(),
             });
         }
+        // The threshold is applied HERE, not in the Advisor: it is the
+        // updater's policy about its own channel, and the rule that renders it
+        // should not be able to disagree with the counter that feeds it.
+        if cs.unreachable_streak >= STALLED_AFTER_CHECKS {
+            stalled.push(StalledUpdate {
+                component: c.as_str().to_string(),
+                streak: cs.unreachable_streak,
+                reason: cs.last_outcome.clone(),
+            });
+        }
     }
-    (available, failed)
+    (available, failed, stalled)
+}
+
+/// The dismissal key for a refusal.
+///
+/// The bundle version when there is one, so a dismissal holds for that bundle
+/// and re-fires on the next — the spec's claim, which was false while
+/// manifest-level failures all signed themselves `component:` (#46). With no
+/// version to key on, the REASON is the thing that distinguishes one refusal
+/// from another, so it is hashed into the key: dismissing "schema 2 is not
+/// supported" leaves a later "artifact points outside the curated directory"
+/// free to fire.
+///
+/// Derived rather than passed in, so no call site can reintroduce an empty
+/// signature by forgetting an argument.
+pub fn failure_signature(version: &str, reason: &str) -> String {
+    if !version.trim().is_empty() {
+        return version.to_string();
+    }
+    let digest = manifest::sha256_hex(reason.trim().as_bytes());
+    format!("reason:{}", &digest[..16])
 }
 
 // ── One component's run ────────────────────────────────────────────────────
@@ -906,6 +1033,13 @@ fn finish(
         cs.last_check_ms = now_ms;
         cs.last_outcome = detail.clone();
         cs.last_ok = outcome.ok();
+        cs.last_outcome_kind = outcome.as_str().to_string();
+        // Reaching the channel — even to be told no — ends the run of silence.
+        // Reset here, once, rather than at each of the four reaching outcomes,
+        // so a future outcome cannot be added without deciding the question.
+        if outcome != Outcome::Unavailable {
+            cs.unreachable_streak = 0;
+        }
         match outcome {
             Outcome::Available => {
                 cs.available_version = version.clone();
@@ -919,13 +1053,22 @@ fn finish(
                 cs.available_notes.clear();
                 cs.last_failure.clear();
                 cs.last_failure_version.clear();
+                cs.last_failure_signature.clear();
             }
             Outcome::Rejected => {
                 cs.last_failure = detail.clone();
                 cs.last_failure_version = version.clone();
+                cs.last_failure_signature = failure_signature(&version, &detail);
                 // The offer stands: the user may still want to retry, and the
                 // Settings row should keep saying which version was refused.
                 cs.available_version = version.clone();
+            }
+            // Nothing was checked, so nothing recorded about the DATA changes:
+            // a standing offer stays offered and a standing refusal stays
+            // refused, because a check that never happened resolves neither.
+            // The only thing that moves is the run length.
+            Outcome::Unavailable => {
+                cs.unreachable_streak = cs.unreachable_streak.saturating_add(1);
             }
         }
     });
@@ -937,6 +1080,17 @@ fn finish(
             version = %version,
             detail = %detail,
             "detection updater: bundle rejected; the previous data is still active"
+        );
+    } else if outcome == Outcome::Unavailable {
+        // Logged, not carded (#46). `info` and not `warn`: on a machine that is
+        // simply offline this is the expected result of every check, and a WARN
+        // per component per day would train the log to be ignored.
+        info!(
+            target: "offload",
+            component = c.as_str(),
+            streak = state_at(root).get(c).unreachable_streak,
+            detail = %detail,
+            "detection updater: update channel unreachable; the current data stays live"
         );
     } else {
         info!(
@@ -973,18 +1127,45 @@ pub async fn run(
     layout: &Layout,
     reload: Reloader<'_>,
 ) -> Vec<RunResult> {
+    // One run at a time, process-wide. A scheduler tick and a "Check now" click
+    // otherwise share `staging/<component>/`, and the loser's `wipe_dir` would
+    // delete the bundle the winner had just validated. Serialized rather than
+    // skipped: a click that has to wait for a tick still does what the user
+    // asked, whereas a click that silently no-ops does not.
+    let _run_guard = run_lock().lock().await;
     let root = layout.state_root.clone();
     let raw = match fetcher.get(manifest_url, manifest::MAX_MANIFEST_BYTES).await {
         Ok(b) => b,
-        Err(e) => return fail_all(components, sched, &root, &e),
+        // Transport. Nothing was refused; the channel did not answer (#46).
+        Err(e) => return fail_all(components, sched, &root, Outcome::Unavailable, &e),
     };
     let text = match String::from_utf8(raw) {
         Ok(t) => t,
-        Err(_) => return fail_all(components, sched, &root, "the manifest is not valid UTF-8"),
+        Err(_) => {
+            return fail_all(
+                components,
+                sched,
+                &root,
+                Outcome::Unavailable,
+                "the response was not valid UTF-8, so it is not the manifest",
+            )
+        }
     };
     let man = match Manifest::parse(&text, manifest_url) {
         Ok(m) => m,
-        Err(e) => return fail_all(components, sched, &root, &e),
+        Err(e) => {
+            // The one place the two failure classes are told apart. A body that
+            // is not even shaped like our index means nobody is publishing here
+            // (a 404 page, a proxy login, a tag that does not exist yet); a body
+            // that IS shaped like it and still fails is our document being
+            // refused by a parse invariant — schema, containment, file names.
+            let outcome = if manifest::looks_like_manifest(&text) {
+                Outcome::Rejected
+            } else {
+                Outcome::Unavailable
+            };
+            return fail_all(components, sched, &root, outcome, &e);
+        }
     };
 
     let mut out = Vec::new();
@@ -1034,26 +1215,30 @@ pub async fn run_live(
 /// A manifest-level failure is every enabled component's failure: none of them
 /// could be checked, and a silent no-op would be indistinguishable from
 /// "everything is current".
+///
+/// `outcome` is the caller's classification — [`Outcome::Unavailable`] when the
+/// channel did not produce our index at all, [`Outcome::Rejected`] when it did
+/// and a parse invariant refused it. The distinction is the whole of #46, so it
+/// is an argument here rather than a guess inside.
 fn fail_all(
     components: &[Component],
     sched: Schedule,
     root: &Path,
+    outcome: Outcome,
     reason: &str,
 ) -> Vec<RunResult> {
     let now = crate::activity::now_ms();
+    let detail = match outcome {
+        Outcome::Unavailable => format!(
+            "could not reach the update channel: {reason}. Nothing was checked and nothing \
+             changed; the current detection data is still live."
+        ),
+        _ => format!("update check failed: {reason}"),
+    };
     components
         .iter()
         .filter(|c| sched.mode(**c) != Mode::Off)
-        .map(|c| {
-            finish(
-                *c,
-                root,
-                now,
-                Outcome::Rejected,
-                String::new(),
-                format!("update check failed: {reason}"),
-            )
-        })
+        .map(|c| finish(*c, root, now, outcome, String::new(), detail.clone()))
         .collect()
 }
 
@@ -1099,7 +1284,14 @@ pub fn revert(c: Component, layout: &Layout, reload: Reloader<'_>) -> RunResult 
 }
 
 /// The production wrapper for [`revert`].
+///
+/// **Must be called from a blocking context** (`spawn_blocking`, which is how
+/// the `detection_revert` IPC command already invokes it) — it takes the same
+/// [`run_lock`] a scheduler tick holds, and `blocking_lock` panics if called on
+/// a runtime thread. The pure [`revert`] is the one the tests drive; it takes no
+/// lock, because a test owns its own tree.
 pub fn revert_live(c: Component) -> RunResult {
+    let _run_guard = run_lock().blocking_lock();
     match Layout::resolve() {
         Some(layout) => revert(c, &layout, &live_reload),
         None => RunResult {
@@ -1160,8 +1352,10 @@ fn revert_inner(
 /// Follows the app's existing background-task shape (a `tauri::async_runtime`
 /// task around a `tokio::time::interval`, as `state::manager` and the loopback
 /// heartbeats use) rather than introducing a scheduling framework. Settings are
-/// re-read on every tick, so a mode or interval change takes effect within one
-/// [`POLL_TICK`] with no restart and no broadcast subscription to keep in sync.
+/// re-read on every tick, so a master, mode or interval change takes effect
+/// within one [`POLL_TICK`] with no restart and no broadcast subscription to
+/// keep in sync — which is why the task is still spawned unconditionally even
+/// though [`tick_once`] may decline to do anything.
 pub fn spawn_scheduler(settings: crate::settings::SettingsHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(LAUNCH_DELAY).await;
@@ -1177,10 +1371,21 @@ pub fn spawn_scheduler(settings: crate::settings::SettingsHandle) {
 }
 
 /// One scheduler pass. Separated so the inertness property is visible in one
-/// place: with both components `off` this returns before reading the state file
-/// and long before touching the network.
+/// place: with the L1 master off, or with both components `off`, this returns
+/// before reading the state file and long before touching the network.
 async fn tick_once(settings: &crate::settings::SettingsHandle) {
     let snap = settings.current();
+    // Phase G's L1 master, whose stated scope is EVERY V32 control (#46). With
+    // protection off there is no polling, no network and no bundle swap — the
+    // updater exists to keep V32's data fresh, and data for a disabled feature
+    // is not worth a daily request. Checked per tick, not at spawn, so flipping
+    // the master back on resumes checks within one `POLL_TICK` with no restart;
+    // that is also why this is not a spawn-baked setting and owes no entry in
+    // `spawn_inject_sig`. Read through the resolver, never the raw field
+    // (decision 16 / #44).
+    if !crate::settings::injection::master_enabled(&snap) {
+        return;
+    }
     let sched = Schedule::from_settings(&snap);
     if sched.is_inert() {
         return;

@@ -227,6 +227,20 @@ pub struct ComponentState {
     /// colour it without parsing prose.
     #[serde(default)]
     pub last_ok: bool,
+    /// [`Outcome::as_str`](super::Outcome::as_str) for that check — the machine
+    /// half of `last_outcome`. `last_ok` alone cannot tell "the channel could
+    /// not be reached" from "the bundle was fine", and Settings has to say
+    /// something different for each (#46: a transport failure is not a bundle
+    /// rejection). Empty on a state file written before this field existed.
+    #[serde(default)]
+    pub last_outcome_kind: String,
+    /// Consecutive checks that ended `unavailable` — the update channel could
+    /// not be reached at all. Reset to 0 by ANY check that reached it, refusal
+    /// included. One 404 is weather; a long run of them is the component
+    /// quietly ceasing to get fresher, which is the state decision 13 exists to
+    /// surface (`updater::STALLED_AFTER_CHECKS`).
+    #[serde(default)]
+    pub unreachable_streak: u32,
     /// A newer version the last check found but did not apply — set in
     /// `check-only` mode, and cleared on a successful apply. This is the field
     /// the "update available" Advisor card and the Apply button read.
@@ -241,10 +255,17 @@ pub struct ComponentState {
     /// failure card is keyed to until the failure is actually resolved.
     #[serde(default)]
     pub last_failure: String,
-    /// Version the failure above was attempting. The failure card's signature,
-    /// so a dismissal holds for that bundle and re-fires on the next one.
+    /// Version the failure above was attempting. Empty when the refusal
+    /// happened at the manifest level, before any bundle had a version — which
+    /// is exactly why it is NOT the card's signature (#46).
     #[serde(default)]
     pub last_failure_version: String,
+    /// The failure card's dismissal signature. The version when there is one,
+    /// else a digest of the reason — never empty, because an empty signature
+    /// made one dismissal silence every future refusal including a containment
+    /// violation. See [`super::failure_signature`].
+    #[serde(default)]
+    pub last_failure_signature: String,
 }
 
 /// The whole state file.

@@ -312,6 +312,30 @@ impl Manifest {
     }
 }
 
+/// Whether `body` is plausibly **our index document at all** — a JSON object
+/// carrying a `schema` key.
+///
+/// This is the line between the updater's two failure classes (#46). A body
+/// that fails this test is not a manifest we refused; it is evidence that
+/// nothing answering to this URL is publishing one — a GitHub 404 page, a
+/// captive-portal login, a proxy error, a release tag that does not exist yet.
+/// Those are transport events: [`super::Outcome::Unavailable`], quiet.
+/// A body that PASSES it and still fails [`Manifest::parse`] is our document
+/// (or something wearing its shape) being refused by a validation invariant —
+/// an unknown schema, a duplicate component, an artifact URL pointing outside
+/// the curated directory. Those are [`super::Outcome::Rejected`] and card
+/// immediately.
+///
+/// Deliberately a *shape* test and not a re-parse: it must answer "is anyone
+/// publishing here", not "is this manifest good", and every question about
+/// goodness already has an answer in [`Manifest::parse`].
+pub fn looks_like_manifest(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("schema")))
+        .unwrap_or(false)
+}
+
 /// Validate one file entry. Split out so every rejection reason names the
 /// component and the file it belongs to.
 fn parse_file(

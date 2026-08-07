@@ -225,7 +225,64 @@ declares its class AND its mutation capability in one reviewed place.
     (Phase C amendment 2026-08-06, same closing-the-analogous-hole logic:
     `fc00::/7` IPv6 unique-local — the v6 RFC1918 — and the deprecated
     IPv4-compatible form `::a.b.c.d`, unmapped and re-checked so `::7f00:1`
-    cannot spell loopback.) The
+    cannot spell loopback. Review amendment 2026-08-07 / #48, finding C-4,
+    two more embedded-v4 spellings on the same discipline: `64:ff9b::/96`,
+    the well-known NAT64 prefix, and `2002::/16`, 6to4 — where
+    `2002:7f00:1::` is 127.0.0.1. Both are **unmapped and re-checked, not
+    blanket-denied**: each embeds a *destination* v4, so the address that
+    matters is the embedded one and `64:ff9b::8.8.8.8` stays reachable.
+    Teredo `2001::/32` is deliberately out: its embedded v4s are the relay
+    and the obfuscated client, not the destination, so unmapping it would
+    screen the wrong address.)
+
+    **Correction, same amendment — `::ffff:0:0/96` is unmapped and
+    re-checked, not blanket-denied.** The enumeration above reads as a flat
+    deny of the range; the code has always re-checked the embedded address,
+    so `::ffff:192.168.1.1` is denied and `::ffff:8.8.8.8` is not. The code
+    is right and this text was wrong: blanket-denying the mapped range would
+    refuse public destinations for no security gain.
+
+    **The screen and the fetcher must agree on what the URL is** (review
+    amendment 2026-08-07 / #48, finding C-4 — the actual hole, and the
+    reason the range list above was never the whole policy). A range check
+    is only as good as the string it is handed, and the extractor was
+    handing it a different string than the third-party fetch server would
+    parse. Three rules, one root cause:
+    - **TAB, LF and CR are stripped before scanning, never treated as
+      terminators.** A WHATWG-conformant parser removes them from anywhere
+      in a URL before parsing — the `url` crate cImp itself uses does it in
+      `Input::next_utf8`, as do Node and Python's `urllib`. Cutting the
+      candidate at the first whitespace turned
+      `http://\t127.0.0.1:12344/props` into `"http://"`, which parsed as
+      nothing and was allowed, while the fetch server stripped the tab and
+      reached the local `llama-server` — the one internal service this
+      decision's own carve-out text names as deliberately unprotected by any
+      allow-list. Every string is now scanned twice, as written and stripped,
+      and the union is screened (stripping alone glues consecutive URLs into
+      one run whose host is the first).
+    - **An unparseable candidate is REFUSED, not allowed.** A candidate
+      exists only because something URL-shaped was found; failing to
+      understand it is not evidence of safety. The one exception is a run
+      that is *nothing but* a scheme prefix (the word "http://" in prose):
+      for a target to hide behind one, it must be separated by a character a
+      parser either removes — and there are exactly three, handled above — or
+      rejects as a forbidden host code point. Note this is the **opposite**
+      call from resolution failure, which still fails open (an unresolvable
+      name is not a reachable target; an unreadable URL is an unknown one).
+    - **Extraction is widened past `http://`/`https://`** to a bare
+      `host:port` or `host/path` run and a protocol-relative `//host/…`,
+      both of which a scheme-guessing fetcher resolves and neither of which
+      produced a candidate before. Plausibility rules keep prose out: an
+      all-numeric host must be a full four-octet IPv4 literal, so `12:30`
+      and `0.1.2.3` are not hosts.
+
+    Accepted residual of the last rule: a bare IP with **neither** port nor
+    path (`{"url": "10.0.0.1"}`) is still not extracted. Extracting it means
+    refusing every argument that merely *mentions* a private address —
+    "what is 192.168.1.1" is an ordinary research question — for the rarest
+    form of the case.
+
+    The
     explicitly configured LAN endpoints (e.g. `172.21.1.11`, itself inside
     `172.16/12`) are the ONLY allow-exceptions, carved back out by exact
     host:port. Hostname targets are **resolved first and every resolved IP

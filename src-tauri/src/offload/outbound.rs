@@ -134,12 +134,28 @@ const CANARY_REDACTION: &str = "[redacted]";
 /// - `::ffff:0:0/96` — IPv4-mapped IPv6, unmapped and re-checked, else
 ///   `::ffff:192.168.1.1` slips a private v4 past a v4-only screen.
 ///
-/// Two additions **beyond** the spec's enumeration, both closing exactly the
-/// hole the mapped-IPv6 entry exists to close:
+/// Four additions **beyond** the spec's enumeration, all closing exactly the
+/// hole the mapped-IPv6 entry exists to close — a v6 spelling of a v4 address
+/// the v4 screen already denies:
 /// - `fc00::/7` — IPv6 unique-local, the v6 analogue of RFC1918. Omitting it
 ///   would leave the v6 private range wide open while the v4 one is closed.
 /// - IPv4-compatible IPv6 (`::a.b.c.d`, deprecated) — same unmap-and-recheck,
 ///   so `::7f00:1` cannot spell loopback past the v4 screen.
+/// - `64:ff9b::/96` — the well-known NAT64 prefix (RFC 6052), the one range the
+///   V32 review found missing (#48).
+/// - `2002::/16` — 6to4 (RFC 3056), where `2002:7f00:1::` spells 127.0.0.1.
+///
+/// The last two are **unmapped and re-checked**, not blanket-denied, for the
+/// same reason `::ffff:` is: both prefixes embed a *destination* v4 address, so
+/// the address that matters is the embedded one. `64:ff9b::8.8.8.8` is a public
+/// destination reached through a translator and stays allowed;
+/// `64:ff9b::7f00:1` is loopback wearing a v6 hat and does not. Blanket-denying
+/// either prefix would deny more than the policy says and buy nothing — an
+/// embedded *public* v4 is not an internal service.
+///
+/// Teredo (`2001::/32`) is deliberately **not** here: its embedded v4s are the
+/// relay server and the obfuscated *client*, not the destination the packet
+/// reaches, so unmapping it would screen the wrong address.
 pub fn is_denied_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_denied_v4(v4),
@@ -179,14 +195,30 @@ fn is_denied_v6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_denied_v4(v4);
     }
+    let segs = ip.segments();
+    let o = ip.octets();
     // ::a.b.c.d — the deprecated IPv4-compatible form. Still accepted by some
     // stacks, so unmap and re-check rather than letting `::7f00:1` through.
-    let segs = ip.segments();
     if segs[..6].iter().all(|s| *s == 0) {
-        let o = ip.octets();
         return is_denied_v4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
-    let o = ip.octets();
+    // 64:ff9b::/96 — the well-known NAT64 prefix (RFC 6052). The v4 destination
+    // is the low 32 bits, so this is the same unmap-and-recheck as `::ffff:`
+    // (#48). A translator forwards to whatever is embedded here; if that is
+    // 127.0.0.1 or 10.x, the fetch reaches the internal service by another
+    // spelling.
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6].iter().all(|s| *s == 0) {
+        return is_denied_v4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // 2002::/16 — 6to4 (RFC 3056). The v4 endpoint sits in bytes 2..6, which is
+    // how `2002:7f00:1::` spells 127.0.0.1. Reaching it needs a 6to4 relay, so
+    // it is theoretical rather than practical — but it is three lines of the
+    // machinery already here, and leaving one embedded-v4 form unscreened while
+    // screening three others is the inconsistency that produces the next
+    // finding.
+    if segs[0] == 0x2002 {
+        return is_denied_v4(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
     // fe80::/10 — link-local.
     if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
         return true;
@@ -210,6 +242,38 @@ const URL_PREFIXES: [&str; 2] = ["http://", "https://"];
 /// quoting/bracketing characters a model or a page would wrap a URL in.
 const URL_TERMINATORS: [char; 8] = ['"', '\'', '`', '<', '>', '\\', '|', '^'];
 
+/// The three characters a WHATWG-conformant URL parser **removes** from
+/// anywhere in a URL before parsing (the spec's *ASCII tab or newline*): TAB,
+/// LF, CR (#48, review finding C-4).
+///
+/// This is the whole parser differential. `scan_extraction` cuts a candidate at
+/// the first whitespace, which includes these three — but the `url` crate cImp
+/// itself uses loops `if !ascii_tab_or_new_line(c)` in `Input::next_utf8`, and
+/// Node and Python's `urllib` do the same. So
+/// `Url::parse("http://\t127.0.0.1:12344/props")` yields host `127.0.0.1`:
+/// cImp's own screen would have caught the bypass had the extractor not cut the
+/// string first. Every string is therefore scanned **twice** — once as written,
+/// once with these three removed — and the union is screened. Scanning both
+/// matters: stripping alone glues `…/a\nhttp://10.0.0.1/` into one run whose
+/// host is the *first* URL, which the as-written scan is what separates.
+const WHATWG_STRIPPED: [char; 3] = ['\t', '\n', '\r'];
+
+/// One URL-shaped run found in an argument, with the evidence that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Candidate {
+    /// The run, normalized to something [`Url::parse`] can accept — a
+    /// schemeless or protocol-relative run gets an assumed `http://`, which is
+    /// what a scheme-guessing fetcher would do with it.
+    url: String,
+    /// Whether a literal `http://`/`https://` prefix was present.
+    ///
+    /// Load-bearing for the deny-on-unparseable rule: an explicit scheme is
+    /// unambiguous evidence that this run *is* a URL, so failing to understand
+    /// it is not evidence of safety. A bare `host:port` run is a heuristic
+    /// guess, and denying on a guess we cannot even parse would refuse prose.
+    strict: bool,
+}
+
 /// Every http/https URL appearing in **any** string value of `args`, at any
 /// nesting depth.
 ///
@@ -223,23 +287,60 @@ const URL_TERMINATORS: [char; 8] = ['"', '\'', '`', '<', '>', '\\', '|', '^'];
 /// Object *keys* are not scanned: a key is part of the server's schema, not
 /// model-authored content.
 pub fn extract_urls(args: &Value) -> Vec<String> {
+    candidates(args).into_iter().map(|c| c.url).collect()
+}
+
+/// [`extract_urls`] with the provenance the screen needs. Order-preserving and
+/// deduplicated: the two scan variants overlap by construction, and a duplicate
+/// candidate is a duplicate DNS resolution for no new information.
+fn candidates(args: &Value) -> Vec<Candidate> {
     let mut out = Vec::new();
-    collect_urls(args, &mut out);
+    collect_candidates(args, &mut out);
     out
 }
 
-fn collect_urls(v: &Value, out: &mut Vec<String>) {
+fn collect_candidates(v: &Value, out: &mut Vec<Candidate>) {
     match v {
         Value::String(s) => scan_string(s, out),
-        Value::Array(items) => items.iter().for_each(|i| collect_urls(i, out)),
-        Value::Object(map) => map.values().for_each(|i| collect_urls(i, out)),
+        Value::Array(items) => items.iter().for_each(|i| collect_candidates(i, out)),
+        Value::Object(map) => map.values().for_each(|i| collect_candidates(i, out)),
         _ => {}
+    }
+}
+
+/// Record one candidate, merging with an existing identical run rather than
+/// repeating it. `strict` is OR-ed: if any scan saw an explicit scheme, the run
+/// is strict.
+fn push_candidate(url: String, strict: bool, out: &mut Vec<Candidate>) {
+    match out.iter_mut().find(|c| c.url == url) {
+        Some(existing) => existing.strict |= strict,
+        None => out.push(Candidate { url, strict }),
     }
 }
 
 /// Pull every URL-looking run out of one string. A single argument can carry
 /// several (a search query listing sources, a prompt quoting a page).
-fn scan_string(s: &str, out: &mut Vec<String>) {
+///
+/// Scanned as written **and**, when it contains any of [`WHATWG_STRIPPED`],
+/// again with those removed — see that constant. A string with none of the
+/// three (the overwhelming majority) is scanned exactly once and behaves
+/// identically to the pre-#48 extractor, which keeps the new behaviour confined
+/// to precisely the strings that trigger the differential.
+fn scan_string(s: &str, out: &mut Vec<Candidate>) {
+    scan_variant(s, out);
+    if s.contains(WHATWG_STRIPPED) {
+        let stripped: String = s.chars().filter(|c| !WHATWG_STRIPPED.contains(c)).collect();
+        scan_variant(&stripped, out);
+    }
+}
+
+fn scan_variant(s: &str, out: &mut Vec<Candidate>) {
+    scan_scheme_runs(s, out);
+    scan_bare_authorities(s, out);
+}
+
+/// Runs that begin with a literal `http://` / `https://`.
+fn scan_scheme_runs(s: &str, out: &mut Vec<Candidate>) {
     let lower = s.to_ascii_lowercase();
     let mut from = 0usize;
     while from < lower.len() {
@@ -256,10 +357,119 @@ fn scan_string(s: &str, out: &mut Vec<String>) {
         // Trailing sentence punctuation is not part of the URL.
         let candidate = s[start..end].trim_end_matches([',', '.', ';', ')', ']', '}']);
         if !candidate.is_empty() {
-            out.push(candidate.to_string());
+            push_candidate(candidate.to_string(), true, out);
         }
         from = end.max(start + 1);
     }
+}
+
+/// Runs with **no** scheme that a scheme-guessing client would still fetch:
+/// a protocol-relative `//169.254.169.254/latest`, and a bare `127.0.0.1:8080/`
+/// (#48). Neither produces a single candidate under [`scan_scheme_runs`], so
+/// before this they were screened by nothing at all while `curl`-shaped fetchers
+/// resolve them happily.
+///
+/// The plausibility rules in [`is_plausible_authority`] are what keeps this from
+/// refusing prose: a bare run needs an explicit port **or** a path, and an
+/// all-numeric host must be a full four-octet IPv4 literal. Without the first
+/// rule, `"the meeting at 12:30"` becomes `http://12:30/`, whose WHATWG host is
+/// `0.0.0.12` — inside `0.0.0.0/8`, and therefore a refusal served for a
+/// sentence about a meeting; without the second, `"upgraded to 10.0.0.1"` is a
+/// refusal served for a build number.
+///
+/// The residual those rules leave, deliberately: a bare IP with neither port
+/// nor path (`{"url": "10.0.0.1"}`, which `curl` would fetch) is not extracted.
+/// Extracting it means refusing every argument that so much as *mentions* a
+/// private address — "what is 192.168.1.1" is an ordinary research question —
+/// and a fetch argument that terse, with no port and no path, is the rarest
+/// form of the rarest case. Recorded in the milestone's accepted residuals.
+fn scan_bare_authorities(s: &str, out: &mut Vec<Candidate>) {
+    for word in s.split(|c: char| c.is_whitespace() || URL_TERMINATORS.contains(&c)) {
+        // Square brackets are NOT trimmed here, unlike the scheme scan's
+        // trailing-punctuation trim: `[::1]:9000/x` is a bracketed IPv6
+        // authority, and eating either bracket turns the one v6 form of this
+        // bypass into an unparseable run that the loose scan then discards.
+        let word = word
+            .trim_start_matches(['(', '{'])
+            .trim_end_matches([',', '.', ';', ')', '}']);
+        // A run with a scheme is `scan_scheme_runs`'s business; a run with some
+        // *other* scheme (`mailto:`, `file:`) is not a fetch we screen.
+        if word.is_empty() || word.contains("://") {
+            continue;
+        }
+        // Protocol-relative runs are explicit URL syntax, so nothing more is
+        // required of them. A bare run must carry a port or a path — otherwise
+        // every dotted word in prose becomes a DNS lookup, and every four-part
+        // build number (`10.0.0.1`) becomes a refusal.
+        let (rest, relative) = match word.strip_prefix("//") {
+            Some(rest) => (rest, true),
+            None => (word, false),
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let has_path = authority.len() < rest.len();
+        if !is_plausible_authority(authority, !relative && !has_path) {
+            continue;
+        }
+        push_candidate(format!("http://{rest}"), false, out);
+    }
+}
+
+/// Whether `auth` reads as a `host[:port]` a URL parser would accept, strictly
+/// enough that ordinary prose does not qualify. See [`scan_bare_authorities`].
+fn is_plausible_authority(auth: &str, port_required: bool) -> bool {
+    if auth.is_empty() {
+        return false;
+    }
+    if let Some(after_open) = auth.strip_prefix('[') {
+        // `[v6]` / `[v6]:port` — unambiguous, so the only question is whether
+        // the literal is real.
+        let Some(close) = after_open.find(']') else {
+            return false;
+        };
+        if after_open[..close].parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        let tail = &after_open[close + 1..];
+        return match tail.strip_prefix(':') {
+            Some(port) => is_port(port),
+            None => tail.is_empty() && !port_required,
+        };
+    }
+    let (host, port) = match auth.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (auth, None),
+    };
+    match port {
+        Some(p) if !is_port(p) => return false,
+        None if port_required => return false,
+        _ => {}
+    }
+    is_plausible_host(host)
+}
+
+fn is_port(p: &str) -> bool {
+    !p.is_empty() && p.len() <= 5 && p.parse::<u32>().is_ok_and(|n| n <= 65535)
+}
+
+/// A four-octet IPv4 literal, or a dotted name whose last label starts with a
+/// letter. The second clause is what rejects `0.5`, `12`, `2026.08.07` and
+/// every other numeric run prose is full of, while keeping `router.lan` and
+/// `internal.example.com`.
+fn is_plausible_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+    labels[labels.len() - 1].starts_with(|c: char| c.is_ascii_alphabetic())
+        && labels
+            .iter()
+            .all(|l| l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
 // ── The allow-exception policy ─────────────────────────────────────────────
@@ -393,6 +603,21 @@ pub struct Denial {
 /// legitimate research with a security-shaped error message that has nothing to
 /// do with security. The screen exists to stop a *reachable* internal target;
 /// an unresolvable name is not one.
+///
+/// **An unparseable candidate does NOT.** (#48, review finding C-4.) This is
+/// the opposite call from the one above, and deliberately so: a resolution
+/// failure means the target does not exist, while a parse failure means *we*
+/// could not read a run that carries an explicit `http://`. A candidate exists
+/// only because something URL-shaped was found; failing to understand it is not
+/// evidence of safety, and the fetcher will get its own, possibly different,
+/// reading. The one exception is a run that is *nothing but* a scheme prefix —
+/// see [`Verdict`].
+///
+/// A denial for an unparseable candidate never pre-empts a denial that names an
+/// address: a parse failure is remembered and reported only if no candidate in
+/// the same call failed the range check. The refusal served to the model is
+/// [`REFUSAL_SSRF`] either way — this only decides what the *audit row* says,
+/// and "127.0.0.1" is worth more to the person reading it than "http://".
 pub async fn screen_urls(args: &Value, policy: &Policy) -> Result<(), Denial> {
     // V32 Phase G: the feature switch, checked before any URL is even
     // extracted — a disabled guard must cost nothing, not merely deny nothing
@@ -401,36 +626,89 @@ pub async fn screen_urls(args: &Value, policy: &Policy) -> Result<(), Denial> {
     if !policy.enabled {
         return Ok(());
     }
-    for raw in extract_urls(args) {
-        if let Some(denial) = screen_one(&raw, policy).await {
-            return Err(denial);
+    let mut unparseable: Option<Denial> = None;
+    for cand in candidates(args) {
+        match screen_one(&cand, policy).await {
+            Verdict::Allow => {}
+            Verdict::Denied(d) => return Err(d),
+            Verdict::Unparseable(d) => {
+                let _ = unparseable.get_or_insert(d);
+            }
         }
     }
-    Ok(())
+    match unparseable {
+        Some(d) => Err(d),
+        None => Ok(()),
+    }
 }
 
-async fn screen_one(raw: &str, policy: &Policy) -> Option<Denial> {
-    let url = Url::parse(raw).ok()?;
-    let host = url.host()?;
-    let port = url.port_or_known_default()?;
-    let host_str = url.host_str()?.to_ascii_lowercase();
+/// The `host`/`ip` a denial carries when the candidate could not be parsed at
+/// all. A stated placeholder rather than an empty string, so the activity row's
+/// target column reads as a fact rather than a missing value.
+const UNPARSEABLE_TARGET: &str = "<unparseable>";
+
+/// What one candidate's screening concluded.
+///
+/// [`Verdict::Unparseable`] is separate from [`Verdict::Denied`] only so
+/// [`screen_urls`] can prefer the denial that names an address. Both refuse.
+enum Verdict {
+    Allow,
+    Denied(Denial),
+    Unparseable(Denial),
+}
+
+async fn screen_one(cand: &Candidate, policy: &Policy) -> Verdict {
+    let parsed = Url::parse(&cand.url).ok().and_then(|u| {
+        let host = u.host()?.to_owned();
+        let host_str = u.host_str()?.to_ascii_lowercase();
+        let port = u.port_or_known_default()?;
+        Some((host, host_str, port))
+    });
+    let Some((host, host_str, port)) = parsed else {
+        // A run we could not read. Deny it if it claimed to be a URL; a
+        // widened, schemeless guess that turns out not to parse was only ever a
+        // guess, and refusing on it would refuse prose.
+        if !cand.strict || is_scheme_only(&cand.url) {
+            return Verdict::Allow;
+        }
+        warn!(
+            target: "offload",
+            candidate = %cand.url,
+            "offload: SSRF screen could not parse a URL-shaped argument; refusing the call"
+        );
+        return Verdict::Unparseable(Denial {
+            url: cand.url.clone(),
+            host: UNPARSEABLE_TARGET.to_string(),
+            ip: UNPARSEABLE_TARGET.to_string(),
+        });
+    };
     if policy.allows(&format!("{host_str}:{port}")) {
-        return None;
+        return Verdict::Allow;
     }
     let deny = |ip: String| {
-        Some(Denial {
-            url: raw.to_string(),
+        Verdict::Denied(Denial {
+            url: cand.url.clone(),
             host: host_str.clone(),
             ip,
         })
     };
     match host {
-        Host::Ipv4(v4) => is_denied_ip(IpAddr::V4(v4)).then(|| deny(v4.to_string()))?,
-        Host::Ipv6(v6) => is_denied_ip(IpAddr::V6(v6)).then(|| deny(v6.to_string()))?,
+        Host::Ipv4(v4) => {
+            if is_denied_ip(IpAddr::V4(v4)) {
+                return deny(v4.to_string());
+            }
+            Verdict::Allow
+        }
+        Host::Ipv6(v6) => {
+            if is_denied_ip(IpAddr::V6(v6)) {
+                return deny(v6.to_string());
+            }
+            Verdict::Allow
+        }
         Host::Domain(name) => {
             // Resolution is the whole point for a name: `internal.example.com`
             // is a public-looking label pointing at 10.x.
-            let resolved = match tokio::net::lookup_host((name, port)).await {
+            let resolved = match tokio::net::lookup_host((name.as_str(), port)).await {
                 Ok(addrs) => addrs,
                 Err(e) => {
                     // Fail-open — see the function docs.
@@ -440,7 +718,7 @@ async fn screen_one(raw: &str, policy: &Policy) -> Option<Denial> {
                         error = %e,
                         "offload: SSRF screen could not resolve a fetch target; allowing the call"
                     );
-                    return None;
+                    return Verdict::Allow;
                 }
             };
             for addr in resolved {
@@ -448,9 +726,26 @@ async fn screen_one(raw: &str, policy: &Policy) -> Option<Denial> {
                     return deny(addr.ip().to_string());
                 }
             }
-            None
+            Verdict::Allow
         }
     }
+}
+
+/// Whether a candidate is a bare `http://` / `https://` with no authority at
+/// all — the word "http://" appearing in prose, which is common enough that
+/// refusing it would be a self-inflicted denial-of-research.
+///
+/// Exempting it is safe, and the reasoning is the same one that makes the strip
+/// in [`WHATWG_STRIPPED`] sufficient: for a fetchable target to be hiding after
+/// a scheme prefix, it must be separated from it by a character the extractor
+/// treats as a terminator. A parser either **removes** that character — and
+/// there are exactly three such characters, which is why every string is
+/// re-scanned with them removed — or **rejects** it, because every other
+/// terminator here (space, `"`, `<`, `>`, `\`, `|`, `^`) is a forbidden host
+/// code point and no parser will fetch past it. So a scheme-only run means the
+/// fetcher sees nothing either.
+fn is_scheme_only(url: &str) -> bool {
+    URL_PREFIXES.iter().any(|p| url.eq_ignore_ascii_case(p))
 }
 
 // ── Per-scope fetch budgets ────────────────────────────────────────────────
@@ -937,6 +1232,16 @@ mod tests {
             // IPv4-compatible v6 (deprecated form).
             "::127.0.0.1",
             "::10.0.0.1",
+            // #48: NAT64 (RFC 6052 well-known prefix) and 6to4 (RFC 3056),
+            // unmapped and re-checked like every other embedded-v4 form.
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "2002:7f00:1::",
+            "2002:7f00:1::1",
+            "2002:c0a8:101::",
+            "2002:a9fe:a9fe::1",
         ] {
             assert!(is_denied_ip(ip(denied)), "{denied} must be denied");
         }
@@ -963,9 +1268,181 @@ mod tests {
             "fe7f::1",
             "fe00::1",
             "::ffff:8.8.8.8",
+            // #48: the embedded-v4 prefixes are unmapped, not blanket-denied,
+            // so a PUBLIC destination reached through NAT64 or 6to4 stays
+            // reachable — exactly as `::ffff:8.8.8.8` does.
+            "64:ff9b::8.8.8.8",
+            "2002:0808:0808::",
+            // …and the neighbours of both prefixes are ordinary public v6.
+            "64:ff9a::1",
+            "64:ff9c::1",
+            "0064:ff9b:1::7f00:1",
+            "2001::1",
+            "2003::1",
         ] {
             assert!(!is_denied_ip(ip(allowed)), "{allowed} must be allowed");
         }
+    }
+
+    /// #48 (review finding C-4) — **the parser differential**, table-driven.
+    ///
+    /// Every row is a string an EXTERNAL tool call could carry that a
+    /// WHATWG-conformant fetcher resolves to an internal address, and that the
+    /// pre-#48 extractor either truncated into nothing (tab/LF/CR) or never
+    /// produced a candidate for at all (schemeless, protocol-relative). Each one
+    /// was **allowed** before this test existed. A regression here is a silent
+    /// security failure, which is why the set is exhaustive about position
+    /// rather than illustrative.
+    ///
+    /// IP literals only, deliberately: a hostname row would make the suite do
+    /// real DNS, and the resolution path has its own fail-open contract.
+    #[tokio::test]
+    async fn the_whatwg_parser_differential_is_closed() {
+        let policy = Policy::default();
+        for (label, arg) in [
+            // ── 1. tab/LF/CR immediately after the scheme: the reported bypass.
+            ("tab after scheme", "http://\t127.0.0.1:12344/props"),
+            ("LF after scheme", "http://\n169.254.169.254/latest/"),
+            ("CR after scheme", "http://\r10.0.0.1/"),
+            ("CRLF after scheme", "http://\r\n192.168.1.1/admin"),
+            ("tab after scheme, v6", "http://\t[::1]:9000/"),
+            ("tab after https", "https://\t10.1.2.3/x"),
+            // ── 2. …and in every other position a parser would strip it from.
+            ("tab inside the scheme", "htt\tp://127.0.0.1/"),
+            ("LF inside the scheme", "ht\ntps://10.0.0.1/"),
+            ("tab inside the host", "http://127.0.0\t.1/"),
+            ("LF inside the host", "http://169.254.\n169.254/"),
+            ("CR before the port", "http://10.0.0.1\r:8080/"),
+            ("tab inside the port", "http://10.0.0.1:80\t80/"),
+            ("tab before the path", "http://127.0.0.1\t/admin"),
+            ("newlines throughout", "h\ntt\rp:\t//\t10.\n0.0.1/x"),
+            // ── 3. schemeless `host:port`, which produced NO candidate before.
+            ("schemeless host:port + path", "127.0.0.1:8080/admin"),
+            ("schemeless host:port", "192.168.1.1:8080"),
+            ("schemeless in prose", "fetch 10.0.0.1:9000/status now"),
+            ("schemeless v6", "[::1]:9000/x"),
+            ("schemeless metadata", "169.254.169.254:80/latest/"),
+            ("schemeless with path only", "10.0.0.1/admin"),
+            // ── 4. protocol-relative, likewise screened by nothing before.
+            ("relative metadata", "//169.254.169.254/latest/"),
+            ("protocol-relative private", "//10.0.0.1/"),
+            ("protocol-relative + port", "//127.0.0.1:12344/props"),
+            ("protocol-relative v6", "//[::1]/"),
+            // ── 5. the truncated candidate itself, when nothing rescues it.
+            ("unparseable port", "http://10.0.0.1:99999999/"),
+            ("unparseable v6 literal", "http://[::1/"),
+            // ── 6. combinations.
+            ("tab + schemeless", "http://\t127.0.0.1:12344/props"),
+            ("decoy then pivot", "https://8.8.8.8/ and //10.0.0.1/x"),
+        ] {
+            let err = screen_urls(&json!({ "url": arg }), &policy)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label}: {arg:?} must be refused"));
+            assert!(!err.url.is_empty(), "{label}: the row must name something");
+        }
+    }
+
+    /// The other half of the same change: what must keep working. A screen that
+    /// refuses prose is a screen the user turns off, and #48 widened extraction
+    /// into exactly the strings prose is made of.
+    #[tokio::test]
+    async fn widened_extraction_does_not_refuse_prose_or_public_targets() {
+        let policy = Policy::default();
+        for (label, arg) in [
+            // Ordinary public targets, literal so the suite stays offline.
+            ("public v4", "http://1.1.1.1/"),
+            ("public v4 + port", "http://8.8.8.8:8080/x?q=1"),
+            ("public v6", "https://[2001:db8::1]/x"),
+            ("public, tab-mangled", "http://\t1.1.1.1/"),
+            ("public schemeless", "8.8.8.8:443/dns-query"),
+            ("public protocol-relative", "//1.1.1.1/"),
+            // The word "http://" in prose — a bare scheme with no authority is
+            // nothing a fetcher can fetch either, so refusing it would be a
+            // self-inflicted denial of research.
+            ("the scheme as a word", "what does http:// even mean"),
+            ("both schemes as words", "http:// vs https:// — which?"),
+            // Numeric prose the bare-authority scan must not read as a host.
+            ("a time", "the meeting is at 12:30 tomorrow"),
+            ("a ratio", "mix them 0.5:1 by volume"),
+            ("a version", "upgraded from 0.1.2.3 to 10.0.0.1 last week"),
+            ("a dotted date", "released 2026.08.07:12 in the changelog"),
+            ("a timestamp", "failed at 09:15:07 with code 0.0.0.0"),
+            // Paths, which are full of slashes and colons.
+            ("a windows path", "C:/repo/src/main.rs"),
+            ("a unix path", "src/offload/outbound.rs and ./README.md"),
+            ("a dotfile path", ".github/workflows/ci.yml"),
+            ("a line comment", "// TODO: revisit 127 later"),
+            ("a double slash in prose", "either // or /* */ works"),
+            // A private address merely *mentioned*: the documented residual.
+            ("a mention", "the gateway here is 192.168.1.1 by default"),
+        ] {
+            assert!(
+                screen_urls(&json!({ "text": arg }), &policy).await.is_ok(),
+                "{label}: {arg:?} must pass"
+            );
+        }
+    }
+
+    /// The audit row must name the address, not the truncation. Both halves of
+    /// a tab bypass are candidates — the useless `"http://"` and the real
+    /// `http://127.0.0.1:12344/props` — and the row a human reads after the
+    /// incident has to be the second one. What the *model* is told is
+    /// [`REFUSAL_SSRF`] either way; only the row differs.
+    #[tokio::test]
+    async fn a_denial_reports_the_address_not_the_truncation() {
+        let policy = Policy::default();
+        let err = screen_urls(&json!({ "url": "http://\t127.0.0.1:12344/props" }), &policy)
+            .await
+            .expect_err("the llama-server pivot must be refused");
+        assert_eq!(err.host, "127.0.0.1", "{err:?}");
+        assert_eq!(err.ip, "127.0.0.1", "{err:?}");
+        assert!(err.url.contains("127.0.0.1:12344"), "{err:?}");
+
+        // With nothing parseable anywhere, the row says so rather than
+        // inventing a host — and the call is still refused.
+        let err = screen_urls(&json!({ "url": "http://10.0.0.1:99999999/" }), &policy)
+            .await
+            .expect_err("an unreadable URL-shaped argument must be refused");
+        assert_eq!(err.host, UNPARSEABLE_TARGET);
+        assert_eq!(err.ip, UNPARSEABLE_TARGET);
+    }
+
+    /// The widened extractor, checked directly: what it emits and, just as
+    /// importantly, what it does not. `extract_urls` is public and
+    /// `detection::first_url` reads its first element for a row's target, so
+    /// the ordering — scheme-bearing runs first, as written before stripped —
+    /// is a contract, not an accident.
+    #[test]
+    fn extraction_is_widened_deduplicated_and_ordered() {
+        // A scheme'd run still comes first, so `detection::first_url` is stable.
+        let urls = extract_urls(&json!({ "u": "http://\t127.0.0.1:12344/props" }));
+        assert_eq!(
+            urls,
+            vec!["http://", "http://127.0.0.1:12344/props"],
+            "the truncation, then the run a parser actually sees"
+        );
+
+        // Both scan variants see the same runs across a newline; the union is
+        // deduplicated so one target is not resolved twice.
+        let urls = extract_urls(&json!({ "u": "http://a.example/1 \n http://b.example/2" }));
+        assert_eq!(urls, vec!["http://a.example/1", "http://b.example/2"]);
+
+        // Stripping alone would glue these into one run whose host is the
+        // FIRST url; scanning as-written too is what keeps the second visible.
+        let urls = extract_urls(&json!({ "u": "http://a.example/x\nhttp://10.0.0.1/" }));
+        assert!(urls.contains(&"http://10.0.0.1/".to_string()), "{urls:?}");
+
+        // Schemeless and protocol-relative runs are normalized with the scheme
+        // a guessing fetcher would assume.
+        assert_eq!(
+            extract_urls(&json!({ "u": "127.0.0.1:8080/admin" })),
+            vec!["http://127.0.0.1:8080/admin"]
+        );
+        assert_eq!(
+            extract_urls(&json!({ "u": "//169.254.169.254/latest" })),
+            vec!["http://169.254.169.254/latest"]
+        );
     }
 
     #[test]

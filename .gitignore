@@ -71,6 +71,12 @@ Thumbs.db
 models/*.onnx
 models/ggml-*.bin
 models/voices/*.bin
+# The V32 classifier weights are USER-INSTALLED and must never be committed
+# (locked decision 25: Llama Community Licence, so cImp does not mirror them).
+# Needs its own rule because the patterns above are non-recursive — `*.onnx`
+# does not match a subdirectory, which is how 284 MB of weights nearly landed
+# in a repo that moved off Git-LFS precisely to avoid that.
+models/promptguard2-22m/
 
 # Local release-staging output (workflow assembles this in CI; ignore if
 # you experiment with `npm run tauri build` followed by manual staging).

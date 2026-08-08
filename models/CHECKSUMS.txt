@@ -46,8 +46,8 @@
 #      (ungated — no HF account needed; ships LICENSE + NOTICE alongside, which
 #      is how the Llama terms reach you rather than us):
 #
-#        model.onnx        284 MB  fp32, best accuracy
-#        model.quant.onnx   72 MB  int8, ~4x smaller — rename to model.onnx
+#        model.quant.onnx   72 MB  int8 - PREFERRED, rename to model.onnx
+#        model.onnx        284 MB  fp32 - no measured accuracy advantage
 #        tokenizer.json     8.6 MB
 #
 #      Take ONE of the two ONNX files. The loader looks for exactly

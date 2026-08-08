@@ -379,6 +379,53 @@ declares its class AND its mutation capability in one reviewed place.
      stays inert until a user installs the weights — which is the state of every
      install, and a supported configuration, not a degraded one. See decision 25
      for the ungated source and the verification digests.
+
+     **Amendment 2026-08-08 — first measurement, on the first machine that ever
+     had the weights.** Two things this bullet asserted turned out to be
+     untested rather than untrue-in-principle, and one of them was a defect:
+
+     - **The tokenizer defeated the windowing entirely.** A published Prompt
+       Guard 2 `tokenizer.json` declares `truncation.max_length: 512` and
+       `padding: Fixed(512)`, and `load_from` used it verbatim — so every input
+       was cut to 512 tokens *before* `windows()` saw it. Measured: a 127-char
+       and a 25,400-char input both encoded to 512 tokens and produced 2
+       windows. Everything past ~512 tokens of any page was never scored, and
+       `bounded` came back **false**, so the verdict claimed "read end to end,
+       nothing found" over a page the screen had read about 2% of. That is
+       decision 5's D-1 failure reintroduced through *configuration*, which is
+       why no code review found it. Truncation and padding are now disabled at
+       load; the sliding-window design does what this bullet always said.
+     - **"Max-score wins over sliding windows" is now real, and priced.**
+       ~130 ms per window on the int8 export: a 1 KB page costs 43 ms, 5 KB
+       costs 330 ms, 25 KB costs 1.6 s, and the 32-window cap costs 4.2 s. So
+       "default on once latency is confirmed negligible" holds at the median
+       and **fails at the tail** — see the `MAX_WINDOWS` note in Phase C.
+     - **The layer is NARROWER than this bullet implies**, and that changes how
+       it composes with the signature screen. Measured per family, identically
+       on both exports (threshold 0.9):
+
+       | family | score | |
+       |---|---|---|
+       | instruction-override | 0.999 / 0.997 | caught |
+       | fake-system-turn | 0.999 | caught |
+       | guardrail-removal | 0.994 | caught |
+       | prompt-extraction | 0.996 | caught |
+       | role-reassignment (DAN) | 0.002 | **miss** |
+       | covert-channel | 0.001 | **miss** |
+       | exfiltration | 0.003 | **miss** |
+
+       Prompt Guard 2 detects attacks on the **containing prompt** and is blind
+       to **agent-steering** — which is exactly what `exfiltration.yar` and the
+       tool-steering rules cover. The two layers are therefore complementary,
+       not redundant, and the classifier is **not** the broader net this bullet
+       reads as. It also means H-4 was even less backstopped than its own
+       amendment claims: with weights installed, the classifier would not have
+       covered the families those evasions exposed.
+       Benign prose scored 0.015 (fp32) / 0.005 (int8) worst case, so the 0.9
+       default threshold sits in open space — the false-positive risk this
+       bullet worried about is not where the problem is.
+     - **int8 is the export to recommend**: 4x smaller (72 MB vs 284 MB),
+       ~15% faster, identical family coverage, and better benign separation.
    - optional grammar-constrained local-LLM judge (V21 grammar work) on
      fetched page bodies: strict `{"injection": bool, "spans": [...]}`
      output; single-slot server constraint respected — judge calls are

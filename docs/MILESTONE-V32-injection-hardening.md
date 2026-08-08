@@ -1,6 +1,9 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). Remaining: live-verifies 1–22, and C3's release-asset publishing plus the Prompt Guard 2 weights are blocking deploy follow-ups (see the C3 and C amendments and decision 24). GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). 
+A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–28** below.
+
+Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-1 `graph_struct_search`, C-2 growth-forgery, the SSRF scheme family, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -280,6 +283,27 @@ declares its class AND its mutation capability in one reviewed place.
    that is every install, and reporting it per result would put the notice on
    every external result in existence), and a tokenization failure (the screen
    said nothing at all, which `score: None` already carries).
+
+   **Amendment 2026-08-08 (review finding M-4) — the code implemented THREE
+   exclusions where this decision names two.** A classifier that *ran and
+   failed* — an `ort` session error, an unrecognized logits shape — returned
+   `score: None`, indistinguishable from the inert case, so it was folded into
+   the same silence. `Scored` had no field able to express it. Two consequences,
+   the second sharper than the first: a classifier whose graph this code cannot
+   read produces no verdict *for every result forever* while Settings shows it
+   healthy; and, because `score_with` returned on the first failing window, a
+   page whose window 3 scored 0.98 and whose window 7 errored was delivered with
+   **no header and no row** — the classifier had already decided it was hostile
+   and the verdict was discarded on the way out.
+   `Scored` now carries `failed: bool`; the loop `break`s instead of returning,
+   so windows already scored survive; and `detection::note_classifier` maps
+   `failed → incomplete`, the same bucket as a yara-x timeout, for the same
+   reason. A flagged-and-partial result now reports both.
+   The two exclusions this decision *does* name are unchanged and are asserted
+   as such — `Scored::default()` covers both, and must stay silent, because a
+   notice on every result of every install without weights is worth nothing.
+   The consumer was extracted to a pure `note_classifier` seam so the fix is
+   testable with no weights installed, which is the state of every machine.
 6. **Spotlighting envelope on every EXTERNAL result at the proxy.** Fetched
    content is wrapped in randomized boundary markers (per-result nonce, so
    pages cannot pre-quote the delimiter) with a one-line preamble: content
@@ -296,14 +320,65 @@ declares its class AND its mutation capability in one reviewed place.
      from garak's probe corpus) instead of hand-growing a bespoke regex
      file. Rules are user-editable files on disk (theme-file pattern) and
      kept fresh by the decision-13 auto-updater.
+
+     **Amendment 2026-08-08 (review finding H-4) — a separator the reader
+     cannot see is not a bypass.** Every shipped rule used `[ \t]{1,4}` between
+     tokens, and `yara-x` compiles with `.unicode(false)`, so those are byte
+     classes: **all nine text rules were defeated by a newline, an NBSP, a
+     zero-width space or five spaces.** Measured against the shipped bundle,
+     20 of 50 hostile probes evaded, with zero false positives — and the
+     line-wrap half fired on *non-adversarial* pages, since any HTML-to-text
+     extractor wrapping at 78 columns breaks a payload for free. This was severe
+     rather than academic because the classifier is inert on every install, so
+     the signature layer *is* the detection surface. The unit tests missed it
+     because every hostile string in them, in `HOSTILE`, and in
+     `detection/smoke/hostile/` was single-line single-spaced ASCII.
+     The fix is three parts, and **none is sufficient alone** (normalization
+     alone took 20 evasions to 15):
+     - **rules** — inter-token gaps become `\s{1,8}`; the three `^`-anchored
+       patterns become `(^|\n)`, because YARA has no `(?m)` and `^` anchors to
+       byte 0 of the whole result, so they were dead on any page starting with a
+       heading (finding F-2). The `[^\n]{0,N}` spans are deliberately untouched:
+       they are the false-positive guard;
+     - **`signature::normalize_for_scan` + a second scan pass**, unioned through
+       `ScanOutcome::merged_with` — drops zero-width and format characters,
+       folds non-ASCII spaces, and folds *soft* wraps (a single newline) while
+       **preserving blank lines**, because the rules' own spans use a paragraph
+       break as the boundary that stops a verb in one paragraph pairing with a
+       target in the next. The raw pass is retained because the byte-counting
+       obfuscation rules count exactly what the normalizer removes. Only runs
+       when normalization changed something, and draws from the *remaining*
+       `SCAN_TIMEOUT`, so the per-call bound holds. Measured: no scan-time
+       regression (0–3 ms on 256 KiB, before and after);
+     - **corpus** — `wrapped_payload.txt` and `unicode_obfuscated.txt` as
+       positive controls, plus `wrapped_prose_and_paragraphs.txt` as the
+       negative control for the fold. This is what makes the property
+       **structural**: the decision-13 gauntlet now rejects any future bundle
+       that regresses it, including one curated from upstream.
+     Result: 0 of 53 probes evade, 15 benign controls still clean. The unit test
+     is written as *payload × transform* rather than a table of known-bad
+     literals, so re-narrowing any separator fails it for every family at once.
+     Note the irony worth recording: Vigil, the upstream these rules derive
+     from, used `\s*` and was never vulnerable — the re-derivation that improved
+     the vocabulary is what narrowed the separator.
+     The same seam is shared by `graph::secrets` and the updater's gauntlet
+     (both go through `scan_with`), so decision 22's credential screen picked up
+     obfuscation resistance for free.
    - **Classifier: Llama Prompt Guard 2 (22M) under `ort`** — Meta's
      actively maintained DeBERTa-based injection/jailbreak classifier
      (86M multilingual variant as the upgrade path). Tiny enough for CPU
      inference at fetch time; 512-token context ⇒ sliding-window chunking
-     over page bodies, max-score wins. Ships via the models-v1 release-asset
-     pipeline (CHECKSUMS.txt like every other model); re-pulling newer
-     weights is a maintenance-run item. Settings-gated, default on once
+     over page bodies, max-score wins. Settings-gated, default on once
      latency is confirmed negligible.
+     **Superseded 2026-08-08 by decision 25 — the weights are USER-INSTALLED
+     and cImp neither bundles nor mirrors them.** This bullet used to say they
+     "ship via the models-v1 release-asset pipeline (CHECKSUMS.txt like every
+     other model)". They do not: unlike Kokoro (Apache-2.0) and Whisper (MIT),
+     Prompt Guard 2 is under the Llama Community Licence, so mirroring it is
+     redistribution with conditions attached, for an optional layer. The layer
+     stays inert until a user installs the weights — which is the state of every
+     install, and a supported configuration, not a degraded one. See decision 25
+     for the ungated source and the verification digests.
    - optional grammar-constrained local-LLM judge (V21 grammar work) on
      fetched page bodies: strict `{"injection": bool, "spans": [...]}`
      output; single-slot server constraint respected — judge calls are
@@ -627,23 +702,39 @@ declares its class AND its mutation capability in one reviewed place.
       `off` / `check-only` (Advisor card "update available") / `auto`
       (default for rules; `check-only` default for the classifier — a
       model swap can shift false-positive behavior, so it asks).
+      **Amended 2026-08-08 (decision 25):** there is one component. The
+      classifier mode and its `check-only` default are gone with it.
     - **Update source is a cImp-curated manifest, not third-party repos
       directly.** The updater fetches a pinned-URL manifest (versioned
-      JSON listing rule-bundle + weight files with SHA256 sums, served
-      from the project's GitHub releases like models-v1); the bundle is
+      JSON listing the rule-bundle files with SHA256 sums); the bundle is
       curated from upstream corpora (Vigil, garak derivations, our own
       additions) by the maintenance process. Rationale: the defense
       layer's own update channel is attack surface — pulling raw from
       third-party repos hands rule content to whoever compromises them.
       HTTPS + checksum manifest + staged download.
+      **Amended 2026-08-08:** the manifest is served from a **branch via
+      `raw.githubusercontent.com`, not from a GitHub release** — see
+      decision 27 (H-5), where serving it from a release made the channel
+      unfetchable by construction. And it lists **rule files only**: the
+      weight component is gone (decision 25).
+      Note on the upstream corpora, recorded 2026-08-08: **Vigil is dormant**
+      (last push 2024-01-31), so it is a source of rule *shapes*, already
+      harvested, not of refreshes. **garak is alive** (8.7k stars, pushed
+      daily) but ships *probes*, not signatures — its right role here is as
+      an expanded validation corpus, which is exactly the gap H-4 exposed.
     - **Validate before activate, keep a rollback.** A rule bundle must
       compile clean under `yara-x` (with a complexity ceiling — a
-      pathological rule must not DoS the fetch path) and new classifier
-      weights must pass a smoke set (known-injection + known-benign
-      samples ship with the app) before the swap; the previous version is
+      pathological rule must not DoS the fetch path) and must scan the
+      smoke set (known-injection + known-benign samples ship with the app)
+      before the swap; the previous version is
       retained on disk with a one-click revert in Settings. A failed
       validation surfaces an Advisor card and keeps the old data — never
       silently degrades to no-detection.
+      **Amended 2026-08-08:** the classifier half of this gate is gone with
+      its component (decision 25), and the rules half gained the **coverage
+      floor** (decision 26) — because "never silently degrades to
+      no-detection" was not actually true: a bundle matching only the public
+      shipped corpus passed every gate here while gutting coverage.
     - **Every signal has its consumer:** applied/failed/available updates
       are Tool Activity rows + Advisor cards; current rules/weights
       versions are shown in the Settings detection section next to a
@@ -1054,14 +1145,161 @@ declares its class AND its mutation capability in one reviewed place.
     update channel exists to prevent is a bundle whose provenance nobody can
     state, and "it was validated by the version we then replaced" is that.
     **It remains a blocking deploy task**, not a footnote (global principle 9):
-    the six-step checklist is in the Phase C3 *deploy follow-ups* bullet and in
-    `detection/manifest.example.json`. The **`classifier` component stays out of
-    the first manifest** until the Prompt Guard 2 weights themselves are
-    published (`models/CHECKSUMS.txt`) — an entry with no assets behind it turns
-    every daily check into a rejected-update card.
+    the checklist is in the Phase C3 *deploy follow-ups* bullet and in
+    `detection/manifest.example.json`.
     Recorded in the Phase C3 deploy-follow-ups bullet and residual (d);
     live-verification recipe 11 validates a staged copy first, via
     `offload.detection_update_manifest_url`. Governs decision 13's channel.
+
+    **UNBLOCKED 2026-08-08 (user: "we need to resolve the detection-v1 as soon
+    as possible").** The reason for the deferral has been discharged and two new
+    ones were found and fixed, so publishing is now the next action rather than
+    a waiting item:
+    - the fixed gauntlet this decision was waiting for is in place, and has
+      since gained the **coverage floor** (decision 26's amendment) — so a
+      half-built bundle is refused on rule count, which the smoke corpus alone
+      could never catch;
+    - the channel URL itself was **unfetchable by construction** until
+      2026-08-08 (decision 27, H-5). Publishing before that fix would have
+      produced a channel that never updated on any install and stayed silent
+      about it for a week — the deferral accidentally prevented shipping a dead
+      channel;
+    - the **`classifier` component is gone entirely** (decision 25), so the
+      "stays out of the first manifest" carve-out this decision used to carry is
+      moot. There is one component.
+    A ready-to-publish `manifest.json` for version `2026.08.08` — real SHA-256s
+    and byte sizes of the H-4-fixed rules — was generated on 2026-08-08. The
+    files are pure LF, so the digests match what `raw.githubusercontent.com`
+    serves from the branch.
+
+25. **The classifier is USER-INSTALLED, and its updater component is deleted
+    (user decision 2026-08-08).** Two changes, one reasoning.
+
+    **The weights are never mirrored.** Kokoro is Apache-2.0 and Whisper is MIT,
+    so both ride the `models-v1` release; Prompt Guard 2 is under the Llama
+    Community Licence, and mirroring it would be redistribution with attribution
+    and acceptable-use conditions attached — for a layer that is optional. An
+    ungated third-party ONNX export exists
+    (`huggingface.co/gravitee-io/Llama-Prompt-Guard-2-22M-onnx`: `gated:false`,
+    200 to an unauthenticated fetch, ships LICENSE + NOTICE, and carries exactly
+    the `model.onnx` + `tokenizer.json` names the loader wants), so a user who
+    wants the layer fetches it directly and the licence reaches *them* rather
+    than us. `models/CHECKSUMS.txt` records verification digests for the fp32
+    (284 MB) and int8 (72 MB) builds, **permanently commented** — every
+    uncommented line in that file is a fetch instruction for
+    `scripts/fetch-models.*`, which pull from `models-v1`, where these
+    deliberately are not. User: *"the release already builds a version with the
+    models … any future changes are my responsibility and will be available in
+    the release."*
+
+    **Therefore the updater's `classifier` component is removed.** Decision 7
+    already routed the weights through models-v1 at maintenance-run cadence;
+    Phase C3 had built a *second* delivery mechanism for the same artifact, and
+    the one that was locked was not the one that was built. A released Meta
+    checkpoint also has no update stream to poll — the documented "upgrade path"
+    is a *different model*, which is a migration decision, not an auto-update.
+    Deleted: `Component::Classifier`, `MAX_CLASSIFIER_FILE_BYTES` (512 MiB),
+    `classifier_dest`, `validate_and_activate_classifier`, the classifier smoke
+    gauntlet, `classifier::rebuild`, `classifier::score_many_with`, and
+    `detection_update_classifier_mode` across Rust, TS and the Settings UI.
+    **Kept:** the classifier *screening* layer — `DetectionLayer::Classifier`,
+    `detection_classifier_enabled`, the threshold, the weights-present readout.
+    Only the update path is gone.
+    Safe with no migration, verified three ways: `Component::parse` returns
+    `None` for unknown and the manifest parser *skips* unknown components, so a
+    manifest still naming `classifier` is ignored rather than an error; and
+    neither `Settings` nor the updater's `State` sets `deny_unknown_fields`, so
+    the stale keys are ignored on read and gone on the next write.
+    Side effect: this closed review findings N-8 (unbounded
+    `previous/classifier/<version>` retention — 90–350 MB leaked per update) and
+    N-12 (512 MiB aggregate-download exposure) outright.
+
+26. **The updater is KEPT, and gains a coverage floor (user decision
+    2026-08-08).** Removal was weighed seriously and rejected: 6,059 lines and
+    seven open findings to deliver ~19 KB of `.yar` text that `release.yml`
+    already copies into all four staging directories. The decision to keep it
+    rests on one thing — *"shipping rules in hours rather than waiting for a
+    release has genuine value"* — and H-4 is the evidence for it: signatures are
+    brittle by construction, so the next evasion class will need a fast path.
+
+    **Amendment — the coverage floor (`updater::coverage_floor`, closing review
+    finding N-10).** The gauntlet's positive control is the shipped
+    `smoke/hostile/` corpus, which is public and on every user's disk. A bundle
+    carrying only rules that match those documents compiles, budgets, hits every
+    hostile control, misses every benign one, and activates green — while
+    gutting coverage. `validate.rs`'s own header claims to stop a bundle that
+    "would quietly disable the layer"; that bundle walked straight through. A
+    candidate whose rule count is under half the live *shipped* set is now
+    refused, with the baseline read from `store::managed_rule_files` (non-
+    recursive) so a user's `local/` rules can never inflate it and make every
+    future bundle look like a regression.
+    Framed honestly in its own doc comment as a **curation guard, not an
+    anti-tamper control**: a hostile publisher controls the rule count too. What
+    it catches is the far likelier failure — a half-built bundle.
+
+27. **The update channel is a BRANCH served by `raw.githubusercontent.com`, not
+    a release asset (2026-08-08, review finding H-5).** This is the fix for a
+    defect that would have been invisible for a week after the first publish.
+
+    `DEFAULT_MANIFEST_URL` pointed at
+    `github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json`.
+    GitHub answers **every** release-asset path with a `302` to a signed CDN
+    host, and `HttpFetcher::client` sets `redirect::Policy::none()` —
+    deliberately, as the U-1 hardening. Both correct in isolation and jointly
+    fatal: every install would have fetched, been redirected, refused, and
+    classified the result `Outcome::Unavailable`, which is the deliberately
+    *silent* arm — no card for the first seven checks. Rules would never have
+    updated anywhere.
+    Nobody caught it because the channel was never published **and because the
+    documented pre-flight cannot catch it**: deploy step 3 stages the manifest on
+    a local HTTP server, which answers 200. The verification step validated
+    everything except the one property that differs between staging and
+    production. Step 3 now says to do one live run against a throwaway ref on
+    the real host first.
+    `raw.githubusercontent.com` answers 200 directly for branch and tag refs, so
+    the redirect ban stays fully intact. It also suits the payload: ~19 KB of
+    text belongs in a git tree where it is diffable and reviewable, published by
+    a commit rather than an asset upload with a flat namespace to work around
+    (which retires a whole deploy step). The channel is an **orphan branch**
+    `detection-v1` — fixed ref, contents updated over time, never a moving
+    "latest" pointer.
+    The missing guard is now
+    `the_pinned_manifest_url_is_fetchable_under_our_own_redirect_policy`: it
+    cannot make a network call, so it asserts what is checkable offline and
+    would have failed loudly on the original URL — https required, any
+    `/releases/download/` path rejected with the reasoning inline, the host
+    allowlisted, and the derived `AssetAnchor` verified to accept a sibling and
+    reject a detour.
+    *Rejected:* allowing a bounded, host-pinned redirect. It keeps release-asset
+    hosting, which only mattered while the classifier's 284 MB blob was on this
+    channel — and decision 25 removed it.
+
+28. **The detection bundle is NOT signed (user decision 2026-08-08 — review
+    finding H-6 declined).** Recorded rather than silently dropped, per global
+    principle 10.
+
+    The finding is factually correct: the bundle is authenticated by TLS plus
+    `contents: write` on the repo, and the manifest carries its own hashes. What
+    it got wrong is the *value* of the fix. **A signature only raises the bar if
+    the key is somewhere the compromise cannot reach.** The channel's trust root
+    is `contents: write` on `Dyserna/cImp` — the same repo and the same
+    `GITHUB_TOKEN` that publishes the cImp **binary** (`release.yml:13-14`,
+    workflow-level, with `gh release` running in the same jobs as `cargo build`
+    and `npm ci`). Anyone who can publish a detection bundle can publish a cImp
+    release with detection removed outright, which is strictly worse and
+    strictly easier. A signing key usable by that release process lives inside
+    the blast radius it is meant to bound. For a solo-maintainer project where
+    the same credentials publish both artifacts, that is ceremony, not security.
+    **Revisit only if the key moves outside CI** — an offline maintainer key,
+    signing locally before upload. That is a real option with a real cost; it is
+    not what the finding proposed.
+    **Left open deliberately:** `release.yml`'s workflow-level
+    `contents: write` is broader than it needs to be — every build step in both
+    jobs holds a token that can rewrite any release. Narrowing it means
+    splitting build from publish (artifacts, then a `publish` job holding the
+    write scope). Worth doing on its own merits and **not detection-specific** —
+    it protects the binary release, which is the larger prize. Recorded as a
+    maintenance item, not a V32 blocker.
 
 ## Phases
 
@@ -1159,15 +1397,18 @@ declares its class AND its mutation capability in one reviewed place.
     it costs a llama-server turn per fetched page against a single-slot
     server, so it lands behind a settings toggle (default off) once the load
     impact is measured.
-  - **Deploy follow-ups (blocking for the classifier layer, not for the
-    milestone's other work):** the Prompt Guard 2 22M weights are HF-gated and
-    could not be fetched here, so the classifier is *gracefully inert* —
-    Settings shows "weights not installed", one line is logged at startup, and
-    the signature screen carries detection alone. The full checklist (accept
-    the Llama licence, export to ONNX, real SHA-256s, `models-v1` asset upload
-    with a non-colliding asset name, `release.yml` cache + staging lines,
-    NOTICE attribution for the Llama 4 Community Licence) is recorded as
-    commented placeholders in `models/CHECKSUMS.txt`.
+  - **The classifier is inert until a user installs the weights, and that is
+    the shipped state.** Settings shows "weights not installed", one line is
+    logged at startup, and the signature screen carries detection alone.
+    **Superseded 2026-08-08 by decision 25.** This used to be a *"deploy
+    follow-up, blocking for the classifier layer"* — a checklist ending in a
+    `models-v1` asset upload and a NOTICE attribution. It is no longer a
+    follow-up at all, blocking or otherwise: cImp does not host these weights,
+    so there is nothing to deploy. What replaced the checklist is an install
+    path for users who want the layer — an ungated third-party ONNX export,
+    with verification digests and the fp32/int8 choice, documented in
+    `models/CHECKSUMS.txt`, in the Settings hint shown when the weights are
+    absent, and in `classifier.rs`'s module doc.
 
 - **C3 — detection updater (decision 13).** Manifest fetch + daily
   scheduler + validate-activate-rollback + `rules.d/local/` overlay +
@@ -1178,10 +1419,13 @@ declares its class AND its mutation capability in one reviewed place.
   - **Manifest schema v1**, documented in
     `offload/detection/updater/manifest.rs` with a worked example committed at
     `detection/manifest.example.json`: `{schema, generated, components: [{
-    component: "rules"|"classifier", version, min_app_version?, notes?,
-    files: [{name, sha256, size, url}]}]}`. Pinned URL =
-    `https://github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json`
-    (fixed tag, assets replaced/added — the `models-v1` precedent).
+    component: "rules", version, min_app_version?, notes?,
+    files: [{name, sha256, size, url}]}]}` (the `"classifier"` component was
+    removed 2026-08-08 — decision 25). Pinned URL =
+    `https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/manifest.json`
+    (fixed branch ref, files updated over time). **Changed 2026-08-08 —
+    decision 27.** It was a release-asset URL, which always answers 302 while
+    the fetcher refuses redirects: the channel could never have worked.
     `schema` is an EXACT match (an unknown schema is rejected, never
     best-effort parsed); an unknown *component* is skipped, so a manifest that
     grows a third one still updates these two.
@@ -1259,25 +1503,28 @@ declares its class AND its mutation capability in one reviewed place.
     per-component mode select, installed/available versions, last check +
     verbatim outcome, Check now / Apply / Revert, plus Open rules folder and the
     manifest URL in force.
-  - **Defaults as locked:** rules `auto`, classifier `check`, interval 24 h. An
+  - **Defaults as locked:** rules `auto`, interval 24 h. An
     unrecognized mode string reads as `check` — a typo must neither disable the
-    updater nor grant it activation rights.
-  - **Deploy follow-ups (blocking for the feature to do anything at all;
-    deferred to the release step by locked decision 24, which records why):**
-    1. create the `detection-v1` release on `Dyserna/cImp`;
-    2. curate the first rule bundle (date-versioned, e.g. `2026.08.07`) from
-       `detection/rules.d/` + the current Vigil/garak refresh;
+    updater nor grant it activation rights. (The classifier's `check` default
+    went with its component, decision 25.)
+  - **Deploy follow-ups (blocking for the feature to do anything at all).
+    Rewritten 2026-08-08 — decision 24 is unblocked and the shape changed:**
+    1. create an **orphan branch** `detection-v1` on `Dyserna/cImp` holding only
+       the channel files — not a release (decision 27);
+    2. curate the first rule bundle (date-versioned, e.g. `2026.08.08`) from
+       `detection/rules.d/` + the current garak refresh (Vigil is dormant);
     3. verify it locally first via `offload.detection_update_manifest_url`
-       pointed at a staged copy (live-verification recipe 11);
-    4. upload the `.yar` assets under `<version>-<file>` names (release assets
-       are flat, so names must be unique across versions);
-    5. write `manifest.json` with real SHA-256s and sizes and upload it **last**
-       — a manifest published ahead of its assets makes every install fail a
-       check it would otherwise have skipped;
-    6. leave the `classifier` component OUT of the published manifest until the
-       Prompt Guard 2 weights themselves are published (see
-       `models/CHECKSUMS.txt`) — an entry with no assets behind it turns every
-       daily check into a rejected-update card.
+       pointed at a staged copy (live-verification recipe 11) — **and then once
+       against a throwaway ref on the real host**, because a local server
+       answers 200 and therefore cannot exercise the transport property that
+       H-5 turned on. That gap is exactly how H-5 survived;
+    4. commit the `.yar` files under `<version>-<file>` names (a branch keeps
+       every version's files side by side, so names must be unique);
+    5. commit `manifest.json` with real SHA-256s and sizes **last** — a manifest
+       published ahead of its files makes every install fail a check it would
+       otherwise have skipped.
+    A ready-to-publish manifest for `2026.08.08`, with real digests of the
+    H-4-fixed rules, was generated on 2026-08-08.
     The checklist is also recorded in `detection/manifest.example.json`.
   - **Phase C3 amendment 2026-08-07 (b) — outcome taxonomy split (#46, review
     finding U-3).** As first built, *every* manifest-level failure — including a
@@ -1602,10 +1849,11 @@ declares its class AND its mutation capability in one reviewed place.
   - **Known residuals.** (a) The compile ceiling is measured *around* the
     compile, not enforced inside it — yara-x exposes no compile deadline, so a
     pathological bundle is reliably *rejected* but still costs its own wall time
-    on a background task. (b) The classifier's apply path cannot be exercised
-    end-to-end anywhere today (the weights are unpublished); its pure decision
-    function `classifier_smoke_verdict` is unit-tested, the scoring wrapper is
-    not. (c) In a **dev tree** the updater's `detection-updates/` directory
+    on a background task. (b) **CLOSED 2026-08-08 by decision 25** — the
+    classifier's apply path could not be exercised end-to-end anywhere (the
+    weights are unpublished) and is now deleted along with the component, so
+    there is no untested path left. `classifier_smoke_verdict` went with it.
+    (c) In a **dev tree** the updater's `detection-updates/` directory
     survives `build.rs`, but a rule file the updater installs into
     `target/{profile}/detection/rules.d/` is pruned by the next build, since the
     repo is the source of truth there — installed layouts are unaffected.
@@ -1613,11 +1861,20 @@ declares its class AND its mutation capability in one reviewed place.
     today — every scheduled check ends `Unavailable`. That is now a quiet,
     logged non-event with a neutral row and a truthful Settings line, and after
     a week of it one `detection.update_stalled.v1` card per enabled component
-    says so honestly. Publishing the release is a deploy follow-up, not a
-    precondition for the code being correct; it is deferred until the U-1/U-2/
-    U-4 fixes have settled the containment check and the activation gauntlet, so
+    says so honestly. Publishing the channel is a deploy follow-up, not a
+    precondition for the code being correct; it was deferred until the U-1/U-2/
+    U-4 fixes had settled the containment check and the activation gauntlet, so
     the first bundle is validated against the fixed gauntlet — **locked
-    decision 24**, which also keeps `classifier` out of the first manifest.
+    decision 24**.
+    **Amended 2026-08-08:** decision 24 is now UNBLOCKED, and the `classifier`
+    carve-out it used to carry is moot (decision 25 deleted the component).
+    Worth recording that this residual was more load-bearing than it read: the
+    "quiet `Unavailable` non-event" it describes is *also* exactly what a
+    channel broken by H-5 would have looked like, indefinitely and on every
+    install. A designed-silent failure state and an undetected defect were
+    indistinguishable — which is why decision 27's guard asserts the pinned URL
+    against the fetch policy rather than trusting the outcome taxonomy to make
+    the difference visible.
     (e) An artifact
     fetch that fails *after* the manifest fetched successfully is still
     `Rejected`, not `Unavailable`: the network answered a moment earlier, so a
@@ -2754,7 +3011,8 @@ declares its class AND its mutation capability in one reviewed place.
     The **same shape was unfixed on four plain-`String` settings** whose real
     domain is a closed vocabulary and whose parse is post-hoc:
     `offload.native_web_visibility`, `offload.detection_update_rules_mode`,
-    `offload.detection_update_classifier_mode` (the C3 component modes) and
+    `offload.detection_update_classifier_mode` (the C3 component modes — the
+    classifier one has since been removed, decision 25) and
     `graph.read_advisor_mode`. `"native_web_visibility": true` — or `null` —
     still hit `quarantine_corrupt_file` and reset themes, tabs, backends, checks,
     MCP servers and pricing. All four now carry a `deserialize_with` whose rule
@@ -3356,6 +3614,15 @@ than fixed because this pass is documentation; each is small.
     at least one of signature/classifier layers (warning header present);
     a benign technical page about prompt engineering is fetched and NOT
     blocked (may flag — surface-only means research continues either way).
+    **Extended 2026-08-08 (H-4) — the check that matters is the obfuscated
+    one.** Serve the same payload four more ways, each rendering identically in
+    a browser: line-wrapped mid-phrase (what any 78-column extractor produces
+    for free), NBSP-separated, five-space-separated, and with one zero-width
+    space *inside* the first keyword. All four must flag. Before the fix none of
+    them did, on a bundle whose unit tests were green — because every hostile
+    fixture was single-line single-spaced ASCII. The zero-width-in-word case is
+    the one no regex can reach, so it is also the check that the normalized
+    second pass is actually running rather than merely present.
 11. Updater. **Rewritten 2026-08-08 (#48): the original predates the outcome
     split entirely, so it could not tell a 404 from a refusal, and it predates
     every U-1/U-2/U-4 fix.** Serve the staged bundle from a loopback HTTP
@@ -3405,6 +3672,22 @@ than fixed because this pass is documentation; each is small.
     - **Revert's own failure modes.** Revert with nothing retained →
       `revert-failed`, `ok:false` row, **no** card, and any pending "available"
       version still shown (not withdrawn, not re-offered as a downgrade).
+11c. **NEW 2026-08-08 — the transport check H-5 proved was missing, and the one
+    recipes 11/11b cannot substitute for.** Both stage the manifest on a *local*
+    HTTP server, which answers 200; the defect was that the pinned host answers
+    302 and the fetcher refuses redirects. Every gauntlet property passed while
+    the channel was unfetchable.
+    - Point `offload.detection_update_manifest_url` at a **throwaway ref on the
+      real host** (`https://raw.githubusercontent.com/<owner>/<repo>/<ref>/manifest.json`)
+      with one valid bundle behind it, and confirm one live run reports
+      `applied`. This is the only check that exercises the transport.
+    - Then, as the negative control, point it at a **release-asset** URL
+      (`https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json`)
+      and confirm the run ends `Unavailable` with the redirect in the logged
+      reason — i.e. reproduce H-5 deliberately, so the failure mode is one
+      someone has actually seen rather than one described in a doc.
+    - Do both **before** the first real publish (decision 24 / deploy step 3).
+
 11b. #48's four checks, all in Settings → Tools → Detection:
     - With the manifest URL pointing nowhere (today's shipped state), the
       component line reads *"Could not reach the update channel: GET …:

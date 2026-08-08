@@ -150,6 +150,68 @@ impl Trigger {
 /// resolves it to a commit sha.
 pub type CheckpointId = String;
 
+/// The trailer value that means "this checkpoint has no such identity" —
+/// written by [`trailer_identity`], read back as `None` by
+/// [`identity_field`].
+///
+/// A placeholder rather than an empty value because git only recognizes a
+/// commit's last paragraph as a trailer block when its lines actually parse as
+/// trailers; `Session:` with nothing after it is exactly the shape that makes
+/// that fragile, and a trailer block that stops being recognized takes the
+/// *other* trailers down with it. `Agent: -` has used this convention since
+/// Phase C — the two new fields simply share it.
+const IDENTITY_ABSENT: &str = "-";
+
+/// Length ceiling for an identity trailer value. A conversation id is a UUID
+/// (36 chars) and a tab id is a short slug; anything past this is not one, and
+/// the trailer block is not a place to store an unbounded caller-supplied
+/// string.
+const MAX_IDENTITY_LEN: usize = 200;
+
+/// Who a checkpoint belongs to: the conversation identity a Timeline row needs
+/// to be joined to a `Screen::Contamination` activity row.
+///
+/// **A struct, not three adjacent `Option<String>` parameters.** All three are
+/// optional strings of the same type sitting next to each other, so a call site
+/// that transposed `session` and `tab` would compile silently and mis-attribute
+/// every checkpoint it made — the same reasoning that made
+/// `tabs::config::OpencodePluginFlags` and `offload::toolclass::CallGuards`
+/// structs.
+///
+/// `Default` is "no identity at all", which is the honest answer for the
+/// triggers that have no conversation behind them: a burst-triggered snapshot,
+/// a manual "Checkpoint now" click, and [`restore`]'s invariant-C pre-restore
+/// safety snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Origin {
+    /// The harness NAME (`"claude"` / `"opencode"`) — shared by every tab of
+    /// that kind, which is exactly why it is not sufficient on its own.
+    pub agent: Option<String>,
+    /// The conversation the prompt belongs to (the harness's own session id).
+    pub session: Option<String>,
+    /// The cImp TAB id. The one field that tells two same-agent tabs on one
+    /// project root apart.
+    pub tab: Option<String>,
+}
+
+impl Origin {
+    /// Build an origin, normalizing each field to `None` when it is
+    /// absent/blank so "" and "   " can never read as an identity. Values are
+    /// *not* sanitized here — that happens at the write boundary
+    /// ([`trailer_identity`]), which is where the framing they could break
+    /// lives.
+    pub fn new(agent: Option<String>, session: Option<String>, tab: Option<String>) -> Self {
+        fn norm(v: Option<String>) -> Option<String> {
+            v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        }
+        Self {
+            agent: norm(agent),
+            session: norm(session),
+            tab: norm(tab),
+        }
+    }
+}
+
 /// One row of the Timeline section (`workbench_checkpoints`).
 #[derive(Clone, Debug, Serialize)]
 pub struct Checkpoint {
@@ -164,8 +226,18 @@ pub struct Checkpoint {
     pub ts_unix: u64,
     pub label: String,
     pub trigger: Trigger,
+    /// The harness name. `None` for a checkpoint no conversation triggered,
+    /// AND for every checkpoint written before this field existed.
     pub agent: Option<String>,
     pub files_changed: u32,
+    /// The conversation this checkpoint was taken for ([`Origin::session`]).
+    /// `None` for a burst/manual/pre-restore checkpoint and for any checkpoint
+    /// written before this field existed (see [`list`]).
+    pub session: Option<String>,
+    /// The cImp tab this checkpoint was taken for ([`Origin::tab`]) — what
+    /// makes two same-agent tabs on one root distinguishable in the Timeline.
+    /// `None` on the same terms as `session`.
+    pub tab: Option<String>,
     // TODO(C5, soft-dep on V12 Phase A `run_check`): an optional
     // `check_summary: Option<HashMap<String, u32>>` (check name → error
     // count), captured from the most recent `CheckReport` when the checks
@@ -440,6 +512,65 @@ fn truncate_label(label: &str) -> String {
     }
 }
 
+/// Render one identity value ([`Origin`]'s `agent`/`session`/`tab`) for the
+/// commit-message trailer block — **the parsing boundary**, not a place that
+/// trusts upstream.
+///
+/// Everything the trailer block's framing can be broken by is rejected here,
+/// and rejection means the value is recorded as [`IDENTITY_ABSENT`] rather than
+/// repaired:
+///
+/// - a **newline** would end the trailer line and let the value forge a whole
+///   extra trailer (`Session: x\nTab: someone-elses-tab`), or — as the first
+///   character of a multi-line value — split the commit's last paragraph so
+///   git stops recognizing it as a trailer block at all;
+/// - the `\u{1e}` / `\u{1f}` record/field separators [`list`] parses on would
+///   fragment the `for-each-ref` record and shift every field after this one,
+///   which is the failure mode that makes a checkpoint *silently vanish* from
+///   the Timeline;
+/// - any other control character, on the same "not a value, a framing hazard"
+///   footing (this is the rule [`truncate_label`] already applies to labels);
+/// - an implausibly long value ([`MAX_IDENTITY_LEN`]).
+///
+/// **Rejected, not sanitized**, because these are machine identifiers whose
+/// only use is an equality join against a contamination row. A repaired
+/// identifier (`"a\u{1f}b"` → `"ab"`) is a *different* identifier presented as
+/// fact, and could collide with a real one; absent is the honest answer and is
+/// the same value the join already treats as "cannot attribute this row".
+/// (Labels are the opposite case — prose, read by a human, where dropping the
+/// whole label to punish one stray character would be worse than repairing it.)
+///
+/// Applies to `agent` too, which reached the trailer unsanitized before this
+/// step: it is `ContextRetrieveBody::agent`, a caller-asserted string, and the
+/// hazard was never specific to the two new fields.
+fn trailer_identity(raw: Option<&str>) -> &str {
+    let Some(value) = raw else {
+        return IDENTITY_ABSENT;
+    };
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_IDENTITY_LEN
+        || value.chars().any(char::is_control)
+        || value == IDENTITY_ABSENT
+    {
+        return IDENTITY_ABSENT;
+    }
+    value
+}
+
+/// The inverse of [`trailer_identity`] for [`list`]: one `for-each-ref` field
+/// back into an `Option<String>`.
+///
+/// `None` for all three ways a value can be absent, which must stay
+/// indistinguishable: the field was never written (a checkpoint from before
+/// this build — see [`list`]'s backward-compatibility note), it was written as
+/// the [`IDENTITY_ABSENT`] placeholder, or `for-each-ref` produced nothing for
+/// the trailer key.
+fn identity_field(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    (!value.is_empty() && value != IDENTITY_ABSENT).then(|| value.to_string())
+}
+
 /// `true` if `id` is a well-formed checkpoint tag name (`cp-<digits>`). The one
 /// gate every [`resolve_commit`] caller relies on to keep untrusted ids out of
 /// `git rev-parse`'s option/rev grammar.
@@ -539,17 +670,32 @@ async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
 /// `list`/`diff_vs_now`/`restore` always have something to anchor to (`Some`
 /// vs `None` on `latest_checkpoint_tag` makes the trees compare unequal
 /// automatically in that case).
+///
+/// **What a dedup hit records — and deliberately does NOT record.** When the
+/// tree is unchanged this returns an EXISTING checkpoint, whose `origin` may
+/// name a different conversation (two tabs on one project root share this
+/// shadow repo, and `WorkbenchService::maybe_snapshot`'s min-gap throttle is
+/// per-root too). The existing checkpoint's `Session`/`Tab` trailers are left
+/// **exactly as they were written**: they are a record of who took *that*
+/// snapshot, and retro-writing the current caller's identity onto it would be
+/// the "silently mislabel an existing checkpoint" failure — it would also
+/// rewrite the commit (changing the `commit` sha every consumer displays) for
+/// an event where nothing was snapshotted. The honest reading of a dedup hit
+/// is "no checkpoint was created, because there was nothing new to capture";
+/// the returned id names a tree state, and that tree state is identical no
+/// matter which tab observed it. Callers must therefore not assume the id they
+/// get back carries their own identity.
 pub async fn snapshot(
     root: &Path,
     label: &str,
     trigger: Trigger,
-    agent: Option<&str>,
+    origin: &Origin,
     extra_ignore: &[String],
     max_file_bytes: u64,
 ) -> AppResult<CheckpointId> {
     let lock = shadow_lock(root);
     let _guard = lock.lock().await;
-    snapshot_inner(root, label, trigger, agent, extra_ignore, max_file_bytes).await
+    snapshot_inner(root, label, trigger, origin, extra_ignore, max_file_bytes).await
 }
 
 /// The body of [`snapshot`], WITHOUT acquiring the per-root shadow lock — so
@@ -561,7 +707,7 @@ async fn snapshot_inner(
     root: &Path,
     label: &str,
     trigger: Trigger,
-    agent: Option<&str>,
+    origin: &Origin,
     extra_ignore: &[String],
     max_file_bytes: u64,
 ) -> AppResult<CheckpointId> {
@@ -588,12 +734,21 @@ async fn snapshot_inner(
 
     let seq = next_seq(&ctx).await?;
     let tag = format!("cp-{seq}");
+    // Identity trailers go LAST, after the three Phase C ones. That ordering is
+    // load-bearing for [`list`]'s backward compatibility — see its note — and it
+    // keeps the message a checkpoint with no identity produces byte-identical to
+    // the old one apart from two appended placeholder lines.
+    //
+    // Every value goes through [`trailer_identity`]: nothing caller-asserted
+    // reaches this commit message without passing the framing check.
     let message = format!(
-        "{}\n\nTrigger: {}\nAgent: {}\nFiles-Changed: {}\n",
+        "{}\n\nTrigger: {}\nAgent: {}\nFiles-Changed: {}\nSession: {}\nTab: {}\n",
         truncate_label(label),
         trigger.as_str(),
-        agent.unwrap_or("-"),
+        trailer_identity(origin.agent.as_deref()),
         changed.len(),
+        trailer_identity(origin.session.as_deref()),
+        trailer_identity(origin.tab.as_deref()),
     );
     let commit = git::run_with_stdin(
         &ctx,
@@ -643,8 +798,30 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
     // end-of-line newline trailing the RS), which the whole-record `.trim()`
     // and per-field `.trim()` below both strip.
     const REC_SEP: char = '\u{1e}';
+    // The `Session`/`Tab` identity fields are APPENDED after `%(refname:short)`
+    // rather than slotted in beside `Agent`, and the guard below is `<
+    // CORE_FIELDS` rather than an exact count. Both are the same
+    // backward-compatibility decision, and it is a mandatory one: a user's
+    // `.cimp/shadow.git` is full of checkpoints whose commit messages carry
+    // only the three Phase C trailers, and an upgrade that emptied their
+    // Timeline would be a data-loss-shaped bug.
+    //
+    // `%(trailers:key=…)` expands to nothing for a key the commit does not
+    // have, while the literal separators around it are printed regardless — so
+    // an old checkpoint yields a full-width record with two EMPTY trailing
+    // fields, which [`identity_field`] reads as `None`. That is asserted
+    // against a real repo of hand-built old-format commits by
+    // `tests::old_eight_field_checkpoints_still_list_after_the_identity_fields`
+    // rather than assumed, because it is a claim about git's behaviour and not
+    // about ours.
+    //
+    // The tail placement plus the tolerant guard makes the reader correct under
+    // the other possible behaviour too: were a missing trailer ever to swallow
+    // its separators, the record would be SHORT rather than SHIFTED, every
+    // field the old format defined would still be at its old index, and the row
+    // would list with the identity absent instead of vanishing.
     let format = format!(
-        "%(objectname){sep}%(creatordate:unix){sep}%(creatordate:iso-strict){sep}%(contents:subject){sep}%(trailers:key=Trigger,valueonly){sep}%(trailers:key=Agent,valueonly){sep}%(trailers:key=Files-Changed,valueonly){sep}%(refname:short){rec_sep}",
+        "%(objectname){sep}%(creatordate:unix){sep}%(creatordate:iso-strict){sep}%(contents:subject){sep}%(trailers:key=Trigger,valueonly){sep}%(trailers:key=Agent,valueonly){sep}%(trailers:key=Files-Changed,valueonly){sep}%(refname:short){sep}%(trailers:key=Session,valueonly){sep}%(trailers:key=Tab,valueonly){rec_sep}",
         sep = FIELD_SEP,
         rec_sep = REC_SEP
     );
@@ -673,7 +850,13 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
             continue;
         }
         let fields: Vec<&str> = record.split(FIELD_SEP).collect();
-        if fields.len() != 8 {
+        // The count that must be present for a row to mean anything — the eight
+        // fields every checkpoint has carried since Phase C. Fields past this
+        // are read through `get`, so adding one can never turn "a field I don't
+        // have" into "skip this row", which is how a schema addition silently
+        // empties a Timeline.
+        const CORE_FIELDS: usize = 8;
+        if fields.len() < CORE_FIELDS {
             continue; // malformed row (shouldn't happen) — skip, don't panic
         }
         let tag = fields[7].trim().to_string();
@@ -681,7 +864,6 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
             .strip_prefix("cp-")
             .and_then(|n| n.parse::<u32>().ok())
             .unwrap_or(0);
-        let agent_raw = fields[5].trim();
         checkpoints.push(Checkpoint {
             id: tag,
             seq,
@@ -690,12 +872,10 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
             ts: fields[2].trim().to_string(),
             label: fields[3].trim().to_string(),
             trigger: Trigger::parse(fields[4].trim()),
-            agent: if agent_raw.is_empty() || agent_raw == "-" {
-                None
-            } else {
-                Some(agent_raw.to_string())
-            },
+            agent: identity_field(fields.get(5).copied()),
             files_changed: fields[6].trim().parse().unwrap_or(0),
+            session: identity_field(fields.get(8).copied()),
+            tab: identity_field(fields.get(9).copied()),
         });
     }
     checkpoints.sort_by_key(|c| c.seq);
@@ -801,11 +981,14 @@ pub async fn restore(
 
     // `snapshot_inner`, not `snapshot`: we already hold the lock, and the async
     // mutex is not re-entrant.
+    // `Origin::default()`: a pre-restore safety snapshot belongs to the restore
+    // action, not to any conversation — the same "no identity" answer the
+    // manual and burst triggers give.
     let pre_restore_id = snapshot_inner(
         root,
         "pre-restore",
         Trigger::PreRestore,
-        None,
+        &Origin::default(),
         extra_ignore,
         max_file_bytes,
     )
@@ -1012,6 +1195,13 @@ mod tests {
         crate::pty::resolve_command("git").is_ok()
     }
 
+    /// The pre-V33 origin shape: a harness name and nothing else. Used by the
+    /// tests that predate the identity fields, so they keep exercising the
+    /// "agent only" row a burst-era build produced.
+    fn agent_origin(agent: &str) -> Origin {
+        Origin::new(Some(agent.to_string()), None, None)
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .args(args)
@@ -1181,7 +1371,11 @@ mod tests {
             &dir,
             "prompt: do the thing",
             Trigger::Prompt,
-            Some("claude"),
+            &Origin::new(
+                Some("claude".into()),
+                Some("f0c1a2b3-4d5e-6f70-8192-a3b4c5d6e7f8".into()),
+                Some("claude-2".into()),
+            ),
             &[],
             0,
         )
@@ -1197,6 +1391,13 @@ mod tests {
         assert_eq!(cps[0].trigger, Trigger::Prompt);
         assert_eq!(cps[0].agent, Some("claude".to_string()));
         assert_eq!(cps[0].files_changed, 1);
+        // The V33 identity join: read back out of a REAL shadow repo, through
+        // `commit-tree` and `for-each-ref`, not out of the format string.
+        assert_eq!(
+            cps[0].session,
+            Some("f0c1a2b3-4d5e-6f70-8192-a3b4c5d6e7f8".to_string())
+        );
+        assert_eq!(cps[0].tab, Some("claude-2".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1224,7 +1425,7 @@ mod tests {
             &canon,
             "prompt: auto",
             Trigger::Prompt,
-            Some("claude"),
+            &agent_origin("claude"),
             &[],
             0,
         )
@@ -1243,20 +1444,27 @@ mod tests {
         }
         let dir = tempdir("dedupe");
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        let id1 = snapshot(&dir, "first", Trigger::Manual, None, &[], 0)
+        let id1 = snapshot(&dir, "first", Trigger::Manual, &Origin::default(), &[], 0)
             .await
             .expect("snapshot 1");
         // Nothing changed on disk since — must return the SAME id, not mint
         // a new checkpoint.
-        let id2 = snapshot(&dir, "second (no-op)", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot 2");
+        let id2 = snapshot(
+            &dir,
+            "second (no-op)",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot 2");
         assert_eq!(id1, id2);
         assert_eq!(list(&dir).await.expect("list").len(), 1);
 
         // A real change DOES produce a new checkpoint.
         std::fs::write(dir.join("a.txt"), "one changed\n").unwrap();
-        let id3 = snapshot(&dir, "third", Trigger::Manual, None, &[], 0)
+        let id3 = snapshot(&dir, "third", Trigger::Manual, &Origin::default(), &[], 0)
             .await
             .expect("snapshot 3");
         assert_ne!(id1, id3);
@@ -1272,11 +1480,461 @@ mod tests {
             return;
         }
         let dir = tempdir("empty");
-        let id = snapshot(&dir, "baseline", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot");
+        let id = snapshot(
+            &dir,
+            "baseline",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(id, "cp-1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── V33: checkpoint identity (session + tab) ─────────────────────────
+
+    /// Run git against `root`'s SHADOW repo and return trimmed stdout.
+    /// Deliberately spells `--git-dir` itself instead of going through
+    /// [`shadow_ctx`]: these helpers build the *legacy* on-disk shapes this
+    /// module must keep reading, so they must not inherit this module's current
+    /// idea of what a checkpoint looks like.
+    fn shadow_git_out(root: &Path, args: &[&str]) -> String {
+        let mut full: Vec<&str> = vec!["--git-dir", ".cimp/shadow.git"];
+        full.extend_from_slice(args);
+        let out = std::process::Command::new("git")
+            .args(&full)
+            .current_dir(root)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {full:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Tag `cp-<seq>` onto a commit carrying **exactly the pre-V33 commit
+    /// message**: subject, blank line, and the three Phase C trailers with no
+    /// `Session`/`Tab`. This is the upgrade case — what is already sitting in
+    /// every existing user's `.cimp/shadow.git` — reproduced byte-for-byte
+    /// rather than simulated by feeding `None` to the current writer (which
+    /// would still emit `Session: -` and prove nothing about the old shape).
+    ///
+    /// Reuses `cp-1`'s tree, so the repo needs one real snapshot first.
+    fn write_legacy_checkpoint(root: &Path, seq: u32, label: &str, agent: &str, files: u32) {
+        let tree = shadow_git_out(root, &["rev-parse", "-q", "--verify", "cp-1^{tree}"]);
+        let message =
+            format!("{label}\n\nTrigger: manual\nAgent: {agent}\nFiles-Changed: {files}\n");
+        // Under `.cimp/`, which `seed_exclude` keeps out of every snapshot, so
+        // this fixture file can never show up as checkpoint content.
+        let msg_path = root.join(".cimp").join(format!("legacy-msg-{seq}.txt"));
+        std::fs::write(&msg_path, &message).unwrap();
+        let msg_arg = msg_path.to_string_lossy().into_owned();
+        let sha = shadow_git_out(root, &["commit-tree", &tree, "-F", &msg_arg]);
+        shadow_git_out(root, &["tag", &format!("cp-{seq}"), &sha]);
+    }
+
+    /// **The upgrade case, and the sharpest trap in this change.** Metadata is
+    /// read back with one `for-each-ref --format` whose field count the parser
+    /// used to assert exactly (`!= 8`), so widening the format without widening
+    /// the guard makes every pre-existing checkpoint fail the arity check and
+    /// disappear from the Timeline *silently* — no error, just an empty
+    /// history.
+    ///
+    /// This asserts against genuinely old-format commits (see
+    /// [`write_legacy_checkpoint`]), not against a re-serialized `None`.
+    ///
+    /// **What it would still pass with if the change regressed:** almost
+    /// nothing — flipping the guard back to `!= 8`, or splicing `Session`/`Tab`
+    /// in beside `Agent` instead of appending them (which would shift
+    /// `refname:short` and blank every legacy row's id), both fail here. It
+    /// would NOT catch a regression in the *writer*; that is what the round-trip
+    /// test covers, which is why both assertions live in this one test: the new
+    /// row's identity is checked alongside the legacy rows', so a "fix" that
+    /// restored legacy rows by dropping the identity fields fails too.
+    #[tokio::test]
+    async fn old_eight_field_checkpoints_still_list_after_the_identity_fields() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("legacy");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        snapshot(
+            &dir,
+            "new format",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-new".into()),
+                Some("claude-2".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
+
+        // Two pre-V33 checkpoints, as an upgraded install would have them.
+        write_legacy_checkpoint(&dir, 2, "old with agent", "claude", 3);
+        write_legacy_checkpoint(&dir, 3, "old without agent", "-", 0);
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(
+            cps.len(),
+            3,
+            "an upgrade must not empty an existing Timeline"
+        );
+
+        let legacy = cps.iter().find(|c| c.id == "cp-2").expect("cp-2 listed");
+        assert_eq!(legacy.label, "old with agent");
+        assert_eq!(legacy.trigger, Trigger::Manual);
+        assert_eq!(legacy.agent, Some("claude".to_string()));
+        assert_eq!(legacy.files_changed, 3);
+        assert_eq!(legacy.seq, 2, "the tag field must not have shifted");
+        assert!(!legacy.commit.is_empty());
+        // Absent, not empty-string, not "-".
+        assert_eq!(legacy.session, None);
+        assert_eq!(legacy.tab, None);
+
+        let legacy_anon = cps.iter().find(|c| c.id == "cp-3").expect("cp-3 listed");
+        assert_eq!(legacy_anon.agent, None);
+        assert_eq!(legacy_anon.session, None);
+        assert_eq!(legacy_anon.tab, None);
+
+        // …and the new-format row beside them still carries its identity.
+        let fresh = cps.iter().find(|c| c.id == "cp-1").expect("cp-1 listed");
+        assert_eq!(fresh.session, Some("sess-new".to_string()));
+        assert_eq!(fresh.tab, Some("claude-2".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint with no conversation behind it — a manual click, a burst,
+    /// [`restore`]'s pre-restore snapshot — lists cleanly with the identity
+    /// fields ABSENT rather than as `"-"`, `""`, or a row that fails to parse.
+    ///
+    /// **What it would still pass with:** it would not catch a writer that
+    /// omitted the trailers entirely (git would then report them empty and this
+    /// still reads `None`). It DOES catch the placeholder leaking to consumers
+    /// as a literal `"-"` tab id — which would make every identityless
+    /// checkpoint look like it belonged to a tab named `-`.
+    #[tokio::test]
+    async fn a_checkpoint_with_no_conversation_lists_with_identity_absent() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("no-origin");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        snapshot(
+            &dir,
+            "manual checkpoint",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        snapshot(&dir, "activity", Trigger::Burst, &Origin::default(), &[], 0)
+            .await
+            .expect("burst snapshot");
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 2);
+        for cp in &cps {
+            assert_eq!(cp.agent, None, "{}", cp.id);
+            assert_eq!(cp.session, None, "{}", cp.id);
+            assert_eq!(cp.tab, None, "{}", cp.id);
+        }
+        assert_eq!(cps[0].trigger, Trigger::Manual);
+        assert_eq!(cps[1].trigger, Trigger::Burst);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The point of this step.** Two Claude tabs on ONE project root must
+    /// produce checkpoints that are distinguishable. `agent` cannot do it —
+    /// it is the harness name and reads `"claude"` for both — so a test that
+    /// only asserted "the tab field is present" would pass with a writer that
+    /// hardcoded one value for every tab.
+    ///
+    /// **What it would still pass with if the change regressed:** nothing that
+    /// matters here. It fails if `tab` is dropped, if both rows get the same
+    /// tab, if `session` and `tab` are transposed (the sessions and tabs are
+    /// deliberately not interchangeable strings), or if identity is written
+    /// once per ROOT rather than once per checkpoint.
+    #[tokio::test]
+    async fn two_tabs_on_one_root_produce_distinguishable_checkpoints() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("two-tabs");
+        std::fs::write(dir.join("a.txt"), "from tab one\n").unwrap();
+        snapshot(
+            &dir,
+            "prompt: tab one",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-aaa".into()),
+                Some("claude".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot tab one");
+
+        std::fs::write(dir.join("a.txt"), "from tab two\n").unwrap();
+        snapshot(
+            &dir,
+            "prompt: tab two",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-bbb".into()),
+                Some("claude-2".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot tab two");
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 2);
+        // The harness name is identical — this is exactly why it was not enough.
+        assert_eq!(cps[0].agent, cps[1].agent);
+        assert_eq!(cps[0].agent, Some("claude".to_string()));
+        // …and the tab/session tell them apart.
+        assert_eq!(cps[0].tab, Some("claude".to_string()));
+        assert_eq!(cps[1].tab, Some("claude-2".to_string()));
+        assert_ne!(cps[0].tab, cps[1].tab);
+        assert_eq!(cps[0].session, Some("sess-aaa".to_string()));
+        assert_eq!(cps[1].session, Some("sess-bbb".to_string()));
+        assert_ne!(cps[0].session, cps[1].session);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dedup hit returns the PREVIOUS checkpoint and leaves its identity
+    /// exactly as written — it does not retro-label an existing checkpoint with
+    /// the current caller's tab, and it does not rewrite the commit.
+    ///
+    /// This is the decision `snapshot`'s doc comment states, asserted rather
+    /// than described: nothing was snapshotted, so there is nothing to
+    /// attribute, and the returned id names a tree state that is identical
+    /// whichever tab observed it.
+    ///
+    /// **What it would still pass with:** it would pass if dedup were removed
+    /// entirely and tab two minted its own checkpoint — so the checkpoint COUNT
+    /// and the unchanged commit sha are both asserted, which pins the "no new
+    /// checkpoint AND no rewritten one" pair rather than either half alone.
+    #[tokio::test]
+    async fn a_dedup_hit_returns_the_previous_checkpoint_without_relabelling_it() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("dedup-identity");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let first = snapshot(
+            &dir,
+            "prompt: tab one",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-aaa".into()),
+                Some("claude".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot tab one");
+        let sha_before = list(&dir).await.expect("list")[0].commit.clone();
+
+        // Tab TWO prompts with the work tree untouched.
+        let second = snapshot(
+            &dir,
+            "prompt: tab two",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-bbb".into()),
+                Some("claude-2".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot tab two");
+        assert_eq!(first, second, "dedup must return the existing checkpoint");
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 1, "a dedup hit must not mint a checkpoint");
+        assert_eq!(
+            cps[0].commit, sha_before,
+            "a dedup hit must not rewrite the existing commit"
+        );
+        assert_eq!(
+            cps[0].tab,
+            Some("claude".to_string()),
+            "the existing checkpoint keeps the identity of whoever actually took it"
+        );
+        assert_eq!(cps[0].session, Some("sess-aaa".to_string()));
+        assert_eq!(cps[0].label, "prompt: tab one");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session id or tab id carrying a newline, a `\u{1f}` field separator or
+    /// a `\u{1e}` record separator cannot corrupt the record, drop the row, or
+    /// bleed into an adjacent field.
+    ///
+    /// The hostile values are shaped to attempt the two real attacks: forging a
+    /// whole extra trailer (`…\nTab: victim-tab`) and fragmenting the
+    /// `for-each-ref` record so the row vanishes or its fields shift.
+    ///
+    /// **What it would still pass with:** an implementation that *repaired*
+    /// rather than rejected would keep the row parseable and pass a
+    /// "row still lists" assertion — so this also asserts the forged tab never
+    /// appears ANYWHERE in the listing, and that the neighbouring fields
+    /// (label, trigger, files-changed, agent) are exactly right rather than
+    /// merely non-empty.
+    #[tokio::test]
+    async fn a_separator_or_newline_in_an_identity_cannot_corrupt_the_record() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("inject");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        snapshot(
+            &dir,
+            "prompt: hostile",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                // Attempt 1: forge a `Tab:` trailer out of the session value.
+                Some("sess-aaa\nTab: victim-tab".into()),
+                // Attempt 2: fragment the for-each-ref record.
+                Some("claude\u{1f}shifted\u{1e}dropped".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 1, "the record must not fragment into extra rows");
+        let cp = &cps[0];
+        // Rejected outright — a mangled identifier would be a different
+        // identifier presented as fact.
+        assert_eq!(cp.session, None);
+        assert_eq!(cp.tab, None);
+        // The forged trailer never took effect anywhere in the listing.
+        assert!(
+            cps.iter().all(|c| c.tab.as_deref() != Some("victim-tab")),
+            "a newline in one identity forged another field"
+        );
+        // Every neighbouring field is intact, i.e. nothing shifted by one.
+        assert_eq!(cp.id, "cp-1");
+        assert_eq!(cp.seq, 1);
+        assert_eq!(cp.label, "prompt: hostile");
+        assert_eq!(cp.trigger, Trigger::Prompt);
+        assert_eq!(cp.agent, Some("claude".to_string()));
+        assert_eq!(cp.files_changed, 1);
+        assert!(cp.ts_unix > 0, "the date fields must still parse");
+
+        // The same hostility in `agent`, which reached the trailer unsanitized
+        // before this change.
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        snapshot(
+            &dir,
+            "prompt: hostile agent",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude\u{1f}x\nFiles-Changed: 999".into()),
+                None,
+                Some("claude-2".into()),
+            ),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot 2");
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 2);
+        let cp = cps.iter().find(|c| c.id == "cp-2").expect("cp-2");
+        assert_eq!(cp.agent, None);
+        assert_eq!(cp.files_changed, 1, "the forged Files-Changed did not win");
+        assert_eq!(cp.tab, Some("claude-2".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The write- and read-side identity funnels, unit-tested. The real proof
+    /// is the round-trip tests above (this is the format-string-level check the
+    /// brief warns not to rely on alone) — kept because it pins the *reason*
+    /// each rejection exists at the boundary itself.
+    #[test]
+    fn identity_values_that_could_break_the_trailer_framing_are_rejected() {
+        // Ordinary identifiers pass through untouched.
+        assert_eq!(trailer_identity(Some("claude-2")), "claude-2");
+        assert_eq!(
+            trailer_identity(Some("f0c1a2b3-4d5e-6f70-8192-a3b4c5d6e7f8")),
+            "f0c1a2b3-4d5e-6f70-8192-a3b4c5d6e7f8"
+        );
+        assert_eq!(trailer_identity(Some("  padded  ")), "padded");
+        // Absent, blank, and the placeholder itself.
+        assert_eq!(trailer_identity(None), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("   ")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("-")), IDENTITY_ABSENT);
+        // Framing hazards: newline (forges a trailer / splits the paragraph),
+        // CR, the two separators `list` parses on, and any other control char.
+        assert_eq!(trailer_identity(Some("a\nTab: x")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("a\r\nb")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("a\u{1f}b")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("a\u{1e}b")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("a\tb")), IDENTITY_ABSENT);
+        assert_eq!(trailer_identity(Some("a\0b")), IDENTITY_ABSENT);
+        // Unbounded caller-supplied strings do not belong in a commit message.
+        let long = "x".repeat(MAX_IDENTITY_LEN + 1);
+        assert_eq!(trailer_identity(Some(&long)), IDENTITY_ABSENT);
+        assert_eq!(
+            trailer_identity(Some(&"x".repeat(MAX_IDENTITY_LEN))).len(),
+            MAX_IDENTITY_LEN
+        );
+
+        // Read side: the three ways a value is absent are indistinguishable.
+        assert_eq!(identity_field(None), None); // field not in the record at all
+        assert_eq!(identity_field(Some("")), None); // trailer key not on the commit
+        assert_eq!(identity_field(Some(IDENTITY_ABSENT)), None); // placeholder
+        assert_eq!(identity_field(Some("  ")), None);
+        assert_eq!(identity_field(Some(" claude-2 ")), Some("claude-2".into()));
+    }
+
+    /// `Origin::new` normalizes blank fields to `None` so `""`/`"   "` — the
+    /// shapes a shim sends when its own lookup missed — can never read as an
+    /// identity downstream.
+    #[test]
+    fn origin_new_normalizes_blank_identities_to_absent() {
+        let o = Origin::new(Some("".into()), Some("   ".into()), Some(" tab ".into()));
+        assert_eq!(o.agent, None);
+        assert_eq!(o.session, None);
+        assert_eq!(o.tab, Some("tab".to_string()));
+        assert_eq!(Origin::new(None, None, None), Origin::default());
     }
 
     // ── restore: round trip, CRLF-faithful, invariant D, invariant C ────
@@ -1291,9 +1949,16 @@ mod tests {
         let crlf_content = b"line1\r\nline2\r\nline3\r\n".to_vec();
         std::fs::write(dir.join("crlf.txt"), &crlf_content).unwrap();
         std::fs::write(dir.join("plain.txt"), "hello\n").unwrap();
-        let cp = snapshot(&dir, "baseline", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot");
+        let cp = snapshot(
+            &dir,
+            "baseline",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
 
         // Mutate both files after the checkpoint.
         std::fs::write(dir.join("crlf.txt"), b"MUTATED\r\n").unwrap();
@@ -1322,9 +1987,16 @@ mod tests {
         }
         let dir = tempdir("keepnew");
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        let cp = snapshot(&dir, "baseline", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot");
+        let cp = snapshot(
+            &dir,
+            "baseline",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
 
         // New, untracked-by-the-checkpoint work appears after the snapshot.
         std::fs::write(dir.join("new_work.txt"), "please don't delete me\n").unwrap();
@@ -1374,9 +2046,16 @@ mod tests {
         }
         let dir = tempdir("recreate");
         std::fs::write(dir.join("keep_me.txt"), "important\n").unwrap();
-        let cp = snapshot(&dir, "baseline", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot");
+        let cp = snapshot(
+            &dir,
+            "baseline",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
 
         std::fs::remove_file(dir.join("keep_me.txt")).unwrap();
         assert!(!dir.join("keep_me.txt").exists());
@@ -1402,11 +2081,11 @@ mod tests {
         }
         let dir = tempdir("prerestore");
         std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        let cp1 = snapshot(&dir, "v1", Trigger::Manual, None, &[], 0)
+        let cp1 = snapshot(&dir, "v1", Trigger::Manual, &Origin::default(), &[], 0)
             .await
             .expect("snapshot v1");
         std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
-        let _cp2 = snapshot(&dir, "v2", Trigger::Manual, None, &[], 0)
+        let _cp2 = snapshot(&dir, "v2", Trigger::Manual, &Origin::default(), &[], 0)
             .await
             .expect("snapshot v2");
         // A real change since v2's snapshot, so `restore`'s internal
@@ -1470,7 +2149,7 @@ mod tests {
 
         // Checkpoint cp-1: state A.
         std::fs::write(dir.join("tracked.txt"), "state A\n").unwrap();
-        let cp1 = snapshot(&dir, "state A", Trigger::Manual, None, &[], 0)
+        let cp1 = snapshot(&dir, "state A", Trigger::Manual, &Origin::default(), &[], 0)
             .await
             .expect("snapshot A");
 
@@ -1534,9 +2213,16 @@ mod tests {
         // never advance the user's HEAD (checked throughout), and a restore
         // to a checkpoint of a clean tree must leave that tree clean again,
         // not just "some new dirty state neither op explains".
-        let baseline = snapshot(&dir, "clean baseline", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot baseline");
+        let baseline = snapshot(
+            &dir,
+            "clean baseline",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot baseline");
         assert_eq!(
             user_git_head(&dir),
             head_before,
@@ -1550,9 +2236,16 @@ mod tests {
         // untouched at the git-metadata level throughout.
         std::fs::write(dir.join("tracked.txt"), "hello v2\n").unwrap();
         std::fs::write(dir.join("untracked.txt"), "scratch\n").unwrap();
-        let cp = snapshot(&dir, "checkpoint", Trigger::Prompt, Some("claude"), &[], 0)
-            .await
-            .expect("snapshot");
+        let cp = snapshot(
+            &dir,
+            "checkpoint",
+            Trigger::Prompt,
+            &agent_origin("claude"),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(
             user_git_head(&dir),
             head_before,
@@ -1619,9 +2312,16 @@ mod tests {
         }
         let dir = tempdir("diffnow");
         std::fs::write(dir.join("a.txt"), "line1\nline2\n").unwrap();
-        let cp = snapshot(&dir, "baseline", Trigger::Manual, None, &[], 0)
-            .await
-            .expect("snapshot");
+        let cp = snapshot(
+            &dir,
+            "baseline",
+            Trigger::Manual,
+            &Origin::default(),
+            &[],
+            0,
+        )
+        .await
+        .expect("snapshot");
         std::fs::write(dir.join("a.txt"), "line1\nline2X\n").unwrap();
         std::fs::write(dir.join("b.txt"), "brand new\n").unwrap();
 
@@ -1649,9 +2349,16 @@ mod tests {
         let dir = tempdir("gc-count");
         for i in 0..5 {
             std::fs::write(dir.join("a.txt"), format!("v{i}\n")).unwrap();
-            snapshot(&dir, &format!("v{i}"), Trigger::Manual, None, &[], 0)
-                .await
-                .expect("snapshot");
+            snapshot(
+                &dir,
+                &format!("v{i}"),
+                Trigger::Manual,
+                &Origin::default(),
+                &[],
+                0,
+            )
+            .await
+            .expect("snapshot");
         }
         assert_eq!(list(&dir).await.expect("list").len(), 5);
 
@@ -1674,9 +2381,16 @@ mod tests {
         let dir = tempdir("gc-nolimit");
         for i in 0..3 {
             std::fs::write(dir.join("a.txt"), format!("v{i}\n")).unwrap();
-            snapshot(&dir, &format!("v{i}"), Trigger::Manual, None, &[], 0)
-                .await
-                .expect("snapshot");
+            snapshot(
+                &dir,
+                &format!("v{i}"),
+                Trigger::Manual,
+                &Origin::default(),
+                &[],
+                0,
+            )
+            .await
+            .expect("snapshot");
         }
         gc(&dir, 0, 0).await.expect("gc no-op");
         assert_eq!(

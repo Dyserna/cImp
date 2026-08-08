@@ -125,6 +125,9 @@ export function workbenchSendHunk(path: string, hunkIndex: number, root?: string
 export type CheckpointTrigger = 'prompt' | 'burst' | 'manual' | 'pre-restore';
 
 /// Mirror of Rust `workbench::shadow::Checkpoint` — one Timeline row.
+///
+/// Hand-mirrored: there is no codegen, so a field added on the Rust side must
+/// be added here or it is silently invisible to the UI.
 export interface Checkpoint {
   id: string;
   seq: number;
@@ -134,8 +137,19 @@ export interface Checkpoint {
   ts_unix: number;
   label: string;
   trigger: CheckpointTrigger;
+  /// The harness NAME ('claude' / 'opencode') — shared by every tab of that
+  /// kind, which is why `tab` below exists.
   agent: string | null;
   files_changed: number;
+  /// V33: the harness conversation this checkpoint was taken for. `null` for a
+  /// burst/manual/pre-restore checkpoint (no conversation behind it) and for
+  /// every checkpoint written before this field existed.
+  session: string | null;
+  /// V33: the cImp tab this checkpoint was taken for — what makes two
+  /// same-agent tabs on one project root distinguishable in the Timeline, and
+  /// what a contamination row is joined against. `null` on the same terms as
+  /// `session`.
+  tab: string | null;
 }
 
 /// Mirror of Rust `workbench::shadow::RestoreReport` — the

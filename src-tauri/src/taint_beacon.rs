@@ -82,7 +82,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::context_hook::{missing_fields, resolve_cwd};
+use crate::context_hook::{missing_fields, resolve_cwd, tab_arg};
 
 /// The agent vocabulary this shim reports under. Only Claude Code runs
 /// `PreToolUse` hooks; OpenCode beacons from its plugin
@@ -204,16 +204,6 @@ fn dispatch(path: &str, body: &str) {
     // `Connection: close` already told it not to expect reuse.
 }
 
-/// The value following `--tab` in `args`, trimmed and non-empty.
-///
-/// Split out and pure so the contract ("no tab ⇒ no beacon") is unit-testable
-/// without a socket or a Claude process.
-fn tab_arg(args: &[String]) -> Option<String> {
-    let i = args.iter().position(|a| a == "--tab")?;
-    let raw = args.get(i + 1)?.trim();
-    (!raw.is_empty()).then(|| raw.to_string())
-}
-
 /// A payload string field, or `""` when absent/not-a-string.
 fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|f| f.as_str()).unwrap_or("")
@@ -224,6 +214,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// `tab_arg` moved to `context_hook` in V33 when `--context-hook` grew the
+    /// same `--tab` flag; this test stays here because this shim's contract
+    /// ("no tab ⇒ no beacon at all") is the stricter of the two consumers.
     #[test]
     fn tab_arg_reads_the_baked_id_and_refuses_an_empty_one() {
         let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };

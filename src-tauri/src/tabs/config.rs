@@ -632,10 +632,18 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
                 && (settings.graph.context_injection || settings.workbench.checkpoints)
             {
                 if let Some(command) = crate::statusline::context_hook_command() {
+                    // V33: `--tab` is baked in for the same reason
+                    // `--taint-beacon`'s is — a `UserPromptSubmit` payload
+                    // carries `session_id` and `cwd` but nothing that names a
+                    // cImp tab, and the checkpoint this hook triggers needs the
+                    // tab id to tell two Claude tabs on one project root apart
+                    // in the Timeline. Purely additive: the shim sends `tab:
+                    // null` without it and the app records a checkpoint with no
+                    // tab, which is exactly the pre-V33 row.
                     hooks.insert(
                         "UserPromptSubmit".to_string(),
                         serde_json::json!([ { "hooks": [
-                            { "type": "command", "command": command, "timeout": 5 }
+                            { "type": "command", "command": format!("{command} --tab {tab}"), "timeout": 5 }
                         ] } ]),
                     );
                 }
@@ -1729,7 +1737,11 @@ export default async (input) => ({{
       const r = await fetch(CIMP_LOOPBACK + "/context/retrieve", {{
         method: "POST",
         headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
-        body: JSON.stringify({{ cwd: input.directory, prompt: p.text, session_id: inp.sessionID, agent: "opencode" }}),
+        // V33: `tab` rides along so the prompt-tap checkpoint this POST fires
+        // can be attributed to THIS tab — `agent` is the harness name, shared
+        // by every OpenCode tab, and `CIMP_TAB_ID` is already baked into this
+        // file for the beacon/gate. Same identity, one source.
+        body: JSON.stringify({{ cwd: input.directory, prompt: p.text, session_id: inp.sessionID, agent: "opencode", tab: CIMP_TAB_ID }}),
         signal: AbortSignal.timeout(600),
       }});
       const j = await r.json();
@@ -2438,7 +2450,7 @@ mod tests {
         let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
             .expect("hook command is a string");
-        assert!(cmd.ends_with(" --context-hook"), "got: {cmd}");
+        assert!(cmd.contains(" --context-hook"), "got: {cmd}");
         assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
     }
 
@@ -2568,9 +2580,47 @@ mod tests {
         let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
             .expect("hook command is a string");
-        assert!(cmd.ends_with(" --context-hook"), "got: {cmd}");
+        assert!(cmd.contains(" --context-hook"), "got: {cmd}");
         // PreCompact stays off — it's still gated on context_injection alone.
         assert!(overlay["hooks"].get("PreCompact").is_none());
+    }
+
+    /// V33: the `UserPromptSubmit` shim carries the cImp TAB it serves, so the
+    /// prompt-tap checkpoint it fires can be attributed to one tab rather than
+    /// to "some Claude tab on this root".
+    ///
+    /// The hook PAYLOAD carries no tab identity, so argv is the only channel —
+    /// the same conclusion `--taint-beacon` and the per-tab MCP children
+    /// reached, pinned by `the_code_audit_child_carries_its_own_tab_id`.
+    ///
+    /// **What it would still pass with:** a build that emitted a constant tab
+    /// id for every tab — hence the loop over two different ids and the
+    /// assertion that the emitted commands DIFFER, which is the property the
+    /// whole step exists for.
+    #[test]
+    fn the_context_hook_carries_its_own_tab_id() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        let hook_command = |tab: &str| {
+            let args = build_pre_args(&claude_cfg(), &settings, tab);
+            let overlay = settings_overlay(&args).expect("overlay present");
+            overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+                .as_str()
+                .expect("hook command is a string")
+                .to_string()
+        };
+        for tab in ["claude", "claude-local"] {
+            let cmd = hook_command(tab);
+            assert!(cmd.contains(" --context-hook "), "got: {cmd}");
+            assert!(cmd.ends_with(&format!(" --tab {tab}")), "got: {cmd}");
+        }
+        assert_ne!(
+            hook_command("claude"),
+            hook_command("claude-local"),
+            "two tabs must not spawn an identical hook command"
+        );
     }
 
     /// Checkpoints alone (graph off) must NOT install the hook — the
@@ -3032,6 +3082,41 @@ mod tests {
         );
         // The gate DOES still apply to actually using the response text.
         assert!(js.contains("CIMP_INJECT_ENABLED && j && j.ok && j.text"));
+    }
+
+    /// V33: the OpenCode side of the same identity — `chat.message`'s
+    /// `/context/retrieve` POST carries this tab's id, not just the harness
+    /// name, so the checkpoint it fires is attributable to one of several
+    /// OpenCode tabs sharing a project root.
+    ///
+    /// It reuses `CIMP_TAB_ID` (already baked in for the beacon/gate) rather
+    /// than re-deriving one, so the plugin has a single notion of "which tab am
+    /// I" and the two cannot drift.
+    ///
+    /// **What it would still pass with:** a literal `tab: "opencode-2"` string
+    /// would satisfy a naive `contains` — so this asserts the *symbol* is used
+    /// and that the constant it reads is defined from the generator's `tab`
+    /// argument.
+    #[test]
+    fn opencode_chat_message_posts_its_own_tab_id() {
+        let js = opencode_plugin_source(1, "x", "opencode-2", ALL_OFF);
+        assert!(
+            js.contains("tab: CIMP_TAB_ID"),
+            "the retrieve POST must carry this tab's id: {js}"
+        );
+        assert!(
+            js.contains(r#"const CIMP_TAB_ID = "opencode-2""#),
+            "CIMP_TAB_ID must come from the generator's tab argument: {js}"
+        );
+        // The retrieve POST is the one inside `chat.message`.
+        let chat_message_start = js.find("\"chat.message\"").expect("chat.message");
+        let handler = &js[chat_message_start..];
+        let body_pos = handler.find("tab: CIMP_TAB_ID").expect("tab in body");
+        let retrieve_pos = handler.find("/context/retrieve").expect("retrieve");
+        assert!(
+            retrieve_pos < body_pos,
+            "the tab id must ride the /context/retrieve body"
+        );
     }
 
     #[test]

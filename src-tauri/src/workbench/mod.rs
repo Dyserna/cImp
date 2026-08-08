@@ -260,8 +260,15 @@ impl WorkbenchService {
             }
         };
         if fire {
-            self.maybe_snapshot(&root, "activity".to_string(), shadow::Trigger::Burst, None)
-                .await;
+            // No origin: a burst is filesystem activity, with no conversation
+            // behind it — this handler sees an `FsBatch`, not a prompt.
+            self.maybe_snapshot(
+                &root,
+                "activity".to_string(),
+                shadow::Trigger::Burst,
+                shadow::Origin::default(),
+            )
+            .await;
         }
     }
 
@@ -281,12 +288,21 @@ impl WorkbenchService {
     /// background task so the caller (a prompt hook, an fs-batch handler)
     /// never blocks on it — per the milestone's "never block a prompt or the
     /// UI thread" contract (C2). No-op entirely when checkpoints are off.
+    ///
+    /// **The throttle is per ROOT, not per origin, and stays that way.** Two
+    /// Claude tabs on one project root share this gate, so a prompt in tab B
+    /// inside tab A's cooldown produces no checkpoint at all — B's identity is
+    /// then simply absent from the Timeline for that window rather than
+    /// attached to A's checkpoint. That is deliberate: identity changes what a
+    /// checkpoint *records*, never *when* one is taken (the alternative — a
+    /// per-origin gate — would multiply shadow-repo writes by the number of
+    /// open tabs, which is the spam this gate exists to prevent).
     async fn maybe_snapshot(
         &self,
         root: &Path,
         label: String,
         trigger: shadow::Trigger,
-        agent: Option<String>,
+        origin: shadow::Origin,
     ) {
         if !self.checkpoints_enabled() {
             return;
@@ -318,7 +334,7 @@ impl WorkbenchService {
                 &root,
                 &label,
                 trigger,
-                agent.as_deref(),
+                &origin,
                 &extra_ignore,
                 max_file_bytes,
             )
@@ -343,14 +359,29 @@ impl WorkbenchService {
     /// deliberately BEFORE that handler's own `context_injection` gate, so
     /// checkpointing runs even when injection is off or yields nothing (the
     /// milestone's Decision 4: checkpointing is decoupled from the injection
-    /// toggle even though it reuses the same transport). `agent` is whatever
-    /// the calling shim identified itself as (`"claude"`/`"opencode"`/`None`
-    /// for unknown); `prompt_head` is used as-is for the label — callers are
-    /// expected to have already truncated it (`shadow::snapshot`'s own
-    /// [`truncate_label`](shadow) is a hard backstop, not the primary cut).
-    pub async fn on_prompt(&self, root: &Path, agent: Option<String>, prompt_head: &str) {
+    /// toggle even though it reuses the same transport). `prompt_head` is used
+    /// as-is for the label — callers are expected to have already truncated it
+    /// (`shadow::snapshot`'s own [`truncate_label`](shadow) is a hard backstop,
+    /// not the primary cut).
+    ///
+    /// `origin` carries the conversation identity the Timeline needs in order
+    /// to be joined to a `Screen::Contamination` activity row: the harness name
+    /// the shim called itself, the harness SESSION id, and the cImp TAB id the
+    /// route resolved. The agent name alone was never enough — it is the
+    /// harness *kind*, shared by every tab of that kind, so two Claude tabs on
+    /// one project root were indistinguishable in the checkpoint stream and
+    /// "nearest preceding checkpoint" could hand the user the other tab's row.
+    ///
+    /// **Still infallible and still non-blocking**, which the loopback's
+    /// fire-and-forget call site depends on: this returns `()`, the real work
+    /// runs on a background task inside
+    /// [`maybe_snapshot`](Self::maybe_snapshot), and the added fields are plain
+    /// data validated where they are written (`shadow::trailer_identity`), so a
+    /// malformed identity degrades to an absent one — never to an error on the
+    /// prompt path.
+    pub async fn on_prompt(&self, root: &Path, origin: shadow::Origin, prompt_head: &str) {
         let label = format!("prompt: {prompt_head}");
-        self.maybe_snapshot(root, label, shadow::Trigger::Prompt, agent)
+        self.maybe_snapshot(root, label, shadow::Trigger::Prompt, origin)
             .await;
     }
 
@@ -362,6 +393,13 @@ impl WorkbenchService {
     /// not something to silently throttle or defer. It still updates
     /// `checkpoint_last` so a subsequent AUTOMATIC trigger's cooldown counts
     /// from this snapshot too (no back-to-back auto + manual spam).
+    ///
+    /// Deliberately `Origin::default()`: a "Checkpoint now" click comes from the
+    /// Workbench panel, not from a conversation, so there is no session and no
+    /// tab to attribute it to. Inventing the focused tab's identity here would
+    /// put a *conversation* label on a checkpoint that conversation did not
+    /// take — the correlation this milestone is building exists to be trusted
+    /// after an incident, so an absent identity beats a plausible one.
     pub async fn checkpoint_now(
         &self,
         root: &Path,
@@ -373,7 +411,7 @@ impl WorkbenchService {
             root,
             &label,
             shadow::Trigger::Manual,
-            None,
+            &shadow::Origin::default(),
             &cfg.graph.ignore,
             cfg.graph.max_file_bytes,
         )

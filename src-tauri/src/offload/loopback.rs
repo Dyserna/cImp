@@ -3172,6 +3172,51 @@ struct ContextRetrieveBody {
     /// not otherwise used by context retrieval itself.
     #[serde(default)]
     agent: Option<String>,
+    /// V33: the cImp TAB this prompt belongs to — `--tab <id>` baked into the
+    /// `--context-hook` command at spawn (`tabs::config`), or `CIMP_TAB_ID`
+    /// from the generated OpenCode plugin. Recorded on the checkpoint this
+    /// prompt triggers so the Timeline can tell two same-agent tabs on one
+    /// project root apart; nothing about context retrieval reads it.
+    ///
+    /// `#[serde(default)]` because a hook shim from an older build sends no
+    /// such field, and a prompt must never fail for lack of identity — the
+    /// checkpoint is simply written without a tab, exactly as before.
+    #[serde(default)]
+    tab: Option<String>,
+}
+
+/// V33: the conversation identity recorded on the prompt-tap checkpoint this
+/// route fires — the join key between a Timeline row and a
+/// `Screen::Contamination` activity row.
+///
+/// **The tab id goes through [`tab_identity`]**, the same #45 narrowing every
+/// other identity-taking route uses, so only a *configured AI tab id* is ever
+/// recorded. A `tab` naming no configured tab is a forged or stale claim, and
+/// writing it into a checkpoint would put a fabricated attribution on a record
+/// whose whole purpose is to be trusted after an incident. It degrades to no
+/// tab — which reads as "cannot attribute this checkpoint", not as "some other
+/// tab". `Anonymous` (a hook shim from a build before `--tab` was baked in, or
+/// an OpenCode plugin file not yet regenerated) lands in the same place, which
+/// is exactly the pre-V33 row.
+///
+/// `session_id` and `agent` are recorded as sent. They are equally
+/// caller-asserted, but neither can widen anything: they are compared for
+/// equality against a contamination row and nothing else, and the framing
+/// hazard they carry is handled where it lives — at the commit-trailer write
+/// boundary (`workbench::shadow`'s `trailer_identity`).
+///
+/// Split out of the handler so the narrowing is exercised by a test rather than
+/// re-implemented in one: a test that owned its own copy of this mapping would
+/// stay green if the handler stopped calling it.
+fn checkpoint_origin(
+    settings: &crate::settings::Settings,
+    body: &ContextRetrieveBody,
+) -> crate::workbench::shadow::Origin {
+    let tab = match tab_identity(settings, body.tab.as_deref()) {
+        TabIdentity::Configured(tab) => Some(tab.to_string()),
+        TabIdentity::Anonymous | TabIdentity::Unknown(_) => None,
+    };
+    crate::workbench::shadow::Origin::new(body.agent.clone(), body.session_id.clone(), tab)
 }
 
 /// `POST /context/retrieve`: rank files for the prompt and return the injectable
@@ -3216,10 +3261,13 @@ async fn handle_context_retrieve(
         let workbench = workbench.inner().clone();
         if workbench.checkpoints_enabled() {
             let root = cwd.clone();
-            let agent = body.agent.clone();
+            // V33: the identity the Timeline is joined on. The settings read
+            // sits INSIDE the `checkpoints_enabled` gate for FIX 8's reason —
+            // a user with checkpoints off pays nothing for this.
+            let origin = checkpoint_origin(&live_settings(app), &body);
             let prompt_head: String = body.prompt.chars().take(80).collect();
             tauri::async_runtime::spawn(async move {
-                workbench.on_prompt(&root, agent, &prompt_head).await;
+                workbench.on_prompt(&root, origin, &prompt_head).await;
             });
         }
     }
@@ -7538,6 +7586,58 @@ mod tests {
             tabs,
             ..Default::default()
         }
+    }
+
+    /// V33: `/context/retrieve` accepts an optional `tab`, and only a
+    /// **configured** one becomes the checkpoint's identity.
+    ///
+    /// Covers the three cases that must stay apart at this boundary: a real tab
+    /// (recorded), a forged/stale one (dropped — never written as a fabricated
+    /// attribution), and a body from a shim old enough not to send the field at
+    /// all (parses fine, records no tab, exactly the pre-V33 row).
+    ///
+    /// **What it would still pass with if the change regressed:** a handler
+    /// that recorded `body.tab` verbatim would fail the forged case; a handler
+    /// that dropped the tab entirely would fail the configured case; a
+    /// `#[serde(default)]` removed from `tab` would fail the old-shim case with
+    /// a parse error, which is what turns "no identity" into "no context
+    /// injection for that user at all".
+    #[test]
+    fn context_retrieve_records_only_a_configured_tab_as_checkpoint_identity() {
+        let s = settings_with_tabs(&["claude", "claude-2"]);
+        let parse = |json: &str| -> ContextRetrieveBody {
+            serde_json::from_str(json).expect("body parses")
+        };
+
+        // A real tab: recorded, alongside the session and agent.
+        let body = parse(
+            r#"{"cwd":"P:/p","prompt":"hi","session_id":"sess-1","agent":"claude","tab":"claude-2"}"#,
+        );
+        let origin = checkpoint_origin(&s, &body);
+        assert_eq!(origin.tab.as_deref(), Some("claude-2"));
+        assert_eq!(origin.session.as_deref(), Some("sess-1"));
+        assert_eq!(origin.agent.as_deref(), Some("claude"));
+
+        // A forged / stale id: dropped, not recorded as fact. The session still
+        // is — it widens nothing and still improves the join materially.
+        let body = parse(
+            r#"{"cwd":"P:/p","prompt":"hi","session_id":"sess-1","agent":"claude","tab":"claude-99"}"#,
+        );
+        let origin = checkpoint_origin(&s, &body);
+        assert_eq!(origin.tab, None);
+        assert_eq!(origin.session.as_deref(), Some("sess-1"));
+
+        // A pre-V33 shim: no `tab` field at all. Must parse, and must record
+        // the pre-V33 shape rather than failing the prompt.
+        let body = parse(r#"{"cwd":"P:/p","prompt":"hi","session_id":"sess-1","agent":"claude"}"#);
+        let origin = checkpoint_origin(&s, &body);
+        assert_eq!(origin.tab, None);
+        assert_eq!(origin.agent.as_deref(), Some("claude"));
+
+        // Blank spellings of "no identity" never read as one.
+        let body = parse(r#"{"prompt":"hi","session_id":"  ","agent":"","tab":"   "}"#);
+        let origin = checkpoint_origin(&s, &body);
+        assert_eq!(origin, crate::workbench::shadow::Origin::default());
     }
 
     /// **The registry's bound, made real.** `latches()`'s doc claimed the map

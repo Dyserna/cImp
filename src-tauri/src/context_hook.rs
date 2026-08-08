@@ -55,6 +55,16 @@ pub fn run() {
         // trigger (recorded on the checkpoint it fires) — see
         // `offload/loopback.rs`'s `ContextRetrieveBody::agent`.
         "agent": "claude",
+        // V33: the cImp TAB this hook serves, baked into argv at spawn.
+        //
+        // The hook payload carries `session_id` and `cwd` but NO tab identity
+        // (the same fact `--taint-beacon` is built around), and `agent` is the
+        // harness NAME — shared by every Claude tab — so without this the
+        // checkpoint stream cannot tell two Claude tabs on one project root
+        // apart. `null` when the flag is absent (a `--settings` overlay written
+        // by an older build, until the tab is restarted): the app records the
+        // checkpoint with no tab rather than guessing one.
+        "tab": tab_arg(&std::env::args().skip(1).collect::<Vec<_>>()),
     })
     .to_string();
 
@@ -102,6 +112,25 @@ pub(crate) fn resolve_cwd(cwd_raw: &str) -> String {
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// The value following `--tab` in `args`, trimmed and non-empty.
+///
+/// A cImp tab id is never discoverable from a hook payload — Claude Code sends
+/// `session_id` and `cwd` and nothing that names a cImp tab (the E2 spike's
+/// finding) — so every shim that needs one gets it baked into argv at spawn by
+/// `tabs::config`, exactly like the per-tab `cimp-offload` / `cimp-code-audit`
+/// MCP children. Lives here with the other shared shim helpers
+/// (`resolve_cwd`/`missing_fields`/`post_loopback`) because `--taint-beacon`
+/// and `--context-hook` both parse it and two copies of an identity parser is
+/// how the two shims' notions of "which tab am I" drift apart.
+///
+/// Pure, so the contract ("no id ⇒ no tab claimed") is testable without a
+/// socket or a Claude process.
+pub(crate) fn tab_arg(args: &[String]) -> Option<String> {
+    let i = args.iter().position(|a| a == "--tab")?;
+    let raw = args.get(i + 1)?.trim();
+    (!raw.is_empty()).then(|| raw.to_string())
 }
 
 /// V16 Feature 3: the required-field names a hook payload is missing —

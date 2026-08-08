@@ -410,9 +410,15 @@ static CONSUMER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// report and put the findings in its next search query.
 ///
 /// A latch is keyed by `(agent, tab)`, so gating that route needs an identity
-/// the child never carried. Hence this. Absent (a hand-run child, or one spawned
-/// before the upgrade) ⇒ the route's fail-open `Anonymous` scope, the same
-/// discipline every other identity-taking route follows.
+/// the child never carried. Hence this.
+///
+/// H-8 (2026-08-08 re-review): absent (a hand-run child, or one spawned before
+/// the upgrade) is no longer the route's fail-open `Anonymous` scope — that made
+/// the whole gate opt-in by the caller it was meant to contain. `/audit/run`
+/// now **refuses** a body without a tab, and its message says to restart the
+/// tab, because a stale child from an older build is the only legitimate way to
+/// produce one. Both spawn paths (`tabs::config::build_pre_args` and
+/// `build_opencode_config`) have sent `--tab` since V32 C-1b.
 static TAB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The configured consumer name, lowercased; `"claude"` when unset.
@@ -568,7 +574,10 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
         "cwd": cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
     });
     // V32 C-1b: the tab whose latch gates this scan. Inserted rather than
-    // always-present so a child with no identity sends the pre-C-1b body.
+    // always-present so a child with no identity sends the pre-C-1b body — which
+    // since H-8 the route refuses with a restart-this-tab message, rather than
+    // running the scan ungated. A `null` here would read identically to the
+    // route (`Option<String>` + trim), so this stays an insert.
     if let (Some(t), Some(map)) = (tab(), body.as_object_mut()) {
         map.insert("tab".to_string(), Value::String(t.to_string()));
     }

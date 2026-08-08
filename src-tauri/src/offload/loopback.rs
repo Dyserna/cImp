@@ -2433,14 +2433,17 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
 /// Deliberately tiny: `category` reuses
 /// [`Category`](crate::audit::adapters::Category)'s own lowercase serde (so
 /// `"security"` / `"quality"` deserialize directly — a bad word is a clean parse
-/// error → 400). `consumer` names the agent that triggered the scan (`claude` /
-/// `opencode`, from the child's `--consumer` flag; absent on a legacy child ⇒
-/// `claude`) and selects which `expose_*` toggle the route re-enforces at run
-/// time — see [`handle_audit_run`]. No `cwd`: an audit always runs against the
-/// app's own launch project root, never the caller's directory.
+/// error → 400). Everything else is validated *after* the parse, by
+/// [`audit_admit`], so a bad value becomes a readable tool error rather than a
+/// bare 400 the model cannot act on.
 #[derive(Deserialize)]
 struct AuditRunBody {
     category: crate::audit::adapters::Category,
+    /// The agent that triggered the scan, from the child's `--consumer` flag.
+    /// It selects which `expose_*` toggle the route re-enforces at run time, so
+    /// it is a *capability selector*, not a label — H-8: narrowed to
+    /// [`AUDIT_CONSUMERS`] by [`audit_consumer`] before it reaches
+    /// [`AuditState::consumer_exposed`](crate::audit::AuditState::consumer_exposed).
     #[serde(default)]
     consumer: Option<String>,
     /// The child's working directory (the agent's project), sent for
@@ -2450,11 +2453,196 @@ struct AuditRunBody {
     cwd: Option<String>,
     /// V32 C-1b (2026-08-07 review): the cImp tab this child serves
     /// (`cimp --code-audit-mcp --tab <id>`), resolved to the tab's taint latch
-    /// so a contaminated conversation cannot run a local scanner. Absent on a
-    /// child spawned before this landed ⇒ the fail-open anonymous scope, like
-    /// every other identity-taking route here.
+    /// so a contaminated conversation cannot run a local scanner.
+    ///
+    /// H-8 (2026-08-08 re-review): **required in practice.** It stays
+    /// `Option` on the wire — a missing field must produce the route's readable
+    /// refusal, not serde's 400 — but [`audit_tab`] refuses a body without it.
+    /// The fail-open anonymous scope the other identity-taking routes keep is
+    /// not available here: this route's whole gate keys on tab identity, so
+    /// "no tab" meant "no containment", silently.
     #[serde(default)]
     tab: Option<String>,
+}
+
+/// The consumers that legitimately POST `/audit/run` (H-8).
+///
+/// Empirically the complete set — there are exactly two spawn sites for the
+/// `cimp --code-audit-mcp` child, and no other caller exists:
+///
+/// - Claude: `tabs::config::build_pre_args` emits
+///   `[--code-audit-mcp, --tab, <id>]` with **no** `--consumer`, so the child's
+///   own default (`audit::mcp::CONSUMER`, `"claude"`) goes on the wire. Pinned
+///   by `tabs::config::tests::the_code_audit_child_carries_its_own_tab_id`.
+/// - OpenCode: `tabs::config::build_opencode_config` emits
+///   `[<exe>, --code-audit-mcp, --consumer, opencode, --tab, <id>]`.
+///
+/// `"offload"` is deliberately **absent**, even though
+/// [`CodeAuditSettings::expose_offload`](crate::settings::schema::CodeAuditSettings)
+/// exists: the offload worker is an *in-process* consumer of the audit surface
+/// and never speaks to this route. `offload::tools::audit_tools::execute` calls
+/// [`audit::mcp::run_audit`](crate::audit::mcp::run_audit) directly through
+/// `audit::global()`, gated by `OffloadService::run_on` (`enabled` AND
+/// `expose_offload` AND a local backend) and re-gated by `HostRouter::call`.
+/// `CodeAuditSettings::mcp_exposed` states the same split from the other side
+/// ("`expose_offload` is deliberately absent: the offload worker runs
+/// in-process"). So `expose_offload` — which defaults **true** — was reachable
+/// over HTTP only by a caller that no legitimate component ever is.
+const AUDIT_CONSUMERS: [&str; 2] = ["claude", "opencode"];
+
+/// H-8: narrow `/audit/run`'s caller-asserted `consumer` to [`AUDIT_CONSUMERS`]
+/// at the parse boundary, returning the `&'static str` the rest of the route
+/// uses. Same discipline `ada4bae` gave `/run`'s `tool` label
+/// ([`offload_tool_name`]) and for a stronger reason: `tool` is only a label,
+/// whereas this value **selects which `expose_*` toggle is checked**.
+///
+/// Absent/blank still means `"claude"`, which is the child's own default and
+/// the pre-H-8 documented behaviour; only *unrecognized* values are refused.
+/// (A child old enough to omit `consumer` predates `--tab` and is already
+/// refused by [`audit_tab`], so the default is compatibility, not a hole.)
+fn audit_consumer(raw: Option<&str>) -> Result<&'static str, String> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude");
+    let lower = raw.to_ascii_lowercase();
+    AUDIT_CONSUMERS
+        .iter()
+        .copied()
+        .find(|c| *c == lower)
+        .ok_or_else(|| {
+            format!(
+                "code audit does not serve the consumer {raw:?} — this route serves the \
+                 cimp-code-audit MCP child only (claude, opencode)"
+            )
+        })
+}
+
+/// H-8: `/audit/run` requires a tab identity — a request without one is
+/// **refused**, never treated as clean.
+///
+/// Both spawn paths have sent `--tab` since V32 C-1b (see [`AUDIT_CONSUMERS`]),
+/// so the only bodies this rejects are a hand-run child, a forged request, and
+/// a *stale* child left over from a pre-C-1b build — which is why the message
+/// names the remedy (restart the tab) rather than the symptom.
+///
+/// Trimming/emptiness is checked here rather than left to [`tab_identity`]
+/// because `""` and `"   "` are exactly the shapes a caller would use to opt
+/// itself back out of the gate.
+fn audit_tab(raw: Option<&str>) -> Result<&str, String> {
+    raw.map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| {
+        "this code-audit MCP connection carries no cImp tab id, so the scan cannot be checked \
+         against that tab's containment latch — restart this tab in cImp (its MCP child is from \
+         an older build) and try again."
+            .to_string()
+    })
+}
+
+/// Everything `/audit/run` decides **before** the scan starts — all four
+/// refusals, in the one order they may be taken — returning the validated
+/// consumer on success. `Err(msg)` is the single `RunResult { ok: false, error }`
+/// the route writes over HTTP 200, always *before* [`write_ndjson_head`].
+///
+/// It is one function, taking its dependencies as arguments, for two reasons:
+/// the caller cannot reach [`LatchRegistry::gate`] without passing every check
+/// first (so an added refusal cannot be inserted on the wrong side of the
+/// gate), and the ordering below is testable without a `TcpStream` or an
+/// `AppHandle`.
+///
+/// **Why this order** (each step's own note says what it decides):
+///
+/// 1. `consumer` — H-8. A *parse-boundary narrowing*: it must precede step 2
+///    because it is what step 2 is keyed by. Engages nothing.
+/// 2. `expose` — the per-consumer run-time re-gate. Kept ahead of the identity
+///    and containment checks so a consumer the user has opted out still gets
+///    the specific "not exposed" error rather than a containment refusal that
+///    would not explain its situation. Engages nothing.
+/// 3. `cwd` — the wrong-instance guard. Same reasoning: a misrouted request was
+///    never going to run here, and its own error is the actionable one.
+///    Engages nothing.
+/// 4. `tab` — H-8. The identity half of the gate below, so it sits immediately
+///    before it and shares its "a request that was never going to run does not
+///    engage this tab's latch" property. Engages nothing: the refusal happens
+///    before any [`LatchScope`] exists.
+/// 5. the taint gate — the only step that may touch the registry, and therefore
+///    last, exactly as V32 C-1b established.
+fn audit_admit(
+    reg: &LatchRegistry,
+    body: &AuditRunBody,
+    served_root: &Path,
+    exposed: impl FnOnce(&str) -> bool,
+    scope_of: impl FnOnce(&'static str, &str) -> LatchScoping,
+    policy_of: impl FnOnce(Option<&LatchScope>) -> GatePolicy,
+) -> Result<&'static str, String> {
+    // 1. H-8: the caller-asserted `consumer` is narrowed to one of two known
+    //    values before anything reads it — see `audit_consumer`.
+    let consumer = audit_consumer(body.consumer.as_deref())?;
+
+    // 2. Re-enforce this consumer's expose toggle at run time (see the route's
+    //    doc comment): a still-registered child whose consumer has since been
+    //    opted out gets a clean tool error, not a scan.
+    if !exposed(consumer) {
+        return Err(format!(
+            "code audit is not exposed to {consumer} — re-enable it in cImp Settings → Code Audit"
+        ));
+    }
+
+    // 3. Wrong-instance guard: the scan always runs against THIS app's launch
+    //    root, so a child whose cwd falls outside it was misrouted (stale or
+    //    foreign discovery entry — possible with several cImp instances off one
+    //    install). A clean error beats silently auditing the wrong project.
+    if let Some(child_cwd) = body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let served = canon(served_root);
+        if !is_ancestor_or_equal(&served, &canon(Path::new(child_cwd))) {
+            return Err(format!(
+                "this cImp instance serves {} — launch cImp in {} (or close the other instance) to audit it",
+                served.display(),
+                child_cwd
+            ));
+        }
+    }
+
+    // 4. H-8: identity is REQUIRED here. Before this, `tab` was caller-supplied
+    //    and optional, absence resolved to `LatchScoping::Anonymous`, and
+    //    `gate(None, ..)` returned `Ok(Clean)` without classifying anything —
+    //    i.e. the whole containment gate below was opt-in by the caller it was
+    //    meant to contain, and opting out was silent.
+    let tab = audit_tab(body.tab.as_deref())?;
+
+    // 5. V32 C-1b: the taint gate — the last thing checked before the scan
+    //    starts. Identity is resolved through the same `latch_scope` funnel
+    //    every other gated route uses (`scope_of`) rather than a route-local
+    //    check that can drift from it, and an unknown tab id still yields no
+    //    scope and so keys no registry entry: #45's bound.
+    let tool = crate::audit::mcp::tool_name_for(body.category);
+    let scoping = scope_of(crate::graph::source_for_consumer(consumer), tab);
+    let scope = scoping.scope();
+    if scope.is_none() {
+        // H-8: **a containment gate that does not apply is never silent.** The
+        // surviving no-scope case is `Unknown` (an id naming no configured tab
+        // — a re-id'd or removed tab, or a forged id); `Anonymous` is refused
+        // at step 4 and can no longer arrive here, but this is written over
+        // `scope.is_none()` rather than over the `Unknown` variant so that a
+        // future variant, or a regression in step 4, still warns instead of
+        // passing through unremarked.
+        //
+        // Not a refusal: refusing here would break a running child whose tab
+        // was re-id'd under it, and V28's honest fallback for "an identity we
+        // cannot resolve" on a TOOL route is fail-open. But it is the case
+        // where containment does not apply, so it is stated in the log rather
+        // than left to be inferred from a missing row.
+        warn!(
+            target: "offload",
+            consumer = %consumer,
+            tab = %tab,
+            tool = %tool,
+            "loopback: /audit/run has no configured tab to latch against — scan is ungated"
+        );
+    }
+    let policy = policy_of(scope);
+    reg.gate(scope, LatchRoute::Native, tool, policy)
+        .map(|_| consumer)
+        .map_err(str::to_string)
 }
 
 /// `POST /audit/run` (V26): run one full code-audit scan of the requested
@@ -2491,6 +2679,22 @@ struct AuditRunBody {
 /// ONE settings snapshot, like `/graph_run`, and it uses
 /// [`LatchRoute::Native`]: this route physically cannot serve a proxied
 /// server's content.
+///
+/// **H-8 (2026-08-08 re-review): the gate is no longer opt-in by the caller.**
+/// C-1b left the gate's only identity input — `body.tab` — caller-supplied and
+/// optional, so a request that simply omitted it resolved to
+/// `LatchScoping::Anonymous`, `gate()` returned `Ok(Clean)` before classifying
+/// anything, and nothing was even logged. An EXTERNAL-latched tab could curl
+/// this route with the discovery-file bearer token and no `tab`, receive the
+/// full gitleaks report, and carry it out through a still-open `ddg__search` —
+/// what leaks there is *latch state*, which decision 3's "a model with a shell
+/// already has this" residual does not cover. Compounding it, `consumer` was
+/// caller-asserted and unbounded while *selecting which `expose_*` toggle is
+/// checked*, including `"offload"` — which defaults **true** and which no
+/// legitimate caller sends (see [`AUDIT_CONSUMERS`]). Both halves are now
+/// closed at the parse boundary by [`audit_admit`]: a body with no usable tab
+/// identity is refused with an actionable message, an unrecognized `consumer`
+/// is refused, and any surviving path on which the gate does not apply warns.
 ///
 /// **Why a stream, framed exactly like `handle_run`:** the child aborts after
 /// 45 s of silence, and a real audit can outlast that, so the heartbeats (every
@@ -2529,13 +2733,6 @@ async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         }
     };
     let category = body.category;
-    let consumer = body
-        .consumer
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("claude")
-        .to_ascii_lowercase();
 
     // Resolve the runner from managed state at request time (robust to the
     // audit-vs-loopback startup order). `main.rs` manages it as `Arc<AuditState>`
@@ -2553,90 +2750,42 @@ async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
         }
     };
 
-    // Re-enforce this consumer's expose toggle at run time (see the doc
-    // comment above): a still-registered child whose consumer has since been
-    // opted out gets a clean tool error, not a scan.
-    if !state.consumer_exposed(&consumer) {
-        let r = RunResult {
-            ok: false,
-            text: None,
-            error: Some(format!(
-                "code audit is not exposed to {consumer} — re-enable it in cImp Settings → Code Audit"
-            )),
-        };
-        return write_json(stream, 200, &r).await;
-    }
-
-    // Wrong-instance guard: the scan always runs against THIS app's launch
-    // root, so a child whose cwd falls outside it was misrouted (stale or
-    // foreign discovery entry — possible with several cImp instances off one
-    // install). A clean error beats silently auditing the wrong project.
-    if let Some(child_cwd) = body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let served_root = canon(&state.root());
-        if !is_ancestor_or_equal(&served_root, &canon(Path::new(child_cwd))) {
+    // Every pre-scan check, in the one order they may be taken, over ONE
+    // settings read for identity + policy (the `/mcp/call` discipline) — see
+    // [`audit_admit`], which owns the ordering rationale and the four refusal
+    // messages.
+    let settings = live_settings(app);
+    let consumer = match audit_admit(
+        latches(),
+        &body,
+        &state.root(),
+        |c| state.consumer_exposed(c),
+        |agent, tab| latch_scope(app, &settings, agent, Some(tab)),
+        |scope| GatePolicy::resolve(&settings, scope),
+    ) {
+        Ok(c) => c,
+        Err(msg) => {
             let r = RunResult {
                 ok: false,
                 text: None,
-                error: Some(format!(
-                    "this cImp instance serves {} — launch cImp in {} (or close the other instance) to audit it",
-                    served_root.display(),
-                    child_cwd
-                )),
+                error: Some(msg),
             };
+            // 200 with `ok:false`, like every other tool-level error on this
+            // route: the child renders `error` as the tool result. Sent BEFORE
+            // `write_ndjson_head`, so this is a plain single-JSON body — which
+            // the child's line reader already handles (`parse_result_line` over
+            // the unterminated trailing line). A refusal written after the
+            // ndjson head would corrupt the stream, so every refusal this route
+            // can take is funnelled through this one arm.
             return write_json(stream, 200, &r).await;
         }
-    }
-
-    // V32 C-1b: the taint gate — the last thing checked before the scan starts,
-    // so a request that was never going to run (not exposed, misrouted) does
-    // not engage this tab's latch. ONE settings read for identity + policy (the
-    // `/mcp/call` discipline), and an unknown tab id yields no scope and so
-    // keys no registry entry: #45's bound, reached through the same
-    // `latch_scope` funnel every other gated route uses rather than a
-    // route-local check that can drift from it.
-    let tool = crate::audit::mcp::tool_name_for(category);
-    let settings = live_settings(app);
-    let scoping = latch_scope(
-        app,
-        &settings,
-        crate::graph::source_for_consumer(&consumer),
-        body.tab.as_deref(),
-    );
-    if let LatchScoping::Unknown(tab) = &scoping {
-        // Not a refusal — unlike `/latch/beacon`, refusing here would break a
-        // running child whose tab was re-id'd under it, and the honest fallback
-        // for "no usable identity" on a TOOL route is V28's fail-open. But it is
-        // the case where containment silently does not apply, so it is stated in
-        // the log rather than left to be inferred from a missing row.
-        warn!(
-            target: "offload",
-            consumer = %consumer,
-            tab = %tab,
-            tool = %tool,
-            "loopback: /audit/run has no configured tab to latch against — scan is ungated"
-        );
-    }
-    let scope = scoping.scope();
-    let policy = GatePolicy::resolve(&settings, scope);
-    if let Err(refusal) = latches().gate(scope, LatchRoute::Native, tool, policy) {
-        let r = RunResult {
-            ok: false,
-            text: None,
-            error: Some(refusal.to_string()),
-        };
-        // 200 with `ok:false`, like every other tool-level error on this route:
-        // the child renders `error` as the tool result. Sent BEFORE
-        // `write_ndjson_head`, so this is a plain single-JSON body — which the
-        // child's line reader already handles (`parse_result_line` over the
-        // unterminated trailing line), exactly as the two refusals above rely on.
-        return write_json(stream, 200, &r).await;
-    }
+    };
 
     write_ndjson_head(stream, "audit").await?;
 
     // Run the scan concurrently with the heartbeat interval: whichever branch
     // fires, `run_audit` still owns clearing `scanning`.
-    let run_fut = crate::audit::mcp::run_audit(&state, category, &consumer);
+    let run_fut = crate::audit::mcp::run_audit(&state, category, consumer);
     tokio::pin!(run_fut);
 
     let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -5038,7 +5187,10 @@ mod tests {
     #[test]
     fn audit_run_body_parses_both_categories_and_rejects_junk() {
         use crate::audit::adapters::Category;
-        // Both wire categories deserialize; `consumer` is optional and ignored.
+        // Both wire categories deserialize. `consumer` and `tab` stay optional
+        // *on the wire* — H-8 enforces them in `audit_admit` instead, so a body
+        // missing either becomes the route's readable tool error rather than a
+        // bare 400 the model cannot act on. Only `category` is a parse error.
         let sec: AuditRunBody =
             serde_json::from_slice(br#"{"category":"security","consumer":"claude"}"#).unwrap();
         assert_eq!(sec.category, Category::Security);
@@ -5390,6 +5542,262 @@ mod tests {
             crate::audit::mcp::tool_name_for(crate::audit::adapters::Category::Quality),
             "quality_audit"
         );
+    }
+
+    // ── H-8 (2026-08-08 re-review): `/audit/run`'s gate is not opt-in ──────
+    //
+    // The finding: the gate's only identity input was `body.tab`, caller
+    // supplied and optional. Absent ⇒ `LatchScoping::Anonymous` ⇒ `scope()`
+    // `None` ⇒ `gate()` returned `Ok(Clean)` before classifying anything, and
+    // said nothing about it. Compounding, `consumer` was caller-asserted and
+    // unbounded while selecting which `expose_*` toggle was checked — including
+    // `"offload"`, which defaults true and which no legitimate caller sends.
+    //
+    // These drive [`audit_admit`], which is the route's ENTIRE pre-scan
+    // decision (the handler adds only body parsing, state resolution and the
+    // wire framing), so the ordering they assert is the ordering that ships.
+
+    /// A `/audit/run` body. `Security` throughout: the gate's tool name comes
+    /// from the category and both categories classify identically
+    /// (`the_audit_and_offload_routes_are_local_capability_at_the_gate`).
+    fn audit_body(consumer: Option<&str>, tab: Option<&str>) -> AuditRunBody {
+        AuditRunBody {
+            category: crate::audit::adapters::Category::Security,
+            consumer: consumer.map(str::to_string),
+            cwd: None,
+            tab: tab.map(str::to_string),
+        }
+    }
+
+    /// Drive [`audit_admit`] against `reg` with a fixed served root, an
+    /// `exposed` verdict and a pre-resolved scoping — the same three
+    /// dependencies the handler supplies from `AuditState` / `latch_scope` /
+    /// `GatePolicy::resolve`.
+    fn admit(
+        reg: &LatchRegistry,
+        body: &AuditRunBody,
+        exposed: bool,
+        scoping: LatchScoping,
+    ) -> Result<&'static str, String> {
+        audit_admit(
+            reg,
+            body,
+            Path::new("P:\\proj"),
+            |_| exposed,
+            |_, _| scoping,
+            |_| ON,
+        )
+    }
+
+    /// H-8, half 1. A body with no usable tab identity is REFUSED — and the
+    /// refusal engages nothing, because it happens before any `LatchScope`
+    /// exists. The message names the remedy (restart the tab), because the only
+    /// legitimate way to arrive here is a child left over from a pre-C-1b
+    /// build.
+    #[test]
+    fn audit_run_refuses_a_body_with_no_tab_and_engages_no_latch() {
+        for tab in [None, Some(""), Some("   "), Some("\t")] {
+            let reg = LatchRegistry::default();
+            let err = admit(
+                &reg,
+                &audit_body(Some("claude"), tab),
+                true,
+                // Unreachable: the refusal precedes scope resolution. Anything
+                // here would be a scope the refusal must not have used.
+                LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+            )
+            .expect_err("a body with no tab identity must be refused");
+            assert!(
+                err.contains("restart this tab"),
+                "the refusal must name the remedy, got {err:?}"
+            );
+            // The invariant, not the string: a refused request leaves the
+            // registry exactly as it found it.
+            assert!(
+                reg.snapshot().is_empty(),
+                "a refused request must not key a latch row ({tab:?})"
+            );
+        }
+    }
+
+    /// H-8, half 1 — the exploit, re-run. An EXTERNAL-latched (contaminated)
+    /// conversation that curls the route *with a tab* is refused by the gate;
+    /// the same conversation curling it *without* one — which used to return the
+    /// full gitleaks report while consulting no latch at all — is refused too.
+    #[test]
+    fn audit_run_refuses_a_contaminated_tab_with_or_without_an_id() {
+        let reg = LatchRegistry::default();
+        // Contaminate: one proxied fetch closes the local side for the session.
+        assert!(reg
+            .gate(
+                Some(&scope("claude-1", Some("sess-a"))),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON
+            )
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch(), "external");
+
+        // With its own identity: the gate now actually runs, and refuses.
+        let err = admit(
+            &reg,
+            &audit_body(Some("claude"), Some("claude-1")),
+            true,
+            LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+        )
+        .expect_err("a contaminated conversation must not run a local scanner");
+        assert_eq!(err, REFUSAL_LOCAL_BLOCKED);
+
+        // Dropping `tab` was the whole exploit — it is no longer an escape.
+        let err = admit(
+            &reg,
+            &audit_body(Some("claude"), None),
+            true,
+            LatchScoping::Anonymous,
+        )
+        .expect_err("omitting `tab` must not opt the caller out of the gate");
+        assert!(err.contains("restart this tab"), "{err:?}");
+
+        // Neither refusal moved the latch (a refused call must never redefine
+        // which side of the boundary the session is on).
+        assert_eq!(reg.snapshot()[0].latch(), "external");
+    }
+
+    /// H-8, half 1 — the surviving no-scope path. An id naming no configured
+    /// tab keeps #45's behaviour: no registry row, no refusal (fail-open on a
+    /// TOOL route), and — this is the H-8 half — it is WARNED rather than
+    /// silent. The warn is written over `scope().is_none()`, so it covers
+    /// `Anonymous` too if step 4 ever regresses; that predicate is pinned here
+    /// because the log line itself is not observable from a unit test.
+    #[test]
+    fn audit_run_warns_but_still_runs_for_an_unknown_tab() {
+        let reg = LatchRegistry::default();
+        assert_eq!(
+            admit(
+                &reg,
+                &audit_body(Some("claude"), Some("ghost")),
+                true,
+                LatchScoping::Unknown("ghost".into()),
+            ),
+            Ok("claude")
+        );
+        assert!(
+            reg.snapshot().is_empty(),
+            "#45's bound: an unknown id keys no registry entry"
+        );
+        // Both identity-less variants take the warn branch.
+        assert!(LatchScoping::Unknown("ghost".into()).scope().is_none());
+        assert!(LatchScoping::Anonymous.scope().is_none());
+    }
+
+    /// H-8 — containment must not be bought by breaking the route. A clean,
+    /// configured tab is admitted, and the scan engages that tab's latch (which
+    /// is also what proves the refusal tests above are asserting a registry the
+    /// success path really does write to).
+    #[test]
+    fn audit_run_admits_a_clean_configured_tab_and_engages_its_latch() {
+        for (consumer, expect) in [
+            (None, "claude"),
+            (Some("claude"), "claude"),
+            (Some("opencode"), "opencode"),
+            (Some(" OpenCode "), "opencode"),
+        ] {
+            let reg = LatchRegistry::default();
+            assert_eq!(
+                admit(
+                    &reg,
+                    &audit_body(consumer, Some("claude-1")),
+                    true,
+                    LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+                ),
+                Ok(expect),
+                "{consumer:?}"
+            );
+            assert_eq!(
+                reg.snapshot()[0].latch(),
+                "local",
+                "an admitted LOCAL-CAPABILITY scan closes the web side"
+            );
+        }
+    }
+
+    /// H-8, half 2. `consumer` is narrowed to the two consumers that actually
+    /// exist before it can select an `expose_*` toggle.
+    ///
+    /// `"offload"` is the one that mattered: `AuditState::consumer_exposed`
+    /// maps it to `expose_offload`, which **defaults true**, while
+    /// `graph::source_for_consumer` maps it to `"claude"` — so a forged caller
+    /// passed a toggle no legitimate caller uses and latched as somebody else.
+    /// The `exposed` closure panics here, which is how the test proves no
+    /// toggle is selected at all rather than merely that the request failed.
+    #[test]
+    fn audit_run_rejects_a_consumer_outside_the_legitimate_set() {
+        for bad in ["offload", "worker", "OFFLOAD", "claude ext", "clau de", "x"] {
+            let reg = LatchRegistry::default();
+            let body = audit_body(Some(bad), Some("claude-1"));
+            let err = match audit_admit(
+                &reg,
+                &body,
+                Path::new("P:\\proj"),
+                |c| panic!("an expose toggle was selected for the rejected consumer {c:?}"),
+                |_, _| panic!("identity was resolved for a rejected consumer"),
+                |_| ON,
+            ) {
+                Ok(c) => panic!("{bad:?} must not be accepted as a consumer (got {c:?})"),
+                Err(e) => e,
+            };
+            assert!(err.contains("does not serve the consumer"), "{err:?} ({bad})");
+            assert!(reg.snapshot().is_empty(), "{bad}");
+        }
+        // The set itself, and the two spellings the spawn paths actually send.
+        assert_eq!(AUDIT_CONSUMERS, ["claude", "opencode"]);
+        assert_eq!(audit_consumer(None), Ok("claude"));
+        assert_eq!(audit_consumer(Some("")), Ok("claude"));
+        assert_eq!(audit_consumer(Some("  ")), Ok("claude"));
+        assert_eq!(audit_consumer(Some("CLAUDE")), Ok("claude"));
+        assert_eq!(audit_consumer(Some(" opencode ")), Ok("opencode"));
+        // …and the value that reaches `consumer_exposed` is one of those two
+        // literals, never the caller's string, so no `expose_*` toggle outside
+        // the pair is reachable over HTTP.
+        for c in AUDIT_CONSUMERS {
+            assert_eq!(audit_consumer(Some(c)), Ok(c));
+        }
+    }
+
+    /// H-8 — ordering. The two pre-existing refusals still come first (their
+    /// messages are the actionable ones), and neither leaves latch state
+    /// behind: a request that was never going to run must not engage the tab's
+    /// latch. Same registry the success path above writes to, so an empty
+    /// snapshot here is a real observation.
+    #[test]
+    fn audit_run_refusals_before_the_gate_leave_no_latch_state() {
+        // Not exposed — refused before identity is even resolved.
+        let reg = LatchRegistry::default();
+        let err = admit(
+            &reg,
+            &audit_body(Some("opencode"), Some("opencode")),
+            false,
+            LatchScoping::Scoped(scope("opencode", Some("sess-a"))),
+        )
+        .expect_err("an opted-out consumer must be refused");
+        assert!(err.contains("is not exposed to opencode"), "{err:?}");
+        assert!(reg.snapshot().is_empty(), "expose refusal keyed a latch row");
+
+        // Misrouted (cwd outside this instance's served root) — likewise.
+        let reg = LatchRegistry::default();
+        let mut body = audit_body(Some("claude"), Some("claude-1"));
+        body.cwd = Some("P:\\other-project".into());
+        let err = audit_admit(
+            &reg,
+            &body,
+            Path::new("P:\\proj"),
+            |_| true,
+            |_, _| LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+            |_| ON,
+        )
+        .expect_err("a misrouted child must be refused");
+        assert!(err.contains("this cImp instance serves"), "{err:?}");
+        assert!(reg.snapshot().is_empty(), "cwd refusal keyed a latch row");
     }
 
     /// The locked cross-module invariant, through the proxy: a server nobody

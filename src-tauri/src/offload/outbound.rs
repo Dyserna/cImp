@@ -233,14 +233,51 @@ fn is_denied_v6(ip: Ipv6Addr) -> bool {
 
 // ── URL extraction ─────────────────────────────────────────────────────────
 
-/// Scheme prefixes we treat as fetchable. Only these two: a `file://` or
-/// `data:` argument is not an SSRF vector for a remote fetch server, and
-/// widening the net here would only add false positives.
-const URL_PREFIXES: [&str; 2] = ["http://", "https://"];
+/// Scheme prefixes we treat as fetchable, **without** the slashes. Only these
+/// two: a `file://` or `data:` argument is not an SSRF vector for a remote fetch
+/// server, and widening the net here would only add false positives.
+///
+/// The slashes are not part of the constant since #48 finding H-3. WHATWG's
+/// *special authority ignore slashes* state skips **any number** of `/` or `\`
+/// after a special scheme's colon — including **zero** — so `http:/127.0.0.1`,
+/// `http:127.0.0.1` and `http:\\127.0.0.1` all resolve to host `127.0.0.1`,
+/// while a literal `"http://"` substring match saw none of them. Matching the
+/// scheme and consuming the slash run separately ([`scan_scheme_runs`]) is what
+/// makes the extractor agree with the parser instead of with one spelling.
+const URL_SCHEMES: [&str; 2] = ["http:", "https:"];
+
+/// What a scheme-bearing run normalizes to once its slash run is consumed:
+/// exactly the two slashes [`Url::parse`] wants, whatever was written.
+const NORMALIZED_SLASHES: &str = "//";
 
 /// Characters that terminate a URL embedded in prose. Whitespace plus the
 /// quoting/bracketing characters a model or a page would wrap a URL in.
+///
+/// Used by [`scan_bare_authorities`], where a run has no scheme and `\` is a
+/// path separator in the Windows paths that scan walks over. A run that *does*
+/// carry a scheme uses [`SCHEME_RUN_TERMINATORS`] instead — see there.
 const URL_TERMINATORS: [char; 8] = ['"', '\'', '`', '<', '>', '\\', '|', '^'];
+
+/// [`URL_TERMINATORS`] minus `\` — the terminator set for a run that already
+/// carries an `http:`/`https:` scheme (#48, finding H-3).
+///
+/// For a **special** scheme WHATWG treats `\` as a slash everywhere: in the
+/// authority-slash run, in the path, in place of `/`. So `http://\10.0.0.1`
+/// has host `10.0.0.1` and `http://127.0.0.1\props` has path `/props`. Cutting
+/// the run at the backslash handed the range check a string the fetcher never
+/// sees; the parser does not stop there, so neither may we.
+///
+/// The remaining members are safe to cut at because a parser either **removes**
+/// them (never — none of these is TAB/LF/CR, which [`WHATWG_STRIPPED`] handles)
+/// or **cannot build an IP host past them**: `<`, `>`, `|` and `^` are
+/// forbidden host code points and fail the parse outright, and `"`, `'` and
+/// backtick, while not forbidden, are not digits — an authority containing one
+/// is never an IPv4 or bracketed IPv6 literal, so it can only be a domain, and
+/// a domain is screened by resolution, which such a name has no answer for.
+/// The corpus test in this module's tests is what actually holds this claim
+/// down: it feeds every one of these characters through [`Url::parse`] as the
+/// oracle rather than trusting this paragraph.
+const SCHEME_RUN_TERMINATORS: [char; 7] = ['"', '\'', '`', '<', '>', '|', '^'];
 
 /// The three characters a WHATWG-conformant URL parser **removes** from
 /// anywhere in a URL before parsing (the spec's *ASCII tab or newline*): TAB,
@@ -339,28 +376,89 @@ fn scan_variant(s: &str, out: &mut Vec<Candidate>) {
     scan_bare_authorities(s, out);
 }
 
-/// Runs that begin with a literal `http://` / `https://`.
+/// Runs that begin with an `http:` / `https:` scheme, in **any** of the
+/// spellings a WHATWG parser accepts (#48, finding H-3).
+///
+/// The scheme is matched case-insensitively (`HTTP:` parses identically — the
+/// parser lowercases it), then the *slash run* — zero or more `/` or `\` in any
+/// mix — is consumed and re-emitted as exactly [`NORMALIZED_SLASHES`]. That is
+/// the whole of WHATWG's *special authority slashes* + *special authority
+/// ignore slashes* states, and it is what makes `http:127.0.0.1:12344/props`,
+/// `http:/127.0.0.1:12344/props` and `http:\\127.0.0.1\props` all arrive at the
+/// range check as the one thing they actually are.
 fn scan_scheme_runs(s: &str, out: &mut Vec<Candidate>) {
     let lower = s.to_ascii_lowercase();
     let mut from = 0usize;
     while from < lower.len() {
-        let Some((start, _)) = URL_PREFIXES
+        let Some((start, scheme)) = URL_SCHEMES
             .iter()
             .filter_map(|p| lower[from..].find(p).map(|i| (from + i, *p)))
             .min_by_key(|(i, _)| *i)
         else {
             return;
         };
-        let end = s[start..]
-            .find(|c: char| c.is_whitespace() || URL_TERMINATORS.contains(&c))
-            .map_or(s.len(), |i| start + i);
-        // Trailing sentence punctuation is not part of the URL.
-        let candidate = s[start..end].trim_end_matches([',', '.', ';', ')', ']', '}']);
-        if !candidate.is_empty() {
-            push_candidate(candidate.to_string(), true, out);
-        }
+        // Past the colon, then past the slash run — of any length, including
+        // none, and `\` counts. `http:` with nothing after it lands `body_start`
+        // at the end of the string, which is the scheme-only case.
+        let after_colon = start + scheme.len();
+        let body_start = after_colon
+            + s[after_colon..]
+                .find(|c: char| c != '/' && c != '\\')
+                .unwrap_or(s.len() - after_colon);
+        let end = s[body_start..]
+            .find(|c: char| c.is_whitespace() || SCHEME_RUN_TERMINATORS.contains(&c))
+            .map_or(s.len(), |i| body_start + i);
+        let body = trim_trailing_punctuation(&s[body_start..end]);
+        // The scheme is emitted **lowercased** — `scheme` is the matched
+        // constant, not `s[start..after_colon]`. `Url::parse` lowercases it
+        // anyway, the slash run beside it is already normalized (so preserving
+        // only the case would be half-fidelity), and canonicalizing here is
+        // what keeps `HTTP:\10.0.0.1:8080/x` from producing two identical
+        // candidates — one from here, one from `scan_bare_authorities` across
+        // the backslash — and therefore two resolutions of one target.
+        push_candidate(format!("{scheme}{NORMALIZED_SLASHES}{body}"), true, out);
         from = end.max(start + 1);
     }
+}
+
+/// Strip the sentence punctuation a URL picked up from the prose around it —
+/// but keep a closing bracket that **balances** one inside the run.
+///
+/// `,`, `.` and `;` are never part of a URL at the end. A closing bracket is,
+/// when it closes something: `http://[::1]` is a bracketed IPv6 authority and
+/// `https://en.example.org/Foo_(bar)` is an ordinary path. The unbalanced case
+/// is the markdown one — `[label](http://host/x)` and `<http://host/x>` — where
+/// the bracket belongs to the prose.
+///
+/// Found by the generated corpus (#48, H-3): the flat `trim_end_matches` this
+/// replaces ate the `]` of every bracketed IPv6 URL that ended at its
+/// authority, so `http://[2001:db8::1]` became the unparseable
+/// `http://[2001:db8::1` — and the deny-on-unparseable rule then refused a
+/// public target. A false refusal rather than a bypass, but the same
+/// screen/parser disagreement H-3 is about, pointing the other way. The same
+/// reasoning is already written into [`scan_bare_authorities`], which is why
+/// *its* trim set never contained `]`.
+fn trim_trailing_punctuation(run: &str) -> &str {
+    let mut end = run.len();
+    while let Some(c) = run[..end].chars().next_back() {
+        let drop = match c {
+            ',' | '.' | ';' => true,
+            ')' | ']' | '}' => {
+                let open = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                run[..end].matches(open).count() < run[..end].matches(c).count()
+            }
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    &run[..end]
 }
 
 /// Runs with **no** scheme that a scheme-guessing client would still fetch:
@@ -735,17 +833,40 @@ async fn screen_one(cand: &Candidate, policy: &Policy) -> Verdict {
 /// all — the word "http://" appearing in prose, which is common enough that
 /// refusing it would be a self-inflicted denial-of-research.
 ///
-/// Exempting it is safe, and the reasoning is the same one that makes the strip
-/// in [`WHATWG_STRIPPED`] sufficient: for a fetchable target to be hiding after
-/// a scheme prefix, it must be separated from it by a character the extractor
-/// treats as a terminator. A parser either **removes** that character — and
-/// there are exactly three such characters, which is why every string is
-/// re-scanned with them removed — or **rejects** it, because every other
-/// terminator here (space, `"`, `<`, `>`, `\`, `|`, `^`) is a forbidden host
-/// code point and no parser will fetch past it. So a scheme-only run means the
-/// fetcher sees nothing either.
+/// # The justification, restated (#48, finding H-3)
+///
+/// The previous version of this doc claimed every terminator other than
+/// TAB/LF/CR is "a forbidden host code point and no parser will fetch past it",
+/// and listed `\` among them. **That was false**, and it was the sentence that
+/// made the exemption look safe: for a *special* scheme WHATWG treats `\` as a
+/// slash, so `http://\10.0.0.1` was extracted as the exempt `"http://"` while
+/// the parser read host `10.0.0.1`. That hole is closed in the extractor, not
+/// here — [`scan_scheme_runs`] now consumes the whole slash run, so a run with
+/// a backslash before its authority produces the authority, never a scheme-only
+/// candidate.
+///
+/// What is left is a genuinely empty run, and the correct argument for
+/// exempting it is narrower than the old one. A candidate is scheme-only
+/// exactly when the character after the slash run is whitespace or one of
+/// [`SCHEME_RUN_TERMINATORS`], and for each of those a parser reaches no
+/// internal target either:
+///
+/// - **TAB, LF, CR** are *removed* by the parser — which is why every string is
+///   also scanned with them removed ([`WHATWG_STRIPPED`]); the stripped scan,
+///   not this exemption, is what decides those.
+/// - **space, `<`, `>`, `|`, `^`** are forbidden host code points: the parse
+///   fails outright.
+/// - **`"`, `'`, backtick** are *not* forbidden, but they are not digits and
+///   not `[`, so an authority beginning with one is neither an IPv4 literal nor
+///   a bracketed IPv6 literal. It can only be a domain, and a domain carrying a
+///   quote has no DNS answer — the resolution path, which is where a
+///   domain-shaped target is screened, has nothing to reach.
+///
+/// That reasoning is asserted, not trusted: `screen_denies_every_form_the_url_parser_resolves`
+/// drives every one of these characters through [`Url::parse`] as the oracle.
 fn is_scheme_only(url: &str) -> bool {
-    URL_PREFIXES.iter().any(|p| url.eq_ignore_ascii_case(p))
+    url.strip_suffix(NORMALIZED_SLASHES)
+        .is_some_and(|scheme| URL_SCHEMES.iter().any(|p| scheme.eq_ignore_ascii_case(p)))
 }
 
 // ── Per-scope fetch budgets ────────────────────────────────────────────────
@@ -1447,15 +1568,187 @@ mod tests {
         }
     }
 
-    /// #48 (review finding C-4) — **the parser differential**, table-driven.
+    // ── The parser-differential corpus (#48, finding H-3) ───────────────────
+    //
+    // C-4 was "fixed" three times, each time against the strings the report
+    // named, and each time the general rule stayed open — because the guard was
+    // a table of forms someone had already thought of. A table can only ever
+    // contain those. What follows is the property instead:
+    //
+    //   for every argument string, as written AND as a WHATWG parser strips it,
+    //   if `Url::parse` yields an IP-literal host that `is_denied_ip` rejects,
+    //   `screen_urls` must deny.
+    //
+    // `Url::parse` (the app's own pinned `url` crate — the same code the fetch
+    // path would use) is the oracle; the corpus is generated, so it contains
+    // spellings nobody wrote down.
+
+    /// Scheme spellings. Case is an axis because WHATWG lowercases the scheme,
+    /// so `HTTP:` parses identically to `http:` and a case-sensitive extractor
+    /// would be a hole all by itself.
+    const CORPUS_SCHEMES: [&str; 3] = ["http:", "HTTP:", "https:"];
+
+    /// Slash runs. WHATWG's *special authority slashes* → *special authority
+    /// ignore slashes* states consume **any number** of `/` or `\`, in any mix,
+    /// **including none** — which is the whole of H-3.
+    const CORPUS_SLASHES: [&str; 8] = ["", "/", "//", "///", "\\", "\\\\", "/\\", "\\/"];
+
+    /// What may sit between the slash run and the authority. The first is the
+    /// ordinary case; TAB/LF/CR are the C-4 differential (a parser *removes*
+    /// them); the rest are every character the extractor treats as a run
+    /// terminator, which is what makes this corpus an audit of the
+    /// [`is_scheme_only`] exemption rather than a restatement of it.
+    const CORPUS_INFIXES: [&str; 11] =
+        ["", "\t", "\n", "\r", "\"", "'", "`", "<", ">", "|", "^"];
+
+    /// Denied authorities, one per family in [`is_denied_ip`], including the
+    /// local `llama-server` that decision 11's carve-out text names as the
+    /// service this screen exists to protect.
+    const CORPUS_DENIED_HOSTS: [&str; 12] = [
+        "127.0.0.1",
+        "127.0.0.1:12344",
+        "169.254.169.254",
+        "10.0.0.1",
+        "192.168.1.1",
+        "172.16.0.1",
+        "100.64.0.1",
+        "0.0.0.0",
+        "[::1]",
+        "[::1]:9000",
+        "[::ffff:127.0.0.1]",
+        "[64:ff9b::10.0.0.1]",
+    ];
+
+    /// The control group: public literals, so the suite stays offline. Every
+    /// one of these must survive every spelling above — a screen that refuses
+    /// them is a screen the user switches off.
+    const CORPUS_PUBLIC_HOSTS: [&str; 4] =
+        ["8.8.8.8", "1.1.1.1:8080", "[2001:db8::1]", "[64:ff9b::8.8.8.8]"];
+
+    const CORPUS_TAILS: [&str; 5] = [
+        "",
+        "/",
+        "/props",
+        "/latest/meta-data/iam/security-credentials/",
+        "/?q=1#frag",
+    ];
+
+    /// scheme × slash run × infix × authority × tail.
+    fn corpus(hosts: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for scheme in CORPUS_SCHEMES {
+            for slashes in CORPUS_SLASHES {
+                for infix in CORPUS_INFIXES {
+                    for host in hosts {
+                        for tail in CORPUS_TAILS {
+                            out.push(format!("{scheme}{slashes}{infix}{host}{tail}"));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The three characters a WHATWG parser removes from anywhere in a URL.
+    fn whatwg_stripped(s: &str) -> String {
+        s.chars().filter(|c| !WHATWG_STRIPPED.contains(c)).collect()
+    }
+
+    /// **The oracle.** Does the app's own URL parser resolve this string — as
+    /// written or as it strips it — to an IP-literal host in a denied range?
     ///
-    /// Every row is a string an EXTERNAL tool call could carry that a
-    /// WHATWG-conformant fetcher resolves to an internal address, and that the
-    /// pre-#48 extractor either truncated into nothing (tab/LF/CR) or never
-    /// produced a candidate for at all (schemeless, protocol-relative). Each one
-    /// was **allowed** before this test existed. A regression here is a silent
-    /// security failure, which is why the set is exhaustive about position
-    /// rather than illustrative.
+    /// IP literals only: a `Host::Domain` verdict would need DNS, which the
+    /// suite does not do and which the screen fails open on by contract.
+    fn parser_reaches_a_denied_ip(arg: &str) -> bool {
+        [arg.to_string(), whatwg_stripped(arg)]
+            .iter()
+            .any(|s| match Url::parse(s).ok().and_then(|u| u.host().map(|h| h.to_owned())) {
+                Some(Host::Ipv4(v4)) => is_denied_ip(IpAddr::V4(v4)),
+                Some(Host::Ipv6(v6)) => is_denied_ip(IpAddr::V6(v6)),
+                _ => false,
+            })
+    }
+
+    /// **The H-3 invariant, generated.** Anything the parser resolves into a
+    /// denied range must be refused — whatever spelling it arrived in.
+    ///
+    /// This is the primary guard for the extractor. A regression to literal
+    /// `http://` substring matching fails it in the thousands: every
+    /// zero-slash, single-slash and backslash spelling is in here, and so are
+    /// the mixed runs (`/\`, `\/`) and uppercase schemes nobody enumerated.
+    #[tokio::test]
+    async fn screen_denies_every_form_the_url_parser_resolves() {
+        let policy = Policy::default();
+        let cases = corpus(&CORPUS_DENIED_HOSTS);
+        assert!(
+            cases.len() > 10_000,
+            "the guard must be generated, not enumerated: {} cases",
+            cases.len()
+        );
+        // The report's own PoC strings are members of the generated set, not a
+        // separate list bolted onto it.
+        for pinned in [
+            "http:/127.0.0.1:12344/props",
+            "http:127.0.0.1:12344/props",
+            "http:\\\\127.0.0.1/props",
+        ] {
+            assert!(
+                cases.iter().any(|c| c == pinned),
+                "{pinned:?} must be generated by the corpus"
+            );
+        }
+
+        let mut oracle_hits = 0usize;
+        for arg in &cases {
+            if !parser_reaches_a_denied_ip(arg) {
+                continue;
+            }
+            oracle_hits += 1;
+            assert!(
+                screen_urls(&json!({ "url": arg }), &policy).await.is_err(),
+                "the parser resolves {arg:?} into a denied range; the screen allowed it"
+            );
+            // …and the same string as a model actually smuggles it: buried in a
+            // sentence, in a field that is not called `url`.
+            let prose = format!("please fetch {arg} and summarise what it says");
+            assert!(
+                screen_urls(&json!({ "note": prose }), &policy).await.is_err(),
+                "the parser resolves {arg:?} into a denied range; embedded in prose it was allowed"
+            );
+        }
+        assert!(
+            oracle_hits > 1_000,
+            "the oracle must actually fire; only {oracle_hits} of {} cases resolved",
+            cases.len()
+        );
+    }
+
+    /// The other half of the same property: the identical cross-product over
+    /// **public** literals must pass, every spelling of it. Over-extraction is
+    /// a false positive, and a false positive here is a denial-of-research —
+    /// so the widened scheme matching is bounded by this test, not by prose.
+    #[tokio::test]
+    async fn the_corpus_never_refuses_a_public_target() {
+        let policy = Policy::default();
+        for arg in corpus(&CORPUS_PUBLIC_HOSTS) {
+            assert!(
+                screen_urls(&json!({ "url": &arg }), &policy).await.is_ok(),
+                "{arg:?} is public in every reading and must pass"
+            );
+        }
+    }
+
+    /// #48 (review finding C-4) — **supplementary pins**, deliberately kept
+    /// after H-3 replaced the table with the corpus above.
+    ///
+    /// These are not the guard. They stay for one reason: the oracle cannot
+    /// drive the *schemeless* half of C-4. `Url::parse("127.0.0.1:8080/admin")`
+    /// fails (`127.0.0.1` is not a valid scheme), so no property expressed in
+    /// terms of `Url::parse` can demand those rows — yet a scheme-*guessing*
+    /// fetcher resolves every one of them. Rows 3, 4 and 6 below are therefore
+    /// a genuine second contract; rows 1, 2 and 5 are historical pins on the
+    /// exact strings C-4 reported, and the corpus subsumes them.
     ///
     /// IP literals only, deliberately: a hostname row would make the suite do
     /// real DNS, and the resolution path has its own fail-open contract.
@@ -1533,8 +1826,20 @@ mod tests {
             ("a version", "upgraded from 0.1.2.3 to 10.0.0.1 last week"),
             ("a dotted date", "released 2026.08.07:12 in the changelog"),
             ("a timestamp", "failed at 09:15:07 with code 0.0.0.0"),
+            // #48 finding H-3: `\` is no longer a terminator inside a
+            // scheme-bearing run, and the scheme now matches without its
+            // slashes. Both widenings run straight through the two things
+            // developer prose is made of — backslash paths, and the word
+            // "http:" — so both are controls here.
+            ("the scheme with no slashes, as a word", "the http: and https: schemes differ"),
+            ("the scheme word beside a windows path", "use http:// or a path like C:\\repo\\a\\b"),
+            ("a backslash inside a public URL", "see http://8.8.8.8/a\\b for the file"),
+            ("a UNC path", "copy it to \\\\fileserver\\share\\doc.txt today"),
+            ("a regex over URLs", "match ^https?://\\S+ in the log"),
+            ("a markdown link", "[docs](http://8.8.8.8/x)"),
             // Paths, which are full of slashes and colons.
             ("a windows path", "C:/repo/src/main.rs"),
+            ("a windows path with backslashes", "open C:\\Users\\amir\\repo\\src\\main.rs"),
             ("a unix path", "src/offload/outbound.rs and ./README.md"),
             ("a dotfile path", ".github/workflows/ci.yml"),
             ("a line comment", "// TODO: revisit 127 later"),
@@ -1597,6 +1902,34 @@ mod tests {
         // FIRST url; scanning as-written too is what keeps the second visible.
         let urls = extract_urls(&json!({ "u": "http://a.example/x\nhttp://10.0.0.1/" }));
         assert!(urls.contains(&"http://10.0.0.1/".to_string()), "{urls:?}");
+
+        // #48 finding H-3: every spelling of the scheme — case, and any slash
+        // run including none — normalizes to ONE candidate. The last two are
+        // also the double-scan check: `\` still splits words for
+        // `scan_bare_authorities`, so those strings are seen by both scans, and
+        // lowercasing the scheme is what makes the two agree on a single
+        // string instead of resolving one target twice.
+        for spelling in [
+            "http://127.0.0.1:12344/props",
+            "http:/127.0.0.1:12344/props",
+            "http:127.0.0.1:12344/props",
+            "HTTP:127.0.0.1:12344/props",
+            "http:///127.0.0.1:12344/props",
+            "HTTP:\\\\127.0.0.1:12344/props",
+            "hTtP:/\\127.0.0.1:12344/props",
+        ] {
+            assert_eq!(
+                extract_urls(&json!({ "u": spelling })),
+                vec!["http://127.0.0.1:12344/props"],
+                "{spelling:?}"
+            );
+        }
+        // …and `\` inside the run is a path separator for a special scheme, not
+        // a terminator, so the run survives it whole.
+        assert_eq!(
+            extract_urls(&json!({ "u": "http://127.0.0.1\\props" })),
+            vec!["http://127.0.0.1\\props"]
+        );
 
         // Schemeless and protocol-relative runs are normalized with the scheme
         // a guessing fetcher would assume.

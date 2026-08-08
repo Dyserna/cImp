@@ -3,7 +3,7 @@
 **Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). 
 A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–29** below.
 
-Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-2 growth-forgery, the SSRF scheme family, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
+Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-2 growth-forgery, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -625,12 +625,16 @@ declares its class AND its mutation capability in one reviewed place.
     - **An unparseable candidate is REFUSED, not allowed.** A candidate
       exists only because something URL-shaped was found; failing to
       understand it is not evidence of safety. The one exception is a run
-      that is *nothing but* a scheme prefix (the word "http://" in prose):
-      for a target to hide behind one, it must be separated by a character a
-      parser either removes — and there are exactly three, handled above — or
-      rejects as a forbidden host code point. Note this is the **opposite**
-      call from resolution failure, which still fails open (an unresolvable
-      name is not a reachable target; an unreadable URL is an unknown one).
+      that is *nothing but* a scheme prefix (the word "http://" in prose).
+      ~~For a target to hide behind one, it must be separated by a character a
+      parser either removes — there are exactly three, handled above — or
+      rejects as a forbidden host code point.~~ **That sentence was false and
+      is retracted — see the 2026-08-08 amendment (finding H-3) below: `\` is
+      not a forbidden host code point for a special scheme, it is a slash.**
+      The exemption survives on a narrower argument, restated there. Note this
+      is the **opposite** call from resolution failure, which still fails open
+      (an unresolvable name is not a reachable target; an unreadable URL is an
+      unknown one).
     - **Extraction is widened past `http://`/`https://`** to a bare
       `host:port` or `host/path` run and a protocol-relative `//host/…`,
       both of which a scheme-guessing fetcher resolves and neither of which
@@ -643,6 +647,62 @@ declares its class AND its mutation capability in one reviewed place.
     refusing every argument that merely *mentions* a private address —
     "what is 192.168.1.1" is an ordinary research question — for the rarest
     form of the case.
+
+    **Review amendment 2026-08-08 (#48, finding H-3) — a fourth rule, and the
+    retraction of the safety argument above: the screen matches the SCHEME, not
+    the string `http://`.** The three rules above were each correct and each
+    closed the strings its report named; the *general* case stayed open for
+    three commits because all three were expressed against a literal
+    `["http://", "https://"]` substring match. WHATWG's *special authority
+    slashes* → *special authority ignore slashes* states consume **any number**
+    of `/` or `\` after a special scheme's colon, **including zero**. Executed
+    against the app's own pinned `url 2.5.8`, `http:/127.0.0.1:12344/props`,
+    `http:127.0.0.1:12344/props`, `http:\\127.0.0.1\props` and
+    `http://\10.0.0.1` all yield the internal host, and all four extracted to
+    nothing or to the exempt `"http://"`. The first is the same local
+    `llama-server` the TAB rule above was written for, reached with bare ASCII
+    containing no control character at all.
+
+    Three consequences, and one of them is the point of the entry:
+
+    - **Extraction matches `https?:` case-insensitively followed by a slash run
+      of any length and any mix of `/` and `\`, normalized to `//`.** `HTTP:`
+      parses identically to `http:` (the parser lowercases it), so case is part
+      of the rule, not a detail.
+    - **`\` is no longer a run terminator once a run carries a scheme.** For a
+      special scheme WHATWG treats `\` as a slash *everywhere*, so cutting the
+      run there hands the range check a string the fetcher never sees. It stays
+      a terminator for the schemeless bare-authority scan, where it is a
+      Windows path separator.
+    - **The scheme-only exemption is KEPT, on a corrected and narrower
+      argument.** The old justification — every terminator is a forbidden host
+      code point — was false, and `\` was the counterexample. The hole it
+      opened is closed in the *extractor* (a run with a backslash before its
+      authority now produces the authority), not by widening the exemption's
+      condition. What remains: TAB/LF/CR are decided by the stripped re-scan,
+      not by this exemption; space, `<`, `>`, `|` and `^` really are forbidden
+      host code points and fail the parse; and `"`, `'` and backtick, though
+      not forbidden, are not digits and not `[`, so an authority starting with
+      one is neither an IPv4 nor a bracketed IPv6 literal — it can only be a
+      domain, and a domain carrying a quote has no DNS answer.
+
+    **How this rule is now guarded — the part that matters most.** The
+    29-row literal table that pinned C-4 is demoted to a supplementary pin and
+    replaced as the primary guard by a **generated corpus with `Url::parse` as
+    the oracle**: scheme spelling × slash run × infix × denied authority ×
+    tail, 15,840 cases, asserting *for every argument string, as written and as
+    the parser strips it, if `Url::parse` yields a host `is_denied_ip` rejects
+    then `screen_urls` must deny* — plus the identical cross-product over
+    public literals, which must all pass. The pre-fix extractor evades **1,170
+    of the 5,760 cases the oracle condemns**; the fixed one evades none. A
+    table can only ever contain forms someone already thought of, which is the
+    definition of this finding.
+
+    Found by that corpus while writing it, and fixed with it: the trailing
+    sentence-punctuation trim ate the `]` of any bracketed IPv6 URL ending at
+    its authority, so `http://[2001:db8::1]` became unparseable and was
+    **refused** by the rule above. The trim is now balance-aware. Same
+    screen/parser disagreement, pointing the other way.
 
     The
     explicitly configured LAN endpoints (e.g. `172.21.1.11`, itself inside

@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then sixteen fix commits `09dc7ec..aed6289` closing its HIGHs and most of its MEDIUMs. This document was audited against the code at `aed6289` on 2026-08-08 (#48) and every stale "as built" claim corrected in place — amendments dated 2026-08-08 are that pass. Remaining: live-verifies 1–22, and C3's release-asset publishing plus the Prompt Guard 2 weights are blocking deploy follow-ups (see the C3 and C amendments). GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). Remaining: live-verifies 1–22, and C3's release-asset publishing plus the Prompt Guard 2 weights are blocking deploy follow-ups (see the C3 and C amendments and decision 24). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -50,8 +50,8 @@ by the worker loop, the loopback proxy, and tests.
 | Class | Members | Latch behavior |
 |---|---|---|
 | **EXTERNAL** | everything proxied from configured MCP servers: `ddg_*`, `context7_*`, and **any unknown/future server by default** | first call latches the task/session: LOCAL-CAPABILITY becomes unavailable |
-| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, plus `run_check` and `security_audit`/`quality_audit`, plus `offload_task`/`offload_batch` (see the two 2026-08-07 amendments below) | first call latches the other way: EXTERNAL becomes unavailable |
-| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `context_recall`/`context_notes` (reads — a **recorded residual**, see the second 2026-08-07 amendment) | never latches, never blocked |
+| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, plus `run_check` and `security_audit`/`quality_audit`, plus `offload_task`/`offload_batch` (see the two 2026-08-07 amendments below, and locked decision 18) | first call latches the other way: EXTERNAL becomes unavailable |
+| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `context_recall`/`context_notes` (reads — a **recorded residual**, see the second 2026-08-07 amendment and locked decision 23) | never latches, never blocked |
 | **PERSISTENT-WRITE** | `context_note` (the one tool whose output outlives the session) | never latches; **write-gated while EXTERNAL-latched** (decision 10) |
 
 Rationale for the graph split: structural tools return names/edges/metadata
@@ -90,10 +90,17 @@ unlatched tasks and to the local/code profile. `mutates_fs` is unchanged —
 class and mutation capability are independent axes, and the V33 Phase F note on
 `run_check` still stands.
 
+This demotion reached only the **offload worker's def-filter**: the audit tools
+arrive from a separate MCP server posting to `/audit/run`, which had no latch
+gate at all. Closed by locked decision 18 (2026-08-07, finding C-1b) — see the
+Phase B amendment for the enforcement point.
+
 **Phase A amendment 2026-08-07 (b) (re-verification sweep, finding C-1c,
-user-decided): `offload_task` and `offload_batch` are DEMOTED from TRUSTED to
-LOCAL-CAPABILITY.** The old rationale waved them through with *"the offload
-tools return a delegated subtask's answer (which gets its own latch)"*. It does
+user-decided — the class half of locked decision 18; its enforcement half is
+the Phase B amendment): `offload_task` and `offload_batch` are DEMOTED from
+TRUSTED to LOCAL-CAPABILITY.** The old rationale waved them through with *"the
+offload tools return a delegated subtask's answer (which gets its own latch)"*.
+It does
 — a **fresh and permissive** one: `Latch::from_profile(task.profile)`, and
 `Profile::Code.latch()` is `Latch::Local`, which *grants*
 `read_file`/`code_search`/`run_command`. The sub-task therefore holds exactly
@@ -122,8 +129,10 @@ fans out to one `/run` per subtask), keyed by the `tab` + `consumer` the
 `--offload-mcp` child now forwards in the body, exactly as `/graph_run` does.
 
 **Same amendment — the TRUSTED rationale for `context_recall`/`context_notes`
-is corrected, and they are NOT demoted.** The old text claimed *"the memory
-reads return the session's own working set"*, which the code contradicts:
+is corrected, and they are NOT demoted (locked decision 23; the write-time
+answer to the exposure it leaves open is decision 22).** The old text claimed
+*"the memory reads return the session's own working set"*, which the code
+contradicts:
 `context_recall` appends `list_project_facts` (*"durable knowledge that outlived
 the sessions it came from"*) and `context_notes` returns this session's notes
 **plus every pinned note for the project**. That is cross-session project
@@ -181,6 +190,11 @@ declares its class AND its mutation capability in one reviewed place.
    always available. *Rejected:* time-window or per-turn resets — an injected
    context stays injected; the latch must be sticky for the contaminated
    scope's lifetime.
+   (**Reach extended by decision 18**, 2026-08-07: two further routes —
+   `POST /audit/run` and `POST /run` — reached LOCAL-CAPABILITY without ever
+   consulting the latch. The exclusion is unchanged; what changed is how much
+   of the surface it governs. **Amended by decision 15** for USER-initiated
+   flips only.)
 2. **Worker enforcement removes tool defs, not just refuses calls.** On
    latch, the next request's tool list (built from
    `enabled_defs_inner`-style assembly in the worker loop, `offload/agent.rs`)
@@ -195,6 +209,11 @@ declares its class AND its mutation capability in one reviewed place.
    bash/write are outside cImp's reach — the proxy latch governs proxied
    tools only. OS-level containment of the natives is V33's job; optional
    hook-based gating is Phase E here, spike-gated.
+   (**Phase E resolved by decision 17**, 2026-08-07: E1/Claude deferred, E2
+   shipped as Phase H behind a default-off toggle, containment still V33.
+   **Route list extended by decision 18**, 2026-08-07: the proxy latch covers
+   FOUR routes now — `/graph_run`, `/mcp/call`, `/audit/run` and `/run` — see
+   the Phase B amendment.)
 4. **`offload_task`/`offload_batch` gain an optional `profile` param:
    `"research" | "code"`.** A declared profile pre-applies the latch at task
    start (research ⇒ LOCAL-CAPABILITY never advertised; code ⇒ EXTERNAL never
@@ -202,6 +221,12 @@ declares its class AND its mutation capability in one reviewed place.
    The tool description gains: *"never include secrets or sensitive code in
    the task text of a research task — the task prompt is visible to whatever
    web content the task fetches, and prompt exfiltration cannot be blocked."*
+   (**Narrowed by decision 18**, 2026-08-07: this decision governs the
+   SUB-TASK's shape and deliberately says nothing about whether a
+   contaminated caller may delegate at all. Since the demotion of
+   `offload_task`/`offload_batch` to LOCAL-CAPABILITY, a latched tab cannot
+   reach either tool — a declared profile still pre-applies the sub-task's
+   latch for every caller that can.)
 5. **Detection is a SURFACE signal, never a silent gate** (global principle:
    every quality signal needs a consumer; its consumers here are (a) the
    reading LLM via an inline warning header, (b) the user via a flagged
@@ -340,6 +365,15 @@ declares its class AND its mutation capability in one reviewed place.
     contaminated before this milestone existed. *Rejected:* hard-blocking the
     tool (loses legitimate research conclusions worth keeping — quarantine
     preserves them behind review); trusting pre-V32 memory (unauditable).
+
+    **Extended twice on 2026-08-08 (#48), both reusing this decision's
+    apparatus rather than adding one:** decision 21 refuses a PERSISTENT-WRITE
+    outright on the **headless** path, where neither of the two facts this
+    decision needs (session identity, taint verdict) is available at all; and
+    decision 22 adds a **second reason to quarantine** — a credential-shaped
+    value in the note text — screened at write time, stored under the same
+    `tainted` column, withheld from the same read paths and reviewed in the
+    same Memory queue. Both are stated in the Phase C2 amendments below.
 11. **SSRF guard + fetch budgets on EXTERNAL fetches.** The proxy screens
     every outbound fetch URL before forwarding: an injected model must not
     use `fetch_content` as a LAN scanner or a pivot to unauthenticated
@@ -619,6 +653,14 @@ declares its class AND its mutation capability in one reviewed place.
       curates the upstream bundle — it is no longer the update mechanism
       itself.
 
+    **Gated and scheduled by three later decisions:** the daily check runs only
+    when `Feature::Detection` resolves on at the app scope (**decision 19**),
+    the Check now / Apply / Revert buttons obey the same predicate
+    (**decision 20**), and the `detection-v1` channel this decision depends on
+    is a **blocking deploy follow-up deferred to the release step**
+    (**decision 24**) — until it is published every check ends `Unavailable`,
+    which amendment (b) made a quiet, logged non-event.
+
     **Review amendment 2026-08-07 (#48, findings D-1 / N-1 / D-4) — the scan
     bound is stated honestly, and an aborted scan no longer reports as a clean
     one.** This decision's own rule is *"never silently degrades to
@@ -741,6 +783,14 @@ declares its class AND its mutation capability in one reviewed place.
     `spawn_inject_sig` and produce the restart hint; every other feature
     resolves per call and takes effect immediately.
 
+    **Applied to the detection updater 2026-08-07 (decisions 19 and 20).** The
+    updater is the one V32 consumer that acts on a timer rather than on a call,
+    and it read the L1 field directly. It resolves `effective(Feature::Detection,
+    Scope::App)` now, per tick and per button click — so it stays live rather
+    than spawn-baked, and owes no `spawn_inject_sig` entry. Decision 20 also
+    settles what an L1 `off` means for a button a human presses: the same thing
+    it means for a timer.
+
     **Effective state must be introspectable** (the same
     every-signal-needs-a-consumer discipline, applied to configuration):
     with three levels, "why is this tab not latching?" has to be answerable
@@ -749,6 +799,269 @@ declares its class AND its mutation capability in one reviewed place.
     decided it. A reduced-protection state (L1 off, or any feature off) is
     visible outside Settings too, on the existing status surface and the
     decision-15 tab badge, so protection cannot be off and forgotten.
+17. **The Phase E split is resolved: E1 (Claude) is DEFERRED, E2 (OpenCode)
+    ships as Phase H behind a default-off toggle, containment stays V33's job
+    (user decision 2026-08-07).** *Numbered here 2026-08-08 (#48).* This
+    decision was taken and written in `522b62d`, but only into the Phase E and
+    Phase H bullets — so `docs/reviews/code-review-V32-2026-08-07.md`,
+    `522b62d`'s own subject line, decision 3 and live-verification recipe 15 all
+    cite "decision 17" against a numbered entry that did not exist. Its full
+    text stays where it was written (the Phase E *USER DECISION 2026-08-07*
+    bullet and the Phase H bullet); the load-bearing parts:
+    - **E1 (Claude) is deferred, not cancelled.** Its `PreToolUse` gate spawns a
+      process per `Read`/`Grep`/`Bash` — the **whole** tool surface, not Phase
+      F's two web tools — so its latency gate is the expensive one and remains
+      unspiked. Claude's own training plus the permission system is a real (if
+      probabilistic) backstop meanwhile. *Rejected:* cancelling it outright —
+      V33 may slip and the backstop may prove insufficient, and the spike is
+      cheap to re-open, so the honest state is "unscheduled with a recorded
+      residual", not "closed". *Rejected:* shipping it unspiked — a per-call
+      process spawn across the whole tool surface is exactly the kind of tax
+      that turns a security control into a thing users switch off.
+    - **E2 (OpenCode) ships as Phase H, default OFF.** OpenCode has no
+      injection-resistance of its own, and Phase F already built the delivery
+      mechanism — the plugin's `tool.execute.before` handler exists and fires
+      today — so denying is a branch rather than a new system. **Whole-surface
+      within its class or nothing:** the E2 spike watched the model reroute a
+      blocked `write` through `bash`, so a partial gate is worse than none.
+      *Rejected:* holding E2 back alongside E1 — it is the consumer that most
+      needs it and the cheapest to reach. *Rejected:* shipping it default ON —
+      the spike verdict is GO-*with-caveats*, and a control that refuses a
+      native `bash` on a fresh install gets answered by switching V32 off
+      wholesale, which is decision 16's own argument.
+    - **Containment stays V33's job**, and Phase H says so in its own text: it
+      runs inside the agent's process, `OPENCODE_PURE=1` and spawning an
+      ungated `opencode` walk around it, and user-typed `!shell`/PTY never reach
+      the hook.
+    - **Companion decision (locked, 3b): the pinned OpenCode `permission` block
+      stays at today's effective `allow` values.** *Rejected for now:*
+      `webfetch: "ask"` — it applies only in `sensor`/`off` mode (in `deny`,
+      webfetch is already refused) and Phase F's badge already reports a fetch
+      after the fact. Revisit if the badge surfaces fetches the user did not
+      expect.
+    **Accepted consequence:** the Accepted-residuals entry on native tools is
+    *narrowed*, not closed — Claude's natives stay entirely outside the latch,
+    and OpenCode's are gated only when a default-off toggle is on, by a policy
+    control with named escapes. Implemented as Phase H (`f5fb221`); spec
+    `522b62d`; live-verification recipe 15.
+18. **`POST /audit/run` and `POST /run` are inside the latch, and
+    `offload_task`/`offload_batch` are LOCAL-CAPABILITY (user decision
+    2026-08-07, #48 findings C-1b / C-1c; `ada4bae`).** The 2026-08-07 demotion
+    of `run_check`/`security_audit`/`quality_audit` (`b80f5b8`, first Phase A
+    amendment) reached only the **offload worker's def-filter**. Two routes
+    reconstituted the trifecta around it, and neither fix helps the other:
+    - **The audit tools never pass through the offload child.** They arrive from
+      a *separate* MCP server — `cimp-code-audit` (`cimp --code-audit-mcp`) —
+      whose client posts to `/audit/run`, a handler that contained no
+      `latches()` call of any kind. It could not have had one as written:
+      `AuditRunBody` carried no `tab`, and the child was **deliberately** spawned
+      without one, pinned by a test (`the_code_audit_child_gets_no_tab_id`)
+      asserting exactly that. The test pinned the opposite of this decision and
+      is **replaced**, not deleted, by
+      `the_code_audit_child_carries_its_own_tab_id`.
+    - **`offload_task` handed its sub-task a fresh permissive latch.**
+      `Latch::from_profile(profile)`, and `Profile::Code.latch() ==
+      Latch::Local`, which *grants* `read_file` / `code_search` /
+      `run_command` — precisely the class the parent had just lost — and the
+      result came back with **no spotlighting envelope, no detection scan and
+      no budget charge**, because all three are `/mcp/call`-only.
+    *Rejected:* gate `/audit/run` only and accept the offload path as a
+    residual — that is not a residual but a fully documented end-to-end bypass
+    of Phase H, reachable on a default install. *Rejected:* propagate the
+    caller's latch into the sub-task instead of demoting — it preserves
+    delegated offload, but it is more machinery on a path that already has
+    three screens it does not run, and it narrows decision 4, which is about the
+    sub-task's *shape* and deliberately says nothing about whether a
+    contaminated caller may delegate at all. *Rejected:* accept both as
+    residuals.
+    **Accepted consequence: a latched tab loses delegated offload entirely** —
+    the same shape as the `run_check` split and taken for the same reason. An
+    EXTERNAL-latched (or contaminated-then-flipped) conversation gets the fixed
+    `REFUSAL_LOCAL_BLOCKED` string for both tools, and a tab that delegates
+    first is latched LOCAL and loses the web; unlatched tabs and the local/code
+    side are unaffected.
+    Recorded as built in the **second Phase A amendment** (the class change and
+    the corrected TRUSTED rule) and the **Phase B amendment's `/audit/run` and
+    `/run` bullets** (the enforcement points, both through the one `latch_scope`
+    funnel on `LatchRoute::Native`); live-verification recipe 20. Extends
+    decision 1's reach and decision 3's route list; decision 4 is untouched.
+19. **The detection updater's scheduler gates on
+    `effective(Feature::Detection, Scope::App)`, not on the L1 master alone
+    (user decision 2026-08-07, #48; `f032796`).** #46 gated `tick_once` on
+    `injection_protection` alone, so with protection **on** and
+    `Feature::Detection` **off** — a supported state under decision 16 — the
+    updater still made a daily network request and hot-swapped bundles for a
+    feature that does nothing with them: the exact case its own comment claimed
+    to cover. The resolver folds L1 in (a master `off` resolves every feature
+    false), so one gate at the right level covers both levels; a raw field read
+    covers neither (decision 16 / #44).
+    **App scope, not per tab**, deliberately: there is one bundle on disk for
+    the whole process, and a per-tab detection override changes which tab
+    *scans* with it, not whether it is worth keeping current. `Scope::App`
+    resolves to L1 ∧ L2, which is exactly that question.
+    *Rejected:* keep `master_enabled` and correct only the comment. The comment
+    already described the behaviour the user wanted; when the prose and the code
+    disagree about a security gate, the cheap fix is the wrong one.
+    Checked **per tick**, never cached, so a flip takes effect within one poll
+    with **no restart** — which is why this is deliberately **not** a
+    spawn-baked setting and owes no `spawn_inject_sig` entry.
+    Implemented as `updater::updates_enabled`, called from `tick_once`; recorded
+    in Phase C3 amendment (c), *user decision (a)*; live-verification recipe
+    14's 2026-08-08 extension. Applies decision 16 to decision 13's channel.
+20. **The updater's manual actions — Check now / Apply / Revert — are gated
+    under the same rule (user decision 2026-08-07, #48; `f032796`).** They were
+    gated on `detectionBusy` alone and ran happily with protection off.
+    Decision 16 locks L1 as *"the one switch that cannot be overridden
+    upward"*, and the Detection panel already told the user in so many words
+    that with protection off nothing is polled or swapped — false for anyone who
+    clicked those buttons.
+    The gate lives in the **IPC commands** — `detection_check_now` (which serves
+    both *Check now* and *Apply*) and `detection_revert`, through one
+    `updates_allowed` helper over decision 19's predicate — and not only in the
+    Svelte `disabled` attribute: a disabled button is a courtesy, an IPC command
+    is a capability, and a UI-only gate is a bypass. It returns an **error**
+    rather than a silently unchanged status, on the same reasoning as
+    `latch_override`'s verbatim errors: a control that does nothing when clicked
+    and says nothing about it teaches the user to distrust it.
+    *Rejected:* leave them ungated, on the reading that the hierarchy governs
+    *background* behaviour and that a button the user presses **is** the user —
+    with the exception documented in the Phase G L1 bullet. That reading is
+    defensible and was declined for one reason: it leaves an already-published
+    promise untrue, and rewriting the promise is the worse repair when the
+    promise is about the code.
+    **Recorded so it is not re-derived: staleness self-heals.** `tick_once`
+    returns *before* reading the state file, so `last_check_ms` does not advance
+    while the gate is closed; every component is therefore due immediately when
+    protection returns, and a spell with detection off costs a delayed check,
+    never a skipped one. Recorded in Phase C3 amendment (c), *user decision
+    (b)*; live-verification recipe 14's extension.
+21. **The headless MCP child refuses persistent writes; reads stay fail-open
+    (user decision 2026-08-08, #48 finding M-2; `b63ebfb`).** The child wrote
+    memory notes with `WriteTaint::Clean` and `session: None` whenever it could
+    not reach the app, justified by *"quarantining every note written while the
+    app is closed is neither evidence of taint nor something a user could
+    anticipate"* — which assumed that condition was not attacker-selectable.
+    It is: `proxy_graph` returned `None` on **five** distinct conditions, and
+    the cheapest needs no shell at all — corrupt
+    `<portable_root>/.cimp-discovery/<pid>.json` with one byte and
+    `read_all_discoveries`'s `filter_map(… .ok())` drops it silently, so every
+    later `graph_*`/`context_*` call from that child takes the headless path for
+    the rest of the tab's life. Claude's own `Write` tool reaches that file. An
+    ordinary app restart opens the same window with no attacker at all.
+    The split is what preserves decision 10's rationale for READS — a
+    contaminated tab must not lose its own memory — while removing the one
+    unquarantined write a model can reach: an app-down `context_note
+    { pin: true }` stored under `sid = ""` is project-wide, permanent,
+    unattributable **and** unquarantined, the highest-privilege write the memory
+    surface offers.
+    *Rejected:* mark the write instead of refusing it — an attacker still gets
+    the note written, just flagged, and the flag is decided by the same
+    unreachable app. *Rejected:* leave the behaviour and correct only the
+    justification.
+    **Same decision: `proxy_graph`'s five conditions are named variants**
+    (`ProxyMiss::{NoInstance, ClientBuild, Transport, HttpStatus, Unparseable}`,
+    each reported once per process, with an exhaustive `match` in a test so a
+    sixth cannot join unlabelled). A security fallback whose trigger set nobody
+    can enumerate is one whose reachability nobody can bound — "cImp is not
+    running" and "the app answered 500" were the same `None`.
+    **Accepted consequence:** the refusal string
+    (`HEADLESS_WRITE_UNAVAILABLE`) is fixed and content-free like every other
+    boundary message, but — unlike the `REFUSAL_*` constants — states that the
+    condition is **transient**, because it is, and a model told "this cannot be
+    unlocked" would drop a finding it could re-record a minute later. The
+    headless path still serves READS with no latch and no session identity;
+    that is the fail-open half, recorded in Accepted residuals.
+    Recorded as built in the Phase C2 amendment 2026-08-08 (M-2 + N-1);
+    live-verification recipe 17. Extends decision 10.
+22. **Credentials are screened at `context_note` WRITE time, and a hit is
+    stored-and-quarantined (user decision 2026-08-08, #48; `b63ebfb`).**
+    `context_recall`/`context_notes` are TRUSTED — never latched, never blocked
+    — and return every **pinned** note for the project. Decision 10's quarantine
+    covers the write side for *injected* content; it says nothing about a note
+    the user themselves pinned, so a user who pinned credentials pinned them
+    into a class a contaminated tab can read back and carry out.
+    *Rejected:* latch the reads instead. That costs a contaminated tab its own
+    memory, which is the *"block that silently drops legitimate research
+    conclusions"* failure decision 10 explicitly rejected. So the screen runs on
+    the way IN, once, over one short string — enforced at `run_tool`'s
+    `context_note` arm, the one funnel the loopback `/graph_run` route, the
+    headless child and the offload worker all reach (a screen at any caller is a
+    screen one caller can forget).
+    **The action on a hit is store-and-quarantine**, reusing decision 10's
+    existing `tainted` column, exclusion from every read path, and Memory-view
+    review queue — nothing new was built to hold it. *Rejected:* refuse, which
+    throws a research conclusion away unrecoverably on a false positive and
+    tells the model to retry, which it cannot usefully do. *Rejected:*
+    strip/redact, which silently rewrites the user's own memory with no copy of
+    what was removed. Quarantine is the only one of the three honest about a
+    pattern match being a **suspicion**, which is what a review queue is for.
+    **The rules are baked into the binary** (`src/graph/secrets.yar`, via
+    `include_str!`), deliberately **not** shipped in `rules.d` even though the
+    engine is the same yara-x through the same `signature::compile_sources` /
+    `scan_with`: the C3 updater replaces that directory wholesale, the injection
+    toggle switches it off, and a broken `local/` file thins it. **A screen over
+    the user's own credentials must not be removable by a bundle update or by a
+    toggle about untrusted *web* content.** *Accepted cost, stated:* these
+    patterns get no update channel and cannot be extended from `rules.d/local/`.
+    Publishing them into the updatable bundle *in addition* is a legitimate
+    follow-up; removing the baked copy is not.
+    *Also rejected here:* **gitleaks** — the audit runner's secret scanner is an
+    out-of-process, optionally-installed child transported through a SARIF
+    report file and taking seconds. A `context_note` call cannot spawn it, and a
+    screen that no-ops on most installs is not a screen.
+    Recorded as built in the Phase C2 *"New work 2026-08-08 — the memory secret
+    screen"* amendment; live-verification recipe 16. Extends decision 10 and
+    answers the exposure decision 23 leaves open.
+23. **`context_recall`/`context_notes` stay TRUSTED, with the rationale
+    corrected (user decision 2026-08-07, #48 finding C-1c; `ada4bae`).** The old
+    rationale claimed *"the memory reads return the session's own working set"*,
+    which the code contradicts: `context_recall` appends `list_project_facts`
+    (*"durable knowledge that outlived the sessions it came from"*) and
+    `context_notes` returns this session's notes **plus every pinned note for
+    the project**. That is cross-session project knowledge reachable under an
+    EXTERNAL latch.
+    *Rejected:* demotion to LOCAL-CAPABILITY. It costs a contaminated tab access
+    to its own memory — the same *"block that silently drops legitimate research
+    conclusions"* failure decision 10 rejected, applied to reads. The three
+    grounds for keeping them are written down as deliberately **weaker** than
+    the structural graph tools': the content is prose the user's own sessions
+    distilled rather than source text; decision 10 quarantines the WRITE side,
+    so injected content cannot enter the store unreviewed; and every delivery is
+    spotlit (`recall_envelope`).
+    **None of the three bounds what a *pre-existing* pinned fact may contain**,
+    so the exposure is addressed at write time instead (decision 22) and the
+    remainder is **recorded as a residual rather than closed**: notes pinned
+    before the screen existed, and anything the precision-first ruleset does not
+    match, stay readable from a contaminated tab. Demotion remains a live option
+    and a user decision.
+    Recorded as built in the second Phase A amendment (*"Same amendment — the
+    TRUSTED rationale … is corrected, and they are NOT demoted"*) and in the
+    class table's TRUSTED row.
+24. **Publishing the `detection-v1` release is deferred to the release step
+    (user decision 2026-08-07).** This is **not** a workaround for the missing
+    release: the #46 outcome-taxonomy split makes an unreachable channel a
+    quiet, logged `Unavailable` non-event on its own — neutral row, truthful
+    Settings line, no card — and after a week one `detection.update_stalled.v1`
+    card per enabled component says so honestly. The code is correct without the
+    release; publishing is not a precondition for that.
+    It is deferred because **U-1, U-2 and U-4 changed the containment check and
+    the activation gauntlet** (asset-origin containment, the activation failure
+    windows, and judging the bundle rather than the directory), and the first
+    published bundle must be validated against the **fixed** gauntlet, not the
+    broken one. Publishing first would mean either shipping a bundle nothing
+    current had judged, or re-publishing it immediately.
+    *Rejected:* publish now and re-validate later — the one thing a curated
+    update channel exists to prevent is a bundle whose provenance nobody can
+    state, and "it was validated by the version we then replaced" is that.
+    **It remains a blocking deploy task**, not a footnote (global principle 9):
+    the six-step checklist is in the Phase C3 *deploy follow-ups* bullet and in
+    `detection/manifest.example.json`. The **`classifier` component stays out of
+    the first manifest** until the Prompt Guard 2 weights themselves are
+    published (`models/CHECKSUMS.txt`) — an entry with no assets behind it turns
+    every daily check into a rejected-update card.
+    Recorded in the Phase C3 deploy-follow-ups bullet and residual (d);
+    live-verification recipe 11 validates a staged copy first, via
+    `offload.detection_update_manifest_url`. Governs decision 13's channel.
 
 ## Phases
 
@@ -765,8 +1078,10 @@ declares its class AND its mutation capability in one reviewed place.
   fallback discipline — but EXTERNAL results still get the envelope.
 
   **Phase B amendment 2026-08-07 (#48, re-verification sweep) — the latch now
-  covers FOUR routes, not two.** The phase's own sentence ("`/graph_run` +
-  `/mcp/call`") was the whole of the enforcement, and two other routes reached
+  covers FOUR routes, not two.** (The enforcement half of locked decision 18;
+  its class half is the second Phase A amendment.) The phase's own sentence
+  ("`/graph_run` + `/mcp/call`") was the whole of the enforcement, and two other
+  routes reached
   LOCAL-CAPABILITY without ever consulting `classify()`. Both are closed by
   applying the *same* gate the other two use — one `latch_scope` funnel, one
   settings snapshot, `LatchRoute::Native`, `GatePolicy::resolve` — rather than a
@@ -947,7 +1262,8 @@ declares its class AND its mutation capability in one reviewed place.
   - **Defaults as locked:** rules `auto`, classifier `check`, interval 24 h. An
     unrecognized mode string reads as `check` — a typo must neither disable the
     updater nor grant it activation rights.
-  - **Deploy follow-ups (blocking for the feature to do anything at all):**
+  - **Deploy follow-ups (blocking for the feature to do anything at all;
+    deferred to the release step by locked decision 24, which records why):**
     1. create the `detection-v1` release on `Dyserna/cImp`;
     2. curate the first rule bundle (date-versioned, e.g. `2026.08.07`) from
        `detection/rules.d/` + the current Vigil/garak refresh;
@@ -1116,7 +1432,8 @@ declares its class AND its mutation capability in one reviewed place.
       with the same clause. The label belongs to the surface; the stored detail
       is now the reason plus what it cost. Its test asserts the **rendered
       composition** rather than a substring, which either half satisfied.
-    - **User decision (a) — the scheduler gate is the FEATURE, not the master.**
+    - **User decision (a) — the scheduler gate is the FEATURE, not the master**
+      (locked decision 19)**.**
       `tick_once` now resolves `effective(Feature::Detection, Scope::App)`
       through the new `updater::updates_enabled`. (b)'s L1-only gate left
       "protection on, detection off" — a supported state — making a daily
@@ -1124,8 +1441,9 @@ declares its class AND its mutation capability in one reviewed place.
       with them, which is the exact case (b)'s own comment claimed to cover. The
       resolver folds L1 in, so one gate at the right level covers both levels.
       Still per tick, so still not spawn-baked.
-    - **User decision (b) — the manual buttons are under the same rule.** *Check
-      now* / *Apply* / *Revert* were gated on `detectionBusy` alone and ran with
+    - **User decision (b) — the manual buttons are under the same rule**
+      (locked decision 20)**.** *Check now* / *Apply* / *Revert* were gated on
+      `detectionBusy` alone and ran with
       protection off, which made the panel's own sentence ("with protection off,
       nothing is polled or swapped") false. The gate is in the **IPC commands**
       (`detection_check_now`, `detection_revert`, via one `updates_allowed`
@@ -1298,7 +1616,9 @@ declares its class AND its mutation capability in one reviewed place.
     says so honestly. Publishing the release is a deploy follow-up, not a
     precondition for the code being correct; it is deferred until the U-1/U-2/
     U-4 fixes have settled the containment check and the activation gauntlet, so
-    the first bundle is validated against the fixed gauntlet. (e) An artifact
+    the first bundle is validated against the fixed gauntlet — **locked
+    decision 24**, which also keeps `classifier` out of the first manifest.
+    (e) An artifact
     fetch that fails *after* the manifest fetched successfully is still
     `Rejected`, not `Unavailable`: the network answered a moment earlier, so a
     missing or unreachable asset is a broken published bundle. A connection that
@@ -1541,7 +1861,9 @@ declares its class AND its mutation capability in one reviewed place.
       here — it is the only scope that exists on the route. Same choice, same
       reason, as the headless MCP child's.
   - **Amendment 2026-08-08 (#48, M-2 + N-1, user decision) — the headless MCP
-    child refuses persistent writes; reads stay fail-open.**
+    child refuses persistent writes; reads stay fail-open.** (Locked
+    decision 21; it extends decision 10 to the path where neither of decision
+    10's two inputs exists.)
     - **What was wrong.** `graph/mcp.rs`'s `handle_call` set
       `taint: WriteTaint::Clean` with `session: None` whenever `proxy_graph`
       returned `None`, justified as *"the alternative would quarantine every
@@ -1590,7 +1912,8 @@ declares its class AND its mutation capability in one reviewed place.
       deliberately not a miss — falling back there would re-run the call
       headless and hide the app's own verdict.
   - **New work 2026-08-08 (#48, user decision) — the memory secret screen
-    (`graph::secrets`).**
+    (`graph::secrets`).** (Locked decision 22; it answers the pinned-credential
+    exposure locked decision 23 leaves open, using decision 10's apparatus.)
     - **Why, and why at write time.** `context_recall`/`context_notes` are
       TRUSTED (never latched) and return every **pinned** note for the project.
       Quarantine covers the write side for *injected* content; it says nothing
@@ -2781,8 +3104,20 @@ declares its class AND its mutation capability in one reviewed place.
   structural graph output and LOCAL-CAPABILITY reads can carry hostile text
   from the user's own tree. Accepted: that content cannot exfiltrate once the
   latch holds, and treating the user's repo as hostile would gut the product.
-- **Claude/OpenCode native tools stay outside the latch** unless Phase E
-  lands (decision 3); OS containment is V33.
+- **Claude/OpenCode native tools stay outside the latch** (decision 3); OS
+  containment is V33. **Narrowed, not closed, by decision 17 (2026-08-07):**
+  - **Claude's natives are entirely outside it.** E1 is DEFERRED — its
+    `PreToolUse` gate would spawn a process per `Read`/`Grep`/`Bash` and its
+    latency gate is unspiked. Claude's own training plus the permission system
+    is the backstop, which is probabilistic by construction.
+  - **OpenCode's natives are gated only when the Phase H toggle is ON**, and it
+    **defaults off**, so the shipped posture is the residual above unchanged.
+    Even switched on it is a **policy** control, not containment, and says so:
+    it runs inside the agent's own process, `OPENCODE_PURE=1` and spawning an
+    ungated `opencode` walk around it, user-typed `!shell`/PTY never reach the
+    hook, and every error path fails OPEN.
+  - Shell-level net access (`curl` in Bash) is invisible in every mode and
+    under every setting — V33 egress control.
 - **Natives do not merely sit *outside* the latch — before #45 they could
   *move* it** (2026-08-07, review finding C-3). Decision 3 documented the
   first half and not the second: the loopback's only control is a per-launch
@@ -2864,6 +3199,43 @@ declares its class AND its mutation capability in one reviewed place.
   moment later; blocking would break legitimate research on a DNS hiccup with
   a security-shaped error).
 
+**Opened by the 2026-08-07/08 review-fix run (#48).** Each is the recorded
+consequence of a decision the run took; each is named in that decision.
+
+- **Pinned memory can carry credentials into a contaminated tab
+  (decision 23).** `context_recall`/`context_notes` stay TRUSTED — never
+  latched, never blocked — and return every **pinned** note for the project, so
+  a note the *user* pinned is readable from an EXTERNAL-latched conversation.
+  Demotion was rejected because it costs a contaminated tab access to its own
+  memory (decision 10's own rejected-alternative). Decision 22's write-time
+  screen closes the *forward* half: notes written from now on are quarantined
+  on a credential hit. What stays open is what was already there — notes pinned
+  before the screen existed — and anything a precision-first ruleset does not
+  match, which is deliberate (the false-positive cost of a loose rule is a
+  research conclusion silently withheld). Demoting the two reads remains a live
+  user decision.
+- **The baked secret ruleset has no update channel (decision 22).** The
+  `context_note` credential patterns are compiled into the binary
+  (`src/graph/secrets.yar`) precisely so a bundle update, the injection toggle
+  or a broken `rules.d/local/` file cannot remove them — which also means they
+  are refreshed only by shipping a new cImp, and a user cannot extend them from
+  `rules.d/local/`. Publishing them into the updatable bundle *in addition* is a
+  legitimate follow-up; removing the baked copy is not.
+- **The headless MCP child still serves memory READS with no latch and no
+  session identity (decision 21).** The write side is refused there; the read
+  side is fail-open by the same decision, because decision 10's rationale for
+  reads — a contaminated tab must not lose its own memory — is what the split
+  exists to preserve. The path is attacker-selectable (a one-byte corruption of
+  `.cimp-discovery/<pid>.json` reaches it), so this is a reachable read of the
+  project's memory outside every V32 control. Bounded by the fact that it is a
+  read of content the user's own sessions produced, and by decision 22's
+  screen having run at write time on anything written since.
+- **A latched tab loses delegated offload entirely (decision 18)** — recorded
+  here as a usability cost knowingly accepted, not a gap: `offload_task` and
+  `offload_batch` return `REFUSAL_LOCAL_BLOCKED` to an EXTERNAL-latched
+  conversation, and a tab that delegates first loses the web. The manual
+  override (decision 15) and a tab restart are the exits.
+
 **Opened by the 2026-08-08 documentation audit (#48).** These are not new
 defects — they are things the spec asserted and the code does not do, found by
 re-reading every "as built" claim against `aed6289`. Each is recorded rather
@@ -2901,12 +3273,13 @@ than fixed because this pass is documentation; each is small.
   it.** The restart-hint signature covers the same inputs by argument, not by
   construction, so a fourth disjunct added to the predicate without a matching
   signature entry produces a plugin file that changes with no restart hint.
-- **An `Unknown` tab id runs `/audit/run` and `/run` ungated.** `latch_scope`
-  distinguishes `Anonymous` / `Unknown(tab)` / `Scoped`, and both routes treat
-  the first two as V28 fail-open, logging a `warn!` that says so. That is the
-  same fail-open discipline the other routes use and is deliberate; it is
-  written here because "the route is gated" now appears in three places and
-  should not be read as unconditional.
+- **An `Unknown` tab id runs `/audit/run` and `/run` ungated** (the fail-open
+  edge of decision 18). `latch_scope` distinguishes `Anonymous` /
+  `Unknown(tab)` / `Scoped`, and both routes treat the first two as V28
+  fail-open, logging a `warn!` that says so. That is the same fail-open
+  discipline the other routes use and is deliberate; it is written here because
+  "the route is gated" now appears in three places and should not be read as
+  unconditional.
 - **The two terminal-escape strippers share no test fixture**, and the
   TypeScript one is not gated on its feature — see Phase G residual (c).
 
@@ -3099,7 +3472,8 @@ than fixed because this pass is documentation; each is small.
     `/status` names which level decided each.
     **Extended 2026-08-08 (#48) — the master and the hierarchy grew four
     consumers this run that the recipe above does not reach:**
-    - **The updater scheduler follows `Feature::Detection`, not L1.** Set
+    - **The updater scheduler follows `Feature::Detection`, not L1**
+      (decisions 19 and 20)**.** Set
       protection ON and *Injection detection* OFF: `tick_once` makes no request
       (nothing at `RUST_LOG=offload=info`), and Check now / Apply / Revert are
       refused by the **IPC command**, not merely greyed out — invoke
@@ -3137,9 +3511,10 @@ than fixed because this pass is documentation; each is small.
 deep review and this documentation pass, and none of them wrote a recipe; these
 are the ones the list above does not reach.
 
-16. **The memory secret screen (`graph::secrets`).** In an UNLATCHED, clean tab
-    — the point is that this is independent of taint — write a
-    `context_note` whose text carries a credential-shaped value (use a fake one
+16. **The memory secret screen (`graph::secrets`, decision 22).** In an
+    UNLATCHED, clean tab — the point is that this is independent of taint —
+    write a `context_note` whose text carries a credential-shaped value (use a
+    fake one
     matching a vendor-prefix rule; `benign_notes_do_not_match` lists what must
     not match). The note is **stored, not refused and not redacted**, appears in
     the Memory view's review queue, and is absent from `context_recall`,
@@ -3150,8 +3525,9 @@ are the ones the list above does not reach.
     "key", "token" and "password" unquoted is stored clean. Second control:
     write a note that trips **both** taint and the secret screen under an
     EXTERNAL latch — both notices are appended, one row.
-17. **The headless persistent-write refusal (M-2).** Stop cImp entirely, then
-    have a Claude or OpenCode tab call `context_note` through the MCP child.
+17. **The headless persistent-write refusal (M-2, decision 21).** Stop cImp
+    entirely, then have a Claude or OpenCode tab call `context_note` through the
+    MCP child.
     It must return the fixed `NOT SAVED: …` string, which says the condition is
     **transient**, and write its own `ok:false` activity row. `context_recall`
     and the `graph_*` reads on the same path must still work (reads stay
@@ -3185,8 +3561,9 @@ are the ones the list above does not reach.
     hardened combination — and confirm the cache is still invalidated when the
     latch moves, since the invalidation now sits **above** the beacon's own
     enable guard.
-20. **`/audit/run` and `/run` are inside the latch (C-1b, C-1c).** Latch a tab
-    EXTERNAL through a proxied `ddg__fetch_content`. Then: `security_audit`
+20. **`/audit/run` and `/run` are inside the latch (C-1b, C-1c, decision 18).**
+    Latch a tab EXTERNAL through a proxied `ddg__fetch_content`. Then:
+    `security_audit`
     (which arrives through the *separate* `cimp-code-audit` MCP server, not the
     offload child) must be refused with `REFUSAL_LOCAL_BLOCKED`, and no scan
     may start; `offload_task { profile: "code", instructions: "…" }` and

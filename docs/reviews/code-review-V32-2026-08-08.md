@@ -40,8 +40,8 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | H-6 | Bundle authenticated by TLS + repo-write only | **DECLINED** | locked decision 28 — key would live inside the blast radius |
 | H-7 | A cloned repo's `opencode.json` is executed configuration | **OPEN** | largely V33 (OS containment); record as known-open meanwhile |
 | H-8 | `/audit/run`'s taint gate is opt-in by the caller | **FIXED** | `80375a9` — `tab` required + `consumer` narrowed; both halves |
-| H-9 | Forensic activity rows are model-evictable | **FIXED** | one retention lane per `Screen` (not the proposed pin); lane set derived from `Screen::ALL` |
-| H-10 | A failed detection-status read renders the layer ARMED | **OPEN** | |
+| H-9 | Forensic activity rows are model-evictable | **FIXED** | `d652171` — one retention lane per `Screen` (not the proposed pin); lane set derived from `Screen::ALL` |
+| H-10 | A failed detection-status read renders the layer ARMED | **FIXED** | `ba0b0d7` — `SignatureHealth` has no `null`; unknown travels as a hierarchy row |
 | F-2 | `^` anchors to byte 0, not line start — three patterns dead | **FIXED** | `5920c92` — folded into H-4 (same file, same class) |
 | M-4 | A classifier that ran and failed is indistinguishable from clean | **FIXED** | `5920c92` — `Scored.failed` → `incomplete`, scored windows kept |
 | N-8 | Unbounded `previous/classifier/<version>` retention | **FIXED** | `5920c92` — died with the classifier component |
@@ -496,7 +496,17 @@ the test never looks.
 
 ### H-10 — a failed detection-status read renders the signature layer as ARMED
 
-> **STATUS: OPEN.** Verified by hand, including that `latch.test.ts:227` pins the wrong behaviour as correct.
+> **STATUS: FIXED — `ba0b0d7`.** **The type made the bug expressible**, so the type was the fix: `{armed} | null` conflated *a failed read* with *nothing to add*, and `SignatureHealth` is now `{armed} | 'unknown' | 'pending'` with **no `null` member** — the pass-through case must be typed as the word `'pending'`.
+>
+> **Both halves of the "or" below were needed**, and the second alone was insufficient. Letting the failure reach the outer `catch` would (a) discard the good hierarchy the backend just returned, (b) leave the tab badge and popover still rendering unknown-as-armed, since `injectionStatusUnknown` has no per-tab surface, and (c) make the chip claim it cannot read the switches when it can. So the read is caught **locally inside the same try**, and the uncertainty travels as a **row in the hierarchy** — where per-scope facts already live — while the health accounting reuses `recordPoll`, `UNKNOWN_AFTER_FAILURES = 3` and the existing 4 s tick with its own counter, because the two reads fail independently. `injectionStatusUnknown` keeps its exact meaning (*the hierarchy itself* is unreadable) and is untouched — setting it here would be the opposite lie, claiming total blindness while every switch is visible.
+>
+> Three states are distinguishable at **every** render site, not just in the model: the status chip gains a fourth word `unverified` (reusing `reduced` would point the user at a switch to flip, which is wrong when nothing was switched), and the tab badge, taint popover and Settings panel each render unknown distinctly. The popover no longer says "off" of a row it could not read. A mixed case states both claims in separate sentences rather than letting one outrank the other.
+>
+> `latch.test.ts:227` is **inverted, not deleted**, and paired with a test that unknown stays distinguishable from **not-armed** — collapsing those two is a *different* lie that the inverted test alone would pass. Verified RED against the pre-fix guard: 4 failed / 33 passed.
+>
+> **Known gap, not introduced here:** `vitest` runs in node with no DOM and the repo has no component harness, so render decisions were extracted to pure exported functions (the convention `latch.ts` already documents) and the tests assert the exact strings and class-driving values rather than component output. A component-level harness is a separate decision.
+>
+> **Rust side checked and clean** (report only): `detection_status` errors only on a `spawn_blocking` JoinError, `detection::status()` is infallible, and `armed = files_loaded > 0 && rules > 0` is the backend's own predicate — no path reports a failed read as armed.
 
 `src/lib/latch.ts:255-258` · `offload.ts:300-307` · test `latch.test.ts:227`
 

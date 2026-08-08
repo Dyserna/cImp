@@ -24,6 +24,40 @@ Green, and green is not the same as contained — see below.
 
 ---
 
+## Status ledger
+
+Updated as findings are dispositioned. **FIXED** means closed in code with a
+test; **DECLINED** means a recorded decision not to fix, with reasoning;
+**PARTIAL** means the useful half landed and the residual is named.
+
+| # | Finding | Status | Where |
+|---|---|---|---|
+| H-1 | C-1 open — `graph_struct_search`/`graph_repo_map` are TRUSTED source readers | **OPEN** | needs a decision amendment, not just a `TABLE` edit |
+| H-2 | C-2 open — contamination clears on any newline-terminated byte | **OPEN** | |
+| H-3 | SSRF — `http:/host`, `http:host`, `http:\host` evade the screen | **OPEN** | |
+| H-4 | Every shipped rule defeated by invisible whitespace | **FIXED** | `5920c92` — rules + normalizer + corpus; 20/50 evading → 0/53 |
+| H-5 | Update channel inert by construction (302 vs redirect ban) | **FIXED** | `5920c92` — `raw.githubusercontent.com` branch + the missing guard |
+| H-6 | Bundle authenticated by TLS + repo-write only | **DECLINED** | locked decision 28 — key would live inside the blast radius |
+| H-7 | A cloned repo's `opencode.json` is executed configuration | **OPEN** | largely V33 (OS containment); record as known-open meanwhile |
+| H-8 | `/audit/run`'s taint gate is opt-in by the caller | **OPEN** | |
+| H-9 | Forensic activity rows are model-evictable | **OPEN** | |
+| H-10 | A failed detection-status read renders the layer ARMED | **OPEN** | |
+| F-2 | `^` anchors to byte 0, not line start — three patterns dead | **FIXED** | `5920c92` — folded into H-4 (same file, same class) |
+| M-4 | A classifier that ran and failed is indistinguishable from clean | **FIXED** | `5920c92` — `Scored.failed` → `incomplete`, scored windows kept |
+| N-8 | Unbounded `previous/classifier/<version>` retention | **FIXED** | `5920c92` — died with the classifier component |
+| N-10 | Corpus-echo bundle passes the whole gauntlet | **PARTIAL** | `5920c92` — `coverage_floor` catches the curation case, not a hostile publisher |
+| N-12 | 512 MiB aggregate-download exposure | **FIXED** | `5920c92` — died with the classifier component |
+| O-1 | The H-1 race guard is `#[ignore]`d and CI never runs `--ignored` | **OPEN** | one extra step in `tests.yml` |
+| — | Pre-existing 1-in-4 test flake on the global rule slot | **FIXED** | `5920c92` — guard made structural in `screen_blocking` |
+
+Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
+
+**Not a finding, but the reason several of these survived:** three regression
+tests pin the defect's *shape* rather than the invariant (see *The pattern*).
+Any fix run here should check what the existing test would still pass with.
+
+---
+
 ## The pattern
 
 Ten of the findings below share one shape, and it is worth stating before the list
@@ -55,6 +89,8 @@ channel URL that always redirects. No single-module reviewer could see it.
 ## HIGH findings
 
 ### H-1 — C-1 is OPEN: the TRUSTED class carries a general source-text read primitive
+
+> **STATUS: OPEN.** Two reviewers found this independently from opposite entry points; verified by hand. The locked taxonomy table lists `graph_struct_search` under TRUSTED too, so closing it needs a **decision amendment**, not just a `TABLE` edit.
 
 `offload/toolclass.rs:205,211` · `graph/mcp.rs:1929-1944` · `graph/builder.rs:838-845`
 
@@ -97,6 +133,8 @@ navigational value, which is why the class exists.
 
 ### H-2 — C-2 is OPEN: contamination clears on any newline-terminated byte
 
+> **STATUS: OPEN.** Found independently by three reviewers; all three links verified by hand. The regression test asserts `gate.observed(0, 0)` — the PoC’s zero-byte file — so one byte of content defeats the fix.
+
 `oob/claude.rs:271-277,1544-1559` · `offload/loopback.rs:1280-1292`
 
 Found independently by three reviewers; verified by hand across all three links.
@@ -121,6 +159,8 @@ recognised entry decoded" out instead of the raw offset delta); or decouple
 `contaminated = false` from rotation and clear it only on tab teardown.
 
 ### H-3 — SSRF: the screen matches literal `http://`, the fetcher accepts `http:`, `http:/`, `http:\`
+
+> **STATUS: OPEN.** The reviewer compiled the extractor against the app’s own `url 2.5.8` and executed it, so the table below is observed output rather than inference.
 
 `offload/outbound.rs:239,343-364,738-749`
 
@@ -157,6 +197,8 @@ every argument string, as written and stripped, if `Url::parse` yields a host th
 `is_denied_ip` rejects, `screen_urls` must deny.*
 
 ### H-4 — every shipped detection rule is defeated by whitespace the reader cannot see
+
+> **STATUS: FIXED — `5920c92`.** Rules widened to `\s{1,8}`, plus `signature::normalize_for_scan` and a second unioned scan pass, plus three smoke-corpus controls so the updater’s gauntlet enforces it on every future bundle. Measured 20/50 hostile probes evading to **0/53**, with 15 benign controls still clean. Locked decision 7 amended.
 
 `detection/rules.d/*.yar` — all nine text rules
 
@@ -195,6 +237,8 @@ ZWSP variants to `detection/smoke/hostile/` so the updater's gauntlet enforces i
 every future bundle.
 
 ### H-5 — the detection update channel is inert by construction
+
+> **STATUS: FIXED — `5920c92`.** Channel repointed to a `raw.githubusercontent.com` branch ref (verified 200, no redirect), and the missing guard added: the pinned URL is now asserted against our own redirect policy, with release-asset paths rejected by name. Locked decision 27; decision 24 unblocked.
 
 `updater/manifest.rs:133` (pinned URL) vs `manifest.rs:692-697`
 (`redirect::Policy::none()`)
@@ -295,6 +339,8 @@ second-best: narrow `permissions:` to the publishing job and add
 
 ### H-7 — a cloned repo's `opencode.json` is executed configuration
 
+> **STATUS: OPEN.** Verified live against the installed OpenCode via `opencode debug config` and `debug agent build`. Mostly V33 territory (OS-level containment), but worth recording as *known-open* rather than left implicit — the docs currently present the additive posture as benign.
+
 `tabs/config.rs:1954,1350,1435,1887`
 
 Verified live against the installed OpenCode via `opencode debug config` /
@@ -325,6 +371,8 @@ never names what else merges in.
 
 ### H-8 — `POST /audit/run`'s taint gate is opt-in by the caller
 
+> **STATUS: OPEN.** Verified by hand: `gate()` returns `Ok(WriteTaint::Clean)` when `scope` is `None`, and the `Anonymous` arm does not even log.
+
 `offload/loopback.rs:2553-2587` · fail-open at `loopback.rs:1583-1585`
 
 Verified by hand. The gate's only identity input is `body.tab`, caller-supplied.
@@ -347,6 +395,8 @@ what leaks here is *latch state*.
 restrict `consumer` to `{"claude","opencode"}` at the parse boundary.
 
 ### H-9 — forensic activity rows are still model-evictable
+
+> **STATUS: OPEN.** Note that the guard test asserts the breach — it floods past the cap and never checks that the targeted row survived.
 
 `activity.rs:488-507,74` · `graph/mcp.rs:1146-1152,911-927`
 
@@ -373,6 +423,8 @@ the test never looks.
 `assert!(snap.iter().any(|e| e.target == "a denial"))` to the test.
 
 ### H-10 — a failed detection-status read renders the signature layer as ARMED
+
+> **STATUS: OPEN.** Verified by hand, including that `latch.test.ts:227` pins the wrong behaviour as correct.
 
 `src/lib/latch.ts:255-258` · `offload.ts:300-307` · test `latch.test.ts:227`
 
@@ -401,34 +453,34 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 
 ## MEDIUM findings
 
-| # | Finding | Location |
-|---|---|---|
-| M-1 | Worker budget/latch is per-**attempt**, not per-task — `run_on` is called up to 4× (fail-over, thinking retry, tier escalation), each with a fresh `Budget::default()`. The 4 MiB/40-call cap is really 8 MiB/80 on a default install, 16 MiB/160 with fail-over configured. A loop that resets its own cap is not stopped. | `agent.rs:1502-1505`, `service.rs:1147-1252` |
-| M-2 | The A-1 fix **inverted a fail-closed default**: a native name missing from `TABLE` used to classify EXTERNAL and be refused/latched; now it "neither latches nor is refused" and falls through to dispatch. Load-bearing in both directions, with no test and no tripwire. | `agent.rs:1258-1268`, `loopback.rs:1586-1589` |
-| M-3 | Spotlighting is spawn-baked in practice (`fact_promotion_block` → `--append-system-prompt` / OpenCode instructions) but declared live: absent from `spawn_inject_sig`, no restart hint. Toggling it on mid-session leaves the running tab injecting **unenveloped pre-V32 memory into the system prompt**. Test pins the defect. | `config.rs:1082-1089`, `injection.rs:330-337,1736` |
-| M-4 | A classifier that runs and fails is indistinguishable from Clean, and a failing window **discards windows that already scored over threshold**. `Scored` has no field to express it. The spec names exactly two exclusions; the code implements three. | `classifier.rs:391-399`, `mod.rs:404-409` |
-| M-5 | At the worker, the "unscreened" notice is **false every time it fires**: `cap_result` truncates to 32 KB, unconditionally below both screening caps, so every byte the model sees was scanned. Trains the reader to discount a notice that is true at the proxy. | `mod.rs:387-394`, `agent.rs:1910/1928` |
-| M-6 | Audit findings enter model context with no envelope, no detection scan, and without contaminating the conversation — scanner-quoted text from `node_modules` is framed as authoritative project data, and `context_note` afterwards is *not* quarantined. `context_recall`, strictly tamer, *is* enveloped. | `audit/mcp.rs:248-266`, `loopback.rs:2618-2621,1706-1708` |
-| M-7 | Three ungated loopback routes reach local capability; `POST /context/post_edit` **executes the project's configured checks** for a caller-supplied `cwd`. None carries a `tab`; none appears in any route enumeration. | `loopback.rs:3297-3328,2659,2768` |
-| M-8 | `run_check` dispatches **above** the class gate on the headless path, so an EXTERNAL-latched tab that corrupts `.cimp-discovery` runs the project's build/test/lint while `ddg__*` stays live. | `graph/mcp.rs:516-529` |
-| M-9 | The `#46` outcome split covers the manifest fetch but not the **artifact** fetch: any asset 404/timeout is recorded as a bundle *rejection* (red card, `unreachable_streak` reset). The deploy note's own publish order makes this the likely steady state. | `updater/mod.rs:1032-1039,1059` |
-| M-10 | A crash *during* rollback deletes the files the rollback already restored — the journal has two phases and the rollback is an unrepresented third state. Permanent, uncarded, and `warn!`s "the previous version was restored". | `updater/mod.rs:1423-1434,1365-1370` |
-| M-11 | `restore_archived` swallows per-file failures; the caller then reports "the previous version was restored" verbatim, and `healthy` cannot see missing files. Silent permanent coverage loss with a reassuring message. | `updater/mod.rs:1401-1413` |
-| M-12 | Crash recovery only runs when the updater is enabled *and* something is due. A user who turns detection off after a crash strands a short/empty `rules.d` permanently — "never degrade to no rules" fails closed on an unrelated switch. | `updater/mod.rs:1974-1999` |
-| M-13 | An identifier collision between a shipped rule and a user rule freezes the update channel forever and blames the user's file — U-4's exact symptom, in the case the README tells users to expect. | `updater/mod.rs:430-437` |
-| M-14 | The updater's run lock is process-local; two instances sharing an exe directory race the swap and can destroy the old bundle with the journal pointing at an empty archive. | `updater/mod.rs:490`, `store.rs:69` |
-| M-15 | H-1's gate-cache fix narrows the race but does not close it: the epoch is bumped *before* the beacon POST and never after it resolves, so a query issued **during** the POST caches an `open` verdict for a full 2 s TTL. | `config.rs:1758-1772,1650-1680` |
-| M-16 | `read` is deliberately left unpinned to preserve OpenCode's `*.env` → "ask" carve-out — but last-match-wins applies to the *project* config too. A repo shipping `{"permission":{"read":"allow"}}` resolves `read * → allow` and `.env` is read with no prompt. Verified live. | `config.rs:2038-2043` |
-| M-17 | `/mcp/call` and worker error paths carry the remote MCP server's `error.message` verbatim and up to 300 chars of raw response body — unscreened, unwrapped, unbudgeted — while both call sites' comments assert these are cImp-composed strings. | `mcp_host.rs:1282-1314`, `loopback.rs:3804` |
-| M-18 | The SSRF widening reads CIDR notation and doc placeholders as fetch targets: `"RFC1918 (10.0.0.0/8)"` in a *search query* refuses the whole call with a security error. Compounds — each benign denial raises the power-of-two threshold that suppresses a later real one. | `outbound.rs:386-415,660-684` |
-| M-19 | Decision 21's "empty is not absent" reasoning is applied on the headless path but not the loopback path: a `PersistentWrite` with no resolvable tab identity is stored **unquarantined**, and `scoped_session` attributes it to another tab's session. | `loopback.rs:1572-1584`, `graph/mcp.rs:1114-1125` |
-| M-20 | `context_note` text is unbounded and the secret screen only sees the first 256 KiB — 256 KiB of filler then an AWS key stores Clean. `secrets.rs:120-128` asserts the opposite ("it cannot reach either bound"). | `graph/mcp.rs:1107,1146` |
-| M-21 | A worker-only detection override leaves the updater inert and the manual buttons lying: `updates_enabled` resolves at `Scope::App`, which deliberately excludes the worker row, so the UI says "detection is off" about a layer that is running. | `updater/mod.rs:246-252`, `injection.rs:724-729` |
-| M-22 | The override popover renders a click-time snapshot that never updates while open — a tab that becomes contaminated while the user reads it keeps saying "Not latched." | `TabBar.svelte:68-102` |
-| M-23 | Promote (unquarantines attacker-authored text into future sessions) is one unconfirmed click; Discard (which can only lose a note) is behind a modal. Polarity inverted vs. the latch UI, which gets it right. | `CodeIntelligenceView.svelte:338-339` |
-| M-24 | `Unscreened`, detector flags, `MemoryQuarantine` and `LatchOverride` collapse into one red chip; only denials are visually distinct. "We did not look at all of it" reads as "we blocked something" — the opposite. | `ToolActivityView.svelte:356-375` |
-| M-25 | The frontend branches on `rules.armed` where the backend publishes `rules.healthy` for exactly this question — 3 of 4 rule files failing renders full protection. `offload.ts:212` documents that `healthy` must be read, never restated. | `latch.ts:259` |
-| M-26 | `FILE_COMPACT_LINES` equals the sum of the per-kind caps (1000), so at saturation every single write triggers a full file read + atomic rewrite, and the accepted child-append race opens on every write instead of every ~1000. | `activity.rs:58-84,472` |
+| # | Finding | Status | Location |
+|---|---|---|---|
+| M-1 | Worker budget/latch is per-**attempt**, not per-task — `run_on` is called up to 4× (fail-over, thinking retry, tier escalation), each with a fresh `Budget::default()`. The 4 MiB/40-call cap is really 8 MiB/80 on a default install, 16 MiB/160 with fail-over configured. A loop that resets its own cap is not stopped. | OPEN | `agent.rs:1502-1505`, `service.rs:1147-1252` |
+| M-2 | The A-1 fix **inverted a fail-closed default**: a native name missing from `TABLE` used to classify EXTERNAL and be refused/latched; now it "neither latches nor is refused" and falls through to dispatch. Load-bearing in both directions, with no test and no tripwire. | OPEN | `agent.rs:1258-1268`, `loopback.rs:1586-1589` |
+| M-3 | Spotlighting is spawn-baked in practice (`fact_promotion_block` → `--append-system-prompt` / OpenCode instructions) but declared live: absent from `spawn_inject_sig`, no restart hint. Toggling it on mid-session leaves the running tab injecting **unenveloped pre-V32 memory into the system prompt**. Test pins the defect. | OPEN | `config.rs:1082-1089`, `injection.rs:330-337,1736` |
+| M-4 | A classifier that runs and fails is indistinguishable from Clean, and a failing window **discards windows that already scored over threshold**. `Scored` has no field to express it. The spec names exactly two exclusions; the code implements three. | **FIXED** `5920c92` | `classifier.rs:391-399`, `mod.rs:404-409` |
+| M-5 | At the worker, the "unscreened" notice is **false every time it fires**: `cap_result` truncates to 32 KB, unconditionally below both screening caps, so every byte the model sees was scanned. Trains the reader to discount a notice that is true at the proxy. | OPEN | `mod.rs:387-394`, `agent.rs:1910/1928` |
+| M-6 | Audit findings enter model context with no envelope, no detection scan, and without contaminating the conversation — scanner-quoted text from `node_modules` is framed as authoritative project data, and `context_note` afterwards is *not* quarantined. `context_recall`, strictly tamer, *is* enveloped. | OPEN | `audit/mcp.rs:248-266`, `loopback.rs:2618-2621,1706-1708` |
+| M-7 | Three ungated loopback routes reach local capability; `POST /context/post_edit` **executes the project's configured checks** for a caller-supplied `cwd`. None carries a `tab`; none appears in any route enumeration. | OPEN | `loopback.rs:3297-3328,2659,2768` |
+| M-8 | `run_check` dispatches **above** the class gate on the headless path, so an EXTERNAL-latched tab that corrupts `.cimp-discovery` runs the project's build/test/lint while `ddg__*` stays live. | OPEN | `graph/mcp.rs:516-529` |
+| M-9 | The `#46` outcome split covers the manifest fetch but not the **artifact** fetch: any asset 404/timeout is recorded as a bundle *rejection* (red card, `unreachable_streak` reset). The deploy note's own publish order makes this the likely steady state. | OPEN | `updater/mod.rs:1032-1039,1059` |
+| M-10 | A crash *during* rollback deletes the files the rollback already restored — the journal has two phases and the rollback is an unrepresented third state. Permanent, uncarded, and `warn!`s "the previous version was restored". | OPEN | `updater/mod.rs:1423-1434,1365-1370` |
+| M-11 | `restore_archived` swallows per-file failures; the caller then reports "the previous version was restored" verbatim, and `healthy` cannot see missing files. Silent permanent coverage loss with a reassuring message. | OPEN | `updater/mod.rs:1401-1413` |
+| M-12 | Crash recovery only runs when the updater is enabled *and* something is due. A user who turns detection off after a crash strands a short/empty `rules.d` permanently — "never degrade to no rules" fails closed on an unrelated switch. | OPEN | `updater/mod.rs:1974-1999` |
+| M-13 | An identifier collision between a shipped rule and a user rule freezes the update channel forever and blames the user's file — U-4's exact symptom, in the case the README tells users to expect. | OPEN | `updater/mod.rs:430-437` |
+| M-14 | The updater's run lock is process-local; two instances sharing an exe directory race the swap and can destroy the old bundle with the journal pointing at an empty archive. | OPEN | `updater/mod.rs:490`, `store.rs:69` |
+| M-15 | H-1's gate-cache fix narrows the race but does not close it: the epoch is bumped *before* the beacon POST and never after it resolves, so a query issued **during** the POST caches an `open` verdict for a full 2 s TTL. | OPEN | `config.rs:1758-1772,1650-1680` |
+| M-16 | `read` is deliberately left unpinned to preserve OpenCode's `*.env` → "ask" carve-out — but last-match-wins applies to the *project* config too. A repo shipping `{"permission":{"read":"allow"}}` resolves `read * → allow` and `.env` is read with no prompt. Verified live. | OPEN | `config.rs:2038-2043` |
+| M-17 | `/mcp/call` and worker error paths carry the remote MCP server's `error.message` verbatim and up to 300 chars of raw response body — unscreened, unwrapped, unbudgeted — while both call sites' comments assert these are cImp-composed strings. | OPEN | `mcp_host.rs:1282-1314`, `loopback.rs:3804` |
+| M-18 | The SSRF widening reads CIDR notation and doc placeholders as fetch targets: `"RFC1918 (10.0.0.0/8)"` in a *search query* refuses the whole call with a security error. Compounds — each benign denial raises the power-of-two threshold that suppresses a later real one. | OPEN | `outbound.rs:386-415,660-684` |
+| M-19 | Decision 21's "empty is not absent" reasoning is applied on the headless path but not the loopback path: a `PersistentWrite` with no resolvable tab identity is stored **unquarantined**, and `scoped_session` attributes it to another tab's session. | OPEN | `loopback.rs:1572-1584`, `graph/mcp.rs:1114-1125` |
+| M-20 | `context_note` text is unbounded and the secret screen only sees the first 256 KiB — 256 KiB of filler then an AWS key stores Clean. `secrets.rs:120-128` asserts the opposite ("it cannot reach either bound"). | OPEN | `graph/mcp.rs:1107,1146` |
+| M-21 | A worker-only detection override leaves the updater inert and the manual buttons lying: `updates_enabled` resolves at `Scope::App`, which deliberately excludes the worker row, so the UI says "detection is off" about a layer that is running. | OPEN | `updater/mod.rs:246-252`, `injection.rs:724-729` |
+| M-22 | The override popover renders a click-time snapshot that never updates while open — a tab that becomes contaminated while the user reads it keeps saying "Not latched." | OPEN | `TabBar.svelte:68-102` |
+| M-23 | Promote (unquarantines attacker-authored text into future sessions) is one unconfirmed click; Discard (which can only lose a note) is behind a modal. Polarity inverted vs. the latch UI, which gets it right. | OPEN | `CodeIntelligenceView.svelte:338-339` |
+| M-24 | `Unscreened`, detector flags, `MemoryQuarantine` and `LatchOverride` collapse into one red chip; only denials are visually distinct. "We did not look at all of it" reads as "we blocked something" — the opposite. | OPEN | `ToolActivityView.svelte:356-375` |
+| M-25 | The frontend branches on `rules.armed` where the backend publishes `rules.healthy` for exactly this question — 3 of 4 rule files failing renders full protection. `offload.ts:212` documents that `healthy` must be read, never restated. | OPEN | `latch.ts:259` |
+| M-26 | `FILE_COMPACT_LINES` equals the sum of the per-kind caps (1000), so at saturation every single write triggers a full file read + atomic rewrite, and the accepted child-append race opens on every write instead of every ~1000. | OPEN | `activity.rs:58-84,472` |
 
 ---
 
@@ -637,3 +689,35 @@ additive OpenCode posture as benign.
 The doc corrections (`HARNESS-NATIVE-TOOLS.md` especially) are cheap and should land
 regardless: it is the document a reviewer consults to learn what the latch covers,
 and it currently describes closed holes as open and shipped gates as unbuilt.
+
+### Progress against that disposition (updated 2026-08-08, `5920c92` + `952ae2b`)
+
+The release blocker stands, and the blocking set is now **H-1, H-2, H-3, H-8,
+H-9, H-10**. H-4 is closed.
+
+- **H-4 FIXED**, and it was the one blocking item that could be closed without a
+  design decision: measured 20/50 hostile probes evading → 0/53, enforced going
+  forward by the smoke corpus so the gauntlet rejects any bundle that regresses
+  it. **F-2** and **M-4** closed with it.
+- **H-5 FIXED and H-6 DECLINED**, so the `detection-v1` publish is unblocked.
+  H-6's reasoning is locked decision 28: a signing key usable by the release
+  process would live inside the blast radius it is meant to bound, because the
+  same `contents: write` publishes the binary. The residual it leaves — narrowing
+  `release.yml`'s workflow-level token — is a maintenance item that protects the
+  binary release, not a V32 blocker.
+- **N-10 PARTIAL**: `coverage_floor` closes the curation half. The hostile-
+  publisher half is knowingly left open, for the same reason H-6 was declined.
+- **N-8 and N-12 FIXED** as a side effect of retiring the classifier component;
+  neither was worth fixing on its own, and both stopped existing.
+- **The remaining six HIGHs are unchanged**, and two of them (H-1, H-7) need a
+  decision from the owner before code: H-1's fix shape (demote the tools vs strip
+  `signature` from `fmt_symbols`) and whether H-7's hermetic OpenCode mode ships
+  in V32 or waits for V33.
+
+**On the definition of done, unchanged and still the gating item:** none of the
+live-verify recipes has been run. Two were added this pass — recipe 10's
+obfuscation variants and the new 11c transport check — and 11c matters most,
+because recipes 11 and 11b stage the manifest on a local server that answers 200
+and therefore *cannot* catch H-5. A verification step that validates everything
+except the property that differs between staging and production is how H-5
+survived, and it would have survived the next review too.

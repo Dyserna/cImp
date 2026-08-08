@@ -40,7 +40,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | H-6 | Bundle authenticated by TLS + repo-write only | **DECLINED** | locked decision 28 — key would live inside the blast radius |
 | H-7 | A cloned repo's `opencode.json` is executed configuration | **OPEN** | largely V33 (OS containment); record as known-open meanwhile |
 | H-8 | `/audit/run`'s taint gate is opt-in by the caller | **FIXED** | `80375a9` — `tab` required + `consumer` narrowed; both halves |
-| H-9 | Forensic activity rows are model-evictable | **OPEN** | |
+| H-9 | Forensic activity rows are model-evictable | **FIXED** | one retention lane per `Screen` (not the proposed pin); lane set derived from `Screen::ALL` |
 | H-10 | A failed detection-status read renders the layer ARMED | **OPEN** | |
 | F-2 | `^` anchors to byte 0, not line start — three patterns dead | **FIXED** | `5920c92` — folded into H-4 (same file, same class) |
 | M-4 | A classifier that ran and failed is indistinguishable from clean | **FIXED** | `5920c92` — `Scored.failed` → `incomplete`, scored windows kept |
@@ -434,7 +434,41 @@ restrict `consumer` to `{"claude","opencode"}` at the parse boundary.
 
 ### H-9 — forensic activity rows are still model-evictable
 
-> **STATUS: OPEN.** Note that the guard test asserts the breach — it floods past the cap and never checks that the targeted row survived.
+> **STATUS: FIXED — but NOT by the fix proposed below, which does not close it.**
+> A `pinned: bool` from `Screen::is_forensic()` fails on its own exploit:
+> `MemoryQuarantine` is simultaneously *in* the forensic set and *is* the flood
+> vector, so 200 quarantine rows evict the `Canary`/`LatchBeacon` rows again —
+> now inside the protected lane — and an unbounded pinned lane would make one
+> row per `context_note` an unbounded growth channel on a file-backed store.
+>
+> What landed instead is a **retention lane per `Screen`** (`activity::Lane`,
+> `enforce_kind_caps` → `enforce_lane_caps`): a lane is a kind, except for
+> `injection_flag`, where it is one screen. Each lane keeps its own newest
+> `INJECTION_FLAG_SCREEN_CAP` (64) rows and evicts only its own oldest, so
+> **no screen's volume can cost another screen its history**, every screen stays
+> bounded, and a chatty screen still keeps its own recent window. The lane set
+> comes from `Screen::ALL`, emitted by a new `declare_screens!` macro from the
+> variant list — so F-3's contamination-event row inherits the guarantee by
+> existing, and sharing a lane would take a deliberate edit. Unrecognized
+> sources (a newer file, a retired wire value) share one bounded catch-all lane.
+>
+> `FILE_COMPACT_LINES` is now derived (`TOTAL_CAPACITY + 500`, held by a
+> `const _: () = assert!(…)`): the old literal `1000` was exactly the then-total
+> capacity, i.e. a saturated store would re-read and rewrite the whole JSONL on
+> every record, and adding lanes would have walked the write path onto that
+> cliff silently.
+>
+> The guard test was fixed, not deleted, and eight tests were added: the literal
+> exploit asserted **by content**, the reverse flood, the full
+> flooder × victim matrix generated from `Screen::ALL`, boundedness under a
+> flood of every screen, non-starvation, the catch-all lane, and survival across
+> a compaction + reload round-trip. All eight go RED against the pre-fix
+> eviction.
+>
+> Side finding closed on the way: `screen_labels_are_the_distinct_wire_values`
+> iterated a hand-written ten-element array and had never seen
+> `Screen::Unscreened` — the same drift `declare_origins!` was introduced to
+> prevent, one enum over. It now iterates `Screen::ALL`.
 
 `activity.rs:488-507,74` · `graph/mcp.rs:1146-1152,911-927`
 
@@ -751,6 +785,16 @@ H-9, H-10**. H-4 is closed.
   decision from the owner before code: H-1's fix shape (demote the tools vs strip
   `signature` from `fmt_symbols`) and whether H-7's hermetic OpenCode mode ships
   in V32 or waits for V33.
+
+**Later the same day** (H-1 `0169d10`, H-2 `2c40136`, H-3 `e5f3627`, H-8
+`80375a9`, H-9), the blocking set is down to **H-7 and H-10**. H-9's entry above
+records the one place where the *proposed* fix was rejected on analysis: a
+forensic pin does not survive its own exploit, because the flood vector is
+itself forensic. Retention is now per screen, which makes the property
+structural — "no source's volume costs another source its history" — instead of
+a privilege list somebody has to keep correct. F-3 remains the prerequisite for
+the clear path; the lane design does not constrain it (a contamination row is a
+new `Screen` variant, and gets its own protected lane by existing).
 
 **On the definition of done, unchanged and still the gating item:** none of the
 live-verify recipes has been run. Two were added this pass — recipe 10's

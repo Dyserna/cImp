@@ -856,12 +856,17 @@ impl McpHost {
     /// `audit` is the calling scope's claim ledger. Every denial used to write
     /// an `injection_flag` row with no dedup at all — unlike the budget and
     /// latch-refusal rows, which have had a claim bit since Phase C — and that
-    /// feed is capped at `INJECTION_FLAG_CAP` and evicts oldest-first *within a
-    /// kind*. So a model looping denied URLs did not merely make noise: it
-    /// evicted the `Canary`, `LatchBeacon` and `MemoryQuarantine` rows that are
-    /// the only forensic record of an attack that got through. `269daf2` made
-    /// it cheaper still, by turning 25 previously-allowed call shapes into a
-    /// denial each.
+    /// feed was one capped window evicted oldest-first *within a kind*. So a
+    /// model looping denied URLs did not merely make noise: it evicted the
+    /// `Canary`, `LatchBeacon` and `MemoryQuarantine` rows that are the only
+    /// forensic record of an attack that got through. `269daf2` made it cheaper
+    /// still, by turning 25 previously-allowed call shapes into a denial each.
+    ///
+    /// #48 finding H-9 moved the cross-screen half of that guarantee into the
+    /// store itself (`activity::Lane`: one retention window per [`Screen`], so
+    /// no screen's volume can cost another screen its rows). What this ledger
+    /// still buys is the SSRF screen's OWN window: without it, denial 1 — the
+    /// interesting one — is evicted by denial 65.
     ///
     /// The refusal served to the model is [`outbound::REFUSAL_SSRF`] whatever
     /// the ledger says — locked decision 11 fixes that string precisely so a

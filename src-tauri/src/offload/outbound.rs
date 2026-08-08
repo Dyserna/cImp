@@ -949,12 +949,19 @@ impl Budget {
 
 // ── Per-scope audit-row claims ─────────────────────────────────────────────
 //
-// The `injection_flag` feed is capped (`activity::INJECTION_FLAG_CAP`, 200) and
-// evicts the OLDEST row of its kind. So an unbounded row source is not merely
-// noisy: a model looping one refused shape destroys the `Canary`,
-// `LatchBeacon` and `MemoryQuarantine` rows that are the only forensic record
-// of the attack that got through. `Budget` already solved this for the
-// exhaustion row with a claim bit; these are the two screens that were missed.
+// The `injection_flag` feed is capped and evicts the oldest row in a lane. It
+// USED to evict the oldest row of the whole *kind*, which made an unbounded row
+// source more than noisy: a model looping one refused shape destroyed the
+// `Canary`, `LatchBeacon` and `MemoryQuarantine` rows that are the only
+// forensic record of the attack that got through. #48 finding H-9 closed that
+// at the store — a lane per [`Screen`], so a flood costs only its own screen's
+// history (`activity::INJECTION_FLAG_SCREEN_CAP`).
+//
+// These claim ledgers are what remains worth doing on top: the store now
+// protects the OTHER screens from a loop, and a claim bit protects the looping
+// screen's own window, so its first denials survive its thousandth. `Budget`
+// already solved this for the exhaustion row; these are the two screens that
+// were missed.
 
 /// What one SSRF denial should do about its `injection_flag` row (#48).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1155,37 +1162,107 @@ pub fn redact_canary(text: &str, canary: &str) -> String {
 
 // ── The `injection_flag` activity row ──────────────────────────────────────
 
+/// Declare [`Screen`], its wire values, [`Screen::ALL`] and
+/// [`Screen::from_wire`] from ONE variant list (#48, finding H-9).
+///
+/// The same move `declare_origins!` makes below, taken here for a second
+/// reason on top of drift: the activity store's retention is **per screen**
+/// (`activity::Lane`), and it decides which lane a row belongs to by looking
+/// its `source` up in [`Screen::ALL`]. A variant absent from that list would
+/// silently share the catch-all lane with every unrecognized source instead of
+/// getting its own guaranteed window — i.e. a new screen would have to be
+/// *remembered* into its own forensic protection. Emitting the list from the
+/// enum makes the protection arrive with the variant.
+///
+/// The hand-written array this replaces was already stale, which is the whole
+/// argument in one line: `screen_labels_are_the_distinct_wire_values` listed
+/// ten of the eleven variants, and [`Screen::Unscreened`] had been invisible to
+/// the test that exists to guard the set since the day it was added.
+macro_rules! declare_screens {
+    (
+        $(#[$enum_attr:meta])*
+        pub enum $name:ident {
+            $( $(#[$variant_attr:meta])* $variant:ident => $wire:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $( $(#[$variant_attr])* $variant, )+
+        }
+
+        impl $name {
+            /// Every screen, in declaration order. Derived from the variant
+            /// list above, not written beside it.
+            ///
+            /// Read in production by `activity::Lane` (one retention lane per
+            /// member) as well as by the tests that guard the set.
+            pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
+
+            /// The row's `source` column — the string the Tool Activity feed
+            /// filters and groups on, so a rename here is a UI change.
+            pub const fn as_str(self) -> &'static str {
+                match self { $( $name::$variant => $wire, )+ }
+            }
+
+            /// The inverse of [`as_str`](Self::as_str): which screen wrote a
+            /// row that is already on disk.
+            ///
+            /// `None` means "not a screen this build declares" — a row written
+            /// by a newer version, or under a wire value since retired. The
+            /// store keeps those in one shared lane rather than guessing; see
+            /// `activity::UNKNOWN_SCREEN_LANE`.
+            pub fn from_wire(source: &str) -> Option<$name> {
+                match source {
+                    $( $wire => Some($name::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+declare_screens! {
 /// Which screen produced a flag row. Serialized into the row so the Tool
 /// Activity feed can tell a network-policy denial from a budget stop from a
 /// confirmed exfiltration attempt from an ordinary latch refusal.
+///
+/// Each variant is also a **retention lane** in the activity store (#48, H-9):
+/// rows of one screen are evicted only by newer rows of that same screen, so no
+/// screen's volume can cost another screen its history. Adding a variant here
+/// adds a lane; nothing else has to be told about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     /// A URL argument resolved into a denied range (decision 11).
-    Ssrf,
+    Ssrf => "ssrf",
     /// The scope's EXTERNAL call/byte budget is spent (decision 11).
-    Budget,
+    Budget => "budget",
     /// The task's canary appeared where it must never appear (decision 12).
-    Canary,
+    Canary => "canary",
     /// A Phase A/B taint-latch refusal. Distinct from the three screens above:
     /// it is the *expected* working of containment, not evidence of an attack,
     /// and the UI must be able to tell them apart.
-    LatchRefusal,
+    LatchRefusal => "latch_refusal",
     /// V32 Phase C2 (decision 10): a `context_note` written under an EXTERNAL
     /// latch was stored **quarantined**. Like the two detection screens below
     /// it denied nothing — the note was saved — so its row reads as flagged,
     /// not failed. Its consumer is the user: without a row, a quarantined note
     /// would be discoverable only by opening the Memory view and noticing a
     /// badge.
-    MemoryQuarantine,
+    ///
+    /// The **highest-volume** variant here, and the one H-9 was about: the
+    /// secret screen fires on note content alone, with no latch, no budget and
+    /// no claim bit, so a model writing notes writes one row per note. Its own
+    /// lane is what makes that ordinary noise instead of an eviction weapon.
+    MemoryQuarantine => "memory_quarantine",
     /// The YARA signature screen matched an EXTERNAL result (decision 7).
     /// Unlike every variant above, this one and [`Screen::Classifier`] denied
     /// nothing — locked decision 5 makes detection surface-only, so their rows
     /// record a *warning that was attached to a delivered result*. See
     /// [`detection`](super::detection).
-    Signature,
+    Signature => "signature",
     /// The Prompt Guard classifier scored an EXTERNAL result over threshold
     /// (decision 7). Surface-only, like [`Screen::Signature`].
-    Classifier,
+    Classifier => "classifier",
     /// V32 review finding D-1 (#48): part of an EXTERNAL result was **not
     /// screened** — a size cap dropped some of it, or a layer that ran did not
     /// finish (a yara-x timeout is indistinguishable from a clean scan at the
@@ -1201,7 +1278,7 @@ pub enum Screen {
     /// and the result was delivered unmodified. It says only that the absence of
     /// a verdict is not a verdict of absence. One row per scope
     /// ([`AuditClaims::claim_unscreened`]) — large pages are ordinary.
-    Unscreened,
+    Unscreened => "unscreened",
     /// V32 Phase C3 (decision 13): the detection **auto-updater** checked,
     /// applied, rejected or reverted a rules/classifier bundle. Not a screen
     /// over a tool call at all — it borrows this vocabulary because its rows
@@ -1214,7 +1291,7 @@ pub enum Screen {
     /// updater row's `ok` is its outcome (rejected ⇒ false, everything else ⇒
     /// true). See
     /// [`detection::updater`](super::detection::updater)`::record_row`.
-    Updater,
+    Updater => "updater",
     /// V32 Phase F (locked decision 15): the USER moved a tab's taint latch —
     /// "switch to local" or "restore full access". Like the quarantine and the
     /// detection screens it denied nothing; unlike them it *granted* something,
@@ -1222,7 +1299,7 @@ pub enum Screen {
     /// every other row in this enum reports against, so a record of who opened
     /// it, when, and from which prior state is what makes the rest legible
     /// after the fact.
-    LatchOverride,
+    LatchOverride => "latch_override",
     /// V32 Phase F (locked decision 14), added by #45: a native-web **beacon**
     /// engaged a tab's EXTERNAL latch. The harness's own `WebFetch`/`webfetch`
     /// never routes through cImp, so this transition used to be visible only as
@@ -1233,7 +1310,8 @@ pub enum Screen {
     /// Not a denial: at beacon time nothing has been refused, exactly like
     /// [`Screen::MemoryQuarantine`]. What makes it worth reading is its
     /// [`Origin`], which is always [`Origin::Http`] — see that type.
-    LatchBeacon,
+    LatchBeacon => "latch_beacon",
+}
 }
 
 /// Declare [`Origin`] and [`Origin::ALL`] from one variant list, so the array
@@ -1318,21 +1396,8 @@ impl Origin {
 }
 
 impl Screen {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Screen::Ssrf => "ssrf",
-            Screen::Budget => "budget",
-            Screen::Canary => "canary",
-            Screen::LatchRefusal => "latch_refusal",
-            Screen::MemoryQuarantine => "memory_quarantine",
-            Screen::Signature => "signature",
-            Screen::Classifier => "classifier",
-            Screen::Unscreened => "unscreened",
-            Screen::Updater => "updater",
-            Screen::LatchOverride => "latch_override",
-            Screen::LatchBeacon => "latch_beacon",
-        }
-    }
+    // `as_str`, `ALL` and `from_wire` are emitted by `declare_screens!` above,
+    // from the same variant list that carries the wire values.
 
     /// Whether this screen actually stopped something. The two detection
     /// screens did not (surface-only), and neither did the C2 memory
@@ -2211,23 +2276,20 @@ mod tests {
     }
 
     /// Every screen's wire value, pinned: these strings are the row `source`
-    /// column the Tool Activity feed filters and groups on, so a rename is a
-    /// UI change, not a refactor.
+    /// column the Tool Activity feed filters and groups on — and, since #48
+    /// finding H-9, the key the activity store's retention lane is chosen by —
+    /// so a rename is a UI change and a retention change, not a refactor.
+    ///
+    /// #48: iterates [`Screen::ALL`], which `declare_screens!` emits from the
+    /// enum, instead of the hand-written ten-element array it used to. That
+    /// array was **already stale**: [`Screen::Unscreened`] had been missing from
+    /// it since the day the variant was added, so the test that exists to guard
+    /// the set had never seen one of its members. The literal list below is now
+    /// the *assertion* rather than the input, so a new variant fails here until
+    /// someone gives it a wire value and names it.
     #[test]
     fn screen_labels_are_the_distinct_wire_values() {
-        let all = [
-            Screen::Ssrf,
-            Screen::Budget,
-            Screen::Canary,
-            Screen::LatchRefusal,
-            Screen::MemoryQuarantine,
-            Screen::Signature,
-            Screen::Classifier,
-            Screen::Updater,
-            Screen::LatchOverride,
-            Screen::LatchBeacon,
-        ];
-        let labels: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let labels: Vec<&str> = Screen::ALL.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             labels,
             [
@@ -2238,11 +2300,24 @@ mod tests {
                 "memory_quarantine",
                 "signature",
                 "classifier",
+                "unscreened",
                 "updater",
                 "latch_override",
                 "latch_beacon"
             ]
         );
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Screen::ALL.len(),
+            "two screens share a wire value, so they would share a retention lane: {labels:?}"
+        );
+        // `from_wire` is the store's lane lookup; a value that does not round
+        // trip would put a real screen in the catch-all lane.
+        for screen in Screen::ALL.iter().copied() {
+            assert_eq!(Screen::from_wire(screen.as_str()), Some(screen));
+        }
+        assert_eq!(Screen::from_wire("not_a_screen"), None);
         // Denial vs. flagged: the quarantine STORED the note, the two detection
         // screens delivered their result, and the updater is not a screen over
         // a call at all — none of them may be painted as a failure in the feed.

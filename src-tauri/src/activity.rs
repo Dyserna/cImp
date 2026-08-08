@@ -17,13 +17,17 @@
 //! the retention caps. Payloads are size-capped at record time so a single
 //! line stays modest and the file stays bounded by the caps.
 //!
-//! Retention is **per kind**, not global: graph/context calls are chatty
+//! Retention is **per lane**, not global: graph/context calls are chatty
 //! (every `graph_*` call, plus read-advisor reminders and auto-check
 //! injections), while `offload_task` runs are rare and comparatively
 //! valuable. A single shared cap would let a graph-heavy session silently
 //! evict every offload row — the exact crowd-out the pre-V0.40.1 split
 //! rings (graph 200 / offload 50 per backend) existed to prevent — so each
-//! kind keeps its own newest-N window instead.
+//! lane keeps its own newest-N window instead.
+//!
+//! A lane is a kind, except for `injection_flag`, where it is one **screen**
+//! (#48, finding H-9 — see [`Lane`]). The invariant either way is the same one,
+//! stated once: **no row source's volume may cost another source its history.**
 //!
 //! Process notes: when the app is running, the cloud-Claude path executes
 //! in-process (loopback warm path) and the local offload worker also runs
@@ -52,6 +56,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::offload::outbound::Screen;
+
 /// Per-kind retention: how many entries of each kind to keep (in memory and
 /// after compaction). `"offload"` gets its own window; every other kind
 /// (currently just `"graph"`) uses the graph cap.
@@ -65,13 +71,32 @@ const AUDIT_CAP: usize = 100;
 /// own window so neither feed crowds the other out.
 const MCP_CAP: usize = 200;
 /// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
-/// refusals). Its own window for both reasons the split exists: these rows are
-/// the *only* consumer of every denial the containment layer makes, so a
-/// graph-heavy session must not evict them — and a model looping against a
-/// boundary must not evict the graph feed either. Sized like the MCP window:
-/// large enough to hold a whole session's worth of denials, small enough that
-/// the file stays modest.
-const INJECTION_FLAG_CAP: usize = 200;
+/// refusals, quarantines, detection flags). Retained **per screen**, not per
+/// kind — this is the window ONE screen's rows get.
+///
+/// A single `injection_flag` window (200, evicted oldest-first) was #48 finding
+/// H-9: `MemoryQuarantine` writes one row per `context_note` — no latch, no
+/// budget, no claim bit — so 200 notes carrying an `AKIA…`-shaped literal
+/// evicted the `Canary` and `LatchBeacon` rows that were the only record of the
+/// exfiltration that got through. Pinning the forensic screens would not have
+/// closed it: `MemoryQuarantine` is *in* the forensic set and is also the flood
+/// vector, so the same attack would have run inside the protected lane. What
+/// closes it is that no screen shares a window with any other — see [`Lane`].
+///
+/// Sized for depth rather than for the old aggregate: 64 rows is more history
+/// than any screen could rely on under the shared 200 (eleven screens, ~18
+/// each), and the rare forensic screens — canary hits, beacons, user latch
+/// overrides — produce single digits in a whole session.
+const INJECTION_FLAG_SCREEN_CAP: usize = 64;
+/// How many lanes the `injection_flag` kind can hold: one per screen this
+/// build declares, plus the single shared lane for sources it does not
+/// recognize ([`UNKNOWN_SCREEN_LANE`]). Derived from `Screen::ALL`, so a new
+/// screen adds a lane by existing.
+const INJECTION_FLAG_LANES: usize = Screen::ALL.len() + 1;
+/// The aggregate ceiling on `injection_flag` rows. Not a cap anything enforces
+/// directly — it is the sum of the lane caps, which is what makes the feed
+/// bounded even though no single counter bounds it.
+const INJECTION_FLAG_TOTAL_CAP: usize = INJECTION_FLAG_SCREEN_CAP * INJECTION_FLAG_LANES;
 /// Payload caps (chars) applied at record time — a request is typically a
 /// small JSON args object or an offload instruction; responses can be large
 /// tool output. Anything past the cap is cut with an explicit marker.
@@ -79,9 +104,29 @@ const REQUEST_CAP_CHARS: usize = 16_000;
 const RESPONSE_CAP_CHARS: usize = 24_000;
 /// On-disk mirror, next to the executable (same location as `settings.json`).
 const FILE_NAME: &str = "tool-activity.jsonl";
+/// Every row the store can hold with every lane full — the ring's size, and
+/// the floor under [`FILE_COMPACT_LINES`].
+const TOTAL_CAPACITY: usize =
+    GRAPH_CAP + OFFLOAD_CAP + AUDIT_CAP + MCP_CAP + INJECTION_FLAG_TOTAL_CAP;
+/// Appends between compactions once the ring is full. Compaction rewrites the
+/// whole file (and re-reads it first, to merge a child's lines), so this is the
+/// amount of cheap appending bought per expensive rewrite.
+const FILE_COMPACT_SLACK: usize = 500;
 /// Compact (rewrite) once the appended file holds this many lines — bounds
 /// file growth between loads without rewriting on every record.
-const FILE_COMPACT_LINES: usize = 1000;
+///
+/// **Derived**, not chosen (#48, H-9): a rewrite resets `file_lines` to
+/// `ring.len()`, so a constant at or below [`TOTAL_CAPACITY`] means a saturated
+/// store rewrites the entire file on **every** record. The old literal `1000`
+/// was exactly the then-total, i.e. one screen-flood away from that cliff;
+/// tying the two together is what keeps adding a lane from silently moving the
+/// store onto it. `compaction_leaves_room_to_append` pins the relation.
+const FILE_COMPACT_LINES: usize = TOTAL_CAPACITY + FILE_COMPACT_SLACK;
+
+/// The relation above, enforced at **compile time**: adding a lane (or raising
+/// a cap) past the compaction trigger must not build. A test could only catch
+/// it after someone ran it.
+const _: () = assert!(FILE_COMPACT_LINES >= TOTAL_CAPACITY + FILE_COMPACT_SLACK);
 
 /// The feed kind an activity belongs to. Kept as a closed enum at every
 /// recording site (see [`ActivityEntry::new`]) so a new recorder can't typo a
@@ -128,6 +173,9 @@ impl ActivityKind {
 
 /// The retention cap for a (serialized) kind. Unknown strings (a future kind
 /// loaded from a newer file) share the graph window rather than erroring.
+///
+/// `injection_flag` is deliberately absent: its rows are never counted per kind
+/// (see [`Lane`]), so a cap here would be a number nothing reads.
 fn kind_cap(kind: &str) -> usize {
     if kind == ActivityKind::Offload.as_str() {
         OFFLOAD_CAP
@@ -135,10 +183,75 @@ fn kind_cap(kind: &str) -> usize {
         AUDIT_CAP
     } else if kind == ActivityKind::Mcp.as_str() {
         MCP_CAP
-    } else if kind == ActivityKind::InjectionFlag.as_str() {
-        INJECTION_FLAG_CAP
     } else {
         GRAPH_CAP
+    }
+}
+
+/// The lane an `injection_flag` row lands in when its `source` is not a screen
+/// this build declares — a row written by a newer version, or under a wire
+/// value since retired.
+///
+/// They share one bounded lane rather than getting one each: the set of foreign
+/// strings is not knowable, and a lane per distinct string would make an
+/// unrecognized file an unbounded growth channel. They still cannot evict a
+/// known screen, which is the property that matters. Cannot collide with a real
+/// wire value — every screen's is a lowercase snake-case identifier, pinned by
+/// `the_unknown_lane_is_not_a_screen_name`.
+const UNKNOWN_SCREEN_LANE: &str = "?unknown";
+
+/// One retention window. Rows compete for eviction **only** against other rows
+/// in their own lane, and every lane has its own cap, so the store's whole
+/// retention contract is one sentence: *a row is evicted only by newer rows of
+/// its own lane.*
+///
+/// For every kind but one, a lane IS the kind. For `injection_flag` a lane is
+/// one [`Screen`] (#48, finding H-9): those rows all share a kind but not a
+/// source, and the sources have wildly different volumes — `MemoryQuarantine`
+/// fires once per `context_note`, `Canary` fires when an exfiltration is caught.
+/// Sharing a window meant the chatty one deleted the rare one's evidence, which
+/// an attacker can drive on purpose.
+///
+/// **A new screen is protected by construction.** The lane set comes from
+/// `Screen::ALL`, which `declare_screens!` emits from the variant list, so a
+/// variant added tomorrow (finding F-3's contamination-event row is the one
+/// already scheduled) has its own guaranteed window the moment it exists.
+/// Sharing a window with another screen would take a deliberate edit here.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Lane {
+    /// The row's kind, verbatim (unknown kinds keep their own string and share
+    /// the graph cap, as they always have).
+    kind: String,
+    /// The screen, for `injection_flag` rows only: a `Screen::as_str()` when the
+    /// source is recognized, [`UNKNOWN_SCREEN_LANE`] when it is not, `None` for
+    /// every other kind.
+    screen: Option<&'static str>,
+}
+
+impl Lane {
+    /// Which lane an entry belongs to. Total and cheap — this runs once per row
+    /// per eviction pass, on the write path.
+    fn of(entry: &ActivityEntry) -> Self {
+        let screen = if entry.kind == ActivityKind::InjectionFlag.as_str() {
+            // `source` carries the screen for every injection_flag writer
+            // (`outbound::record_flag` and the C3 updater's `record_row` both
+            // stamp `Screen::as_str()`); anything else came off disk.
+            Some(Screen::from_wire(&entry.source).map_or(UNKNOWN_SCREEN_LANE, |s| s.as_str()))
+        } else {
+            None
+        };
+        Self {
+            kind: entry.kind.clone(),
+            screen,
+        }
+    }
+
+    /// How many rows this lane retains.
+    fn cap(&self) -> usize {
+        match self.screen {
+            Some(_) => INJECTION_FLAG_SCREEN_CAP,
+            None => kind_cap(&self.kind),
+        }
     }
 }
 
@@ -289,7 +402,7 @@ impl ActivityStore {
             }
         };
         insert_sorted(&mut inner.ring, rec);
-        enforce_kind_caps(&mut inner.ring);
+        enforce_lane_caps(&mut inner.ring);
         if inner.file_lines >= FILE_COMPACT_LINES {
             // Compaction rewrites the whole file; fold in any lines another
             // process appended first so the rewrite can't clobber them.
@@ -398,7 +511,7 @@ impl ActivityStore {
                 repaired = true;
             }
         }
-        if enforce_kind_caps(&mut inner.ring) {
+        if enforce_lane_caps(&mut inner.ring) {
             repaired = true;
         }
         inner.file_lines = total_lines;
@@ -432,7 +545,7 @@ impl ActivityStore {
             }
         }
         if merged {
-            enforce_kind_caps(&mut inner.ring);
+            enforce_lane_caps(&mut inner.ring);
         }
     }
 
@@ -483,19 +596,28 @@ fn insert_sorted(ring: &mut VecDeque<ActivityRecord>, rec: ActivityRecord) {
     ring.insert(idx, rec);
 }
 
-/// Drop the oldest entries of any kind that exceeds its cap (the ring is
+/// Drop the oldest entries of any [`Lane`] that exceeds its cap (the ring is
 /// ts-sorted, so front-most = oldest). Returns whether anything was removed.
-fn enforce_kind_caps(ring: &mut VecDeque<ActivityRecord>) -> bool {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+///
+/// Every removal is charged to the lane it came from and to no other: the pass
+/// counts per lane, then walks oldest-first dropping only rows whose *own* lane
+/// is still over. So a source that floods pays for it out of its own window,
+/// and the total is bounded by the sum of the lane caps ([`TOTAL_CAPACITY`])
+/// without any counter having to track the total.
+///
+/// One pass, no sorting, no allocation beyond the count map — it runs under the
+/// store lock on every `record`.
+fn enforce_lane_caps(ring: &mut VecDeque<ActivityRecord>) -> bool {
+    let mut counts: HashMap<Lane, usize> = HashMap::new();
     for r in ring.iter() {
-        *counts.entry(r.entry.kind.clone()).or_default() += 1;
+        *counts.entry(Lane::of(&r.entry)).or_default() += 1;
     }
     let mut removed = false;
     let mut i = 0;
     while i < ring.len() {
-        let kind = ring[i].entry.kind.clone();
-        let count = counts.get_mut(&kind).expect("counted above");
-        if *count > kind_cap(&kind) {
+        let lane = Lane::of(&ring[i].entry);
+        let count = counts.get_mut(&lane).expect("counted above");
+        if *count > lane.cap() {
             *count -= 1;
             ring.remove(i);
             removed = true;
@@ -669,6 +791,33 @@ mod tests {
         rec_kind(ActivityKind::Graph, target)
     }
 
+    /// An `injection_flag` row as the real writers build one: the `source`
+    /// column carries the SCREEN (`outbound::record_flag` stamps
+    /// `Screen::as_str()`), which is what puts the row in its retention lane.
+    /// `rec_kind` alone would produce a row sourced `"offload"` — a real kind
+    /// with no real screen, i.e. the one shape no writer emits.
+    fn rec_flag(screen: Screen, target: &str) -> ActivityRecord {
+        let mut r = rec_kind(ActivityKind::InjectionFlag, target);
+        r.entry.source = screen.as_str().to_string();
+        r
+    }
+
+    /// How many rows one screen currently holds.
+    fn screen_rows(snap: &[ActivityEntry], screen: Screen) -> usize {
+        snap.iter()
+            .filter(|e| {
+                e.kind == ActivityKind::InjectionFlag.as_str() && e.source == screen.as_str()
+            })
+            .count()
+    }
+
+    /// Whether a row with this exact `target` survived. The forensic assertions
+    /// are by CONTENT, never by count: a count is satisfied by any 200 rows,
+    /// including the 200 that replaced the evidence.
+    fn kept(snap: &[ActivityEntry], target: &str) -> bool {
+        snap.iter().any(|e| e.target == target)
+    }
+
     fn rec_kind(kind: ActivityKind, target: &str) -> ActivityRecord {
         ActivityRecord {
             entry: ActivityEntry::new(
@@ -820,12 +969,20 @@ mod tests {
     }
 
     /// V32: security denials are the only consumer of every containment
-    /// refusal, so a chatty session must never evict them — their own window,
-    /// like every other kind.
+    /// refusal, so a chatty session must never evict them.
+    ///
+    /// # This test used to assert the breach (#48, finding H-9)
+    ///
+    /// It planted a row targeted `"a denial"`, flooded past the cap, and then
+    /// checked only that the count equalled the cap — which is true *precisely
+    /// because* the planted row had been evicted, and it never looked. The
+    /// assertions it was missing are the three below: the planted row survives
+    /// a flood of another KIND, it survives a flood of another SCREEN, and it
+    /// is its own screen's newer rows — nobody else's — that finally retire it.
     #[test]
     fn injection_flag_entries_keep_their_own_window() {
         let store = temp_store("flag-cap");
-        store.record(rec_kind(ActivityKind::InjectionFlag, "a denial"));
+        store.record(rec_flag(Screen::Canary, "a denial"));
         for i in 0..(GRAPH_CAP + 50) {
             store.record(rec(&format!("g{i}")));
         }
@@ -835,15 +992,318 @@ mod tests {
             1,
             "a graph flood evicted the security denials"
         );
-        for i in 0..(INJECTION_FLAG_CAP + 10) {
-            store.record(rec_kind(ActivityKind::InjectionFlag, &format!("d{i}")));
+        assert!(
+            kept(&snap, "a denial"),
+            "the planted denial row was evicted by graph traffic — the count above cannot see that"
+        );
+
+        // A flood of a DIFFERENT screen must not touch it either: same kind,
+        // different lane.
+        for i in 0..(INJECTION_FLAG_SCREEN_CAP + 10) {
+            store.record(rec_flag(Screen::MemoryQuarantine, &format!("q{i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert!(
+            kept(&snap, "a denial"),
+            "a memory-quarantine flood evicted the canary row"
+        );
+        assert_eq!(
+            screen_rows(&snap, Screen::MemoryQuarantine),
+            INJECTION_FLAG_SCREEN_CAP,
+            "the flooding screen must be bounded by its own lane cap"
+        );
+
+        // And its own screen's newer rows are what finally retire it — the one
+        // eviction the design allows.
+        for i in 0..(INJECTION_FLAG_SCREEN_CAP + 10) {
+            store.record(rec_flag(Screen::Canary, &format!("c{i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert!(
+            !kept(&snap, "a denial"),
+            "a lane must still evict its own oldest — otherwise it is unbounded"
+        );
+        assert_eq!(
+            screen_rows(&snap, Screen::Canary),
+            INJECTION_FLAG_SCREEN_CAP
+        );
+        assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// **The H-9 exploit, literally.** A canary exfiltration is caught (a
+    /// `Canary` row and the `LatchBeacon` row naming what engaged containment),
+    /// and the model then issues `context_note` after `context_note` carrying an
+    /// `AKIA…`-shaped literal. `context_note` has no fetch budget, no SSRF
+    /// screen and no latch refusal to stop it, and the secret screen writes one
+    /// `MemoryQuarantine` row per note.
+    ///
+    /// The flood is sized past the WHOLE feed's aggregate ceiling, so it is not
+    /// a test of one particular shared number: any design that retains
+    /// `injection_flag` rows in a single shared window loses the two planted
+    /// rows here, whatever that window's size.
+    ///
+    /// Asserted by CONTENT. The pre-fix version of this store passes every
+    /// count-shaped assertion in this file while holding nothing but quarantine
+    /// rows.
+    #[test]
+    fn a_quarantine_flood_cannot_evict_the_forensic_trail() {
+        let store = temp_store("h9-exploit");
+        store.record(rec_flag(Screen::Canary, "canary in a fetched page"));
+        store.record(rec_flag(Screen::LatchBeacon, "webfetch engaged the latch"));
+
+        for i in 0..(INJECTION_FLAG_TOTAL_CAP + 8) {
+            store.record(rec_flag(Screen::MemoryQuarantine, &format!("note {i}")));
+        }
+
+        let snap = store.snapshot_since(0);
+        assert!(
+            kept(&snap, "canary in a fetched page"),
+            "the note flood evicted the canary row — the only record of the exfiltration"
+        );
+        assert!(
+            kept(&snap, "webfetch engaged the latch"),
+            "the note flood evicted the beacon row — the only record of what engaged containment"
+        );
+        assert_eq!(
+            screen_rows(&snap, Screen::MemoryQuarantine),
+            INJECTION_FLAG_SCREEN_CAP,
+            "the flood must be bounded by its own lane"
+        );
+        // Newest-first ordering is untouched by lane eviction — the UI reads
+        // this snapshot in order.
+        assert!(snap.windows(2).all(|w| w[0].ts_ms >= w[1].ts_ms));
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// The flood in the other direction: the chatty screen is a FORENSIC one.
+    ///
+    /// A pinned/unpinned split would pass the test above and fail here — the
+    /// quarantine is in the forensic set, so pinning it puts the flood inside
+    /// the protected lane and the canary rows are evicted exactly as before.
+    /// The property is per-screen, not per-privilege.
+    #[test]
+    fn a_chatty_forensic_screen_cannot_evict_a_rare_one() {
+        let store = temp_store("h9-reverse");
+        store.record(rec_flag(Screen::LatchOverride, "the user restored access"));
+        for i in 0..(INJECTION_FLAG_TOTAL_CAP + 8) {
+            store.record(rec_flag(Screen::Canary, &format!("canary hit {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert!(
+            kept(&snap, "the user restored access"),
+            "a canary flood evicted the record of the user granting capability back"
+        );
+        assert_eq!(
+            screen_rows(&snap, Screen::Canary),
+            INJECTION_FLAG_SCREEN_CAP
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// The property itself, over the ENUM: **no screen can evict another
+    /// screen's rows** — for every screen as the flooder, and every screen as
+    /// the victim.
+    ///
+    /// Generated from `Screen::ALL`, which `declare_screens!` emits from the
+    /// variant list, so a screen added tomorrow is covered as both roles
+    /// without anyone extending this test. That is the same reason the lane set
+    /// is derived from `ALL` rather than listed: F-3's contamination-event row
+    /// must inherit the guarantee by construction, not by being remembered.
+    #[test]
+    fn no_screen_can_evict_another_screens_rows() {
+        for flooder in Screen::ALL.iter().copied() {
+            let store = temp_store(&format!("h9-matrix-{}", flooder.as_str()));
+            for victim in Screen::ALL.iter().copied() {
+                store.record(rec_flag(victim, &format!("keep-{}", victim.as_str())));
+            }
+            for i in 0..(INJECTION_FLAG_SCREEN_CAP + 5) {
+                store.record(rec_flag(flooder, &format!("flood-{i}")));
+            }
+            let snap = store.snapshot_since(0);
+            for victim in Screen::ALL.iter().copied() {
+                if victim == flooder {
+                    continue;
+                }
+                assert!(
+                    kept(&snap, &format!("keep-{}", victim.as_str())),
+                    "a {} flood evicted the {} row",
+                    flooder.as_str(),
+                    victim.as_str()
+                );
+            }
+            assert_eq!(
+                screen_rows(&snap, flooder),
+                INJECTION_FLAG_SCREEN_CAP,
+                "{} exceeded its own lane cap",
+                flooder.as_str()
+            );
+            let _ = fs::remove_file(&store.path);
+        }
+    }
+
+    /// Bounded: every screen flooding at once still totals the sum of the lane
+    /// caps and no more. Per-screen retention would be worthless if "its own
+    /// lane" meant an unbounded one — the store is written to disk.
+    #[test]
+    fn the_injection_feed_is_bounded_under_a_flood_of_every_screen() {
+        let store = temp_store("h9-bounded");
+        for screen in Screen::ALL.iter().copied() {
+            for i in 0..(2 * INJECTION_FLAG_SCREEN_CAP) {
+                store.record(rec_flag(screen, &format!("{}-{i}", screen.as_str())));
+            }
+        }
+        let snap = store.snapshot_since(0);
+        for screen in Screen::ALL.iter().copied() {
+            assert_eq!(
+                screen_rows(&snap, screen),
+                INJECTION_FLAG_SCREEN_CAP,
+                "{} is not bounded by its lane cap",
+                screen.as_str()
+            );
+        }
+        let flags = snap.iter().filter(|e| e.kind == "injection_flag").count();
+        assert_eq!(flags, Screen::ALL.len() * INJECTION_FLAG_SCREEN_CAP);
+        assert!(flags <= INJECTION_FLAG_TOTAL_CAP);
+        assert!(snap.len() <= TOTAL_CAPACITY);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// Non-starvation: a screen that legitimately produces a lot keeps its
+    /// whole share, and keeps the NEWEST rows of it, while every other lane is
+    /// also busy.
+    #[test]
+    fn a_screen_using_its_whole_share_keeps_its_newest_rows() {
+        let store = temp_store("h9-starve");
+        for i in 0..INJECTION_FLAG_SCREEN_CAP {
+            store.record(rec_flag(Screen::LatchRefusal, &format!("refusal {i}")));
+        }
+        // Every other lane goes to work around it.
+        for screen in Screen::ALL
+            .iter()
+            .copied()
+            .filter(|s| *s != Screen::LatchRefusal)
+        {
+            for i in 0..(INJECTION_FLAG_SCREEN_CAP + 20) {
+                store.record(rec_flag(screen, &format!("{}-{i}", screen.as_str())));
+            }
+        }
+        for i in 0..(GRAPH_CAP + 50) {
+            store.record(rec(&format!("g{i}")));
         }
         let snap = store.snapshot_since(0);
         assert_eq!(
-            snap.iter().filter(|e| e.kind == "injection_flag").count(),
-            INJECTION_FLAG_CAP
+            screen_rows(&snap, Screen::LatchRefusal),
+            INJECTION_FLAG_SCREEN_CAP,
+            "a screen inside its own share lost rows to other lanes"
         );
-        assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
+        for i in 0..INJECTION_FLAG_SCREEN_CAP {
+            assert!(kept(&snap, &format!("refusal {i}")), "lost refusal {i}");
+        }
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// The guarantee has to survive the JSONL round-trip, because that is where
+    /// the forensic rows actually live: the flood below is long enough to force
+    /// at least one compaction (whole-file rewrite from the ring), and the
+    /// assertions then run against a FRESH store loaded from the file.
+    #[test]
+    fn the_forensic_trail_survives_compaction_and_reload() {
+        let store = temp_store("h9-compact");
+        store.record(rec_flag(Screen::Canary, "canary in a fetched page"));
+        store.record(rec_flag(Screen::LatchBeacon, "webfetch engaged the latch"));
+        for i in 0..(FILE_COMPACT_LINES + 20) {
+            store.record(rec_flag(Screen::MemoryQuarantine, &format!("note {i}")));
+        }
+        // The compaction did happen, and left room to append again rather than
+        // rewriting the file on every subsequent record.
+        {
+            let inner = store.inner.lock().expect("lock");
+            assert!(inner.file_lines <= FILE_COMPACT_LINES);
+            assert!(inner.ring.len() <= TOTAL_CAPACITY);
+        }
+
+        let reloaded = ActivityStore::new(store.path.clone());
+        let snap = reloaded.snapshot_since(0);
+        assert!(
+            kept(&snap, "canary in a fetched page"),
+            "the canary row did not survive compaction + reload"
+        );
+        assert!(
+            kept(&snap, "webfetch engaged the latch"),
+            "the beacon row did not survive compaction + reload"
+        );
+        assert_eq!(
+            screen_rows(&snap, Screen::MemoryQuarantine),
+            INJECTION_FLAG_SCREEN_CAP
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// Rows whose `source` this build does not know — written by a newer
+    /// version, or under a retired wire value — share ONE bounded lane. They
+    /// stay bounded, and they cannot evict a screen this build does know.
+    #[test]
+    fn an_unrecognized_source_shares_one_bounded_lane() {
+        let store = temp_store("h9-unknown");
+        store.record(rec_flag(Screen::Canary, "canary in a fetched page"));
+        for i in 0..(INJECTION_FLAG_SCREEN_CAP + 20) {
+            let mut r = rec_kind(ActivityKind::InjectionFlag, &format!("future {i}"));
+            r.entry.source = format!("a_screen_from_v33_{}", i % 3);
+            store.record(r);
+        }
+        let snap = store.snapshot_since(0);
+        assert!(
+            kept(&snap, "canary in a fetched page"),
+            "unrecognized-source rows evicted a known screen's row"
+        );
+        let unknown = snap
+            .iter()
+            .filter(|e| {
+                e.kind == ActivityKind::InjectionFlag.as_str()
+                    && Screen::from_wire(&e.source).is_none()
+            })
+            .count();
+        assert_eq!(
+            unknown, INJECTION_FLAG_SCREEN_CAP,
+            "the catch-all lane must be bounded like any other"
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
+    /// The sentinel lane key can never be mistaken for a screen.
+    #[test]
+    fn the_unknown_lane_is_not_a_screen_name() {
+        assert!(Screen::from_wire(UNKNOWN_SCREEN_LANE).is_none());
+        assert!(Screen::ALL
+            .iter()
+            .all(|s| s.as_str() != UNKNOWN_SCREEN_LANE));
+    }
+
+    /// Compaction must leave room to append (#48, H-9).
+    ///
+    /// A rewrite resets `file_lines` to `ring.len()`, so if the trigger sat at
+    /// or below the store's total capacity, a saturated store would re-read and
+    /// rewrite the whole file on **every** record. The old literal `1000` was
+    /// exactly the then-total; adding lanes without this relation would have
+    /// walked the write path onto that cliff silently. (The constant relation
+    /// itself is a `const _: () = assert!(…)` up top — a build failure, not a
+    /// test failure. What this adds is the observed behaviour: a store that has
+    /// actually compacted has room to append again.)
+    #[test]
+    fn compaction_leaves_room_to_append() {
+        let store = temp_store("compact-headroom");
+        for i in 0..(FILE_COMPACT_LINES + 5) {
+            store.record(rec(&format!("g{i}")));
+        }
+        let inner = store.inner.lock().expect("lock");
+        assert_eq!(inner.ring.len(), GRAPH_CAP);
+        assert!(
+            inner.file_lines + FILE_COMPACT_SLACK <= FILE_COMPACT_LINES,
+            "after compaction the file must have room for {FILE_COMPACT_SLACK} appends, had {}",
+            FILE_COMPACT_LINES - inner.file_lines
+        );
+        drop(inner);
         let _ = fs::remove_file(&store.path);
     }
 

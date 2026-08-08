@@ -6438,11 +6438,15 @@ mod tests {
     /// #48 — the SSRF denial row is bounded per tab session, and the bound
     /// resets on a proved session rotation.
     ///
-    /// Every denial used to write a row with no dedup at all, while
-    /// `INJECTION_FLAG_CAP` is 200 and evicts oldest-first within a kind: a
-    /// model looping denied URLs destroyed the `Canary`, `LatchBeacon` and
+    /// Every denial used to write a row with no dedup at all, while the feed
+    /// was one 200-row window evicted oldest-first within a kind: a model
+    /// looping denied URLs destroyed the `Canary`, `LatchBeacon` and
     /// `MemoryQuarantine` rows that are the only record of an attack that got
-    /// through. A process-global set keyed on the scope string was the wrong
+    /// through. Finding H-9 closed the cross-screen half of that at the store
+    /// (`activity::Lane` — one window per screen, so a loop costs only its own
+    /// screen's history); this ledger is what keeps a loop from evicting the
+    /// SSRF screen's own first denials. A process-global set keyed on the scope
+    /// string was the wrong
     /// shape — proxy scopes are stable `agent:tab`, so it would suppress a
     /// tab's rows across every future session — which is why the ledger rides
     /// the tab's `Budget`.

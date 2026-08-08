@@ -796,7 +796,7 @@ pub fn advisor_signals() -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<Stalle
 /// `warn!` line in a log nobody has open. The user's own file is silently not
 /// protecting them, which is `files_failed` doing exactly what its doc comment
 /// says it is for: *"it means rules the user believes are active are not"*.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct BrokenLocalRules {
     /// Where the rules live, so the card names a folder the user can open.
     pub dir: String,

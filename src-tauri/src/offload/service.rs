@@ -2139,10 +2139,12 @@ mod tests {
 
     #[test]
     fn global_cap_sums_slots_and_clamps() {
-        let mut snap = OffloadSettings {
-            backends: vec![local_backend("a", 4), local_backend("b", 2)],
-            ..OffloadSettings::default()
-        };
+        // Built by mutation rather than by functional update: `OffloadSettings`
+        // carries fields that are `pub(in crate::settings)` (#44/#48 — the
+        // injection hierarchy's inputs), and `..Default::default()` names every
+        // field, private ones included (E0451).
+        let mut snap = OffloadSettings::default();
+        snap.backends = vec![local_backend("a", 4), local_backend("b", 2)];
         assert_eq!(compute_global_cap(&snap), 6);
 
         snap.global_concurrency = Some(100);

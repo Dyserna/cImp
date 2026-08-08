@@ -25,6 +25,7 @@ use std::path::Path;
 
 use crate::error::{AppError, AppResult};
 use crate::pty::{resolve_command, PtyLaunchSpec};
+use crate::settings::injection::Consumer as InjConsumer;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
 use crate::state::TabId;
 
@@ -277,7 +278,7 @@ fn alloc_loopback_port() -> Option<u16> {
 /// `use_local_provider`) rather than the `TabId` variant, so a `+`-spawned
 /// duplicate — which copies its template's `command` — gets identical
 /// treatment to the reserved tab it came from.
-fn command_is(command: &str, name: &str) -> bool {
+pub(crate) fn command_is(command: &str, name: &str) -> bool {
     Path::new(command)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -465,14 +466,19 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // native-web visibility mode AND the consumer-hygiene switch, both
         // spawn-baked, both resolved PER TAB through the three-level hierarchy.
         //
-        // `injection::spawn_sig` carries the master switch, the two spawn-baked
-        // L2 flags and every AI tab's L3 cells plus its resolved mode, so a flip
-        // at any of the three levels moves this signature and raises the restart
-        // hint. Live features (latch, spotlighting, detection, SSRF, budgets,
-        // canary, quarantine) are deliberately absent: they take effect on the
-        // next call, and a restart nag for a change that needs no restart is
-        // how a hint stops being read.
-        "injection": crate::settings::injection::spawn_sig(s),
+        // `injection::spawn_sig` carries the master switch, the spawn-baked L2
+        // flags THIS consumer reads and every CLAUDE tab's L3 cells plus its
+        // resolved mode, so a flip at any of the three levels moves this
+        // signature and raises the restart hint. Live features (latch,
+        // spotlighting, detection, SSRF, budgets, canary, quarantine) are
+        // deliberately absent: they take effect on the next call, and a restart
+        // nag for a change that needs no restart is how a hint stops being read.
+        //
+        // #48 (F-x): per-consumer, not the shared blob it used to be. An
+        // OpenCode-only flip — the Phase H gate, or a native-web override on an
+        // OpenCode tab — was marking Claude tabs dirty and nagging them to
+        // restart for a change that cannot reach them.
+        "injection": crate::settings::injection::spawn_sig(s, InjConsumer::Claude),
     });
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
@@ -498,10 +504,10 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // V32 Phase F: `sensor` bakes the beacon handler's flag into the
         // plugin, `deny` writes `permission.webfetch/websearch = "deny"` into
         // `OPENCODE_CONFIG_CONTENT` — both spawn-time, like the Claude half.
-        // V32 Phase G: same per-tab fragment as the Claude object; the OpenCode
-        // side additionally reads consumer hygiene for its pinned permission
-        // block, which the fragment already carries.
-        "injection": crate::settings::injection::spawn_sig(s),
+        // V32 Phase G: the per-tab fragment, now scoped to the OPENCODE tabs
+        // and to the features this consumer reads (#48, F-x) — which is all
+        // three, since the Phase H gate lives in the generated plugin.
+        "injection": crate::settings::injection::spawn_sig(s, InjConsumer::Opencode),
     });
     [claude, opencode]
 }
@@ -1302,8 +1308,26 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
     let _ = std::fs::write(&path, text);
 }
 
+/// Filename stem of the generated OpenCode plugin, one file **per tab**.
+///
+/// V32 #48 (H-2): it used to be a single `cimp-inject.js` per *directory*, while
+/// `opencode_plugin_wanted` and the baked `beacon`/`native_gate` flags are
+/// resolved per TAB and `ai_working_dir` hands every builtin tab the same launch
+/// cwd. One file, N tabs, last spawn wins: duplicating the OpenCode tab with `+`
+/// and leaving the copy at the app-wide default silently replaced the original's
+/// posture, with nothing surfacing it — `injection_status` still reported the
+/// original's *resolved* gate as on, and `spawn_inject_sig` compared equal
+/// because both consumers embed the same blob.
+const OPENCODE_PLUGIN_PREFIX: &str = "cimp-inject-";
+
+/// The pre-#48 single-file artifact. Removed on every OpenCode spawn so an
+/// upgrade cleans up after itself — left in place it would keep running (with a
+/// dead port and token, so inert, but also with whichever tab's flags were baked
+/// last) alongside the per-tab files.
+const OPENCODE_PLUGIN_LEGACY: &str = "cimp-inject.js";
+
 /// V10: write (or remove) the OpenCode injection/memory plugin in the project's
-/// `.opencode/plugin/cimp-inject.js`. The plugin is dependency-free (node
+/// `.opencode/plugin/cimp-inject-<tab>.js`. The plugin is dependency-free (node
 /// builtins + global `fetch`, so OpenCode does not run a launch-time
 /// `bun install`) and bakes in the current loopback port + token — regenerated
 /// each launch since the token rotates per app run (idempotent overwrite). It
@@ -1319,26 +1343,46 @@ fn write_opencode_instructions(cfg: &AiToolTabConfig, settings: &Settings) {
 /// extends that same handler from beacon-only to beacon-and-GATE, behind a
 /// default-off setting — see [`opencode_plugin_source`] for its honest limits.
 ///
-/// Removed when nothing wants it ([`opencode_plugin_wanted`]). Also adds
+/// Removed when THIS tab wants nothing ([`opencode_plugin_wanted`]). Also adds
 /// `.opencode/` to the project's `.git/info/exclude` so the generated plugin and
 /// OpenCode's own `.opencode/.gitignore` don't dirty `git status`.
 fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab: &str) {
-    let plugin_path = working_dir
-        .join(".opencode")
-        .join("plugin")
-        .join("cimp-inject.js");
+    let dir = working_dir.join(".opencode").join("plugin");
+    let plugin_path = dir.join(format!("{OPENCODE_PLUGIN_PREFIX}{tab}.js"));
 
-    // Nothing to inject, record OR watch → clean up a stale plugin.
+    // Housekeeping first, so it runs whatever this tab's own answer is: drop the
+    // pre-#48 single-file artifact and any per-tab file whose tab is gone.
+    let _ = std::fs::remove_file(dir.join(OPENCODE_PLUGIN_LEGACY));
+    sweep_stale_opencode_plugins(&dir, settings);
+
+    // Nothing to inject, record OR watch → clean up a stale plugin. THIS tab's
+    // predicate only; see [`sweep_stale_opencode_plugins`].
     if !opencode_plugin_wanted(settings, tab) {
         let _ = std::fs::remove_file(&plugin_path);
         return;
     }
-    // Need the loopback endpoint to reach the app; without it, skip (and
-    // clean). This runs IN the app at tab spawn, so it must bake THIS
-    // instance's endpoint — `read_own_discovery` (pid-keyed), never the
-    // shared last-writer-wins file a sibling instance may have overwritten.
+    // Need the loopback endpoint to reach the app. This runs IN the app at tab
+    // spawn, so it must bake THIS instance's endpoint — `read_own_discovery`
+    // (pid-keyed), never the shared last-writer-wins file a sibling instance may
+    // have overwritten.
+    //
+    // #48: a missing discovery file used to take the same DELETE branch as
+    // "nothing wants it". It is not the same thing — the tab wants the plugin
+    // and we cannot write a working one — and on an install where
+    // `loopback_needed()` is false (offload, graph and the audit MCP all off,
+    // native-web on `sensor`) that branch fired on every spawn, so the sensor
+    // was reported live everywhere while no plugin existed on disk. Leave
+    // whatever is there alone and say so: a stale file's baked port/token simply
+    // fail to connect, and this file's whole posture is "never throws, never
+    // denies on doubt", so a dead endpoint costs a beacon, not a session.
     let Some(disc) = crate::offload::loopback::read_own_discovery() else {
-        let _ = std::fs::remove_file(&plugin_path);
+        tracing::warn!(
+            target: "tabs",
+            tab,
+            "opencode plugin: no loopback discovery for this instance; \
+             leaving any existing plugin in place and skipping the rewrite \
+             (its beacon/gate cannot reach the app until the loopback runs)"
+        );
         return;
     };
 
@@ -1350,6 +1394,7 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab: &str) {
     let js = opencode_plugin_source(
         disc.port,
         &disc.token,
+        tab,
         OpencodePluginFlags {
             inject: inject_enabled,
             auto_check: auto_check_enabled,
@@ -1358,13 +1403,44 @@ fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab: &str) {
         },
     );
 
-    if let Some(dir) = plugin_path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
     }
     let _ = std::fs::write(&plugin_path, js);
     git_exclude_opencode(working_dir);
+}
+
+/// Remove generated plugin files belonging to tab ids that are no longer
+/// configured at all (a duplicated tab the user deleted, a renamed reserved id).
+///
+/// **Keyed on existence, never on another tab's predicate.**
+/// [`opencode_plugin_wanted`]'s own docs lock the reason: "a gate that
+/// disappears when an unrelated feature is toggled is worse than no gate", and
+/// from tab A's side tab B's settings are exactly such an unrelated feature —
+/// which is how the single-file artifact went wrong in the first place. A tab
+/// that still exists but no longer wants its plugin drops it at its own next
+/// spawn, in the branch above.
+fn sweep_stale_opencode_plugins(dir: &Path, settings: &Settings) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // no plugin dir yet — nothing to sweep
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name
+            .strip_prefix(OPENCODE_PLUGIN_PREFIX)
+            .and_then(|rest| rest.strip_suffix(".js"))
+        else {
+            continue; // not ours (OpenCode's own plugins live here too)
+        };
+        let configured = settings
+            .tabs
+            .iter()
+            .any(|t| matches!(t, TabConfig::AiTool(c) if c.id == id));
+        if !configured {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// V32 Phase F: whether the generated OpenCode plugin should exist at all.
@@ -1438,7 +1514,12 @@ struct OpencodePluginFlags {
 /// OS-level containment is V33's job. What this buys is the thing the E2 spike
 /// measured: a compromised model that reaches for `read` after fetching a
 /// hostile page is refused, in the same session, with a message it can read.
-fn opencode_plugin_source(port: u16, token: &str, flags: OpencodePluginFlags) -> String {
+fn opencode_plugin_source(
+    port: u16,
+    token: &str,
+    tab: &str,
+    flags: OpencodePluginFlags,
+) -> String {
     // V32 Phase H: the two name sets come from the ONE reviewed table
     // (`toolclass::OPENCODE_NATIVE_TABLE`), rendered through serde so the JS
     // literal cannot be malformed by a name someone adds later. The web set is
@@ -1474,11 +1555,29 @@ const CIMP_EDIT_TOOLS = new Set(["edit", "write", "patch"]);
 // observe.
 const CIMP_BEACON_ENABLED = {beacon};
 const CIMP_WEB_TOOLS = new Set({native_web_tools});
-// The cImp TAB this OpenCode process was spawned for, from the env
-// (`compose_ai_env`). The hook input carries no tab or cwd identity — the E2
-// spike's finding — and the tab id is the key the whole latch registry uses,
-// so without it a beacon has nothing to engage.
-const CIMP_TAB_ID = (typeof process !== "undefined" && process.env && process.env.CIMP_TAB_ID) || "";
+// The cImp TAB this FILE was generated for, baked at spawn. The tab id is the
+// key the whole latch registry uses, and the hook input carries no tab or cwd
+// identity (the E2 spike's finding), so without it a beacon has nothing to
+// engage.
+const CIMP_TAB_ID = {tab_id};
+// …and whether this OpenCode process is that tab's, from the env
+// (`compose_ai_env` sets `CIMP_TAB_ID` on every OpenCode spawn).
+//
+// #48 (H-2): there is now ONE FILE PER TAB in `.opencode/plugin/`, because the
+// flags baked above are resolved per tab while the directory is shared by every
+// builtin tab. OpenCode loads EVERY file in that directory into EVERY session
+// it starts there — so a file that is not this process's tab must be completely
+// inert, or tab B's flags would run under tab A's identity and every handler
+// would fire once per installed file. Every handler below returns immediately
+// unless this matches.
+//
+// A hand-run `opencode` in the same project (no `CIMP_TAB_ID` in its env) now
+// matches nothing and gets no injection, no memory tap and no beacon. That is
+// deliberate: those POSTs carried a session cImp has no tab for, and the
+// alternative — letting an unbound process run every installed file — is
+// duplicate prompt injection and duplicate usage rows.
+const CIMP_TAB_MATCH =
+  (typeof process !== "undefined" && process.env && process.env.CIMP_TAB_ID) === CIMP_TAB_ID;
 
 // ── V32 Phase H (locked decision 17): the native-tool GATE ──────────────────
 //
@@ -1510,6 +1609,16 @@ const CIMP_REFUSAL_NATIVE_WEB = {refusal_web};
 const CIMP_GATE_TTL_MS = 2000;
 // The fail-open verdict, and the initial value: gate off, nothing latched.
 let CIMP_GATE_STATE = {{ at: 0, gate: false, latch: "open" }};
+// Monotonic invalidation counter (#48, H-1). Validation and invalidation used
+// to speak different languages: the query RE-ASSIGNED `CIMP_GATE_STATE` to a
+// fresh object stamped with a `now` captured BEFORE its fetch, while the beacon
+// invalidated by MUTATING `.at = 0` on whatever object was current. A query
+// still in flight when a beacon fired therefore overwrote the invalidation with
+// its pre-beacon verdict and re-validated it for a full TTL — `read` and
+// `webfetch` dispatched concurrently, and every local tool for the next 2 s ran
+// against an `open` latch the beacon had already moved to EXTERNAL. Both halves
+// now move this counter instead, so a stale reply is recognizable as stale.
+let CIMP_GATE_EPOCH = 0;
 
 // Resolve this tab's gate verdict from the app, cached for CIMP_GATE_TTL_MS.
 //
@@ -1525,7 +1634,20 @@ let CIMP_GATE_STATE = {{ at: 0, gate: false, latch: "open" }};
 async function cimpGateState() {{
   const now = Date.now();
   if (now - CIMP_GATE_STATE.at < CIMP_GATE_TTL_MS) return CIMP_GATE_STATE;
+  // The epoch this query started at. Anything that invalidates the cache bumps
+  // it, so a reply that resolves after an invalidation is recognizably about a
+  // latch that has already moved.
+  const epoch = CIMP_GATE_EPOCH;
   const open = {{ at: now, gate: false, latch: "open" }};
+  // Commit a verdict to the cache ONLY if nothing invalidated while it was in
+  // flight; otherwise drop it and answer `open`. Dropping is the fail-open
+  // direction twice over — `open` denies nothing, and an empty cache re-queries
+  // on the very next tool call rather than serving a stale verdict for a TTL.
+  const settle = (v) => {{
+    if (CIMP_GATE_EPOCH !== epoch) return open;
+    CIMP_GATE_STATE = v;
+    return v;
+  }};
   try {{
     const r = await fetch(CIMP_LOOPBACK + "/latch/state", {{
       method: "POST",
@@ -1533,18 +1655,16 @@ async function cimpGateState() {{
       body: JSON.stringify({{ tab: CIMP_TAB_ID, consumer: "opencode" }}),
       signal: AbortSignal.timeout(1500),
     }});
-    if (!r || !r.ok) {{ CIMP_GATE_STATE = open; return open; }}
+    if (!r || !r.ok) return settle(open);
     const j = await r.json();
     // The backend resolves the whole three-level hierarchy (and ANDs in the
     // taint-latch feature) — this side holds no part of it and asserts nothing
     // beyond the two fields' types.
-    if (!j || j.gate !== true || typeof j.latch !== "string") {{ CIMP_GATE_STATE = open; return open; }}
-    CIMP_GATE_STATE = {{ at: now, gate: true, latch: j.latch }};
+    if (!j || j.gate !== true || typeof j.latch !== "string") return settle(open);
+    return settle({{ at: now, gate: true, latch: j.latch }});
   }} catch (_e) {{
-    CIMP_GATE_STATE = open;
-    return open;
+    return settle(open);
   }}
-  return CIMP_GATE_STATE;
 }}
 
 // V24 Phase F: child session id -> parent session id, learned from
@@ -1560,6 +1680,7 @@ export default async (input) => ({{
   // when injection is off — only APPLYING the returned text to the draft is
   // gated. Mirrors the Claude `--context-hook` shim, which always POSTs too.
   "chat.message": async (inp, out) => {{
+    if (!CIMP_TAB_MATCH) return;
     const p = out.parts.find((x) => x.type === "text");
     if (!p || !p.text) return;
     try {{
@@ -1594,7 +1715,7 @@ export default async (input) => ({{
     // Ordering matters: gate before beacon, so a refused web call does not first
     // engage the latch and contaminate the conversation. That is the same
     // property the proxy's `gate` has — a refused call never moves the latch.
-    if (CIMP_NATIVE_GATE_ENABLED && CIMP_TAB_ID && inp) {{
+    if (CIMP_NATIVE_GATE_ENABLED && CIMP_TAB_MATCH && inp) {{
       const local = CIMP_NATIVE_LOCAL_TOOLS.has(inp.tool);
       const web = CIMP_WEB_TOOLS.has(inp.tool);
       // An unlisted name (task, skill, todowrite, question) is UNGATED and costs
@@ -1609,13 +1730,23 @@ export default async (input) => ({{
     }}
     // ── V32 Phase F: the BEACON half — report-only, and it still never throws.
     try {{
-      if (!CIMP_BEACON_ENABLED || !CIMP_TAB_ID) return;
-      if (!inp || !CIMP_WEB_TOOLS.has(inp.tool)) return;
-      // This call is about to engage the tab's EXTERNAL latch, so whatever the
-      // gate cached a moment ago is now stale. Invalidate BEFORE the POST: if
-      // the fetch throws, the cache must still be dropped, or a `read` in the
-      // next second could slip through against a latch that has moved.
-      CIMP_GATE_STATE.at = 0;
+      if (!CIMP_TAB_MATCH || !inp || !CIMP_WEB_TOOLS.has(inp.tool)) return;
+      // A native web tool is about to run, so whatever the gate cached a moment
+      // ago describes a latch that is about to move. Invalidate here, ABOVE the
+      // beacon's own enable guard and BEFORE the POST:
+      //
+      //   * above the guard, because the gate can be ON while the beacon is off
+      //     — `off`/`deny` native-web mode with the gate switched on is the most
+      //     hardened combination available, and it was the one where nothing
+      //     invalidated the cache at all (#48, H-1's second half);
+      //   * before the POST, so a fetch that throws still leaves the stale
+      //     verdict dropped rather than live for the rest of its TTL.
+      //
+      // Bumping the epoch is what makes this stick: a query already in flight
+      // can no longer commit its pre-beacon verdict on top of this.
+      CIMP_GATE_EPOCH++;
+      CIMP_GATE_STATE = {{ at: 0, gate: false, latch: "open" }};
+      if (!CIMP_BEACON_ENABLED) return;
       await fetch(CIMP_LOOPBACK + "/latch/beacon", {{
         method: "POST",
         headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
@@ -1631,6 +1762,7 @@ export default async (input) => ({{
     }} catch (_e) {{}}
   }},
   "tool.execute.after": async (inp) => {{
+    if (!CIMP_TAB_MATCH) return;
     try {{
       const body = {{
         cwd: input.directory,
@@ -1680,6 +1812,7 @@ export default async (input) => ({{
   // let the backend upsert-by-msg_id absorb the duplicate. Never gated on the
   // inject/auto-check flags (usage is always recorded); best-effort, non-blocking.
   event: async ({{ event }}) => {{
+    if (!CIMP_TAB_MATCH) return;
     try {{
       if (!event) return;
       const info = event.properties && event.properties.info;
@@ -1721,6 +1854,11 @@ export default async (input) => ({{
 "#,
         port = port,
         token = token,
+        // JSON-quoted, never hand-quoted: tab ids are `[a-z0-9-]` today
+        // (reserved ids and `ai-<uuid>` duplicates), but a literal built by
+        // string concatenation is one rename away from being a syntax error in
+        // a file the harness loads at startup.
+        tab_id = serde_json::to_string(tab).unwrap_or_else(|_| "\"\"".to_string()),
         inject = if flags.inject { "true" } else { "false" },
         auto_check = if flags.auto_check { "true" } else { "false" },
         beacon = if flags.beacon { "true" } else { "false" },
@@ -2290,7 +2428,7 @@ mod tests {
         // The read advisor is the only `PreToolUse` producer under test here;
         // V32 Phase F's sensor beacon is a second one, turned off so
         // "no PreToolUse hook" keeps meaning "no read advisor".
-        settings.offload.native_web_visibility = "off".to_string();
+        settings.set_native_web_mode_for_test(NativeWebVisibility::Off);
         let args = build_pre_args(&claude_cfg(), &settings, "claude");
         let overlay = settings_overlay(&args).expect("overlay present");
         let cmd = overlay["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
@@ -2733,7 +2871,7 @@ mod tests {
 
     #[test]
     fn opencode_plugin_source_bakes_endpoint_and_flag() {
-        let js = opencode_plugin_source(54321, "deadbeef00", ALL_ON);
+        let js = opencode_plugin_source(54321, "deadbeef00", "opencode", ALL_ON);
         assert!(js.contains("127.0.0.1:54321"));
         assert!(js.contains("deadbeef00"));
         assert!(js.contains("CIMP_INJECT_ENABLED = true"));
@@ -2746,7 +2884,7 @@ mod tests {
         // V24 Phase F: the usage-forwarding `event` hook + its POST body shape.
         assert!(js.contains("event: async"));
         assert!(js.contains(r#"kind: "usage""#));
-        let off = opencode_plugin_source(1, "x", ALL_OFF);
+        let off = opencode_plugin_source(1, "x", "opencode", ALL_OFF);
         assert!(off.contains("CIMP_INJECT_ENABLED = false"));
         assert!(off.contains("CIMP_AUTO_CHECK_ENABLED = false"));
     }
@@ -2758,7 +2896,7 @@ mod tests {
     /// flags (usage is always recorded).
     #[test]
     fn opencode_plugin_source_forwards_usage_on_completed_turn() {
-        let js = opencode_plugin_source(54321, "tok", ALL_ON);
+        let js = opencode_plugin_source(54321, "tok", "opencode", ALL_ON);
         // Gates on an assistant turn that has completed.
         assert!(
             js.contains(r#"info.role !== "assistant""#),
@@ -2788,7 +2926,7 @@ mod tests {
         // The usage `event` hook must NOT be gated on the inject/auto-check
         // flags — usage is recorded regardless. The hook body (from `event:`
         // to the end) references neither flag.
-        let off = opencode_plugin_source(1, "x", ALL_OFF);
+        let off = opencode_plugin_source(1, "x", "opencode", ALL_OFF);
         let event_start = off.find("event: async").expect("event hook present");
         let hook = &off[event_start..];
         assert!(
@@ -2803,7 +2941,7 @@ mod tests {
     /// sidechain parity) and roll activity up to the parent.
     #[test]
     fn opencode_tool_event_stamps_parent_session_for_children() {
-        let js = opencode_plugin_source(1, "x", ALL_ON);
+        let js = opencode_plugin_source(1, "x", "opencode", ALL_ON);
         let start = js
             .find(r#""tool.execute.after""#)
             .expect("tool hook present");
@@ -2831,7 +2969,7 @@ mod tests {
     /// attributable.
     #[test]
     fn opencode_chat_message_posts_retrieve_even_when_injection_disabled() {
-        let js = opencode_plugin_source(1, "x", ALL_OFF);
+        let js = opencode_plugin_source(1, "x", "opencode", ALL_OFF);
         assert!(
             js.contains(r#"agent: "opencode""#),
             "missing agent field: {js}"
@@ -3590,9 +3728,11 @@ mod tests {
     /// the latch (`off`) or taking a tool away (`deny`).
     #[test]
     fn native_web_visibility_defaults_to_sensor_and_validates_post_hoc() {
-        assert_eq!(Settings::default().offload.native_web_visibility, "sensor");
+        // The stored default, read through the resolver rather than off the
+        // field (#48: the tri-mode IS `Feature::NativeWeb`'s L2, so it now sits
+        // behind the same `pub(in crate::settings)` boundary as the rest).
         assert_eq!(
-            NativeWebVisibility::parse(&Settings::default().offload.native_web_visibility),
+            native_web_for(&Settings::default(), "opencode", "opencode"),
             NativeWebVisibility::Sensor
         );
         assert_eq!(NativeWebVisibility::parse("off"), NativeWebVisibility::Off);
@@ -3619,16 +3759,24 @@ mod tests {
         let base = spawn_inject_sig(&Settings::default());
         for mode in ["off", "deny"] {
             let mut s = Settings::default();
-            s.offload.native_web_visibility = mode.to_string();
+            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             let sig = spawn_inject_sig(&s);
             assert_ne!(sig[0], base[0], "claude signature must move for {mode}");
             assert_ne!(sig[1], base[1], "opencode signature must move for {mode}");
             // V32 Phase G: the mode moved out of a top-level `native_web` key
             // and into the `injection` fragment, where it sits as the
             // native-web feature's L2 alongside the master switch, the
-            // consumer-hygiene flag and every tab's resolved posture.
-            assert_eq!(sig[0]["injection"]["l2"][0], serde_json::json!(mode));
-            assert_eq!(sig[1]["injection"]["l2"][0], serde_json::json!(mode));
+            // consumer-hygiene flag and every tab's resolved posture. #48 keyed
+            // that `l2` array by feature (it is per-consumer now, so a
+            // positional index would silently mean a different control on the
+            // Claude side than on the OpenCode side).
+            for consumer in [0, 1] {
+                assert_eq!(
+                    sig[consumer]["injection"]["l2"][0],
+                    serde_json::json!(["native_web", mode]),
+                    "consumer {consumer}"
+                );
+            }
         }
     }
 
@@ -3688,7 +3836,7 @@ mod tests {
         // Hygiene off + native-web `deny`: the DENIALS survive, because they are
         // a different feature the user did not touch. The pins do not come back.
         let mut denied = off;
-        denied.offload.native_web_visibility = "deny".into();
+        denied.set_native_web_mode_for_test(NativeWebVisibility::Deny);
         let c = cfg(&denied);
         assert_eq!(c["agent"]["build"]["permission"]["webfetch"], "deny");
         assert_eq!(c["agent"]["build"]["permission"]["websearch"], "deny");
@@ -3704,7 +3852,7 @@ mod tests {
             ..Settings::default()
         };
         s.offload.enabled = true;
-        s.offload.native_web_visibility = "deny".into();
+        s.set_native_web_mode_for_test(NativeWebVisibility::Deny);
         s.set_master_for_test(false);
 
         let TabConfig::AiTool(claude) = &s.tabs[0] else {
@@ -3771,7 +3919,7 @@ mod tests {
         let pre_tool_use = |mode: &str| -> Vec<serde_json::Value> {
             let mut s = Settings::default();
             s.graph.enabled = true; // the loopback the beacon POSTs into
-            s.offload.native_web_visibility = mode.to_string();
+            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             let args = build_pre_args(&claude_cfg(), &s, "claude-2");
             settings_overlay(&args)
                 .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
@@ -3809,7 +3957,7 @@ mod tests {
         let settings = Settings::default(); // offload + graph + audit all off
         assert!(!settings.loopback_needed());
         assert_eq!(
-            NativeWebVisibility::parse(&settings.offload.native_web_visibility),
+            native_web_for(&settings, "claude", "claude"),
             NativeWebVisibility::Sensor,
             "the default mode is what makes this case worth pinning"
         );
@@ -3831,7 +3979,7 @@ mod tests {
         let overlay_for = |mode: &str| -> Option<serde_json::Value> {
             let mut s = Settings::default();
             s.graph.enabled = true;
-            s.offload.native_web_visibility = mode.to_string();
+            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             settings_overlay(&build_pre_args(&claude_cfg(), &s, "claude"))
         };
         let deny = overlay_for("deny").expect("overlay present");
@@ -3861,7 +4009,7 @@ mod tests {
     fn deny_mode_flips_only_the_web_keys_of_the_pinned_opencode_block() {
         let perm_for = |mode: &str| -> serde_json::Value {
             let mut s = Settings::default();
-            s.offload.native_web_visibility = mode.to_string();
+            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             build_opencode_config(&opencode_cfg(), &s, "opencode")["agent"]["build"]["permission"]
                 .clone()
         };
@@ -3897,7 +4045,7 @@ mod tests {
         let with = |graph: bool, mode: &str| -> bool {
             let mut s = Settings::default();
             s.graph.enabled = graph;
-            s.offload.native_web_visibility = mode.to_string();
+            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             opencode_plugin_wanted(&s, "opencode")
         };
         // The case the trap was: graph off, sensor on ⇒ still written.
@@ -3920,9 +4068,9 @@ mod tests {
             ..Settings::default()
         };
         off.graph.enabled = false;
-        off.offload.native_web_visibility = "off".to_string();
+        off.set_native_web_mode_for_test(NativeWebVisibility::Off);
         let mut sensor = off.clone();
-        sensor.offload.native_web_visibility = "sensor".to_string();
+        sensor.set_native_web_mode_for_test(NativeWebVisibility::Sensor);
         assert_ne!(
             spawn_inject_sig(&off)[1],
             spawn_inject_sig(&sensor)[1],
@@ -3939,7 +4087,7 @@ mod tests {
     fn opencode_env_carries_the_tab_id_for_the_plugin() {
         for mode in ["off", "sensor", "deny"] {
             let mut s = Settings::default();
-            s.offload.native_web_visibility = mode.to_string();
+            s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
             let env = compose_ai_env(&opencode_cfg(), &s, "opencode-3");
             assert_eq!(
                 env.get("CIMP_TAB_ID").map(String::as_str),
@@ -3959,7 +4107,7 @@ mod tests {
     /// by throwing — is wrapped so nothing can escape it.
     #[test]
     fn opencode_plugin_beacon_handler_is_flagged_and_never_throws() {
-        let on = opencode_plugin_source(1, "t", OpencodePluginFlags { beacon: true, ..ALL_OFF });
+        let on = opencode_plugin_source(1, "t", "opencode", OpencodePluginFlags { beacon: true, ..ALL_OFF });
         assert!(on.contains("CIMP_BEACON_ENABLED = true"));
         assert!(on.contains("tool.execute.before"));
         assert!(on.contains("/latch/beacon"));
@@ -3989,7 +4137,7 @@ mod tests {
 
         // Off/deny bake the flag false, so the handler is inert even though the
         // file may still be written for the graph's sake.
-        let off = opencode_plugin_source(1, "t", ALL_OFF);
+        let off = opencode_plugin_source(1, "t", "opencode", ALL_OFF);
         assert!(off.contains("CIMP_BEACON_ENABLED = false"));
     }
 
@@ -4002,10 +4150,10 @@ mod tests {
     /// made (so no added latency at all on the common install).
     #[test]
     fn the_native_gate_is_inert_when_its_flag_is_false() {
-        let off = opencode_plugin_source(1, "t", OpencodePluginFlags { beacon: true, ..ALL_OFF });
+        let off = opencode_plugin_source(1, "t", "opencode", OpencodePluginFlags { beacon: true, ..ALL_OFF });
         assert!(off.contains("CIMP_NATIVE_GATE_ENABLED = false"));
         // The one guard that must precede every gate action.
-        assert!(off.contains("if (CIMP_NATIVE_GATE_ENABLED && CIMP_TAB_ID && inp) {"));
+        assert!(off.contains("if (CIMP_NATIVE_GATE_ENABLED && CIMP_TAB_MATCH && inp) {"));
         // The beacon half is untouched by Phase H.
         assert!(off.contains("CIMP_BEACON_ENABLED = true"));
         assert!(off.contains("/latch/beacon"));
@@ -4023,7 +4171,7 @@ mod tests {
             opencode_native_names, ToolClass, REFUSAL_NATIVE_LOCAL_BLOCKED,
             REFUSAL_NATIVE_WEB_BLOCKED,
         };
-        let js = opencode_plugin_source(1, "t", ALL_ON);
+        let js = opencode_plugin_source(1, "t", "opencode", ALL_ON);
         assert!(js.contains("CIMP_NATIVE_GATE_ENABLED = true"));
 
         // Every local-capability native name is in the gated set…
@@ -4070,19 +4218,29 @@ mod tests {
     /// nothing, exactly like the app being closed.
     #[test]
     fn the_native_gate_fails_open_on_every_error_path() {
-        let js = opencode_plugin_source(1, "t", ALL_ON);
+        let js = opencode_plugin_source(1, "t", "opencode", ALL_ON);
         let start = js
             .find("async function cimpGateState()")
             .expect("state helper present");
         let end = js[start..].find("\nexport default").expect("helper ends") + start;
         let helper = &js[start..end];
         // Non-200 ⇒ open. Malformed/absent body ⇒ open. Any throw ⇒ open.
-        assert!(helper.contains("if (!r || !r.ok) { CIMP_GATE_STATE = open; return open; }"));
-        assert!(helper.contains(r#"if (!j || j.gate !== true || typeof j.latch !== "string") { CIMP_GATE_STATE = open; return open; }"#));
+        // Every one of them goes through `settle`, which caches only when no
+        // invalidation raced the query (#48, H-1) and answers `open` otherwise.
+        assert!(helper.contains("if (!r || !r.ok) return settle(open);"));
+        assert!(helper.contains(
+            r#"if (!j || j.gate !== true || typeof j.latch !== "string") return settle(open);"#
+        ));
         assert!(helper.contains("catch (_e) {"), "{helper}");
         assert!(
-            helper.contains("CIMP_GATE_STATE = open;\n    return open;"),
+            helper.contains("return settle(open);\n  }\n}"),
             "the catch arm must return the fail-open verdict: {helper}"
+        );
+        // …and `settle` itself never denies on doubt: a raced verdict is
+        // dropped, not applied and not cached.
+        assert!(
+            helper.contains("if (CIMP_GATE_EPOCH !== epoch) return open;"),
+            "{helper}"
         );
         // The fail-open verdict is what `open` means: no gate, nothing latched.
         assert!(helper.contains(r#"const open = { at: now, gate: false, latch: "open" };"#));
@@ -4093,19 +4251,181 @@ mod tests {
     /// The cache: an in-memory TTL so the hook's common path costs a `Set`
     /// lookup, plus the invalidation that keeps it honest — a beacon has just
     /// moved the latch this cache describes.
+    ///
+    /// #48 (H-1) hardened both halves. Invalidation and validation now speak the
+    /// same language (a monotonic epoch, so an in-flight query cannot commit a
+    /// pre-beacon verdict on top of an invalidation), and the invalidation sits
+    /// ABOVE the beacon's own enable guard — `off`/`deny` native-web mode with
+    /// the gate switched ON is the most hardened combination there is, and it
+    /// was the one where nothing dropped the cache at all.
     #[test]
     fn the_native_gate_caches_state_and_drops_it_when_the_beacon_fires() {
-        let js = opencode_plugin_source(1, "t", ALL_ON);
+        let js = opencode_plugin_source(1, "t", "opencode", ALL_ON);
         assert!(js.contains("const CIMP_GATE_TTL_MS = 2000;"));
         assert!(js.contains("if (now - CIMP_GATE_STATE.at < CIMP_GATE_TTL_MS) return CIMP_GATE_STATE;"));
         assert!(js.contains("/latch/state"));
-        // The beacon drops the cache BEFORE its POST, so a fetch that throws
-        // still leaves the stale verdict invalidated.
+        assert!(js.contains("let CIMP_GATE_EPOCH = 0;"));
         let hook = &js[js.find(r#""tool.execute.before""#).expect("hook")..];
         let hook = &hook[..hook.find(r#""tool.execute.after""#).expect("hook ends")];
-        let invalidate = hook.find("CIMP_GATE_STATE.at = 0;").expect("invalidation");
+        let bump = hook.find("CIMP_GATE_EPOCH++;").expect("epoch bump");
+        let drop = hook
+            .find(r#"CIMP_GATE_STATE = { at: 0, gate: false, latch: "open" };"#)
+            .expect("cache drop");
+        let beacon_guard = hook
+            .find("if (!CIMP_BEACON_ENABLED) return;")
+            .expect("beacon enable guard");
         let beacon_post = hook.find("/latch/beacon").expect("beacon post");
-        assert!(invalidate < beacon_post, "invalidate before the POST: {hook}");
+        // Both halves of the invalidation, above the beacon's enable guard…
+        assert!(
+            bump < beacon_guard && drop < beacon_guard,
+            "invalidate above the beacon guard, or the gate-on/beacon-off \
+             posture never drops its cache: {hook}"
+        );
+        // …and before the POST, so a fetch that throws still leaves the stale
+        // verdict invalidated.
+        assert!(bump < beacon_post, "invalidate before the POST: {hook}");
+        // The web-tool test is what makes this a beacon-shaped invalidation
+        // rather than a blanket one: an unlisted tool costs nothing.
+        assert!(
+            hook.find("CIMP_WEB_TOOLS.has(inp.tool)")
+                .is_some_and(|w| w < bump),
+            "only a native WEB tool invalidates: {hook}"
+        );
+    }
+
+    /// **The one property no source assertion can reach** (#48, H-1): the gate
+    /// cache clobber race, executed.
+    ///
+    /// Every other test in this file greps the generated string. H-1 is a
+    /// *runtime* interleaving — an in-flight `/latch/state` query resolving
+    /// AFTER a beacon has moved the latch — so the only way to pin it is to run
+    /// the file. This writes the generated plugin plus a ~50-line driver into a
+    /// temp dir and executes them under `node` with `fetch` stubbed, holding the
+    /// first state query open until the beacon has fired.
+    ///
+    /// Against the pre-#48 plugin the driver's final `read` is ADMITTED: the
+    /// stale query re-assigned `CIMP_GATE_STATE` to `{gate:true, latch:"open"}`
+    /// stamped with a pre-beacon `now`, re-validating it for a full 2 s TTL over
+    /// the beacon's `.at = 0`. Against this one it is REFUSED, because the epoch
+    /// moved while the query was in flight and `settle` therefore dropped the
+    /// verdict instead of caching it.
+    ///
+    /// Ignored by default: `cargo test` must not require a `node` on PATH.
+    ///
+    /// Run: `cargo test --bin cimp -- --ignored --nocapture gate_cache`
+    #[test]
+    #[ignore]
+    fn the_gate_cache_survives_a_beacon_racing_an_in_flight_query() {
+        let dir = std::env::temp_dir().join(format!("cimp-plugin-harness-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("plugin.mjs"),
+            opencode_plugin_source(1, "tok", "opencode", ALL_ON),
+        )
+        .expect("write plugin");
+        std::fs::write(dir.join("driver.mjs"), GATE_RACE_DRIVER).expect("write driver");
+
+        let out = std::process::Command::new("node")
+            .arg("driver.mjs")
+            .current_dir(&dir)
+            .output()
+            .expect("node on PATH — this test is #[ignore]d precisely because it needs one");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "driver failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("OK: refused after the beacon"),
+            "the post-beacon read was admitted — the stale verdict was cached\
+             \n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
+    /// The driver for [`the_gate_cache_survives_a_beacon_racing_an_in_flight_query`].
+    /// Kept beside it rather than in a fixture file so the interleaving it
+    /// stages and the invariant it asserts read together.
+    const GATE_RACE_DRIVER: &str = r#"
+// Stubbed loopback. The FIRST /latch/state query is held open (its resolver is
+// parked) so a beacon can be interleaved behind it; later queries answer
+// immediately with whatever `latch` is current.
+let held = null;
+let latch = "open";
+globalThis.fetch = (url) => {
+  const u = String(url);
+  if (u.endsWith("/latch/state")) {
+    // Snapshot the latch AT REQUEST TIME — that is what makes a held reply a
+    // genuinely PRE-beacon verdict rather than a fresh read of a moved latch.
+    const answered = latch;
+    const reply = { ok: true, json: async () => ({ gate: true, latch: answered }) };
+    if (held === null) return new Promise((resolve) => { held = () => resolve(reply); });
+    return Promise.resolve(reply);
+  }
+  // The beacon POST. This is what engages EXTERNAL app-side, so model it.
+  if (u.endsWith("/latch/beacon")) latch = "external";
+  return Promise.resolve({ ok: true, json: async () => ({}) });
+};
+process.env.CIMP_TAB_ID = "opencode";
+
+const hooks = await (await import("./plugin.mjs")).default({ directory: "." });
+const before = hooks["tool.execute.before"];
+
+// 1. A `read` starts its state query. Pre-beacon, so it will answer "open".
+const inflight = before({ tool: "read", sessionID: "s" });
+// 2. A `webfetch` runs concurrently: it engages EXTERNAL and invalidates.
+await before({ tool: "webfetch", sessionID: "s" });
+if (latch !== "external") { console.log("FAIL: the beacon did not engage"); process.exit(1); }
+// 3. NOW the first query resolves, carrying its pre-beacon verdict. It must not
+//    become the cache: this read itself was already in flight and is admitted,
+//    which is fine, but the next one must re-ask.
+held();
+await inflight;
+// 4. The read that must be refused. Under the clobber bug it is served from a
+//    cache that says `latch:"open"` for a full TTL.
+try {
+  await before({ tool: "read", sessionID: "s" });
+  console.log("FAIL: admitted against an EXTERNAL latch");
+  process.exit(1);
+} catch (e) {
+  if (!String(e && e.message).length) { console.log("FAIL: empty refusal"); process.exit(1); }
+  console.log("OK: refused after the beacon");
+}
+"#;
+
+    /// One file per tab (#48, H-2), and every handler inert in any other tab's
+    /// process.
+    ///
+    /// OpenCode loads EVERY file in `.opencode/plugin/` into EVERY session it
+    /// starts in that directory, and `ai_working_dir` hands every builtin tab
+    /// the same launch cwd — so per-tab files are only safe because each one
+    /// checks the process's `CIMP_TAB_ID` against the id baked into it. Without
+    /// that, tab B's flags would run under tab A's identity (the env var is A's)
+    /// and every handler would fire once per installed file.
+    #[test]
+    fn the_plugin_is_scoped_to_the_tab_it_was_generated_for() {
+        let js = opencode_plugin_source(1, "t", "ai-abc123", ALL_ON);
+        assert!(js.contains(r#"const CIMP_TAB_ID = "ai-abc123";"#), "{js}");
+        assert!(js.contains("process.env.CIMP_TAB_ID) === CIMP_TAB_ID"), "{js}");
+        // Every handler bails out first thing when this file is not this
+        // process's tab. Four handlers, four guards.
+        for handler in [
+            r#""chat.message""#,
+            r#""tool.execute.before""#,
+            r#""tool.execute.after""#,
+            "event:",
+        ] {
+            let at = js.find(handler).unwrap_or_else(|| panic!("{handler}"));
+            let body = &js[at..];
+            let guard = body.find("CIMP_TAB_MATCH").unwrap_or_else(|| panic!("{handler}"));
+            let fetch = body.find("fetch(").unwrap_or_else(|| panic!("{handler}"));
+            assert!(guard < fetch, "{handler} must check the tab before it acts");
+        }
+        // The id is JSON-quoted, never concatenated: a syntax error here is a
+        // file the harness fails to load at startup.
+        assert!(opencode_plugin_source(1, "t", "a\"b", ALL_ON)
+            .contains(r#"const CIMP_TAB_ID = "a\"b";"#));
     }
 
     /// Ordering: the GATE runs before the BEACON, so a refused call never
@@ -4115,7 +4435,7 @@ mod tests {
     /// throwing.
     #[test]
     fn the_gate_runs_before_the_beacon_and_only_the_gate_may_throw() {
-        let js = opencode_plugin_source(1, "t", ALL_ON);
+        let js = opencode_plugin_source(1, "t", "opencode", ALL_ON);
         let hook = &js[js.find(r#""tool.execute.before""#).expect("hook")..];
         let hook = &hook[..hook.find(r#""tool.execute.after""#).expect("hook ends")];
         let gate = hook.find("CIMP_NATIVE_GATE_ENABLED").expect("gate half");
@@ -4147,7 +4467,7 @@ mod tests {
             _ => unreachable!(),
         };
         s.graph.enabled = false;
-        s.offload.native_web_visibility = "off".to_string();
+        s.set_native_web_mode_for_test(NativeWebVisibility::Off);
         assert!(
             !opencode_plugin_wanted(&s, &id),
             "nothing wants it yet — the baseline"

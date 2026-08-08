@@ -1165,6 +1165,9 @@
   // listens for `settings-deep-link` events fired while the window is
   // already open. Both call `scrollToTabSection` with the same id.
   let unlistenDeepLink: (() => void) | undefined;
+  /// #48 (F-x): the `ai-tab-restart-hint` listener, now that the backend emits
+  /// to this window too.
+  let unlistenRestartHint: (() => void) | undefined;
   // Async-IIFE / async-onMount disposal guard. The deep-link listener
   // is registered after an `await` and may not resolve before the
   // window closes. Without this flag the late-resolving listener gets
@@ -1212,6 +1215,7 @@
     void refreshAuditGlobalConfig();
     snapshot = structuredClone(get(settings));
     for (const t of AI_TABS) captureBaseline(t);
+    injectionAppBaseline = injectionAppShape(snapshot);
     unsub = settings.subscribe((s) => {
       snapshot = structuredClone(s);
     });
@@ -1276,12 +1280,29 @@
       return;
     }
     unlistenDeepLink = deepLinkUnlisten;
+
+    // #48 (F-x): the backend's spawn-injection edge hint. It used to be emitted
+    // to the main window only — a toast the user never sees, because they are
+    // standing HERE when they flip the switch that raised it. Rendered as the
+    // per-tab restart hint the Tabs section already has, so the affordance the
+    // hint points at (a Restart button) is the same one it appears beside.
+    const restartHintUnlisten = await listen<string[]>('ai-tab-restart-hint', (e) => {
+      const tabs = new Set(spawnStaleTabs);
+      for (const c of e.payload ?? []) for (const t of consumerTabs(c)) tabs.add(t);
+      spawnStaleTabs = [...tabs];
+    });
+    if (disposed) {
+      restartHintUnlisten();
+      return;
+    }
+    unlistenRestartHint = restartHintUnlisten;
   });
 
   onDestroy(() => {
     disposed = true;
     unsub?.();
     unlistenDeepLink?.();
+    unlistenRestartHint?.();
     if (backendStatusTimer) clearInterval(backendStatusTimer);
   });
 
@@ -1468,14 +1489,63 @@
     };
   }
 
+  /// The APP-WIDE spawn-baked injection cells: L1 and the three app-wide L2
+  /// inputs the hierarchy feeds into `spawn_inject_sig`.
+  ///
+  /// `restartShape` above covers a TAB's three L3 cells and nothing else (#48,
+  /// F-x), so flipping the master switch — or the native-web mode, consumer
+  /// hygiene or the OpenCode native gate at L2 — raised no hint in this window
+  /// at all, even though every one of them moves the backend signature and
+  /// therefore every running tab's posture. Section-level rather than per-tab
+  /// because that is what they are: they affect all tabs at once.
+  function injectionAppShape(s: Settings | null): string {
+    if (!s) return '';
+    return JSON.stringify([
+      s.offload.injection.protection,
+      s.offload.native_web_visibility,
+      s.offload.injection.consumer_hygiene_enabled,
+      s.offload.injection.opencode_native_gate_enabled,
+    ]);
+  }
+
+  /// Captured when this window opens (and again whenever a tab is restarted
+  /// from here — the natural "you have acted on it" moment). There is no way to
+  /// know from Settings that every AI tab has been restarted, so the hint
+  /// deliberately errs toward staying visible rather than clearing itself.
+  let injectionAppBaseline = $state<string>('');
+  const injectionAppRestartRequired = $derived(
+    injectionAppBaseline !== '' && injectionAppShape(snapshot) !== injectionAppBaseline,
+  );
+
+  /// Tabs the BACKEND has told us launch differently now — the payload of
+  /// `ai-tab-restart-hint`, expanded from consumer names to this window's tab
+  /// ids (#48, F-x: that event used to reach the main window only, which is the
+  /// one place the user is NOT standing when they change a setting here).
+  ///
+  /// This is the wider signal of the two: it covers every spawn-baked input,
+  /// not just the injection hierarchy — MCP server exposure, the guidance
+  /// addendum, the statusline overlay, the local-provider env, the OpenCode
+  /// provider block. Cleared per tab when that tab is restarted from here.
+  let spawnStaleTabs = $state<string[]>([]);
+
+  function consumerTabs(consumer: string): AiTabId[] {
+    return consumer === 'opencode' ? ['opencode'] : ['claude', 'claude-local'];
+  }
+
   const restartRequired = $derived.by(() => {
     const out: Record<string, boolean> = {};
     if (!snapshot) return out;
     for (const t of AI_TABS) {
       const baseline = tabBaselines[t];
       const live = aiTabFromSnapshot(t);
-      if (!baseline || !live) continue;
-      out[t] = JSON.stringify(restartShape(live)) !== JSON.stringify(restartShape(baseline));
+      const backendStale = spawnStaleTabs.includes(t);
+      if (!baseline || !live) {
+        out[t] = backendStale;
+        continue;
+      }
+      out[t] =
+        backendStale ||
+        JSON.stringify(restartShape(live)) !== JSON.stringify(restartShape(baseline));
     }
     return out;
   });
@@ -1483,6 +1553,12 @@
   async function restartTab(tab: AiTabId) {
     await requestTabRestart(tab);
     captureBaseline(tab);
+    spawnStaleTabs = spawnStaleTabs.filter((t) => t !== tab);
+    // The app-wide injection cells are baked into whatever launches next, so a
+    // restart here is also the moment this window's section-level hint has been
+    // acted on for at least one tab. Re-baseline only when nothing else is
+    // still stale, so the hint outlives a partial restart.
+    if (spawnStaleTabs.length === 0) injectionAppBaseline = injectionAppShape(snapshot);
   }
 
   /// Tabs visible in the Tabs section, in their stored order. Filtered
@@ -4369,6 +4445,23 @@
               per-feature switches below are the smaller instrument.
             </small>
           {/if}
+          {#if injectionAppRestartRequired}
+            <!--
+              #48 (F-x): the app-wide half of the restart hint. The per-tab hint
+              in the Tabs section diffs a tab's own L3 cells; the master switch
+              and the three app-wide L2 inputs move the backend's spawn
+              signature too, and until now nothing in this window said so. It
+              stays up until a tab is restarted from Settings, because there is
+              no way to tell from here that they all have been.
+            -->
+            <small class="hint down">
+              ⚠ Spawn-baked changes are pending. The master switch, the native
+              web tools mode, consumer hygiene and OpenCode native-tool gating
+              are baked into an AI tab when it launches, so every running tab
+              keeps the posture it started with — restart them (Settings → Tabs
+              → Restart) for these to apply.
+            </small>
+          {/if}
           {#if injectionRows.length === 0}
             <small class="hint down">
               ⚠ The resolved injection state could not be read from the backend,
@@ -4542,6 +4635,25 @@
                     : ''}
                 </span>
               </li>
+              {#if detection.local_rules_broken}
+                <!-- #48/U-4's other half: once a broken `local/` rule stopped
+                     vetoing the update channel it stopped being loud, and its
+                     only trace was a `warn!` line in a log nobody has open.
+                     The Advisor card is the nudge; this is the row in the place
+                     the user goes to look. Same backend predicate, so the two
+                     cannot disagree about whether their rules are live. -->
+                <li class="down">
+                  <span class="mcp-dot" aria-hidden="true"></span>
+                  <span class="mcp-name">Your rule files</span>
+                  <span class="mcp-detail" title={detection.local_rules_broken.dir}>
+                    {detection.local_rules_broken.failed.length} file(s) in
+                    <code>rules.d/local/</code> did not compile and are NOT matching:
+                    {detection.local_rules_broken.failed.join(', ')} — the rest of the
+                    set ({detection.local_rules_broken.rules} rule(s)) is live. Fix the
+                    file and press Reload rules.
+                  </span>
+                </li>
+              {/if}
               <li class:healthy={detection.classifier.present} class:down={!detection.classifier.present}>
                 <span class="mcp-dot" aria-hidden="true"></span>
                 <span class="mcp-name">Classifier</span>

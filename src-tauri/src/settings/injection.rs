@@ -882,12 +882,81 @@ pub fn detection_config(s: &Settings, scope: Scope<'_>) -> crate::offload::detec
 
 // ── Spawn signature + introspection ───────────────────────────────────────
 
-/// The hierarchy's contribution to `tabs::config::spawn_inject_sig`.
+/// Which AI consumer a spawn signature is being built for.
 ///
-/// Every level of every **spawn-baked** feature ([`Feature::spawn_baked`]), for
-/// every AI tab: the master switch, the app-wide L2 inputs, and each tab's
-/// resolved values. A flip at any of the three levels moves this, so the user
-/// gets the restart hint a spawn-baked change owes them.
+/// The split matches how `tabs::config` already divides the launch path:
+/// `build_pre_args` is Claude-only, `build_opencode_config` /
+/// `write_opencode_plugin` take everything else. So the two consumers' tab sets
+/// PARTITION the AI tabs — no tab belongs to neither, which is what keeps the
+/// per-consumer signatures from dropping a row between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consumer {
+    Claude,
+    Opencode,
+}
+
+impl Consumer {
+    /// The consumer a tab whose command is `command` launches.
+    pub fn for_command(command: &str) -> Self {
+        if crate::tabs::config::command_is(command, "claude") {
+            Consumer::Claude
+        } else {
+            Consumer::Opencode
+        }
+    }
+
+    /// Whether `feature`'s spawn-baked value reaches this consumer's launch at
+    /// all.
+    ///
+    /// Exhaustive, so a new [`Feature`] cannot be added without an answer here —
+    /// and the answer defaults to nothing: a control that reaches neither
+    /// consumer would simply never raise a hint, which is why the match names
+    /// every variant rather than falling through.
+    fn reads(self, feature: Feature) -> bool {
+        match feature {
+            // Claude reads the mode in `build_pre_args` (the beacon hook, and
+            // `permissions.deny` in `deny` mode); OpenCode bakes it into the
+            // plugin's beacon flag and its pinned permission block.
+            Feature::NativeWeb => true,
+            // The hygiene paragraph is Claude's `--append-system-prompt` and
+            // OpenCode's managed instructions file; the pinned permission block
+            // is OpenCode's alone.
+            Feature::ConsumerHygiene => true,
+            // Phase H's gate exists only inside the generated OpenCode plugin.
+            // This is the row the shared blob was nagging Claude tabs about.
+            Feature::OpencodeNativeGate => self == Consumer::Opencode,
+            // Live features never reach a spawn signature at all — filtered out
+            // by `Feature::spawn_baked` before this is asked — but naming them
+            // keeps the match total.
+            Feature::TaintLatch
+            | Feature::Spotlighting
+            | Feature::Detection
+            | Feature::SsrfGuard
+            | Feature::FetchBudgets
+            | Feature::Canary
+            | Feature::MemoryQuarantine
+            | Feature::TerminalEscapeHygiene => false,
+        }
+    }
+}
+
+/// The hierarchy's contribution to `tabs::config::spawn_inject_sig`, **for one
+/// consumer**.
+///
+/// Every level of every **spawn-baked** feature ([`Feature::spawn_baked`]) that
+/// `consumer` actually reads, for every AI tab that IS a `consumer` tab: the
+/// master switch, the app-wide L2 inputs, and each tab's resolved values. A flip
+/// at any of the three levels moves this, so the user gets the restart hint a
+/// spawn-baked change owes them.
+///
+/// **Per consumer since #48 (F-x).** Both consumer objects used to embed the
+/// identical blob, so an OpenCode-only flip — `opencode_native_gate`, or a
+/// native-web override on the OpenCode tab — marked Claude tabs dirty too and
+/// nagged them to restart for a change that could not reach them. The feature
+/// that introduced the rule ("a restart nag for a change that needs no restart
+/// is how a hint stops being read") was violating it. Two filters do the work,
+/// and nothing else changed: which TABS contribute a row, and which FEATURES
+/// each row (and the `l2` array) carries.
 ///
 /// Live features are deliberately absent: they take effect on the next call, and
 /// a restart nag for a change that needs no restart is how a hint stops being
@@ -902,39 +971,52 @@ pub fn detection_config(s: &Settings, scope: Scope<'_>) -> crate::offload::detec
 /// `sensor` and `deny` both resolve the feature "on" but launch a tab very
 /// differently, so a signature built from booleans alone would miss a mode
 /// change.
-pub fn spawn_sig(s: &Settings) -> serde_json::Value {
+pub fn spawn_sig(s: &Settings, consumer: Consumer) -> serde_json::Value {
+    // The spawn-baked features this consumer reads, in `Feature::ALL` order.
+    // Driven by `Feature::spawn_baked` rather than by a hand-written pair, so a
+    // future spawn-baked control gets its restart hint by declaring itself —
+    // not by someone remembering this function.
+    let features: Vec<Feature> = Feature::ALL
+        .iter()
+        .copied()
+        .filter(|f| f.spawn_baked() && consumer.reads(*f))
+        .collect();
     let rows: Vec<serde_json::Value> = s
         .tabs
         .iter()
         .filter_map(|t| match t {
-            TabConfig::AiTool(c) => Some(c),
+            TabConfig::AiTool(c) if Consumer::for_command(&c.command) == consumer => Some(c),
             _ => None,
         })
         .map(|c| {
             let scope = Scope::tab_only(&c.id);
-            // Driven by `Feature::spawn_baked` rather than by a hand-written
-            // pair, so a future spawn-baked control gets its restart hint by
-            // declaring itself — not by someone remembering this function.
-            let resolved: Vec<serde_json::Value> = Feature::ALL
+            let resolved: Vec<serde_json::Value> = features
                 .iter()
-                .filter(|f| f.spawn_baked())
                 .map(|f| serde_json::json!([f.key(), effective(*f, scope, s)]))
                 .collect();
             serde_json::json!([c.id, native_web_mode(s, scope).as_str(), resolved])
         })
         .collect();
+    // The app-wide L2 input for each of those features. The native-web entry is
+    // the tri-mode string — that IS its L2 (the module docs' reconciliation
+    // note), and it carries `sensor` vs `deny`, which a boolean would lose.
+    let l2: Vec<serde_json::Value> = features
+        .iter()
+        .map(|f| match f {
+            Feature::NativeWeb => {
+                serde_json::json!([f.key(), s.offload.native_web_visibility.clone()])
+            }
+            _ => serde_json::json!([f.key(), feature_l2(*f, s)]),
+        })
+        .collect();
     serde_json::json!({
         // L1 explicitly, even though it is folded into every resolved value
         // above: a master flip on an install with no AI tabs configured must
-        // still move the signature rather than compare equal to itself.
+        // still move the signature rather than compare equal to itself. Shared
+        // by both consumers on purpose — L1 is the one switch that reaches
+        // every launch there is.
         "master": s.offload.injection.protection,
-        // The app-wide L2 inputs for the two spawn-baked features. The mode is
-        // native-web's L2 — see the module docs' reconciliation note.
-        "l2": [
-            s.offload.native_web_visibility,
-            s.offload.injection.consumer_hygiene_enabled,
-            s.offload.injection.opencode_native_gate_enabled,
-        ],
+        "l2": l2,
         "tabs": rows,
     })
 }
@@ -1076,6 +1158,17 @@ pub fn protection_reduced(s: &Settings) -> bool {
 // and adding a variant to `Feature` fails to compile here until the new
 // control's L2 storage is named. That is a stronger property than the field
 // names the retired tripwire searched for (#44).
+/// Which detection layer a test is setting — see
+/// [`Settings::set_detection_layer_for_test`]. Test-only, because the two
+/// layers have no run-time selector of their own: production code reads them
+/// through [`detection_config`], which resolves [`Feature::Detection`] first.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetectionLayer {
+    Signature,
+    Classifier,
+}
+
 #[cfg(test)]
 impl Settings {
     /// L1 — the global master.
@@ -1110,6 +1203,30 @@ impl Settings {
                     NativeWebMode::Off.as_str().to_string()
                 }
             }
+        }
+    }
+
+    /// L2 for [`Feature::NativeWeb`] as a **posture** rather than an on/off.
+    ///
+    /// `set_l2_for_test` can only say `off`/`sensor`; `deny` is a third posture,
+    /// and several `tabs::config` tests sweep all three. Added with #48, when
+    /// `native_web_visibility` joined the other L2 switches behind
+    /// `pub(in crate::settings)` — by the Phase G reconciliation this tri-mode
+    /// IS that feature's L2, so it belongs on the same side of the boundary.
+    pub(crate) fn set_native_web_mode_for_test(&mut self, mode: NativeWebMode) {
+        self.offload.native_web_visibility = mode.as_str().to_string();
+    }
+
+    /// One of the two detection LAYERS beneath [`Feature::Detection`].
+    ///
+    /// Enum-keyed like the rest (#48): the layer selection lives *inside* an
+    /// enabled surface — `detection_config` checks the feature first and wins —
+    /// so these are inputs to the resolver, not switches an enforcement site may
+    /// read on its own.
+    pub(crate) fn set_detection_layer_for_test(&mut self, layer: DetectionLayer, on: bool) {
+        match layer {
+            DetectionLayer::Signature => self.offload.detection_signature_enabled = on,
+            DetectionLayer::Classifier => self.offload.detection_classifier_enabled = on,
         }
     }
 
@@ -1493,93 +1610,195 @@ mod tests {
         assert!(!detection_config(&s, Scope::App).signature);
     }
 
-    /// The spawn signature moves for spawn-baked features at BOTH levels, and
-    /// stays put for the live ones.
+    /// One Claude tab and one OpenCode tab — the shape the per-consumer spawn
+    /// signature has to tell apart (#48, F-x).
+    fn settings_both_consumers() -> Settings {
+        Settings {
+            tabs: vec![
+                super::super::schema::default_claude_tab(),
+                super::super::schema::default_opencode_tab(),
+            ],
+            ..Settings::default()
+        }
+    }
+
+    /// The id of the first tab whose command launches `consumer`.
+    fn tab_of(s: &Settings, consumer: Consumer) -> String {
+        s.tabs
+            .iter()
+            .find_map(|t| match t {
+                TabConfig::AiTool(c) if Consumer::for_command(&c.command) == consumer => {
+                    Some(c.id.clone())
+                }
+                _ => None,
+            })
+            .expect("a tab for this consumer")
+    }
+
+    /// The spawn signature moves for spawn-baked features at BOTH levels, stays
+    /// put for the live ones — and, since #48 (F-x), moves for the RIGHT
+    /// CONSUMER.
+    ///
+    /// Both consumer objects used to embed the identical blob, so an
+    /// OpenCode-only flip (the Phase H gate; a native-web override on the
+    /// OpenCode tab) marked Claude tabs dirty and nagged them to restart for a
+    /// change that cannot reach them — the feature that introduced the rule
+    /// "a restart nag for a change that needs no restart is how a hint stops
+    /// being read" violating it. The third column below is the property: exactly
+    /// which consumers each flip is allowed to disturb.
     #[test]
     fn the_spawn_signature_tracks_only_spawn_baked_levels() {
-        let base = settings();
-        // `spawn_sig` walks every AI tab itself, so no id is needed here.
-        let _ = a_tab(&base);
-        let sig = spawn_sig;
-        let before = sig(&base);
+        use Consumer::{Claude, Opencode};
+        let base = settings_both_consumers();
+        let before = |c: Consumer| spawn_sig(&base, c);
 
-        for (name, mutate) in [
+        type Mutate = Box<dyn Fn(&mut Settings)>;
+        let moves: Vec<(&str, Mutate, &[Consumer])> = vec![
             (
                 "native-web L2 (the mode)",
-                Box::new(|s: &mut Settings| s.offload.native_web_visibility = "deny".into())
-                    as Box<dyn Fn(&mut Settings)>,
+                Box::new(|s: &mut Settings| s.set_native_web_mode_for_test(NativeWebMode::Deny)),
+                &[Claude, Opencode],
             ),
             (
-                "native-web L3",
+                "native-web L3 on the Claude tab",
                 Box::new(|s: &mut Settings| {
-                    let id = a_tab(s);
+                    let id = tab_of(s, Claude);
                     set_tab_override(s, &id, Feature::NativeWeb, Override::Off);
                 }),
+                &[Claude],
+            ),
+            (
+                "native-web L3 on the OpenCode tab",
+                Box::new(|s: &mut Settings| {
+                    let id = tab_of(s, Opencode);
+                    set_tab_override(s, &id, Feature::NativeWeb, Override::Off);
+                }),
+                &[Opencode],
             ),
             (
                 "consumer-hygiene L2",
-                Box::new(|s: &mut Settings| s.offload.injection.consumer_hygiene_enabled = false),
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::ConsumerHygiene, false)),
+                &[Claude, Opencode],
             ),
             (
-                "consumer-hygiene L3",
+                "consumer-hygiene L3 on the Claude tab",
                 Box::new(|s: &mut Settings| {
-                    let id = a_tab(s);
+                    let id = tab_of(s, Claude);
                     set_tab_override(s, &id, Feature::ConsumerHygiene, Override::Off);
                 }),
+                &[Claude],
             ),
             // V32 Phase H: both levels of the OpenCode native gate. Its flag is
             // compiled into the generated plugin, so a flip that does not move
-            // this signature is a gate the user believes is on and is not.
+            // the OpenCode signature is a gate the user believes is on and is
+            // not — and one that moves the CLAUDE signature is the F-x nag.
             (
                 "opencode-native-gate L2",
-                Box::new(|s: &mut Settings| {
-                    s.offload.injection.opencode_native_gate_enabled = true
-                }),
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::OpencodeNativeGate, true)),
+                &[Opencode],
             ),
             (
                 "opencode-native-gate L3",
                 Box::new(|s: &mut Settings| {
-                    let id = a_tab(s);
+                    let id = tab_of(s, Opencode);
                     set_tab_override(s, &id, Feature::OpencodeNativeGate, Override::On);
                 }),
+                &[Opencode],
             ),
             (
+                // L1 reaches every launch there is, so both objects carry it.
                 "the global master",
-                Box::new(|s: &mut Settings| s.offload.injection.protection = false),
+                Box::new(|s: &mut Settings| s.set_master_for_test(false)),
+                &[Claude, Opencode],
             ),
-        ] {
-            let mut s = settings();
+        ];
+        for (name, mutate, expect) in moves {
+            let mut s = settings_both_consumers();
             mutate(&mut s);
-            assert_ne!(sig(&s), before, "{name} must move the spawn signature");
+            for c in [Claude, Opencode] {
+                let moved = spawn_sig(&s, c) != before(c);
+                assert_eq!(
+                    moved,
+                    expect.contains(&c),
+                    "{name}: {c:?} signature moved={moved}, expected={}",
+                    expect.contains(&c)
+                );
+            }
         }
 
         // Live features must NOT move it — a restart hint for a change that
         // takes effect on the next call is how a hint stops being read.
-        for (name, mutate) in [
+        let stays: Vec<(&str, Mutate)> = vec![
             (
                 "taint latch L2",
-                Box::new(|s: &mut Settings| s.offload.injection.taint_latch_enabled = false)
-                    as Box<dyn Fn(&mut Settings)>,
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::TaintLatch, false)),
             ),
             (
                 "spotlighting L3",
                 Box::new(|s: &mut Settings| {
-                    let id = a_tab(s);
+                    let id = tab_of(s, Claude);
                     set_tab_override(s, &id, Feature::Spotlighting, Override::Off);
                 }),
             ),
             (
                 "detection L2",
-                Box::new(|s: &mut Settings| s.offload.injection.detection_enabled = false),
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::Detection, false)),
             ),
             (
                 "fetch budgets L2",
-                Box::new(|s: &mut Settings| s.offload.injection.fetch_budgets_enabled = false),
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::FetchBudgets, false)),
             ),
-        ] {
-            let mut s = settings();
+        ];
+        for (name, mutate) in stays {
+            let mut s = settings_both_consumers();
             mutate(&mut s);
-            assert_eq!(sig(&s), before, "{name} must not move the spawn signature");
+            for c in [Claude, Opencode] {
+                assert_eq!(
+                    spawn_sig(&s, c),
+                    before(c),
+                    "{name} must not move the {c:?} spawn signature"
+                );
+            }
+        }
+    }
+
+    /// **Splitting the signature must not DROP a cell** (#48, F-x). Every AI tab
+    /// appears in exactly one consumer's rows, and every spawn-baked feature is
+    /// carried by at least one consumer — so the union of the two objects covers
+    /// what the single shared blob covered, which is the contract
+    /// `spawn_inject_sig` has in this repo.
+    #[test]
+    fn the_per_consumer_split_partitions_the_tabs_and_covers_every_feature() {
+        let s = settings_both_consumers();
+        let ids = |c: Consumer| -> Vec<String> {
+            spawn_sig(&s, c)["tabs"]
+                .as_array()
+                .expect("tabs array")
+                .iter()
+                .map(|row| row[0].as_str().expect("tab id").to_string())
+                .collect()
+        };
+        let mut union = ids(Consumer::Claude);
+        union.extend(ids(Consumer::Opencode));
+        union.sort();
+        let mut all: Vec<String> = s
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                TabConfig::AiTool(c) => Some(c.id.clone()),
+                _ => None,
+            })
+            .collect();
+        all.sort();
+        assert_eq!(union, all, "every AI tab belongs to exactly one consumer");
+
+        // …and every spawn-baked feature is read by at least one of them.
+        for f in Feature::ALL.iter().filter(|f| f.spawn_baked()) {
+            assert!(
+                Consumer::Claude.reads(*f) || Consumer::Opencode.reads(*f),
+                "{} is spawn-baked but reaches no consumer, so no hint would ever fire",
+                f.key()
+            );
         }
     }
 

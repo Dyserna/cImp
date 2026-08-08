@@ -619,10 +619,15 @@ pub fn init() {
 /// Settings block's "Reload rules" affordance, and what the C3 updater calls
 /// after it swaps a validated bundle into place.
 pub fn reload(settings: &Settings) -> DetectionStatus {
+    // The `local/` breakage is read AFTER the recompile, deliberately: this is
+    // the "Reload rules" path, and the whole point of the button is that a file
+    // the user just fixed stops being reported broken.
+    let rules = signature::reload();
     DetectionStatus {
-        rules: signature::reload(),
+        rules,
         classifier: classifier::status(),
         updater: updater::status(settings),
+        local_rules_broken: updater::broken_local_rules(settings),
     }
 }
 
@@ -635,6 +640,17 @@ pub struct DetectionStatus {
     /// this struct rather than a command of its own so the Settings poller that
     /// already asks for rule counts gets it in the same round trip.
     pub updater: updater::UpdaterStatus,
+    /// #48 (U-4's other half): the user's OWN `rules.d/local/` files that do not
+    /// compile, when the signature layer is on and armed.
+    ///
+    /// The same [`updater::broken_local_rules`] value the Advisor's
+    /// `detection.broken_local_rules.v1` card is built from — published here so
+    /// the Settings surface renders ONE predicate rather than re-deriving "is a
+    /// failed file the user's" from the `local/` prefix in its own language
+    /// (the N-3 lesson: a dot that computes its own health eventually disagrees
+    /// with the health check). `None` in every healthy or irrelevant case,
+    /// including a layer that is switched off.
+    pub local_rules_broken: Option<updater::BrokenLocalRules>,
 }
 
 /// The current status without recompiling.
@@ -643,6 +659,7 @@ pub fn status(settings: &Settings) -> DetectionStatus {
         rules: signature::status(),
         classifier: classifier::status(),
         updater: updater::status(settings),
+        local_rules_broken: updater::broken_local_rules(settings),
     }
 }
 
@@ -857,8 +874,9 @@ mod tests {
     #[tokio::test]
     async fn the_detection_parent_switch_disables_both_layers() {
         let mut s = Settings::default();
-        s.offload.detection_signature_enabled = true;
-        s.offload.detection_classifier_enabled = true;
+        use crate::settings::injection::DetectionLayer;
+        s.set_detection_layer_for_test(DetectionLayer::Signature, true);
+        s.set_detection_layer_for_test(DetectionLayer::Classifier, true);
         s.set_l2_for_test(crate::settings::injection::Feature::Detection, false);
         let cfg = Config::from_settings(&s, crate::settings::injection::Scope::App);
         assert!(!cfg.signature && !cfg.classifier);

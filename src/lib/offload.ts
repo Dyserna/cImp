@@ -231,6 +231,20 @@ export interface DetectionStatus {
   /// the auto-updater stands for each component. Rides this same status so the
   /// Settings poller gets it in one round trip.
   updater: UpdaterStatus;
+  /// #48: the user's OWN `rules.d/local/` files that do not compile, when the
+  /// signature layer is on and armed — `null` in every healthy or irrelevant
+  /// case. The same value the Advisor's `detection.broken_local_rules.v1` card
+  /// is built from, so the Settings line and the card cannot disagree about
+  /// whether the user's rules are live.
+  local_rules_broken: {
+    /// The folder the user can open to fix them.
+    dir: string;
+    /// Rejected file names, `local/`-prefixed.
+    failed: string[];
+    /// What IS live, so the line does not read as "detection is off".
+    files_loaded: number;
+    rules: number;
+  } | null;
 }
 
 /// One updatable detection component's update state.

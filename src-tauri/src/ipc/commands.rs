@@ -995,11 +995,21 @@ pub async fn settings_update(
             consumers.push("opencode");
         }
         // Best-effort UI hint — never fail the save over it.
-        let _ = app.emit_to(
-            EventTarget::webview_window("main"),
-            "ai-tab-restart-hint",
-            consumers,
-        );
+        //
+        // BOTH windows (#48, F-x). This used to target `main` only, whose
+        // listener is a toast — and the user who just flipped the switch is
+        // standing in the SETTINGS window, which never heard the event that
+        // exists to tell them their change needs a restart. The Settings window
+        // renders it as a per-tab restart hint beside its own Restart buttons;
+        // the main window keeps its toast for the case where Settings is
+        // already closed.
+        for label in [crate::ipc::windows::SETTINGS_LABEL, "main"] {
+            let _ = app.emit_to(
+                EventTarget::webview_window(label),
+                "ai-tab-restart-hint",
+                consumers.clone(),
+            );
+        }
     }
     Ok(())
 }

@@ -1291,10 +1291,14 @@ declares its class AND its mutation capability in one reviewed place.
       something louder about the same folder and two cards about one directory
       is how a user learns to dismiss both. It also stays quiet for a failure in
       a *bundle* file: that is the updater's problem and already has three
-      cards. **Not** a Settings line: the Settings detection block is owned by
-      `src/lib/settings/*` and was outside this change's scope — a
-      `files_failed` row there, bound to the same signal, remains a worthwhile
-      follow-up.
+      cards. **The Settings line landed 2026-08-08**: `DetectionStatus` now
+      publishes `local_rules_broken` — the very same
+      `updater::broken_local_rules` value, not a re-derivation from the `local/`
+      prefix in TypeScript — and Settings → Tools → Detection renders it as a
+      "Your rule files" health row beside the signature/classifier dots. One
+      predicate, so the card and the row cannot disagree about whether the user's
+      rules are live (the N-3 lesson: a dot that computes its own health
+      eventually disagrees with the health check).
 - **C2 — memory quarantine (decision 10).** `tainted` flag on `mem_note`
   rows written under latch; recall/auto-injection exclusion; Memory UI
   promote-or-discard; spotlighting envelope on all recalled memory at
@@ -1794,11 +1798,102 @@ declares its class AND its mutation capability in one reviewed place.
     and does nothing there: `injection_status` reports tabs through
     `Scope::tab_only`, which carries no agent (Phase G's "override lookup keys on
     the tab id alone"), so "OpenCode-only" is stated in the Settings hint rather
-    than structurally. (b) There is no JS-execution harness in the repo, so the
-    plugin's gate is pinned by Rust-side source assertions over the generated
-    file (both directions, the fail-open arms, the cache, the ordering, the
-    absence of `output.args`); its runtime behaviour was verified out-of-band
-    against a stubbed loopback during implementation, not in CI.
+    than structurally. (b) **CLOSED 2026-08-08 — there is a JS-execution harness
+    now**, see the H-1 amendment below.
+
+  **Phase H amendment 2026-08-08 (#48, findings H-1 + H-2) — the two ways the
+  gate could be handed back after it was engaged.**
+  - **H-1, the cache clobber race.** Validation and invalidation spoke different
+    languages: `cimpGateState()` **re-assigned** `CIMP_GATE_STATE` to a fresh
+    object stamped with a `now` captured *before* its fetch, while the beacon
+    invalidated by **mutating** `.at = 0` on whatever object was current. A query
+    still in flight when a beacon fired therefore overwrote the invalidation with
+    its pre-beacon verdict and re-validated it for a **full 2 s TTL**. Concretely:
+    OpenCode dispatches `read` and `webfetch` concurrently; `read`'s query gets
+    `latch:"open"`, `webfetch`'s hook engages EXTERNAL, `read`'s query resolves
+    and writes `{gate:true, latch:"open"}` — and every
+    `read`/`bash`/`edit`/`write`/`patch`/`glob`/`grep` for the next two seconds is
+    admitted against an EXTERNAL latch. That is exactly the whole-surface property
+    decision 17 exists for.
+    **Fix:** a monotonic `CIMP_GATE_EPOCH`, captured before the fetch and checked
+    before the cache is written (`settle`). A verdict that raced an invalidation
+    is **dropped, not applied** — which is fail-open twice over: `open` denies
+    nothing, and an empty cache re-queries on the very next tool call instead of
+    serving a stale verdict for a TTL. The plugin's locked posture (NEVER THROWS,
+    NEVER DENIES ON DOUBT) is unchanged; the one call already in flight when the
+    beacon fires is still admitted, which is not a window but a single call that
+    predates the fetched bytes.
+  - **H-1's second half, and the reason it was worse than the race.** The
+    invalidation sat *inside* the beacon half, **below** its
+    `if (!CIMP_BEACON_ENABLED …) return` guard — so in `off`/`deny` native-web
+    mode with the gate switched on (**the most hardened combination the product
+    offers**) nothing invalidated the cache at all. Hoisted above that guard; only
+    the web-tool test still precedes it, so an unlisted tool costs nothing.
+  - **#45's beacon 400 does not interact.** The plugin never inspects the beacon
+    response and the invalidation precedes the POST, so a rejected beacon still
+    leaves the cache dropped. Recorded because it is the obvious next question.
+  - **There is a JS-execution harness now** (closing residual (b) above):
+    `tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query`
+    writes the generated plugin plus a ~40-line driver into a temp dir and runs
+    them under `node` with `fetch` stubbed, **holding the first `/latch/state`
+    query open** until the beacon has fired. It is `#[ignore]`d — `cargo test`
+    must not require a `node` on PATH — and run with
+    `cargo test --bin cimp -- --ignored gate_cache`. It was validated by
+    reverting the epoch check: the driver then prints
+    `FAIL: admitted against an EXTERNAL latch`. **No source assertion can catch
+    H-1**, which is why the harness exists at all; the source assertions still
+    pin what they always did (both directions, the fail-open arms, the ordering,
+    the absence of `output.args`, and now the epoch and the hoist).
+  - **H-2, one file for N tabs.** `opencode_plugin_wanted` and the baked
+    `beacon`/`native_gate` flags are resolved **per tab**, but the artifact was
+    `<working_dir>/.opencode/plugin/cimp-inject.js` and `ai_working_dir` returns
+    the shared launch cwd for every builtin tab. One file, N tabs, last spawn
+    wins. The review framed this as tab B *deleting* the plugin tab A's gate rides
+    on; the re-verification narrowed it — the delete branch needs `graph.enabled
+    == false` AND B's native-web `off` AND B's gate off, so **with the graph on
+    (the common case) the file is overwritten, not deleted**, which is the general
+    defect: duplicate the OpenCode tab with `+`, leave the copy at the app-wide
+    default while the original carries an L3 `On`, and the original's posture is
+    silently replaced. Nothing surfaced it — `injection_status` still reported the
+    original's *resolved* gate as on, and `spawn_inject_sig` compared equal
+    because both consumers embedded the same blob.
+    **Fix:** one file per tab, `cimp-inject-<tab>.js`, the way
+    `write_opencode_instructions` has always been keyed.
+  - **N files are only safe because each one checks whose process it is in.** The
+    review's premise that each file "is already scoped by its own `CIMP_TAB_ID`"
+    was **wrong**: the constant was read from `process.env`, i.e. from whichever
+    tab's process loaded it. OpenCode loads *every* file in `plugin/` into *every*
+    session started in that directory, so N files would have meant tab B's flags
+    running under tab A's identity and every handler firing once per installed
+    file (duplicate prompt injection, duplicate usage rows). The tab id is now
+    **baked** into the file, and `CIMP_TAB_MATCH` compares it against the env;
+    all four handlers return immediately when it does not match. **Deliberate
+    narrowing:** a hand-run `opencode` in the same project (no `CIMP_TAB_ID` in
+    its environment) now matches nothing and gets no injection, no memory tap and
+    no beacon. Those POSTs carried a session cImp had no tab for; the alternative
+    — letting an unbound process run every installed file — is the duplicate-fire
+    case above.
+  - **The stale-file sweep keys on existence, never on another tab's predicate.**
+    `sweep_stale_opencode_plugins` removes `cimp-inject-*.js` for ids that are no
+    longer configured *tabs at all*; a tab that still exists but no longer wants
+    its plugin drops it at its own next spawn. That is the constraint
+    `opencode_plugin_wanted`'s own docs lock — "a gate that disappears when an
+    unrelated feature is toggled is worse than no gate" — and from tab A's side,
+    tab B's settings are exactly such an unrelated feature. The legacy
+    `cimp-inject.js` is removed on every OpenCode spawn so an upgrade cleans up
+    after itself.
+  - **A missing discovery file no longer takes the delete branch.** "The loopback
+    is not running" is not "nothing wants this", and on an install where
+    `loopback_needed()` is false (offload, graph and the audit MCP all off,
+    native-web on `sensor`) that branch fired at every spawn — sensor mode
+    reported live everywhere with no plugin on disk. It now `warn!`s and leaves
+    whatever is there alone: a stale file's baked port and token simply fail to
+    connect, and this file's whole posture is that a dead endpoint costs a beacon,
+    not a session. **Residual:** `injection_status` still reports the OpenCode
+    sensor row from settings alone, so on such an install it reads "on" while no
+    plugin exists. The Claude side gates its beacon hook on `loopback_needed()`
+    honestly; matching that in the status view needs the report to know about
+    loopback state, and is left open.
 - **F — native-web visibility modes + manual latch override (decisions 14
   + 15; user-decided 2026-08-07).** `native_web_visibility` setting
   (`off | sensor | deny`, default `sensor`): report-only beacon hooks
@@ -2158,6 +2253,30 @@ declares its class AND its mutation capability in one reviewed place.
     `Override` serializes as a lowercase string and is parsed **post-hoc**
     (unknown ⇒ `Inherit`, the neutral cell): a hand-edited typo must neither
     grant protection nor remove it, and must not quarantine the settings file.
+    **Amended 2026-08-08 (#48) — the defect class, not just `Override`.**
+    `00b906b` fixed `Override` (a hand-written `Deserialize` through
+    `serde_json::Value`, so `true`/`null`/`1`/`[]`/`{}` all read as `Inherit`
+    instead of failing the typed parse and resetting every setting in the file).
+    The **same shape was unfixed on four plain-`String` settings** whose real
+    domain is a closed vocabulary and whose parse is post-hoc:
+    `offload.native_web_visibility`, `offload.detection_update_rules_mode`,
+    `offload.detection_update_classifier_mode` (the C3 component modes) and
+    `graph.read_advisor_mode`. `"native_web_visibility": true` — or `null` —
+    still hit `quarantine_corrupt_file` and reset themes, tabs, backends, checks,
+    MCP servers and pricing. All four now carry a `deserialize_with` whose rule
+    is one sentence: **a non-string reads exactly as an unrecognized string
+    does**, returned spelled canonically so the repaired cell also round-trips as
+    something the Settings `<select>` can display. Deliberately *not* "as the
+    shipped default": `detection_update_rules_mode` ships `auto` and falls back
+    to `check`, and `check` is the answer decision 13 argued for — a typo must
+    neither silently disable the updater nor silently grant it activation rights.
+    The sweep found no other post-hoc-parsed string *setting*
+    (`ThinkingMode`/`TierHint` parse tool arguments, `mcp_host::Consumer` a CLI
+    flag, `shadow::Trigger` a git trailer); the wider residual is unchanged and
+    is a property of typed deserialization, not of these fields — **any**
+    wrong-typed value anywhere in the file (`"detection_update_interval_hours":
+    "24"`) still quarantines it. Only the fields where a boolean or a `null` is
+    the *intuitive* hand edit have been made total.
   - **The no-raw-reads invariant is structural** (amended 2026-08-07, #44).
     Every L1/L2 switch on `InjectionSettings`, every L3 cell on
     `TabInjectionOverrides` / `WorkerInjectionOverrides`, and the two fields that
@@ -2166,7 +2285,30 @@ declares its class AND its mutation capability in one reviewed place.
     Naming one from an enforcement site is a privacy error (`E0616`), so the
     invariant is enforced by the compiler rather than watched by a test. The
     `offload.injection` field itself stays `pub`: reaching the block is legal,
-    naming a switch inside it is not. Serde is unaffected (the derived impls live
+    naming a switch inside it is not.
+    **Correction 2026-08-08 (#48): as first written, that claim overstated its
+    coverage.** #44 widened `InjectionSettings`, `TabInjectionOverrides` and
+    `WorkerInjectionOverrides` and stopped there — but six switches the hierarchy
+    genuinely reads sit on `OffloadSettings`, one level out, and stayed `pub`:
+    `native_web_visibility`, `detection_signature_enabled`,
+    `detection_classifier_enabled`, `detection_classifier_threshold`,
+    `external_fetch_max_calls`, `external_fetch_max_bytes`. The load-bearing one
+    is `native_web_visibility`: by this phase's own reconciliation that tri-mode
+    **is** `Feature::NativeWeb`'s L2, so **one L2 input of eleven was outside the
+    compiler-enforced boundary** while the spec said the boundary was structural.
+    Nothing was broken — an audit found no production read of any of the six
+    outside `crate::settings`, only `#[cfg(test)]` ones — but "structural" is a
+    claim about what the compiler refuses, and it was refusing less than stated.
+    All six are `pub(in crate::settings)` as of #48. Cost: ~15 test call sites,
+    13 of them `native_web_visibility` writes in `tabs::config::tests`, plus one
+    `..OffloadSettings::default()` functional update in `offload::service` that
+    E0451 now rejects (a functional update names every field, private ones
+    included). Two new enum-keyed test writers join the four from #44:
+    `set_native_web_mode_for_test` (a *posture*, since `set_l2_for_test` can only
+    say `off`/`sensor` and several tests sweep `deny` too) and
+    `set_detection_layer_for_test`. The other four fields needed no writer — no
+    out-of-boundary test touches them — and none was added, because an unused
+    helper is a clippy warning today and a field-name setter tomorrow. Serde is unaffected (the derived impls live
     in the declaring module) and the Settings window never touches Rust fields —
     it round-trips whole `Settings` objects through `apply_settings`.
     `injection::master_enabled` is therefore the ONLY way an outside module can
@@ -2236,6 +2378,49 @@ declares its class AND its mutation capability in one reviewed place.
     read. The Settings window's own `restartShape` gained the same two cells.
     The OpenCode `plugin[0]` signature entry narrowed to `graph.enabled` alone,
     because its sensor half is now per-tab and is carried by the new fragment.
+    **Amended 2026-08-08 (#48, F-x) — three related defects in the restart-hint
+    surface, one of which was this feature breaking its own rule.**
+    (1) **`spawn_sig` is per consumer now.** Both consumer objects embedded the
+    *identical* blob, so any hierarchy change marked both dirty: an
+    OpenCode-only flip — `opencode_native_gate`, whose flag exists only inside
+    the generated plugin, or a native-web override on the OpenCode tab — nagged
+    every Claude tab to restart for a change that cannot reach it. The feature
+    that introduced "a restart nag for a change that needs no restart is how a
+    hint stops being read" was violating it. `spawn_sig(s, Consumer)` applies two
+    filters and nothing else: which **tabs** contribute a row
+    (`Consumer::for_command`, reusing `tabs::config::command_is` so the partition
+    matches the launch path's own split rather than a second copy of it — hence
+    `tabs::config` is `pub(crate)` now), and which **features** each row and the
+    `l2` array carry (`Consumer::reads`, exhaustive over `Feature`). **Nothing
+    was dropped:** the two tab sets partition the AI tabs (`claude` ⇒ Claude,
+    everything else ⇒ OpenCode, exactly as `build_pre_args` /
+    `build_opencode_config` already split), every spawn-baked feature is read by
+    at least one consumer, and L1 stays in both objects because it reaches every
+    launch there is. Both properties are asserted, not asserted-by-comment, in
+    `the_per_consumer_split_partitions_the_tabs_and_covers_every_feature`; the
+    existing signature test now carries a third column naming exactly which
+    consumers each flip may disturb. The `l2` array became `[key, value]` pairs
+    in the same change — positional indices would silently mean different
+    controls on the two sides.
+    (2) **The Settings window hears the hint now.** The backend emitted
+    `ai-tab-restart-hint` to `webview_window("main")` only, whose sole listener
+    is a toast — and the user who just flipped the switch is standing in the
+    **Settings** window. It is emitted to both, and Settings renders it as the
+    per-tab restart hint its Tabs section already has (so the hint appears beside
+    the Restart button it points at), cleared per tab when that tab is restarted
+    from there. This is the wider of the two signals: it covers every spawn-baked
+    input, not just the hierarchy.
+    (3) **`restartShape` never covered the app-wide cells.** It diffs a *tab's*
+    three L3 cells, so flipping L1 `protection` or any of the three app-wide L2
+    inputs — all of which move the backend signature — raised nothing in Settings
+    at all. Added as a **section-level** hint in the injection block (they affect
+    all tabs at once, so a per-tab shape would be the wrong shape), baselined when
+    the window opens and re-baselined on a restart from Settings once nothing
+    else is stale. It errs toward staying visible: this window cannot know that
+    every AI tab has been restarted.
+    **Correctly excluded, recorded so it is not "fixed" later:** the detection
+    updater's per-tick gate is resolved live and is deliberately not spawn-baked,
+    so it owes no `spawn_inject_sig` entry.
   - **Enforcement sites, complete list.** Worker: `AgentConfig::latch_active`
     (skips `Latch::from_profile` + `latch_gate`, so the latch stays `Open` and
     `filter_defs` is the identity) and `canary_active` (an EMPTY canary is the

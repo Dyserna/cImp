@@ -10,6 +10,71 @@ use serde::{Deserialize, Serialize};
 
 use crate::shell::ShellSpec;
 
+// ── Enum-ish string settings: a wrong TYPE must not quarantine the file ────
+//
+// (#48, the G-1 defect class.) A settings field whose real domain is a small
+// closed vocabulary but whose storage is `String` carries exactly the defect
+// `injection::Override` had before #48: the post-hoc `parse` covers an
+// unrecognized **string**, while a value of the wrong JSON **type** never
+// reaches it. `#[serde(default)]` fires for an ABSENT key, never for a present
+// one that fails to deserialize — so `"native_web_visibility": true` (or
+// `null`, or `0`) failed the typed parse of the WHOLE settings file, which
+// `settings::persistence` quarantines and replaces with seeded defaults:
+// themes, tabs, backends, checks, MCP servers and pricing all reset because one
+// mode string was hand-edited wrong.
+//
+// The rule below is one sentence: **a non-string reads exactly as an
+// unrecognized string does.** Not "as the shipped default" — for the two
+// updater modes those differ, and the documented fallback (`check`, the middle
+// setting) is the one that must neither silently disable the updater nor
+// silently grant it activation rights. The fallback is returned spelled
+// canonically so the repaired value also round-trips to disk as something the
+// Settings window's `<select>` can display: a corrupt cell is repaired, not
+// perpetuated.
+//
+// Per-field wrappers rather than one blanket lenient deserializer, because the
+// answer belongs to the field: a shared helper that guessed would be one more
+// place the vocabulary is written down.
+fn lenient_enum_string<'de, D>(d: D, fallback: &str) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => fallback.to_string(),
+    })
+}
+
+/// `offload.native_web_visibility` — non-string ⇒ `sensor`, which is also what
+/// `injection::NativeWebMode::parse` answers for an unrecognized string: a typo
+/// must neither blind the latch nor silently take a tool away.
+fn de_native_web_visibility<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    lenient_enum_string(d, "sensor")
+}
+
+/// The two `offload.detection_update_*_mode` fields — non-string ⇒ `check`,
+/// which is what `detection::updater::Mode::parse` answers for an unrecognized
+/// string (the middle setting, deliberately).
+fn de_update_mode<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    lenient_enum_string(d, "check")
+}
+
+/// `graph.read_advisor_mode` — non-string ⇒ `advise`, the behaviour every
+/// consumer already falls back to for an unrecognized string (only an explicit
+/// `substitute` selects the other arm).
+fn de_read_advisor_mode<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    lenient_enum_string(d, "advise")
+}
+
 /// Reserved IDs the integrity check protects. Hand-edited settings files
 /// cannot make these disappear — they are restored with defaults if missing
 /// and forced to `builtin: true` regardless of what the file claims. Four
@@ -1567,7 +1632,10 @@ pub struct OffloadSettings {
     /// Additive `#[serde(default)]` — old settings files round-trip with the
     /// default cap. No schema-version bump (the V8/V16/V23 precedent for a
     /// plain additive field).
-    pub external_fetch_max_calls: u32,
+    /// `pub(in crate::settings)` (#48): an input to the enable hierarchy, read
+    /// only through [`injection`](crate::settings::injection) — see
+    /// [`InjectionSettings`] for why that boundary is visibility, not a scan.
+    pub(in crate::settings) external_fetch_max_calls: u32,
     /// V32 (locked decision 11): cap on the cumulative bytes of EXTERNAL tool
     /// results one contaminated scope may pull. The companion to
     /// [`external_fetch_max_calls`] — a handful of huge pages is the same
@@ -1579,7 +1647,9 @@ pub struct OffloadSettings {
     /// schema-version bump.
     ///
     /// [`external_fetch_max_calls`]: Self::external_fetch_max_calls
-    pub external_fetch_max_bytes: u64,
+    /// `pub(in crate::settings)` (#48) — see
+    /// [`external_fetch_max_calls`](Self::external_fetch_max_calls).
+    pub(in crate::settings) external_fetch_max_bytes: u64,
     /// V32 (locked decision 7): run the YARA **signature** screen over every
     /// EXTERNAL tool result. Rules are data files under
     /// `<exe-dir>/detection/rules.d/` (plus the user's own `local/` overlay).
@@ -1590,7 +1660,10 @@ pub struct OffloadSettings {
     /// automaton scan over a capped prefix.
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
-    pub detection_signature_enabled: bool,
+    /// `pub(in crate::settings)` (#48): the layer selection lives *inside* the
+    /// `Feature::Detection` surface — `injection::detection_config` checks the
+    /// parent first and wins — so reading it raw answers a different question.
+    pub(in crate::settings) detection_signature_enabled: bool,
     /// V32 (locked decision 7): run the Llama Prompt Guard 2 **classifier**
     /// screen over every EXTERNAL tool result.
     ///
@@ -1601,7 +1674,9 @@ pub struct OffloadSettings {
     /// on every machine that fetched them.
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
-    pub detection_classifier_enabled: bool,
+    /// `pub(in crate::settings)` (#48) — see
+    /// [`detection_signature_enabled`](Self::detection_signature_enabled).
+    pub(in crate::settings) detection_classifier_enabled: bool,
     /// V32: the probability at or above which the classifier's verdict counts
     /// as a flag. Prompt Guard 2's positive class is "malicious"; 0.9 is the
     /// conservative default, chosen because a false positive costs a warning
@@ -1609,7 +1684,9 @@ pub struct OffloadSettings {
     /// that would make the whole surface worthless.
     ///
     /// Additive `#[serde(default)]`; no schema-version bump.
-    pub detection_classifier_threshold: f32,
+    /// `pub(in crate::settings)` (#48) — see
+    /// [`detection_signature_enabled`](Self::detection_signature_enabled).
+    pub(in crate::settings) detection_classifier_threshold: f32,
     /// V32 Phase C3 (locked decision 13): what the auto-updater may do with the
     /// **signature rule bundle** — `"off"` / `"check"` / `"auto"`.
     ///
@@ -1622,7 +1699,11 @@ pub struct OffloadSettings {
     /// `detection::updater::Mode::parse`): a typo must neither silently disable
     /// the updater nor silently grant it activation rights.
     ///
+    /// A value of the wrong JSON *type* reads the same way (#48) — see
+    /// [`de_update_mode`].
+    ///
     /// Additive `#[serde(default)]`; no schema-version bump.
+    #[serde(deserialize_with = "de_update_mode")]
     pub detection_update_rules_mode: String,
     /// V32 Phase C3: the same for the **classifier weights**.
     ///
@@ -1632,7 +1713,11 @@ pub struct OffloadSettings {
     /// up to. The Advisor card and the Settings Apply button are how they say
     /// yes.
     ///
+    /// A value of the wrong JSON *type* reads the same way (#48) — see
+    /// [`de_update_mode`].
+    ///
     /// Additive `#[serde(default)]`; no schema-version bump.
+    #[serde(deserialize_with = "de_update_mode")]
     pub detection_update_classifier_mode: String,
     /// V32 Phase C3: hours between update checks. Default 24; floored at
     /// `detection::updater::MIN_INTERVAL_HOURS` so a mistyped `0` cannot become
@@ -1674,14 +1759,27 @@ pub struct OffloadSettings {
     /// a silently-open side channel is worse than a beacon. An unrecognized
     /// string also reads as `sensor` (see
     /// `crate::tabs::config::NativeWebVisibility::parse`): a typo must neither
-    /// blind the latch nor silently take a tool away.
+    /// blind the latch nor silently take a tool away. A value of the wrong JSON
+    /// *type* — `true`, `null`, `0` — reads the same way (#48) instead of
+    /// failing the typed parse of the whole file; see [`de_native_web_visibility`].
     ///
     /// **Spawn-baked**: all three modes act only when a tab launches, so this
     /// field carries a `spawn_inject_sig` entry and flipping it raises the
     /// "restart the AI tab" hint.
     ///
+    /// `pub(in crate::settings)` (#48): by the Phase G reconciliation this
+    /// tri-mode **is** `Feature::NativeWeb`'s L2, so it belongs behind the same
+    /// compiler-enforced boundary as the eleven booleans in
+    /// [`InjectionSettings`] — leaving one L2 input of eleven readable from an
+    /// enforcement site is what made "the no-raw-reads invariant is structural"
+    /// overstate its coverage. Read it through
+    /// [`injection::native_web_mode`](crate::settings::injection::native_web_mode);
+    /// test code outside the boundary writes it through
+    /// `Settings::set_native_web_mode_for_test`.
+    ///
     /// Additive `#[serde(default)]`; no schema-version bump.
-    pub native_web_visibility: String,
+    #[serde(deserialize_with = "de_native_web_visibility")]
+    pub(in crate::settings) native_web_visibility: String,
     /// V32 Phase G (locked decision 16): the three-level enable hierarchy's
     /// **L1 + L2** switches, plus the L3 row for the `offload-worker`
     /// pseudo-scope (which has no tab config to hang one off).
@@ -2085,7 +2183,11 @@ pub struct GraphSettings {
     /// file is cheap to re-read; the reminder isn't worth it).
     pub read_advisor_min_lines: u32,
     /// `"advise"` (remind with the outline) or `"substitute"` (also include the
-    /// most relevant symbol body). Default `"advise"`.
+    /// most relevant symbol body). Default `"advise"`. Compared post-hoc by its
+    /// consumers, so an unrecognized string — and, since #48, a value of the
+    /// wrong JSON type — behaves as `advise` rather than quarantining the whole
+    /// settings file; see [`de_read_advisor_mode`].
+    #[serde(deserialize_with = "de_read_advisor_mode")]
     pub read_advisor_mode: String,
     /// V16 Feature 5: trust TTL — after this many retrieval turns since the
     /// advisor last observed a full read of a file, a `Read` passes again
@@ -4427,6 +4529,78 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    /// **#48 — the G-1 defect class, on the enum-ish STRING settings.**
+    ///
+    /// `00b906b` fixed `injection::Override`, whose guard test passed only
+    /// strings and so stayed green while every non-string shape quarantined the
+    /// file. The same shape was unfixed on four plain-`String` fields with
+    /// closed vocabularies and post-hoc parses. This drives whole `Settings`
+    /// round trips — the shape `settings::persistence` actually deserializes,
+    /// where a failure means `quarantine_corrupt_file` and seeded defaults for
+    /// themes, tabs, backends, checks, MCP servers and pricing.
+    ///
+    /// The asserted answer is the field's fallback for an UNRECOGNIZED STRING,
+    /// spelled canonically — the rule these deserializers implement — not
+    /// necessarily its shipped default (`detection_update_rules_mode` ships
+    /// `auto` and falls back to `check`).
+    #[test]
+    fn a_non_string_enum_setting_reads_as_its_documented_fallback() {
+        // (JSON pointer into `offload`/`graph`, canonical fallback).
+        let cases: &[(&str, &str, &str)] = &[
+            ("offload", "native_web_visibility", "sensor"),
+            ("offload", "detection_update_rules_mode", "check"),
+            ("offload", "detection_update_classifier_mode", "check"),
+            ("graph", "read_advisor_mode", "advise"),
+        ];
+        let bogus = [
+            json!(true),
+            json!(false),
+            json!(null),
+            json!(1),
+            json!(0),
+            json!(-1),
+            json!(0.5),
+            json!([]),
+            json!(["sensor"]),
+            json!({}),
+            json!({ "value": "sensor" }),
+        ];
+        for (group, field, fallback) in cases {
+            for junk in &bogus {
+                let s = Settings::default();
+                let mut v = serde_json::to_value(&s).expect("settings serialize");
+                v[group][field] = junk.clone();
+                let back: Settings = serde_json::from_value(v).unwrap_or_else(|e| {
+                    panic!("{group}.{field} = {junk} quarantines the settings file: {e}")
+                });
+                let got = serde_json::to_value(&back).expect("re-serialize");
+                assert_eq!(
+                    got[group][field].as_str(),
+                    Some(*fallback),
+                    "{group}.{field} = {junk}"
+                );
+                // …and the rest of the file survived, which is the finding.
+                assert_eq!(back.tabs.len(), s.tabs.len(), "{group}.{field} = {junk}");
+                assert_eq!(
+                    back.schema_version, s.schema_version,
+                    "{group}.{field} = {junk}"
+                );
+            }
+            // A recognized string is still taken verbatim — the leniency must
+            // not swallow real values.
+            let s = Settings::default();
+            let mut v = serde_json::to_value(&s).expect("settings serialize");
+            v[group][field] = json!("substitute-or-deny-placeholder");
+            let back: Settings = serde_json::from_value(v).expect("a string always parses");
+            let got = serde_json::to_value(&back).expect("re-serialize");
+            assert_eq!(
+                got[group][field].as_str(),
+                Some("substitute-or-deny-placeholder"),
+                "{group}.{field}"
+            );
+        }
+    }
 
     fn local_backend(cmd: &str) -> OffloadBackend {
         OffloadBackend {

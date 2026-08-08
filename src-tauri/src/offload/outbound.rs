@@ -1311,6 +1311,39 @@ pub enum Screen {
     /// [`Screen::MemoryQuarantine`]. What makes it worth reading is its
     /// [`Origin`], which is always [`Origin::Http`] — see that type.
     LatchBeacon => "latch_beacon",
+    /// #48 finding F-3: the moment a tab's conversation **became
+    /// contaminated** — the false → true transition of the taint registry's
+    /// contamination bit, whichever path caused it.
+    ///
+    /// Before this variant the primary path wrote nothing at all. An admitted
+    /// proxied EXTERNAL call set the bit and left only an `info!` that fires on
+    /// the *latch* transition, so a tab already latched `Local` — or one
+    /// running with the latch feature off and the quarantine on — contaminated
+    /// in total silence. The system knew *that* a tab was contaminated and
+    /// could never say *when*, *by which tool*, or *from which page*.
+    ///
+    /// **One row per TAB**, not per conversation — and that is H-2's doing, not
+    /// a choice made here. The bit is sticky across session rotations (the
+    /// rotation signal is a file the model's own shell can write), so it
+    /// transitions once per registry entry and the row's session names the
+    /// conversation contamination *started* in. Subsequent EXTERNAL calls
+    /// restate a fact this row already carries and are covered by the ordinary
+    /// proxied-MCP activity row. Self-limiting by construction — the transition
+    /// test *is* the claim — so unlike [`Screen::LatchRefusal`] it needs no
+    /// claim bit.
+    ///
+    /// Not a denial: the call that contaminated the conversation was admitted.
+    /// What the row records is a state change, and it is the anchor every later
+    /// containment event in that tab hangs off — including the checkpoint the
+    /// Workbench Timeline will offer the user to restore.
+    ///
+    /// Distinct from [`Screen::LatchBeacon`], which a beacon writes *as well*:
+    /// that one says "a harness-native web tool was detected", this one says
+    /// "this conversation stopped being clean". The two do not always come in
+    /// pairs — a beacon after a session rotation re-engages the (reset) latch
+    /// and writes a beacon row, while the tab's contamination never lapsed and
+    /// so has nothing new to report.
+    Contamination => "contamination",
 }
 }
 
@@ -1408,7 +1441,10 @@ impl Screen {
     /// the user *granting* capability back, nor [`Screen::LatchBeacon`], which
     /// records containment *engaging* before anything has been refused, nor
     /// [`Screen::Unscreened`], which records that a screen did **less** than a
-    /// full pass over a result it nonetheless delivered.
+    /// full pass over a result it nonetheless delivered, nor
+    /// [`Screen::Contamination`], which records a call that was **admitted**
+    /// (a refused call never contaminates — that is the whole point of setting
+    /// the bit on the far side of the gate).
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
@@ -1419,6 +1455,7 @@ impl Screen {
                 | Screen::Updater
                 | Screen::LatchOverride
                 | Screen::LatchBeacon
+                | Screen::Contamination
         )
     }
 }
@@ -1443,6 +1480,17 @@ pub struct Flag<'a> {
     pub consumer: &'a str,
     /// Which contaminated scope fired: a worker task id, or `agent:tab`.
     pub scope: &'a str,
+    /// The harness session (conversation) the scope was running when this row
+    /// was written, when the writer knows it — `None` for a worker task scope,
+    /// which has no harness session, and for any tab whose session the V28
+    /// registry currently withholds.
+    ///
+    /// A **separate column from `scope`** on purpose (#48, F-3): `scope` is
+    /// `agent:tab` and a tab outlives its conversations, so it cannot answer
+    /// "which conversation was this?". A consumer that has to join a row to
+    /// something else conversation-shaped — a checkpoint, a transcript — needs
+    /// an exact key, and the alternative is guessing by nearest wall clock.
+    pub session: Option<&'a str>,
     /// The tool whose call was screened.
     pub tool: &'a str,
     /// Host of the offending URL, when there is one.
@@ -1474,7 +1522,27 @@ pub struct Flag<'a> {
 /// quarantine). A caller *applying a request from outside that dispatch* — an
 /// IPC command, or a loopback route — must say so instead; `Internal` claims
 /// the least, but claiming it wrongly is what makes a row lie by omission.
+///
+/// **Under `cfg(test)` the row is diverted to [`test_rows`] instead of the
+/// store** (#48, F-3). The activity store is process-global, writes a JSONL
+/// file next to the executable, and — outside a tokio runtime, which is where
+/// unit tests run — `record_bg` records *inline*. So before this, a test could
+/// only assert what a writer DECIDED (via [`flag_request`] on a `Flag` it built
+/// itself), never that a code path called `record_flag` at all, let alone with
+/// what. That gap is exactly the shape of F-3: the contamination row's whole
+/// content is that a path fires it, so a test that re-derives the payload
+/// beside the path proves nothing.
 pub fn record_flag(flag: Flag<'_>) {
+    let record = flag_record(flag);
+    #[cfg(test)]
+    test_rows::push(record);
+    #[cfg(not(test))]
+    crate::activity::record_bg(record);
+}
+
+/// The activity record one flag row becomes — [`record_flag`] without the
+/// write, so the row a path produces is assertable end to end.
+pub fn flag_record(flag: Flag<'_>) -> ActivityRecord {
     let ts = crate::activity::now_ms();
     // The at-a-glance column: the offending host when the screen had one,
     // otherwise the scope that hit its limit.
@@ -1483,7 +1551,7 @@ pub fn record_flag(flag: Flag<'_>) {
         None => flag.scope.to_string(),
     };
     let request = flag_request(&flag);
-    crate::activity::record_bg(ActivityRecord {
+    ActivityRecord {
         entry: ActivityEntry::new(
             ActivityKind::InjectionFlag,
             ts,
@@ -1502,7 +1570,49 @@ pub fn record_flag(flag: Flag<'_>) {
         ),
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
         response: flag.detail.to_string(),
-    });
+    }
+}
+
+/// Where [`record_flag`] puts its rows in a test build: a per-thread buffer,
+/// drained by the test that provoked them.
+///
+/// Per **thread** rather than per process because `cargo test` runs cases
+/// concurrently and a shared buffer would make every assertion about "the rows
+/// this path wrote" a race. Every writer reached from a unit test is
+/// synchronous on the test's own thread (`record_flag` is called inline by the
+/// gate, the beacon and the screens), so the thread is the right boundary — a
+/// row written from a spawned task is simply not captured, which is honest
+/// rather than flaky.
+#[cfg(test)]
+pub mod test_rows {
+    use super::{ActivityRecord, Screen};
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ROWS: RefCell<Vec<ActivityRecord>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn push(rec: ActivityRecord) {
+        ROWS.with(|r| r.borrow_mut().push(rec));
+    }
+
+    /// Take every row written on this thread so far, oldest first.
+    pub fn drain() -> Vec<ActivityRecord> {
+        ROWS.with(|r| r.borrow_mut().drain(..).collect())
+    }
+
+    /// Drop anything buffered — call at the top of a test that asserts on
+    /// counts, so a neighbour case's rows on a reused thread cannot leak in.
+    pub fn reset() {
+        ROWS.with(|r| r.borrow_mut().clear());
+    }
+
+    /// The rows one screen wrote, from a drained batch.
+    pub fn of_screen(rows: &[ActivityRecord], screen: Screen) -> Vec<&ActivityRecord> {
+        rows.iter()
+            .filter(|r| r.entry.source == screen.as_str())
+            .collect()
+    }
 }
 
 /// The row's request payload — the JSON the Tool Activity detail pane shows.
@@ -1520,6 +1630,8 @@ pub fn flag_request(flag: &Flag<'_>) -> serde_json::Value {
         "origin": flag.origin.as_str(),
         "consumer": flag.consumer,
         "scope": flag.scope,
+        // The conversation, beside the tab that held it. See `Flag::session`.
+        "session": flag.session,
         "tool": flag.tool,
         "host": flag.host,
         "url": flag.url,
@@ -2303,7 +2415,8 @@ mod tests {
                 "unscreened",
                 "updater",
                 "latch_override",
-                "latch_beacon"
+                "latch_beacon",
+                "contamination"
             ]
         );
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
@@ -2376,6 +2489,7 @@ mod tests {
                 origin,
                 consumer: "claude",
                 scope: "claude:claude-1",
+                session: None,
                 tool: "unlatch",
                 host: None,
                 url: None,

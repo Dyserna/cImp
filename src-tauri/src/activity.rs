@@ -214,9 +214,11 @@ const UNKNOWN_SCREEN_LANE: &str = "?unknown";
 ///
 /// **A new screen is protected by construction.** The lane set comes from
 /// `Screen::ALL`, which `declare_screens!` emits from the variant list, so a
-/// variant added tomorrow (finding F-3's contamination-event row is the one
-/// already scheduled) has its own guaranteed window the moment it exists.
+/// variant added tomorrow has its own guaranteed window the moment it exists.
 /// Sharing a window with another screen would take a deliberate edit here.
+/// `Screen::Contamination` (finding F-3) is the first variant to arrive under
+/// that guarantee: it was added to the enum and to nothing else, and it has its
+/// own lane and its own row in the generated eviction matrix.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Lane {
     /// The row's kind, verbatim (unknown kinds keep their own string and share
@@ -1076,6 +1078,39 @@ mod tests {
         let _ = fs::remove_file(&store.path);
     }
 
+    /// #48 (F-3): the same exploit aimed at the row that anchors everything
+    /// else — the moment a tab became contaminated.
+    ///
+    /// It is one row per tab-session and the rarest thing in the feed, and every
+    /// other containment event in that tab is only legible relative to it, so
+    /// "the quarantine flood cannot reach it" is the property worth stating
+    /// separately from the generated matrix below. The flood here is a
+    /// `MemoryQuarantine` one *because* that is what a contaminated tab
+    /// produces: the notes it writes after the transition are exactly the rows
+    /// that would have evicted the record of the transition.
+    #[test]
+    fn a_quarantine_flood_cannot_evict_the_contamination_row() {
+        let store = temp_store("f3-contamination");
+        store.record(rec_flag(
+            Screen::Contamination,
+            "claude:claude-1 read a page",
+        ));
+        for i in 0..(INJECTION_FLAG_TOTAL_CAP + 8) {
+            store.record(rec_flag(Screen::MemoryQuarantine, &format!("note {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert!(
+            kept(&snap, "claude:claude-1 read a page"),
+            "the notes a contaminated tab writes evicted the record of its contamination"
+        );
+        assert_eq!(
+            screen_rows(&snap, Screen::Contamination),
+            1,
+            "the transition row is one per tab-session and must not be duplicated by retention"
+        );
+        let _ = fs::remove_file(&store.path);
+    }
+
     /// The flood in the other direction: the chatty screen is a FORENSIC one.
     ///
     /// A pinned/unpinned split would pass the test above and fail here — the
@@ -1109,7 +1144,9 @@ mod tests {
     /// variant list, so a screen added tomorrow is covered as both roles
     /// without anyone extending this test. That is the same reason the lane set
     /// is derived from `ALL` rather than listed: F-3's contamination-event row
-    /// must inherit the guarantee by construction, not by being remembered.
+    /// had to inherit the guarantee by construction, not by being remembered —
+    /// and it did, `Screen::Contamination` appearing in both roles here with no
+    /// edit to this test.
     #[test]
     fn no_screen_can_evict_another_screens_rows() {
         for flooder in Screen::ALL.iter().copied() {

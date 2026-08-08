@@ -199,6 +199,37 @@ fn ai_working_dir(cfg: &AiToolTabConfig, launch_cwd: &Path) -> std::path::PathBu
     cfg.cwd.clone().unwrap_or_else(|| launch_cwd.to_path_buf())
 }
 
+/// The directory a configured AI tab launches in, by tab id — [`ai_working_dir`]
+/// for one tab instead of a whole list (#48, finding F-3).
+///
+/// **Why this exists.** V32 activity rows written from the loopback taint gate
+/// carried `root: ""`, so they could not be filtered per project — which is
+/// exactly why the contamination row could not be shown on a per-project
+/// surface. The root has to come from somewhere the caller cannot choose: the
+/// request bodies carry a `cwd`, but that is the child's claim about itself,
+/// and the row's whole purpose is to be trustworthy after an incident. A tab id
+/// is config-derived and already validated against this same settings snapshot
+/// (`loopback::is_configured_tab`), so resolving the root *from the tab* keeps
+/// the row's project attribution as trustworthy as its tab attribution.
+///
+/// `None` for an id that names no configured AI tab — including a Shell or
+/// Preview tab, which host no harness. Callers decide their own fallback; this
+/// function does not invent one, because "the tab does not exist" and "the tab
+/// runs in the launch dir" are different facts.
+///
+/// Every AI tab kind, not just Claude ([`claude_tab_dirs`]'s narrower set): the
+/// taint latch scopes OpenCode tabs identically.
+pub(crate) fn ai_tab_dir(
+    settings: &Settings,
+    tab_id: &str,
+    launch_cwd: &Path,
+) -> Option<std::path::PathBuf> {
+    settings.tabs.iter().find_map(|t| match t {
+        TabConfig::AiTool(c) if c.id == tab_id => Some(ai_working_dir(c, launch_cwd)),
+        _ => None,
+    })
+}
+
 /// NC-2 (issue #5): every configured Claude AI tab and the working directory it
 /// launches in — `(tab_id, working_dir)`. Resolution is [`ai_working_dir`], the
 /// same call [`build_ai_tool_spec`] makes, so the permission-hook route can

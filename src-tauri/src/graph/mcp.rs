@@ -916,6 +916,7 @@ fn record_secret_screen_flag(agent: Option<&str>, hits: &[String]) {
         origin: Origin::Internal,
         consumer: agent.unwrap_or("offload"),
         scope: "memory secret screen",
+        session: None,
         tool: "context_note",
         host: None,
         url: None,

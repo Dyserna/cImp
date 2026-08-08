@@ -809,7 +809,15 @@ async fn handle_run(
     }
     let scope = scoping.scope();
     let policy = GatePolicy::resolve(&settings, scope);
-    if let Err(refusal) = latches().gate(scope, LatchRoute::Native, tool, policy) {
+    // `CallProvenance::internal()`: cImp's own dispatch, and a native route
+    // serves no fetched page — there is no content origin to name (#48, F-3).
+    if let Err(refusal) = latches().gate(
+        scope,
+        LatchRoute::Native,
+        tool,
+        policy,
+        CallProvenance::internal(),
+    ) {
         let r = RunResult {
             ok: false,
             text: None,
@@ -969,6 +977,25 @@ struct LatchScope {
     /// same-root ambiguity). `None` is *absence of evidence*, never evidence of
     /// a new session — see [`TabLatch::observe`].
     session: Option<String>,
+    /// The project root this tab runs against, in [`crate::activity::root_key`]
+    /// form — the `root` column of the activity rows this scope's calls
+    /// produce (#48, finding F-3).
+    ///
+    /// It rides on the scope rather than on each call because it is a property
+    /// of the tab, and because [`latch_scope`] is the ONE funnel every gated
+    /// route resolves identity through: a row written from a path that has a
+    /// scope therefore cannot be written without a root, which is the mistake
+    /// `beacon_row` and the memory-quarantine row made (`root: ""`, so neither
+    /// can be filtered per project, so neither can appear on a per-project
+    /// surface).
+    ///
+    /// **Resolved from settings, not from the request.** The gated bodies all
+    /// carry a `cwd`, but that is the calling child's claim about itself; the
+    /// tab id is config-derived and validated against the same snapshot
+    /// ([`is_configured_tab`]), so `crate::tabs::ai_tab_dir` gives a root with
+    /// the same trust level as the identity it hangs off. Empty only if no
+    /// working directory can be resolved at all — see [`tab_root_key`].
+    root: String,
 }
 
 impl LatchScope {
@@ -1125,9 +1152,40 @@ fn latch_scope(
                 agent,
                 tab: tab.to_string(),
                 session,
+                root: tab_root_key(app, settings, tab),
             })
         }
     }
+}
+
+/// The project root one configured AI tab runs against, as an activity
+/// `root_key` (#48, finding F-3). See [`LatchScope::root`] for why the tab —
+/// rather than the request body's `cwd` — is the source.
+///
+/// Two fallbacks, in order, and both are deliberate:
+///
+/// 1. **The app's launch directory**, when the id resolves to no AI tab config.
+///    That is reachable through [`is_configured_tab`]'s empty-list escape (a
+///    request that arrives before managed state is up), and the launch dir is
+///    what such a tab *would* run in — [`crate::tabs::ai_tab_dir`] returns the
+///    per-tab `cwd` override or exactly this.
+/// 2. **The process cwd**, when managed state is not up at all. The app sets
+///    `LaunchContext::cwd` from the process cwd at startup and never chdirs, so
+///    this is the same directory by another route rather than a guess.
+///
+/// An empty string is possible only if even `current_dir()` fails (a deleted
+/// cwd). It is not papered over with a placeholder: a root that cannot be
+/// resolved must read as absent, not as some other project.
+fn tab_root_key(app: &AppHandle, settings: &crate::settings::Settings, tab: &str) -> String {
+    let launch = app
+        .try_state::<crate::ipc::AppState>()
+        .map(|s| s.launch.cwd.clone())
+        .or_else(|| std::env::current_dir().ok());
+    let Some(launch) = launch else {
+        return String::new();
+    };
+    let dir = crate::tabs::ai_tab_dir(settings, tab, &launch).unwrap_or(launch);
+    crate::activity::root_key(&dir)
 }
 
 /// The outcome of [`latch_scope`] — [`TabIdentity`] with the session folded in.
@@ -1520,6 +1578,70 @@ impl LatchRoute {
     }
 }
 
+/// What the calling ROUTE knows about a gated call that the registry cannot see
+/// (#48, finding F-3): who asked for it, and — when the call is an intake —
+/// where the content it is about to bring back is coming from.
+///
+/// Every field here is one the [`Screen::Contamination`](outbound::Screen)
+/// row needs and the [`LatchRegistry`] has no way to derive. The registry owns
+/// per-tab state; it does not see request bodies, does not parse tool
+/// arguments, and cannot tell an IPC command from a loopback POST.
+///
+/// **Required at every call site, not defaulted.** The same rule
+/// [`outbound::Flag::origin`] is under, for the same reason: #45 found that a
+/// provenance column behind a defaulting constructor lets a new call site
+/// inherit "cImp decided this" by writing nothing, which is the exact shape of
+/// omission these rows exist to prevent. A native route states
+/// [`CallProvenance::internal`] — with no URL, because a native route cannot
+/// carry a fetched page — as a decision rather than by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CallProvenance<'a> {
+    /// Who asked for the state change a resulting row records.
+    origin: outbound::Origin,
+    /// The URL the call is fetching, when the route can see one. `/mcp/call`
+    /// reads it out of the tool arguments (`detection::origin_of`) — the same
+    /// pair its SSRF and detection rows carry, so a contamination row and the
+    /// screen rows about the same call name the same page.
+    url: Option<&'a str>,
+    /// That URL's host — the at-a-glance column.
+    host: Option<&'a str>,
+}
+
+impl<'a> CallProvenance<'a> {
+    /// cImp's own dispatch, executing a call it was already running, with no
+    /// fetched content in view. Every native route.
+    const fn internal() -> Self {
+        CallProvenance {
+            origin: outbound::Origin::Internal,
+            url: None,
+            host: None,
+        }
+    }
+
+    /// cImp's own dispatch over the proxied intake, naming the page it is
+    /// about to read (either half may be absent — a search tool has arguments
+    /// but no URL).
+    fn intake(url: Option<&'a str>, host: Option<&'a str>) -> Self {
+        CallProvenance {
+            origin: outbound::Origin::Internal,
+            url,
+            host,
+        }
+    }
+
+    /// A loopback POST from a local process — the native-web beacon. Marked
+    /// [`outbound::Origin::Http`] because the launch token is readable by
+    /// anything running as this user, so a beacon is never evidence that the
+    /// user acted (#45).
+    const fn http() -> Self {
+        CallProvenance {
+            origin: outbound::Origin::Http,
+            url: None,
+            host: None,
+        }
+    }
+}
+
 /// The per-tab-session taint latches for the tools this proxy serves.
 ///
 /// Locked decision 3: consumer enforcement lives here, keyed by V28 tab
@@ -1592,6 +1714,138 @@ fn live_settings(app: &AppHandle) -> crate::settings::Settings {
         .unwrap_or_default()
 }
 
+/// One contamination TRANSITION, ready to record — see [`note_contamination`].
+///
+/// Owned rather than borrowed because the transition is detected under the
+/// registry mutex and the row is written after it is dropped: `record_flag`
+/// goes through `activity::record_bg`, whose contract is that it does file I/O
+/// (inline off a tokio runtime), and holding a lock across that would put the
+/// store's I/O on the critical path of every other tab's gated call.
+struct Contamination {
+    origin: outbound::Origin,
+    consumer: &'static str,
+    /// `agent:tab` — [`LatchScope::label`], the same convention every other
+    /// V32 row uses.
+    scope: String,
+    /// The conversation, when the registry entry knows it.
+    session: Option<String>,
+    tool: String,
+    url: Option<String>,
+    host: Option<String>,
+    root: String,
+    detail: String,
+}
+
+impl Contamination {
+    /// Write the row. Fire-and-forget, like every other `record_flag` call on
+    /// these paths: recording an event must not be able to fail the call it
+    /// observes.
+    fn record(self) {
+        info!(
+            target: "offload",
+            consumer = self.consumer,
+            scope = %self.scope,
+            tool = %self.tool,
+            host = self.host.as_deref().unwrap_or(""),
+            root = %self.root,
+            "loopback: V32 conversation became contaminated"
+        );
+        outbound::record_flag(outbound::Flag {
+            screen: outbound::Screen::Contamination,
+            origin: self.origin,
+            consumer: self.consumer,
+            scope: &self.scope,
+            session: self.session.as_deref(),
+            tool: &self.tool,
+            host: self.host.as_deref(),
+            url: self.url.as_deref(),
+            resolved_ip: None,
+            canary: false,
+            root: self.root.clone(),
+            detail: &self.detail,
+        });
+    }
+}
+
+/// **The one place a conversation is marked contaminated** (#48, finding F-3).
+///
+/// Both paths that can set the bit — an admitted proxied EXTERNAL call in
+/// [`LatchRegistry::gate`], and the native-web beacon in
+/// [`LatchRegistry::beacon`] — flip it *here*, so the transition cannot be set
+/// on one path and recorded on the other, and a third path added later gets the
+/// row by calling the only function that sets the bit.
+///
+/// # What it records, and what it deliberately does not
+///
+/// It records the **transition**, false → true, not every contaminating call.
+/// Later EXTERNAL calls restate a fact this row already carries, and each
+/// already writes an ordinary proxied-MCP activity row of its own; what had no
+/// record at all was the moment the conversation stopped being clean. The
+/// `mem::replace` below *is* the claim, so this is self-limiting and needs no
+/// separate claim bit of the [`TabLatch::latch_flagged`] kind.
+///
+/// Because the bit is sticky across session rotations (H-2 — see
+/// [`TabLatch::contaminated`]), "once" here means **once per tab**, not once
+/// per conversation: a `/clear` in a contaminated tab keeps the taint and
+/// writes no second row, and the row's `session` therefore names the
+/// conversation contamination started in. A consumer joining these rows to
+/// conversation-scoped state has to read them that way.
+///
+/// It does **not** decide whether the call contaminates. That is the caller's
+/// classification (`gate` calls it only for `ToolClass::External` on a route
+/// where EXTERNAL means content; the beacon calls it unconditionally, because a
+/// beacon *is* the harness reporting that it read a page). Nothing about when
+/// contamination is SET changes here — this is observability over an unchanged
+/// decision.
+///
+/// # Why the return value must be used
+///
+/// The detection happens under the registry mutex and the write happens after
+/// it is released, so the two are necessarily separate statements. `#[must_use]`
+/// is what keeps them from drifting apart: a path that flips the bit and drops
+/// the result fails the build under `-D warnings`, which is the same
+/// "compile-time or it will be forgotten" posture `declare_screens!` takes for
+/// the retention lane.
+#[must_use = "a contamination transition that is detected and not recorded is finding F-3 again — \
+              call Contamination::record() after dropping the registry lock"]
+fn note_contamination(
+    entry: &mut TabLatch,
+    scope: &LatchScope,
+    tool: &str,
+    prov: CallProvenance<'_>,
+) -> Option<Contamination> {
+    if std::mem::replace(&mut entry.contaminated, true) {
+        return None;
+    }
+    Some(Contamination {
+        origin: prov.origin,
+        consumer: scope.agent,
+        scope: scope.label(),
+        // The registry entry's session, not the scope's: `observe` has already
+        // run by the time any caller reaches here, so this is the session the
+        // latch itself considers current — the one a later join has to match.
+        session: entry.session.clone(),
+        tool: tool.to_string(),
+        url: prov.url.map(str::to_string),
+        host: prov.host.map(str::to_string),
+        root: scope.root.clone(),
+        detail: format!(
+            "CONTAMINATED: external content entered this conversation via {tool}{}. Nothing was \
+             refused — the call was admitted, and this row records the state change it caused. \
+             From here on every persistent memory write from this tab is quarantined for review \
+             and every external result keeps its spotlighting envelope (latch={}). The bit is \
+             sticky and no filesystem-derived signal clears it (H-2: a new harness session is not \
+             proof of a new context window, because the model's own shell can forge one), so \
+             until a user-driven clear exists a cImp restart is the only reset.",
+            match prov.host {
+                Some(h) => format!(" from {h}"),
+                None => String::new(),
+            },
+            entry.latch.label(),
+        ),
+    })
+}
+
 impl LatchRegistry {
     /// Decide one call, and engage the latch when it may proceed.
     ///
@@ -1613,12 +1867,18 @@ impl LatchRegistry {
     /// 16). With both off the gate returns immediately without touching any
     /// state — a disabled control must leave no trace, not merely no verdict,
     /// or `/status` would keep showing latches the user turned off.
+    ///
+    /// #48 (F-3): `prov` is what the calling route knows and the registry
+    /// cannot derive — see [`CallProvenance`]. It is used for exactly one thing
+    /// here: the [`Screen::Contamination`](outbound::Screen) row, written when
+    /// an admitted call is the one that stops this conversation being clean.
     fn gate(
         &self,
         scope: Option<&LatchScope>,
         route: LatchRoute,
         name: &str,
         policy: GatePolicy,
+        prov: CallProvenance<'_>,
     ) -> Result<WriteTaint, &'static str> {
         if policy.inert() {
             return Ok(WriteTaint::Clean);
@@ -1692,12 +1952,13 @@ impl LatchRegistry {
                     origin: outbound::Origin::Internal,
                     consumer: scope.agent,
                     scope: &scope.label(),
+                    session: scope.session.as_deref(),
                     tool: name,
                     host: None,
                     url: None,
                     resolved_ip: None,
                     canary: false,
-                    root: String::new(),
+                    root: scope.root.clone(),
                     detail: toolclass::QUARANTINE_WRITE_NOTICE,
                 });
                 return Ok(WriteTaint::Quarantined);
@@ -1725,12 +1986,13 @@ impl LatchRegistry {
                     origin: outbound::Origin::Internal,
                     consumer: scope.agent,
                     scope: &scope.label(),
+                    session: scope.session.as_deref(),
                     tool: name,
                     host: None,
                     url: None,
                     resolved_ip: None,
                     canary: false,
-                    root: String::new(),
+                    root: scope.root.clone(),
                     detail: refusal,
                 });
             }
@@ -1747,21 +2009,47 @@ impl LatchRegistry {
         // returned above), because contamination is the quarantine's input as
         // much as the latch's — a user who keeps quarantine but drops the latch
         // still needs "this conversation read a page" to be true.
-        if class == ToolClass::External {
-            entry.contaminated = true;
-        }
+        //
+        // #48 (F-3): and the TRANSITION is recorded, through the one function
+        // that owns the bit. This was the finding's whole substance — the line
+        // this replaces set the bit silently, and the only trace was the `info!`
+        // below, which fires on the *latch* transition. A tab already latched
+        // `Local`, or one running with the latch feature off and the quarantine
+        // on, contaminated with no timestamp, no tool and no row. The condition
+        // is unchanged, deliberately: recording must follow the same rule the
+        // bit does, or the switch combination that made it silent still would.
+        //
         // Engagement is the LATCH's own state, so it moves only while the latch
         // feature is on: a latch shown as engaged in `/status` while the feature
-        // is off would describe a boundary that is not being enforced.
-        if policy.latch && entry.latch.engage(class) {
+        // is off would describe a boundary that is not being enforced. It is
+        // sequenced ahead of the contamination note for one reporting reason —
+        // the row quotes the latch this call leaves the tab in, so a fresh tab's
+        // contamination row must say `external` rather than the `open` it was a
+        // microsecond earlier. Nothing can observe the entry between the two
+        // (both run under the one lock), so the order is a choice about the row,
+        // not about the semantics.
+        let engaged = policy.latch && entry.latch.engage(class);
+        let contamination = if class == ToolClass::External {
+            note_contamination(entry, scope, name, prov)
+        } else {
+            None
+        };
+        let latch = entry.latch.label();
+        // Both the log line and the row are written with the lock released —
+        // `record_flag` reaches the activity store, which does file I/O.
+        drop(tabs);
+        if engaged {
             info!(
                 target: "offload",
                 agent = scope.agent,
                 tab = %scope.tab,
                 tool = %name,
-                latch = entry.latch.label(),
+                latch,
                 "loopback: V32 session taint latch engaged"
             );
+        }
+        if let Some(contamination) = contamination {
+            contamination.record();
         }
         Ok(WriteTaint::Clean)
     }
@@ -1799,7 +2087,22 @@ impl LatchRegistry {
     /// V32 Phase G: gated by the same [`GatePolicy`] a proxied call resolves.
     /// An inert policy answers with the default view and records nothing — a
     /// beacon whose latch and quarantine are both off has nothing to report to.
-    fn beacon(&self, scope: Option<&LatchScope>, tool: &str, policy: GatePolicy) -> BeaconOutcome {
+    ///
+    /// #48 (F-3): the [`Screen::LatchBeacon`](outbound::Screen) row the handler
+    /// writes is unchanged and still says what it always said — *a native web
+    /// tool was detected*. The contamination row this method now writes says
+    /// something different — *this conversation stopped being clean* — and a
+    /// beacon into an already-contaminated tab writes only the first. `prov`
+    /// carries the [`outbound::Origin`] for the same reason the handler states
+    /// it for the beacon row: over this route it is `Http`, and that is a fact
+    /// about the caller, not about the tab.
+    fn beacon(
+        &self,
+        scope: Option<&LatchScope>,
+        tool: &str,
+        policy: GatePolicy,
+        prov: CallProvenance<'_>,
+    ) -> BeaconOutcome {
         if policy.inert() {
             return BeaconOutcome::inert();
         }
@@ -1811,9 +2114,15 @@ impl LatchRegistry {
         entry.observe(scope.session.as_deref());
         // Unchanged, deliberately: contamination is set on every beacon and
         // nothing here or elsewhere clears it (locked decision 15). What #48
-        // adds is only that the TRANSITION is observable, so it can be recorded.
-        let contaminated_now = !std::mem::replace(&mut entry.contaminated, true);
+        // adds is only that the TRANSITION is observable, so it can be recorded
+        // — through the SAME function the proxied gate flips the bit with, so
+        // the two paths cannot disagree about what a transition is or produce
+        // two shapes of row for it. Ordered after the engagement for the same
+        // reporting reason `gate` states: the row quotes the latch this beacon
+        // leaves the tab in.
         let moved = policy.latch && entry.latch.engage(ToolClass::External);
+        let contamination = note_contamination(entry, scope, tool, prov);
+        let contaminated_now = contamination.is_some();
         // One row per tab-session over BOTH transitions, rather than one per
         // transition kind: a policy change mid-session could otherwise produce a
         // second row for the same conversation.
@@ -1842,6 +2151,9 @@ impl LatchRegistry {
                 latch = view.latch,
                 "loopback: V32 conversation marked contaminated by a native-web beacon (latch unmoved)"
             );
+        }
+        if let Some(contamination) = contamination {
+            contamination.record();
         }
         BeaconOutcome {
             view,
@@ -2012,12 +2324,13 @@ impl LatchRegistry {
                 origin: outbound::Origin::Internal,
                 consumer: scope.agent,
                 scope: &scope.label(),
+                session: scope.session.as_deref(),
                 tool,
                 host: None,
                 url: None,
                 resolved_ip: None,
                 canary: false,
-                root: String::new(),
+                root: scope.root.clone(),
                 detail: outbound::REFUSAL_BUDGET,
             });
         }
@@ -2289,12 +2602,13 @@ pub fn apply_latch_override(
         origin: row.origin,
         consumer: agent,
         scope: &scope.label(),
+        session: scope.session.as_deref(),
         tool: &row.tool,
         host: None,
         url: None,
         resolved_ip: None,
         canary: false,
-        root: String::new(),
+        root: scope.root.clone(),
         detail: &row.detail,
     });
     Ok(outcome.view)
@@ -2374,7 +2688,13 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // tab's scope, from ONE settings read — so a tab with the latch overridden
     // off still quarantines, and a tab with the master switch off does neither.
     let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
-    let taint = match latches().gate(scope.as_ref(), LatchRoute::Native, &body.name, gate_policy) {
+    let taint = match latches().gate(
+        scope.as_ref(),
+        LatchRoute::Native,
+        &body.name,
+        gate_policy,
+        CallProvenance::internal(),
+    ) {
         Ok(t) => t,
         Err(refusal) => {
             let r = RunResult {
@@ -2640,9 +2960,15 @@ fn audit_admit(
         );
     }
     let policy = policy_of(scope);
-    reg.gate(scope, LatchRoute::Native, tool, policy)
-        .map(|_| consumer)
-        .map_err(str::to_string)
+    reg.gate(
+        scope,
+        LatchRoute::Native,
+        tool,
+        policy,
+        CallProvenance::internal(),
+    )
+    .map(|_| consumer)
+    .map_err(str::to_string)
 }
 
 /// `POST /audit/run` (V26): run one full code-audit scan of the requested
@@ -3913,6 +4239,16 @@ async fn handle_mcp_call(
     let scope = latch_scope(app, &settings, agent, body.tab.as_deref()).into_scope();
     let inj_scope = crate::settings::injection::Scope::for_tab(agent, body.tab.as_deref());
     let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
+    // V32 Phase C: the flagged row's provenance, read from the arguments before
+    // they are moved into the call — the result alone cannot say which page it
+    // came from, and that is the first thing a user reads off the row.
+    //
+    // #48 (F-3): read BEFORE the gate rather than after the budget, because the
+    // gate is now also a row writer — this is the route whose admitted call
+    // contaminates the conversation, and "from which page" is one of the three
+    // facts the contamination row exists to carry. Moving the read up changes
+    // nothing else: `origin_of` only inspects the arguments.
+    let (flag_url, flag_host) = detection::origin_of(&body.arguments);
     // The gate's V32 Phase C2 `WriteTaint` is discarded here, and can only ever
     // be `Clean`: this route serves proxied `<server>__<tool>` ids, every one of
     // which classifies EXTERNAL by the unknown-⇒-EXTERNAL invariant, so no
@@ -3923,6 +4259,7 @@ async fn handle_mcp_call(
         LatchRoute::Proxied,
         &body.name,
         gate_policy,
+        CallProvenance::intake(flag_url.as_deref(), flag_host.as_deref()),
     ) {
         let r = RunResult {
             ok: false,
@@ -3956,10 +4293,6 @@ async fn handle_mcp_call(
         .as_ref()
         .map(LatchScope::label)
         .unwrap_or_else(|| format!("{agent}:(no tab identity)"));
-    // V32 Phase C: the flagged row's provenance, read from the arguments before
-    // they are moved into the call — the result alone cannot say which page it
-    // came from, and that is the first thing a user reads off the row.
-    let (flag_url, flag_host) = detection::origin_of(&body.arguments);
     let detection_cfg = detection::Config::from_settings(&settings, inj_scope);
     let spotlight_on = crate::settings::injection::effective(
         crate::settings::injection::Feature::Spotlighting,
@@ -4153,34 +4486,58 @@ async fn handle_latch_beacon(
     }
     let scope = scoping.scope();
     let policy = GatePolicy::resolve(&settings, scope);
-    let out = latches().beacon(scope, &tool, policy);
-    // #48: keyed on `report`, not on `engaged`. A beacon that contaminates a
-    // `Local`-latched tab moves no latch and used to leave no trace at all,
-    // while quarantining every `context_note` the tab made afterwards.
-    if out.report {
-        if let Some(scope) = scope {
-            let row = beacon_row(outbound::Origin::Http, &tool, &out);
-            outbound::record_flag(outbound::Flag {
-                screen: outbound::Screen::LatchBeacon,
-                origin: row.origin,
-                consumer: scope.agent,
-                scope: &scope.label(),
-                tool: &row.tool,
-                host: None,
-                url: None,
-                resolved_ip: None,
-                canary: false,
-                root: String::new(),
-                detail: &row.detail,
-            });
-        }
-    }
+    // `CallProvenance::http()`: this route is a loopback POST from a local
+    // process, and the contamination row it may write has to say so for the
+    // same reason the beacon row does — the launch token is readable by
+    // anything running as this user (#45).
+    let out = latches().beacon(scope, &tool, policy, CallProvenance::http());
+    report_beacon(scope, outbound::Origin::Http, &tool, &out);
     write_json(
         stream,
         200,
         &serde_json::json!({ "ok": true, "latch": out.view }),
     )
     .await
+}
+
+/// Write the [`Screen::LatchBeacon`](outbound::Screen) row for one beacon, if
+/// this beacon is the one that reports.
+///
+/// Split out of `handle_latch_beacon` (#48, F-3) so the *pair* of rows a beacon
+/// produces is assertable: `LatchRegistry::beacon` writes the contamination row
+/// itself, this writes the beacon row, and the two say different things — "this
+/// conversation stopped being clean" and "a harness-native web tool was
+/// detected". A test that only saw one of them could not tell a regression that
+/// dropped the other from a design that never had it.
+///
+/// Keyed on [`BeaconOutcome::report`], not on `engaged`: a beacon that
+/// contaminates a `Local`-latched tab moves no latch and used to leave no trace
+/// at all, while quarantining every `context_note` the tab made afterwards.
+fn report_beacon(
+    scope: Option<&LatchScope>,
+    origin: outbound::Origin,
+    tool: &str,
+    out: &BeaconOutcome,
+) {
+    if !out.report {
+        return;
+    }
+    let Some(scope) = scope else { return };
+    let row = beacon_row(origin, tool, out);
+    outbound::record_flag(outbound::Flag {
+        screen: outbound::Screen::LatchBeacon,
+        origin: row.origin,
+        consumer: scope.agent,
+        scope: &scope.label(),
+        session: scope.session.as_deref(),
+        tool: &row.tool,
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: false,
+        root: scope.root.clone(),
+        detail: &row.detail,
+    });
 }
 
 /// The upper bound on a caller-supplied tool name before it reaches an activity
@@ -4627,6 +4984,19 @@ mod tests {
         latch: true,
         quarantine: true,
     };
+
+    /// The provenance a NATIVE route states (#48, F-3): cImp's own dispatch,
+    /// no fetched page in view. What every pre-F-3 `gate` test was implicitly
+    /// asserting, since none of them was an intake.
+    const NO_CONTENT: CallProvenance<'static> = CallProvenance::internal();
+    /// The provenance the `/latch/beacon` route states — always `Http`.
+    const BEACON_PROV: CallProvenance<'static> = CallProvenance::http();
+
+    /// The project root the test scopes claim. A real scope's root is resolved
+    /// from the tab's settings entry (`tab_root_key`); the tests care only that
+    /// it is carried through to the row, so one fixed value keeps the
+    /// assertions readable.
+    const TEST_ROOT: &str = "P:\\proj";
 
     #[test]
     fn find_subslice_locates_header_end() {
@@ -5257,6 +5627,7 @@ mod tests {
             agent: "claude",
             tab: tab.to_string(),
             session: session.map(str::to_string),
+            root: TEST_ROOT.to_string(),
         }
     }
 
@@ -5276,11 +5647,18 @@ mod tests {
         // The classic fetch-then-read sequence, which under ON closes the local
         // side after the first EXTERNAL call.
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", off)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                off,
+                NO_CONTENT
+            )
             .is_ok());
         for name in ["graph_snippet", "read_file", "context_note", "ddg__search"] {
             assert!(
-                reg.gate(Some(&s), LatchRoute::Native, name, off).is_ok(),
+                reg.gate(Some(&s), LatchRoute::Native, name, off, NO_CONTENT)
+                    .is_ok(),
                 "{name} must not be refused with the latch off"
             );
         }
@@ -5302,13 +5680,25 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-q", Some("ses"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", no_quarantine)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                no_quarantine,
+                NO_CONTENT
+            )
             .is_ok());
         // The latch still engaged (that is a different feature)…
         assert_eq!(reg.snapshot()[0].latch(), "external");
         // …but the write is not held.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", no_quarantine),
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                "context_note",
+                no_quarantine,
+                NO_CONTENT
+            ),
             Ok(WriteTaint::Clean)
         );
     }
@@ -5325,18 +5715,36 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-mix", Some("ses"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", quarantine_only)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                quarantine_only,
+                NO_CONTENT
+            )
             .is_ok());
         // The latch itself never moved — it is off.
         assert_eq!(reg.snapshot()[0].latch(), "open");
         assert!(reg.snapshot()[0].view.contaminated);
         // Local tools stay open (no latch)…
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", quarantine_only)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                quarantine_only,
+                NO_CONTENT
+            )
             .is_ok());
         // …and the write is held anyway.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", quarantine_only),
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                "context_note",
+                quarantine_only,
+                NO_CONTENT
+            ),
             Ok(WriteTaint::Quarantined)
         );
     }
@@ -5352,7 +5760,10 @@ mod tests {
         };
         let reg = LatchRegistry::default();
         let s = scope("claude-beacon-off", Some("ses"));
-        assert_eq!(reg.beacon(Some(&s), "WebFetch", off), BeaconOutcome::inert());
+        assert_eq!(
+            reg.beacon(Some(&s), "WebFetch", off, BEACON_PROV),
+            BeaconOutcome::inert()
+        );
         assert!(reg.snapshot().is_empty());
     }
 
@@ -5388,7 +5799,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
 
         for blocked in [
@@ -5398,7 +5815,7 @@ mod tests {
             "graph_semantic_code",
         ] {
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, blocked, ON),
+                reg.gate(Some(&s), LatchRoute::Native, blocked, ON, NO_CONTENT),
                 Err(REFUSAL_LOCAL_BLOCKED),
                 "{blocked}"
             );
@@ -5406,7 +5823,7 @@ mod tests {
         // The external side itself stays usable — the latch is exclusion, not
         // a kill switch.
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
     }
@@ -5418,12 +5835,18 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
 
         for blocked in ["ddg__search", "ddg__fetch_content", "context7__query-docs"] {
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Proxied, blocked, ON),
+                reg.gate(Some(&s), LatchRoute::Proxied, blocked, ON, NO_CONTENT),
                 Err(REFUSAL_EXTERNAL_BLOCKED),
                 "{blocked}"
             );
@@ -5431,10 +5854,16 @@ mod tests {
         // Local work continues, including the memory write (only an EXTERNAL
         // latch gates persistence).
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "context_note", ON)
+            .gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT)
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
     }
@@ -5458,7 +5887,8 @@ mod tests {
             "context_notes",
         ] {
             assert!(
-                reg.gate(Some(&s), LatchRoute::Native, trusted, ON).is_ok(),
+                reg.gate(Some(&s), LatchRoute::Native, trusted, ON, NO_CONTENT)
+                    .is_ok(),
                 "{trusted}"
             );
         }
@@ -5471,10 +5901,11 @@ mod tests {
         ] {
             let reg = LatchRegistry::default();
             let s = scope("t", Some("s"));
-            assert!(reg.gate(Some(&s), route, first, ON).is_ok());
+            assert!(reg.gate(Some(&s), route, first, ON, NO_CONTENT).is_ok());
             for trusted in ["graph_outline", "context_recall", "context_notes"] {
                 assert!(
-                    reg.gate(Some(&s), LatchRoute::Native, trusted, ON).is_ok(),
+                    reg.gate(Some(&s), LatchRoute::Native, trusted, ON, NO_CONTENT)
+                        .is_ok(),
                     "{trusted} under {first}"
                 );
             }
@@ -5498,10 +5929,16 @@ mod tests {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .gate(
+                    Some(&s),
+                    LatchRoute::Proxied,
+                    "ddg__fetch_content",
+                    ON,
+                    NO_CONTENT
+                )
                 .is_ok());
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, blocked, ON),
+                reg.gate(Some(&s), LatchRoute::Native, blocked, ON, NO_CONTENT),
                 Err(REFUSAL_LOCAL_BLOCKED),
                 "{blocked} must be refused once the conversation has read a page"
             );
@@ -5511,10 +5948,12 @@ mod tests {
             // worker task.
             let reg = LatchRegistry::default();
             let s = scope("claude-2", Some("sess-b"));
-            assert!(reg.gate(Some(&s), LatchRoute::Native, blocked, ON).is_ok());
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Native, blocked, ON, NO_CONTENT)
+                .is_ok());
             assert_eq!(reg.snapshot()[0].latch(), "local", "{blocked}");
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
+                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
                 Err(REFUSAL_EXTERNAL_BLOCKED),
                 "{blocked}"
             );
@@ -5542,10 +5981,16 @@ mod tests {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .gate(
+                    Some(&s),
+                    LatchRoute::Proxied,
+                    "ddg__fetch_content",
+                    ON,
+                    NO_CONTENT
+                )
                 .is_ok());
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, blocked, ON),
+                reg.gate(Some(&s), LatchRoute::Native, blocked, ON, NO_CONTENT),
                 Err(REFUSAL_LOCAL_BLOCKED),
                 "{blocked} must be refused once the conversation has read a page"
             );
@@ -5561,10 +6006,12 @@ mod tests {
         ] {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
-            assert!(reg.gate(Some(&s), LatchRoute::Native, first, ON).is_ok());
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Native, first, ON, NO_CONTENT)
+                .is_ok());
             assert_eq!(reg.snapshot()[0].latch(), "local", "{first}");
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
+                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
                 Err(REFUSAL_EXTERNAL_BLOCKED),
                 "{first}"
             );
@@ -5678,7 +6125,8 @@ mod tests {
                 Some(&scope("claude-1", Some("sess-a"))),
                 LatchRoute::Proxied,
                 "ddg__fetch_content",
-                ON
+                ON,
+                NO_CONTENT
             )
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
@@ -5791,7 +6239,10 @@ mod tests {
                 Ok(c) => panic!("{bad:?} must not be accepted as a consumer (got {c:?})"),
                 Err(e) => e,
             };
-            assert!(err.contains("does not serve the consumer"), "{err:?} ({bad})");
+            assert!(
+                err.contains("does not serve the consumer"),
+                "{err:?} ({bad})"
+            );
             assert!(reg.snapshot().is_empty(), "{bad}");
         }
         // The set itself, and the two spellings the spawn paths actually send.
@@ -5826,7 +6277,10 @@ mod tests {
         )
         .expect_err("an opted-out consumer must be refused");
         assert!(err.contains("is not exposed to opencode"), "{err:?}");
-        assert!(reg.snapshot().is_empty(), "expose refusal keyed a latch row");
+        assert!(
+            reg.snapshot().is_empty(),
+            "expose refusal keyed a latch row"
+        );
 
         // Misrouted (cwd outside this instance's served root) — likewise.
         let reg = LatchRegistry::default();
@@ -5853,11 +6307,23 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "somenewserver__anything", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "somenewserver__anything",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
     }
@@ -5874,24 +6340,30 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         // Unlatched: clean, and the write itself does not latch.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Clean)
         );
         assert_eq!(reg.snapshot()[0].latch(), "open");
 
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         // EXTERNAL-latched: proceeds, tainted — NOT `Err(REFUSAL_WRITE_BLOCKED)`.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Quarantined)
         );
         // ...and the quarantined write still does not move the latch.
         assert_eq!(reg.snapshot()[0].latch(), "external");
         // Reads of the same store stay open — quarantine is about persistence.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_recall", ON),
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                "context_recall",
+                ON,
+                NO_CONTENT
+            ),
             Ok(WriteTaint::Clean)
         );
     }
@@ -5904,16 +6376,22 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Clean)
         );
         // No tab identity ⇒ no scope to latch and none to taint.
         assert_eq!(
-            reg.gate(None, LatchRoute::Native, "context_note", ON),
+            reg.gate(None, LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Clean)
         );
     }
@@ -5926,6 +6404,7 @@ mod tests {
             agent: "opencode",
             tab: tab.to_string(),
             session: session.map(str::to_string),
+            root: TEST_ROOT.to_string(),
         }
     }
 
@@ -6108,7 +6587,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = oc_scope("opencode", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         // EXTERNAL ⇒ the plugin denies the local natives.
         let view = reg.view_for(&s);
@@ -6140,26 +6625,45 @@ mod tests {
             agent: "opencode",
             tab: "claude-1".to_string(),
             session: Some("sess-c".to_string()),
+            root: TEST_ROOT.to_string(),
         };
 
         assert!(reg
-            .gate(Some(&a), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&a), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&a), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&a),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         // Tab B is untouched, and may latch the OTHER way.
         assert!(reg
-            .gate(Some(&b), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&b),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search", ON),
+            reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
             Err(REFUSAL_EXTERNAL_BLOCKED)
         );
         // Same tab STRING, different agent ⇒ its own scope.
         assert!(reg
-            .gate(Some(&opencode), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&opencode),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
 
         let rows = reg.snapshot();
@@ -6184,17 +6688,35 @@ mod tests {
         let reg = LatchRegistry::default();
         let before = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&before), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&before),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&before), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&before),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
 
         // Tab restarted: same tab id, new session.
         let after = scope("claude-1", Some("sess-b"));
         assert!(reg
-            .gate(Some(&after), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&after),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         let rows = reg.snapshot();
         assert_eq!(rows.len(), 1, "the restart reuses the tab's row: {rows:?}");
@@ -6212,24 +6734,48 @@ mod tests {
         // Latched before the registry knew any session at all.
         let unknown = scope("claude-1", None);
         assert!(reg
-            .gate(Some(&unknown), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(
+                Some(&unknown),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&unknown),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
 
         // The session becomes known: same conversation, so the latch carries.
         let known = scope("claude-1", Some("sess-a"));
         assert_eq!(
-            reg.gate(Some(&known), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&known),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         assert_eq!(reg.snapshot()[0].session.as_deref(), Some("sess-a"));
 
         // The registry blinks again: still no reset.
         assert_eq!(
-            reg.gate(Some(&unknown), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&unknown),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         assert_eq!(
@@ -6253,7 +6799,10 @@ mod tests {
             (LatchRoute::Proxied, "ddg__search"),
             (LatchRoute::Native, "context_note"),
         ] {
-            assert!(reg.gate(None, route, name, ON).is_ok(), "{name}");
+            assert!(
+                reg.gate(None, route, name, ON, NO_CONTENT).is_ok(),
+                "{name}"
+            );
         }
         assert!(
             reg.snapshot().is_empty(),
@@ -6262,7 +6811,13 @@ mod tests {
         // And it does not leak into a tab that DOES have identity.
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
     }
 
@@ -6274,17 +6829,29 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         for _ in 0..3 {
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
+                reg.gate(
+                    Some(&s),
+                    LatchRoute::Native,
+                    "graph_snippet",
+                    ON,
+                    NO_CONTENT
+                ),
                 Err(REFUSAL_LOCAL_BLOCKED)
             );
             assert_eq!(reg.snapshot()[0].latch(), "external");
         }
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "external");
     }
@@ -6299,7 +6866,8 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         for junk in ["graph_", "graph_nosuchtool", "ddg__search", ""] {
             assert!(
-                reg.gate(Some(&s), LatchRoute::Native, junk, ON).is_ok(),
+                reg.gate(Some(&s), LatchRoute::Native, junk, ON, NO_CONTENT)
+                    .is_ok(),
                 "{junk}"
             );
         }
@@ -6309,7 +6877,13 @@ mod tests {
         );
         // The real local-capability call that follows still latches normally.
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
     }
@@ -6326,7 +6900,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         let json = serde_json::to_value(reg.snapshot()).unwrap();
         let row = &json[0];
@@ -6352,7 +6926,13 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         for _ in 0..3 {
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .gate(
+                    Some(&s),
+                    LatchRoute::Proxied,
+                    "ddg__fetch_content",
+                    ON,
+                    NO_CONTENT
+                )
                 .is_ok());
             assert!(reg
                 .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
@@ -6374,7 +6954,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert!(reg
             .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
@@ -6407,7 +6993,13 @@ mod tests {
         let failure: Result<String, String> = Err("upstream 500".into());
         for _ in 0..3 {
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .gate(
+                    Some(&s),
+                    LatchRoute::Proxied,
+                    "ddg__fetch_content",
+                    ON,
+                    NO_CONTENT
+                )
                 .is_ok());
             assert!(reg
                 .budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
@@ -6424,7 +7016,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-2", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         reg.charge_call(Some(&s), &failure);
         reg.charge_call(Some(&s), &Ok("x".repeat(999)));
@@ -6456,7 +7054,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         // Drive the registry's own ledger the way `TabAudit` does.
         let claim = || {
@@ -6482,7 +7086,7 @@ mod tests {
         let fresh = LatchRegistry::default();
         let f = scope("claude-2", Some("sess-a"));
         assert!(fresh
-            .gate(Some(&f), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&f), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         assert!(matches!(
             fresh.claim(
@@ -6497,7 +7101,13 @@ mod tests {
         // resets the budget resets the ledger with it.
         let rotated = scope("claude-1", Some("sess-b"));
         assert!(reg
-            .gate(Some(&rotated), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(
+                Some(&rotated),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert!(matches!(
             reg.claim(
@@ -6544,7 +7154,7 @@ mod tests {
         let b = scope("claude-2", Some("sess-b"));
         for _ in 0..3 {
             assert!(reg
-                .gate(Some(&a), LatchRoute::Proxied, "ddg__search", ON)
+                .gate(Some(&a), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
                 .is_ok());
             reg.charge(Some(&a), 1);
         }
@@ -6553,13 +7163,23 @@ mod tests {
             Err(outbound::REFUSAL_BUDGET)
         );
         // A different tab is untouched.
-        assert!(reg.gate(Some(&b), LatchRoute::Proxied, "ddg__search", ON).is_ok());
-        assert!(reg.budget_gate(Some(&b), TEST_LIMITS, "ddg__search").is_ok());
+        assert!(reg
+            .gate(Some(&b), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
+            .is_ok());
+        assert!(reg
+            .budget_gate(Some(&b), TEST_LIMITS, "ddg__search")
+            .is_ok());
 
         // The registry withholding a session must NOT reset the budget.
         let a_silent = scope("claude-1", None);
         assert!(reg
-            .gate(Some(&a_silent), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(
+                Some(&a_silent),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(
             reg.budget_gate(Some(&a_silent), TEST_LIMITS, "ddg__search"),
@@ -6569,9 +7189,17 @@ mod tests {
         // A genuinely new session does.
         let a2 = scope("claude-1", Some("sess-a2"));
         assert!(reg
-            .gate(Some(&a2), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(
+                Some(&a2),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
-        assert!(reg.budget_gate(Some(&a2), TEST_LIMITS, "ddg__search").is_ok());
+        assert!(reg
+            .budget_gate(Some(&a2), TEST_LIMITS, "ddg__search")
+            .is_ok());
     }
 
     // ── V32 Phase F — native-web beacons + the manual override ──────────────
@@ -6584,7 +7212,7 @@ mod tests {
     fn a_native_web_beacon_engages_the_external_latch_like_a_proxied_fetch() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
-        let out = reg.beacon(Some(&s), "WebFetch", ON);
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
         let view = out.view;
         assert_eq!(view.latch, "external");
         assert!(view.contaminated);
@@ -6596,11 +7224,17 @@ mod tests {
         assert_eq!(reg.snapshot()[0].latch(), "external");
         // ...and the containment that follows is the ordinary Phase B one.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Quarantined)
         );
     }
@@ -6612,7 +7246,7 @@ mod tests {
     #[test]
     fn a_beacon_without_tab_identity_is_a_no_op_and_an_unknown_tab_is_created() {
         let reg = LatchRegistry::default();
-        let out = reg.beacon(None, "WebSearch", ON);
+        let out = reg.beacon(None, "WebSearch", ON, BEACON_PROV);
         assert_eq!(out, BeaconOutcome::inert());
         assert!(
             reg.snapshot().is_empty(),
@@ -6621,7 +7255,9 @@ mod tests {
         // First contact for this tab is the beacon itself.
         let fresh = scope("claude-9", Some("sess-z"));
         assert_eq!(
-            reg.beacon(Some(&fresh), "WebFetch", ON).view.latch,
+            reg.beacon(Some(&fresh), "WebFetch", ON, BEACON_PROV)
+                .view
+                .latch,
             "external"
         );
         let rows = reg.snapshot();
@@ -6639,9 +7275,15 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
-        let out = reg.beacon(Some(&s), "WebFetch", ON);
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
         assert_eq!(
             out.view.latch, "local",
             "sticky: a beacon never flips a latch"
@@ -6654,7 +7296,7 @@ mod tests {
         // The contamination is what bites: the memory write is quarantined even
         // though the latch says `local`.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Quarantined)
         );
     }
@@ -6669,7 +7311,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_outline", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_outline",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert!(reg
             .apply_override(&s, LatchOverride::FlipLocal)
@@ -6681,7 +7329,13 @@ mod tests {
         // Local: flip is refused (it is already there), unlatch works.
         let reg = LatchRegistry::default();
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert!(reg.apply_override(&s, LatchOverride::FlipLocal).is_err());
         let out = reg
@@ -6693,7 +7347,13 @@ mod tests {
         // External: the flip is the workflow button.
         let reg = LatchRegistry::default();
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         let out = reg
             .apply_override(&s, LatchOverride::FlipLocal)
@@ -6719,19 +7379,37 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "graph_snippet", ON),
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
             Err(REFUSAL_LOCAL_BLOCKED)
         );
         reg.apply_override(&s, LatchOverride::FlipLocal)
             .expect("flip");
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
             Err(REFUSAL_EXTERNAL_BLOCKED)
         );
     }
@@ -6752,14 +7430,20 @@ mod tests {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
             assert!(reg
-                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .gate(
+                    Some(&s),
+                    LatchRoute::Proxied,
+                    "ddg__fetch_content",
+                    ON,
+                    NO_CONTENT
+                )
                 .is_ok());
             let out = reg.apply_override(&s, action).expect("override applies");
             assert!(out.view.contaminated, "{action:?}");
             // The latch moved; the quarantine did not.
             assert_ne!(out.view.latch, "external", "{action:?}");
             assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+                reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
                 Ok(WriteTaint::Quarantined),
                 "{action:?}: a post-override write must still be quarantined"
             );
@@ -6770,7 +7454,13 @@ mod tests {
             // an attacker-writable transcript directory.
             let after = scope("claude-1", Some("sess-b"));
             assert_eq!(
-                reg.gate(Some(&after), LatchRoute::Native, "context_note", ON),
+                reg.gate(
+                    Some(&after),
+                    LatchRoute::Native,
+                    "context_note",
+                    ON,
+                    NO_CONTENT
+                ),
                 Ok(WriteTaint::Quarantined),
                 "{action:?}: a rotation must not re-open the persistence channel"
             );
@@ -6788,17 +7478,23 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         reg.apply_override(&s, LatchOverride::Unlatch)
             .expect("unlatch");
         // Both sides answer again... (the local call re-latches Local, so probe
         // the external side first).
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Quarantined),
             "unlatching must not un-contaminate the conversation"
         );
@@ -6813,7 +7509,10 @@ mod tests {
             LatchOverride::parse("flip_local"),
             Ok(LatchOverride::FlipLocal)
         );
-        assert_eq!(LatchOverride::parse(" unlatch "), Ok(LatchOverride::Unlatch));
+        assert_eq!(
+            LatchOverride::parse(" unlatch "),
+            Ok(LatchOverride::Unlatch)
+        );
         for junk in ["", "unlatch_all", "flip", "FLIP_LOCAL", "open"] {
             assert!(LatchOverride::parse(junk).is_err(), "{junk}");
         }
@@ -6914,13 +7613,20 @@ mod tests {
                     agent: "claude",
                     tab: t.to_string(),
                     session: None,
+                    root: TEST_ROOT.to_string(),
                 }),
                 _ => None,
             };
             assert!(reg
-                .gate(scope.as_ref(), LatchRoute::Proxied, "ddg__search", ON)
+                .gate(
+                    scope.as_ref(),
+                    LatchRoute::Proxied,
+                    "ddg__search",
+                    ON,
+                    NO_CONTENT
+                )
                 .is_ok());
-            let _ = reg.beacon(scope.as_ref(), "WebFetch", ON);
+            let _ = reg.beacon(scope.as_ref(), "WebFetch", ON, BEACON_PROV);
         }
         assert!(
             reg.snapshot().is_empty(),
@@ -6959,10 +7665,17 @@ mod tests {
             agent: "claude",
             tab: "claude".to_string(),
             session: Some("real-session".to_string()),
+            root: TEST_ROOT.to_string(),
         };
         let reg = LatchRegistry::default();
         assert!(reg
-            .gate(Some(&scope), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&scope),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         // Mirror that admitted EXTERNAL call onto the standalone entry, so the
         // test's subject is built by the same two facts the gate sets.
@@ -7000,7 +7713,10 @@ mod tests {
         t.observe(Some("aaaa"));
         assert_eq!(t.session.as_deref(), Some("aaaa"), "the id itself rotates");
         assert_eq!(t.latch, Latch::Open, "a rotation reopens the latch");
-        assert!(!t.latch_flagged, "and re-arms the one-row-per-scope reports");
+        assert!(
+            !t.latch_flagged,
+            "and re-arms the one-row-per-scope reports"
+        );
         assert!(!t.beacon_flagged);
         assert!(
             !t.budget.exhausted(ONE_CALL),
@@ -7188,7 +7904,13 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         let out = reg
             .apply_override(&s, LatchOverride::FlipLocal)
@@ -7232,7 +7954,7 @@ mod tests {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
 
-            let beacon = reg.beacon(Some(&s), "WebFetch", ON);
+            let beacon = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
             assert!(beacon.engaged);
             let brow = beacon_row(origin, "WebFetch", &beacon);
             assert_eq!(brow.origin, origin);
@@ -7272,6 +7994,7 @@ mod tests {
                     origin: row.origin,
                     consumer: s.agent,
                     scope: &s.label(),
+                    session: None,
                     tool: &row.tool,
                     host: None,
                     url: None,
@@ -7307,12 +8030,18 @@ mod tests {
         let s = scope("claude-1", Some("sess-a"));
         // A local-capability call first: the tab latches LOCAL, uncontaminated.
         assert!(reg
-            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON)
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
             .is_ok());
         assert_eq!(reg.snapshot()[0].latch(), "local");
         assert!(!reg.snapshot()[0].view.contaminated);
 
-        let out = reg.beacon(Some(&s), "WebFetch", ON);
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
         assert!(!out.engaged, "the beacon cannot move a LOCAL latch");
         assert!(out.contaminated_now, "but it did contaminate the session");
         assert!(out.report, "and that is a reportable transition");
@@ -7330,14 +8059,14 @@ mod tests {
 
         // Still one row per tab-session: a caller in a loop produces no more.
         for _ in 0..5 {
-            let again = reg.beacon(Some(&s), "WebFetch", ON);
+            let again = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
             assert!(!again.report, "the feed must not be floodable");
             assert!(!again.contaminated_now, "and the bit is set only once");
         }
         // …and it is the SESSION that bounds it: a rotation re-arms the report,
         // because a new conversation's contamination is a new fact.
         let rotated = scope("claude-1", Some("sess-b"));
-        let after = reg.beacon(Some(&rotated), "WebFetch", ON);
+        let after = reg.beacon(Some(&rotated), "WebFetch", ON, BEACON_PROV);
         assert!(after.report, "a rotated session reports again");
     }
 
@@ -7347,10 +8076,10 @@ mod tests {
     fn an_engaging_beacon_reports_exactly_once_per_tab_session() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
-        let first = reg.beacon(Some(&s), "WebFetch", ON);
+        let first = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
         assert!(first.engaged && first.contaminated_now && first.report);
         for _ in 0..5 {
-            assert!(!reg.beacon(Some(&s), "WebSearch", ON).report);
+            assert!(!reg.beacon(Some(&s), "WebSearch", ON, BEACON_PROV).report);
         }
     }
 
@@ -7363,7 +8092,7 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
-            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON)
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
         assert_eq!(
             serde_json::to_value(reg.snapshot()).unwrap(),
@@ -7402,18 +8131,22 @@ mod tests {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         for name in ["graph_snippet", "graph_outline", "context_recall"] {
-            assert!(reg.gate(Some(&s), LatchRoute::Native, name, ON).is_ok(), "{name}");
+            assert!(
+                reg.gate(Some(&s), LatchRoute::Native, name, ON, NO_CONTENT)
+                    .is_ok(),
+                "{name}"
+            );
         }
         assert!(!reg.snapshot()[0].view.contaminated);
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON),
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Clean)
         );
         // A REFUSED external call must not contaminate either — otherwise a
         // hallucinated (or injected) call to the blocked side could quarantine
         // a clean session's memory writes.
         assert_eq!(
-            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
             Err(REFUSAL_EXTERNAL_BLOCKED)
         );
         assert!(!reg.snapshot()[0].view.contaminated);
@@ -7449,6 +8182,426 @@ mod tests {
         for _ in 0..50 {
             assert!(reg.budget_gate(None, TEST_LIMITS, "ddg__search").is_ok());
             reg.charge(None, 100_000);
+        }
+    }
+
+    // ── #48 finding F-3 — the contamination TRANSITION row ─────────────────
+    //
+    // Every case below asserts on the rows `record_flag` actually received
+    // (`outbound::test_rows`), not on the registry's own return values. That is
+    // deliberate: `BeaconOutcome::contaminated_now` and `LatchStatus.contaminated`
+    // were already true before this work and F-3 was still open, because
+    // "the bit flipped" and "something recorded that the bit flipped" are
+    // different facts and only the second one survives the call.
+
+    /// Contamination rows in the order they were written.
+    fn contamination_rows(
+        rows: &[crate::activity::ActivityRecord],
+    ) -> Vec<&crate::activity::ActivityRecord> {
+        outbound::test_rows::of_screen(rows, outbound::Screen::Contamination)
+    }
+
+    /// One row's request payload, parsed.
+    fn payload(row: &crate::activity::ActivityRecord) -> serde_json::Value {
+        serde_json::from_str(&row.request).expect("the row's request payload is JSON")
+    }
+
+    /// The quarantine-only posture: the switch combination that made the
+    /// proxied path contaminate in complete silence.
+    const QUARANTINE_ONLY: GatePolicy = GatePolicy {
+        latch: false,
+        quarantine: true,
+    };
+
+    /// The primary path, which before this wrote **nothing at all**: an
+    /// admitted proxied EXTERNAL call. One row, carrying when / which tool /
+    /// which page / which project / which conversation.
+    ///
+    /// The "exactly once" half is the other half of the finding: the row must
+    /// name the moment the conversation stopped being clean, so a second
+    /// EXTERNAL call — which restates a fact this row already carries, and
+    /// writes its own ordinary MCP activity row — must not write another.
+    #[test]
+    fn the_proxied_intake_records_the_contamination_transition_exactly_once() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(Some("https://evil.example/page"), Some("evil.example")),
+            )
+            .is_ok());
+        // A second EXTERNAL call, in the same conversation, from a different
+        // page: the conversation is already contaminated.
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                CallProvenance::intake(Some("https://other.example/q"), Some("other.example")),
+            )
+            .is_ok());
+
+        let rows = outbound::test_rows::drain();
+        let hits = contamination_rows(&rows);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a contaminated conversation must produce exactly one transition row, got {:?}",
+            hits.iter().map(|r| &r.entry.tool).collect::<Vec<_>>()
+        );
+        let row = hits[0];
+        // WHEN — the standard stamp, not a field the writer invented.
+        assert!(row.entry.ts_ms > 0, "the row has no timestamp");
+        // WHICH TOOL — the call that caused the transition, not the later one.
+        assert_eq!(row.entry.tool, "ddg__fetch_content");
+        // WHICH PROJECT — the field F-3 calls load-bearing. An empty root here
+        // makes the row invisible to every per-project surface.
+        assert_eq!(row.entry.root, TEST_ROOT);
+        assert!(!row.entry.root.is_empty());
+        // Nothing was refused: the call was admitted, so the feed must not
+        // paint this as a failure.
+        assert!(row.entry.ok, "a contamination row is not a denial");
+        let req = payload(row);
+        assert_eq!(req["screen"], "contamination");
+        assert_eq!(req["origin"], "internal");
+        assert_eq!(
+            req["scope"], "claude:claude-1",
+            "the LatchScope::label form"
+        );
+        // WHICH CONVERSATION — what step 3 will join a checkpoint against.
+        assert_eq!(req["session"], "sess-a");
+        // FROM WHICH PAGE.
+        assert_eq!(req["host"], "evil.example");
+        assert_eq!(req["url"], "https://evil.example/page");
+        assert_eq!(row.entry.target, "evil.example (claude:claude-1)");
+        assert!(
+            row.response.contains("CONTAMINATED"),
+            "the detail must say what happened: {}",
+            row.response
+        );
+        // The latch the call LEAVES the tab in, not the one it found. A row
+        // written before `engage` would say `open` about a tab that is
+        // EXTERNAL-latched from this very call — the reader would then look for
+        // a second event that never happened.
+        assert!(
+            row.response.contains("latch=external"),
+            "the row quotes the pre-engagement latch: {}",
+            row.response
+        );
+    }
+
+    /// The beacon path records the transition **as well as** its own
+    /// `latch_beacon` row. The two are different statements — "this
+    /// conversation stopped being clean" and "a harness-native web tool was
+    /// detected" — and a build that collapsed them into one would still pass
+    /// every count-shaped assertion about "a beacon writes a row".
+    #[test]
+    fn a_beacon_writes_the_contamination_row_and_its_own_beacon_row() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
+        report_beacon(Some(&s), outbound::Origin::Http, "WebFetch", &out);
+
+        let rows = outbound::test_rows::drain();
+        assert_eq!(contamination_rows(&rows).len(), 1, "no contamination row");
+        assert_eq!(
+            outbound::test_rows::of_screen(&rows, outbound::Screen::LatchBeacon).len(),
+            1,
+            "the beacon row this work must not have displaced"
+        );
+        let row = contamination_rows(&rows)[0];
+        assert_eq!(row.entry.tool, "WebFetch");
+        assert_eq!(row.entry.root, TEST_ROOT);
+        let req = payload(row);
+        // A beacon is a local process POSTing the loopback, never evidence a
+        // human acted — the row has to say so (#45).
+        assert_eq!(req["origin"], "http");
+        assert_eq!(req["scope"], "claude:claude-1");
+        assert_eq!(req["session"], "sess-a");
+        // Nothing was fetched *through* cImp, so there is no page to name —
+        // absent rather than invented.
+        assert_eq!(req["host"], serde_json::Value::Null);
+
+        // And a caller in a loop writes neither row again.
+        for _ in 0..5 {
+            let again = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
+            report_beacon(Some(&s), outbound::Origin::Http, "WebFetch", &again);
+        }
+        assert!(
+            outbound::test_rows::drain().is_empty(),
+            "the transition is over; a loop must not be able to flood the feed"
+        );
+    }
+
+    /// **The two silent cases F-3 is about.** Both contaminate without moving
+    /// any latch, so a fix keyed on the latch transition — or a test that only
+    /// exercised the happy path — leaves exactly the bug being fixed.
+    #[test]
+    fn contamination_is_recorded_even_when_no_latch_moves() {
+        // (a) A tab already latched LOCAL. The beacon cannot flip it (the fetch
+        //     already happened), so nothing about the latch changes — while
+        //     every `context_note` from here on is quarantined.
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch(), "local");
+        let _ = outbound::test_rows::drain();
+
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
+        assert!(!out.engaged, "a beacon never flips a LOCAL latch");
+        let rows = outbound::test_rows::drain();
+        let hits = contamination_rows(&rows);
+        assert_eq!(hits.len(), 1, "the LOCAL-latched case recorded nothing");
+        assert_eq!(hits[0].entry.root, TEST_ROOT);
+        assert_eq!(payload(hits[0])["scope"], "claude:claude-1");
+
+        // (b) The taint latch feature OFF, the memory quarantine ON. The
+        //     contamination bit is still tracked (it is the quarantine's input),
+        //     the latch never engages, and this is the posture under which the
+        //     proxied path was silent even for a brand-new conversation.
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let t = scope("claude-2", Some("sess-b"));
+        assert!(reg
+            .gate(
+                Some(&t),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                QUARANTINE_ONLY,
+                CallProvenance::intake(Some("https://p.example/x"), Some("p.example")),
+            )
+            .is_ok());
+        assert_eq!(
+            reg.snapshot()[0].latch(),
+            "open",
+            "the latch feature is off, so nothing engaged"
+        );
+        let rows = outbound::test_rows::drain();
+        let hits = contamination_rows(&rows);
+        assert_eq!(hits.len(), 1, "the latch-off case recorded nothing");
+        assert_eq!(hits[0].entry.root, TEST_ROOT);
+        assert_eq!(payload(hits[0])["host"], "p.example");
+        assert_eq!(payload(hits[0])["session"], "sess-b");
+        assert!(
+            hits[0].response.contains("latch=open"),
+            "with the latch feature off the row must not claim a latch: {}",
+            hits[0].response
+        );
+        // The quarantine that follows is the fact the row explains.
+        assert_eq!(
+            reg.gate(
+                Some(&t),
+                LatchRoute::Native,
+                "context_note",
+                QUARANTINE_ONLY,
+                NO_CONTENT
+            ),
+            Ok(WriteTaint::Quarantined)
+        );
+    }
+
+    /// The row follows the BIT, so everything that does not set the bit writes
+    /// nothing: a purely local conversation, a REFUSED external call (which
+    /// must never contaminate — that is what keeps a hallucinated call to the
+    /// blocked side from quarantining a clean session), a native route's
+    /// EXTERNAL-classified name (a typo, not a page), and an inert policy.
+    #[test]
+    fn nothing_that_leaves_the_conversation_clean_writes_a_contamination_row() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        for name in ["graph_snippet", "graph_outline", "context_recall"] {
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Native, name, ON, NO_CONTENT)
+                .is_ok());
+        }
+        // EXTERNAL on a NATIVE route: a misspelled native tool, not content.
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "ddg__search", ON, NO_CONTENT)
+            .is_ok());
+        // The tab is LOCAL-latched now, so a proxied external call is refused.
+        assert_eq!(
+            reg.gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                CallProvenance::intake(Some("https://evil.example/"), Some("evil.example")),
+            ),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+        // Both controls off: a disabled control leaves no trace at all.
+        const OFF: GatePolicy = GatePolicy {
+            latch: false,
+            quarantine: false,
+        };
+        let inert = scope("claude-3", Some("sess-c"));
+        assert!(reg
+            .gate(
+                Some(&inert),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                OFF,
+                CallProvenance::intake(Some("https://evil.example/"), Some("evil.example")),
+            )
+            .is_ok());
+        assert!(
+            !reg.beacon(Some(&inert), "WebFetch", OFF, BEACON_PROV)
+                .report
+        );
+
+        let rows = outbound::test_rows::drain();
+        assert!(
+            contamination_rows(&rows).is_empty(),
+            "a clean conversation was reported as contaminated: {:?}",
+            contamination_rows(&rows)
+                .iter()
+                .map(|r| &r.entry.tool)
+                .collect::<Vec<_>>()
+        );
+        assert!(!reg.snapshot()[0].view.contaminated);
+    }
+
+    /// A tab with no identity keys nothing and reports nothing — the fail-open
+    /// reading every gate here takes. Stated as a test because the row's whole
+    /// value is per-tab attribution, and a row scoped to "(no tab identity)"
+    /// would be a row no per-project surface could use.
+    #[test]
+    fn an_identityless_call_records_no_contamination() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(
+                None,
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(Some("https://evil.example/"), Some("evil.example")),
+            )
+            .is_ok());
+        let _ = reg.beacon(None, "WebFetch", ON, BEACON_PROV);
+        let rows = outbound::test_rows::drain();
+        assert!(contamination_rows(&rows).is_empty());
+    }
+
+    /// **One transition per TAB, not per conversation** — and the row's
+    /// `session` therefore names the conversation contamination *started* in.
+    ///
+    /// This follows H-2 rather than the beacon's own reporting rule, and the
+    /// difference is deliberate on both sides. `observe` re-arms
+    /// `beacon_flagged` on a proved session rotation (a new conversation may
+    /// report a native web tool again) but does **not** clear `contaminated`,
+    /// because the rotation signal is a file the model's own shell can write.
+    /// So a `/clear` in a contaminated tab keeps the taint, keeps quarantining
+    /// its memory writes — and writes no second row, because nothing
+    /// transitioned.
+    ///
+    /// Pinned as a test because a consumer that joins these rows to
+    /// conversation-scoped state has to know it: the anchor is the tab's first
+    /// contamination, not "the contamination of the session you are looking
+    /// at". If the contamination bit ever regains a clear path, this is the
+    /// test that has to be revisited with it.
+    #[test]
+    fn contamination_is_recorded_once_per_tab_across_session_rotations() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let first = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&first),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(None, Some("a.example")),
+            )
+            .is_ok());
+        let rotated = scope("claude-1", Some("sess-b"));
+        assert!(reg
+            .gate(
+                Some(&rotated),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(None, Some("b.example")),
+            )
+            .is_ok());
+        // The rotation did happen — the latch reopened and the budget refilled…
+        assert_eq!(reg.snapshot()[0].session.as_deref(), Some("sess-b"));
+        // …and the tab stayed contaminated across it, so there was no second
+        // transition to record.
+        assert!(reg.snapshot()[0].view.contaminated);
+        let rows = outbound::test_rows::drain();
+        let hits = contamination_rows(&rows);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the sticky bit transitioned once, so exactly one row may exist"
+        );
+        assert_eq!(
+            payload(hits[0])["session"],
+            "sess-a",
+            "the row names the conversation contamination STARTED in"
+        );
+        assert_eq!(payload(hits[0])["host"], "a.example");
+    }
+
+    /// The two paths produce ONE shape of row, because they share
+    /// [`note_contamination`]. Asserted over the payload KEYS rather than by
+    /// eye: a second writer that drifted (a missing `session`, a different
+    /// `scope` spelling) would give the Timeline two shapes to understand.
+    #[test]
+    fn both_contamination_paths_write_the_same_row_shape() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        let a = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&a),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(Some("https://x.example/"), Some("x.example")),
+            )
+            .is_ok());
+        let b = scope("claude-2", Some("sess-b"));
+        let out = reg.beacon(Some(&b), "WebFetch", ON, BEACON_PROV);
+        report_beacon(Some(&b), outbound::Origin::Http, "WebFetch", &out);
+
+        let rows = outbound::test_rows::drain();
+        let hits = contamination_rows(&rows);
+        assert_eq!(hits.len(), 2);
+        let keys = |r: &crate::activity::ActivityRecord| {
+            let mut k: Vec<String> = payload(r)
+                .as_object()
+                .expect("object payload")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(hits[0]), keys(hits[1]));
+        for row in &hits {
+            assert_eq!(row.entry.source, "contamination");
+            assert_eq!(row.entry.kind, "injection_flag");
+            assert!(!row.entry.root.is_empty(), "an empty root defeats the row");
+            assert!(row.entry.ok);
         }
     }
 }

@@ -914,6 +914,7 @@ impl McpHost {
                         origin: outbound::Origin::Internal,
                         consumer: consumer.source(),
                         scope,
+                        session: None,
                         tool: namespaced,
                         host: Some(&denial.host),
                         url: Some(&denial.url),

@@ -27,10 +27,15 @@ export interface ActivityEntry {
   /// than a full pass over it (a truncated or skipped scan — "not flagged" is
   /// not "clean"), `updater` for the V32 C3 detection auto-updater (whose
   /// `tool` is the component and whose `ok` is the outcome — `rejected` is the
-  /// only false), `latch_override` for a user-applied latch move and
-  /// `latch_beacon` for a native-web beacon engaging one. Every row's request payload carries an
-  /// `origin` (`internal` / `ipc` / `http`) naming who asked; `ipc` is the only
-  /// one that means a human acted (#45).
+  /// only false), `latch_override` for a user-applied latch move,
+  /// `latch_beacon` for a native-web beacon engaging one, and `contamination`
+  /// for the moment a tab's conversation stopped being clean (one row per tab,
+  /// naming the tool and page that did it — #48 finding F-3). Rendered as free
+  /// text, so a source this build does not know still reads correctly: it just
+  /// gets no accent colour. Every row's request payload carries an
+  /// `origin` (`internal` / `ipc` / `http`) naming who asked — `ipc` is the only
+  /// one that means a human acted (#45) — and a `session` naming the harness
+  /// conversation, when the writer knew it.
   source: string;
   tool: string;
   target: string;

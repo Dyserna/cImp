@@ -32,7 +32,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 
 | # | Finding | Status | Where |
 |---|---|---|---|
-| H-1 | C-1 open — `graph_struct_search`/`graph_repo_map` are TRUSTED source readers | **OPEN** | needs a decision amendment, not just a `TABLE` edit |
+| H-1 | C-1 open — `graph_struct_search`/`graph_repo_map` are TRUSTED source readers | **FIXED** | `0169d10` — demote both + strip `signature`; amendment 2026-08-08 (c) + decision 29 |
 | H-2 | C-2 open — contamination clears on any newline-terminated byte | **FIXED** | `2c40136` — reset removed, not re-armed; amends decision 15 |
 | H-3 | SSRF — `http:/host`, `http:host`, `http:\host` evade the screen | **OPEN** | |
 | H-4 | Every shipped rule defeated by invisible whitespace | **FIXED** | `5920c92` — rules + normalizer + corpus; 20/50 evading → 0/53 |
@@ -53,6 +53,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | F-4 | `is_configured_tab` is agent-agnostic — `(consumer, tab)` verified nowhere | **OPEN** | raised by the fix run |
 | F-5 | `/graph_run` + `/mcp/call` share H-8's tab half | **OPEN** | raised by the fix run; a decision, not a bug |
 | F-6 | H-2's decode proof degrades silently if the CLI drops `sessionId` | **OPEN** | raised by the fix run; wants a drift canary |
+| F-7 | Auto-injection still pushes signatures into a contaminated tab | **OPEN** | raised by the fix run; bounds what H-1 claims |
 
 Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
 
@@ -93,6 +94,18 @@ channel URL that always redirects. No single-module reviewer could see it.
 ## HIGH findings
 
 ### H-1 — C-1 is OPEN: the TRUSTED class carries a general source-text read primitive
+
+> **STATUS: FIXED — `0169d10`.** User-decided shape: **demote both + strip signatures**, recorded as **locked decision 29** and the **Phase A amendment 2026-08-08 (c)** in the milestone — a defect in the locked decision itself, not code drift from it, so the taxonomy table was corrected rather than silently edited.
+>
+> `graph_struct_search` and `graph_repo_map` are `ToolClass::LocalCapability`. `fmt_symbols` — the shared renderer behind `graph_find_symbol` / `graph_outline` / `graph_callers` / `graph_callees` — no longer emits `signature` at all; those four keep name, kind, path, line, the `[test]` tag and the V15 confidence badge. The strip is **unconditional**, not latch-conditional: the four callers are always TRUSTED, so the condition would always be true and would be one more thing a future caller can get wrong.
+>
+> **The seam is at the model-facing MCP output only.** The index still stores `signature`, `SymbolHit` still carries it, and every human-facing consumer still renders it — the `graph_dead_exports` Tauri command behind Code Intelligence, `context::read_advice`'s outline line, `context::file_digest` and `context::repo_map` in auto-injection. A human reading their own repo is not the threat model; a blanket removal would have been a regression dressed as a fix, so a test asserts two of those consumers still get it.
+>
+> **Both enforcement paths verified by reading the call sites, not by trusting the table** — the way C-1 survived `b80f5b8`. Worker: `filter_defs` (`agent.rs:1507,1554`) + `latch_gate` (`agent.rs:1259`). Proxy/tab: `LatchRegistry::gate` (`loopback.rs:1630`) on `/graph_run` (`loopback.rs:2377`), which is the **only** path for a tab — the proxy never def-filters the graph surface. Both resolve through `classify()`, so no new route was needed. Tests assert each name on each path.
+>
+> `graph_repo_map`'s 200,000-char `budget_chars` clamp (`graph/mcp.rs::run_repo_map`) is unchanged and still applies; the tool is now latch-gated *in addition to* being clamped. No internal caller breaks: session-start repo-map auto-injection calls `context::repo_map` in-process (`graph/service.rs:2480`), never the tool.
+>
+> **Deferred, not implemented:** literal redaction inside the signature (keep the type and name, blank the value) — better information-per-risk, but per-language tree-sitter work whose failure mode is a silent leak. Its own decision, per decision 29.
 
 > **STATUS: OPEN.** Two reviewers found this independently from opposite entry points; verified by hand. The locked taxonomy table lists `graph_struct_search` under TRUSTED too, so closing it needs a **decision amendment**, not just a `TABLE` edit.
 
@@ -863,3 +876,44 @@ running in a worktree writes checkpoints the Timeline never lists; and the latch
 path records *that* external content entered, never *what* looked suspicious, so
 a user judging "false positive" from a beacon row is judging "did WebFetch run",
 not "was the page malicious".
+
+### F-7 — auto-injection still pushes source signatures into a contaminated tab
+
+`graph/context.rs:542` (`file_digest`) · `:931` (`public_signatures` → `repo_map`)
+· `graph/service.rs:2480` (session-start injection)
+
+Raised while closing H-1, and it **bounds what H-1 can claim**. The fix removes
+repo source text from every model-*requestable* TRUSTED path, but the context
+auto-injection channel still delivers `signature` lines — file digests and the
+session-start repo map — to a tab regardless of its latch.
+
+Not a hole in the same sense, and deliberately not fixed with H-1: injection is a
+**push** channel keyed on the *user's* prompt, not on a tool call. The model
+cannot steer which file it names, cannot request it, and it crosses no gate by
+construction. Cutting it would degrade auto-injection for every clean session to
+close a channel the attacker does not control.
+
+Recorded because the inference "after H-1 a contaminated tab never sees a source
+line again" is **false**, and that is exactly the kind of over-reading a future
+reviewer would make from the H-1 entry alone.
+
+Related, same class, also left alone: `graph/mcp.rs:1568` `semantic_code_query`
+prints `signature`, but `graph_semantic_code` is already LOCAL-CAPABILITY and so
+already latch-gated.
+
+### Note — the proxy never def-filters the graph surface
+
+`offload/loopback.rs:1530` · contrast `offload/agent.rs:1507,1554`
+
+Not a finding; recorded because it was assumed otherwise while briefing H-1 and
+the asymmetry should not have to be rediscovered. The **worker** enforces a
+demotion twice — `filter_defs` strips the tool from the advertised list *and*
+`latch_gate` refuses it in flight. A **tab** gets only the second: its per-session
+child caches `tools/list` at connect, so the graph surface is never latch-filtered
+per tab and the refusal at `LatchRegistry::gate` is the whole enforcement.
+
+Security-equivalent (the call is refused either way) but not behaviour-equivalent:
+an EXTERNAL-latched tab still *sees* a demoted tool advertised and learns of the
+latch by being refused. Pre-existing and identical for `graph_snippet`; H-1's
+tests assert the two paths separately rather than deriving one from the other,
+which is the right posture regardless.

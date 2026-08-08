@@ -293,13 +293,31 @@ export interface UpdaterStatus {
   state_dir: string;
 }
 
-/// Read the detection status. `reload = true` recompiles the YARA rules from
-/// disk first — what the "Reload rules" button calls after the user edits a
-/// file in `detection/rules.d/local/`. Returns `null` when the app isn't
-/// reachable so the caller can render a neutral state.
+/// Read the detection status, **propagating the failure**. `reload = true`
+/// recompiles the YARA rules from disk first — what the "Reload rules" button
+/// calls after the user edits a file in `detection/rules.d/local/`.
+///
+/// The non-swallowing form exists because of #48, H-10: the swallowing one below
+/// hands its caller a `null` that means "could not read", and a caller that
+/// treats "could not read" as "nothing to report" renders the signature layer as
+/// ARMED. Any surface whose default rendering is *reassuring* must take this
+/// form and decide what a failure looks like — see `latch.ts`'s
+/// [`recordSignatureRead`].
+export async function fetchDetectionStatus(reload = false): Promise<DetectionStatus> {
+  return invoke<DetectionStatus>('detection_status', { reload });
+}
+
+/// The same read with the failure swallowed to `null`, for callers whose
+/// *rendering of `null` is itself the honest answer* — today only the Settings
+/// detection panel, which renders "cImp could not read the detection layer's
+/// status" in that case.
+///
+/// **Do not feed this `null` to a surface that would read it as "all clear"**
+/// (#48, H-10). It means "we could not tell", which is a third state, not the
+/// absence of news.
 export async function detectionStatus(reload = false): Promise<DetectionStatus | null> {
   try {
-    return await invoke<DetectionStatus>('detection_status', { reload });
+    return await fetchDetectionStatus(reload);
   } catch (e) {
     console.warn('detection_status failed', e);
     return null;

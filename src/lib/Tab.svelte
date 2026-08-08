@@ -5,7 +5,7 @@
   // (Close? Yes / No); clicking × on an already-closed shell skips the
   // confirm and calls close_tab immediately.
   import type { AvatarState } from './avatarState';
-  import type { FeatureState, LatchRow } from './latch';
+  import { reducedTabLine, type FeatureState, type LatchRow } from './latch';
 
   let {
     tabId,
@@ -181,9 +181,10 @@
           : taint.latch === 'local'
             ? 'This session has used local file / source-text tools: web and other external tools are closed for it.'
             : 'This session has read external content. Memory writes stay quarantined for this tab until cImp is restarted.',
-      reduced.length === 0
-        ? ''
-        : `Injection protection reduced for this tab: ${reduced.map((f) => f.label).join(', ')} off.`,
+      // #48/H-10: the sentence used to end in the word "off" for every row,
+      // including one whose state cImp had failed to read. `reducedTabLine`
+      // splits the two claims.
+      reducedTabLine(reduced),
     ]
       .filter(Boolean)
       .join(' '),
@@ -313,6 +314,7 @@
         class="taint"
         class:taint-contaminated={taint?.contaminated}
         class:taint-reduced={!taint && reduced.length > 0}
+        class:taint-unverified={!taint && reduced.length > 0 && reduced.every((f) => f.unknown)}
         role="button"
         tabindex="0"
         aria-label="Containment state for this tab"
@@ -483,6 +485,13 @@
      user turned off is a configuration fact, not an event. */
   .taint-reduced {
     color: var(--text-tertiary);
+  }
+  /* #48/H-10: a tab whose ONLY reduced row is one cImp could not read. Dashed
+     rather than solid, matching the status chip's unknown treatment — it is a
+     broken instrument, not a switch anyone turned off. */
+  .taint-unverified {
+    border-bottom: 1px dashed currentColor;
+    border-radius: 0;
   }
   .taint:hover {
     background: var(--surface-3);

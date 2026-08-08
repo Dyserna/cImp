@@ -19,43 +19,34 @@
   //     ticks running (#48, G-3). Rendering nothing there would be the one
   //     failure this surface cannot have: "no chip" reads as "fully protected",
   //     which is exactly the off-and-forgotten state decision 16 forbids.
+  //   * the state is UNVERIFIED — everything this chip CAN read is on, and one
+  //     thing it cannot read is the signature layer's armed-ness (#48, H-10).
+  //     Distinct from "reduced" on purpose: nothing was switched off, and
+  //     saying so would send the user hunting Settings for a switch that is
+  //     already on.
   // Clicking opens Settings, where the matrix says exactly which and why.
+  //
+  // The whole decision — visible, which word, which tooltip — is `latch.ts`'s
+  // `injectionChipState`, because a chip that must not lie needs tests and
+  // `.svelte` files have no harness in this repo.
   import { openSettingsWindow } from '../settings/ipc';
-  import { injectionStatus, injectionStatusUnknown, reducedSummary } from '../latch';
+  import { injectionStatus, injectionStatusUnknown, injectionChipState } from '../latch';
 
-  const status = $derived($injectionStatus);
-  const unknown = $derived($injectionStatusUnknown);
-  const masterOff = $derived(!unknown && !!status && !status.protection);
-  const visible = $derived(unknown || !!status?.reduced);
-
-  /// What is reduced, in the tooltip's words. The rule is `latch.ts`'s
-  /// `isReducedRow` — the same one the tab badge beside this chip uses — rather
-  /// than a third copy of it (#48, G-2): the chip previously counted
-  /// `in_scope && !effective`, omitting the `default_on` clause Phase H
-  /// published specifically to prevent the two disagreeing in one viewport.
-  const summary = $derived(reducedSummary(status));
-
-  const title = $derived(
-    unknown
-      ? 'Injection protection state is UNKNOWN — cImp has not been able to read it for several polls, so this app cannot tell you what is switched on. Check the console. Click to open Settings.'
-      : masterOff
-        ? 'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings.'
-        : `Injection protection is reduced — ${summary}. Click to open Settings.`,
-  );
+  const chip = $derived(injectionChipState($injectionStatus, $injectionStatusUnknown));
 </script>
 
-{#if visible}
+{#if chip.visible}
   <button
     type="button"
     class="status-button injection"
-    class:master-off={masterOff}
-    class:unknown
+    class:master-off={chip.label === 'off'}
+    class:unknown={chip.degraded}
     onclick={() => void openSettingsWindow()}
-    {title}
-    aria-label={title}
+    title={chip.title}
+    aria-label={chip.title}
   >
     <span class="glyph" aria-hidden="true">⛨</span>
-    <span class="text">{unknown ? 'unknown' : masterOff ? 'off' : 'reduced'}</span>
+    <span class="text">{chip.label}</span>
   </button>
 {/if}
 
@@ -86,9 +77,9 @@
     color: var(--text-danger-soft);
     border-color: var(--text-danger-soft);
   }
-  /* "Unknown" is not "off": it is a broken instrument, not a posture the user
-     chose. Same weight as the reduced state, dashed so it does not read as a
-     confident claim about anything (#48, G-3). */
+  /* "Unknown" / "unverified" are not "off": they are a broken instrument, not a
+     posture the user chose. Same weight as the reduced state, dashed so it does
+     not read as a confident claim about anything (#48, G-3, H-10). */
   .unknown {
     border-style: dashed;
     border-color: var(--awaiting);

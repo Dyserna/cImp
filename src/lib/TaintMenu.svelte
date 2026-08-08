@@ -32,6 +32,7 @@
   import { onMount } from 'svelte';
   import {
     applyLatchOverride,
+    featureStateWord,
     type FeatureState,
     type LatchAction,
     type LatchRow,
@@ -100,7 +101,8 @@
     // A row that carries its own reason is not a setting anyone flipped — see
     // `latch.ts`'s `withSignatureHealth` (#48, D-2). The three `decided_by`
     // levels answer "who decided this switch", which is the wrong question for
-    // a fact about data on disk.
+    // a fact about data on disk, and doubly wrong for a fact cImp could not
+    // read at all (#48, H-10 — that row's word is "unknown", not "off").
     if (f.reason) return f.reason;
     switch (f.decided_by) {
       case 'global':
@@ -176,8 +178,12 @@
     <div class="state warn">Injection protection is reduced for this tab:</div>
     <ul class="reduced">
       {#each reduced as f (f.feature)}
-        <li>
-          {f.label} — off
+        <!-- "off" for a switch, "unknown" for a state cImp could not read
+             (#48, H-10). Rendering the second as the first is a smaller lie
+             than rendering it as protected, but it is still a lie: it points
+             the user at a switch to flip. -->
+        <li class:unknown={f.unknown}>
+          {f.label} — {featureStateWord(f)}
           <span class="why">({whyOff(f)})</span>
         </li>
       {/each}
@@ -268,6 +274,11 @@
   }
   .why {
     color: var(--text-tertiary);
+  }
+  /* A row whose state could not be read is not a confident claim — the same
+     dashed treatment the status chip uses for its unknown state. */
+  .reduced li.unknown {
+    border-bottom: 1px dashed var(--border-default);
   }
   .err {
     color: var(--text-danger-soft);

@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { writable, derived, type Readable } from 'svelte/store';
 import type { TabId } from './tabs/types';
-import { detectionStatus } from './offload';
+import { fetchDetectionStatus } from './offload';
 
 /// V32 Phase F (locked decisions 14 + 15): the per-tab taint-latch state that
 /// drives the tab-chrome badge and its override popover.
@@ -79,6 +79,19 @@ export interface FeatureState {
   /// on the frontend-composed row below, whose "off" is a fact about data on
   /// disk rather than a switch anyone flipped.
   reason?: string;
+  /// This row's state could not be READ — as distinct from read-and-off (#48,
+  /// H-10).
+  ///
+  /// Absent on every backend row: the backend resolves settings, and a setting
+  /// it can publish it can read. Present only on the frontend-composed
+  /// signature row, whose subject is an IPC call that can fail.
+  ///
+  /// `effective` is `false` on such a row because nothing may claim the layer is
+  /// working — but "off" and "we cannot tell" are different sentences and every
+  /// surface here renders them differently. A consumer that branches on
+  /// `effective` alone collapses the third state back into the second, which is
+  /// the same family of bug one layer down.
+  unknown?: boolean;
 }
 
 /// One scope's rows. `scope` is `app`, `offload-worker`, or a tab id.
@@ -209,25 +222,140 @@ export function reducedFeaturesFor(
 ///   switched on with no rules to match with). Nobody flipped these, so folding
 ///   them into the first number made the chip's sentence untrue — spec residual
 ///   (g).
-export function reducedSummary(status: InjectionStatus | null): string {
+export interface ReducedCounts {
+  /// Controls someone turned off.
+  switched: number;
+  /// Rows that are on and doing nothing (they carry their own `reason`).
+  inert: number;
+  /// Rows whose state could not be read at all (#48, H-10). Never folded into
+  /// either of the other two: "off" and "we cannot tell" are different claims,
+  /// and a surface that says the first when it means the second is the defect
+  /// this counter exists to make impossible.
+  unreadable: number;
+}
+
+/// [`reducedSummary`]'s counts, for surfaces that must BRANCH on the shape of
+/// the reduction rather than phrase it — the status chip picks its word from
+/// these. Exported so no component re-derives them (#48, G-2).
+export function reducedCounts(status: InjectionStatus | null): ReducedCounts {
   const switched = new Set<string>();
   const inert = new Set<string>();
+  const unreadable = new Set<string>();
   for (const scope of status?.scopes ?? []) {
     for (const f of scope.features) {
-      if (isReducedRow(f)) (f.reason ? inert : switched).add(f.feature);
+      if (!isReducedRow(f)) continue;
+      (f.unknown ? unreadable : f.reason ? inert : switched).add(f.feature);
     }
   }
+  return { switched: switched.size, inert: inert.size, unreadable: unreadable.size };
+}
+
+export function reducedSummary(status: InjectionStatus | null): string {
+  const { switched, inert, unreadable } = reducedCounts(status);
   const parts: string[] = [];
-  if (switched.size > 0) {
-    parts.push(`${switched.size} control${switched.size === 1 ? '' : 's'} switched off`);
+  if (switched > 0) {
+    parts.push(`${switched} control${switched === 1 ? '' : 's'} switched off`);
   }
-  if (inert.size > 0) {
-    parts.push(`${inert.size} layer${inert.size === 1 ? '' : 's'} switched on but inert`);
+  if (inert > 0) {
+    parts.push(`${inert} layer${inert === 1 ? '' : 's'} switched on but inert`);
+  }
+  if (unreadable > 0) {
+    parts.push(`${unreadable} layer${unreadable === 1 ? '' : 's'} whose state could not be read`);
   }
   // The backend can report `reduced` for a reason no row expresses (it is the
   // source of truth and this side must not argue with it), so the chip still
   // has something to say when nothing here matches.
   return parts.join(', ') || 'something is off';
+}
+
+/// The word the status chip wears, and what it means.
+///
+/// - `unknown` — the hierarchy poll itself has been failing: we cannot see ANY
+///   of it (#48, G-3).
+/// - `off` — the L1 master switch is off.
+/// - `unverified` — everything we CAN read is on, and something we cannot read
+///   is the signature layer's armed-ness (#48, H-10). Not `reduced`: nobody
+///   turned anything off, and not silence either.
+/// - `reduced` — at least one thing is really off.
+export type InjectionChipLabel = 'unknown' | 'off' | 'unverified' | 'reduced';
+
+export interface InjectionChipState {
+  /// Whether the chip renders at all. Silence means "everything on, and we can
+  /// see that it is" — it must never mean "we did not look".
+  visible: boolean;
+  label: InjectionChipLabel;
+  /// Whether the chip wears the dashed "this is not a confident claim"
+  /// treatment. True for both epistemic states.
+  degraded: boolean;
+  title: string;
+}
+
+/// The whole status chip, as a value.
+///
+/// Lives here rather than in `InjectionBadge.svelte` for the reason given on
+/// [`reducedSummary`]: `.svelte` files have no test harness in this repo, and
+/// the chip's job is to not lie.
+export function injectionChipState(
+  status: InjectionStatus | null,
+  pollUnknown: boolean,
+): InjectionChipState {
+  const counts = reducedCounts(status);
+  const summary = reducedSummary(status);
+  if (pollUnknown) {
+    return {
+      visible: true,
+      label: 'unknown',
+      degraded: true,
+      title:
+        'Injection protection state is UNKNOWN — cImp has not been able to read it for several polls, so this app cannot tell you what is switched on. Check the console. Click to open Settings.',
+    };
+  }
+  const visible = !!status?.reduced;
+  if (status && !status.protection) {
+    return {
+      visible,
+      label: 'off',
+      degraded: false,
+      title:
+        'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings.',
+    };
+  }
+  const unreadable = counts.unreadable > 0;
+  const onlyUnreadable = unreadable && counts.switched === 0 && counts.inert === 0;
+  return {
+    visible,
+    label: onlyUnreadable ? 'unverified' : 'reduced',
+    degraded: unreadable,
+    title: onlyUnreadable
+      ? `Injection protection cannot be verified — ${summary}. It is not switched off; cImp cannot currently tell whether it is working. Click to open Settings.`
+      : unreadable
+        ? `Injection protection is reduced, and part of it cannot be verified — ${summary}. Click to open Settings.`
+        : `Injection protection is reduced — ${summary}. Click to open Settings.`,
+  };
+}
+
+/// How one reduced row reads in a list: `off` for a switch, `unknown` for a
+/// state nobody could read. The popover and the tab tooltip both call it, so
+/// they cannot describe the same row differently (#48, H-10 / G-2).
+export function featureStateWord(f: FeatureState): 'off' | 'unknown' {
+  return f.unknown ? 'unknown' : 'off';
+}
+
+/// The tab badge's tooltip sentence for its reduced rows.
+///
+/// Two sentences rather than one list, because the old single sentence ended in
+/// the word "off" and would have said it of a row whose state we failed to read.
+export function reducedTabLine(reduced: FeatureState[]): string {
+  const off = reduced.filter((f) => !f.unknown).map((f) => f.label);
+  const unreadable = reduced.filter((f) => f.unknown).map((f) => f.label);
+  const parts: string[] = [];
+  if (off.length > 0) {
+    parts.push(`Injection protection reduced for this tab: ${off.join(', ')} off.`);
+  }
+  if (unreadable.length > 0) {
+    parts.push(`cImp could not read the state of: ${unreadable.join(', ')}.`);
+  }
+  return parts.join(' ');
 }
 
 // ── V32 Phase C / #48 D-2 — a disarmed signature layer is reduced protection ─
@@ -241,8 +369,80 @@ export function reducedSummary(status: InjectionStatus | null): string {
 /// question.
 export const SIGNATURE_RULES_FEATURE = 'signature_rules_live';
 
-/// Fold "the signature layer is on and has no rules to match with" into the
-/// injection hierarchy as an extra row.
+/// What one poll knows about the signature layer — THREE outcomes, spelled out
+/// because two of them used to share a `null` (#48, H-10).
+///
+/// - `{ armed }` — we read it. `true` is the only value that renders protected.
+/// - `'unknown'` — we could not read it, for long enough to say so
+///   ([`UNKNOWN_AFTER_FAILURES`] consecutive failures). Renders as its own state,
+///   never as armed and never as "switched off".
+/// - `'pending'` — no reading yet, and no reason to alarm anyone: the first
+///   ticks after launch, or a transient failure still inside the grace window.
+///   Publishes the backend's hierarchy unchanged.
+///
+/// The union is deliberately closed and has no `null` member: the old signature
+/// took `{ armed } | null`, and `null` was produced BOTH by a swallowed IPC
+/// failure and by "nothing to add", so a broken `detection_status` rendered the
+/// signature layer as fully armed indefinitely. Anything that wants the
+/// pass-through has to type the word `'pending'` and mean it.
+export type SignatureHealth = { armed: boolean } | 'unknown' | 'pending';
+
+/// One tick's detection read, folded into the running health.
+///
+/// **Why the detection read gets its own accounting** (#48, H-10). It used to
+/// have none: `detectionStatus()` swallowed its failure to `null`, `null` took
+/// the same branch as `armed: true`, and the enclosing `try` still called
+/// `recordPoll(health, true)` — so "armed", "not armed" and "the IPC is broken"
+/// all rendered as fully protected, with a healthy tick and no user-visible
+/// trace. This is D-2 one layer up: D-2 was *a failed reload silently disarms
+/// the layer*; H-10 was *a failed status read silently renders it armed*.
+///
+/// Reuses [`recordPoll`] rather than inventing a second debounce — same
+/// reducer, same [`UNKNOWN_AFTER_FAILURES`], same 4 s tick. Its own COUNTER
+/// though, and not [`injectionStatusUnknown`]: that flag means "the hierarchy
+/// itself is unreadable", and raising it for a failed detection read would have
+/// the chip claim total blindness while it can in fact see every switch. The
+/// detection blindness travels as a ROW in the hierarchy instead, which is where
+/// per-scope facts already live and which every surface already renders.
+///
+/// `last` keeps the most recent successful reading across the grace window, so
+/// two hiccups in a row do not blank a state we know; the Nth consecutive
+/// failure discards it and says `'unknown'`.
+export interface SignatureRead {
+  health: PollHealth;
+  /// The last reading that actually landed, or `null` before the first one.
+  last: { armed: boolean } | null;
+  /// What [`withSignatureHealth`] should be told this tick.
+  rules: SignatureHealth;
+}
+
+/// Nothing read yet — the state at the moment polling starts.
+export const SIGNATURE_UNREAD: SignatureRead = {
+  health: HEALTHY_POLL,
+  last: null,
+  rules: 'pending',
+};
+
+/// Fold one detection read into [`SignatureRead`]. `read === null` means the
+/// IPC call FAILED — the one thing the old code could not say.
+export function recordSignatureRead(
+  prev: SignatureRead,
+  read: { armed: boolean } | null,
+): SignatureRead {
+  if (read) return { health: recordPoll(prev.health, true), last: read, rules: read };
+  const health = recordPoll(prev.health, false);
+  return {
+    health,
+    last: prev.last,
+    // Inside the grace window: keep showing the last thing we actually read, or
+    // stay quiet if we never read one. Past it: say we cannot see.
+    rules: health.unknown ? 'unknown' : (prev.last ?? 'pending'),
+  };
+}
+
+/// Fold what we know about the signature layer into the injection hierarchy as
+/// an extra row: "on and with no rules to match with", or "on and we could not
+/// tell".
 ///
 /// **Why this exists (#48, D-2).** The reduced-protection surfaces are derived
 /// entirely from settings toggles, so a signature layer that had been disarmed
@@ -252,18 +452,31 @@ export const SIGNATURE_RULES_FEATURE = 'signature_rules_live';
 /// cannot be off and forgotten"), and a layer that is switched on and doing
 /// nothing is the clearest case of exactly that.
 ///
+/// **And why it takes three states (#48, H-10).** A layer whose status could not
+/// be READ is not the same fact as one that reported itself disarmed, and
+/// neither is "fully protected". The row carries `unknown` so the three stay
+/// three all the way to the pixels; `reduced` is raised for both, because that
+/// flag is what makes the surfaces speak at all and silence is the one rendering
+/// an unreadable state must never get.
+///
 /// Added **only to scopes where the detection feature both applies and
 /// resolves on**: a scope that never screens, or one the user switched off, is
-/// not reduced by a rules directory it does not read. `reduced` follows the
-/// same rule, so it can never be raised by a row nobody got.
+/// not reduced by a rules directory it does not read — and is not made
+/// *uncertain* by a status read either, which is why the same gate covers the
+/// unknown case. "Off by configuration" stays the feature's own row.
 export function withSignatureHealth(
   status: InjectionStatus | null,
-  rules: { armed: boolean } | null,
+  rules: SignatureHealth,
 ): InjectionStatus | null {
-  if (!status || !rules || rules.armed) return status;
+  if (!status || rules === 'pending') return status;
+  const unreadable = rules === 'unknown';
+  if (!unreadable && rules.armed) return status;
   const row: FeatureState = {
     feature: SIGNATURE_RULES_FEATURE,
     label: 'Signature rules loaded',
+    // Nothing may claim the layer is working. When the state is UNREADABLE this
+    // is "we cannot say it is on", not "it is off" — `unknown` below carries
+    // that distinction, and every surface renders the two differently.
     effective: false,
     decided_by: 'feature',
     override_value: 'inherit',
@@ -273,7 +486,10 @@ export function withSignatureHealth(
     // Nothing to bake into a spawn: this row is a fact about the rules
     // directory, not a switch. It never reaches the Settings matrix.
     spawn_baked: false,
-    reason: 'the rules directory compiled to no usable rules',
+    unknown: unreadable,
+    reason: unreadable
+      ? 'cImp could not read the detection layer’s status'
+      : 'the rules directory compiled to no usable rules',
   };
   let anywhere = false;
   const scopes = status.scopes.map((s) => {
@@ -338,9 +554,18 @@ const POLL_MS = 4000;
 /// the same call, and [`UNKNOWN_AFTER_FAILURES`] consecutive failures of the
 /// hierarchy poll flip [`injectionStatusUnknown`], which the status chip renders
 /// as "protection state unknown". See [`recordPoll`] for why.
+///
+/// Three reads, three failure treatments, none of them silent (#48, H-10):
+/// - `injection_status` — last value kept; [`injectionStatusUnknown`] after N.
+/// - `detection_status` — last value kept; an `unknown` ROW in the hierarchy
+///   after N ([`recordSignatureRead`]). Not the app-wide flag: we can still see
+///   every switch, just not whether the signature layer is armed.
+/// - `latch_status` — last value kept, warned, no sentinel (an absent latch row
+///   already means "no gated call yet" by design).
 export function startLatchPolling(): () => void {
   let stopped = false;
   let health = HEALTHY_POLL;
+  let signature = SIGNATURE_UNREAD;
   const tick = async (): Promise<void> => {
     // V32 Phase G rides the same tick. Settings changes are rarer than latch
     // moves, but the two are read together everywhere they are shown (the tab
@@ -352,11 +577,28 @@ export function startLatchPolling(): () => void {
       // #48/D-2: the signature layer's actual armed-ness rides the same tick as
       // the toggles, for the same reason the latch does — a badge and its
       // explanation disagreeing for a poll interval is how a badge stops being
-      // read. `detectionStatus` swallows its own failure and returns null,
-      // which leaves the hierarchy exactly as the backend published it.
-      const detection = await detectionStatus();
+      // read.
+      //
+      // #48/H-10: read through the NON-swallowing `fetchDetectionStatus`, and
+      // hand the failure to [`recordSignatureRead`] rather than to nobody. The
+      // swallowing `detectionStatus()` returned a `null` that the hierarchy
+      // could not distinguish from "armed", so a permanently broken
+      // `detection_status` rendered the signature layer as fully protected for
+      // as long as the app ran. Caught HERE rather than left to the outer
+      // `catch`, because the hierarchy the backend just handed us is still good
+      // and still wants publishing — with the uncertainty attached to it.
+      let read: { armed: boolean } | null = null;
+      try {
+        read = { armed: (await fetchDetectionStatus()).rules.armed };
+      } catch (e) {
+        console.warn(
+          `detection_status poll failed (${signature.health.failures + 1} in a row)`,
+          e,
+        );
+      }
+      signature = recordSignatureRead(signature, read);
       if (!stopped) {
-        injectionStatus.set(withSignatureHealth(status, detection?.rules ?? null));
+        injectionStatus.set(withSignatureHealth(status, signature.rules));
         health = recordPoll(health, true);
         injectionStatusUnknown.set(health.unknown);
       }

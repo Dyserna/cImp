@@ -4665,7 +4665,15 @@
               </li>
             </ul>
           {:else}
-            <small class="hint">Detection status unavailable (the app is still starting).</small>
+            <!-- #48/H-10: "unavailable" is a third state, not a quiet "fine".
+                 The old parenthetical guessed a cause ("still starting") that a
+                 permanently failing `detection_status` makes untrue, and this
+                 panel is where a user goes to check. -->
+            <small class="hint">
+              Detection status unavailable — cImp could not read it. It may still
+              be starting; if this persists, the layers below are UNVERIFIED
+              rather than known to be off. Check the console.
+            </small>
           {/if}
           <div class="row">
             <button type="button" onclick={reloadDetection}>Reload rules</button>

@@ -1410,9 +1410,11 @@ export interface OffloadSettings {
   /// V32 C3: what the detection auto-updater may do with the signature rule
   /// bundle — `"off"` / `"check"` / `"auto"`. Default `auto`.
   detection_update_rules_mode: string;
-  /// V32 C3: the same for the classifier weights. Default `check` — a model
-  /// swap can shift false-positive behaviour, so it asks.
-  detection_update_classifier_mode: string;
+  // `detection_update_classifier_mode` was removed 2026-08-08 with the
+  // updater's `classifier` component: the Prompt Guard 2 weights ship with the
+  // release via the models-v1 pipeline (locked decision 7), so there is no
+  // channel for a mode to gate. An older settings file may still carry the key;
+  // the Rust side ignores it and drops it on the next write.
   /// V32 C3: hours between update checks. Default 24, floored at 1.
   detection_update_interval_hours: number;
   /// V32 C3: override for the pinned manifest URL; empty means the pinned one.
@@ -1778,7 +1780,6 @@ export function defaultSettings(): Settings {
       detection_classifier_enabled: true,
       detection_classifier_threshold: 0.9,
       detection_update_rules_mode: 'auto',
-      detection_update_classifier_mode: 'check',
       detection_update_interval_hours: 24,
       detection_update_manifest_url: '',
       native_web_visibility: 'sensor',

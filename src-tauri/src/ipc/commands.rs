@@ -1218,7 +1218,7 @@ pub async fn detection_check_now(
         None | Some("") => Component::ALL.to_vec(),
         Some(name) => vec![Component::parse(name).ok_or_else(|| {
             AppError::Offload(format!(
-                "unknown detection component `{name}` (expected \"rules\" or \"classifier\")"
+                "unknown detection component `{name}` (expected \"rules\")"
             ))
         })?],
     };

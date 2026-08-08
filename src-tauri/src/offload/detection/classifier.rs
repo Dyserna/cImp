@@ -18,15 +18,21 @@
 //! blocks, and its verdict is itself untrusted — it is never fed into the taint
 //! latch or the fetch budgets.
 //!
-//! # Gracefully inert without weights
+//! # Gracefully inert without weights — the default state, and a supported one
 //!
-//! The weights are gated on HuggingFace and are **not** in this repository or
-//! the models-v1 release yet (see the deploy follow-ups in
-//! `docs/MILESTONE-V32-injection-hardening.md`). With the files absent this
-//! module reports [`Status::present`]`= false`, logs one line at startup, and
-//! the screen is skipped — the signature layer carries detection alone. That is
-//! a deliberate design point, not a stub: a user who never installs the weights
-//! must get a working app and an honest Settings readout, not a broken screen.
+//! **cImp does not ship these weights and does not mirror them** (decided
+//! 2026-08-08). They are under the Llama Community Licence; Kokoro is
+//! Apache-2.0 and Whisper is MIT, so those two ride along on the `models-v1`
+//! release and this one does not — mirroring it would be redistribution with
+//! attribution and acceptable-use conditions attached, for a layer that is
+//! optional. A user who wants it fetches it directly, and the licence reaches
+//! them with it.
+//!
+//! With the files absent this module reports [`Status::present`]`= false`, logs
+//! one line at startup, and the screen is skipped — the signature layer carries
+//! detection alone. That is a deliberate design point, not a stub: a user who
+//! never installs the weights must get a working app and an honest Settings
+//! readout, not a broken screen. It is the state of every install by default.
 //!
 //! Expected layout, under the same `models/` directory the TTS and STT models
 //! use (`<portable-root>/models/`, resolved by [`crate::tts::model_dir`]):
@@ -35,6 +41,14 @@
 //! models/promptguard2-22m/model.onnx
 //! models/promptguard2-22m/tokenizer.json
 //! ```
+//!
+//! An ungated ONNX export that matches this layout file-for-file lives at
+//! `huggingface.co/gravitee-io/Llama-Prompt-Guard-2-22M-onnx` (fp32 284 MB, or
+//! `model.quant.onnx` at 72 MB — rename it, the loader wants that exact name).
+//! `models/CHECKSUMS.txt` carries verification digests for both, marked
+//! permanently commented so `scripts/fetch-models.*` never tries to pull them
+//! from a release they are deliberately not on. Any export meeting
+//! [`score_from_logits`]'s contract works; the digests pin one specific build.
 //!
 //! # Windowing, and the work cap
 //!
@@ -184,38 +198,15 @@ pub fn status() -> Status {
     }
 }
 
-/// Drop the cached session and load again from the models directory, returning
-/// the fresh [`Status`].
-///
-/// The C3 updater's hot-swap: activating new weights is a file move, and
-/// without this the process would keep serving the old graph until restart —
-/// an update that appears to have applied while nothing changed is worse than
-/// one that visibly did not.
-pub fn rebuild() -> Status {
-    *engine().lock().unwrap_or_else(PoisonError::into_inner) = None;
-    status()
-}
-
-/// Score `samples` with the weights in `dir`, on a throwaway session.
-///
-/// The updater's classifier smoke set runs through here so the *staged* weights
-/// are judged before they are installed — scoring with the live session would
-/// only ever confirm what is already active. The session is dropped when this
-/// returns; nothing about the live one is disturbed either way.
-pub fn score_many_with(
-    dir: &std::path::Path,
-    samples: &[(String, String)],
-) -> Result<Vec<(String, f32)>, String> {
-    let mut engine = load_from(dir)?;
-    let mut out = Vec::with_capacity(samples.len());
-    for (name, text) in samples {
-        let score = score_with(&mut engine, text).score.ok_or_else(|| {
-            format!("the staged weights produced no score for the control document `{name}`")
-        })?;
-        out.push((name.clone(), score));
-    }
-    Ok(out)
-}
+// `rebuild()` and `score_many_with()` lived here until 2026-08-08. Both existed
+// solely for the C3 updater's `classifier` component — a hot-swap after a
+// weights download, and a smoke score against *staged* weights before install.
+// That component was removed (user decision): the Prompt Guard 2 weights are
+// HF-gated, a released checkpoint has no update stream, and locked decision 7
+// already ships them through the models-v1 release-asset pipeline with
+// `CHECKSUMS.txt`, at maintenance-run cadence. Weights are therefore installed
+// the same way the TTS and STT blobs are — with the release, or by hand — and
+// picked up on the next launch. There is nothing left to hot-swap.
 
 /// One startup log line, so an absent classifier is visible in the log and not
 /// only in Settings. Called from app setup alongside the rules compile.
@@ -332,6 +323,21 @@ pub struct Scored {
     /// would put an unscreened notice on every page of every install without
     /// the weights.
     pub bounded: bool,
+    /// Inference **started and did not finish**: a window's `run_one` failed
+    /// (an `ort` session error, an unrecognized logits shape) after the screen
+    /// was already running (#48, M-4).
+    ///
+    /// This is the third state the type used to be unable to express, and its
+    /// absence was the defect: a classifier that ran and failed returned
+    /// `score: None`, which the caller read as the *inert* case and folded into
+    /// silence — byte-identical to a page that was screened and cleared.
+    ///
+    /// Deliberately `false` for the two cases the spec excludes, because
+    /// neither is a layer that *ran*: no weights installed (inert — today that
+    /// is every install, and reporting it per result would put the notice on
+    /// every external result in existence), and a tokenization failure (the
+    /// screen said nothing at all, which `score: None` already carries).
+    pub failed: bool,
 }
 
 /// Score `text`.
@@ -379,6 +385,7 @@ fn score_with(engine: &mut Engine, text: &str) -> Scored {
     let cls = special_id(&engine.tokenizer, &["[CLS]", "<s>", "<|startoftext|>"]);
     let sep = special_id(&engine.tokenizer, &["[SEP]", "</s>", "<|endoftext|>"]);
     let mut scores = Vec::new();
+    let mut failed = false;
     for window in windows(ids) {
         let mut seq: Vec<i64> = Vec::with_capacity(window.len() + 2);
         if let Some(c) = cls {
@@ -390,17 +397,22 @@ fn score_with(engine: &mut Engine, text: &str) -> Scored {
         }
         match run_one(engine, &seq) {
             Some(s) => scores.push(s),
+            // #48/M-4: `break`, not `return`. This used to discard `scores`,
+            // so a page whose window 3 scored 0.98 and whose window 7 hit a
+            // transient session error was delivered with NO header and NO row
+            // — the classifier had already decided it was hostile and the
+            // verdict was thrown away on the way out. Keep what was scored,
+            // and report separately that the pass did not finish.
             None => {
-                return Scored {
-                    score: None,
-                    bounded,
-                }
+                failed = true;
+                break;
             }
         }
     }
     Scored {
         score: verdict(&scores, 0.0).map(|(max, _)| max),
         bounded,
+        failed,
     }
 }
 

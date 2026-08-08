@@ -4708,6 +4708,23 @@
             />
             <span>Classifier screen (Prompt Guard 2)</span>
           </label>
+          {#if detection && !detection.classifier.present}
+            <small class="hint">
+              Optional and not bundled — cImp does not ship these weights, because
+              they are under the Llama Community Licence rather than the permissive
+              licences the TTS and speech models use. The layer stays inert until
+              you install them, and that is a supported configuration: the YARA
+              signature screen carries detection on its own. To enable it, put
+              <code>model.onnx</code> and <code>tokenizer.json</code> in
+              <code>models/promptguard2-22m/</code> and restart. An ungated ONNX
+              export lives at
+              <code>huggingface.co/gravitee-io/Llama-Prompt-Guard-2-22M-onnx</code>
+              — it offers a 284&nbsp;MB fp32 build and a 72&nbsp;MB int8 one
+              (<code>model.quant.onnx</code>, rename it). Digests to verify against,
+              and the requirements any other export must meet, are in
+              <code>models/CHECKSUMS.txt</code>.
+            </small>
+          {/if}
           <label>
             <span>Classifier threshold (0–1)</span>
             <input
@@ -4734,9 +4751,8 @@
 
           <h4>Detection updates</h4>
           <small class="hint top">
-            Rules and classifier weights go stale: signatures only match
-            phrasings someone has already written down, and a model only
-            generalises as far as its training. cImp checks a curated manifest
+            Signature rules go stale: they only match phrasings someone has
+            already written down. cImp checks a curated manifest
             (its own GitHub release, never third-party repos) on a daily
             interval. A candidate bundle is verified by SHA-256, compiled, and
             run against shipped control documents — it must catch the known
@@ -4755,7 +4771,7 @@
             {#each detection.updater.components as comp (comp.component)}
               <div class="updater-row">
                 <div class="row">
-                  <strong>{comp.component === 'rules' ? 'Signature rules' : 'Classifier weights'}</strong>
+                  <strong>Signature rules</strong>
                   <span class="mcp-detail">
                     installed: <code>{comp.installed_version || '(shipped)'}</code>
                     {#if comp.available_version && comp.available_version !== comp.installed_version}
@@ -4771,14 +4787,11 @@
                 <label>
                   <span>Update mode</span>
                   <select
-                    value={comp.component === 'rules'
-                      ? snapshot.offload.detection_update_rules_mode
-                      : snapshot.offload.detection_update_classifier_mode}
+                    value={snapshot.offload.detection_update_rules_mode}
                     onchange={(e) => {
                       const v = (e.currentTarget as HTMLSelectElement).value;
                       patch((s) => {
-                        if (comp.component === 'rules') s.offload.detection_update_rules_mode = v;
-                        else s.offload.detection_update_classifier_mode = v;
+                        s.offload.detection_update_rules_mode = v;
                       });
                     }}
                   >

@@ -367,6 +367,28 @@ pub async fn screen(text: &str, cfg: Config) -> Verdict {
 /// Both layers, synchronously — the body of [`screen`]'s blocking task, split
 /// out so the composition is testable without a runtime.
 fn screen_blocking(text: &str, cfg: Config) -> Verdict {
+    // In test builds, serialize with the tests that OWN the global rule slot.
+    //
+    // `signature::scan` reads that slot and lazily reloads it when empty, so
+    // every test reaching this function shares mutable global state with
+    // `signature`'s two slot-ownership tests — which install a deliberate state
+    // and then assert on it. The result was a 1-in-4 flake in
+    // `a_reload_that_compiles_to_nothing_keeps_the_previous_rules_live`.
+    //
+    // The guard lives HERE rather than at each call site because the reach is
+    // indirect and growing: `wrap_external_result` is the entry point for a
+    // dozen tests, and a guard those tests have to remember to take is one a
+    // future test will forget. Serializing the single choke point is structural
+    // — it covers tests not yet written.
+    //
+    // **Invariant: nothing holding `signature::test_lock` may call `screen`.**
+    // The lock is not reentrant. The two tests that hold it call `scan`
+    // directly and never come through here; keep it that way.
+    #[cfg(test)]
+    let _slot = signature::test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let mut v = Verdict::default();
     if cfg.signature {
         match signature::scan(text) {
@@ -395,29 +417,57 @@ fn screen_blocking(text: &str, cfg: Config) -> Verdict {
     }
     if cfg.classifier {
         let scored = classifier::score_blocking(text);
+        note_classifier(&mut v, &scored, text.len(), cfg.classifier_threshold);
+    }
+    v
+}
+
+/// Fold one [`classifier::Scored`] into the verdict.
+///
+/// Split from [`screen_blocking`] so it is testable with no weights installed —
+/// the same pure-seam discipline `classifier::windows_truncated` follows, and
+/// for the same reason: the weights are absent on every machine by design, so
+/// the part that *can* be verified must not be entangled with the part that
+/// cannot. Without this seam #48/M-4's fix would have no test at all.
+fn note_classifier(v: &mut Verdict, scored: &classifier::Scored, text_len: usize, threshold: f32) {
+    {
         if let Some(score) = scored.score {
             v.score = Some(score);
-            if score >= cfg.classifier_threshold {
+            if score >= threshold {
                 v.layers.push(LAYER_CLASSIFIER);
             }
         }
-        // `score: None` is the inert case (no weights) and the failure case
-        // alike: this screen has nothing to say. Never "benign" — and never
+        // `score: None` alone is the INERT case (no weights) or a tokenization
+        // failure: this screen has nothing to say. Never "benign" — and never
         // "unscreened" either, because a layer that is switched off at the
         // filesystem has its own consumer (the Settings block's `present:
         // false` and the startup log line), and reporting it per result would
         // put this notice on every page of every install without the weights.
+        //
+        // A layer that RAN and did not finish is a different fact, and #48/M-4
+        // is that it had no representation: `Scored.failed` carries it now, and
+        // it maps to `incomplete` — the same bucket as a yara-x timeout, for
+        // the same reason. Note this can coexist with a `score`: the windows
+        // that did complete are still reported, so a page that flagged before
+        // the failure both flags AND says the pass was partial.
+        if scored.failed {
+            v.incomplete = true;
+            v.unscreened_detail.push(format!(
+                "{LAYER_CLASSIFIER}: inference did not finish; {} window(s) were scored before it \
+                 stopped",
+                if scored.score.is_some() { "some" } else { "no" }
+            ));
+        }
         if scored.bounded {
             v.bounded = true;
             v.unscreened_detail.push(format!(
                 "{LAYER_CLASSIFIER}: scored the first {} KiB of {} KiB, and at most {} windows",
                 classifier::MAX_INPUT_BYTES / 1024,
-                text.len() / 1024,
+                text_len / 1024,
                 classifier::MAX_WINDOWS
             ));
         }
     }
-    v
 }
 
 // ── The single composition helper the two boundaries call ──────────────────
@@ -667,6 +717,68 @@ pub fn status(settings: &Settings) -> DetectionStatus {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #48/M-4 — a classifier that RAN and did not finish must be
+    /// distinguishable from one that read the result and cleared it.
+    ///
+    /// Before the fix `score_with` returned `score: None` on the first failing
+    /// window, discarding every window already scored, and the caller folded
+    /// that into the *inert* case: no header, no row, no log line. A page whose
+    /// window 3 scored 0.98 and whose window 7 hit a transient session error was
+    /// delivered byte-identically to a page that was screened and found clean.
+    ///
+    /// Driven through the real `note_classifier` seam rather than a
+    /// re-implementation, because the defect was in exactly this mapping.
+    #[test]
+    fn a_classifier_pass_that_did_not_finish_is_not_reported_as_clean() {
+        let scored = |score, failed, bounded| classifier::Scored {
+            score,
+            failed,
+            bounded,
+        };
+
+        // Ran, finished, found nothing: neither flagged nor unscreened. This is
+        // the only shape that means "read end to end, nothing found".
+        let mut clean = Verdict::default();
+        note_classifier(&mut clean, &scored(Some(0.02), false, false), 2048, 0.9);
+        assert!(!clean.flagged() && !clean.unscreened(), "{clean:?}");
+
+        // Ran and died mid-pass with nothing scored yet: unscreened, not clean.
+        let mut died = Verdict::default();
+        note_classifier(&mut died, &scored(None, true, false), 2048, 0.9);
+        assert!(died.incomplete, "a pass that stopped early must say so");
+        assert!(died.unscreened() && !died.flagged(), "{died:?}");
+        assert!(
+            died.unscreened_detail.iter().any(|d| d.contains("no window")),
+            "{:?}",
+            died.unscreened_detail
+        );
+
+        // The sharp case: it had ALREADY crossed the threshold when a later
+        // window failed. The flag must survive — that verdict was the whole
+        // point of running — and the partial pass must be reported too.
+        let mut both = Verdict::default();
+        note_classifier(&mut both, &scored(Some(0.98), true, false), 2048, 0.9);
+        assert!(both.flagged(), "the score that fired must not be discarded");
+        assert!(both.incomplete, "and the pass was still partial");
+        assert!(
+            both.unscreened_detail.iter().any(|d| d.contains("some window")),
+            "{:?}",
+            both.unscreened_detail
+        );
+
+        // The two EXCLUDED cases keep their exclusion: an inert layer (no
+        // weights — today that is every install) and a tokenization failure
+        // both surface as `Scored::default()`, which must stay silent. If this
+        // ever reports unscreened, every external result on every install
+        // carries the notice and the signal is worthless.
+        let mut inert = Verdict::default();
+        note_classifier(&mut inert, &classifier::Scored::default(), 2048, 0.9);
+        assert!(
+            !inert.unscreened() && !inert.flagged(),
+            "an inert classifier must say nothing: {inert:?}"
+        );
+    }
 
     fn ctx(cfg: Config) -> ResultCtx<'static> {
         ResultCtx {

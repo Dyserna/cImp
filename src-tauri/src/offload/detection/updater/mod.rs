@@ -2,10 +2,17 @@
 //!
 //! # Why this exists
 //!
-//! Signature rules and a classifier decay without updates, and tying freshness
-//! to manual maintenance runs makes staleness the default. So the data both
-//! detection layers read is kept current on a daily check, from a channel the
-//! project curates ([`manifest`]).
+//! Signature rules decay without updates — they only match phrasings someone
+//! has already written down — and tying freshness to manual maintenance runs
+//! makes staleness the default. So the rule bundle is kept current on a daily
+//! check, from a channel the project curates ([`manifest`]).
+//!
+//! The **classifier weights are not on this channel** and never were, in the
+//! end: locked decision 7 ships them through the models-v1 release-asset
+//! pipeline with `CHECKSUMS.txt`, at maintenance-run cadence, exactly like the
+//! TTS and STT blobs. A `classifier` component was built here and removed on
+//! 2026-08-08 — a released Meta checkpoint has no update stream to poll, and
+//! two delivery mechanisms for one artifact is one too many.
 //!
 //! # The shape of one run
 //!
@@ -182,7 +189,6 @@ pub fn is_due(mode: Mode, now_ms: u64, last_check_ms: u64, interval_hours: u32) 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Schedule {
     pub rules: Mode,
-    pub classifier: Mode,
     pub interval_hours: u32,
 }
 
@@ -190,7 +196,6 @@ impl Schedule {
     pub fn from_settings(s: &Settings) -> Self {
         Self {
             rules: Mode::parse(&s.offload.detection_update_rules_mode),
-            classifier: Mode::parse(&s.offload.detection_update_classifier_mode),
             interval_hours: s.offload.detection_update_interval_hours,
         }
     }
@@ -198,13 +203,12 @@ impl Schedule {
     pub fn mode(self, c: Component) -> Mode {
         match c {
             Component::Rules => self.rules,
-            Component::Classifier => self.classifier,
         }
     }
 
-    /// Both components off ⇒ the updater does nothing at all.
+    /// Every component off ⇒ the updater does nothing at all.
     pub fn is_inert(self) -> bool {
-        self.rules == Mode::Off && self.classifier == Mode::Off
+        self.rules == Mode::Off
     }
 }
 
@@ -264,8 +268,6 @@ pub struct Layout {
     /// `<exe-dir>/detection/rules.d` — the live rule bundle (whose `local/`
     /// subdirectory is never enumerated).
     pub rules_dest: PathBuf,
-    /// `<models>/promptguard2-22m` — the live classifier weights.
-    pub classifier_dest: PathBuf,
     /// `<exe-dir>/detection/smoke` — the validation corpus.
     pub smoke_dir: PathBuf,
 }
@@ -278,7 +280,6 @@ impl Layout {
         Some(Self {
             state_root: store::state_dir()?,
             rules_dest: store::destination(Component::Rules)?,
-            classifier_dest: store::destination(Component::Classifier)?,
             smoke_dir: validate::smoke_dir()?,
         })
     }
@@ -286,7 +287,6 @@ impl Layout {
     pub fn dest(&self, c: Component) -> &Path {
         match c {
             Component::Rules => &self.rules_dest,
-            Component::Classifier => &self.classifier_dest,
         }
     }
 }
@@ -309,14 +309,6 @@ pub fn live_reload(c: Component, dir: &Path) -> Result<String, String> {
         Component::Rules => {
             let s = super::signature::reload();
             health_from_rules(&s, dir)
-        }
-        Component::Classifier => {
-            let s = super::classifier::rebuild();
-            if s.present {
-                Ok("weights loaded".to_string())
-            } else {
-                Err(s.error.unwrap_or_else(|| "weights did not load".into()))
-            }
         }
     }
 }
@@ -1087,14 +1079,74 @@ async fn apply_component(
     // this runs at most once a day on a background task with nothing waiting on
     // it — the seconds-scale ceiling is the whole point of having a ceiling.
     match c {
-        Component::Rules => validate_and_activate_rules(staging, layout, &entry.version, reload),
-        Component::Classifier => {
-            validate_and_activate_classifier(staging, layout, &entry.version, &names, reload)
+        Component::Rules => {
+            let _ = &names;
+            validate_and_activate_rules(staging, layout, &entry.version, reload)
         }
     }
 }
 
 /// The rules half.
+/// Fraction of the live rule count a candidate bundle may not fall below.
+///
+/// Curation churn moves the count by a few rules; halving it is not curation.
+const COVERAGE_FLOOR: usize = 2;
+
+/// Refuse a bundle that would sharply shrink the live rule set.
+///
+/// **This is a curation guard, not an anti-tamper control**, and the distinction
+/// is worth being honest about (#48, N-10 / the H-6 decision). The gauntlet's
+/// positive control is the shipped `smoke/hostile/` corpus — public, on every
+/// user's disk — so a bundle of three rules that match exactly those documents
+/// and nothing else compiles clean, scans fast, hits every hostile control,
+/// misses every benign one, and activates green. `validate.rs`'s own header
+/// claims to stop a bundle that "would quietly disable the layer", and that
+/// bundle walks straight through.
+///
+/// What this does NOT defend against is a hostile publisher: anyone who can
+/// write the manifest can also write the rule count, and — since the channel's
+/// trust root is `contents: write` on the repo that ships the binary — can also
+/// ship a cImp release with detection removed outright. That is precisely why
+/// bundle signing was declined (H-6): a key reachable by the compromise it
+/// defends against is ceremony.
+///
+/// What it DOES catch is the likelier failure by far: a curator publishing a
+/// half-built bundle. That is worth ten lines.
+///
+/// Compares against the **shipped** set only — `store::managed_rule_files` is
+/// non-recursive, so a user's `local/` rules never inflate the baseline and a
+/// user who writes twenty of their own cannot make every future bundle look
+/// like a regression. An unreadable or empty live set yields no baseline and
+/// the check passes: a first install has nothing to compare against.
+fn coverage_floor(candidate_rules: usize, dest: &Path) -> Result<(), String> {
+    let live: Vec<(String, String)> = store::managed_rule_files(dest)
+        .into_iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_string_lossy().to_string();
+            Some((name, std::fs::read_to_string(&p).ok()?))
+        })
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+    let (compiled, _failed) = super::signature::compile_sources(&live);
+    let Some(compiled) = compiled else {
+        // The live set does not compile, so it is not a baseline worth
+        // defending — the candidate can only be an improvement.
+        return Ok(());
+    };
+    let live_rules = compiled.iter().count();
+    if live_rules > 0 && candidate_rules * COVERAGE_FLOOR < live_rules {
+        return Err(format!(
+            "coverage floor: the candidate bundle carries {candidate_rules} rule(s) against the \
+             {live_rules} currently live — a drop that large is a half-built bundle, not curation. \
+             The smoke corpus cannot catch this on its own (a bundle matching only the shipped \
+             hostile controls passes every other gate), so the count is checked directly."
+        ));
+    }
+    Ok(())
+}
+
 fn validate_and_activate_rules(
     staging: &Path,
     layout: &Layout,
@@ -1104,6 +1156,7 @@ fn validate_and_activate_rules(
     let sources = super::signature::read_sources(staging);
     let corpus = validate::load_corpus(&layout.smoke_dir);
     let report = validate::validate_rules(&sources, &corpus)?;
+    coverage_floor(report.rules, layout.dest(Component::Rules))?;
     // #48, U-4: snapshot which `local/` files are ALREADY broken, before the
     // swap, so the post-activation health check judges the BUNDLE rather than
     // the directory. Taken here (not inside `activate`) because it must be read
@@ -1124,42 +1177,6 @@ fn validate_and_activate_rules(
         report.hostile_samples,
         report.compile_ms,
         report.slowest_scan_ms
-    ))
-}
-
-/// The classifier half.
-///
-/// The staged weights score the shipped smoke corpus BEFORE anything is
-/// swapped. With no usable corpus — or with staged weights the scorer cannot
-/// load — the update is rejected rather than trusted: swapping a classifier is
-/// exactly the change locked decision 13 said should *ask*, and installing an
-/// unverified model is the opposite of asking.
-fn validate_and_activate_classifier(
-    staging: &Path,
-    layout: &Layout,
-    version: &str,
-    names: &[String],
-    reload: Reloader<'_>,
-) -> Result<String, String> {
-    let corpus = validate::load_corpus(&layout.smoke_dir);
-    if !corpus.is_usable() {
-        return Err(format!(
-            "the smoke corpus is missing or empty ({} benign, {} hostile documents) — staged \
-             weights cannot be verified, so they are rejected rather than trusted",
-            corpus.benign.len(),
-            corpus.hostile.len()
-        ));
-    }
-    let injection = super::classifier::score_many_with(staging, &corpus.hostile)?;
-    let benign = super::classifier::score_many_with(staging, &corpus.benign)?;
-    validate::classifier_smoke_verdict(&injection, &benign)?;
-    let _ = names;
-    activate(Component::Classifier, staging, layout, version, reload)?;
-    Ok(format!(
-        "activated classifier weights `{version}`, verified against {} injection + {} benign \
-         control document(s). The previous weights are retained and can be reverted from Settings.",
-        injection.len(),
-        benign.len()
     ))
 }
 

@@ -34,15 +34,6 @@
 //!      every other gate and quietly disable the layer. That is precisely the
 //!      silent degradation the decision forbids, so it is a gate, not a nicety.
 //!
-//! # The classifier gauntlet
-//!
-//! Weights are scored against the same shipped corpus before the `ort` session
-//! is rebuilt: the injection samples must score high, the benign samples low,
-//! and the two populations must actually separate ([`classifier_smoke_verdict`]).
-//! The decision function is pure and unit-tested; the scoring step around it
-//! needs real weights and is therefore skipped — honestly reported as skipped —
-//! wherever they are absent, which is every machine today.
-//!
 //! # The corpus is shipped data
 //!
 //! `<exe-dir>/detection/smoke/{benign,hostile}/*.txt`, staged by `build.rs` and
@@ -80,15 +71,6 @@ pub const SCAN_BUDGET: Duration = signature::SCAN_TIMEOUT;
 
 /// Directory name under `<exe-dir>/detection/` holding the smoke corpus.
 pub const SMOKE_DIR: &str = "smoke";
-
-/// Classifier smoke: the lowest score any known-injection sample may have.
-pub const CLASSIFIER_MIN_INJECTION: f32 = 0.5;
-/// Classifier smoke: the highest score any known-benign sample may have.
-pub const CLASSIFIER_MAX_BENIGN: f32 = 0.5;
-/// Classifier smoke: the minimum gap between the worst injection sample and the
-/// best benign one. A model that puts everything at 0.5001/0.4999 technically
-/// satisfies the two bounds above while carrying no signal.
-pub const CLASSIFIER_MIN_SEPARATION: f32 = 0.2;
 
 /// `<exe-dir>/detection/smoke`. Derived from the rules directory so it follows
 /// the same primary/grandparent fallback `signature::rules_dir` uses for test
@@ -270,61 +252,6 @@ pub fn validate_rules(
     })
 }
 
-/// The classifier smoke decision, given the scores the staged weights produced
-/// for the two halves of the corpus.
-///
-/// Split from the scoring so it is testable with no model file — the same
-/// pure-seam discipline `classifier.rs` follows, and for the same reason: the
-/// weights are absent on every machine today, and the part that *can* be
-/// verified must not be entangled with the part that cannot.
-pub fn classifier_smoke_verdict(
-    injection: &[(String, f32)],
-    benign: &[(String, f32)],
-) -> Result<(), String> {
-    if injection.is_empty() || benign.is_empty() {
-        return Err(format!(
-            "the classifier smoke corpus is incomplete ({} injection, {} benign documents)",
-            injection.len(),
-            benign.len()
-        ));
-    }
-    for (name, score) in injection {
-        if *score < CLASSIFIER_MIN_INJECTION {
-            return Err(format!(
-                "classifier smoke failed: known-injection sample `{name}` scored {score:.3}, below \
-                 the {CLASSIFIER_MIN_INJECTION} floor — these weights would miss the attacks the \
-                 current ones catch"
-            ));
-        }
-    }
-    for (name, score) in benign {
-        if *score > CLASSIFIER_MAX_BENIGN {
-            return Err(format!(
-                "classifier smoke failed: benign sample `{name}` scored {score:.3}, above the \
-                 {CLASSIFIER_MAX_BENIGN} ceiling — these weights would flag ordinary content"
-            ));
-        }
-    }
-    // Both bounds can be satisfied by a model with no signal at all (everything
-    // hugging 0.5). Require the two populations to actually separate.
-    let worst_injection = injection
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::INFINITY, f32::min);
-    let best_benign = benign
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::NEG_INFINITY, f32::max);
-    if worst_injection - best_benign < CLASSIFIER_MIN_SEPARATION {
-        return Err(format!(
-            "classifier smoke failed: the worst injection sample ({worst_injection:.3}) and the \
-             best benign one ({best_benign:.3}) are within {CLASSIFIER_MIN_SEPARATION} of each \
-             other — these weights carry no usable separation"
-        ));
-    }
-    Ok(())
-}
-
 /// Which files a staged component must have produced before validation is even
 /// attempted. Cheap sanity that the download step wrote what the manifest
 /// promised, named per component so the error is legible.
@@ -479,44 +406,6 @@ mod tests {
         assert!(report.rules >= 10, "{report:?}");
     }
 
-    // ── Classifier smoke ────────────────────────────────────────────────
-
-    fn scores(v: &[(&str, f32)]) -> Vec<(String, f32)> {
-        v.iter().map(|(n, s)| ((*n).to_string(), *s)).collect()
-    }
-
-    #[test]
-    fn classifier_smoke_accepts_a_separating_model() {
-        assert!(classifier_smoke_verdict(
-            &scores(&[("a", 0.97), ("b", 0.88)]),
-            &scores(&[("c", 0.02), ("d", 0.11)])
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn classifier_smoke_rejects_a_model_that_misses_injections_or_flags_benign_text() {
-        let e = classifier_smoke_verdict(&scores(&[("a", 0.20)]), &scores(&[("c", 0.02)]))
-            .expect_err("miss");
-        assert!(e.contains("known-injection sample"), "{e}");
-        let e = classifier_smoke_verdict(&scores(&[("a", 0.97)]), &scores(&[("c", 0.80)]))
-            .expect_err("false positive");
-        assert!(e.contains("benign sample"), "{e}");
-    }
-
-    /// The separation gate: both bounds can be met by a model with no signal.
-    #[test]
-    fn classifier_smoke_rejects_a_model_with_no_usable_separation() {
-        let e = classifier_smoke_verdict(&scores(&[("a", 0.51)]), &scores(&[("c", 0.49)]))
-            .expect_err("no separation");
-        assert!(e.contains("no usable separation"), "{e}");
-    }
-
-    #[test]
-    fn classifier_smoke_needs_both_halves_of_the_corpus() {
-        assert!(classifier_smoke_verdict(&[], &scores(&[("c", 0.01)])).is_err());
-        assert!(classifier_smoke_verdict(&scores(&[("a", 0.99)]), &[]).is_err());
-    }
 
     #[test]
     fn staged_files_present_names_what_is_missing() {

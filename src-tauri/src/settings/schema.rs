@@ -1705,20 +1705,13 @@ pub struct OffloadSettings {
     /// Additive `#[serde(default)]`; no schema-version bump.
     #[serde(deserialize_with = "de_update_mode")]
     pub detection_update_rules_mode: String,
-    /// V32 Phase C3: the same for the **classifier weights**.
-    ///
-    /// Default `check` — deliberately different from the rules default. A model
-    /// swap can shift false-positive behaviour across every page the app ever
-    /// fetches, and that is a change the user should agree to rather than wake
-    /// up to. The Advisor card and the Settings Apply button are how they say
-    /// yes.
-    ///
-    /// A value of the wrong JSON *type* reads the same way (#48) — see
-    /// [`de_update_mode`].
-    ///
-    /// Additive `#[serde(default)]`; no schema-version bump.
-    #[serde(deserialize_with = "de_update_mode")]
-    pub detection_update_classifier_mode: String,
+    // `detection_update_classifier_mode` lived here until 2026-08-08. The
+    // updater's `classifier` component was removed (user decision) — the
+    // Prompt Guard 2 weights ship with the release via the models-v1 pipeline
+    // per locked decision 7, so there is no update channel for them to gate.
+    // An installed settings file may still carry the key; `Settings` does not
+    // set `deny_unknown_fields`, so it is ignored on read and gone on the next
+    // write. No migration, no schema-version bump.
     /// V32 Phase C3: hours between update checks. Default 24; floored at
     /// `detection::updater::MIN_INTERVAL_HOURS` so a mistyped `0` cannot become
     /// a request loop against a release asset.
@@ -1961,10 +1954,6 @@ impl std::fmt::Debug for OffloadSettings {
                 &self.detection_update_rules_mode,
             )
             .field(
-                "detection_update_classifier_mode",
-                &self.detection_update_classifier_mode,
-            )
-            .field(
                 "detection_update_interval_hours",
                 &self.detection_update_interval_hours,
             )
@@ -2040,10 +2029,10 @@ impl Default for OffloadSettings {
             detection_signature_enabled: true,
             detection_classifier_enabled: true,
             detection_classifier_threshold: 0.9,
-            // The locked C3 defaults: rules maintain themselves, the
-            // classifier asks. See the field docs for why they differ.
+            // The locked C3 default: the rule bundle maintains itself. It is
+            // the only updatable component — the classifier weights ship with
+            // the release (locked decision 7, models-v1 pipeline).
             detection_update_rules_mode: "auto".into(),
-            detection_update_classifier_mode: "check".into(),
             detection_update_interval_hours: 24,
             // Empty = the pinned manifest URL.
             detection_update_manifest_url: String::new(),
@@ -4550,7 +4539,6 @@ mod tests {
         let cases: &[(&str, &str, &str)] = &[
             ("offload", "native_web_visibility", "sensor"),
             ("offload", "detection_update_rules_mode", "check"),
-            ("offload", "detection_update_classifier_mode", "check"),
             ("graph", "read_advisor_mode", "advise"),
         ];
         let bogus = [

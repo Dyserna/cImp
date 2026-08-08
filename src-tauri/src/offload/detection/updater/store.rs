@@ -7,9 +7,7 @@
 //! detection-updates/
 //!   state.json                     installed versions, last check + outcome
 //!   staging/rules/                 downloads, wiped before and after every run
-//!   staging/classifier/
 //!   previous/rules/<version>/      the bundle the current one replaced
-//!   previous/classifier/<version>/
 //! ```
 //!
 //! # Why a sibling of `detection/`, not a subdirectory
@@ -109,36 +107,21 @@ pub fn sanitize_version(v: &str) -> String {
 
 // ── The live destination for each component ────────────────────────────────
 
-/// Where a component's files actually live when active.
-///
-/// The two destinations differ because the two artifacts ship differently
-/// (rules beside the binary like `themes/`, weights in the portable root's
-/// shared `models/`), and pretending otherwise would mean one of them moving
-/// house for the updater's convenience.
+/// Where a component's files actually live when active — rules beside the
+/// binary, like `themes/` and `palettes/`.
 pub fn destination(c: Component) -> Option<PathBuf> {
     match c {
         Component::Rules => super::super::signature::rules_dir(),
-        Component::Classifier => super::super::classifier::model_dir(),
     }
 }
 
 /// The updater-managed files currently at `dest` for `c` — top level only.
 ///
-/// For rules this is every `*.yar`/`*.yara` in `rules.d` itself; `local/` is a
-/// subdirectory and is never enumerated. For the classifier it is the two known
-/// artifact names, so a user's own scratch file in the model directory is not
-/// swept into the archive either.
+/// Every `*.yar`/`*.yara` in `rules.d` itself; `local/` is a subdirectory and is
+/// never enumerated.
 pub fn managed_files(dest: &Path, c: Component) -> Vec<PathBuf> {
     match c {
         Component::Rules => managed_rule_files(dest),
-        Component::Classifier => [
-            super::super::classifier::MODEL_FILE,
-            super::super::classifier::TOKENIZER_FILE,
-        ]
-        .iter()
-        .map(|n| dest.join(n))
-        .filter(|p| p.is_file())
-        .collect(),
     }
 }
 
@@ -367,8 +350,10 @@ pub struct State {
     pub schema: u32,
     #[serde(default)]
     pub rules: ComponentState,
-    #[serde(default)]
-    pub classifier: ComponentState,
+    // A `classifier` key may still be present in an installed `state.json`
+    // (the component was removed 2026-08-08). `deny_unknown_fields` is not set,
+    // so serde drops it on read and it disappears on the next write — no
+    // migration, no schema bump.
 }
 
 impl Default for State {
@@ -376,7 +361,6 @@ impl Default for State {
         Self {
             schema: STATE_SCHEMA,
             rules: ComponentState::default(),
-            classifier: ComponentState::default(),
         }
     }
 }
@@ -385,14 +369,12 @@ impl State {
     pub fn get(&self, c: Component) -> &ComponentState {
         match c {
             Component::Rules => &self.rules,
-            Component::Classifier => &self.classifier,
         }
     }
 
     pub fn get_mut(&mut self, c: Component) -> &mut ComponentState {
         match c {
             Component::Rules => &mut self.rules,
-            Component::Classifier => &mut self.classifier,
         }
     }
 }
@@ -710,12 +692,12 @@ mod tests {
         let mut s = State::default();
         s.get_mut(Component::Rules).installed_version = "2026.08.07".into();
         s.get_mut(Component::Rules).last_check_ms = 42;
-        s.get_mut(Component::Classifier).available_version = "22m-2".into();
+        s.get_mut(Component::Rules).available_version = "2026.09.01".into();
         save_state(&dir, &s).expect("save");
         let back = load_state(&dir);
         assert_eq!(back.get(Component::Rules).installed_version, "2026.08.07");
         assert_eq!(back.get(Component::Rules).last_check_ms, 42);
-        assert_eq!(back.get(Component::Classifier).available_version, "22m-2");
+        assert_eq!(back.get(Component::Rules).available_version, "2026.09.01");
 
         std::fs::write(dir.join(STATE_FILE), "{ not json").unwrap();
         assert_eq!(load_state(&dir), State::default());

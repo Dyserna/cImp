@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use manifest::MapFetcher;
 
-const BASE: &str = "https://github.com/Dyserna/cImp/releases/download/detection-v1/";
+const BASE: &str = "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -67,7 +67,6 @@ impl Tree {
         let layout = Layout {
             state_root: root.join("detection-updates"),
             rules_dest: root.join("detection").join("rules.d"),
-            classifier_dest: root.join("models").join("promptguard2-22m"),
             smoke_dir: root.join("detection").join("smoke"),
         };
         std::fs::create_dir_all(layout.rules_dest.join("local")).unwrap();
@@ -123,7 +122,6 @@ impl Tree {
     fn schedule(&self, rules: Mode) -> Schedule {
         Schedule {
             rules,
-            classifier: Mode::Off,
             interval_hours: 24,
         }
     }
@@ -150,10 +148,6 @@ fn scoped_reload(c: Component, dir: &Path) -> Result<String, String> {
             let (_, status) = super::super::signature::compile_report(Some(dir));
             health_from_rules(&status, dir)
         }
-        // No weights exist anywhere in CI, so a classifier reload in a test can
-        // only ever report "not installed"; the classifier path is covered by
-        // the pure smoke-verdict tests in `validate`.
-        Component::Classifier => Err("weights not installed".to_string()),
     }
 }
 
@@ -1387,6 +1381,54 @@ async fn a_pre_existing_broken_local_rule_does_not_fail_a_good_bundle() {
         .join("local")
         .join("broken.yar")
         .is_file());
+}
+
+/// #48, N-10 — the coverage floor, and why the smoke corpus cannot replace it.
+///
+/// The gauntlet's positive control is the shipped `smoke/hostile/` corpus, which
+/// is public and on every user's disk. A bundle carrying only rules that match
+/// those documents passes every other gate — compiles, budgets, hits every
+/// hostile control, misses every benign one — and would activate green while
+/// gutting coverage. `coverage_floor` is the direct count check that catches it.
+///
+/// Framed as a **curation guard**: it stops a half-built bundle, not a hostile
+/// publisher (who controls the count too — see the H-6 decision).
+#[test]
+fn a_bundle_that_guts_coverage_is_refused_even_when_it_passes_the_corpus() {
+    let tree = Tree::new();
+    let dest = &tree.layout.rules_dest;
+
+    // Nothing live yet: a first install has no baseline and must not be gated.
+    assert!(coverage_floor(1, dest).is_ok(), "no baseline to compare against");
+
+    // Seed a live bundle of four rules.
+    let four = (0..4)
+        .map(|i| format!("rule Live_{i} {{ strings: $a = \"payload{i}\" condition: $a }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dest.join("core.yar"), &four).unwrap();
+
+    // Ordinary curation — same size, or a rule or two fewer — passes.
+    assert!(coverage_floor(4, dest).is_ok(), "no change");
+    assert!(coverage_floor(3, dest).is_ok(), "ordinary churn");
+    assert!(coverage_floor(9, dest).is_ok(), "growth");
+
+    // Halving is not curation.
+    let e = coverage_floor(1, dest).expect_err("a 4 -> 1 collapse must be refused");
+    assert!(e.contains("coverage floor"), "{e}");
+    assert!(e.contains("1 rule(s)") && e.contains("4 currently live"), "{e}");
+
+    // A user's own rules must NOT inflate the baseline: twenty local rules
+    // cannot make every future shipped bundle look like a regression.
+    let many_local = (0..20)
+        .map(|i| format!("rule My_{i} {{ strings: $a = \"mine{i}\" condition: $a }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dest.join("local").join("mine.yar"), &many_local).unwrap();
+    assert!(
+        coverage_floor(3, dest).is_ok(),
+        "local/ rules are the user's, not the bundle's — they must not be a baseline"
+    );
 }
 
 /// U-4's second deliverable, and the reason forgiveness is baseline-relative

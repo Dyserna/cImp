@@ -46,7 +46,7 @@ rule CImp_Exfil_MarkdownImageQuery
         // an exfiltration sink actually uses.
         $img  = /!\[[^\]\n]{0,60}\]\([ \t]{0,2}https?:\/\/[^\s)]{4,}[?&](q|d|c|p|s|x|data|out|dump|payload|leak|info|content|context|prompt|result|summary|secret|key|token|msg|text|body)=/ nocase
         // The instruction that plants one, for pages that describe rather than embed.
-        $tell = /(render|display|include|insert|output|embed|show)[^\n]{0,50}(markdown[ \t]{1,4})?(image|img|!\[)[^\n]{0,60}(with|containing|encode|append|include)[^\n]{0,40}(the[ \t]{1,4})?(summary|content|data|context|instructions|secret|result)/ nocase
+        $tell = /(render|display|include|insert|output|embed|show)[^\n]{0,50}(markdown\s{1,8})?(image|img|!\[)[^\n]{0,60}(with|containing|encode|append|include)[^\n]{0,40}(the\s{1,8})?(summary|content|data|context|instructions|secret|result)/ nocase
     condition:
         any of them
 }
@@ -59,8 +59,8 @@ rule CImp_Exfil_EncodeIntoUrl
         description = "Directive to encode data into a URL, query string or parameter"
         provenance  = "cImp; the obfuscated variant of CImp_Exfil_SendSensitiveDataToUrl"
     strings:
-        $encode = /(append|encode|embed|include|place|put|add|base64|url-?encode|hex-?encode)[^\n]{0,50}(in|into|to|as|within)[ \t]{1,4}(the[ \t]{1,4})?(url|uri|link|query[ \t-]?(string|param|parameter)?|parameter|path|fragment|hostname|subdomain)/ nocase
-        $what   = /(system prompt|your instructions|conversation|context|history|file[ \t]{1,4}content|the[ \t]{1,4}(contents|output|result)|secret|key|token|credential)/ nocase
+        $encode = /(append|encode|embed|include|place|put|add|base64|url-?encode|hex-?encode)[^\n]{0,50}(in|into|to|as|within)\s{1,8}(the\s{1,8})?(url|uri|link|query[ \t-]?(string|param|parameter)?|parameter|path|fragment|hostname|subdomain)/ nocase
+        $what   = /(system prompt|your instructions|conversation|context|history|file\s{1,8}content|the\s{1,8}(contents|output|result)|secret|key|token|credential)/ nocase
     condition:
         $encode and $what
 }
@@ -73,7 +73,7 @@ rule CImp_Exfil_ImperativeFetchWithPayloadParam
         description = "An imperative fetch of a URL whose query parameter is a data sink"
         provenance  = "cImp; matches the milestone's own live-verification payload shape"
     strings:
-        $fetch = /(fetch|curl|wget|visit|browse|navigate[ \t]{1,4}to|open|request|GET|call)[ \t]{1,4}(the[ \t]{1,4}(url|link|page)[ \t]{1,4})?https?:\/\/[^\s"'`<>]{2,}[?&](q|d|c|p|s|x|data|out|dump|payload|leak|info|content|context|prompt|result|secret|key|token)=/ nocase
+        $fetch = /(fetch|curl|wget|visit|browse|navigate\s{1,8}to|open|request|GET|call)\s{1,8}(the\s{1,8}(url|link|page)\s{1,8})?https?:\/\/[^\s"'`<>]{2,}[?&](q|d|c|p|s|x|data|out|dump|payload|leak|info|content|context|prompt|result|secret|key|token)=/ nocase
     condition:
         $fetch
 }
@@ -89,8 +89,8 @@ rule CImp_ToolSteering_ReadThenReport
         // Our own tool names are a strong signal on their own: a fetched page
         // has no legitimate reason to know them.
         $tool = /\b(read_file|list_dir|code_search|run_command|graph_snippet|graph_search_docs|graph_semantic_code|offload_task|context_note)\b/
-        $use  = /(use|call|invoke|run|execute|issue|make)[ \t]{1,4}(the[ \t]{1,4}|a[ \t]{1,4})?(read_file|list_dir|code_search|run_command|read|write|edit|bash|shell|terminal|browser|webfetch)[ \t]{0,4}(tool|function|command|call)/ nocase
-        $route = /(include|paste|attach|append|add|put|send|return|report)[^\n]{0,50}(content|output|result|text|response|file|answer)[^\n]{0,30}(in|into|to|within)[^\n]{0,25}(the[ \t]{1,4})?(url|link|query|request|message|comment|search|next[ \t]{1,4}(call|fetch))/ nocase
+        $use  = /(use|call|invoke|run|execute|issue|make)\s{1,8}(the\s{1,8}|a\s{1,8})?(read_file|list_dir|code_search|run_command|read|write|edit|bash|shell|terminal|browser|webfetch)[ \t]{0,4}(tool|function|command|call)/ nocase
+        $route = /(include|paste|attach|append|add|put|send|return|report)[^\n]{0,50}(content|output|result|text|response|file|answer)[^\n]{0,30}(in|into|to|within)[^\n]{0,25}(the\s{1,8})?(url|link|query|request|message|comment|search|next\s{1,8}(call|fetch))/ nocase
     condition:
         ($tool and $route) or ($use and $route)
 }
@@ -103,7 +103,7 @@ rule CImp_ToolSteering_SecretFileRead
         description = "Directive to read a well-known credential or key file"
         provenance  = "cImp; the read half of read-then-exfiltrate"
     strings:
-        $read = /(read|open|cat|print|show|display|retrieve|fetch|load|access|dump|contents[ \t]{1,4}of)[^\n]{0,50}(~\/\.ssh\/|\/\.ssh\/|id_rsa|id_ed25519|\.env\b|\.aws\/credentials|\.npmrc|\.git-credentials|\/etc\/(passwd|shadow)|credentials\.json|secrets?\.(json|yaml|yml|toml)|\.pem\b)/ nocase
+        $read = /(read|open|cat|print|show|display|retrieve|fetch|load|access|dump|contents\s{1,8}of)[^\n]{0,50}(~\/\.ssh\/|\/\.ssh\/|id_rsa|id_ed25519|\.env\b|\.aws\/credentials|\.npmrc|\.git-credentials|\/etc\/(passwd|shadow)|credentials\.json|secrets?\.(json|yaml|yml|toml)|\.pem\b)/ nocase
     condition:
         $read
 }

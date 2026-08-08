@@ -22,41 +22,57 @@
 # https://huggingface.co/ggerganov/whisper.cpp on 2026-06-14.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# V32 injection detection (Llama Prompt Guard 2, 22M) — NOT PUBLISHED YET.
+# V32 injection detection (Llama Prompt Guard 2, 22M) — USER-INSTALLED, NOT
+# BUNDLED AND NOT MIRRORED. This is the one model in this file the project does
+# not ship.
 #
-# The two lines below are PLACEHOLDERS, deliberately left commented out. Every
-# line in this file is a download instruction for scripts/fetch-models.*, so
-# uncommenting them before the assets exist on the `models-v1` release turns
-# every fetch (and every CI run) into a 404. Uncomment them in the same change
-# that publishes the assets, and replace the zeroed digests with the real ones.
+# Decision, 2026-08-08: cImp does not host these weights. They are under the
+# Llama Community Licence — unlike Kokoro (Apache-2.0) and Whisper (MIT),
+# mirroring them onto the `models-v1` release would be redistribution with
+# attribution and acceptable-use conditions attached, for a layer that is
+# optional. An ungated third-party ONNX export already exists, so a user who
+# wants the layer fetches it directly and the licence travels with it.
 #
-# Deploy checklist (V32 Phase C follow-up):
-#   1. Accept the Llama licence and pull
-#      https://huggingface.co/meta-llama/Llama-Prompt-Guard-2-22M
-#      (gated — needs an HF account; cannot be automated in CI).
-#   2. Export to ONNX (opset 14+, dynamic batch + sequence axes, int64
-#      `input_ids`/`attention_mask`; the classifier accepts a 1-logit or
-#      2-logit head — see offload/detection/classifier.rs::score_from_logits)
-#      and copy the repo's `tokenizer.json` unchanged.
-#   3. Place them at models/promptguard2-22m/{model.onnx,tokenizer.json},
-#      record the real SHA-256s here, uncomment.
-#   4. Upload with scripts/publish-models-release.ps1 (assets are flat: the
-#      files land on the release as `model.onnx` / `tokenizer.json`, which
-#      COLLIDE with any other model exported under those generic names —
-#      rename them to `promptguard2-22m.onnx` / `promptguard2-22m-tokenizer.json`
-#      on the release, or teach the scripts a per-entry asset-name column,
-#      before publishing).
-#   5. Add the paths to the `models cache` allowlist and the staging `cp`
-#      lines in .github/workflows/release.yml.
-#   6. NOTICE: Prompt Guard 2 ships under the Llama 4 Community Licence —
-#      add its attribution before the assets go into a release zip.
+# The three lines at the end of this block stay COMMENTED, permanently. Every
+# uncommented line here is a download instruction for scripts/fetch-models.*,
+# which pull from the `models-v1` release — and these assets are deliberately
+# not there. They are recorded so a user can VERIFY what they downloaded, not
+# so anything can fetch it. Do not uncomment them.
 #
-# Until then the classifier screen is gracefully inert: cImp logs one line at
-# startup, Settings → Tools → Detection shows "weights not installed", and the
-# YARA signature screen carries detection alone.
+# To install the classifier screen (entirely optional):
 #
-# 0000000000000000000000000000000000000000000000000000000000000000  promptguard2-22m/model.onnx
-# 0000000000000000000000000000000000000000000000000000000000000000  promptguard2-22m/tokenizer.json
+#   1. Fetch two files from
+#      https://huggingface.co/gravitee-io/Llama-Prompt-Guard-2-22M-onnx
+#      (ungated — no HF account needed; ships LICENSE + NOTICE alongside, which
+#      is how the Llama terms reach you rather than us):
+#
+#        model.onnx        284 MB  fp32, best accuracy
+#        model.quant.onnx   72 MB  int8, ~4x smaller — rename to model.onnx
+#        tokenizer.json     8.6 MB
+#
+#      Take ONE of the two ONNX files. The loader looks for exactly
+#      `model.onnx`, so if you take the quantized build, rename it.
+#
+#   2. Place them at models/promptguard2-22m/{model.onnx,tokenizer.json}
+#      (beside kokoro-v1.0.onnx — `<exe-dir>/../models/`).
+#
+#   3. Verify against the digests below, then restart cImp. Settings → Tools →
+#      Detection flips from "weights not installed" to the model directory.
+#
+# Any ONNX export works, not just this one: opset 14+, dynamic batch + sequence
+# axes, int64 `input_ids`/`attention_mask`, and a 1-logit or 2-logit head — see
+# offload/detection/classifier.rs::score_from_logits. The digests below pin the
+# specific build above; a different export will not match them, which is fine.
+#
+# Without the weights the classifier screen is gracefully inert: cImp logs one
+# line at startup, Settings shows "weights not installed", and the YARA
+# signature screen carries detection alone. That is the state of every install
+# by default, and it is a supported configuration — not a degraded one.
+#
+# Verified 2026-08-08 against gravitee-io/Llama-Prompt-Guard-2-22M-onnx @ main:
+# c6f4d2ebf59be36f3557ad484bf11a51f1b356f570958d1ec1cbbe322a8dfddf  promptguard2-22m/model.onnx        (fp32, 284217797 bytes)
+# 38c3f03e30a4d5d229aeb7bf638e778322f8179d0ed0d4953eb22f88d8e0cf6b  promptguard2-22m/model.quant.onnx  (int8,  72542430 bytes)
+# 92c8b45d0b12ae0dd9680fbfe9804503542c377d65838558cd0b48a795385dde  promptguard2-22m/tokenizer.json    (        8649291 bytes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb  kokoro-v1.0.onnx

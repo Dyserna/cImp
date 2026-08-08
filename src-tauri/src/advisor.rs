@@ -165,8 +165,8 @@ pub const RULE_DRIFT_SUBAGENT: &str = "drift.subagent_transcripts.v1";
 // so neither sits behind the global `MIN_SESSIONS` floor.
 
 /// A newer detection bundle exists and was not applied: the component is in
-/// `check-only` mode (the locked default for the classifier), or its
-/// `min_app_version` is ahead of this build. Signature = `component:version`,
+/// `check-only` mode, or its `min_app_version` is ahead of this build.
+/// Signature = `component:version`,
 /// so a dismissal holds for THAT bundle and re-fires on the next one.
 pub const RULE_DETECTION_UPDATE_AVAILABLE: &str = "detection.update_available.v1";
 /// The last update attempt was **refused** — bad checksum, a bundle that would
@@ -2232,9 +2232,9 @@ mod tests {
     fn an_available_detection_update_raises_a_warn_only_card() {
         let sig = Signals {
             detection_updates: vec![AvailableUpdate {
-                component: "classifier".into(),
+                component: "rules".into(),
                 installed: String::new(),
-                available: "22m-2".into(),
+                available: "2026.09.01".into(),
                 notes: "multilingual variant".into(),
             }],
             ..Signals::default()
@@ -2245,11 +2245,11 @@ mod tests {
             .expect("fires");
         assert!(p.warn_only, "there is nothing safe to auto-apply");
         assert!(p.setting.is_empty());
-        assert_eq!(p.proposed, "22m-2");
+        assert_eq!(p.proposed, "2026.09.01");
         assert_eq!(p.current, "(shipped)", "no installed version yet");
-        assert!(p.rationale.contains("classifier"));
+        assert!(p.rationale.contains("rules"));
         assert!(p.rationale.contains("multilingual variant"), "{}", p.rationale);
-        assert_eq!(p.signature, "classifier:22m-2");
+        assert_eq!(p.signature, "rules:2026.09.01");
     }
 
     /// A rejected bundle is a card too — nothing is degraded, but a component

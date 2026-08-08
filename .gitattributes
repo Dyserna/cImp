@@ -3,3 +3,13 @@
 # (The Git-LFS rules that used to live here are gone — the model blobs moved
 # to assets on the `models-v1` GitHub release; see scripts/fetch-models.ps1.)
 *.sh text eol=lf
+
+# The detection bundle and its smoke corpus are BYTE-EXACT artifacts, and two
+# separate things depend on that:
+#   * the corpus encodes zero-width (U+200B) and NBSP (U+00A0) separators on
+#     purpose — they are the payload, not formatting;
+#   * the .yar files' SHA-256s are published in the update manifest, so a
+#     checkout that rewrote line endings would produce a bundle whose digests
+#     no longer match what raw.githubusercontent.com serves.
+# Line-ending translation would silently break both. Keep them LF everywhere.
+detection/** text eol=lf

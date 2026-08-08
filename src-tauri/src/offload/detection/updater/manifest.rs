@@ -8,9 +8,11 @@
 //! (Vigil, garak) live in repositories we do not control, and the defense
 //! layer's own update channel is attack surface — a compromise of any of those
 //! upstreams would otherwise write rule content straight into every install.
-//! The maintenance run curates upstream into a bundle; the bundle is published
-//! as GitHub release assets on a fixed tag; this module reads the JSON index of
-//! that release.
+//! The maintenance run curates upstream into a bundle; the bundle is committed
+//! to a fixed branch of this repo and served as plain files by
+//! `raw.githubusercontent.com`; this module reads the JSON index of that branch.
+//! (It was published as GitHub *release assets* until 2026-08-08 — see
+//! [`DEFAULT_MANIFEST_URL`] for why that could never have worked.)
 //!
 //! # Schema (v1)
 //!
@@ -29,7 +31,7 @@
 //!           "name": "injection_core.yar",
 //!           "sha256": "6f…64 hex chars…",
 //!           "size": 8421,
-//!           "url": "https://github.com/Dyserna/cImp/releases/download/detection-v1/rules-2026.08.07-injection_core.yar"
+//!           "url": "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/2026.08.07-injection_core.yar"
 //!         }
 //!       ]
 //!     }
@@ -69,8 +71,8 @@
 //! manifest is fetched from a pinned URL ([`DEFAULT_MANIFEST_URL`]); an asset
 //! URL is accepted only if it resolves, *after normalization*, under that URL
 //! minus its last path segment ([`AssetAnchor`]). So a manifest served from the
-//! `detection-v1` release can only ever name assets on the `detection-v1`
-//! release. This is what makes the curated channel actually curated: whoever
+//! `detection-v1` branch can only ever name files on the `detection-v1` branch.
+//! This is what makes the curated channel actually curated: whoever
 //! can rewrite the manifest still cannot redirect the download to a host — or a
 //! path — of their choosing.
 //!
@@ -93,8 +95,10 @@
 //! ```
 //!
 //! Popping past the root clamps rather than erroring, so an attacker does not
-//! even have to count segments. On `github.com` an arbitrary path is any
-//! GitHub user's published release assets — and a bundle of one rule that
+//! even have to count segments. On `raw.githubusercontent.com` an arbitrary
+//! path is any file on any ref of any public repo on GitHub (and on
+//! `github.com`, where this channel used to live, any user's published release
+//! assets) — and a bundle of one rule that
 //! matches exactly the shipped hostile controls and nothing else passes the
 //! whole validation gauntlet, silently reducing the signature layer to a
 //! corpus echo. That is the silent degradation locked decision 13 forbids,
@@ -126,12 +130,37 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// The pinned manifest URL: a fixed release tag whose assets are replaced and
-/// added over time, exactly like the `models-v1` release the model blobs ship
-/// from. A fixed tag (rather than "latest") means the URL never has to be
-/// discovered, so there is no API call and no redirect chain to trust.
+/// The pinned manifest URL: a fixed branch in this repo, whose files are
+/// updated over time. A fixed ref (rather than "latest") means the URL never
+/// has to be discovered, so there is no API call and no redirect chain to trust.
+///
+/// **Served from `raw.githubusercontent.com`, NOT from a release asset — and
+/// that is load-bearing, not cosmetic (#48, H-5).** This channel pointed at
+/// `github.com/<owner>/<repo>/releases/download/<tag>/…` until 2026-08-08.
+/// GitHub answers *every* release-asset path with a `302` to a signed CDN URL
+/// on a different host, and [`HttpFetcher::client`] refuses redirects outright
+/// (deliberately — see the U-1 hardening note there). The two are individually
+/// correct and jointly fatal: the moment the channel was published, every
+/// install would have fetched, been redirected, refused, and classified the
+/// result `Outcome::Unavailable` — which is the deliberately *silent* arm, no
+/// card, for the first seven checks. Rules would never have updated anywhere,
+/// and the failure would have been invisible for a week.
+///
+/// Nobody caught it because the channel was never published, and the local
+/// verification step in `detection/manifest.example.json` stages the manifest on
+/// a local HTTP server, which answers `200` — the one property that differs
+/// between staging and production is the one that mattered.
+///
+/// `raw.githubusercontent.com` answers `200` directly for both branch and tag
+/// refs, so the redirect ban stays fully intact. It also suits the payload
+/// better: the bundle is ~19 KB of text, so it belongs in a git tree where it
+/// is diffable and reviewable, and publishing is a commit rather than an asset
+/// upload with flat-namespace collisions to work around.
+///
+/// **A ref that redirects will silently disable this channel.** That is what
+/// `the_pinned_manifest_url_is_fetchable_under_our_own_redirect_policy` guards.
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json";
+    "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/manifest.json";
 
 /// The only manifest schema this build understands.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -145,40 +174,44 @@ pub const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 /// mis-sized entry cannot fill a disk.
 pub const MAX_RULE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Ceiling on one classifier artifact. The 22M ONNX export is ~90 MB and the
-/// documented 86M upgrade path is ~350 MB, so this bounds the *known* upgrade
-/// path with room to spare rather than being an arbitrary large number.
-pub const MAX_CLASSIFIER_FILE_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Ceiling on files per component — a bundle is a handful of rule files or two
-/// model artifacts, never hundreds.
+/// Ceiling on files per component — a bundle is a handful of rule files, never
+/// hundreds.
 pub const MAX_FILES_PER_COMPONENT: usize = 64;
 
-/// The two updatable components. A closed set: each has its own validation
+/// The updatable components. A closed set: each has its own validation
 /// pipeline, its own on-disk destination and its own default mode, so "some
 /// other component" has nowhere to go.
+///
+/// There is exactly one today. A `classifier` component existed briefly and was
+/// removed (2026-08-08, user decision): the Prompt Guard 2 weights are HF-gated,
+/// a released checkpoint does not receive a stream of updates, and locked
+/// decision 7 already routes them through the **models-v1 release-asset
+/// pipeline** with `CHECKSUMS.txt` — the same path as the TTS and STT blobs, at
+/// maintenance-run cadence. Two delivery mechanisms for one artifact is one too
+/// many, and the one that was locked is not the one this module built. The enum
+/// stays an enum so a genuinely periodic future artifact has somewhere to go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Component {
     /// The YARA signature bundle under `<exe-dir>/detection/rules.d/`.
     Rules,
-    /// The Prompt Guard 2 weights + tokenizer under `models/promptguard2-22m/`.
-    Classifier,
 }
 
 impl Component {
-    pub const ALL: [Component; 2] = [Component::Rules, Component::Classifier];
+    pub const ALL: [Component; 1] = [Component::Rules];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Component::Rules => "rules",
-            Component::Classifier => "classifier",
         }
     }
 
+    /// `None` for anything this build does not know — including the retired
+    /// `classifier` component, which a manifest may still list. The parser's
+    /// forward-compatible skip (see the module doc) turns that into "ignored",
+    /// not an error, so a curator does not have to coordinate the removal.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "rules" => Some(Component::Rules),
-            "classifier" => Some(Component::Classifier),
             _ => None,
         }
     }
@@ -187,7 +220,6 @@ impl Component {
     pub const fn max_file_bytes(self) -> u64 {
         match self {
             Component::Rules => MAX_RULE_FILE_BYTES,
-            Component::Classifier => MAX_CLASSIFIER_FILE_BYTES,
         }
     }
 }
@@ -818,7 +850,53 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const BASE: &str = "https://github.com/Dyserna/cImp/releases/download/detection-v1/";
+    const BASE: &str = "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/";
+
+    /// #48, H-5 — the guard whose absence let the channel ship dead.
+    ///
+    /// The pinned URL and the fetch policy are two halves of one contract and
+    /// nothing tied them together: `DEFAULT_MANIFEST_URL` pointed at a GitHub
+    /// release asset, which *always* answers `302`, while `HttpFetcher` refuses
+    /// redirects. Both correct in isolation; jointly they made the channel
+    /// unfetchable on every install, silently.
+    ///
+    /// This cannot make a network call, so it asserts the property that is
+    /// checkable offline and would have failed loudly on the original URL: the
+    /// pinned host must be one that serves content directly. Release-asset
+    /// paths are named explicitly because they are the specific trap, and the
+    /// one a future maintainer would most plausibly walk back into — the
+    /// `models-v1` precedent, which this channel was originally modelled on,
+    /// really does live there and really does work, because `curl -L` follows
+    /// the redirect that this fetcher deliberately will not.
+    #[test]
+    fn the_pinned_manifest_url_is_fetchable_under_our_own_redirect_policy() {
+        let u = url::Url::parse(DEFAULT_MANIFEST_URL).expect("the pinned URL must parse");
+        assert_eq!(u.scheme(), "https", "the channel is never plaintext");
+
+        let host = u.host_str().expect("the pinned URL names a host");
+        assert!(
+            !u.path().contains("/releases/download/"),
+            "`{DEFAULT_MANIFEST_URL}` is a GitHub RELEASE-ASSET path. Those answer 302 to a \
+             signed CDN host, and `HttpFetcher::client` sets `redirect::Policy::none()`, so \
+             every fetch would fail as `Outcome::Unavailable` — the silent arm. Serve the \
+             manifest from a host that returns 200 directly (raw.githubusercontent.com), or \
+             change the fetch policy deliberately and update this test with the reasoning."
+        );
+        assert!(
+            matches!(host, "raw.githubusercontent.com") || host.ends_with(".local"),
+            "`{host}` is not a host this fetcher is known to complete against. Adding one is \
+             fine — verify it answers 200 without a redirect first, because the failure mode is \
+             a channel that never updates and says nothing about it for a week."
+        );
+
+        // The anchor derived from it must accept a sibling file and reject a
+        // detour, which is what makes the pinned URL a containment boundary
+        // rather than just a starting point.
+        let anchor = AssetAnchor::parse(DEFAULT_MANIFEST_URL).expect("the pinned URL anchors");
+        assert!(anchor.accepts(&format!("{BASE}2026.08.08-injection_core.yar")));
+        assert!(!anchor.accepts("https://raw.githubusercontent.com/Dyserna/cImp/main/evil.yar"));
+        assert!(!anchor.accepts("https://evil.example/injection_core.yar"));
+    }
 
     fn manifest_json(files: &str) -> String {
         format!(
@@ -848,7 +926,7 @@ mod tests {
         assert_eq!(rules.version, "2026.08.07");
         assert_eq!(rules.files.len(), 1);
         assert_eq!(rules.files[0].size, 1234);
-        assert!(!m.components.contains_key(&Component::Classifier));
+        assert_eq!(m.components.len(), 1, "only the components this build knows");
     }
 
     /// An unknown schema is refused outright. Best-effort parsing a security
@@ -954,8 +1032,8 @@ mod tests {
     fn an_asset_url_outside_the_manifests_own_directory_is_rejected() {
         for bad in [
             "https://evil.example/rules.yar",
-            "https://github.com/Dyserna/cImp/releases/download/other-tag/rules.yar",
-            "http://github.com/Dyserna/cImp/releases/download/detection-v1/rules.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/other-tag/rules.yar",
+            "http://raw.githubusercontent.com/Dyserna/cImp/detection-v1/rules.yar",
             "file:///C:/rules.yar",
         ] {
             let f = file_json("a.yar", &"a".repeat(64), 10, bad);
@@ -982,27 +1060,27 @@ mod tests {
         let anchor = AssetAnchor::parse(DEFAULT_MANIFEST_URL).expect("the pinned URL anchors");
         for (bad, why) in [
             (
-                "https://github.com/Dyserna/cImp/releases/download/detection-v1/../../../../../attacker/repo/releases/download/v1/x.yar",
+                "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/../../../../../attacker/repo/releases/download/v1/x.yar",
                 "literal dot segments",
             ),
             (
-                "https://github.com/Dyserna/cImp/releases/download/detection-v1/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/attacker/x.yar",
+                "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/attacker/x.yar",
                 "percent-encoded dot segments",
             ),
             (
-                "https://github.com/Dyserna/cImp/releases/download/detection-v1/%2E%2E/%2E%2E/%2E%2E/%2E%2E/%2E%2E/attacker/x.yar",
+                "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/%2E%2E/%2E%2E/%2E%2E/%2E%2E/%2E%2E/attacker/x.yar",
                 "percent-encoded dot segments, upper case",
             ),
             (
-                "https://github.com/Dyserna/cImp/releases/download/detection-v1/..\\..\\..\\..\\..\\attacker\\x.yar",
+                "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/..\\..\\..\\..\\..\\attacker\\x.yar",
                 "backslash is a path separator for a special scheme",
             ),
             (
-                "https://github.com/Dyserna/cImp/releases/download/detection-v1/./../../../../../attacker/x.yar",
+                "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/./../../../../../attacker/x.yar",
                 "single-dot segments mixed in",
             ),
             (
-                "https://github.com/Dyserna/cImp/releases/download/detection-v1/../../../../../../../../../../attacker/x.yar",
+                "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/../../../../../../../../../../attacker/x.yar",
                 "over-popping clamps at the root instead of erroring, so the segment count is \
                  not a defence",
             ),
@@ -1033,12 +1111,12 @@ mod tests {
     fn an_ordinary_sibling_asset_still_passes_and_a_query_does_not() {
         let anchor = AssetAnchor::parse(DEFAULT_MANIFEST_URL).expect("the pinned URL anchors");
         for good in [
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/rules-2026.08.07-injection_core.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/rules-2026.08.07-injection_core.yar",
             // A `.` segment that resolves back to the same directory is not an
             // escape and must not be collateral damage.
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/./rules.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/./rules.yar",
             // Down is fine; only up is not.
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/sub/rules.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/sub/rules.yar",
         ] {
             assert!(anchor.accepts(good), "sibling asset must pass: {good}");
         }
@@ -1046,17 +1124,17 @@ mod tests {
             "injection_core.yar",
             &"a".repeat(64),
             10,
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/rules-2026.08.07-injection_core.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/rules-2026.08.07-injection_core.yar",
         );
         assert!(Manifest::parse(&manifest_json(&f), DEFAULT_MANIFEST_URL).is_ok());
 
         for bad in [
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/x.yar?token=1",
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/x.yar#frag",
-            "https://user:pw@github.com/Dyserna/cImp/releases/download/detection-v1/x.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/x.yar?token=1",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/x.yar#frag",
+            "https://user:pw@raw.githubusercontent.com/Dyserna/cImp/detection-v1/x.yar",
             // A sibling DIRECTORY whose name merely starts with the anchor's
             // last segment — the classic prefix-compare false accept.
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1-evil/x.yar",
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1-evil/x.yar",
         ] {
             assert!(!anchor.accepts(bad), "must be rejected: {bad}");
         }
@@ -1081,7 +1159,7 @@ mod tests {
             );
         }
         for bad in [
-            "http://github.com/Dyserna/cImp/releases/download/detection-v1/manifest.json",
+            "http://raw.githubusercontent.com/Dyserna/cImp/detection-v1/manifest.json",
             "http://evil.example/bundle/manifest.json",
             // Not loopback: someone else's DNS name that merely ends in it.
             "http://localhost.evil.example/bundle/manifest.json",
@@ -1122,7 +1200,7 @@ mod tests {
         assert!(asset_prefix("https://github.com").is_err());
         assert_eq!(
             asset_prefix(DEFAULT_MANIFEST_URL).unwrap(),
-            "https://github.com/Dyserna/cImp/releases/download/detection-v1/"
+            "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/"
         );
     }
 

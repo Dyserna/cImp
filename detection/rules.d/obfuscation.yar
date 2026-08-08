@@ -52,7 +52,7 @@ rule CImp_Obfuscation_HtmlCommentImperative
         description = "An injection imperative parked inside an HTML comment"
         provenance  = "cImp; the cheapest way to hide a payload from a rendered page"
     strings:
-        $c = /<!--[^>]{0,300}(ignore[ \t]{1,4}(all[ \t]{1,4}|the[ \t]{1,4})?(previous|prior|above)|you[ \t]{1,4}are[ \t]{1,4}now|new[ \t]{1,4}instructions|system[ \t]{1,4}prompt|assistant[ \t]{0,2}:|do[ \t]{1,4}not[ \t]{1,4}tell[ \t]{1,4}the[ \t]{1,4}user|send[ \t]{1,4}(it|them|the)[ \t]{1,4}to)/ nocase
+        $c = /<!--[^>]{0,300}(ignore\s{1,8}(all\s{1,8}|the\s{1,8})?(previous|prior|above)|you\s{1,8}are\s{1,8}now|new\s{1,8}instructions|system\s{1,8}prompt|assistant[ \t]{0,2}:|do\s{1,8}not\s{1,8}tell\s{1,8}the\s{1,8}user|send\s{1,8}(it|them|the)\s{1,8}to)/ nocase
     condition:
         $c
 }
@@ -66,7 +66,7 @@ rule CImp_Obfuscation_VisuallyHiddenImperative
         provenance  = "cImp; display:none / font-size:0 / off-screen payload placement"
     strings:
         $hidden = /(display[ \t]{0,2}:[ \t]{0,2}none|visibility[ \t]{0,2}:[ \t]{0,2}hidden|font-size[ \t]{0,2}:[ \t]{0,2}0(px|pt|em|rem)?[ \t]{0,2}[;"']|opacity[ \t]{0,2}:[ \t]{0,2}0[ \t]{0,2}[;"']|text-indent[ \t]{0,2}:[ \t]{0,2}-[0-9]{3,}|left[ \t]{0,2}:[ \t]{0,2}-[0-9]{4,})/ nocase
-        $imper  = /(ignore[ \t]{1,4}(all[ \t]{1,4}|the[ \t]{1,4})?(previous|prior|above)[ \t]{1,4}(instruction|prompt)|you[ \t]{1,4}are[ \t]{1,4}now[ \t]{1,4}|from[ \t]{1,4}now[ \t]{1,4}on[, \t]|new[ \t]{1,4}instructions[ \t]{0,2}:|system[ \t]{1,4}prompt[ \t]{0,2}:|do[ \t]{1,4}not[ \t]{1,4}tell[ \t]{1,4}the[ \t]{1,4}user)/ nocase
+        $imper  = /(ignore\s{1,8}(all\s{1,8}|the\s{1,8})?(previous|prior|above)\s{1,8}(instruction|prompt)|you\s{1,8}are\s{1,8}now\s{1,8}|from\s{1,8}now\s{1,8}on[, \t]|new\s{1,8}instructions[ \t]{0,2}:|system\s{1,8}prompt[ \t]{0,2}:|do\s{1,8}not\s{1,8}tell\s{1,8}the\s{1,8}user)/ nocase
     condition:
         $hidden and $imper
 }
@@ -81,8 +81,8 @@ rule CImp_Obfuscation_DecodeThenExecute
     strings:
         // The directive half, in either order ("decode … then follow" /
         // "follow the base64 below").
-        $decode_then = /(base64[ \t-]{0,2}decode|b64decode|atob|decode[ \t]{1,4}(the[ \t]{1,4})?(following|below|this|string|text|payload|message)|from[ \t]{1,4}base64|rot13)[^\n]{0,80}(and[ \t]{1,4}|then[ \t]{1,4}|,[ \t]{1,4})(execute|run|follow|obey|do|perform|apply|comply|act)/ nocase
-        $exec_encoded = /(execute|run|follow|obey|perform|apply|comply[ \t]{1,4}with)[^\n]{0,40}(the[ \t]{1,4})?(following[ \t]{1,4}|below[ \t]{1,4}|encoded[ \t]{1,4}|obfuscated[ \t]{1,4})?(base64|rot13|hex[ \t]{1,4}string|encoded[ \t]{1,4}(instruction|command|payload|message))/ nocase
+        $decode_then = /(base64[ \t-]{0,2}decode|b64decode|atob|decode\s{1,8}(the\s{1,8})?(following|below|this|string|text|payload|message)|from\s{1,8}base64|rot13)[^\n]{0,80}(and\s{1,8}|then\s{1,8}|,\s{1,8})(execute|run|follow|obey|do|perform|apply|comply|act)/ nocase
+        $exec_encoded = /(execute|run|follow|obey|perform|apply|comply\s{1,8}with)[^\n]{0,40}(the\s{1,8})?(following\s{1,8}|below\s{1,8}|encoded\s{1,8}|obfuscated\s{1,8})?(base64|rot13|hex\s{1,8}string|encoded\s{1,8}(instruction|command|payload|message))/ nocase
     condition:
         // Deliberately NOT "a long base64 blob is present": data URIs, inline
         // images and embedded certificates make long blobs ordinary on real

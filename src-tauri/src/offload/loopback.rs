@@ -1189,8 +1189,10 @@ struct TabLatch {
     latch: Latch,
     /// V32 Phase C: this session's EXTERNAL call/byte spend (locked decision
     /// 11). It lives *here*, beside the latch, precisely so it inherits the
-    /// latch's scope and reset rule — one contaminated conversation, one
-    /// budget, both cleared together when the tab's session rotates.
+    /// latch's scope and reset rule — one conversation, one budget, both
+    /// cleared together when the tab's session rotates. (H-2: `contaminated`
+    /// no longer rides along; a permissive reset and an un-tainting reset need
+    /// different evidence — see [`TabLatch::contaminated`].)
     budget: Budget,
     /// Whether this session's taint-latch refusal has already been reported to
     /// the Tool Activity feed. One row per scope: the latch is sticky, so every
@@ -1220,9 +1222,39 @@ struct TabLatch {
     /// while contamination says what is already in its context window. A note
     /// written after "switch to local" was still composed by a model that read
     /// an attacker's page, so persistence must stay quarantined — contamination
-    /// is a property of the conversation, not of the latch position. Only a
-    /// session rotation ([`TabLatch::observe`]) ends it, because only a new
-    /// conversation has a clean context.
+    /// is a property of the conversation, not of the latch position.
+    ///
+    /// # H-2 (2026-08-08 re-review): the bit is STICKY, and why
+    ///
+    /// It used to be cleared by [`TabLatch::observe`] on a session rotation,
+    /// "because only a new conversation has a clean context". The premise was
+    /// wrong about *who decides* a rotation happened. A Claude tab's session id
+    /// is the file stem of the newest `*.jsonl` under its transcript root, and
+    /// **decision 3 puts Claude's native Bash outside every cImp latch** — so
+    /// the model can create that file itself. Every bar the tap could put in
+    /// front of the rotation (the file exists / the file grew / the file
+    /// decodes as a transcript naming that session) is a bar over a file the
+    /// attacker is writing. C-2 fixed "the file exists", H-2 defeated "the file
+    /// grew" with one trailing newline, and "it decodes" falls to `echo
+    /// '{"sessionId":"…"}'`. **No filesystem-derived fact can be the trust root
+    /// for un-tainting a context window**, so the reset is gone rather than
+    /// re-armed.
+    ///
+    /// This amends locked decision 15: contamination is now a property of the
+    /// **tab**, not of the conversation, deliberately — because the conversation
+    /// boundary is attacker-controlled and the tab id is not (it is
+    /// config-derived, and [`is_configured_tab`] bounds the key space).
+    ///
+    /// **The accepted cost.** A genuine `/clear` in the same tab keeps the bit:
+    /// that conversation's `context_note` writes stay quarantined (they are
+    /// stored and held for review, not dropped) and the badge keeps saying
+    /// "contaminated". `/latch/override` deliberately cannot clear it either.
+    /// The only escape is dropping the registry entry — and note that the
+    /// registry ([`latches`]) is a process-global map with no eviction, so
+    /// **today that means an app restart**, not a tab restart. Adding a
+    /// tab-teardown hook that removes the entry is the open follow-up; it is
+    /// deliberately not invented here, because a new clear path is a new attack
+    /// surface and needs its own decision.
     contaminated: bool,
 }
 
@@ -1258,12 +1290,19 @@ impl TabLatch {
     /// Fold the currently-observed session id into this entry, resetting the
     /// latch when the tab's session has demonstrably **rotated**.
     ///
-    /// This is what makes the latch's scope "the tab's live session" rather
+    /// This is what makes the LATCH's scope "the tab's live session" rather
     /// than "the tab": a tab restart starts a new harness session, the V28
-    /// registry re-stamps the tab with the new id, and the contaminated scope
-    /// ends with the conversation that was contaminated. (The tab id itself
-    /// never rotates — it is config-derived — so keying on it alone would
-    /// strand a tab latched until the app restarted.)
+    /// registry re-stamps the tab with the new id, and the new conversation is
+    /// not denied `read`/`bash` on the strength of the previous one's fetch.
+    /// (The tab id itself never rotates — it is config-derived — so keying on
+    /// it alone would strand a tab latched until the app restarted.)
+    ///
+    /// **What a rotation does NOT do (H-2).** It does not clear
+    /// [`contaminated`](Self::contaminated). Everything reset here is
+    /// permissive state that the next real call re-earns; the contamination bit
+    /// is the one fact whose reset an attacker would *want*, and the rotation
+    /// signal is derived from a file that attacker can create. See the field's
+    /// doc for the full argument and its accepted cost.
     ///
     /// The three cases, and why `None` is not one of them:
     /// - a *different* session id ⇒ new scope, latch back to [`Latch::Open`];
@@ -1286,10 +1325,12 @@ impl TabLatch {
                 self.budget.reset();
                 self.latch_flagged = false;
                 self.beacon_flagged = false;
-                // V32 Phase F: the ONE place contamination is cleared. A tab
-                // restart is the only clean exit the decision-15 UI offers, and
-                // this is what makes that true rather than advisory.
-                self.contaminated = false;
+                // H-2 (2026-08-08 re-review): `contaminated` is deliberately
+                // NOT cleared here — see the field's own doc. A rotation is a
+                // claim about a file an attacker can create; it may reopen the
+                // latch and refill the budget (both merely permissive, and both
+                // re-earned by the next real call), but it may not un-taint a
+                // context window.
             }
             // First sighting: the same scope, only now identified. The latch
             // carries over — calls made before the registry knew the session
@@ -1308,7 +1349,9 @@ pub struct LatchView {
     /// [`Latch::label`]: `open` / `external` / `local`.
     pub latch: &'static str,
     /// Locked decision 15: has external content entered this conversation at
-    /// all? Survives every override; only a session rotation clears it.
+    /// all? Survives every override — and, since H-2, every session rotation
+    /// too: the bit is sticky for the tab's registry entry (see
+    /// [`TabLatch::contaminated`]).
     pub contaminated: bool,
     /// Whether "switch to local" applies right now (EXTERNAL-latched only).
     pub can_flip_local: bool,
@@ -1333,7 +1376,8 @@ impl Default for LatchView {
 ///
 /// Deliberately only two, and both narrowing or explicit: there is no
 /// "latch external" (the system does that) and no "clear contamination"
-/// (nothing outside a session rotation may).
+/// (nothing in this process may — H-2 removed the session-rotation reset that
+/// used to be the one exception; see [`TabLatch::contaminated`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatchOverride {
     /// EXTERNAL → Local. Restores the proxied local-capability tools and closes
@@ -2183,7 +2227,9 @@ fn override_row(
             "USER OVERRIDE ({}, origin: {}): taint latch {} → {}. Contamination is NOT cleared by \
              an override (contaminated={}): memory writes stay quarantined and external results \
              keep their envelope, because the injected content is still in the conversation. \
-             Restarting the tab is the only clean reset.",
+             Nothing in a running cImp clears it (H-2: not even a new harness session — that \
+             signal comes from a file the model's own shell can write); restarting cImp is the \
+             only clean reset.",
             action.as_str(),
             origin.as_str(),
             outcome.prior.label(),
@@ -4045,7 +4091,8 @@ fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> Flag
              {what} (latch={}, contaminated={}). This row records an authenticated POST to \
              /latch/beacon from a local process — the cImp beacon shim is the expected sender, \
              but the launch token is readable by anything running as this user, so this is NOT \
-             evidence of a user action. Restarting the tab is the only clean reset.",
+             evidence of a user action. Restarting cImp is the only clean reset (H-2: the \
+             contamination bit no longer clears on a new harness session).",
             origin.as_str(),
             out.view.latch,
             out.view.contaminated,
@@ -6235,10 +6282,15 @@ mod tests {
     /// **The core Phase F invariant.** Contamination is a property of the
     /// CONVERSATION, not of the latch position: a note written after any
     /// override was still composed by a model that read an attacker's page, so
-    /// persistence stays quarantined through both moves. Only a session
-    /// rotation — a tab restart, the one clean exit the UI names — clears it.
+    /// persistence stays quarantined through both moves.
+    ///
+    /// H-2 extends it past the session boundary: this test used to end by
+    /// rotating the session and asserting a clean scope ("a tab restart, the one
+    /// clean exit the UI names"). It now asserts the opposite, because the
+    /// rotation signal comes from a file the model's own Bash can create — see
+    /// [`TabLatch::contaminated`]. The latch still reopens; the bit does not.
     #[test]
-    fn contamination_survives_every_override_and_only_a_restart_clears_it() {
+    fn contamination_survives_every_override_and_every_session_rotation() {
         for action in [LatchOverride::FlipLocal, LatchOverride::Unlatch] {
             let reg = LatchRegistry::default();
             let s = scope("claude-1", Some("sess-a"));
@@ -6256,15 +6308,17 @@ mod tests {
             );
             assert!(reg.snapshot()[0].view.contaminated, "{action:?}");
 
-            // Tab restart ⇒ new session ⇒ clean scope, and only then.
+            // H-2: a new session id reopens the latch — but the write is STILL
+            // quarantined, because "the session rotated" is a claim sourced from
+            // an attacker-writable transcript directory.
             let after = scope("claude-1", Some("sess-b"));
             assert_eq!(
                 reg.gate(Some(&after), LatchRoute::Native, "context_note", ON),
-                Ok(WriteTaint::Clean),
-                "{action:?}"
+                Ok(WriteTaint::Quarantined),
+                "{action:?}: a rotation must not re-open the persistence channel"
             );
             let rows = reg.snapshot();
-            assert!(!rows[0].view.contaminated, "{action:?}");
+            assert!(rows[0].view.contaminated, "{action:?}");
             assert_eq!(rows[0].latch(), "open", "{action:?}");
         }
     }
@@ -6437,7 +6491,7 @@ mod tests {
         assert!(is_configured_tab(&settings_with_tabs(&[]), "anything"));
     }
 
-    // ── V32 C-2 — a forged session rotation must not clear contamination ────
+    // ── V32 C-2 / H-2 — a session rotation must not clear contamination ─────
 
     /// A tab that has read a page: EXTERNAL-latched, contaminated, session
     /// `real-session`.
@@ -6460,65 +6514,97 @@ mod tests {
         t
     }
 
-    /// **The seam the whole finding lives on**, stated once so the two guards
-    /// below have something to be guards *of*: a session id that reaches
-    /// [`TabLatch::observe`] as a rotation clears `contaminated`, which locked
-    /// decision 15 reserves for a genuinely new conversation.
+    /// **The seam the whole finding lives on, inverted by H-2.**
     ///
-    /// This is not a defect — it is the intended behaviour on a *proven*
-    /// rotation, and it is what makes a tab restart the clean exit the
-    /// decision-15 UI promises. What C-2 found is that two writers could hand
-    /// `observe` an id with nothing behind it.
+    /// This test used to assert the opposite — that a rotation reaching
+    /// [`TabLatch::observe`] CLEARS `contaminated` — on the reading that only a
+    /// new conversation has a clean context. C-2 then tried to make the
+    /// rotation signal trustworthy, and H-2 showed it cannot be: the signal is
+    /// the newest `*.jsonl` under a directory the model's own Bash can write
+    /// (decision 3), so every bar over it is a bar over the attacker's own file.
+    ///
+    /// The rotation still resets everything **permissive** — latch, budget, the
+    /// one-row-per-scope report bits — because those are re-earned by the next
+    /// real call and a stale one would falsely deny a fresh conversation. It no
+    /// longer resets the one bit an attacker would want reset.
     #[test]
-    fn a_session_rotation_that_reaches_observe_clears_contamination() {
+    fn a_session_rotation_resets_the_latch_but_never_the_contamination_bit() {
+        const ONE_CALL: outbound::BudgetLimits = outbound::BudgetLimits {
+            max_calls: 1,
+            max_bytes: 0,
+        };
         let mut t = contaminated_tab();
+        t.latch_flagged = true;
+        t.beacon_flagged = true;
+        t.budget.charge(4096);
         assert!(t.contaminated && t.latch == Latch::External);
+        assert!(t.budget.exhausted(ONE_CALL), "the spend is on the books");
+
         t.observe(Some("aaaa"));
-        assert_eq!(t.latch, Latch::Open, "a proven rotation reopens the latch");
+        assert_eq!(t.session.as_deref(), Some("aaaa"), "the id itself rotates");
+        assert_eq!(t.latch, Latch::Open, "a rotation reopens the latch");
+        assert!(!t.latch_flagged, "and re-arms the one-row-per-scope reports");
+        assert!(!t.beacon_flagged);
         assert!(
-            !t.contaminated,
-            "a proven rotation ends the contaminated conversation — decision 15's one exit"
+            !t.budget.exhausted(ONE_CALL),
+            "and refills the fetch budget"
         );
+        assert!(
+            t.contaminated,
+            "H-2: a rotation is a claim about an attacker-writable file, so it may \
+             not un-taint the context window — only dropping the tab's registry entry does"
+        );
+
         // …and the same call with NO id, or the same id, changes nothing. This
         // is the "keep calling until the registry blinks" attack `observe`
-        // already defended against; C-2 is its harder sibling.
+        // already defended against; C-2 and H-2 are its harder siblings.
         let mut t = contaminated_tab();
         t.observe(None);
         t.observe(Some("real-session"));
         assert!(t.contaminated && t.latch == Latch::External);
     }
 
-    /// **C-2, filesystem variant.** A Claude tab's session id is the stem of the
-    /// newest `*.jsonl` in its project dir, ranked purely by mtime, and the tap
-    /// used to mark a post-attach file live *immediately*
+    /// **C-2/H-2, filesystem variant.** A Claude tab's session id is the stem of
+    /// the newest `*.jsonl` in its project dir, ranked purely by mtime, and the
+    /// tap used to mark a post-attach file live *immediately*
     /// (`live_confirmed = !first_attach`). So `type nul > …/aaaa.jsonl` from
-    /// Bash — a zero-byte file — reported session `aaaa` within one 200 ms poll,
-    /// and the rotation above cleared the contamination bit.
+    /// Bash — a zero-byte file — reported session `aaaa` within one 200 ms poll.
     ///
-    /// The fix is upstream of `observe`, in the tap: growth is the only proof a
-    /// rotated file is a live conversation. Asserted **through**
-    /// `oob::claude::LiveSessionGate` — the decision `run`'s loop delegates to —
-    /// rather than beside it, so reverting `rotated()` to the old
-    /// confirm-on-appearance rule fails this test.
+    /// C-2's fix put a growth bar in the tap, and **H-2 walked straight over it
+    /// with `echo {} > …/aaaa.jsonl`**: `read_complete_lines` advances the
+    /// offset for any newline-terminated bytes, so a trailing `\n` was the whole
+    /// bar. The old version of this test asserted `gate.observed(0, 0)` — the
+    /// zero-byte PoC's exact shape — which is why one byte of content defeated a
+    /// green suite.
+    ///
+    /// Two independent guards now, and this test states both:
+    /// 1. the gate takes a DECODE proof, so bytes alone confirm nothing; and
+    /// 2. **even a confirmed rotation cannot clear `contaminated`**, because the
+    ///    file the proof is read from is one the attacker writes.
+    ///
+    /// Asserted **through** `oob::claude::LiveSessionGate` rather than beside
+    /// it, so weakening the gate fails this test.
     #[test]
-    fn a_rotation_with_no_observed_growth_does_not_clear_contamination() {
+    fn a_forged_rotation_neither_confirms_a_session_nor_clears_contamination() {
         use crate::oob::claude::LiveSessionGate;
         let mut tab = contaminated_tab();
         let mut gate = LiveSessionGate::default();
         // The tap is running on a confirmed session.
-        assert!(gate.observed(0, 4096));
+        assert!(gate.observed(true));
 
         // The forged file wins `newest_jsonl` on mtime. The tap rotates onto it
-        // and drains: zero bytes, because nothing is writing to it.
+        // and drains. Whatever the attacker wrote — nothing (`type nul`), or
+        // bytes that decode to no record of this session (`echo {}`) — the drain
+        // reports no evidence, however far the offset moved.
         gate.rotated();
-        let live = gate.observed(0, 0);
+        let live = gate.observed(false);
         assert!(
             !live,
-            "an empty post-attach transcript must not be reported live"
+            "a transcript that yields no record naming this session is not live"
         );
         // Ten more polls of the same nothing.
         for _ in 0..10 {
-            assert!(!gate.observed(0, 0));
+            assert!(!gate.observed(false));
         }
         // So no rotation ever reaches the registry, and the latch keeps the
         // session it was engaged for.
@@ -6529,37 +6615,53 @@ mod tests {
         assert_eq!(tab.latch, Latch::External);
         assert!(
             tab.contaminated,
-            "contamination survives a transcript file that only ever appeared"
+            "contamination survives a transcript file the harness never wrote"
+        );
+
+        // H-2's belt-and-braces half: suppose the forger goes one better and
+        // writes `{"sessionId":"aaaa"}`, clearing the decode bar. The rotation
+        // now DOES reach `observe` — and still cannot un-taint the tab.
+        let mut gate = LiveSessionGate::default();
+        gate.rotated();
+        assert!(gate.observed(true), "a decoded record confirms the session");
+        tab.observe(Some("aaaa"));
+        assert_eq!(tab.latch, Latch::Open, "the permissive state does reset");
+        assert!(
+            tab.contaminated,
+            "H-2: no filesystem-derived rotation may clear the contamination bit"
         );
     }
 
     /// The other half of the same rule: a **real** new session — a file the
-    /// harness is actually writing into — still rotates the scope. The fix must
-    /// not buy containment by freezing every tab at its first session.
+    /// harness is actually writing into — still rotates the LATCH's scope. The
+    /// fix must not buy containment by freezing every tab's latch at its first
+    /// session. (What it deliberately does NOT rotate is `contaminated`; that is
+    /// the test above.)
     #[test]
-    fn a_rotation_with_observed_growth_does_clear_contamination() {
+    fn a_rotation_with_decoded_evidence_does_reopen_the_latch() {
         use crate::oob::claude::LiveSessionGate;
         let mut tab = contaminated_tab();
         let mut gate = LiveSessionGate::default();
-        assert!(gate.observed(0, 4096));
+        assert!(gate.observed(true));
 
         gate.rotated();
         // First poll after the rotation: the harness has created the file but
         // the first line has not landed yet. Still not proof.
-        assert!(!gate.observed(0, 0));
-        // Next poll: bytes.
-        let live = gate.observed(0, 812);
-        assert!(live, "a growing transcript IS this tab's live session");
+        assert!(!gate.observed(false));
+        // A line lands that carries no `sessionId` at all (a real shape —
+        // `{"type":"file-history-snapshot",…}`). Not evidence either: it neither
+        // confirms nor vetoes.
+        assert!(!gate.observed(false));
+        // Next poll: a decoded record naming this session.
+        let live = gate.observed(true);
+        assert!(live, "a transcript writing THIS session's records is live");
         // Confirmation is sticky until the next rotation — a quiet turn must
         // not un-confirm a session the tap already proved.
-        assert!(gate.observed(812, 812));
+        assert!(gate.observed(false));
 
         tab.observe(Some("new-session"));
         assert_eq!(tab.latch, Latch::Open);
-        assert!(
-            !tab.contaminated,
-            "a proven new conversation starts clean — that is the point of the tab restart"
-        );
+        assert_eq!(tab.session.as_deref(), Some("new-session"));
     }
 
     /// **C-2, token variant.** `/memory/event`'s three `mark_live_session`
@@ -6639,7 +6741,12 @@ mod tests {
         assert!(detail.contains("USER OVERRIDE (flip_local"), "{detail}");
         assert!(detail.contains("external → local"), "{detail}");
         assert!(detail.contains("contaminated=true"), "{detail}");
-        assert!(detail.contains("Restarting the tab"), "{detail}");
+        // H-2: the row must name the reset that actually works. A tab restart
+        // does not clear the bit any more — the registry entry outlives the
+        // harness session — so a row still saying so would misdirect an
+        // incident review.
+        assert!(detail.contains("restarting cImp"), "{detail}");
+        assert!(!detail.contains("Restarting the tab"), "{detail}");
         assert_eq!(
             row.tool, "flip_local",
             "the action is the row's tool column"

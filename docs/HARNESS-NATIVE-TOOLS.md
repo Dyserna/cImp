@@ -428,7 +428,10 @@ raises the hint.
 * **Exit path:** *Switch to local* (decision 15) flips the latch — external
   closes, local reopens, never both at once. That is the intended
   "research done, now apply it" button. *Full unlatch* recreates the trifecta
-  and asks for confirmation. A tab restart is the only truly clean reset.
+  and asks for confirmation. Restarting cImp is the only truly clean reset —
+  since H-2 (2026-08-08) a new harness session no longer clears the
+  contamination bit, because "the session rotated" is inferred from a transcript
+  file the model's own shell can create.
 
 **The recommended research pattern under `deny`:**
 

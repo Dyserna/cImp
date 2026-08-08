@@ -180,7 +180,7 @@
           ? 'This session has used web / external content: local file and source-text tools are closed for it.'
           : taint.latch === 'local'
             ? 'This session has used local file / source-text tools: web and other external tools are closed for it.'
-            : 'This session has read external content. Memory writes stay quarantined until the tab is restarted.',
+            : 'This session has read external content. Memory writes stay quarantined for this tab until cImp is restarted.',
       reduced.length === 0
         ? ''
         : `Injection protection reduced for this tab: ${reduced.map((f) => f.label).join(', ')} off.`,

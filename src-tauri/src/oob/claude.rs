@@ -224,35 +224,43 @@ fn spawn_heartbeat(ctx: OobContext, root: PathBuf, hb: Arc<TapHeartbeat>) {
 ///    the registry entry keyed by this tab id.
 /// 3. `loopback::TabLatch::observe` reads that entry, sees a **changed** session
 ///    id, and treats it as a new conversation: `latch = Open`, `budget.reset()`,
-///    `latch_flagged = false`, **`contaminated = false`**. It is called from all
-///    three state paths (`gate`, `beacon`, `view_for`), so even a `/latch/state`
-///    poll applies it.
+///    `latch_flagged = false` — and, until H-2, **`contaminated = false`**. It
+///    is called from all three state paths (`gate`, `beacon`, `view_for`), so
+///    even a `/latch/state` poll applies it.
 ///
-/// Clearing contamination is the sharp end: locked decision 15 says
-/// *"contamination is a property of the conversation, not of the latch
-/// position"*, and `/latch/override` deliberately cannot clear it. After that
-/// reset the next `context_note` stores **clean**, so an injected conclusion is
-/// auto-injected into every future clean session — the persistence decision 10
-/// exists to prevent.
+/// # The rule, and what H-2 changed about it
 ///
-/// # The rule
+/// The rule was **"growth is the proof, and it is the only proof"**: a file's
+/// appearance means nothing, bytes arriving in it mean a live harness is
+/// writing. The 2026-08-08 re-review's H-2 is what that costs: growth proves
+/// something is writing, not that the *harness* is writing, and
+/// `read_complete_lines` advances the offset for any newline-terminated bytes.
+/// `echo {} > <newest>.jsonl` cleared the bar in one command.
 ///
-/// **Growth is the proof, and it is the only proof.** A file's appearance means
-/// nothing; bytes arriving in it mean a live harness is writing. Rotation drops
-/// confirmation ([`rotated`](Self::rotated)) and only
-/// [`observed`](Self::observed) restores it. That leaves the decision-15
-/// invariant intact where it matters: keeping `latch = Open` and a fresh budget
-/// on a *proven* rotation is fine, and it is specifically clearing
-/// `contaminated` that now requires proof.
+/// So the bar here is now a **decode proof**: at least one line of the new bytes
+/// must parse as a transcript record AND carry a top-level `sessionId` equal to
+/// this session's id (see `record_names_session`). That is strictly stronger
+/// than an offset delta, and it is what [`observed`](Self::observed) takes.
+///
+/// **It is defence in depth, not a trust root, and the difference matters.** The
+/// attacker who creates the file also writes its contents, so
+/// `echo '{"sessionId":"aaaa"}' > aaaa.jsonl` still clears this bar — decision 3
+/// puts Claude's native Bash outside every cImp latch. Nothing derived from the
+/// transcript directory can be a trust root for the *sharp* consequence, so the
+/// sharp consequence no longer hangs off it: `TabLatch::contaminated` is now
+/// sticky and a rotation cannot clear it, whatever this gate says. What this
+/// gate still protects is the live-session registry itself — session-scoped
+/// memory (V28), the Usage "active now" set, and permission attribution — where
+/// a wrong answer is a misattribution rather than a released containment bit.
 ///
 /// Cost: a genuinely new session is reported live one poll (200 ms) later than
 /// before, once its first line lands — the harness writes its first entry within
 /// the same tick it creates the file, so this is not observable in practice.
 ///
-/// This closes the filesystem half of C-2 only. The token half — a
-/// `/memory/event` POST keying the same registry with a tab-colliding string —
-/// is closed in `offload/loopback.rs::mark_live_session_from_event`. **Neither
-/// alone is sufficient**: they are two independent writers into one registry.
+/// This is the filesystem half only. The token half — a `/memory/event` POST
+/// keying the same registry with a tab-colliding string — is closed in
+/// `offload/loopback.rs::mark_live_session_from_event`. **Neither alone is
+/// sufficient**: they are two independent writers into one registry.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct LiveSessionGate {
     confirmed: bool,
@@ -266,11 +274,19 @@ impl LiveSessionGate {
         self.confirmed = false;
     }
 
-    /// The drain ran from `before` and left the offset at `after`. New bytes
-    /// confirm the file, permanently (until the next rotation). Returns whether
-    /// the tap may report this session live.
-    pub(crate) fn observed(&mut self, before: u64, after: u64) -> bool {
-        if after != before {
+    /// Fold one drain's evidence in. `own_record` is
+    /// [`Drained::own_record`] — "the bytes just consumed contained at least one
+    /// decoded transcript record naming this session". Confirmation is then
+    /// permanent until the next rotation (a quiet turn must not un-confirm a
+    /// session already proved). Returns whether the tap may report this session
+    /// live.
+    ///
+    /// H-2: this deliberately takes the *evidence*, not `(before, after)`
+    /// offsets. The old signature made "the offset moved" the predicate, and an
+    /// offset moves for any newline-terminated byte — including one written by
+    /// the model's own shell.
+    pub(crate) fn observed(&mut self, own_record: bool) -> bool {
+        if own_record {
             self.confirmed = true;
         }
         self.confirmed
@@ -334,8 +350,8 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // session) are read from the start.
     let mut first_attach = true;
     // Whether the attached transcript is demonstrably THIS tab's live session
-    // — growth is the only proof, on every attach and every rotation alike.
-    // See [`LiveSessionGate`].
+    // — a decoded record naming the session is the proof, on every attach and
+    // every rotation alike (H-2). See [`LiveSessionGate`].
     let mut live = LiveSessionGate::default();
 
     loop {
@@ -358,9 +374,10 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
         match newest_jsonl(&root) {
             Some(path) if Some(&path) != cur.as_ref() => {
                 // Rotated to a new (or first) transcript file. Either way the
-                // file must prove itself by GROWING before it is reported live
-                // (V32 C-2 — see [`LiveSessionGate`]); `first_attach` still
-                // decides the backlog posture, and only that.
+                // file must prove itself by yielding a DECODED record that
+                // names its session before it is reported live (V32 C-2, then
+                // H-2 — see [`LiveSessionGate`]); `first_attach` still decides
+                // the backlog posture, and only that.
                 live.rotated();
                 offset = if first_attach {
                     std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
@@ -407,8 +424,7 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            let before = offset;
-            offset = drain_new_lines(
+            let drained = drain_new_lines(
                 &path,
                 offset,
                 &mut seen,
@@ -422,12 +438,16 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
                 &ctx,
             )
             .await;
+            offset = drained.offset;
             // V24 Phase B: refresh this tab's live-session registry entry
             // (keyed by the stable tab id) so the Usage snapshot marks the
             // session active — but only once the file is confirmed to be this
             // tab's own session, so a dead previous-run transcript is never
             // reported as the current one.
-            if live.observed(before, offset) {
+            //
+            // H-2: the gate takes the drain's DECODE evidence, never the offset
+            // delta — the offset above advances for any newline-terminated byte.
+            if live.observed(drained.own_record) {
                 ctx.mark_live_session(&session_id, "claude");
                 // H1-R2: hand the confirmed session to the heartbeat so it
                 // refreshes `live_sessions` too while this loop is parked in
@@ -449,8 +469,49 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     }
 }
 
+/// What one [`drain_new_lines`] pass consumed — the two facts H-2 requires be
+/// kept apart.
+///
+/// The offset is bookkeeping: it advances past every complete line so the tail
+/// never re-reads or skips, and it must go on doing exactly that whatever the
+/// lines contained. The evidence flag is a *claim about identity*, and it is set
+/// only by a line that decoded and named this session. Deriving the second from
+/// the first is the H-2 defect: `read_complete_lines` moves the offset for any
+/// newline-terminated bytes, so a one-byte `echo` was indistinguishable from a
+/// live harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drained {
+    /// The new tail offset — past whole lines only, partial trailing line held
+    /// back (see [`read_complete_lines`]).
+    offset: u64,
+    /// At least one line in this chunk parsed AND carried a top-level
+    /// `sessionId` equal to the `session_id` the drain was called with. Fed to
+    /// [`LiveSessionGate::observed`]; nothing else may set it.
+    own_record: bool,
+}
+
+/// Whether a decoded transcript line is a record **of** `session_id`: a
+/// top-level `"sessionId"` equal to it.
+///
+/// H-2's predicate, isolated so it has a name and a test. Three deliberate
+/// properties:
+///
+/// * **Not every line has the field** — `{"type":"file-history-snapshot",…}` has
+///   no `sessionId`. Such a line is simply *not evidence*: it neither confirms
+///   nor vetoes, so a real transcript that opens with one is confirmed by its
+///   next line instead.
+/// * **An empty `session_id` never matches.** The id is a `file_stem` that falls
+///   back to `""`; a bare `.jsonl` must not be confirmable by a line carrying
+///   `"sessionId":""`.
+/// * **Untyped `get`**, per the module's format-tolerance discipline — a
+///   non-object line (`3`, `[]`) answers `false` rather than panicking.
+fn record_names_session(obj: &Value, session_id: &str) -> bool {
+    !session_id.is_empty() && obj.get("sessionId").and_then(Value::as_str) == Some(session_id)
+}
+
 /// Read complete new lines from `path` starting at `offset`, speaking assistant
-/// text, and return the new offset (advanced only past whole lines).
+/// text, and return the new offset (advanced only past whole lines) together
+/// with whether any of those lines identified this session ([`Drained`]).
 #[allow(clippy::too_many_arguments)]
 async fn drain_new_lines(
     path: &Path,
@@ -464,9 +525,13 @@ async fn drain_new_lines(
     project_dir: &Path,
     session_id: &str,
     ctx: &OobContext,
-) -> u64 {
+) -> Drained {
+    // H-2: the offset advance is unconditional and unchanged — a chunk with no
+    // evidence in it is still fully consumed. Only `own_record` is earned.
+    let mut own_record = false;
     let Some((complete, new_offset)) = read_complete_lines(path, offset) else {
-        return offset; // nothing new/complete, or rotated away mid-loop.
+        // Nothing new/complete, or rotated away mid-loop.
+        return Drained { offset, own_record };
     };
     offset = new_offset;
 
@@ -476,6 +541,11 @@ async fn drain_new_lines(
             continue;
         }
         if let Some(obj) = parse_transcript_line(path, line) {
+            // H-2: the ONE place the live-session evidence flag is set. Inside
+            // the parse arm by construction, so an unparseable line can never
+            // be evidence — and outside every early `continue`, so the drain's
+            // "skip the bad line, keep draining" posture is untouched.
+            own_record |= record_names_session(&obj, session_id);
             note_cli_version(&obj, version_noted);
             // Canary fact: an inline sidechain line means the 1.x sub-agent
             // contract is (still) live — see `SubagentState::drift_tick`.
@@ -506,7 +576,7 @@ async fn drain_new_lines(
             }
         }
     }
-    offset
+    Drained { offset, own_record }
 }
 
 /// V16 Feature 1: record the Claude Code CLI version from a transcript entry's
@@ -2588,7 +2658,7 @@ mod tests {
         let mut commit_calls = IdRing::default();
         let mut version_noted = false;
         let mut subs = SubagentState::default();
-        let offset = drain_new_lines(
+        let drained = drain_new_lines(
             &path,
             0,
             &mut seen,
@@ -2604,9 +2674,16 @@ mod tests {
         .await;
 
         assert_eq!(
-            offset,
+            drained.offset,
             content.len() as u64,
             "the whole chunk is consumed despite the corrupt line"
+        );
+        // H-2: none of these lines carries a `sessionId`, so none of them is
+        // live-session evidence — and the offset advanced anyway. The two facts
+        // are independent by construction (see `Drained`).
+        assert!(
+            !drained.own_record,
+            "a chunk with no sessionId-bearing line is not evidence, however many bytes it moved"
         );
         assert!(
             agents.is_empty(),
@@ -2620,6 +2697,124 @@ mod tests {
             sig.try_recv(),
             Ok(StateSignal::AgentsActiveChanged { active: false, .. })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── H-2 (2026-08-08) — live-session evidence is a DECODE proof ──────────
+
+    /// The predicate itself, at the four shapes that decide it.
+    ///
+    /// H-2 in one sentence: the old bar was "the offset moved", which
+    /// `read_complete_lines` clears for **any** newline-terminated bytes — so
+    /// `echo {} > <newest>.jsonl` from the model's own shell reported a forged
+    /// session live. The bar is now "a decoded record named this session".
+    #[test]
+    fn record_names_session_matches_only_a_line_that_names_this_session() {
+        let v = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        // The `echo {}` PoC: valid JSON, newline-terminated, no `sessionId`.
+        assert!(!record_names_session(&v("{}"), "aaaa"));
+        // A REAL transcript line that legitimately lacks the field. Not
+        // evidence — and, just as important, not a veto: the drain keeps going
+        // and the next line may still confirm.
+        assert!(!record_names_session(
+            &v(r#"{"type":"file-history-snapshot","messageId":"m1"}"#),
+            "aaaa"
+        ));
+        // Someone else's session id.
+        assert!(!record_names_session(
+            &v(r#"{"type":"user","sessionId":"bbbb"}"#),
+            "aaaa"
+        ));
+        // The real thing: the stem of `<stem>.jsonl` appears as `sessionId`.
+        assert!(record_names_session(
+            &v(r#"{"type":"assistant","sessionId":"aaaa","message":{"id":"m1"}}"#),
+            "aaaa"
+        ));
+        // A `file_stem` that fell back to `""` must never be confirmable, and a
+        // non-object line answers false rather than panicking (the module's
+        // format-tolerance discipline).
+        assert!(!record_names_session(&v(r#"{"sessionId":""}"#), ""));
+        assert!(!record_names_session(&v("3"), "aaaa"));
+        assert!(!record_names_session(&v("[]"), "aaaa"));
+    }
+
+    /// The same rule **through the drain**, which is where the evidence is
+    /// actually produced — and with the offset asserted beside it, because H-2
+    /// is precisely the two facts having been one.
+    #[tokio::test]
+    async fn drain_reports_live_session_evidence_only_for_a_matching_session_id() {
+        let dir = std::env::temp_dir().join(format!("oob-h2-evidence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No `version` key anywhere: `note_cli_version` must stay out of the
+        // global harness-version file during tests.
+        let drain = |name: &str, body: &'static str, session: &'static str| {
+            let path = dir.join(name);
+            let parent = dir.clone();
+            std::fs::write(&path, body).unwrap();
+            async move {
+                let (ctx, _sig) = agent_ctx();
+                let mut seen = HashSet::new();
+                let mut agents = HashSet::new();
+                let mut tool_names = ToolNameRing::default();
+                let mut commit_calls = IdRing::default();
+                let mut version_noted = false;
+                let mut subs = SubagentState::default();
+                let out = drain_new_lines(
+                    &path,
+                    0,
+                    &mut seen,
+                    &mut agents,
+                    &mut tool_names,
+                    &mut commit_calls,
+                    &mut version_noted,
+                    &mut subs,
+                    &parent,
+                    session,
+                    &ctx,
+                )
+                .await;
+                (out, body.len() as u64)
+            }
+        };
+
+        // Everything a forger can produce with one shell command, plus the one
+        // real line that carries no `sessionId`. None of it is evidence — and
+        // the offset still consumes all of it.
+        let forged = concat!(
+            "{}\n",
+            r#"{"type":"file-history-snapshot","messageId":"m1"}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"someone-else","message":{"content":"hi"}}"#,
+            "\n",
+            "not json at all, just bytes and a newline\n",
+        );
+        let (out, len) = drain("aaaa.jsonl", forged, "aaaa").await;
+        assert!(
+            !out.own_record,
+            "no line named this session, so nothing here may report it live"
+        );
+        assert_eq!(
+            out.offset, len,
+            "the offset advances for every complete line regardless — H-2 is these two \
+             facts being independent"
+        );
+
+        // Unparseable garbage must not confirm AND must not stop the good line
+        // after it from confirming (`parse_transcript_line`'s skip-and-continue
+        // contract).
+        let real = concat!(
+            "{\"type\":\"assistant\",\"message\":{ TRUNCATED MID-WRITE\n",
+            r#"{"type":"assistant","sessionId":"bbbb","message":{"id":"m9","content":[]}}"#,
+            "\n",
+        );
+        let (out, len) = drain("bbbb.jsonl", real, "bbbb").await;
+        assert!(
+            out.own_record,
+            "a decoded record naming this session IS the proof, even behind a corrupt line"
+        );
+        assert_eq!(out.offset, len);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -24,7 +24,11 @@ export interface LatchRow {
   /// `open` | `external` | `local`.
   latch: string;
   /// Whether external content has entered this conversation at all. Survives
-  /// every override; only a tab restart (session rotation) clears it.
+  /// every override — and, since H-2 (2026-08-08), every session rotation too:
+  /// the rotation signal is the newest `*.jsonl` in a directory the model's own
+  /// Bash can write, so it cannot be the trust root for un-tainting a context
+  /// window. Nothing in a running cImp clears this bit; see
+  /// `offload/loopback.rs`'s `TabLatch::contaminated`.
   contaminated: boolean;
   /// Whether "switch to local" applies right now (EXTERNAL-latched only).
   can_flip_local: boolean;

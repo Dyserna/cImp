@@ -16,7 +16,10 @@
   //      model that may already be steered.
   //
   // The restart line is static and always shown, because it is the only truly
-  // clean exit — every override leaves the contamination bit set.
+  // clean exit — every override leaves the contamination bit set. Since H-2
+  // (2026-08-08) it names an APP restart, not a tab restart: a new harness
+  // session no longer clears the bit, because "the session rotated" is read from
+  // a transcript file the model's own shell can create.
   //
   // Positioning / dismissal mirror TabContextMenu: fixed at the click coords,
   // clamped into the viewport, dismissed by Escape or a mousedown outside.
@@ -224,7 +227,7 @@
   {/if}
 
   <div class="separator"></div>
-  <div class="state">Restarting the tab is the only clean reset.</div>
+  <div class="state">Restarting cImp is the only clean reset.</div>
   {#if error}
     <div class="state err">{error}</div>
   {/if}

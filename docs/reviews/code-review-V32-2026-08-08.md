@@ -33,13 +33,13 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | # | Finding | Status | Where |
 |---|---|---|---|
 | H-1 | C-1 open — `graph_struct_search`/`graph_repo_map` are TRUSTED source readers | **OPEN** | needs a decision amendment, not just a `TABLE` edit |
-| H-2 | C-2 open — contamination clears on any newline-terminated byte | **OPEN** | |
+| H-2 | C-2 open — contamination clears on any newline-terminated byte | **FIXED** | `2c40136` — reset removed, not re-armed; amends decision 15 |
 | H-3 | SSRF — `http:/host`, `http:host`, `http:\host` evade the screen | **OPEN** | |
 | H-4 | Every shipped rule defeated by invisible whitespace | **FIXED** | `5920c92` — rules + normalizer + corpus; 20/50 evading → 0/53 |
 | H-5 | Update channel inert by construction (302 vs redirect ban) | **FIXED** | `5920c92` — `raw.githubusercontent.com` branch + the missing guard |
 | H-6 | Bundle authenticated by TLS + repo-write only | **DECLINED** | locked decision 28 — key would live inside the blast radius |
 | H-7 | A cloned repo's `opencode.json` is executed configuration | **OPEN** | largely V33 (OS containment); record as known-open meanwhile |
-| H-8 | `/audit/run`'s taint gate is opt-in by the caller | **OPEN** | |
+| H-8 | `/audit/run`'s taint gate is opt-in by the caller | **FIXED** | `80375a9` — `tab` required + `consumer` narrowed; both halves |
 | H-9 | Forensic activity rows are model-evictable | **OPEN** | |
 | H-10 | A failed detection-status read renders the layer ARMED | **OPEN** | |
 | F-2 | `^` anchors to byte 0, not line start — three patterns dead | **FIXED** | `5920c92` — folded into H-4 (same file, same class) |
@@ -49,6 +49,10 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | N-12 | 512 MiB aggregate-download exposure | **FIXED** | `5920c92` — died with the classifier component |
 | O-1 | The H-1 race guard is `#[ignore]`d and CI never runs `--ignored` | **OPEN** | one extra step in `tests.yml` |
 | — | Pre-existing 1-in-4 test flake on the global rule slot | **FIXED** | `5920c92` — guard made structural in `screen_blocking` |
+| F-3 | The primary contamination path writes no forensic record at all | **OPEN** | raised by the fix run; blocks the clear path |
+| F-4 | `is_configured_tab` is agent-agnostic — `(consumer, tab)` verified nowhere | **OPEN** | raised by the fix run |
+| F-5 | `/graph_run` + `/mcp/call` share H-8's tab half | **OPEN** | raised by the fix run; a decision, not a bug |
+| F-6 | H-2's decode proof degrades silently if the CLI drops `sessionId` | **OPEN** | raised by the fix run; wants a drift canary |
 
 Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
 
@@ -133,7 +137,13 @@ navigational value, which is why the class exists.
 
 ### H-2 — C-2 is OPEN: contamination clears on any newline-terminated byte
 
-> **STATUS: OPEN.** Found independently by three reviewers; all three links verified by hand. The regression test asserts `gate.observed(0, 0)` — the PoC’s zero-byte file — so one byte of content defeats the fix.
+> **STATUS: FIXED — `2c40136`.** Fixed by *removing* the reset, not by raising the bar: no filesystem-derived fact can be the trust root for un-tainting a context window, because decision 3 puts the model's shell outside every latch and the model therefore writes the very file the rotation is inferred from. C-2 raised "the file exists" to "the file grew"; H-2 walked over that with one newline; "it decodes" would fall to `echo '{"sessionId":"…"}'`. `TabLatch::observe` still resets latch/budget/`latch_flagged`/`beacon_flagged` — permissive state the next real call re-earns — but not `contaminated`. **Amends locked decision 15: contamination is a property of the tab, not the conversation**, because the conversation boundary is attacker-controlled.
+>
+> Defence in depth: `LiveSessionGate::observed` now takes a decode proof instead of an offset delta — `drain_new_lines` returns `Drained { offset, own_record }`, with `own_record` set only inside the parse arm for a line whose top-level `sessionId` matches, so an unparseable line can neither be evidence nor abort the drain, and the offset advance stays unconditional and independent.
+>
+> The three tests that pinned the old rule were **inverted, not deleted** — including the C-2 regression that asserted `gate.observed(0, 0)`, the zero-byte PoC shape this finding walked over.
+>
+> **Consequence, deliberate and user-accepted:** the registry has no eviction, so `contaminated` now clears only on an app restart. Six user-facing strings that said "restarting the tab is the only clean reset" became false and were rewritten. A user-driven clear path (Timeline evidence + an explicit clear action) is designed and scheduled as a V32 phase before release — see the new findings section.
 
 `oob/claude.rs:271-277,1544-1559` · `offload/loopback.rs:1280-1292`
 
@@ -371,7 +381,15 @@ never names what else merges in.
 
 ### H-8 — `POST /audit/run`'s taint gate is opt-in by the caller
 
-> **STATUS: OPEN.** Verified by hand: `gate()` returns `Ok(WriteTaint::Clean)` when `scope` is `None`, and the `Anonymous` arm does not even log.
+> **STATUS: FIXED — `80375a9`.** Both halves closed, not the "or" below. `tab` is now required (refused post-parse, not via serde: the child turns any non-200 into `"cImp returned 400: …"`, a truncated protocol complaint instead of the actionable "restart this tab in cImp — its MCP child is from an older build"; post-parse also trims `""`/`"   "`, the exact shapes a caller would use to opt back out, which serde cannot). `consumer` is narrowed at the parse boundary to `{claude, opencode}`.
+>
+> **The `"offload"` arm was worse than described.** Both spawn sites were traced: `tabs/config.rs:886` sends no `--consumer` (the child defaults `claude`), `:2117` sends `opencode`. The offload worker calls `run_audit` **in-process and never opens a socket** — `settings/schema.rs:1390-1398` says so outright ("`expose_offload` is deliberately absent: the offload worker runs in-process"). So `consumer_exposed`'s `"offload" => expose_offload` arm was reachable over HTTP *only* by a caller no legitimate component ever is, and it defaults **true** while `expose_claude` additionally requires the master `enabled`. `audit_consumer` returns `&'static str`, so the caller's own string never reaches `consumer_exposed` at all.
+>
+> The decision is extracted to `audit_admit` — ordered consumer → expose → cwd → tab → gate, dependencies injected as closures. That makes "a refusal engages no latch" testable as an *observation* rather than a tautology, routes all four refusals through one arm before `write_ndjson_head` (preserving the single-JSON-over-200 shape `parse_result_line` relies on), and makes `gate()` unreachable without every prior check passing. The `warn!` is now written over `scope.is_none()`, covering `Anonymous` and any future variant rather than `Unknown` alone.
+>
+> **Known ceiling:** the unknown-tab test cannot assert the `warn!` itself (not observable without a tracing-capture harness); it pins the *predicate* so a regression is visible in review.
+>
+> **Correction to this report:** the fail-open cited below as `loopback.rs:1583-1585` is really **`1626-1629`** — 1583-1585 is the `live_settings` call.
 
 `offload/loopback.rs:2553-2587` · fail-open at `loopback.rs:1583-1585`
 
@@ -721,3 +739,127 @@ because recipes 11 and 11b stage the manifest on a local server that answers 200
 and therefore *cannot* catch H-5. A verification step that validates everything
 except the property that differs between staging and production is how H-5
 survived, and it would have survived the next review too.
+
+---
+
+## Findings raised by the 2026-08-08 fix run (not in the original review)
+
+Each was surfaced by an implementation agent while closing a numbered finding,
+verified by hand, and deliberately **reported rather than fixed in place** — a
+fix whose blast radius is not reviewable is how the four issue-fixes of the
+previous run introduced six defects of their own.
+
+### F-3 — the primary contamination path writes no forensic record at all
+
+`offload/loopback.rs:1750-1752`
+
+H-9 says forensic rows are *evictable*. This is worse and upstream of it: the
+main path that sets `contaminated` — an admitted proxied EXTERNAL call — writes
+**no activity row**. The only trace is the `info!` at `:1756`, which fires only
+when the *latch moves* (`policy.latch && entry.latch.engage(class)`), so a tab
+that is already `Local`-latched, or one running with the latch feature off,
+contaminates in total silence. There is no timestamp, no tool, no host, no row.
+
+Only the native-web beacon path (`:1815`) records anything, and only once per
+tab-session. Consequence: for the common case the system knows *that* a tab is
+contaminated and can never say *when*, *by which tool*, or *from which page* —
+so contamination cannot be correlated to anything, including a checkpoint.
+
+This is the blocking prerequisite for the user-driven clear path (below).
+
+### F-4 — `is_configured_tab` is agent-agnostic, so `(consumer, tab)` is verified nowhere
+
+`offload/loopback.rs:1026`
+
+The guard checks that a supplied id names *some* configured AI tab, not one
+belonging to the asserted consumer. A caller may therefore key a latch under
+`("claude", <an OpenCode tab's id>)`. Harmless on `/audit/run` today — a
+cross-keyed latch is freshly open and engages a latch nobody reads — but it
+means the consumer/tab pair is a *verified* pair on no route. Compounding: the
+empty-list escape means that with **zero** AI tabs configured any id resolves to
+`Scoped`; low severity (there is no contaminated tab to leak from in that state)
+but wider than the doc's "availability floor" framing admits.
+
+### F-5 — `/graph_run` and `/mcp/call` share H-8's tab half
+
+`offload/loopback.rs:2288-2310` · `:3728+`
+
+Both take `tab` optionally with the same `Anonymous ⇒ Ok(WriteTaint::Clean)`
+fail-open, and neither logs when the gate does not apply (`/graph_run` does not
+even distinguish `Unknown` — it calls `.into_scope()` directly). They do **not**
+share the consumer half: their `consumer` selects no capability toggle, only the
+latch key via `source_for_consumer`, so an arbitrary string collapses to
+`"claude"` and buys nothing.
+
+Not fixed with H-8, deliberately: unlike `/audit/run`, the fail-open here is a
+**locked decision** (`latch_scope`'s doc — "a tool call must never fail for lack
+of identity"), so closing it is a decision, not a bug fix. Both spawn paths for
+those children have carried `--tab` since V28, so the same argument H-8 used
+does apply. A shared helper is not obviously right: `/audit/run`'s remedy string
+is route-specific and `/mcp/call` reads its consumer from the query string; what
+is genuinely shared is a `require_tab`-style refusal plus the `scope.is_none()`
+warn.
+
+### F-6 — a silent-degradation path with no consumer (introduced by the H-2 fix)
+
+`oob/claude.rs` — `LiveSessionGate` / `record_names_session`
+
+The H-2 decode proof requires a transcript line carrying a top-level `sessionId`.
+If a future Claude CLI drops that field, the tap confirms nothing, forever:
+`mark_live_session` stops firing, V28 memory scoping degrades to unscoped and
+Usage stops flagging sessions active — quietly, with a green build.
+`SubagentState::drift_tick` does not cover this. Wants a canary of the same shape
+as the existing drift canaries: *N drains, bytes consumed, zero `sessionId`-
+bearing lines.* Filed against the standing rule that every quality signal needs a
+consumer — enforce, surface, or delete.
+
+### Scheduled work: the user-driven contamination clear path
+
+H-2 closed the forged reset by removing the only reset, which leaves an app
+restart as the sole exit. The owner's decision is that this ships with a
+**user-driven** clear instead, on the reasoning that the correct trust root is
+not *evidence* (any filesystem fact is forgeable by a model with a shell) but
+*authority* — a human acting in cImp's own UI is a fact no shell can fabricate,
+the same root the existing consent flows already use.
+
+Agreed shape, to be built as a V32 phase before release, after the remaining
+HIGHs:
+
+1. **A contamination event record** at `loopback.rs:1750-1752` — bounded by a
+   claim bit like the beacon's, carrying `ts_ms`, scope, tool, host. Closes F-3
+   and is the prerequisite for everything else.
+2. **H-9's pinning**, so that record is not evictable by 200 `context_note`
+   calls.
+3. **Checkpoint identity** — thread `session_id` + tab into
+   `WorkbenchService::on_prompt` (`/context/retrieve` already receives
+   `session_id` at `loopback.rs:2690-2692` and simply does not pass it) and into
+   the shadow-commit trailers. Turns correlation from nearest-preceding-by-wall-
+   clock into an exact match, and fixes the fact that two Claude tabs are
+   indistinguishable in the checkpoint stream.
+4. **The clear action** — a third `LatchAction`, an IPC command, a confirm
+   dialog, and its own audit row. Lives in the taint popover, **not** only in the
+   Timeline: the Timeline is a Workbench section gated on a setting that can be
+   off. Must also reset `beacon_flagged`/`latch_flagged`, or a re-contamination
+   after a false-positive clear is silent. Must **not** promote already-
+   quarantined notes — decision 10 keeps that behind the Memory view's own
+   review.
+5. **Timeline as the evidence surface** — a row-kind union (the view is fully
+   homogeneous today, so a non-checkpoint row is a new concept for it), merged by
+   time, with per-row actions.
+
+**The asymmetry to design against, because it runs opposite to intuition:**
+restoring a checkpoint rolls back files and **cannot** remove injected text from
+the model's context window. So *restore* is the case where clearing contamination
+is least justified, while *false-positive resume* is the case where the context
+has actually been judged benign. Owner's decision: after a restore the bit stays
+set and lifts only when the tap observes a genuine session rotation — which the
+H-2 decode proof can now attest honestly. This is the one place a filesystem
+signal is trustworthy, because we are waiting for evidence to *arrive* rather
+than accepting a claim to *drop* a guard.
+
+Known limits of the design, recorded so they are not rediscovered: checkpoints
+are per project root and the Timeline reads the app's launch cwd, so a tab
+running in a worktree writes checkpoints the Timeline never lists; and the latch
+path records *that* external content entered, never *what* looked suspicious, so
+a user judging "false positive" from a beacon row is judging "did WebFetch run",
+not "was the page malicious".

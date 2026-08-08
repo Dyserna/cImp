@@ -673,9 +673,12 @@ async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
 ///
 /// **What a dedup hit records — and deliberately does NOT record.** When the
 /// tree is unchanged this returns an EXISTING checkpoint, whose `origin` may
-/// name a different conversation (two tabs on one project root share this
-/// shadow repo, and `WorkbenchService::maybe_snapshot`'s min-gap throttle is
-/// per-root too). The existing checkpoint's `Session`/`Tab` trailers are left
+/// name a different conversation — two tabs on one project root share this
+/// shadow repo, and since V33 they no longer share
+/// `WorkbenchService::maybe_snapshot`'s min-gap throttle (it is keyed per
+/// `(root, tab)`), so a second tab reaching this function moments after the
+/// first is now the ORDINARY case rather than one the throttle mostly
+/// prevented. The existing checkpoint's `Session`/`Tab` trailers are left
 /// **exactly as they were written**: they are a record of who took *that*
 /// snapshot, and retro-writing the current caller's identity onto it would be
 /// the "silently mislabel an existing checkpoint" failure — it would also

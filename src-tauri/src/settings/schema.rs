@@ -2470,9 +2470,17 @@ pub struct WorkbenchSettings {
     pub checkpoint_burst_files: u32,
     /// Time window (seconds) the burst-file count above is measured over.
     pub checkpoint_burst_window_s: u32,
-    /// Minimum seconds between any two automatic snapshots (prompt-tap OR
-    /// burst), so a rapid-fire prompt sequence or a noisy save loop can't
-    /// spam the shadow repo with near-duplicate commits.
+    /// Minimum seconds between two automatic snapshots FROM THE SAME SOURCE,
+    /// so a rapid-fire prompt sequence or a noisy save loop can't spam the
+    /// shadow repo with near-duplicate commits.
+    ///
+    /// "Source" is the AI tab the prompt came from — the burst trigger, which
+    /// belongs to no tab, is its own source. The gap is therefore enforced per
+    /// `(project, tab)` rather than per project (V33): with two AI tabs on one
+    /// project, each tab's prompt can take its own checkpoint inside the
+    /// other's cooldown, which is what lets the Timeline say which checkpoint
+    /// was live for a GIVEN tab. The cost, accepted deliberately: snapshot
+    /// volume scales with the number of active tabs on a project.
     pub checkpoint_min_gap_s: u32,
 }
 

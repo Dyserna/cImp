@@ -6682,8 +6682,16 @@
                 )}
             />
           </label>
+          <small class="hint">
+            The minimum gap is enforced per AI tab, not per project: with two
+            tabs open on one project, each tab's prompt can still take its own
+            checkpoint inside the other's cooldown — so the Timeline can show
+            which checkpoint was live for a given tab. Two tabs editing one
+            working tree do interleave their checkpoints, so restoring one
+            tab's checkpoint can roll back the other's work.
+          </small>
           <label>
-            <span>Minimum gap between snapshots (seconds)</span>
+            <span>Minimum gap between snapshots, per tab (seconds)</span>
             <input
               type="number"
               min="1"

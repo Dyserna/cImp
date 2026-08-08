@@ -75,19 +75,12 @@ pub struct WorkbenchService {
     app: AppHandle,
     settings: SettingsHandle,
     fs_batch_tx: broadcast::Sender<FsBatch>,
-    /// Phase C §C3: the min-gap gate every AUTOMATIC checkpoint trigger
-    /// (prompt-tap, burst) shares — keyed PER PROJECT ROOT (FIX 4 / V13 code
-    /// review: this used to be a single global `Mutex<Option<Instant>>`, so
-    /// a checkpoint in project A would swallow project B's within the
-    /// min-gap — a checkpoint that never fires for a distinct project just
-    /// because some OTHER project happened to checkpoint moments earlier).
-    /// Mirrors [`Self::burst_state`]'s per-root shape. No entry for a root
-    /// until its first automatic OR manual snapshot fires.
-    /// [`checkpoint_now`](Self::checkpoint_now) (the manual trigger) bypasses
-    /// the gate itself but still updates its root's entry, so a manual
-    /// checkpoint counts toward that root's next automatic trigger's
-    /// cooldown.
-    checkpoint_last: Mutex<HashMap<PathBuf, Instant>>,
+    /// Phase C §C3: the `checkpoint_min_gap_s` gate every AUTOMATIC
+    /// checkpoint trigger (prompt-tap, burst) shares, plus the background
+    /// snapshot job it admits. See [`CheckpointScheduler`] for the key it
+    /// throttles on and why it is a struct of its own rather than a bare map
+    /// field here.
+    checkpoints: CheckpointScheduler,
     /// Phase C §C3 burst trigger: per-root rolling window of distinct
     /// changed paths seen since the window last reset. Keyed by project root
     /// since multiple projects can be open in different tabs at once.
@@ -118,6 +111,157 @@ type CachedCommitTimes = (Instant, Arc<Vec<(String, i64)>>);
 struct BurstState {
     paths: HashSet<String>,
     window_start: Instant,
+}
+
+/// The bucket [`CheckpointScheduler`]'s min-gap gate throttles on: a canonical
+/// project root ([`git::canonical_path`], so two spellings of one project share
+/// a bucket) PLUS the [`shadow::Origin::tab`] the checkpoint belongs to.
+///
+/// **`None` is one shared bucket, not a bypass and not a per-caller bucket.**
+/// The only automatic trigger that reaches the gate without a tab is the burst
+/// trigger ([`WorkbenchService::handle_fs_batch_for_burst`] — it sees an
+/// `FsBatch`, never a conversation); the manual and pre-restore triggers do not
+/// go through the gate at all. Giving the tab-less callers their own bucket is
+/// what keeps a busy tab from starving the burst trigger, which exists
+/// precisely to cover the edits no tab's prompt hook can see (a shell tab, an
+/// external editor) — folding them in with a tab, or with each other per
+/// trigger, would either silence that fallback or exempt filesystem noise from
+/// the one gate that debounces it. Bursts therefore still throttle each other,
+/// which is the whole point of the gate for them.
+///
+/// **Only the tab, not the session.** A tab's session id rolls over (`/clear`,
+/// a restart) while the tab stays the same, so keying on the session too would
+/// mint an unbounded stream of new buckets over a long-lived tab — a slow
+/// throttle leak, and unnecessary: sessions within one tab are sequential, so
+/// the tab already names the concurrency the owner asked to separate.
+type CheckpointKey = (PathBuf, Option<String>);
+
+/// Everything one snapshot job needs out of settings, read once by
+/// [`WorkbenchService::maybe_snapshot`] and handed to the scheduler — so the
+/// scheduler itself has no dependency on `SettingsHandle` or `AppHandle` and
+/// can be exercised directly against a real shadow repo in tests.
+#[derive(Clone, Debug)]
+struct SnapshotParams {
+    /// `workbench.checkpoint_min_gap_s`, as a `Duration`.
+    min_gap: Duration,
+    /// `graph.ignore` — forwarded to [`shadow::snapshot`]'s `extra_ignore`.
+    extra_ignore: Vec<String>,
+    /// `graph.max_file_bytes`.
+    max_file_bytes: u64,
+    /// `workbench.checkpoint_max`, for the opportunistic [`shadow::gc`].
+    checkpoint_max: u32,
+    /// `workbench.checkpoint_max_age_days`, likewise.
+    checkpoint_max_age_days: u32,
+}
+
+/// The automatic-checkpoint min-gap gate and the background snapshot it
+/// admits.
+///
+/// **Split out of [`WorkbenchService`] deliberately.** The service owns a Tauri
+/// `AppHandle`, and this crate builds `tauri` without its `test` feature, so
+/// there is no way to construct one in a unit test; a gate living directly on
+/// the service could only ever be "tested" by re-implementing its keying inside
+/// the test, which would keep passing after the real gate regressed. Everything
+/// the gate needs (`last`, plus [`SnapshotParams`]) lives here instead, so the
+/// tests below drive the *real* gate composed with the *real*
+/// [`shadow::snapshot`] against a temp repo.
+#[derive(Default)]
+struct CheckpointScheduler {
+    /// Last checkpoint time per [`CheckpointKey`]. No entry for a key until
+    /// its first automatic OR manual snapshot fires.
+    last: Mutex<HashMap<CheckpointKey, Instant>>,
+}
+
+impl CheckpointScheduler {
+    /// Opportunistic eviction bound for [`Self::last`], mirroring
+    /// [`WorkbenchService::BURST_STATE_MAX_AGE`]'s reasoning — but note the
+    /// eviction below uses `max(min_gap, this)`, which makes it provably
+    /// decision-neutral: an evicted entry is by construction older than
+    /// `min_gap`, so it could only ever have ADMITTED the next checkpoint
+    /// anyway. It exists purely so a bucket for a tab the user has since
+    /// deleted from their config, or a project root closed hours ago, does not
+    /// sit in the map for the rest of the app's lifetime.
+    const ENTRY_MAX_AGE: Duration = Duration::from_secs(3600);
+
+    /// The bucket `origin` checkpoints into on `root`. Canonicalizes the root
+    /// here, once, so every writer (prompt-tap, burst, manual, restore) keys
+    /// the same way no matter how its caller spelled the path.
+    fn key(root: &Path, origin: &shadow::Origin) -> CheckpointKey {
+        (git::canonical_path(root), origin.tab.clone())
+    }
+
+    /// The gate: `true` (and the bucket is stamped `now`) when `key` has not
+    /// checkpointed within `min_gap`, `false` when it has. Check and stamp are
+    /// one critical section, so two prompts racing on one tab can never both
+    /// pass.
+    fn admit(&self, key: CheckpointKey, min_gap: Duration) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.retain(|_, t| t.elapsed() < min_gap.max(Self::ENTRY_MAX_AGE));
+        if last.get(&key).is_some_and(|prev| prev.elapsed() < min_gap) {
+            return false;
+        }
+        last.insert(key, Instant::now());
+        true
+    }
+
+    /// Stamp `origin`'s bucket without gating anything — for the triggers that
+    /// deliberately bypass the gate but should still start their own bucket's
+    /// cooldown ([`WorkbenchService::checkpoint_now`] and
+    /// [`WorkbenchService::restore`], both `Origin::default()`, i.e. the
+    /// tab-less bucket).
+    fn record(&self, root: &Path, origin: &shadow::Origin) {
+        self.last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Self::key(root, origin), Instant::now());
+    }
+
+    /// Gate, then run the snapshot (+ opportunistic gc) on a background task
+    /// so no caller ever blocks on a `git` round trip. `None` when the gate
+    /// throttled this trigger; otherwise the spawned task's handle, which
+    /// production drops (fire-and-forget — a dropped tauri `JoinHandle`
+    /// detaches, it does not abort) and the tests await so they can assert on
+    /// the shadow repo afterwards deterministically.
+    fn spawn_if_due(
+        &self,
+        root: &Path,
+        label: String,
+        trigger: shadow::Trigger,
+        origin: shadow::Origin,
+        params: SnapshotParams,
+    ) -> Option<tauri::async_runtime::JoinHandle<()>> {
+        let key = Self::key(root, &origin);
+        if !self.admit(key.clone(), params.min_gap) {
+            return None;
+        }
+        // `key.0` is the already-canonicalized root — snapshot the same
+        // spelling the gate keyed on.
+        let root = key.0;
+        Some(tauri::async_runtime::spawn(async move {
+            match shadow::snapshot(
+                &root,
+                &label,
+                trigger,
+                &origin,
+                &params.extra_ignore,
+                params.max_file_bytes,
+            )
+            .await
+            {
+                Ok(_) => {
+                    if let Err(e) =
+                        shadow::gc(&root, params.checkpoint_max, params.checkpoint_max_age_days)
+                            .await
+                    {
+                        warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed")
+                }
+            }
+        }))
+    }
 }
 
 /// Backend-facing status for the Workbench tab's top-of-view banner (A2): is
@@ -186,7 +330,7 @@ impl WorkbenchService {
             app,
             settings,
             fs_batch_tx,
-            checkpoint_last: Mutex::new(HashMap::new()),
+            checkpoints: CheckpointScheduler::default(),
             burst_state: Mutex::new(HashMap::new()),
             worktree_check_cache: Mutex::new(HashMap::new()),
             commit_times_cache: Mutex::new(HashMap::new()),
@@ -220,19 +364,25 @@ impl WorkbenchService {
     /// least `checkpoint_burst_files` distinct paths within
     /// `checkpoint_burst_window_s` (the window resets on fire OR on going
     /// stale). [`maybe_snapshot`](Self::maybe_snapshot) separately enforces
-    /// `checkpoint_min_gap_s`, so a burst that fires right after a prompt-tap
-    /// snapshot is still debounced there.
+    /// `checkpoint_min_gap_s` against the TAB-LESS bucket (see
+    /// [`CheckpointKey`]), so consecutive bursts still debounce each other —
+    /// but, since V33's per-`(root, tab)` keying, a burst is no longer
+    /// debounced by a prompt-tap snapshot moments earlier, nor vice versa. That
+    /// is the intended direction of the change: the burst trigger's whole job
+    /// is to catch the edits no tab's prompt hook sees, which it can only do if
+    /// a busy tab cannot starve it.
     async fn handle_fs_batch_for_burst(&self, batch: FsBatch) {
         let cfg = self.settings.current();
         if !cfg.workbench.checkpoints {
             return;
         }
         // Normalize the root to a single canonical form: `batch.root` arrives
-        // as a `root.display()` string round-trip, while the prompt-tap path
-        // keys `checkpoint_last` from a raw `&Path`. Without normalizing, the
-        // two representations of the same project become distinct map keys and
-        // the shared `checkpoint_min_gap_s` debounce stops working across the
-        // burst and prompt triggers.
+        // as a `root.display()` string round-trip, while every other caller
+        // passes a raw `&Path`. Without normalizing, the two representations of
+        // the same project become distinct `burst_state` keys and the rolling
+        // window silently splits in two. (`CheckpointScheduler` canonicalizes
+        // its own key, so the min-gap gate no longer depends on this — but
+        // `burst_state`, right below, still does.)
         let root = git::canonical_path(&PathBuf::from(&batch.root));
         let burst_files = cfg.workbench.checkpoint_burst_files.max(1) as usize;
         let window = Duration::from_secs(cfg.workbench.checkpoint_burst_window_s.max(1) as u64);
@@ -280,23 +430,37 @@ impl WorkbenchService {
     }
 
     /// Phase C §C3: the shared entry point for the two AUTOMATIC triggers
-    /// (prompt-tap, burst). Enforces `checkpoint_min_gap_s` against `root`'s
-    /// own entry in the per-root `checkpoint_last` gate (so a rapid prompt
-    /// sequence or a burst right after a prompt-tap snapshot can't spam the
-    /// shadow repo — independently per project root), then
-    /// does the actual `shadow::snapshot` + opportunistic `shadow::gc` on a
-    /// background task so the caller (a prompt hook, an fs-batch handler)
-    /// never blocks on it — per the milestone's "never block a prompt or the
-    /// UI thread" contract (C2). No-op entirely when checkpoints are off.
+    /// (prompt-tap, burst). Enforces `checkpoint_min_gap_s`, then does the
+    /// actual `shadow::snapshot` + opportunistic `shadow::gc` on a background
+    /// task so the caller (a prompt hook, an fs-batch handler) never blocks on
+    /// it — per the milestone's "never block a prompt or the UI thread"
+    /// contract (C2). No-op entirely when checkpoints are off.
     ///
-    /// **The throttle is per ROOT, not per origin, and stays that way.** Two
-    /// Claude tabs on one project root share this gate, so a prompt in tab B
-    /// inside tab A's cooldown produces no checkpoint at all — B's identity is
-    /// then simply absent from the Timeline for that window rather than
-    /// attached to A's checkpoint. That is deliberate: identity changes what a
-    /// checkpoint *records*, never *when* one is taken (the alternative — a
-    /// per-origin gate — would multiply shadow-repo writes by the number of
-    /// open tabs, which is the spam this gate exists to prevent).
+    /// **The throttle is per `(project root, tab)`** — see [`CheckpointKey`]
+    /// for the exact bucket, including what a trigger with no tab keys on. It
+    /// was per project root alone until V33: two AI tabs on one root shared one
+    /// cooldown, so a prompt in tab B inside tab A's window produced no
+    /// checkpoint at all and B's identity was simply missing from the Timeline
+    /// for that window — which the contamination correlation this milestone
+    /// builds needs, since it answers "which checkpoint was live when THIS tab
+    /// went bad". The accepted cost, decided with the trade-off on the table:
+    /// shadow-repo write volume now scales with the number of ACTIVE tabs, and
+    /// two tabs editing one working tree interleave their checkpoints, so
+    /// restoring one tab's checkpoint can roll back the other tab's work.
+    ///
+    /// **Per-tab throttling does NOT mean every tab gets its own checkpoint.**
+    /// The gate is only the first of two filters. `shadow::snapshot`'s dedup is
+    /// the second: when the working tree is byte-identical to the last
+    /// checkpoint's tree it commits nothing and hands back that EXISTING
+    /// checkpoint, and (by design — see `shadow::snapshot`'s doc comment) does
+    /// not relabel it with the current caller's identity. So a tab whose prompt
+    /// arrives with no file changes since the previous checkpoint still ends up
+    /// with no checkpoint of its own, no matter how long the gap has been; what
+    /// this change guarantees is narrower and is the guarantee the feature
+    /// actually needs — **a tab whose prompt follows real file changes always
+    /// gets its own labelled checkpoint, even inside another tab's cooldown.**
+    /// That is correct rather than a gap: a checkpoint names a tree STATE, and
+    /// an identical tree needs no second snapshot to be restorable.
     async fn maybe_snapshot(
         &self,
         root: &Path,
@@ -308,49 +472,19 @@ impl WorkbenchService {
             return;
         }
         let cfg = self.settings.current();
-        let min_gap = Duration::from_secs(cfg.workbench.checkpoint_min_gap_s as u64);
-        // Canonicalize so this gate keys on the same form as every other
-        // `checkpoint_last` writer (burst, manual, restore) regardless of how
-        // the caller spelled `root`.
-        let root = git::canonical_path(root);
-        {
-            let mut last = self
-                .checkpoint_last
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(prev) = last.get(&root) {
-                if prev.elapsed() < min_gap {
-                    return;
-                }
-            }
-            last.insert(root.clone(), Instant::now());
-        }
-        let extra_ignore = cfg.graph.ignore.clone();
-        let max_file_bytes = cfg.graph.max_file_bytes;
-        let checkpoint_max = cfg.workbench.checkpoint_max;
-        let checkpoint_max_age_days = cfg.workbench.checkpoint_max_age_days;
-        tauri::async_runtime::spawn(async move {
-            match shadow::snapshot(
-                &root,
-                &label,
-                trigger,
-                &origin,
-                &extra_ignore,
-                max_file_bytes,
-            )
-            .await
-            {
-                Ok(_) => {
-                    if let Err(e) = shadow::gc(&root, checkpoint_max, checkpoint_max_age_days).await
-                    {
-                        warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed");
-                    }
-                }
-                Err(e) => {
-                    warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed")
-                }
-            }
-        });
+        let params = SnapshotParams {
+            min_gap: Duration::from_secs(cfg.workbench.checkpoint_min_gap_s as u64),
+            extra_ignore: cfg.graph.ignore.clone(),
+            max_file_bytes: cfg.graph.max_file_bytes,
+            checkpoint_max: cfg.workbench.checkpoint_max,
+            checkpoint_max_age_days: cfg.workbench.checkpoint_max_age_days,
+        };
+        // Fire-and-forget: the handle is deliberately dropped (a dropped tauri
+        // `JoinHandle` detaches rather than aborting), so this returns as soon
+        // as the gate has been consulted.
+        let _ = self
+            .checkpoints
+            .spawn_if_due(root, label, trigger, origin, params);
     }
 
     /// Phase C §C3 prompt-tap trigger: called from `offload/loopback.rs`'s
@@ -390,9 +524,15 @@ impl WorkbenchService {
     /// [`maybe_snapshot`](Self::maybe_snapshot)'s min-gap gate or its
     /// background-task indirection — an explicit "Checkpoint now" click is a
     /// deliberate user action awaiting a real result (the new checkpoint id),
-    /// not something to silently throttle or defer. It still updates
-    /// `checkpoint_last` so a subsequent AUTOMATIC trigger's cooldown counts
-    /// from this snapshot too (no back-to-back auto + manual spam).
+    /// not something to silently throttle or defer. It still stamps the gate
+    /// so a subsequent AUTOMATIC trigger's cooldown counts from this snapshot
+    /// too (no back-to-back auto + manual spam) — the TAB-LESS bucket
+    /// (`Origin::default()`), which since V33's per-`(root, tab)` keying means
+    /// it debounces the burst trigger and no longer silences a tab's next
+    /// prompt-tap. That follows the same rule the rest of the gate now obeys —
+    /// an identity is throttled only by its OWN recent checkpoints — and
+    /// stamping every tab's bucket from here would reintroduce exactly the
+    /// cross-identity starvation the per-tab key was chosen to remove.
     ///
     /// Deliberately `Origin::default()`: a "Checkpoint now" click comes from the
     /// Workbench panel, not from a conversation, so there is no session and no
@@ -416,10 +556,7 @@ impl WorkbenchService {
             cfg.graph.max_file_bytes,
         )
         .await?;
-        self.checkpoint_last
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(git::canonical_path(root), Instant::now());
+        self.checkpoints.record(root, &shadow::Origin::default());
         if let Err(e) = shadow::gc(
             root,
             cfg.workbench.checkpoint_max,
@@ -463,8 +600,16 @@ impl WorkbenchService {
     /// `id`. `delete_new` gates invariant D (files created since the
     /// checkpoint are deleted only when explicitly requested) — see
     /// `shadow::restore`'s doc comment for the full sequence and every
-    /// safety invariant it upholds. Updates `checkpoint_last` for the same
-    /// reason [`checkpoint_now`](Self::checkpoint_now) does.
+    /// safety invariant it upholds. Stamps the gate's tab-less bucket for the
+    /// same reason (and with the same consequences as)
+    /// [`checkpoint_now`](Self::checkpoint_now) does.
+    ///
+    /// **Invariant C is upheld upstream of the gate, not by it.** The
+    /// pre-restore safety snapshot is taken inside `shadow::restore` via
+    /// `snapshot_inner`, which never consults `checkpoint_min_gap_s` at all —
+    /// so no throttle bucket, a tab's or the tab-less one, can swallow the
+    /// snapshot that makes a restore undoable. The stamp below happens strictly
+    /// AFTER the restore has returned.
     pub async fn restore(
         &self,
         root: &Path,
@@ -480,10 +625,7 @@ impl WorkbenchService {
             cfg.graph.max_file_bytes,
         )
         .await?;
-        self.checkpoint_last
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(git::canonical_path(root), Instant::now());
+        self.checkpoints.record(root, &shadow::Origin::default());
         Ok(report)
     }
 
@@ -1007,6 +1149,471 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    // ---- V33 per-`(root, tab)` checkpoint throttle -------------------------
+    //
+    // These drive the REAL [`CheckpointScheduler`] (the gate `maybe_snapshot`
+    // calls) composed with the REAL `shadow::snapshot`, against a real temp
+    // shadow repo. `WorkbenchService` itself is unreachable from a unit test —
+    // it owns a Tauri `AppHandle` and this crate builds `tauri` without its
+    // `test` feature — which is why the gate lives on a struct of its own; the
+    // only production step not covered here is `maybe_snapshot`'s three-line
+    // settings read + `spawn_if_due` call.
+
+    /// A bare project directory (no user git repo needed — the shadow repo is
+    /// self-contained). Under `std::env::temp_dir()`, matching `shadow.rs`.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wb-gate-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `min_gap_s` is the only knob any of these tests vary; the rest are the
+    /// shipped defaults.
+    fn gate_params(min_gap_s: u64) -> SnapshotParams {
+        SnapshotParams {
+            min_gap: Duration::from_secs(min_gap_s),
+            extra_ignore: Vec::new(),
+            max_file_bytes: 1_000_000,
+            checkpoint_max: 100,
+            checkpoint_max_age_days: 7,
+        }
+    }
+
+    /// One AI tab's identity. Distinct session ids on purpose: the gate must
+    /// key on the TAB, so two tabs stay two buckets and one tab's rolling
+    /// session ids stay one.
+    fn tab_origin(tab: &str) -> shadow::Origin {
+        shadow::Origin::new(
+            Some("claude".to_string()),
+            Some(format!("session-of-{tab}")),
+            Some(tab.to_string()),
+        )
+    }
+
+    /// Fire one automatic trigger exactly as `maybe_snapshot` does, then WAIT
+    /// for the spawned snapshot task so the assertions that follow see a
+    /// settled shadow repo. Returns whether the gate admitted it.
+    async fn fire(
+        sched: &CheckpointScheduler,
+        root: &Path,
+        label: &str,
+        trigger: shadow::Trigger,
+        origin: shadow::Origin,
+        params: &SnapshotParams,
+    ) -> bool {
+        match sched.spawn_if_due(root, label.to_string(), trigger, origin, params.clone()) {
+            Some(handle) => {
+                handle.await.expect("checkpoint task");
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// **The point of the per-`(root, tab)` key.** Two tabs on one project
+    /// root, both prompting well inside one `checkpoint_min_gap_s` window,
+    /// each get their OWN checkpoint carrying their OWN tab id.
+    ///
+    /// The `b.txt` write between the two prompts is load-bearing: with no file
+    /// change, `snapshot`'s dedup would hand tab B tab A's existing checkpoint
+    /// and the test would pass on the dedup path while proving nothing about
+    /// the throttle. With it, a regression to per-root keying leaves exactly
+    /// one checkpoint and this fails.
+    #[tokio::test]
+    async fn two_tabs_on_one_root_each_get_their_own_checkpoint_inside_one_gap_window() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("two-tabs");
+        let sched = CheckpointScheduler::default();
+        // A gap far longer than the test: every prompt below is "inside the
+        // window" by construction, with no timing race.
+        let params = gate_params(3600);
+
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: from tab a",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await,
+            "the first prompt on a cold gate must always be admitted"
+        );
+
+        std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: from tab b",
+                shadow::Trigger::Prompt,
+                tab_origin("opencode"),
+                &params
+            )
+            .await,
+            "a second TAB on the same root must not be throttled by the first"
+        );
+
+        let cps = shadow::list(&dir).await.expect("list");
+        let tabs: Vec<Option<String>> = cps.iter().map(|c| c.tab.clone()).collect();
+        assert_eq!(
+            tabs,
+            vec![Some("claude".to_string()), Some("opencode".to_string())],
+            "each tab must have a checkpoint labelled with its own id: {cps:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: making the key per-tab must NOT make it
+    /// a no-op. One tab prompting twice inside its own gap is still throttled.
+    ///
+    /// `c.txt` is written before the second prompt so that a gate which stopped
+    /// throttling would actually mint a second checkpoint (dedup would hide the
+    /// regression otherwise) — i.e. this test cannot pass by accident on the
+    /// dedup path.
+    #[tokio::test]
+    async fn one_tab_prompting_twice_inside_the_gap_is_still_throttled() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("same-tab");
+        let sched = CheckpointScheduler::default();
+        let params = gate_params(3600);
+
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: one",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await
+        );
+
+        std::fs::write(dir.join("c.txt"), "c1\n").unwrap();
+        assert!(
+            !fire(
+                &sched,
+                &dir,
+                "prompt: two",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await,
+            "the SAME tab inside its own min-gap must still be throttled"
+        );
+
+        let cps = shadow::list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 1, "throttled prompt must not snapshot: {cps:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tab-less bucket, asserted in both directions (see [`CheckpointKey`]
+    /// for the decision): a burst is NOT starved by a tab that checkpointed
+    /// moments ago, and bursts DO still throttle each other.
+    #[tokio::test]
+    async fn tabless_triggers_share_one_bucket_that_no_tab_can_starve() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("tabless");
+        let sched = CheckpointScheduler::default();
+        let params = gate_params(3600);
+
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: tab a",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await
+        );
+
+        std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "activity",
+                shadow::Trigger::Burst,
+                shadow::Origin::default(),
+                &params
+            )
+            .await,
+            "a tab's checkpoint must not starve the tab-less (burst) bucket"
+        );
+
+        std::fs::write(dir.join("c.txt"), "c1\n").unwrap();
+        assert!(
+            !fire(
+                &sched,
+                &dir,
+                "activity",
+                shadow::Trigger::Burst,
+                shadow::Origin::default(),
+                &params
+            )
+            .await,
+            "tab-less triggers share ONE bucket, so they still debounce each other"
+        );
+
+        let cps = shadow::list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 2, "expected exactly two checkpoints: {cps:?}");
+        assert_eq!(cps[1].tab, None, "the burst checkpoint carries no tab");
+        assert_eq!(cps[1].trigger, shadow::Trigger::Burst);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Invariant C under the new key.** `restore`'s pre-restore safety
+    /// snapshot — the thing that makes a restore undoable — must be taken even
+    /// when every bucket the gate could possibly consult is inside its
+    /// cooldown. It is, because `shadow::restore` snapshots via
+    /// `snapshot_inner` and never touches the gate at all; this pins that.
+    #[tokio::test]
+    async fn pre_restore_snapshot_survives_a_hot_gate_on_every_bucket() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("pre-restore");
+        let sched = CheckpointScheduler::default();
+        let params = gate_params(3600);
+
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: tab a",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await
+        );
+        let target = shadow::list(&dir).await.expect("list")[0].id.clone();
+
+        std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "activity",
+                shadow::Trigger::Burst,
+                shadow::Origin::default(),
+                &params
+            )
+            .await
+        );
+
+        // Both buckets are now hot — proven, not assumed.
+        assert!(
+            !fire(
+                &sched,
+                &dir,
+                "prompt: tab a again",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await,
+            "precondition: the tab bucket must be inside its cooldown"
+        );
+        assert!(
+            !fire(
+                &sched,
+                &dir,
+                "activity",
+                shadow::Trigger::Burst,
+                shadow::Origin::default(),
+                &params
+            )
+            .await,
+            "precondition: the tab-less bucket must be inside its cooldown"
+        );
+
+        // Uncommitted work that only the pre-restore snapshot can save.
+        std::fs::write(dir.join("a.txt"), "v2-unsaved\n").unwrap();
+        let before = shadow::list(&dir).await.expect("list").len();
+
+        let report = shadow::restore(&dir, &target, false, &[], params.max_file_bytes)
+            .await
+            .expect("restore");
+
+        assert_ne!(
+            report.pre_restore_id, target,
+            "the pre-restore snapshot must be a NEW checkpoint, not a throttled/dedup reuse"
+        );
+        let cps = shadow::list(&dir).await.expect("list");
+        assert_eq!(
+            cps.len(),
+            before + 1,
+            "expected one new checkpoint: {cps:?}"
+        );
+        let pre = cps
+            .iter()
+            .find(|c| c.id == report.pre_restore_id)
+            .expect("pre-restore checkpoint listed");
+        assert_eq!(pre.trigger, shadow::Trigger::PreRestore);
+        // And the restore itself really ran (so this isn't passing on a no-op).
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "v1\n",
+            "the restore must have rolled a.txt back"
+        );
+        // ...and the undo point really holds the work that was rolled back.
+        let undone =
+            shadow::diff_vs_now(&dir, &report.pre_restore_id, &[], params.max_file_bytes, 3)
+                .await
+                .expect("diff vs the pre-restore checkpoint");
+        assert!(
+            undone.contains("v2-unsaved"),
+            "the pre-restore checkpoint must hold the pre-restore content: {undone}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The dedup interaction the `maybe_snapshot` doc comment warns about.**
+    /// Passing the gate is not the same as getting a checkpoint: with nothing
+    /// changed on disk, `snapshot` returns the existing checkpoint and commits
+    /// nothing — inside the window (where the gate refuses anyway) and outside
+    /// it (where the gate admits and dedup is the only thing standing there).
+    #[tokio::test]
+    async fn same_tab_with_no_file_changes_gets_no_new_checkpoint_either_way() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("dedup-same-tab");
+        let sched = CheckpointScheduler::default();
+
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: one",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &gate_params(3600)
+            )
+            .await
+        );
+        assert_eq!(shadow::list(&dir).await.expect("list").len(), 1);
+
+        // Inside the window: the GATE refuses.
+        assert!(
+            !fire(
+                &sched,
+                &dir,
+                "prompt: two",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &gate_params(3600)
+            )
+            .await
+        );
+        assert_eq!(shadow::list(&dir).await.expect("list").len(), 1);
+
+        // Outside the window (gap 0): the gate ADMITS, and dedup is what keeps
+        // the shadow repo from gaining a duplicate of an identical tree.
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: three",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &gate_params(0)
+            )
+            .await,
+            "with the gap elapsed the gate must admit — dedup, not the gate, is the filter here"
+        );
+        let cps = shadow::list(&dir).await.expect("list");
+        assert_eq!(
+            cps.len(),
+            1,
+            "an unchanged tree must not mint a second checkpoint: {cps:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The corollary the doc comment spells out, pinned so nobody "fixes" it:
+    /// per-tab THROTTLING does not imply a per-tab CHECKPOINT. Tab B passes
+    /// the gate, but with an unchanged tree it gets tab A's checkpoint back,
+    /// still labelled tab A — a checkpoint names a tree state, and this tree
+    /// state is already captured.
+    #[tokio::test]
+    async fn a_second_tab_with_no_changes_does_not_relabel_the_existing_checkpoint() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("dedup-two-tabs");
+        let sched = CheckpointScheduler::default();
+        let params = gate_params(3600);
+
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: tab a",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await
+        );
+        // No file change at all before tab B's prompt.
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: tab b",
+                shadow::Trigger::Prompt,
+                tab_origin("opencode"),
+                &params
+            )
+            .await,
+            "the gate must admit tab B — it has its own bucket"
+        );
+
+        let cps = shadow::list(&dir).await.expect("list");
+        assert_eq!(
+            cps.len(),
+            1,
+            "dedup: identical tree, one checkpoint: {cps:?}"
+        );
+        assert_eq!(
+            cps[0].tab,
+            Some("claude".to_string()),
+            "the existing checkpoint keeps the identity that took it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn setup_repo(tag: &str) -> std::path::PathBuf {

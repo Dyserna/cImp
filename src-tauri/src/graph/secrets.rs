@@ -211,7 +211,12 @@ mod tests {
             ),
             (
                 "secret_slack_token",
-                "xoxb-1234567890-0987654321-abcdefghijklmnop",
+                // Split so the sample never appears contiguously in the file:
+                // it is synthetic, but shaped well enough that repo-side
+                // scanners (GitHub push protection, gitleaks) flag it and
+                // block the push. `concat!` folds it back at compile time, so
+                // `screen` still sees the whole token.
+                concat!("xoxb", "-1234567890-0987654321-", "abcdefghijklmnop"),
             ),
             (
                 "secret_anthropic_api_key",
@@ -228,7 +233,11 @@ mod tests {
                 "secret_google_api_key",
                 "AIzaSyB1234567890abcdefghijklmnopqrstuv",
             ),
-            ("secret_stripe_key", "sk_live_0123456789abcdefghijklmnop"),
+            (
+                // Split for the same reason as the Slack sample above.
+                "secret_stripe_key",
+                concat!("sk", "_live_", "0123456789abcdefghijklmnop"),
+            ),
             (
                 "secret_json_web_token",
                 "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",

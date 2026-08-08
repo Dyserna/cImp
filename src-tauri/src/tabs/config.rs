@@ -999,7 +999,8 @@ fn compose_capability_guidance(cfg: &AiToolTabConfig, settings: &Settings) -> St
 /// `build_opencode_config` (everything else) already split.
 ///
 /// V32 Phase G adds the feature gate above that: consumer hygiene is one of the
-/// ten switchable controls, and the paragraph is spawn-baked, so its L2 and L3
+/// eleven switchable controls (ten until Phase H added `opencode_native_gate`;
+/// count corrected 2026-08-08, #48), and the paragraph is spawn-baked, so its L2 and L3
 /// both ride `spawn_inject_sig`. The advertise gate stays *underneath* the
 /// switch — with no cImp tool surface there is no marker vocabulary to teach,
 /// whatever the switch says.
@@ -1454,9 +1455,19 @@ fn sweep_stale_opencode_plugins(dir: &Path, settings: &Settings) {
 /// ran unobserved. The write condition is therefore the OR of every consumer's
 /// need, and each handler carries its own baked flag inside the file.
 ///
-/// Pure (settings in, bool out) so both `write_opencode_plugin` and
-/// [`spawn_inject_sig`] read the same predicate and the restart hint can never
-/// disagree with what a fresh tab would write.
+/// Pure (settings in, bool out), so the write condition is one expression a
+/// reviewer can read in one place.
+///
+/// **Corrected 2026-08-08 (#48, review Part 7 item 10).** This used to say
+/// "so both `write_opencode_plugin` and [`spawn_inject_sig`] read the same
+/// predicate and the restart hint can never disagree with what a fresh tab
+/// would write". Only the first of those calls it. `spawn_inject_sig`
+/// **reconstructs** the condition: `graph.enabled` rides its `plugin[0]` entry,
+/// and the native-web and Phase H halves ride
+/// `injection::spawn_sig(s, Consumer::Opencode)` instead. The two do add up
+/// today — that is asserted, not assumed — but by argument rather than by
+/// construction, so **a fourth disjunct added here needs a matching
+/// `spawn_inject_sig` input or the plugin changes with no restart hint.**
 ///
 /// V32 Phase G: per-TAB, because the sensor half is now resolved per tab. The
 /// graph half is app-wide and stays so.

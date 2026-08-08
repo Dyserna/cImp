@@ -346,7 +346,9 @@ cargo/npm — check their sources manually.
 | Whisper STT model | `ggml-small.bin` (~466 MB, MIT) — fetched from the `models-v1` GitHub release, verified vs `models/CHECKSUMS.txt` | whisper.cpp ggml model releases. **Same policy as the TTS model (issue #16): no swap without a new capability — don't re-suggest incremental upgrades.** |
 | `llama-server` (llama.cpp) | offload backend **and** embedding server; user-run, not bundled | <https://github.com/ggml-org/llama.cpp/releases> — rebuild/redownload periodically. |
 | Offload model | Qwen3.6-35B-A3B (GGUF, quantized) on the local llama-server | newer Qwen / quant releases. |
-| Embedding model | Qwen3-Embedding-4B Q8_0, 2560-dim, on `mcp1:8085` (RTX 3070) | re-embed the graph if you change model/dims (auto-probed). |
+| Embedding model | Qwen3-Embedding-4B Q8_0, 2560-dim, on `mcp1:12344` (RTX 3070) — **port corrected 2026-08-08; it has been 12344 since 2026-07-11 and this row still said 8085** | re-embed the graph if you change model/dims (auto-probed). |
+| Injection-detection rule bundle (V32 C3) | `detection/rules.d/*.yar` — seeded from the repo, thereafter replaced wholesale by the updater from the `detection-v1` GitHub release (`manifest.json` + `<version>-<file>.yar` assets, SHA-256 pinned). `rules.d/local/` is user-owned and never touched. | **OPEN DEPLOY FOLLOW-UP: the `detection-v1` release does not exist yet**, so every scheduled check ends `unavailable` and after a week raises one stall card per enabled component. Publish checklist in `detection/manifest.example.json` and the V32 C3 amendment; curate + re-publish as a maintenance-run task once it exists. |
+| Prompt Guard 2 22M weights (V32 C) | The classifier layer's ONNX weights, expected under the models dir via the `models-v1` pipeline. | **OPEN DEPLOY FOLLOW-UP: not published** (HF-gated; the Llama 4 Community Licence must be accepted, the model exported to ONNX, real SHA-256s written, and a non-colliding asset name chosen). Until then the classifier is *gracefully inert* — Settings shows "weights not installed" and the signature layer carries detection alone. Placeholders + the full checklist are commented in `models/CHECKSUMS.txt`; keep the `classifier` component OUT of the published manifest until the weights land. |
 | Offload MCP servers | `ddg` + `context7` as Streamable-HTTP endpoints (`172.21.1.11:17201/17202`); plus stdio `git`/`fetch`/`fs`/`context7` | each MCP server's own repo; live-reloadable in Settings → Tools. |
 | WebView2 runtime | Windows system component (or installer-bundled) | OS-managed; relevant only if shipping an installer. |
 | Claude Code CLI | user-installed, self-updating; hosts the V10–V14 hook contracts (injection, PreCompact, read advisor, post-edit, statusline) | see **Claude Code / OpenCode CLIs — hook & plugin behavior contracts** below; re-check after visible CLI updates. |
@@ -685,17 +687,47 @@ validated rule bundles itself. The run now does two things instead:
    - Settings → Tools → Detection → *Detection updates* shows installed /
      available version, last-check time and the last outcome verbatim.
    - Tool Activity → filter `injection_flag`, source `updater` — one row per
-     check with `ok` reflecting the outcome (`applied` / `up-to-date` /
-     `available` / `reverted` are healthy, `rejected` is not).
-   - Advisor cards: `detection.update_available.v1` (something newer is
-     waiting on a decision) and `detection.update_failed.v1` (a bundle was
-     rejected; the old data is still live).
+     check, `ok` reflecting the outcome. **Seven outcomes, corrected
+     2026-08-08 (#48 split the taxonomy and this list was never updated):**
+     `applied` / `up-to-date` / `available` / `reverted` / **`unavailable`**
+     are healthy (`ok:true`); `rejected` and **`revert-failed`** are not.
+     `unavailable` means the channel did not produce our index at all — a 404,
+     DNS, offline, a captive portal — and is deliberately a quiet non-event
+     with no card, which is the state cImp ships in today until `detection-v1`
+     is published. `revert-failed` is `ok:false` but raises **no** card either:
+     a user action that did not do what it said is not a bundle refusal.
+   - Advisor cards: **five, not the two this list carried until 2026-08-08.**
+     `detection.update_available.v1` (something newer is waiting on a
+     decision), `detection.update_failed.v1` (a bundle was rejected; the old
+     data is still live), `detection.update_stalled.v1` (7 consecutive checks
+     that were not `applied`/`up-to-date` — the component has stopped getting
+     fresher, whatever the reason), `detection.signature_down.v1` (the layer is
+     switched on and compiled to **nothing** — this one is about data on disk,
+     not about the channel) and `detection.local_rules_broken.v1` (the user's
+     own `rules.d/local/` files failed to compile; suppressed while
+     `signature_down` is already up). All five are warn-only and signed.
    - On-disk record: `<exe-dir>/detection-updates/state.json`.
-   Two symptoms to act on: **checks that never happened** (`last_check_ms` far
-   in the past with the mode not `off` — the scheduler or the network is the
-   suspect) and **a component rejecting every bundle** — nothing is degraded,
-   but that component has stopped getting fresher, which is the failure the
-   whole phase exists to prevent.
+   Symptoms to act on:
+   - **Checks that never happened** — `last_check_ms` far in the past with the
+     mode not `off`. **Diagnosis corrected 2026-08-08 (#48):** this used to say
+     "the scheduler or the network is the suspect". The network is now the
+     *least* likely of the three, because a transport failure still reaches
+     `finish` and still stamps `last_check_ms` — an unreachable channel
+     produces a **fresh** timestamp with `unavailable` beside it, not a stale
+     one. The commonest cause today is the **feature switch**: `tick_once` is
+     gated on `effective(Feature::Detection, Scope::App)`, so *Injection
+     detection* off (or the L1 master off) stops the scheduler dead — no
+     polling, no network, no swap, and the manual buttons refuse from the IPC
+     command with a tooltip naming the switch. Check that first, then a mode of
+     `off` on the component, then the scheduler task itself.
+   - **A component that keeps refusing** — nothing is degraded, but that
+     component has stopped getting fresher, which is the failure the whole
+     phase exists to prevent. `stale_streak` is the counter that notices; the
+     stall card fires at 7 and is suppressed while a takeable offer stands.
+   - **The layer disarmed or the user's own rules broken** — `signature_down`
+     and `local_rules_broken` are the two cards about the *data*, not the
+     channel, and they are the ones a run is most likely to be the first to
+     see.
 2. **Curate the upstream bundle.** Refresh the rules from the Vigil / garak
    corpora and our own additions, publish them as `detection-v1` release assets
    with a new dated version, and grow `detection/smoke/` in the same change: a
@@ -707,15 +739,27 @@ Facts worth keeping in mind when something looks wrong:
 
 - **`rules.d/local/` is never touched** by the updater — structurally, not by a
   filter (`store::managed_rule_files` is non-recursive). Hand-written rules
-  survive every update; report anything else as a bug, not a config issue.
-- **Assets may only come from the manifest's own directory.** Artifact URLs
-  must start with the manifest URL minus its last segment, so a manifest cannot
-  redirect a download elsewhere. The `detection_update_manifest_url` override
-  moves both together — that is how a staged bundle is tested locally.
+  survive every update; report anything else as a bug, not a config issue. Nor
+  can a broken one **veto** an update any more (#48, U-4): the health check is
+  baseline-relative, forgiving only `local/` files that were already failing
+  before the swap, and it raises `detection.local_rules_broken.v1` instead of
+  rolling a good bundle back. A `local/` file that compiled before and fails
+  after — a collision the bundle introduced — still fails and still rolls back.
+- **Assets may only come from the manifest's own directory** — enforced by a
+  **parsed** structural compare (`manifest::AssetAnchor`: scheme, `Host`, port,
+  empty credentials, no query or fragment, normalized-path prefix), not a
+  string `starts_with`, which dot-segment traversal walked past until #48. The
+  fetch client also refuses redirects outright, and `http://` is accepted only
+  for loopback hosts. The `detection_update_manifest_url` override moves the
+  manifest and its assets together — that is how a staged bundle is tested
+  locally, and it is validated *before* the fetch, so a bad override costs zero
+  requests.
 - **Validation gates, in order:** compiles clean (any rejected file fails the
-  whole bundle), compiles inside 5 s, scans each control document inside 750 ms,
-  no benign control matches, every hostile control matches. The last one is
-  what stops a match-nothing bundle from silently disabling the layer.
+  whole bundle), compiles inside 5 s, scans each control document inside
+  **1 s** (`validate::SCAN_BUDGET` *is* `signature::SCAN_TIMEOUT`; both read
+  750 ms until #48 corrected the live constant to the value yara-x actually
+  applies), no benign control matches, every hostile control matches. The last
+  one is what stops a match-nothing bundle from silently disabling the layer.
 - **A rejected bundle changes nothing on disk** and the previous version stays
   retained under `detection-updates/previous/`, one-click revertible in
   Settings.
@@ -1025,6 +1069,7 @@ spike is run, and record the outcome where the last column says.
 | **`tts-webgpu` on non-NVIDIA** | That the shipped WebGPU TTS backend works on an AMD/Intel GPU. | **open** — no such GPU available on the dev box | *Dependencies to track* → `ort` open follow-ups |
 | **`Notification` payload shape** (`notify_hook.rs`) | Whether the Claude Code `Notification` hook payload is flat (`{notification_type, message}`) or nested (`{notification: {type, message}}`) — the reference docs render both ways. The shim reads BOTH spellings; the app-side classifier falls back to prose matching, then the TUI-regex scanner backstops the whole path. | **unverified** — degrades gracefully (never to silence), but the parser carries double-read complexity until settled | Capture recipe in `notify_hook.rs`'s module doc (register `"command": "cat > file"` as a `Notification` hook, read the captured stdin); record the outcome there and simplify the parser once settled. Runs naturally alongside the issue #5 live-verify. |
 | **V30 OpenCode push contracts** *(placeholder — pre-release)* | When V30 (MCP channels / session-push fanout) merges: the OpenCode `noReply` injection behavior (safe only on OpenCode **≥ 1.18.13** — a *minimum-version* fact, the first in this doc) and the format-2 push file with per-slot aging both become harness-drift surfaces. | **pre-release** — at V30 release time, replace this row with real drift-table rows + live-verify recipes | V30 milestone docs (`docs/MILESTONE-V30*`); the drift table in *Claude Code / OpenCode CLIs* above |
+| **V32 injection-hardening harness contracts** *(placeholder — pre-release, added 2026-08-08)* | When V32 releases, four harness behaviours it rides become drift surfaces, and only the last of them has a drift-table row today: (1) **`PreToolUse` timeout semantics are UNDOCUMENTED** — the hooks reference gives the exit-code table and the `timeout` field but never says whether a timed-out hook blocks; `taint_beacon` is built to not depend on it (80 ms dispatch, never reads the reply), and a harness change that makes a timeout blocking would turn the `sensor` beacon into a silent deny. (2) **The Claude `--settings` overlay key set** — cImp emits `hooks` + `statusLine`, plus `permissions` in native-web `deny`; an upstream key rename or a stricter schema breaks the overlay silently, and the deny-mode key set has **no** test guarding it (V32 accepted residual). (3) **OpenCode loads every file in `.opencode/plugin/`** into every session in that directory — the per-tab `cimp-inject-<tab>.js` scheme is only safe while that stays true *and* `CIMP_TAB_ID` stays process-wide; `tool.execute.before` denying via `throw` is the gate's only mechanism. (4) The **OpenCode native tool registry** allowlist, which already has its own row above. | **pre-release** — at V32 release time, replace this row with real drift-table rows in *Claude Code / OpenCode CLIs* and fold live-verifies 12–22 into *Live-verify recipes* | `docs/MILESTONE-V32-injection-hardening.md` (Phases F/H amendments, Accepted residuals, live-verification 12–22); `src-tauri/src/taint_beacon.rs` module doc |
 
 ---
 

@@ -3700,11 +3700,20 @@ async fn handle_mcp_call(
     // `/graph_run` uses, so one tab keys one latch from both routes.
     let agent =
         crate::graph::source_for_consumer(query_param(&req.path, "consumer").unwrap_or("claude"));
-    // V32 Phase G: ONE settings read for the whole call, so the latch, the
-    // budget, the SSRF screen, detection and the envelope all resolve under the
-    // same snapshot — a mid-call settings save must not leave a result screened
-    // by one posture and wrapped by another. #45 adds the tab-id check inside
-    // `latch_scope` to that list, which is why the read precedes it.
+    // V32 Phase G: ONE settings read here, so the tab-id check, the latch, the
+    // budget, detection and the envelope all resolve under the same snapshot —
+    // a mid-call settings save must not leave a result screened by one posture
+    // and wrapped by another. #45 adds the tab-id check inside `latch_scope` to
+    // that list, which is why the read precedes it.
+    //
+    // Corrected 2026-08-08 (#48, review finding G-4): this comment also named
+    // "the SSRF screen", and that one is NOT resolved here. `ServiceHandle::mcp_call`
+    // builds `outbound::Policy` from its own independent `self.settings.current()`,
+    // so the SSRF guard can be a snapshot behind or ahead of everything above.
+    // Benign in practice (sub-millisecond, both postures the user's own) and
+    // recorded as an accepted residual in the V32 spec rather than fixed here;
+    // the fix is to thread `settings` into `mcp_call`. Do not restore the old
+    // wording without making it true.
     let settings = live_settings(app);
     let scope = latch_scope(app, &settings, agent, body.tab.as_deref()).into_scope();
     let inj_scope = crate::settings::injection::Scope::for_tab(agent, body.tab.as_deref());

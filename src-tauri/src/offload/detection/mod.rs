@@ -644,7 +644,7 @@ pub struct DetectionStatus {
     /// compile, when the signature layer is on and armed.
     ///
     /// The same [`updater::broken_local_rules`] value the Advisor's
-    /// `detection.broken_local_rules.v1` card is built from — published here so
+    /// `detection.local_rules_broken.v1` card is built from — published here so
     /// the Settings surface renders ONE predicate rather than re-deriving "is a
     /// failed file the user's" from the `local/` prefix in its own language
     /// (the N-3 lesson: a dot that computes its own health eventually disagrees

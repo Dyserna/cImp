@@ -63,11 +63,20 @@
 //!
 //! # Cost
 //!
-//! One process spawn plus one loopback round-trip, and ONLY on `WebFetch` /
+//! One process spawn plus one one-way loopback POST, and ONLY on `WebFetch` /
 //! `WebSearch` — the matcher installed in the `--settings` overlay is
-//! `WebFetch|WebSearch`, so `Read`/`Grep`/`Bash` pay nothing. The POST is
-//! capped by `context_hook`'s 600 ms socket timeout and the hook entry's own
-//! 2 s budget; both are fail-open.
+//! `WebFetch|WebSearch`, so `Read`/`Grep`/`Bash` pay nothing.
+//!
+//! **Corrected 2026-08-08 (#48, review Part 7 item 16.)** This paragraph said
+//! the POST is "capped by `context_hook`'s 600 ms socket timeout and the hook
+//! entry's own 2 s budget". Both numbers named the wrong things. This shim
+//! does not use `context_hook`'s timeout at all — it has its own
+//! [`DISPATCH_TIMEOUT`] of **80 ms**, applied to the connect and to the write,
+//! and it never reads the reply, so there is no third wait. The hook entry
+//! `tabs::config` writes carries `"timeout": 5` (**5 s**, the siblings' value),
+//! and that is a defence-in-depth ceiling on a pathological process spawn, not
+//! the mechanism that keeps the call safe — see the timeout-semantics note
+//! above. Both are fail-open.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};

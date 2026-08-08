@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F + G coded 2026-08-07; E (#37) pending; live-verifies pending, and C3's release-asset publishing is a blocking deploy follow-up (see its amendment). GitHub: milestone 5, umbrella #29.
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then sixteen fix commits `09dc7ec..aed6289` closing its HIGHs and most of its MEDIUMs. This document was audited against the code at `aed6289` on 2026-08-08 (#48) and every stale "as built" claim corrected in place — amendments dated 2026-08-08 are that pass. Remaining: live-verifies 1–22, and C3's release-asset publishing plus the Prompt Guard 2 weights are blocking deploy follow-ups (see the C3 and C amendments). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -142,6 +142,30 @@ memory; it is a user decision, not taken here.
 server must never default into TRUSTED or LOCAL-CAPABILITY. Reclassification
 is an explicit allowlist edit in the class table, reviewed like code.
 
+**Phase A amendment 2026-08-08 (#48, findings A-1 / N-4) — the invariant is
+about CLASSIFICATION; engaging the latch additionally requires a ROUTE.** This
+amendment was owed here and was written only into the decision 11 amendment,
+where a reader looking for "what does the class table promise" would not find
+it. `classify()` still answers EXTERNAL for every name it does not know, and
+nothing about that changed. What changed is the consequence: `agent.rs`'s
+`latch_gate` used to move the latch on that verdict alone, so a **misspelled
+local tool** — `graph_symbols` for `graph_search_docs` — was classified
+External and latched the task EXTERNAL *before* dispatch came back with
+"unknown native tool". The task then permanently lost all thirteen enforced
+LOCAL-CAPABILITY tools and was told by the fixed refusal that the latch cannot
+be unlocked. One typo from a local 30B model ended the task.
+
+The rule now: **an EXTERNAL classification engages the latch only on a route
+that can carry external content.** `LatchRoute::external_is_content()` is the
+one method both gates call (the proxy's had it since Phase B, writing down
+why; the worker had the same fact — `name.contains("__")` — and was not
+feeding it in). Because every proxied tool id contains `__` by construction,
+the restrictive default still governs every name that *can* carry external
+content, a hallucinated namespaced one included. What it excludes is the name
+that cannot carry any. The same one-route-computed-once value also feeds
+`external`, so an `ERROR: unknown native tool: …` string is no longer charged
+to the EXTERNAL fetch budget (N-4).
+
 The class table also carries a per-tool **`mutates_fs` attribute** (true for
 `run_command` and the harness-native Edit/Write/Bash entries; false for all
 reads/fetches). Its consumer is V33 Phase F (tool-sourced checkpoints fire
@@ -279,13 +303,30 @@ declares its class AND its mutation capability in one reviewed place.
    which have shifted across versions before (SDK v2 revert precedent).
    Exact values are a Phase D decision with the user; the milestone locks
    only that they are *pinned*.
-9. **Channel-content invariant gets a tripwire test.** Push content must
-   never carry text authored by an LLM, a scanner finding message, or fetched
-   content — only app-composed templates (`graph/service.rs:3449`,
-   `audit/runner.rs:1003` today). A test asserts every `PushNotice`
-   constructor call site uses static format strings; a future producer that
-   violates this upgrades ordinary injection into autonomous turn-starting
-   injection (V30 contract).
+9. **Channel-content invariant.** Push content must never carry text authored
+   by an LLM, a scanner finding message, or fetched content — only
+   app-composed templates (two producers today: the graph indexer's
+   completion notice and the audit runner's). A future producer that violates
+   this upgrades ordinary injection into autonomous turn-starting injection
+   (V30 contract).
+
+   **Amended 2026-08-07 (#47, user-decided) — the enforcement mechanism is a
+   TYPE, not a tripwire test; see the Phase D amendment for the full
+   reasoning.** As originally locked this decision read *"gets a tripwire
+   test"* and *"a test asserts every `PushNotice` constructor call site uses
+   static format strings"*. Both sentences are retired: `src/push_tripwire.rs`
+   is **deleted**, and the invariant is now held by `PushNotice`'s own
+   signature — `new(template: &'static str, args: &[&str], meta)`, a private
+   `content` field, no `Default`, and deserialization only through a
+   validating `TryFrom<PushNoticeWire>`. A composed `String` cannot be passed
+   at all, so the three construction paths the scan could not see (struct
+   literal, `..Default::default()`, `Deserialize`) are compile errors rather
+   than things a scanner has to notice. What the type does **not** decide, and
+   what therefore remains a reviewer's judgement: `args` are runtime `&str`,
+   so *which values* fill the slots is unpinned, and the wire path validates
+   rather than closes (see the Phase D amendment's residual). Decision 9 is
+   otherwise unchanged — the *invariant* is the same one; only its enforcement
+   moved.
 10. **Memory writes are quarantined under taint — injection must not gain
     persistence.** `context_note` output outlives the session: pinned notes
     are auto-injected into FUTURE clean sessions (V10), so a compromised
@@ -535,8 +576,18 @@ declares its class AND its mutation capability in one reviewed place.
       (updater-managed) + `detection/rules.d/local/*.yar` (user-owned,
       NEVER touched by the updater — hand-written rules survive every
       update); classifier weights under the existing models dir. Both
-      hot-reload: rules recompile on file change (settings-broadcast
-      pattern), a weights swap rebuilds the `ort` session.
+      reload without a restart, but **not on a file change** — corrected
+      2026-08-08 (#48, review Part 7 item 2): as first written this bullet
+      said "rules recompile on file change (settings-broadcast pattern)", and
+      **no filesystem watcher was ever built** for `rules.d/` or for the
+      weights (the only `notify::Watcher` in the binary is the code graph's,
+      over project roots). Reload is explicit-call only, from exactly three
+      places: `detection::init()` at startup, `detection::reload()` behind the
+      Settings *Reload rules* button, and `updater::live_reload` after an
+      activated bundle (`classifier::rebuild` has only the last of the three).
+      Editing a file in `rules.d/local/` by hand therefore takes effect on the
+      next launch, the next Settings reload, or the next applied update —
+      which is the honest statement of the theme-file pattern here.
     - **Scheduler:** on-launch check (debounced) + a daily interval
       (default `24h`, configurable), per component. Modes per component:
       `off` / `check-only` (Advisor card "update available") / `auto`
@@ -771,11 +822,17 @@ declares its class AND its mutation capability in one reviewed place.
     truncated flagged result still gets its closing marker.
   - **Work caps** (documented here because they bound what detection can
     promise): the signature screen scans the first **256 KiB** of a result
-    under a **750 ms** scanner timeout; the classifier tokenizes at most
+    under a **1 s** scanner timeout (`signature::SCAN_TIMEOUT` — it read
+    `750 ms` until #48; yara-x rounds up to whole seconds against a
+    free-running 1 Hz heartbeat, so the constant now states the bound the
+    library will actually apply); the classifier tokenizes at most
     **64 KiB** and scores at most **32** 512-token windows (overlap 64,
     max-score wins). Past those bounds a result is *unscreened*, not "clean" —
     consistent with surface-only, a missing verdict costs a header, not
-    correctness.
+    correctness. **That sentence described nothing in the data model until
+    #48** (review Part 7 item 1): `unscreened` is now `signature::ScanOutcome`
+    + `Verdict.bounded` / `.incomplete`, with three named consumers — see the
+    decision 5 amendment.
   - Rules ship as data at `<exe-dir>/detection/rules.d/` (+ user-owned
     `local/`), staged by `build.rs` and both release zips exactly like
     `themes/`. Seed bundle: 19 rules in 3 files across the
@@ -819,6 +876,12 @@ declares its class AND its mutation capability in one reviewed place.
     download to any host — the curated channel would be curated in name only.
     It also makes the `detection_update_manifest_url` override safe and
     special-case-free: an override relocates the whole bundle, never part of it.
+    **The invariant was stated correctly here and enforced incorrectly until
+    #48** (review Part 7 item 3): the check was `starts_with` on the raw
+    manifest string, which dot-segment traversal walked straight past. It is
+    `manifest::AssetAnchor`'s parsed structural compare now, and redirects are
+    refused rather than followed — see amendment (d) before relying on this
+    paragraph.
   - **No archive format, therefore no new archive dependency.** Files are
     listed and fetched individually: a zip would put a decompressor over
     attacker-controlled bytes *before* validation, in the module whose entire
@@ -840,28 +903,43 @@ declares its class AND its mutation capability in one reviewed place.
   - **Validation gauntlet** (`updater/validate.rs`): compiles clean (ANY
     rejected file fails the whole bundle — the live loader's per-file tolerance
     exists for the user's `local/` rules, not for a bundle we published),
-    compiles inside 5 s, scans each control document inside 750 ms (the same
-    budget the live scanner enforces), **no benign control matches**, and — added
+    compiles inside 5 s, scans each control document inside **1 s**
+    (`validate::SCAN_BUDGET` *is* `signature::SCAN_TIMEOUT`, so the two cannot
+    drift; it read 750 ms until #48 corrected the live constant),
+    **no benign control matches**, and — added
     while building — **every hostile control MUST match**. That positive control
     is what stops a syntactically perfect match-nothing bundle from passing
     every other gate and silently disabling the layer. An absent or empty corpus
     REJECTS rather than waving the bundle through. Corpus ships as data at
     `detection/smoke/{benign,hostile}/*.txt`.
   - **Activation** archives the outgoing files first, moves the staged ones in
-    second, and restores the archive on any failure — including a hot-reload
-    that comes back unhealthy, which is part of the transaction rather than a
+    second, and restores the archive on any failure — including a reload that
+    comes back unhealthy, which is part of the transaction rather than a
     follow-up (it catches a set that moved perfectly but collides with a
-    `local/` rule). `rules.d/local/` is untouched *by construction*:
+    `local/` rule). **"On any failure" was false until #48** (review Part 7
+    item 4): only the *second* loop rolled back, and a failure inside the
+    archive loop left `rules.d` holding a subset with `previous_version`
+    unwritten. There are two undos now — `roll_back` after the move loop has
+    started, `restore_archived` alone during the archive loop — plus a crash
+    journal for a kill between them, so the sentence is true as written; see
+    amendment (d). `rules.d/local/` is untouched *by construction*:
     `store::managed_rule_files` is non-recursive and nothing in the updater
     opens `local/`.
   - **Consumers:** `injection_flag` activity rows with a new
     `outbound::Screen::Updater` (`source = "updater"`), the one screen whose row
     `ok` is its outcome rather than `is_denial()` — so it composes its own row
-    instead of bending `record_flag`'s every-flag-is-a-denial shape. Plus three
-    Advisor rules (two as first built, a third added by the #46 fix below):
-    `detection.update_available.v1`, `detection.update_failed.v1` and
-    `detection.update_stalled.v1`, all warn-only and all signed so a dismissal
-    holds for one condition and re-fires on the next.
+    instead of bending `record_flag`'s every-flag-is-a-denial shape. Plus the
+    detection Advisor rules — **five at HEAD, not the three this bullet listed
+    until 2026-08-08 (#48)**, all warn-only and all signed so a dismissal holds
+    for one condition and re-fires on the next:
+    `detection.update_available.v1` and `detection.update_failed.v1` (as first
+    built), `detection.update_stalled.v1` (#46, re-keyed onto `stale_streak` by
+    (c)), `detection.signature_down.v1` (amendment (d) — the layer is switched
+    on and compiled to nothing) and `detection.local_rules_broken.v1` (the U-4
+    amendment — the user's own `local/` files failed to compile, suppressed
+    while `signature_down` is already up). The last two are **not** fed by
+    `updater::advisor_signals`' per-component loop; they are facts about data on
+    disk, fed by `signature::advisor_signal` and `updater::broken_local_rules`.
     Settings → Tools → Detection grew a *Detection updates* block:
     per-component mode select, installed/available versions, last check +
     verbatim outcome, Check now / Apply / Revert, plus Open rules folder and the
@@ -931,11 +1009,15 @@ declares its class AND its mutation capability in one reviewed place.
       reintroduce an empty key.
     - **State additions** (all additive `#[serde(default)]`, `STATE_SCHEMA`
       unchanged at 1): `last_outcome_kind`, `unreachable_streak`,
-      `last_failure_signature`. Each has exactly one consumer — the Settings
-      rendering branch, the stall rule + the Settings streak note, and the
-      failure card's dismissal key respectively. (Amended by (c) below: the
-      stall rule moved to a fourth field, `stale_streak`, and
-      `unreachable_streak` kept the Settings note.)
+      `last_failure_signature`. **Sentence corrected 2026-08-08 (#48):** this
+      read *"Each has exactly one consumer — the Settings rendering branch, the
+      stall rule + the Settings streak note, and the failure card's dismissal
+      key respectively"*, which names two consumers for the middle field in the
+      same breath as claiming one apiece. As (c) below settled it, each field
+      now genuinely has one: `last_outcome_kind` → the Settings rendering
+      branch; `unreachable_streak` → the Settings "N checks in a row" note;
+      `last_failure_signature` → the failure card's dismissal key. The stall
+      rule reads a fourth field, `stale_streak`.
     - **Scheduler now under the Phase G L1 master.** `tick_once` returns early
       when protection is off, so there is no polling, no network and no bundle
       swap. Checked **per tick, through the resolver** (never a raw field —
@@ -1582,11 +1664,18 @@ declares its class AND its mutation capability in one reviewed place.
     user never reviews it. Fail-safe direction (the note is dropped, never
     released), but it does mean the review queue is not durable indefinitely.
 - **D — consumer hygiene.** Pinned OpenCode `permission` block; guidance
-  addendum line for Claude tabs (the `--append-system-prompt` /
-  guidance-addendum seam in `ipc/commands.rs:981`) stating the
-  data-not-instructions contract for `<boundary>`-wrapped content; tool
-  descriptions updated (secrets-in-task-text warning); channel-invariant
-  tripwire test (decision 9); terminal escape hygiene — strip C0/OSC control
+  addendum line for Claude tabs stating the data-not-instructions contract for
+  `<boundary>`-wrapped content (**pointer corrected 2026-08-08, #48 review
+  Part 7 item 17**: this bullet said `ipc/commands.rs:981`, which is not the
+  seam. The addendum is composed by `tabs::config::injection_hygiene_guidance`,
+  assembled with the other nudges in `tabs::config::compose_capability_guidance`
+  and emitted onto one `--append-system-prompt` in `tabs::config::build_pre_args`
+  — named by function rather than by line, since every line pointer in this
+  document has drifted at least once); tool
+  descriptions updated (secrets-in-task-text warning); the channel-content
+  invariant of decision 9 — **a type since #47, not the tripwire test this
+  bullet originally promised**, see the amendment below; terminal escape
+  hygiene — strip C0/OSC control
   sequences from any string cImp composes out of external content (TTS text,
   toasts, activity rows; Svelte auto-escaping already covers HTML) and audit
   the xterm.js config to confirm OSC 52 clipboard WRITES from displayed
@@ -1601,8 +1690,16 @@ declares its class AND its mutation capability in one reviewed place.
     editing a template failed the build until a human re-read it. The type had
     **three other construction paths the scan could not see** (V32 review Part 4
     item 2): a struct literal over `pub content: String`, a `..Default::default()`
-    update, and `Deserialize` — which `offload/mcp.rs` already uses on untrusted
-    input. A future `PushNotice { content: format!("{worker_answer}"), meta }`
+    update, and `Deserialize` — which `offload/mcp.rs` already runs on the
+    inbound SSE frame. (**Provenance corrected 2026-08-08, #48:** #47's write-up
+    called that "untrusted input". It is not third-party input: `channel_params`
+    parses a frame off cImp's **own** `GET /events` stream, fetched from the
+    loopback with the per-launch bearer token, behind the same `authorized`
+    check as every other route. The honest bound is *local same-user* — the
+    discovery file that names port and token is a user-writable file inside the
+    portable root that Claude's own `Write` tool can reach — not *app-composed*.
+    Which is the same bound decision 3 already states for the whole loopback.)
+    A future `PushNotice { content: format!("{worker_answer}"), meta }`
     would have stayed green, and `offload.session_push` — dormant today,
     releasable tomorrow — would have carried LLM output into a message that
     starts a turn on an idle session.
@@ -1613,9 +1710,26 @@ declares its class AND its mutation capability in one reviewed place.
     the constructor). The fourth path, "the argument is a static template", is
     closed by the signature itself: `new(template: &'static str, args: &[&str],
     meta)` interpolates `{}` slots internally, so a composed `String` cannot be
-    passed at all. All four shapes were verified as compile errors on a scratch
-    commit — `E0451`/`E0616` (private field), `E0277` (no `Default`), `E0716`/
-    `E0597` (a non-`'static` template) — then reverted.
+    passed at all. Three of those shapes were verified as compile errors on a
+    scratch commit — `E0451`/`E0616` (private field), `E0277` (no `Default`),
+    `E0716`/`E0597` (a non-`'static` template) — then reverted.
+  - **Correction 2026-08-08 (#48) — three of four paths are closed; the fourth
+    is validated, not closed.** #47's write-up (and `PushNotice`'s own type doc,
+    corrected in the source by this pass) said the wire path *"cannot mint one
+    the constructor would have refused"*. It can. `TryFrom<PushNoticeWire>`
+    enforces exactly two things — reject blank/whitespace `content`, and filter
+    `meta` keys through `keep_valid_meta` — and **nothing** about the
+    static-template property, because there is no `&'static str` anywhere on
+    that path. `serde_json::from_value(json!({"content": worker_answer}))`
+    parses, for any non-blank string. So the accurate statement of what #47
+    bought is: the struct literal, the `..Default::default()` update and a
+    composed-`String` argument are **compile errors**; the deserialize path is
+    **validated**, and its guarantee is the provenance of the stream it reads
+    (above), not the shape of the value. That is enough today — the only
+    producer of those frames is cImp itself and `offload.session_push` is off
+    (threat-model item 3) — and it is *not* a type-level invariant, which is
+    what the sentence claimed. The residual is recorded in Accepted residuals so
+    the next reader of decision 9 does not inherit the stronger reading.
   - **What the type deliberately does NOT decide**, stated so nobody reads more
     into it: `args` are runtime `&str`, so *which values* go in the slots is
     still a reviewer's judgement. The **sentence** a push makes is now pinned;
@@ -1725,7 +1839,15 @@ declares its class AND its mutation capability in one reviewed place.
     indicator stops being read. So `Feature::default_enabled()` was added,
     "reduced" is now measured **against each feature's default**, and the report
     row publishes `default_on` so the frontend applies the backend's rule rather
-    than a second list of defaults in TypeScript. Consequence, stated because it
+    than a second list of defaults in TypeScript. **That last clause was
+    half-true until 2026-08-08** (#48, review Part 7 item 11): the row published
+    `default_on` and the *chip* ignored it, counting `in_scope && !effective`
+    and so reporting every fresh install's default-off gate rows as "controls
+    switched off"; and `INJECTION_FEATURES` was a second list in TypeScript
+    anyway. Both are closed — one exported `isReducedRow` behind the chip, the
+    badge and the popover, and the matrix rendering from `injection.scopes`
+    (which now also publishes `spawn_baked`) instead of a hand-mirrored table.
+    See the Phase G/H amendment. Consequence, stated because it
     is a deliberate asymmetry: a scope that switches the gate ON is *more*
     protected than default and is likewise not "reduced". The migration test was
     renamed to `an_untouched_config_resolves_every_feature_to_its_default` and
@@ -1948,8 +2070,23 @@ declares its class AND its mutation capability in one reviewed place.
     one array.
   - **Claude deny** = `{"permissions": {"deny": ["WebFetch","WebSearch"]}}` in
     the same overlay. Bare tool names, no path globs, so the CD-4
-    permission-glob narrowing does not reach it; the overlay key-set tripwire
-    was widened with that reasoning recorded.
+    permission-glob narrowing does not reach it.
+    **Correction 2026-08-08 (#48, review Part 7 item 8 — still open at HEAD,
+    recorded rather than fixed):** this bullet claimed *"the overlay key-set
+    tripwire was widened with that reasoning recorded"*. It was **not**
+    widened. `settings_overlay_matches_claude_settings_contract` still asserts
+    `keys == ["hooks","statusLine"]` and builds its overlay from
+    `Settings::default()`, i.e. `sensor` — so in `deny` mode, where the overlay
+    grows a third top-level `permissions` key, that assertion cannot and does
+    not run. The review's own framing was half right and is corrected here too:
+    the deny-mode **`permissions` value** *is* pinned, by a separate test
+    (`deny_mode_permission_denies_the_native_web_tools` asserts the exact
+    `{"deny":["WebFetch","WebSearch"]}` object and that no `allow`/`ask`
+    sub-key appears); what nothing guards is the deny-mode **top-level key
+    set**. A future overlay producer that emits a fourth top-level key only in
+    `deny` mode passes both tests silently. Recorded in Accepted residuals;
+    closing it is one `assert_eq!` over the deny-mode key set and is not done
+    here because this pass is documentation.
   - **OpenCode**: `tool.execute.before` handler in the existing plugin, gated
     on a baked `CIMP_BEACON_ENABLED`, wrapped so nothing can escape (the hook
     denies by *throwing* — an escaping error would turn a sensor into a silent
@@ -1958,10 +2095,23 @@ declares its class AND its mutation capability in one reviewed place.
     Deny mode flips `agent.build.permission.webfetch/websearch` to `"deny"`,
     leaving the Phase D `bash`/`edit` pins alone.
   - **The E2 fail-open trap is closed.** `write_opencode_plugin`'s condition is
-    now the pure predicate `opencode_plugin_wanted(settings)` =
-    `graph.enabled || mode == sensor`, shared with `spawn_inject_sig`. It was
+    now the pure predicate `opencode_plugin_wanted(settings, tab)` =
+    `graph.enabled || native web is sensor || the Phase H gate is on`. It was
     `graph.enabled` alone, with an unconditional delete otherwise — a security
-    handler riding it vanished when an unrelated feature was toggled off. The
+    handler riding it vanished when an unrelated feature was toggled off.
+    **Correction 2026-08-08 (#48, review Part 7 item 10):** this bullet said
+    the predicate is *"shared with `spawn_inject_sig`"*. It is not, and never
+    was — `spawn_inject_sig` does not call `opencode_plugin_wanted` at all; it
+    **reconstructs** the condition, carrying `graph.enabled` in its `plugin[0]`
+    entry and the native-web / gate halves separately through
+    `injection::spawn_sig(s, Consumer::Opencode)`. Coverage today is intact,
+    but by argument rather than by construction: the two halves are asserted to
+    add up, not derived from one expression. (`opencode_plugin_wanted`'s own
+    doc comment carried the same false "both read the same predicate" claim and
+    is corrected in the source by this pass.) The residual is recorded: a
+    fourth disjunct added to `opencode_plugin_wanted` without a matching
+    `spawn_inject_sig` entry produces a plugin file that changes with no
+    restart hint. The
     existing handlers were deliberately NOT re-gated (the V24 contract is that
     usage is always recorded); every graph-touching backend path already
     early-returns when the graph is off, so the wider write adds no disk side
@@ -2017,7 +2167,14 @@ declares its class AND its mutation capability in one reviewed place.
       registry is keyed on a body-supplied string with no TTL, cap or eviction,
       and every entry is serialized into every `/status` response and every 4 s
       `latch_status` poll. `latches()`'s "bounded by construction" claim is now
-      true and tested rather than asserted in a comment.
+      true and tested rather than asserted in a comment (review Part 7 item 7).
+      **One caveat, stated 2026-08-08 (#48) because the claim is otherwise read
+      as unconditional:** `is_configured_tab` deliberately accepts **any** id
+      while the AI-tab list is *empty*, since `live_settings` falls back to
+      `Settings::default()` before managed state is up and a request arriving in
+      that window must not be rejected on the strength of a list cImp could not
+      read. It is an availability floor that lapses the moment settings load —
+      but it is also the precondition for the negative half of live-verify 13b.
       **The check is deliberately "is this a configured tab id", not "is this
       the tab that owns this connection"** — the OpenCode plugin is written per
       *working directory*, not per tab (the review's unfixed H-2), so the baked
@@ -2031,9 +2188,23 @@ declares its class AND its mutation capability in one reviewed place.
       `outbound::Flag`** and deleted the two-function split. A struct literal
       must name every field, so a new row's provenance is now a decision rather
       than something inherited by writing nothing — which is the same
-      "unrepresentable, not watched" move as the rest of that issue. All nine
-      call sites state it: eight `internal`, the override route `ipc`, the
-      beacon route `http`. `ipc` is the only value that
+      "unrepresentable, not watched" move as the rest of that issue.
+      **Count corrected 2026-08-08 (#48).** This read *"All nine call sites
+      state it: eight `internal`, the override route `ipc`, the beacon route
+      `http`"* — which sums to ten, was eleven when it was written, and is
+      **thirteen** at HEAD (fifteen counting the two inside `#[cfg(test)]`).
+      Recounted: **eleven** state `Origin::Internal` — one each in
+      `graph/mcp.rs` and `offload/mcp_host.rs`, four in `offload/agent.rs`,
+      three in `offload/loopback.rs`, two in `offload/detection/mod.rs` — and
+      **two** state `origin: row.origin`. That second detail is the part the
+      old sentence had backwards, and it matters: after A2-3 the override and
+      beacon sites deliberately do **not** spell `Ipc`/`Http` into the `Flag`
+      literal. They name the origin once, a line earlier, when building the
+      `FlagRow` (`override_row(Origin::Ipc, …)` / `beacon_row(Origin::Http,
+      …)`), and the literal reads it back off that struct — which is precisely
+      what gives the row's prose and its `origin` key one source. A test pins
+      the indirection, so a future site setting `Flag.origin` from anything
+      but `row.origin` fails. `ipc` is the only value that
       means a human acted. A beacon that actually MOVES a latch now also writes
       its own row (`Screen::LatchBeacon`, `ok: true` — it engaged containment,
       it denied nothing) marked `http`, whose detail says in words that the
@@ -2308,7 +2479,19 @@ declares its class AND its mutation capability in one reviewed place.
     say `off`/`sensor` and several tests sweep `deny` too) and
     `set_detection_layer_for_test`. The other four fields needed no writer — no
     out-of-boundary test touches them — and none was added, because an unused
-    helper is a clippy warning today and a field-name setter tomorrow. Serde is unaffected (the derived impls live
+    helper is a clippy warning today and a field-name setter tomorrow.
+    **Re-verified at `aed6289` (2026-08-08), and now stated precisely enough to
+    be falsifiable:** every L1 switch and all eleven L2 switches on
+    `InjectionSettings`, its `worker` field, all nine `TabInjectionOverrides`
+    cells, all six `WorkerInjectionOverrides` cells, their `get`/`set`
+    accessors, `AiToolTabConfig::injection_overrides`, **and** the six
+    `OffloadSettings` fields named above are `pub(in crate::settings)`. A
+    repo-wide search for those six names outside `src-tauri/src/settings/`
+    returns three hits, none of them a field read: one comment and two
+    `#[cfg(test)]` *function names*. So the word "structural" now means what it
+    says — the set of modules that can name any of these is closed by the
+    compiler, not by a scan and not by an audit.
+    Serde is unaffected (the derived impls live
     in the declaring module) and the Settings window never touches Rust fields —
     it round-trips whole `Settings` objects through `apply_settings`.
     `injection::master_enabled` is therefore the ONLY way an outside module can
@@ -2470,8 +2653,11 @@ declares its class AND its mutation capability in one reviewed place.
     settings and go through the one `apply_settings` write path, so the Settings
     window cannot race its own full-object save.
   - **Surfaces.** Settings → Tools grew an *Injection protection* block ahead of
-    the other V32 blocks (master switch with an explicit off-state warning, ten
-    per-feature rows, per-scope override selects showing `Inherit (on/off)` plus
+    the other V32 blocks (master switch with an explicit off-state warning,
+    **eleven** per-feature rows — this read "ten" until 2026-08-08 (#48, review
+    Part 7 item 14); Phase H's `opencode_native_gate` was the eleventh
+    `Feature` and the count was never updated — per-scope override selects
+    showing `Inherit (on/off)` plus
     the resolved value and which level decided it). Outside Settings: the Phase F
     tab badge now also appears — in its own muted colour — when a tab's controls
     are switched off, its tooltip and the `TaintMenu` popover name which and why,
@@ -2535,14 +2721,35 @@ declares its class AND its mutation capability in one reviewed place.
       added** — the duplication is gone instead. The native-web row's
       `field: 'protection'` filler (the global master, bound as a placeholder on
       a row with no L2 boolean) is now `null`, and the type permits it.
-  - **Known residuals.** (a) The Settings matrix's resolved column reflects
-    *saved* settings, so it lags an unsaved flip by the 500 ms debounce; the raw
-    switches beside it are live. (b) `Scope::Tab`'s `agent` is carried for the
+  - **Known residuals.** (a) The Settings matrix's resolved column lags a flip
+    by up to **~4.5 s**, and the raw switches beside it are live.
+    **Corrected 2026-08-08 (#48, review Part 7 item 15):** this residual said
+    "the 500 ms debounce", which is the wrong mechanism and roughly an
+    eighth of the real figure. The 500 ms is `settings::broadcaster`'s save
+    debounce, and it is not even on the critical path — `injection_status`
+    reads the in-memory snapshot. What the column actually waits for is
+    `SettingsApp`'s own **4 s** `setInterval` over `refreshBackendStatuses`, so
+    the worst case is one debounce plus one poll interval. (b) `Scope::Tab`'s
+    `agent` is carried for the
     scope key and the activity vocabulary only — override lookup keys on the tab
     id alone (ids are unique across agents), which is why `Scope::tab_only`
-    exists for callers with no agent in hand. (c) Terminal escape hygiene's
-    enforcement site is the TTS composition path only; the Phase D audit's other
-    conclusion (xterm.js does not honour OSC 52) is structural and has no switch.
+    exists for callers with no agent in hand. (c) Terminal escape hygiene has
+    **two** enforcement sites, in two languages — **corrected 2026-08-08 (#48,
+    review Part 7 item 9)**, where this residual said "the TTS composition path
+    only". Rust: `OobContext::speak`, which *is* gated on
+    `Feature::TerminalEscapeHygiene` at `Scope::App`. TypeScript:
+    `src/lib/toast.ts`'s `showToast`, a hand-written twin of
+    `processing::strip_terminal_escapes` (its own doc says so) covering CSI, the
+    C1 string introducers and bare controls. Two consequences worth having
+    written down rather than discovered: the toast path is **not** gated on the
+    feature, so switching the control off silences the TTS strip and not the
+    toast strip (a fail-safe asymmetry, deliberately left — a user turning this
+    off is escaping a TTS-mangling bug, not asking for escape sequences in their
+    toasts); and the two implementations **do not share a test vector** — both
+    suites hand-copy the same literals and nothing fails if one gains a case the
+    other lacks. The shared fixture is recorded as open test debt. The Phase D
+    audit's other conclusion (xterm.js does not honour OSC 52) is structural and
+    has no switch.
     (d) *New with the F-y amendment:* the matrix is built from
     `injection_status`, so if that command fails the per-feature rows are
     replaced by an explicit warning instead of rendering. The L1 master switch —
@@ -2593,19 +2800,37 @@ declares its class AND its mutation capability in one reviewed place.
     every proxied local-capability tool there refuses until that tab is
     restarted. It is also a **cross-tab memory quarantine**: the contamination
     bit alone holds every later `context_note` in tab B for review, whether or
-    not the latch moved. Bounded (configured tabs only), audited (one row per
-    tab-session, honestly attributed) and recoverable (a restart), but not
-    closed. Closing it needs a per-tab secret the beacon proves possession
-    of, which the OpenCode plugin cannot hold while it is written per
-    *working directory* rather than per tab (finding H-2).
+    not the latch moved. Bounded (configured tabs only, with
+    `is_configured_tab`'s documented empty-list escape while settings are still
+    loading), audited (one row per tab-session, honestly attributed) and
+    recoverable (a restart), but not closed.
 
-    **Correction, 2026-08-07 (#48).** "Audited" was not true as #45 shipped it:
-    the row was written only when the *latch* moved, while contamination was
-    set on every beacon. A beacon aimed at a `Local`-latched tab therefore
-    quarantined that tab's whole memory stream with no row, no `warn!` and no
-    `info!` — the residual claimed a property the code did not have. Both
-    transitions are recorded now (see the Phase F #48 amendment); the sentence
-    above describes the code as it stands.
+    **Correction, 2026-08-08 (#48, `d9ebbd4`) — "audited" was false as #45
+    shipped it, and is true now.** The row was written only when the *latch*
+    moved (`if out.engaged`), while `contaminated = true` was set on **every**
+    beacon — and `engaged` is false both when the tab is already External
+    (correct, sticky) and when it is latched `Local`. A beacon aimed at a
+    Local-latched tab therefore quarantined that tab's entire memory stream
+    permanently with no row, no `warn!` and no `info!`, while this residual
+    asserted the property the code did not have. `BeaconOutcome` now carries
+    `contaminated_now` beside `engaged`; the row is keyed on a stored
+    `TabLatch::beacon_flagged` bit (same one-row-per-tab-session bound, same
+    reset on a **proved** session rotation as `latch_flagged`), an `info!`
+    covers the latch-unmoved case, and the row's first sentence follows the
+    outcome rather than asserting an engagement that may not have happened.
+    Decision 15 is unmoved: this records that the bit was SET; nothing clears
+    it. The paragraph above now describes the code as it stands.
+
+    **Closing it, re-scoped 2026-08-08 (#48).** The old text said closing this
+    needs a per-tab secret "which the OpenCode plugin cannot hold while it is
+    written per *working directory* rather than per tab (finding H-2)". **H-2
+    is fixed** — the plugin is `cimp-inject-<tab>.js` with the tab id baked in
+    and compared against `CIMP_TAB_ID` — so that blocker is gone and a per-tab
+    beacon secret is now *implementable*. It is still not implemented, and the
+    Claude side would need the same treatment (the `PreToolUse` shim reads the
+    shared discovery file). Left open deliberately: per decision 3 this buys
+    audit-trail fidelity and cross-tab DoS resistance, not containment, and the
+    containment answer is V33.
   - **Never reachable, by either route: clearing `contaminated`.** Decision 15
     holds — contamination is a property of the conversation, not of the latch
     position. (The separate finding C-2 — that a forged session *rotation* did
@@ -2639,6 +2864,52 @@ declares its class AND its mutation capability in one reviewed place.
   moment later; blocking would break legitimate research on a DNS hiccup with
   a security-shaped error).
 
+**Opened by the 2026-08-08 documentation audit (#48).** These are not new
+defects — they are things the spec asserted and the code does not do, found by
+re-reading every "as built" claim against `aed6289`. Each is recorded rather
+than fixed because this pass is documentation; each is small.
+
+- **The deny-mode `--settings` overlay has no top-level key-set guard.**
+  `settings_overlay_matches_claude_settings_contract` asserts
+  `keys == ["hooks","statusLine"]` and builds from `Settings::default()`, i.e.
+  `sensor` — so it never runs against a `deny`-mode overlay, which legitimately
+  carries a third key (`permissions`). The deny-mode `permissions` **value** is
+  pinned separately and thoroughly (`deny_mode_permission_denies_the_native_web_tools`
+  asserts the exact object and that no `allow`/`ask` sub-key appears); the key
+  *set* is not pinned at all in that mode, so a fourth top-level key emitted
+  only under `deny` ships silently. Phase F's claim that "the overlay key-set
+  tripwire was widened" is corrected in place.
+- **`/mcp/call` resolves its SSRF policy from a second settings snapshot.**
+  The handler takes one snapshot for the latch, the budget, detection and the
+  envelope, and `service::mcp_call` takes an independent
+  `self.settings.current()` for `outbound::Policy`. Two doc comments (in
+  `loopback.rs` and `service.rs`) asserted the cross-module invariant that
+  there is exactly one read, and a third asserted that this service "must not
+  take a second, independent read" twenty lines above the one it takes; all
+  three are corrected in the source by this pass. **The code is unchanged** —
+  the window is sub-millisecond and both postures are the user's own — but it
+  is a stated invariant that does not hold, which is the class this milestone's
+  own principles single out. Closing it means threading the handler's snapshot
+  into `mcp_call` rather than re-reading; it is one parameter.
+- **The channel-content invariant is a type for in-process producers and a
+  validator on the wire.** `TryFrom<PushNoticeWire>` rejects blank content and
+  filters meta keys; it does not — and cannot, with no `&'static str` on that
+  path — enforce the static-template property. See the decision 9 and Phase D
+  amendments. Bounded today by `offload.session_push` being off and by the
+  frame source being cImp's own authenticated loopback stream.
+- **`spawn_inject_sig` reconstructs `opencode_plugin_wanted` instead of calling
+  it.** The restart-hint signature covers the same inputs by argument, not by
+  construction, so a fourth disjunct added to the predicate without a matching
+  signature entry produces a plugin file that changes with no restart hint.
+- **An `Unknown` tab id runs `/audit/run` and `/run` ungated.** `latch_scope`
+  distinguishes `Anonymous` / `Unknown(tab)` / `Scoped`, and both routes treat
+  the first two as V28 fail-open, logging a `warn!` that says so. That is the
+  same fail-open discipline the other routes use and is deliberate; it is
+  written here because "the route is gated" now appears in three places and
+  should not be read as unconditional.
+- **The two terminal-escape strippers share no test fixture**, and the
+  TypeScript one is not gated on its feature — see Phase G residual (c).
+
 ## Live verification (definition of done, per global principle 9)
 
 1. Research offload against a page seeded with a visible injection payload
@@ -2658,15 +2929,48 @@ declares its class AND its mutation capability in one reviewed place.
    appear in a fresh session's auto-injection or `context_recall`; after
    explicit promote, it does.
 7. SSRF (range-based, not host-based — the target need not be listening;
-   denial is pre-connection on CIDR membership): `fetch_content` of an
-   address in each denied block — a `192.168/16` and a `10/8` address (any
-   host in-range, independent of this network's actual gateway),
-   `http://127.0.0.1:<loopback-port>/`, `http://169.254.169.254/`, and the
-   IPv4-mapped form `http://[::ffff:192.168.0.1]/` — each refused with the
-   fixed string + activity row. A public hostname that resolves to a private
-   IP is refused on the resolved IP; a public→private redirect is refused at
-   the hop. The configured LAN MCP endpoints (172.21.1.11) still work; a
-   loop of fetches trips the per-task budget.
+   denial is pre-connection on CIDR membership). **Rewritten 2026-08-08 (#48):
+   one leg was not runnable and the IPv4-mapped leg proved the wrong thing.**
+   - **Denied, each with the fixed string + an activity row:** `fetch_content`
+     of a `192.168/16` and a `10/8` address (any host in-range, independent of
+     this network's actual gateway), `http://127.0.0.1:<loopback-port>/`,
+     `http://169.254.169.254/`, and the IPv4-mapped form
+     `http://[::ffff:192.168.0.1]/`.
+   - **The pair that distinguishes unmap-and-recheck from a blanket deny, and
+     the reason the previous version of this recipe could not tell them apart:**
+     `http://[::ffff:192.168.0.1]/` must be **refused** *and*
+     `http://[::ffff:8.8.8.8]/` must be **allowed**. Only running both proves
+     the code re-checks the embedded v4 rather than denying `::ffff:0:0/96`
+     wholesale — which is what decision 11's own text wrongly described until
+     #48. Same shape for the two spellings added by the C-4 fix:
+     `http://[64:ff9b::192.168.0.1]/` refused, `http://[64:ff9b::8.8.8.8]/`
+     allowed; `http://[2002:c0a8:1::]/` refused (6to4 over `192.168.1.0`),
+     `http://[2002:808:808::]/` allowed.
+   - **The parser differential (C-4), the actual hole.** Pass
+     `{"url": "http://\t127.0.0.1:<loopback-port>/status"}` and the LF variant
+     `{"url": "http://\n169.254.169.254/latest/meta-data/"}` — both refused,
+     and the audit row must name the **address** (`127.0.0.1`), not the
+     truncated candidate (`http://`). Then the two that need widening *and*
+     stripping together: `127.0.0.1\t:8080/admin` and `//169.254.\n169.254/`.
+     Control, and the point of the control: the prose argument
+     `"see http:// for the scheme"` is **not** refused, and neither is
+     `"what is 192.168.1.1"` (a bare IP with no port and no path is
+     deliberately not extracted — the recorded residual).
+   - **Hostnames:** a public name that resolves to a private IP is refused on
+     the resolved IP, not the name.
+   - **NOT verifiable from cImp, and deliberately removed from this recipe:**
+     "a public→private redirect is refused at the hop". The fetch happens
+     inside the third-party MCP server's process; cImp never sees the hop. The
+     Accepted-residuals entry says so explicitly, so asking a verifier to check
+     it was asking them to fail. (The *updater* is the one place cImp does
+     fetch, and its redirect policy is `none()` — verified in recipe 11.)
+   - **Controls:** the configured LAN MCP endpoints (172.21.1.11) still work; a
+     loop of fetches trips the per-task budget; **a loop of ~200 denied URLs
+     produces roughly 8 rows, not 200** (`AuditClaims` writes at denials
+     1, 2, 4, 8 …, each naming how many it stands for), and the `Canary` /
+     `LatchBeacon` / `MemoryQuarantine` rows already in the feed survive it.
+     The refusal string served to the model is identical on every denial,
+     first or two-hundredth.
 8. Escape hygiene: a page containing an OSC 52 clipboard-write sequence is
    fetched and echoed — clipboard unchanged; TTS/toast text renders the
    sequence stripped.
@@ -2679,12 +2983,55 @@ declares its class AND its mutation capability in one reviewed place.
     at least one of signature/classifier layers (warning header present);
     a benign technical page about prompt engineering is fetched and NOT
     blocked (may flag — surface-only means research continues either way).
-11. Updater: point the manifest URL at a staged bundle with a bumped
-    version — daily check (or Check now) downloads, validates, hot-swaps;
-    a rule file in `rules.d/local/` survives the update and still matches;
-    a deliberately broken staged bundle (bad checksum, then non-compiling
-    rule) is REJECTED, old rules stay active, Advisor card raised; revert
-    button restores the previous bundle.
+11. Updater. **Rewritten 2026-08-08 (#48): the original predates the outcome
+    split entirely, so it could not tell a 404 from a refusal, and it predates
+    every U-1/U-2/U-4 fix.** Serve the staged bundle from a loopback HTTP
+    server (`http://127.0.0.1:<port>/…`) — plaintext is loopback-only now, so
+    a `http://` manifest URL on any other host is `Rejected` **before any
+    request is made**, which is itself worth checking once.
+    - **Happy path.** Manifest URL at a staged bundle with a bumped version →
+      Check now downloads, validates, swaps and reloads. Installed version
+      moves; `previous/` gains the old bundle; Revert restores it.
+    - **`local/` survives and cannot veto (U-4).** A hand-written rule in
+      `rules.d/local/` still matches after the update. Then break it — a syntax
+      error, or a rule identifier that collides with one in the bundle that was
+      *already* colliding — and check that a **good** bundle still applies:
+      outcome `applied`, not a rollback, plus a `detection.local_rules_broken.v1`
+      card naming the file and a "Your rule files" health row in Settings beside
+      the signature/classifier dots. Then the negative control: a `local/` file
+      that compiled **before** and fails **after** (a collision the new bundle
+      introduces) must still fail and still roll back.
+    - **Rejected vs Unavailable.** Bad checksum, then a non-compiling rule,
+      then an artifact URL pointed outside the manifest's directory →
+      `rejected` each time: `ok:false` row, `detection.update_failed.v1` card,
+      old rules still live. Point the manifest URL at a path that 404s →
+      `unavailable`: a **neutral `ok:true`** row, the ordinary-colour Settings
+      line, and **no** card. That distinction is the whole of #46.
+    - **Containment (U-1), the evasions that used to pass.** With a valid
+      manifest, rewrite one artifact URL to each of
+      `…/detection-v1/../../../../attacker/repo/releases/download/v1/x.yar`,
+      `…/detection-v1/%2e%2e/%2e%2e/attacker/x.yar` and
+      `…/detection-v1/..\..\attacker\x.yar`. All three must be `Rejected` with
+      the unchanged rejection message, and **zero** artifact requests must
+      reach the attacker path. Also: a `?`-query or `#`-fragment on an artifact
+      URL is refused outright, and a manifest served with a 302 to another host
+      surfaces as its own status rather than being followed.
+    - **Rollback and recovery (U-2).** Hold a file in `rules.d` open (or let AV
+      lock it) during activation: `rules.d` must come back **complete**, not a
+      subset, and the returned detail must say the rollback happened. Kill the
+      app mid-activation and relaunch: `run`/`revert` finish the recorded swap
+      from `detection-updates/activation.json` under the run lock before
+      touching anything, and the archive is not wiped.
+    - **A failed reload never disarms the layer (D-2).** Make `rules.d`
+      unreadable (or every file broken) and trigger a reload: `scan` must keep
+      using the **previously compiled** rules, Settings must show the new failed
+      status honestly, and `detection.signature_down.v1` must raise only if the
+      layer really has nothing live. Confirm the ⛨ chip and the tab badge both
+      pick the fact up (it enters the hierarchy as a row carrying its own
+      `reason`, not as a switch someone flipped).
+    - **Revert's own failure modes.** Revert with nothing retained →
+      `revert-failed`, `ok:false` row, **no** card, and any pending "available"
+      version still shown (not withdrawn, not re-offered as a downgrade).
 11b. #48's four checks, all in Settings → Tools → Detection:
     - With the manifest URL pointing nowhere (today's shipped state), the
       component line reads *"Could not reach the update channel: GET …:
@@ -2721,7 +3068,15 @@ declares its class AND its mutation capability in one reviewed place.
     `latch_override` rows in Tool Activity whose payload reads
     `"origin": "ipc"`; a tab restart still resets everything.
 13b. #45's two negative checks, run from a shell with the launch token and
-    port from `<exe-dir>/.cimp-offload.json`:
+    port from `<exe-dir>/.cimp-offload.json`.
+    **Precondition, added 2026-08-08 (#48) — without it the second check
+    passes for the wrong reason:** at least **one** AI tab must be configured.
+    `is_configured_tab` deliberately accepts *any* id when the AI-tab list is
+    empty (the documented availability floor, since `live_settings` falls back
+    to `Settings::default()` before managed state is up), so with zero AI tabs
+    the forged `not-a-tab` beacon is **accepted** and answers 200. Run this
+    with a real tab present; if you want to see the escape itself, that is a
+    separate check, not this one.
     - `curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization:
       Bearer $TOK" -d '{"tab":"claude","consumer":"claude","action":"unlatch"}'
       http://127.0.0.1:$PORT/latch/override` → **404**. The route is gone; the
@@ -2737,11 +3092,34 @@ declares its class AND its mutation capability in one reviewed place.
     `context_note` under a would-be-latched session stores clean — i.e.
     pre-V32 behavior, confirmed at every layer at once. Turn the master
     back ON: the same sequence latches, envelopes and quarantines again
-    with no restart (the live features) — only native-web visibility and
-    consumer hygiene need the restart the hint asks for. Then, with the
-    master ON and the taint latch feature OFF app-wide, set one tab's
-    latch override to `On`: that tab latches, a second tab does not, and
+    with no restart (the live features) — only native-web visibility,
+    consumer hygiene and the Phase H gate need the restart the hint asks for.
+    Then, with the master ON and the taint latch feature OFF app-wide, set one
+    tab's latch override to `On`: that tab latches, a second tab does not, and
     `/status` names which level decided each.
+    **Extended 2026-08-08 (#48) — the master and the hierarchy grew four
+    consumers this run that the recipe above does not reach:**
+    - **The updater scheduler follows `Feature::Detection`, not L1.** Set
+      protection ON and *Injection detection* OFF: `tick_once` makes no request
+      (nothing at `RUST_LOG=offload=info`), and Check now / Apply / Revert are
+      refused by the **IPC command**, not merely greyed out — invoke
+      `detection_check_now` directly and it returns the refusal error. This is
+      the state #46's L1-only gate left polling.
+    - **An identity-less call honours a per-tab `On` (N-1).** With the taint
+      latch OFF app-wide and one tab's L3 set to `On`, make a proxied call that
+      carries **no** `--tab` (an identity-less child): it must resolve
+      protected, not fail-open. Control: with no tab stating `On`, the same
+      call is unprotected as before.
+    - **The reduced-protection count is one rule.** Turn off exactly one
+      control on one scope: the ⛨ chip's tooltip and the tab badge must agree,
+      the count must be of **distinct controls** (not scope×feature pairs), and
+      a default-off control at its default (the Phase H gate on a fresh
+      install) must **not** be counted. Break the `injection_status` command
+      (stop the backend mid-poll): after three consecutive failures the chip
+      reads `⛨ unknown` and both poll failures `console.warn` — it must never
+      render as fully protected.
+    - **A disarmed signature layer shows up as reduced protection**, carrying
+      its own `reason` and counted separately from switches — see recipe 11.
 15. Phase H (OpenCode native gating, decision 17): with the toggle OFF
     (default) an OpenCode tab behaves exactly as it does today — a
     latched tab still runs `bash`/`read` natively. Turn it ON, restart
@@ -2754,3 +3132,84 @@ declares its class AND its mutation capability in one reviewed place.
     on — every native tool still runs (fail-open on an unreachable
     loopback is the locked behavior, not a bug). Control: with the
     toggle on and the tab UNLATCHED, nothing is refused.
+
+**Recipes added 2026-08-08 (#48).** Sixteen commits landed controls between the
+deep review and this documentation pass, and none of them wrote a recipe; these
+are the ones the list above does not reach.
+
+16. **The memory secret screen (`graph::secrets`).** In an UNLATCHED, clean tab
+    — the point is that this is independent of taint — write a
+    `context_note` whose text carries a credential-shaped value (use a fake one
+    matching a vendor-prefix rule; `benign_notes_do_not_match` lists what must
+    not match). The note is **stored, not refused and not redacted**, appears in
+    the Memory view's review queue, and is absent from `context_recall`,
+    `context_notes` and a fresh session's auto-injection until promoted. A
+    `Screen::MemoryQuarantine` row appears with `ok: true`, and the notice names
+    the matched **rules**, never the matched text. Control, and the one that
+    matters most: a paragraph of ordinary research prose containing the words
+    "key", "token" and "password" unquoted is stored clean. Second control:
+    write a note that trips **both** taint and the secret screen under an
+    EXTERNAL latch — both notices are appended, one row.
+17. **The headless persistent-write refusal (M-2).** Stop cImp entirely, then
+    have a Claude or OpenCode tab call `context_note` through the MCP child.
+    It must return the fixed `NOT SAVED: …` string, which says the condition is
+    **transient**, and write its own `ok:false` activity row. `context_recall`
+    and the `graph_*` reads on the same path must still work (reads stay
+    fail-open — a contaminated tab must not lose its own memory). Then the
+    reachable-without-a-shell variant: with cImp **running**, corrupt one byte
+    of `<portable_root>/.cimp-discovery/<pid>.json` and repeat — the same
+    refusal, and stderr names the miss reason (`unparseable-response` /
+    `no-instance` / …) exactly once per process rather than five conditions
+    collapsed into silence. Restore the file; the next call goes back through
+    the app.
+18. **Per-tab OpenCode plugin files (H-2).** Configure two OpenCode tabs in the
+    same working directory. Give tab A an L3 `On` for `opencode_native_gate`
+    and leave tab B at the app-wide default. Spawn both. `.opencode/plugin/`
+    must contain `cimp-inject-<A>.js` **and** `cimp-inject-<B>.js` — never one
+    shared `cimp-inject.js`, and the legacy file must be deleted on the first
+    spawn after upgrade. Latch tab A EXTERNAL: a native `read` in A is refused
+    and a native `read` in B is not. Delete tab B from settings and respawn A:
+    B's file is swept, A's is untouched. Finally, run `opencode` **by hand** in
+    that directory (no `CIMP_TAB_ID` in the environment): no injection, no
+    memory tap, no beacon — every handler returns on the `CIMP_TAB_MATCH` check,
+    and no handler fires twice.
+19. **The gate-cache epoch (H-1).** This is the one thing no source assertion
+    can show, which is why an `#[ignore]`d Node harness exists
+    (`cargo test --bin cimp -- --ignored gate_cache`). Run it, then reproduce
+    live: with the gate ON, have OpenCode dispatch `read` and `webfetch`
+    concurrently so the `read` query is in flight when the `webfetch` beacon
+    engages EXTERNAL. The `read` verdict must be **dropped, not applied** — the
+    next `read`/`bash`/`edit` re-queries immediately and is refused, rather than
+    being admitted for the remaining TTL. Second half, and the more important
+    one: set native-web to `off` (or `deny`) with the gate ON — the most
+    hardened combination — and confirm the cache is still invalidated when the
+    latch moves, since the invalidation now sits **above** the beacon's own
+    enable guard.
+20. **`/audit/run` and `/run` are inside the latch (C-1b, C-1c).** Latch a tab
+    EXTERNAL through a proxied `ddg__fetch_content`. Then: `security_audit`
+    (which arrives through the *separate* `cimp-code-audit` MCP server, not the
+    offload child) must be refused with `REFUSAL_LOCAL_BLOCKED`, and no scan
+    may start; `offload_task { profile: "code", instructions: "…" }` and
+    `offload_batch` must be refused too — the sub-task no longer gets its own
+    permissive latch to launder a local read through. Confirm the `--tab` id
+    really travels: both children now carry it on the spawn line and forward it
+    in the body. Controls: on an unlatched tab all four run normally; running
+    `security_audit` **first** latches the tab LOCAL and the web side closes.
+21. **A forged session rotation cannot clear contamination (C-2).** With a tab
+    EXTERNAL-latched **and contaminated**, run
+    `type nul > %USERPROFILE%\.claude\projects\<encoded-root>\aaaa.jsonl` from
+    the tab's own Bash. Within a poll or two `/status` must still show
+    `contaminated: true` and the latch still External — a zero-byte file is not
+    a rotation, only observed **growth** is. Then the token variant: POST
+    `/memory/event` with a `session` naming a configured AI tab id — refused
+    with a `warn!`, the registry unchanged. Positive control: start a genuinely
+    new session in that tab and confirm the latch and budget do reset once its
+    first line lands (decision 15 still reopens the latch on a *proved*
+    rotation; only clearing `contaminated` needed proof).
+22. **A hallucinated tool name does not end a task (A-1).** Run an offload task
+    and have the worker call a misspelled local tool (`graph_symbols`). It must
+    come back "unknown native tool" with the task **unlatched**, `read_file` and
+    `code_search` still advertised on the next step, and **no** fetch-budget
+    charge for the error string. Control: a genuinely proxied unknown id
+    (anything containing `__`) still latches EXTERNAL — unknown-⇒-EXTERNAL is
+    unchanged for names that can carry content.

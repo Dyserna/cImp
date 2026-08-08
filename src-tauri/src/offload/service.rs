@@ -277,8 +277,25 @@ pub fn valid_meta_key(key: &str) -> bool {
 ///   `PushNotice::new(format!("…{answer}"), …)` — the failure mode decision 9
 ///   names — is a compile error rather than something a reviewer has to catch.
 /// - Deserialization goes through [`PushNoticeWire`] and a validating
-///   `TryFrom`, so the SSE path cannot mint one the constructor would have
-///   refused.
+///   `TryFrom`, which rejects blank content and applies the same meta-key
+///   contract as the constructor.
+///
+/// **Correction 2026-08-08 (#48).** The third bullet used to end "so the SSE
+/// path cannot mint one the constructor would have refused". It can, and the
+/// distinction is worth stating precisely because decision 9 is read off this
+/// comment. `TryFrom<PushNoticeWire>` enforces exactly two things — non-blank
+/// `content`, and `keep_valid_meta` over the attributes — and **nothing** about
+/// the static-template property, because there is no `&'static str` anywhere on
+/// that path: `serde_json::from_value(json!({"content": worker_answer}))`
+/// parses for any non-blank string. So three of the four construction paths
+/// (struct literal, `Default`, a composed `String` argument) are **compile
+/// errors**, and the fourth is **validated**. What bounds it is the provenance
+/// of the frames, not the shape of the value: `offload::mcp::channel_params` parses cImp's
+/// own `GET /events` stream, fetched from the loopback with the per-launch
+/// bearer token behind the same `authorized` check as every other route — i.e.
+/// local same-user, the bound decision 3 already states for the whole loopback,
+/// not "app-composed". Adequate while `offload.session_push` is off; not a
+/// type-level invariant, and not to be described as one.
 ///
 /// What the type does **not** decide is whether an individual interpolated
 /// value is app-owned: `args` are runtime `&str`, and "this count came from our
@@ -892,9 +909,22 @@ impl OffloadService {
     ///
     /// #48: `audit` is the calling tab session's claim ledger, threaded from
     /// the loopback handler (which owns the registry the ledger lives in) to
-    /// the SSRF chokepoint. It is passed through rather than resolved here for
-    /// the same reason the settings snapshot is: this service must not take a
-    /// second, independent read of state the handler already holds.
+    /// the SSRF chokepoint. It is passed through rather than resolved here
+    /// because the handler already holds it.
+    ///
+    /// **KNOWN GAP, stated 2026-08-08 (#48, review finding G-4).** The
+    /// settings snapshot is *not* threaded the same way, though two comments in
+    /// this file and one in `loopback.rs` said it was. The `self.settings.current()`
+    /// below is a **second, independent read**: the handler resolves the latch,
+    /// the budget, the detection config and the envelope from its own snapshot,
+    /// and the SSRF [`outbound::Policy`] is built from this one. A settings save
+    /// landing between them leaves a call admitted under posture A and screened
+    /// under posture B. The window is sub-millisecond and both postures are the
+    /// user's own, so the practical impact is benign — but it is a stated
+    /// cross-module invariant that does not hold, which is precisely the class
+    /// this milestone's own principles single out. Closing it is one extra
+    /// parameter (`snap: &Settings`) from the handler; recorded in the V32
+    /// spec's Accepted residuals rather than changed in a documentation pass.
     // See `McpHost::call_recorded`, whose argument list this forwards verbatim.
     #[allow(clippy::too_many_arguments)]
     pub async fn mcp_call(
@@ -925,14 +955,20 @@ impl OffloadService {
     }
 
     // V32 Phase G removed the `external_budget_limits` / `detection_config`
-    // accessors that used to live here. The loopback's `/mcp/call` handler now
-    // takes ONE settings snapshot per call and resolves the latch, the budget,
-    // the SSRF policy, the detection config and the envelope from it — because a
+    // accessors that used to live here, cutting four independent
+    // `settings.current()` reads through this service down to one. The
+    // loopback's `/mcp/call` handler takes a snapshot per call and resolves the
+    // latch, the budget, the detection config and the envelope from it — a
     // mid-call settings save must not leave a result screened under one posture
-    // and wrapped under another, which is exactly what four independent
-    // `settings.current()` reads through this service made possible. The
-    // worker's copies are still snapshotted in [`Self::run`], from the `cur`
-    // read it already takes.
+    // and wrapped under another.
+    //
+    // Corrected 2026-08-08 (#48, G-4): this used to claim the SSRF *policy* was
+    // resolved from that same snapshot. It is not — `mcp_call` above takes its
+    // own read for it, so "ONE settings snapshot per call" is one short of
+    // true. See the KNOWN GAP paragraph on `mcp_call`.
+    //
+    // The worker's copies are still snapshotted in [`Self::run`], from the
+    // `cur` read it already takes.
 
     /// Run one offload task end-to-end against the live pool and return the
     /// synthesized answer. Acquires the global permit *and* the chosen

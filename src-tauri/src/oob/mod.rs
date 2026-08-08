@@ -115,8 +115,10 @@ impl OobContext {
     /// place, and it happens BEFORE markdown reduction so a control sequence
     /// cannot alter how `to_speakable` sees fences or list markers.
     ///
-    /// V32 Phase G (locked decision 16): the strip is one of the ten switchable
-    /// controls, resolved at [`Scope::App`] — TTS and toasts are global surfaces
+    /// V32 Phase G (locked decision 16): the strip is one of the eleven
+    /// switchable controls (ten until Phase H added `opencode_native_gate`;
+    /// count corrected 2026-08-08, #48), resolved at [`Scope::App`] — TTS and
+    /// toasts are global surfaces
     /// (the global-only avatar/TTS decision), so this feature has an L1 and an
     /// L2 and deliberately no per-scope row. Resolved per burst rather than
     /// cached: the settings handle is already read here for `tts_enabled`, and a

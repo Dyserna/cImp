@@ -5446,9 +5446,14 @@ mod tests {
     fn trusted_tools_never_latch_and_are_never_refused() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
+        // V32 H-1: `graph_repo_map` was in this list until the 2026-08-08
+        // re-review demoted it out of TRUSTED — see
+        // `the_source_text_graph_readers_are_refused_at_the_proxy_gate` below,
+        // which asserts the opposite verdict for it and for
+        // `graph_struct_search` on this same route.
         for trusted in [
             "graph_outline",
-            "graph_repo_map",
+            "graph_find_symbol",
             "context_recall",
             "context_notes",
         ] {
@@ -5473,6 +5478,46 @@ mod tests {
                     "{trusted} under {first}"
                 );
             }
+        }
+    }
+
+    /// **V32 H-1 (2026-08-08 re-review — C-1 reopened): `graph_struct_search`
+    /// and `graph_repo_map` are refused at the TAB gate.**
+    ///
+    /// This is the second of the two enforcement paths and, for a
+    /// Claude/OpenCode tab, the only one: graph tools arrive on `/graph_run`,
+    /// which gates by name through [`LatchRegistry::gate`], and the proxy never
+    /// def-filters the graph surface (the per-session child caches `tools/list`
+    /// at connect). A fix verified only against the worker's `filter_defs` —
+    /// which is how C-1 survived `b80f5b8` — would leave this route wide open,
+    /// so it is asserted here rather than inferred from the class table.
+    #[test]
+    fn the_source_text_graph_readers_are_refused_at_the_proxy_gate() {
+        for blocked in ["graph_struct_search", "graph_repo_map"] {
+            // Contaminated conversation ⇒ refused with the fixed local string.
+            let reg = LatchRegistry::default();
+            let s = scope("claude-1", Some("sess-a"));
+            assert!(reg
+                .gate(Some(&s), LatchRoute::Proxied, "ddg__fetch_content", ON)
+                .is_ok());
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Native, blocked, ON),
+                Err(REFUSAL_LOCAL_BLOCKED),
+                "{blocked} must be refused once the conversation has read a page"
+            );
+
+            // …and used first it LATCHES the tab local, closing the web — the
+            // accepted consequence of the demotion for a tab, not just for a
+            // worker task.
+            let reg = LatchRegistry::default();
+            let s = scope("claude-2", Some("sess-b"));
+            assert!(reg.gate(Some(&s), LatchRoute::Native, blocked, ON).is_ok());
+            assert_eq!(reg.snapshot()[0].latch(), "local", "{blocked}");
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON),
+                Err(REFUSAL_EXTERNAL_BLOCKED),
+                "{blocked}"
+            );
         }
     }
 

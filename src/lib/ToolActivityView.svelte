@@ -44,7 +44,7 @@
   // descriptions in `src-tauri/src/graph/mcp.rs::tool_specs`; kept here as
   // static docs (moved from CodeIntelligenceView).
   const GRAPH_TOOLS = [
-    { name: 'graph_find_symbol', desc: 'Where a symbol (function/struct/trait/…) is defined — file, line, signature.', example: 'Where is GraphService defined?' },
+    { name: 'graph_find_symbol', desc: 'Where a symbol (function/struct/trait/…) is defined — file, line, kind. Never source text (V32 H-1); pair with graph_snippet for the body.', example: 'Where is GraphService defined?' },
     { name: 'graph_callers', desc: 'Which functions call the given symbol (its call sites). Impact analysis.', example: 'What calls graphRebuild?' },
     { name: 'graph_callees', desc: 'Which symbols are called by the given symbol.', example: 'What does handle_call call?' },
     { name: 'graph_references', desc: 'Every reference (use site) of a name — file, line, column.', example: 'Find all references to ToolDef.' },

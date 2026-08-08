@@ -3541,7 +3541,13 @@ mod tests {
             "code_search",
             "graph_snippet",
             "graph_outline",
+            // V32 H-1: `graph_repo_map` was this fixture's TRUSTED exemplar
+            // until the 2026-08-08 re-review demoted it (it packs first-source-
+            // line signatures). It stays in the surface — now on the blocked
+            // side — and `graph_struct_search` joins it, because the two
+            // demoted names are the ones a regression would silently restore.
             "graph_repo_map",
+            "graph_struct_search",
             "run_check",
             "security_audit",
             "context_note",
@@ -3607,12 +3613,19 @@ mod tests {
         // review demoted them out of TRUSTED: a scanner report quotes source and
         // secrets, and a check runs processes, so both must vanish alongside
         // `read_file` rather than staying live next to `ddg__*`.
+        // V32 H-1 (C-1 reopened): `graph_struct_search` and `graph_repo_map`
+        // are on this list too since the 2026-08-08 demotion. Both returned
+        // repo SOURCE TEXT — a caller-supplied tree-sitter query's matches, and
+        // first-source-line signatures packed to a 200k budget — from inside
+        // the one class that is never blocked, next to the live `ddg__*` defs.
         for gone in [
             "read_file",
             "code_search",
             "graph_snippet",
             "run_check",
             "security_audit",
+            "graph_struct_search",
+            "graph_repo_map",
             "context_note",
         ] {
             assert!(
@@ -3621,12 +3634,7 @@ mod tests {
             );
         }
         // The external side and TRUSTED survive.
-        for kept in [
-            "ddg__search",
-            "ddg__fetch_content",
-            "graph_outline",
-            "graph_repo_map",
-        ] {
+        for kept in ["ddg__search", "ddg__fetch_content", "graph_outline"] {
             assert!(after.contains(&kept.to_string()), "`{kept}` missing: {after:?}");
         }
 
@@ -3672,20 +3680,29 @@ mod tests {
         // graph query must not cost the task either capability.
         let mut latch = Latch::default();
         assert!(gate(&mut latch, "graph_outline").is_ok());
-        assert!(gate(&mut latch, "graph_repo_map").is_ok());
+        assert!(gate(&mut latch, "graph_find_symbol").is_ok());
         assert_eq!(latch, Latch::Open);
 
         for latched in [Latch::External, Latch::Local] {
             let mut l = latched;
             assert!(gate(&mut l, "graph_outline").is_ok());
-            assert!(gate(&mut l, "graph_repo_map").is_ok());
+            assert!(gate(&mut l, "graph_find_symbol").is_ok());
             assert_eq!(l, latched, "a TRUSTED call must not move the latch");
             let names = advertised_names(&all, latched);
-            for kept in ["graph_outline", "graph_repo_map"] {
-                assert!(
-                    names.contains(&kept.to_string()),
-                    "TRUSTED `{kept}` missing under {latched:?}: {names:?}"
-                );
+            assert!(
+                names.contains(&"graph_outline".to_string()),
+                "TRUSTED `graph_outline` missing under {latched:?}: {names:?}"
+            );
+            // V32 H-1: the exemplar used to be `graph_repo_map`. It is
+            // LOCAL-CAPABILITY now, so under an EXTERNAL latch it must be
+            // absent from the very list this test once required it to be in.
+            if latched == Latch::External {
+                for gone in ["graph_repo_map", "graph_struct_search"] {
+                    assert!(
+                        !names.contains(&gone.to_string()),
+                        "H-1: `{gone}` is advertised under {latched:?}: {names:?}"
+                    );
+                }
             }
         }
     }

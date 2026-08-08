@@ -49,13 +49,26 @@
 //!   capability the caller just lost.
 //! - **TRUSTED** — never latches, never blocked. Membership requires that a
 //!   result carry **near-zero exfil value**, not merely that cImp composed its
-//!   framing: the *structural* graph tools return names/edges/metadata, and
-//!   that is the whole of the class's clean case. A tool whose body quotes repo
-//!   content, runs a process, or delegates to something that can do either does
-//!   not qualify, however local its execution — that distinction is what the
-//!   review found this list had blurred. A research task rarely needs snippet
-//!   bodies; a code task rarely needs the web — so the split costs little and
-//!   buys the containment.
+//!   framing. **"Structural" is a property of the RENDERED RESULT, not of the
+//!   name of the tool or of the relation it queries** — a tool that walks the
+//!   graph and then prints repo text is a source reader wearing a structural
+//!   label, and this list asserted the opposite of itself for two milestones.
+//!   The 2026-08-08 re-review's finding H-1 (C-1 reopened) named both ways it
+//!   was false: `graph_struct_search` read every indexed file of a language off
+//!   disk and returned the text a caller-supplied tree-sitter query matched
+//!   (`code_search` with an AST filter), and the `signature` the four symbol
+//!   tools printed is the definition's **first source line**, so
+//!   `graph_find_symbol{name: "STRIPE_SECRET"}` answered
+//!   `const STRIPE_SECRET: &str = "sk_live_…";` verbatim. Both were closed the
+//!   same day: `graph_struct_search`/`graph_repo_map` are LOCAL-CAPABILITY
+//!   above, and `graph/mcp.rs`'s `fmt_symbols` no longer emits `signature` at
+//!   all. What the surviving members return is names, kinds, paths, line
+//!   numbers and edges — no source text on any path, which is the class's clean
+//!   case restated as a property a reviewer can check row by row. A tool whose
+//!   body quotes repo content, runs a process, or delegates to something that
+//!   can do either does not qualify, however local its execution. A research
+//!   task rarely needs snippet bodies; a code task rarely needs the web — so
+//!   the split costs little and buys the containment.
 //!
 //!   The memory reads (`context_recall` / `context_notes`) are the class's one
 //!   **recorded residual**, not a clean case, and the rationale says so rather
@@ -194,6 +207,29 @@ pub const TABLE: &[ClassRow] = &[
     // both tools reach (an `offload_batch` fans out to one `/run` per subtask).
     row("offload_task", ToolClass::LocalCapability, false),
     row("offload_batch", ToolClass::LocalCapability, false),
+    // Demoted from TRUSTED by the 2026-08-08 re-review (finding H-1 — C-1
+    // reopened; see the milestone's THIRD Phase A amendment). Both were carried
+    // into TRUSTED by the word "structural", which describes the relation they
+    // query and not the text they print:
+    //
+    // - `graph_struct_search` reads every indexed file of a language off disk at
+    //   call time (`graph/mcp.rs::run_struct_search`), runs a caller-supplied
+    //   tree-sitter query over it and returns the matched **source text** —
+    //   100 rows × 2000 chars on shipped defaults. It is `code_search` with an
+    //   AST filter; `(string_literal) @s` hands back the repo's literals.
+    // - `graph_repo_map` packs symbol SIGNATURES — first source lines, see
+    //   `graph/builder.rs::signature_of` — to a model-supplied `budget_chars`
+    //   clamped to 200,000. C-1's own failure scenario named it by hand and the
+    //   2026-08-07 fix run demoted its five neighbours and left it alone.
+    //
+    // Left TRUSTED they were a general source-text read primitive sitting in the
+    // one class `Latch::blocks` never blocks and `filter_defs` never strips,
+    // live beside every `ddg__*` def under an EXTERNAL latch: the full trifecta,
+    // through the class declared clean. The four `fmt_symbols` tools below stay
+    // TRUSTED because the same fix removed `signature` from their model-facing
+    // output — they return names, kinds, paths, lines and edges only.
+    row("graph_struct_search", ToolClass::LocalCapability, false),
+    row("graph_repo_map", ToolClass::LocalCapability, false),
     // ── TRUSTED — structural graph + app-composed reads ────────────────────
     row("graph_find_symbol", ToolClass::Trusted, false),
     row("graph_callers", ToolClass::Trusted, false),
@@ -202,13 +238,11 @@ pub const TABLE: &[ClassRow] = &[
     row("graph_imports", ToolClass::Trusted, false),
     row("graph_outline", ToolClass::Trusted, false),
     row("graph_transitive", ToolClass::Trusted, false),
-    row("graph_repo_map", ToolClass::Trusted, false),
     row("graph_impact", ToolClass::Trusted, false),
     row("graph_tests_for", ToolClass::Trusted, false),
     row("graph_recent_changes", ToolClass::Trusted, false),
     row("graph_dead_exports", ToolClass::Trusted, false),
     row("graph_cycles", ToolClass::Trusted, false),
-    row("graph_struct_search", ToolClass::Trusted, false),
     // Also absent from the locked table but shipped in `graph::tool_specs()`
     // (V15). Both return structure only — a node path and a subsystem/god-node
     // report — so they belong with the structural set; leaving them to the
@@ -739,6 +773,13 @@ mod tests {
             // `offload_task` laundered `read_file` past a latched tab.
             "offload_task",
             "offload_batch",
+            // Demoted by the 2026-08-08 re-review (H-1 — C-1 reopened): the
+            // structural label described the relation they query, not the text
+            // they print. `graph_struct_search` returns the source a
+            // caller-supplied tree-sitter query matched; `graph_repo_map` packs
+            // first-source-line signatures to a 200k-clamped budget.
+            "graph_struct_search",
+            "graph_repo_map",
         ] {
             assert_eq!(classify(n), ToolClass::LocalCapability, "{n}");
         }
@@ -752,13 +793,11 @@ mod tests {
             "graph_imports",
             "graph_outline",
             "graph_transitive",
-            "graph_repo_map",
             "graph_impact",
             "graph_tests_for",
             "graph_recent_changes",
             "graph_dead_exports",
             "graph_cycles",
-            "graph_struct_search",
             "graph_path",
             "graph_architecture",
             "context_recall",
@@ -768,15 +807,33 @@ mod tests {
         }
         // …and the class holds nothing else. A future promotion into the one
         // class that never latches and is never blocked has to change this
-        // count, which is the review step the C-1/C-1c findings needed.
+        // count, which is the review step the C-1/C-1c/H-1 findings needed.
+        //
+        // 16 since the H-1 demotion (2026-08-08): 14 graph tools —
+        // find_symbol, callers, callees, references, imports, outline,
+        // transitive, impact, tests_for, recent_changes, dead_exports, cycles,
+        // path, architecture — plus the two memory reads. Counted against the
+        // table below rather than against the list above, so dropping a name
+        // from BOTH lists cannot pass silently.
+        let trusted: Vec<&str> = TABLE
+            .iter()
+            .filter(|r| r.class == ToolClass::Trusted)
+            .map(|r| r.name)
+            .collect();
         assert_eq!(
-            TABLE
-                .iter()
-                .filter(|r| r.class == ToolClass::Trusted)
-                .count(),
-            18,
-            "TRUSTED membership changed — re-read the module docs' membership rule"
+            trusted.len(),
+            16,
+            "TRUSTED membership changed — re-read the module docs' membership rule: {trusted:?}"
         );
+        // H-1: the two demoted names are the ones a regression would put back,
+        // so name them here instead of trusting the count alone (a swap keeps
+        // the count and reopens the hole).
+        for gone in ["graph_struct_search", "graph_repo_map"] {
+            assert!(
+                !trusted.contains(&gone),
+                "`{gone}` is TRUSTED again — it returns repo source text (V32 H-1)"
+            );
+        }
         // PERSISTENT-WRITE: exactly one member.
         assert_eq!(classify("context_note"), ToolClass::PersistentWrite);
         assert_eq!(
@@ -979,6 +1036,60 @@ mod tests {
         assert!(loc.contains(&"graph_snippet".to_string()));
         assert!(loc.contains(&"context_note".to_string()));
         assert!(loc.contains(&"offload_task".to_string()));
+    }
+
+    /// **V32 H-1 (C-1 reopened): the two source-text graph readers must be gone
+    /// from BOTH enforcement paths under an EXTERNAL latch.**
+    ///
+    /// `b80f5b8`'s C-1 demotion reached only the worker's def-filter, which is
+    /// how the finding survived a fix once already — so this asserts the
+    /// def-removal half ([`filter_defs`]) AND the in-flight-refusal half
+    /// ([`Latch::refusal`], which [`Latch::proxy_gate`] also resolves through)
+    /// for each name. A test that pinned only the advertised list is exactly
+    /// the PoC-shaped test the review named.
+    #[test]
+    fn the_source_text_graph_readers_are_blocked_on_both_enforcement_paths() {
+        // Path 1 — def removal (the worker's advertised surface).
+        let all = vec![
+            def("graph_struct_search"),
+            def("graph_repo_map"),
+            def("graph_outline"),
+            def("ddg__search"),
+        ];
+        let ext = names(&filter_defs(&all, Latch::External));
+        assert_eq!(
+            ext,
+            ["graph_outline", "ddg__search"],
+            "H-1: a contaminated scope must not be offered a source-text graph reader: {ext:?}"
+        );
+
+        for name in ["graph_struct_search", "graph_repo_map"] {
+            let class = classify(name);
+            assert_eq!(class, ToolClass::LocalCapability, "{name}");
+            // Path 2 — the in-flight refusal, for a call hallucinated from an
+            // earlier turn's def list or issued in the same turn the latch
+            // engaged. This is also the path a Claude/OpenCode TAB takes: the
+            // proxy gates `/graph_run` by name through `proxy_gate`, and it
+            // never filters graph defs at all, so for a tab it is the ONLY
+            // path — which is why both are asserted here and not just one.
+            assert_eq!(
+                Latch::External.refusal(class),
+                Some(REFUSAL_LOCAL_BLOCKED),
+                "{name}"
+            );
+            assert_eq!(
+                Latch::External.proxy_gate(class),
+                ProxyGate::Refuse(REFUSAL_LOCAL_BLOCKED),
+                "{name}"
+            );
+            // …and in the other direction each of them now LATCHES, closing the
+            // web for the rest of the scope. That is the accepted consequence
+            // of the demotion, asserted rather than discovered in the field.
+            let mut l = Latch::Open;
+            assert!(l.engage(class), "{name} must latch the scope LOCAL");
+            assert_eq!(l, Latch::Local, "{name}");
+            assert!(l.blocks(ToolClass::External), "{name}");
+        }
     }
 
     #[test]

@@ -1,9 +1,9 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
 **Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). 
-A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–28** below.
+A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–29** below.
 
-Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-1 `graph_struct_search`, C-2 growth-forgery, the SSRF scheme family, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
+Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-2 growth-forgery, the SSRF scheme family, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
 **Builds on:** the single-proxy MCP design (every consumer — Claude tabs,
 OpenCode tabs, the offload worker — sees ONE `cimp-offload` server), V28
 per-tab MCP identity (`--tab` spawn arg + `live_session_for_tab`), the V8
@@ -53,8 +53,8 @@ by the worker loop, the loopback proxy, and tests.
 | Class | Members | Latch behavior |
 |---|---|---|
 | **EXTERNAL** | everything proxied from configured MCP servers: `ddg_*`, `context7_*`, and **any unknown/future server by default** | first call latches the task/session: LOCAL-CAPABILITY becomes unavailable |
-| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, plus `run_check` and `security_audit`/`quality_audit`, plus `offload_task`/`offload_batch` (see the two 2026-08-07 amendments below, and locked decision 18) | first call latches the other way: EXTERNAL becomes unavailable |
-| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_repo_map`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_struct_search`, `graph_path`, `graph_architecture`), `context_recall`/`context_notes` (reads — a **recorded residual**, see the second 2026-08-07 amendment and locked decision 23) | never latches, never blocked |
+| **LOCAL-CAPABILITY** | `read_file`, `list_dir`, `code_search`, `run_command`, plus the **content-bearing** graph tools `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code`, `graph_struct_search`, `graph_repo_map`, plus `run_check` and `security_audit`/`quality_audit`, plus `offload_task`/`offload_batch` (see the two 2026-08-07 amendments and the 2026-08-08 (c) amendment below, and locked decisions 18 and 29) | first call latches the other way: EXTERNAL becomes unavailable |
+| **TRUSTED** | structural graph tools (`graph_find_symbol`, `graph_callers`, `graph_callees`, `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`, `graph_impact`, `graph_tests_for`, `graph_recent_changes`, `graph_dead_exports`, `graph_cycles`, `graph_path`, `graph_architecture`) — **none of which returns repo source text**: the four that used to print a definition's first line via `signature` no longer do (2026-08-08 (c) amendment, finding H-1) — plus `context_recall`/`context_notes` (reads — a **recorded residual**, see the second 2026-08-07 amendment and locked decision 23) | never latches, never blocked |
 | **PERSISTENT-WRITE** | `context_note` (the one tool whose output outlives the session) | never latches; **write-gated while EXTERNAL-latched** (decision 10) |
 
 Rationale for the graph split: structural tools return names/edges/metadata
@@ -149,6 +149,77 @@ bounds what a *pre-existing* pinned fact may contain — a user who has pinned
 credentials or a private architecture note has pinned them into a class that
 never latches. Demoting is a live option and would cost a latched tab its own
 memory; it is a user decision, not taken here.
+
+**Phase A amendment 2026-08-08 (c) (full re-review, finding H-1 — C-1 reopened;
+user-decided): `graph_struct_search` and `graph_repo_map` are DEMOTED from
+TRUSTED to LOCAL-CAPABILITY, and the four `fmt_symbols` tools lose `signature`
+from their model-facing output.** This corrects a **defect in the locked
+decision itself**, not code drift from it: both tools appear under TRUSTED in
+the taxonomy table above (now edited), and the code faithfully implemented what
+the table said.
+
+The table's own rationale — *"structural tools return names/edges/metadata
+(near-zero exfil value)"* — was applied to the **relation a tool queries**
+instead of to the **text it returns**. Two members failed it:
+
+- `graph_struct_search` is `code_search` with an AST filter. Its executor
+  (`graph/mcp.rs::run_struct_search`) reads every indexed file of a language
+  **off disk at call time**, runs a *caller-supplied* tree-sitter query over it
+  and returns the matched source — 100 rows × 2000 chars on shipped defaults.
+  `(string_literal) @s` returns the repo's literals.
+- `graph_repo_map` packs symbol **signatures** to a model-supplied
+  `budget_chars` clamped to 200,000. A signature is the definition's first
+  source line (`graph/builder.rs::signature_of` = `first_line(node_text(..))`
+  capped at 200 chars), not a name. C-1's own failure scenario named this tool
+  by hand; the 2026-08-07 fix run demoted five of its neighbours and never
+  touched it.
+
+The same source-line problem reached four tools that are **not** demoted:
+`graph_find_symbol`, `graph_outline`, `graph_callers` and `graph_callees` all
+rendered `signature` through the shared `fmt_symbols`, so
+`graph_find_symbol{name: "STRIPE_SECRET"}` returned
+`const STRIPE_SECRET: &str = "sk_live_…";` verbatim (Rust `const_item` /
+`static_item` are indexed symbols). Demoting all six would have gutted the class
+— navigation is the whole reason it exists — so the fix is split: the two
+*general* source readers are demoted, and the four *navigational* tools keep
+name, kind, path, line, the `[test]` tag and the V15 confidence badge while
+`fmt_symbols` stops emitting `signature` at all. The class's clean case is
+restated as a property a reviewer can check row by row: **a TRUSTED result
+contains no repo source text on any path.**
+
+**The seam, deliberately narrow.** The strip is at the model-facing MCP output
+and nowhere else. The graph index still stores `signature`, `SymbolHit` still
+carries it, and every human-facing consumer still renders it — the
+`graph_dead_exports` Tauri command behind Code Intelligence, the read advisor's
+outline line, the file digests and repo map in auto-injection. A human reading
+their own repo is not the threat model, and blanket-removing the field would
+have been a regression dressed as a fix.
+
+**Exploit this closes.** Under an EXTERNAL latch `graph_snippet`, `read_file`
+and `code_search` are stripped from the advertised list while
+`graph_struct_search` stayed live and `ddg__search` stayed live: an injected
+page requested `(string_literal) @s`, got the repo's literals, and exfiltrated
+through the still-open external side. The full trifecta, through the one class
+that is never blocked and never stripped.
+
+Consequences, accepted: a research-profile task and an EXTERNAL-latched tab can
+no longer run a structural search or a repo map, and a scope that runs one first
+is latched LOCAL and loses the web — the same shape as the `run_check`/audit
+split above. `graph_repo_map`'s 200,000-char clamp is unchanged and still
+applies; the tool is now latch-gated *in addition to* being budget-clamped.
+Session-start repo-map **auto-injection** is unaffected: it calls
+`context::repo_map` in-process (`graph/service.rs`), never the tool, so it
+crosses no gate. Enforcement needed no new route — both gates classify by name
+through `classify()` (the worker's `filter_defs` + `latch_gate`, and the proxy's
+`gate()` on `/graph_run`), which is exactly what C-1b/C-1c had to add for the
+audit and offload routes and what the graph route has had since Phase B.
+
+**Not done, recorded as a follow-up decision:** *literal redaction* instead of a
+blanket strip — keep the signature but blank string/byte literals inside it, so
+`const STRIPE_SECRET: &str = "…"` keeps its type and name and drops only the
+value. Better on information-per-risk, but it is per-language tree-sitter work
+with its own failure modes (a missed node kind is a silent leak), so it is a
+separate decision rather than a rider on this one.
 
 **Invariant (cross-module): unknown = EXTERNAL.** A newly configured MCP
 server must never default into TRUSTED or LOCAL-CAPABILITY. Reclassification
@@ -1347,6 +1418,25 @@ declares its class AND its mutation capability in one reviewed place.
     write scope). Worth doing on its own merits and **not detection-specific** —
     it protects the binary release, which is the larger prize. Recorded as a
     maintenance item, not a V32 blocker.
+
+29. **The TRUSTED class is closed against source text by DEMOTING BOTH general
+    readers and STRIPPING `signature` (user decision 2026-08-08 — review
+    finding H-1, C-1 reopened).** `graph_struct_search` and `graph_repo_map`
+    become LOCAL-CAPABILITY; `graph_find_symbol` / `graph_outline` /
+    `graph_callers` / `graph_callees` stay TRUSTED and stop emitting
+    `signature` (a definition's first source line) in their model-facing MCP
+    output. Full reasoning, the seam it cuts at, and the accepted consequences
+    are in the **Phase A amendment 2026-08-08 (c)** above; this entry exists so
+    the decision is findable from the numbered list.
+
+    The rule the class now states and the tests enforce: **a TRUSTED result
+    contains no repo source text on any path.** Two of the three candidate
+    fixes were rejected — demoting all six (gutting navigation, the reason the
+    class exists) and a latch-conditional strip (the four are always TRUSTED, so
+    the condition is always true and is one more thing to get wrong). The third,
+    **literal redaction inside the signature**, is deferred as its own decision:
+    it is per-language tree-sitter work whose failure mode (a missed node kind)
+    is a silent leak.
 
 ## Phases
 

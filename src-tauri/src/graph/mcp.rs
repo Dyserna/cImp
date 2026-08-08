@@ -90,8 +90,8 @@ pub fn tool_specs() -> Vec<GraphToolSpec> {
         one(
             "graph_find_symbol",
             "Find where a symbol (function, struct, trait, etc.) is DEFINED in this project. \
-             Returns each definition's file, line, kind, and signature. Prefer this over grep \
-             for 'where is X defined'.",
+             Returns each definition's file, line and kind — never its source text; use \
+             `graph_snippet` for the body. Prefer this over grep for 'where is X defined'.",
             &[("name", "The exact symbol name to look up.")],
         ),
         one(
@@ -1662,6 +1662,37 @@ pub async fn offload_run_check(roots: &[PathBuf], args: &Value) -> Result<String
 
 // ── result formatting (compact, token-bounded text for the model) ────────
 
+/// The symbol-row renderer for `graph_find_symbol` / `graph_outline` /
+/// `graph_callers` / `graph_callees` — and, incidentally, for `graph_snippet`'s
+/// two ancillary listings (the ambiguous-name disambiguation and the
+/// whole-file-span outline).
+///
+/// # V32 H-1 — it deliberately does NOT print `signature`
+///
+/// The four tools above are [`ToolClass::Trusted`](crate::offload::toolclass::ToolClass),
+/// i.e. reachable under an EXTERNAL latch with every `ddg__*` def still live,
+/// on the stated premise that a TRUSTED result carries near-zero exfil value.
+/// `SymbolHit::signature` breaks that premise outright: `graph/builder.rs`'s
+/// `signature_of` is `first_line(node_text(..))` capped at 200 chars — the
+/// **definition's first source line**, not a name — and Rust `const_item` /
+/// `static_item` are indexed symbols, so `graph_find_symbol{name:
+/// "STRIPE_SECRET"}` used to answer `const STRIPE_SECRET: &str = "sk_live_…";`
+/// verbatim, through the one class that is never blocked and never stripped.
+///
+/// The strip is **unconditional**, not latch-conditional, for two reasons: the
+/// four callers are always TRUSTED, so "when the call is TRUSTED-classed"
+/// resolves to "always" for them anyway; and this function is purely
+/// model-facing (no IPC/UI consumer), so an unconditional cut is one rule a
+/// reviewer can check instead of a conditional a future caller can get wrong.
+/// The navigational value the class exists to provide — name, kind, path, line,
+/// the `[test]` tag and the V15 edge-confidence badge — is untouched, and a
+/// model that wants the text has `graph_snippet` (LOCAL-CAPABILITY, and
+/// therefore latched out of a contaminated scope, which is the point).
+///
+/// **The seam:** `signature` is stripped HERE, at the model-facing MCP output,
+/// and nowhere else. The index still stores it, `SymbolHit` still carries it,
+/// and the Code Intelligence UI, the read advisor and auto-injection still
+/// render it — a human looking at their own repo is not the threat model.
 fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
     if syms.is_empty() {
         return "No matching symbols.".to_string();
@@ -1672,12 +1703,11 @@ fn fmt_symbols(syms: &[SymbolHit], max_rows: usize) -> String {
         .map(|s| {
             let tag = if s.is_test { " [test]" } else { "" };
             format!(
-                "{} ({}) — {}:{}  {}{}{}",
+                "{} ({}) — {}:{}{}{}",
                 s.name,
                 s.kind,
                 s.file,
                 s.start_line,
-                s.signature,
                 tag,
                 conf_badge(s.confidence)
             )
@@ -2966,6 +2996,152 @@ mod snippet_tests {
         let (s2, t2) = cap_bytes("abc", 10);
         assert!(!t2);
         assert_eq!(s2, "abc");
+    }
+}
+
+/// **V32 H-1 (2026-08-08 re-review — C-1 reopened): the four TRUSTED symbol
+/// tools must not return a definition's source line.**
+///
+/// The review named all four (`graph_find_symbol`, `graph_outline`,
+/// `graph_callers`, `graph_callees`); a test covering only `graph_find_symbol`
+/// would be exactly the PoC-shaped test that let C-1 survive two fix runs, so
+/// every one of them is exercised against the same secret-shaped fixture — and
+/// through `run_tool`, the real dispatch arm, not through `fmt_symbols`
+/// directly.
+#[cfg(test)]
+mod h1_signature_strip_tests {
+    use super::{run_tool, GraphIndex};
+    use crate::graph::{parse_file, Lang};
+    use crate::offload::toolclass::{classify, CallGuards, ToolClass};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    /// The literal an injected page would exfiltrate. Split with `concat!` for
+    /// the reason `graph::secrets`' fixtures are (commit `ee034d5`): a
+    /// contiguous well-formed token trips GitHub push protection and gitleaks
+    /// on this repo, blocking the push. The compiler folds it back, so the
+    /// fixture on disk carries the whole thing.
+    const SECRET: &str = concat!("sk", "_live_", "H1CANARYdoNOTreturnME0123");
+
+    /// Every definition is a **one-liner**, so each one's first source line —
+    /// which is exactly what `signature_of` captures — contains the secret.
+    /// That makes the leak observable through all four tools rather than only
+    /// through the `const`, which is the difference between this test and the
+    /// finding's proof of concept.
+    fn fixture() -> String {
+        format!(
+            "pub const STRIPE_SECRET: &str = \"{SECRET}\";\n\
+             pub fn charge() -> i32 {{ let k = \"{SECRET}\"; helper() }}\n\
+             pub fn helper() -> i32 {{ let k = \"{SECRET}\"; k.len() as i32 }}\n"
+        )
+    }
+
+    fn setup(tag: &str) -> (PathBuf, GraphIndex) {
+        let dir = std::env::temp_dir().join(format!("h1-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let src = fixture();
+        std::fs::write(dir.join("src/pay.rs"), &src).unwrap();
+        let idx = GraphIndex::open(&dir, ".ckg").expect("open");
+        idx.index_file_graph(&parse_file("src/pay.rs", &src, Lang::Rust))
+            .expect("index");
+        (dir, idx)
+    }
+
+    fn call(idx: &GraphIndex, name: &str, args: serde_json::Value) -> String {
+        run_tool(idx, name, &args, 50, 2_000, None, None, CallGuards::clean())
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+    }
+
+    #[test]
+    fn no_trusted_symbol_tool_returns_the_definitions_source_line() {
+        let (dir, idx) = setup("four");
+
+        // The whole point of the class: these four are reachable with every
+        // `ddg__*` def still live, so a leak here is a leak with an exit.
+        for n in [
+            "graph_find_symbol",
+            "graph_outline",
+            "graph_callers",
+            "graph_callees",
+        ] {
+            assert_eq!(classify(n), ToolClass::Trusted, "{n}");
+        }
+
+        // The fixture really does index the way the finding describes — a
+        // `const` whose stored signature is the assignment line. Without this
+        // the four assertions below could pass on an empty graph.
+        let stored = idx.find_symbol("STRIPE_SECRET").expect("find_symbol");
+        assert_eq!(stored.len(), 1, "the const must be an indexed symbol");
+        assert!(
+            stored[0].signature.contains(SECRET),
+            "the INDEX still stores the signature — the strip is at the MCP \
+             boundary, not in the index: {:?}",
+            stored[0].signature
+        );
+
+        let cases = [
+            ("graph_find_symbol", json!({ "name": "STRIPE_SECRET" }), "STRIPE_SECRET"),
+            ("graph_outline", json!({ "file": "src/pay.rs" }), "charge"),
+            // `charge` calls `helper`, so `helper`'s callers and `charge`'s
+            // callees each resolve to a one-line definition holding the secret.
+            ("graph_callers", json!({ "name": "helper" }), "charge"),
+            ("graph_callees", json!({ "name": "charge" }), "helper"),
+        ];
+        for (tool, args, expected_row) in cases {
+            let out = call(&idx, tool, args);
+            assert!(
+                !out.contains(SECRET),
+                "H-1: `{tool}` returned the definition's source line: {out}"
+            );
+            assert!(
+                !out.contains("sk_live"),
+                "H-1: `{tool}` returned a source literal: {out}"
+            );
+            // …and it still does its job. A strip that also removed the
+            // navigation would "pass" the assertion above while breaking the
+            // reason the class exists.
+            assert!(
+                out.contains(expected_row),
+                "`{tool}` lost its rows entirely: {out}"
+            );
+            assert!(
+                out.contains("src/pay.rs:"),
+                "`{tool}` lost the file:line navigation: {out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The seam.** `signature` is cut at the model-facing MCP output and
+    /// nowhere else — so the consumers a human reads still get it. Two are
+    /// asserted: the read advisor's outline line (`context::read_advice`, which
+    /// answers a redundant `Read` in the user's own session) and the
+    /// `dead_exports` row that backs the Code Intelligence UI's `title=`
+    /// tooltip through the `graph_dead_exports` Tauri command.
+    ///
+    /// If this fails, the fix was a blanket removal at the wrong layer.
+    #[test]
+    fn the_non_model_facing_consumers_still_get_the_signature() {
+        let (dir, idx) = setup("seam");
+
+        let advice = super::super::context::read_advice(&idx, &dir, "src/pay.rs", None, false, 0);
+        assert!(
+            advice.contains(SECRET),
+            "the read advisor's outline is a UI/session surface, not a TRUSTED \
+             tool result — it must keep the signature: {advice}"
+        );
+
+        // The IPC row `graph_dead_exports` (ipc/commands.rs) maps straight from
+        // `SymbolHit::signature`; the MCP tool of the same name has never
+        // printed one (`fmt_dead_exports`), which is why only the row is
+        // checked here.
+        let rows = idx.dead_exports(50).expect("dead_exports");
+        assert!(
+            rows.iter().any(|s| s.signature.contains(SECRET)),
+            "the IPC dead-export rows must still carry the signature: {rows:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

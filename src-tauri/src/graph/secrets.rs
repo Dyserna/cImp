@@ -1,4 +1,5 @@
-//! V32 Phase C2 (user decision 2026-08-07) — the **memory secret screen**.
+//! V32 Phase C2 (locked decision 22, user decision 2026-08-08) — the **memory
+//! secret screen**.
 //!
 //! # Why a write-time screen and not a read-time latch
 //!

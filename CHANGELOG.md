@@ -5,6 +5,36 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0-rc.2] — 2026-08-10
+
+**Pre-release, for testing.** A small delta over rc.1: one behavioural fix and
+the verification material for the milestone. Everything rc.1 said about its own
+readiness still holds — the V32/V33 injection-hardening milestone remains
+unsigned-off, now with **11 open MEDIUM findings** (F-18 below joins the ten),
+and **none of the 25 live-verification recipes has been run**. Settings schema
+is unchanged at 29.
+
+### Fixed
+
+- **Session identity follows the right tab.** The per-tab `--session-id` pin is
+  now verified rather than assumed, and the Code Intelligence Overview follows
+  the focused tab.
+
+### Known issues
+
+- **The injection controls are hard to find (F-18).** Every V32 switch lives
+  under Settings → **Offload task tools** — *Injection protection* (the master),
+  *Native web tools*, *Injection detection*, *Detection updates*. The taint
+  popover instead directs you to a "Settings → Tools" section that does not
+  exist, and the ⛨ chip's "Click to open Settings" opens no particular section.
+  The controls all work; only the signposting is wrong. Found by running rc.1.
+
+### Documentation
+
+- The milestone's 25 live-verification recipes are now a runnable checklist at
+  `docs/reviews/V32-live-verify-checklist-2026-08-10.md`, in the order they
+  should run, with the setup constraints that were not previously written down.
+
 ## [0.51.0-rc.1] — 2026-08-09
 
 **Pre-release, for testing.** The V32/V33 injection-hardening milestone below is

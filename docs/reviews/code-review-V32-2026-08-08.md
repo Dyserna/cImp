@@ -546,7 +546,7 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-5 | At the worker, the "unscreened" notice is **false every time it fires**: `cap_result` truncates to 32 KB, unconditionally below both screening caps, so every byte the model sees was scanned. Trains the reader to discount a notice that is true at the proxy. | OPEN | `mod.rs:387-394`, `agent.rs:1910/1928` |
 | M-6 | Audit findings enter model context with no envelope, no detection scan, and without contaminating the conversation — scanner-quoted text from `node_modules` is framed as authoritative project data, and `context_note` afterwards is *not* quarantined. `context_recall`, strictly tamer, *is* enveloped. | OPEN | `audit/mcp.rs:248-266`, `loopback.rs:2618-2621,1706-1708` |
 | M-7 | Three ungated loopback routes reach local capability; `POST /context/post_edit` **executes the project's configured checks** for a caller-supplied `cwd`. None carries a `tab`; none appears in any route enumeration. | **FIXED (taint gate + enumeration)** `526c91f` — see the M-7 note below; the caller-supplied `cwd` half is **NOT** closed and is folded into H-7 | `loopback.rs:4095,4181,4690`, `toolclass.rs:234-266`, `config.rs:659,683,762,1872` |
-| M-8 | `run_check` dispatches **above** the class gate on the headless path, so an EXTERNAL-latched tab that corrupts `.cimp-discovery` runs the project's build/test/lint while `ddg__*` stays live. | OPEN | `graph/mcp.rs:516-529` |
+| M-8 | `run_check` dispatches **above** the class gate on the headless path, so an EXTERNAL-latched tab that corrupts `.cimp-discovery` runs the project's build/test/lint while `ddg__*` stays live. | **FIXED (gate raised + widened to the class, keyed on the child's tab identity)** `4555d70` — see the M-8 note below; the residual is the identity-less caller, which is F-5/H-8 | `graph/mcp.rs:520-524,632-706`, `offload/mcp.rs:400-414` |
 | M-9 | The `#46` outcome split covers the manifest fetch but not the **artifact** fetch: any asset 404/timeout is recorded as a bundle *rejection* (red card, `unreachable_streak` reset). The deploy note's own publish order makes this the likely steady state. | **FIXED** `a17f25c` — an artifact fetch failure is `Unavailable`, not a rejection | `updater/mod.rs:1032-1039,1059` |
 | M-10 | A crash *during* rollback deletes the files the rollback already restored — the journal has two phases and the rollback is an unrepresented third state. Permanent, uncarded, and `warn!`s "the previous version was restored". | **FIXED** `a17f25c` — `Phase::Restoring`; recovery no longer deletes what the rollback restored | `updater/mod.rs:1423-1434,1365-1370` |
 | M-11 | `restore_archived` swallows per-file failures; the caller then reports "the previous version was restored" verbatim, and `healthy` cannot see missing files. Silent permanent coverage loss with a reassuring message. | **FIXED** `a17f25c` — restore debt is durable and retried; verdict = health AND no debt | `updater/mod.rs:1401-1413` |
@@ -626,6 +626,64 @@ carries exported signatures — the same content H-1 demoted `graph_repo_map` fo
    but it is exactly M-2's subject: **M-2's tripwire must assert `TABLE` ↔
    dispatchable-name correspondence, with the three `hook_*` names as a documented
    exception.**
+
+### M-8 — what was closed, and on what discriminator
+
+**The literal finding is a no-op and was not the fix.** `run_check` is already
+`ToolClass::LocalCapability`, and the only gate it dispatched above
+(`headless_write_refused`) refused PERSISTENT-WRITE and nothing else — so moving the
+`run_check` block below it changes no behaviour. The real hole is that the headless
+path has **no latch at all**, by design, and therefore serves the whole
+LOCAL-CAPABILITY class unlatched: `run_check` (executes the project's configured
+commands) plus the six graph tools that return source text. `run_check` is the
+sharpest instance, not the extent.
+
+**Closed.** `handle_call` now takes the calling MCP child's `--tab` identity and
+consults one class-driven gate (`graph/mcp.rs::headless_refusal`) as the first thing
+it does — above the `run_check` dispatch and above the index open. PERSISTENT-WRITE
+is refused as before; LOCAL-CAPABILITY is refused **when the child serves a cImp tab**
+and served when it does not.
+
+**Why not the `ProxyMiss` reason.** Gating on *why* the proxy missed — allow under
+`Transport` ("the app is genuinely unreachable"), refuse under the
+attacker-manufacturable ones — narrows nothing, because **every** reason is reachable
+with a single `Write`, the tool decision 3 concedes cImp cannot gate. Truncating
+`.cimp-discovery/<pid>.json` gives `NoInstance`; *adding* a well-formed entry whose
+`root` is a deeper ancestor of the child's cwd and whose `port` is dead gives
+`Transport`, because `loopback::select_discovery` prefers the deepest matching root
+(`loopback.rs:170-195`). A gate keyed on the reason is a gate the attacker holds the
+key to. This contradicts the enum's own doc comment, which calls `Transport` "the case
+the fallback was designed for" — true of intent, false of reachability.
+
+**Why `tab` is the discriminator.** It is argv, baked in by cImp at spawn on both
+consumers' paths and unreachable from any request body. `Some` ⇒ a latch for this tab
+exists in the app and this path cannot read it. `None` ⇒ the child was not spawned by
+cImp: the documented first-class headless consumers (`claude -p`, cron —
+`ARCHITECTURE.md` § *Warm pool vs. fallback child*) have no tab, no latch scope
+anywhere, and are **ungated on the app path too** (`latch_scope`'s locked fail-open).
+The restored invariant is therefore: *the headless path is never more permissive than
+the app path would be for the same caller identity*.
+
+**Residual — narrowed, not eliminated.** An attacker who can make the child present
+**no** tab identity still gets unlatched LOCAL-CAPABILITY headless. cImp's own children
+cannot be made to do this (argv is fixed at spawn and reaches this frame without
+touching a request body), but a caller that can **spawn processes** can simply start
+its own MCP child with no `--tab`.
+
+That bypass is **self-limiting, and stating why is the point**: it requires exactly the
+capability the gate is protecting. Anything able to spawn a tabless child can already
+run the project's checks and read its source directly, so the bypass grants it nothing
+it did not already hold. The gate therefore has teeth precisely where it needs them —
+a caller with no process-spawn capability (the offload worker; a tab whose harness
+denies `Bash`/`run_command`) cannot reach around it. Do not "discover" this later and
+file it as a hole; it is the boundary the design accepts.
+
+Beyond that, the residual is the same one F-5/H-8 track everywhere else: *an
+identity-less caller is ungated by design*, now with one more consumer riding on it. The second, accepted cost is a false
+positive: a tab whose latch is `Open` also loses these tools while the app is
+unreachable — the only direction available to a frame that cannot read the latch, and
+an already-anomalous window (an AI tab is a cImp webview; cImp down normally means the
+tab is gone too).
 
 ---
 

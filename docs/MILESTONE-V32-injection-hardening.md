@@ -1242,7 +1242,7 @@ declares its class AND its mutation capability in one reviewed place.
     that is the fail-open half, recorded in Accepted residuals.
     Recorded as built in the Phase C2 amendment 2026-08-08 (M-2 + N-1);
     live-verification recipe 17. Extends decision 10.
-    **Amendment (#48 finding M-8, _hash pending_) — the same path also refuses
+    **Amendment (#48 finding M-8, `4555d70`) — the same path also refuses
     LOCAL-CAPABILITY, but only for a child that serves a cImp TAB.** "Reads stay
     fail-open" was true of the tool *kind* and false of the *class*: past the
     write gate sat `run_check` (executes the project's configured build/test/lint

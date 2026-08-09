@@ -557,8 +557,8 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-16 | `read` is deliberately left unpinned to preserve OpenCode's `*.env` → "ask" carve-out — but last-match-wins applies to the *project* config too. A repo shipping `{"permission":{"read":"allow"}}` resolves `read * → allow` and `.env` is read with no prompt. Verified live. | OPEN | `config.rs:2038-2043` |
 | M-17 | `/mcp/call` and worker error paths carry the remote MCP server's `error.message` verbatim and up to 300 chars of raw response body — unscreened, unwrapped, unbudgeted — while both call sites' comments assert these are cImp-composed strings. | OPEN | `mcp_host.rs:1282-1314`, `loopback.rs:3804` |
 | M-18 | The SSRF widening reads CIDR notation and doc placeholders as fetch targets: `"RFC1918 (10.0.0.0/8)"` in a *search query* refuses the whole call with a security error. Compounds — each benign denial raises the power-of-two threshold that suppresses a later real one. | OPEN | `outbound.rs:386-415,660-684` |
-| M-19 | Decision 21's "empty is not absent" reasoning is applied on the headless path but not the loopback path: a `PersistentWrite` with no resolvable tab identity is stored **unquarantined**, and `scoped_session` attributes it to another tab's session. | OPEN | `loopback.rs:1572-1584`, `graph/mcp.rs:1114-1125` |
-| M-20 | `context_note` text is unbounded and the secret screen only sees the first 256 KiB — 256 KiB of filler then an AWS key stores Clean. `secrets.rs:120-128` asserts the opposite ("it cannot reach either bound"). | OPEN | `graph/mcp.rs:1107,1146` |
+| M-19 | Decision 21's "empty is not absent" reasoning is applied on the headless path but not the loopback path: a `PersistentWrite` with no resolvable tab identity is stored **unquarantined**, and `scoped_session` attributes it to another tab's session. | **FIXED (both defects; quarantine — not refusal — plus a write-only session resolver)** `19440d2` — see the M-19 note below | `loopback.rs` (`unattributed_write`, `LatchRegistry::gate`), `toolclass.rs` (`WriteTaint::Unattributed`, `write_notice`, `UNATTRIBUTED_WRITE_NOTICE`), `graph/mcp.rs` (`write_session`, the `context_note` arm) |
+| M-20 | `context_note` text is unbounded and the secret screen only sees the first 256 KiB — 256 KiB of filler then an AWS key stores Clean. `secrets.rs:120-128` asserts the opposite ("it cannot reach either bound"). | **FIXED (bound made structural; the false claim corrected)** `19440d2` — see the M-20 note below | `graph/secrets.rs` (`NoteText`, `MAX_NOTE_BYTES`, the static assert, `screen`), `graph/mcp.rs` (the `context_note` arm's parse boundary) |
 | M-21 | A worker-only detection override leaves the updater inert and the manual buttons lying: `updates_enabled` resolves at `Scope::App`, which deliberately excludes the worker row, so the UI says "detection is off" about a layer that is running. | OPEN | `updater/mod.rs:246-252`, `injection.rs:724-729` |
 | M-22 | The override popover renders a click-time snapshot that never updates while open — a tab that becomes contaminated while the user reads it keeps saying "Not latched." | OPEN | `TabBar.svelte:68-102` |
 | M-23 | Promote (unquarantines attacker-authored text into future sessions) is one unconfirmed click; Discard (which can only lose a note) is behind a modal. Polarity inverted vs. the latch UI, which gets it right. | OPEN | `CodeIntelligenceView.svelte:338-339` |
@@ -1007,6 +1007,121 @@ timing-dependent line in the file.
 **CI:** `.github/workflows/tests.yml`'s ignored-test inventory goes 3 → 4 and the
 node-backed step now runs both gate tests by name, one `--exact` run each (O-1's
 "a filter that matches nothing exits 0" guard applies per name).
+
+### M-19 — two defects, both closed, and which precedent each followed
+
+The finding names two things that are not the same size. Reported separately
+because they were fixed in different places, for different reasons.
+
+**Defect 1 — the unquarantined store.** `LatchRegistry::gate`'s identity-less
+fail-open returned `WriteTaint::Clean` for *every* class, PERSISTENT-WRITE
+included, so a `/graph_run` caller with no resolvable tab wrote a `context_note`
+straight into auto-injecting project memory. The precedent for treating that
+class as an exception was already in the tree, one module over: on the headless
+path the identical two missing facts (no session identity, no taint verdict) make
+the same call a hard refusal, on the stated grounds that a note written blind is
+*"project-wide, permanent, unattributable AND unquarantined — the
+highest-privilege write the memory surface offers."* Two paths, the same missing
+facts, opposite answers. `unattributed_write` makes them agree. It is a
+**quarantine, not the headless path's refusal** — locked decision 10 governs the
+loopback path, and the headless refusal exists because there is no running app to
+review a queue in, not because refusal is the better answer. Everything else
+about the fail-open is untouched: no other class changes verdict, no latch row is
+created, and F-5/H-8/M-8's reliance on it is intact.
+
+**It is a new `WriteTaint` variant (`Unattributed`), not a reuse of
+`Quarantined`.** `QUARANTINE_WRITE_NOTICE` states as *fact* that "this session
+has used an external tool (web/MCP-server)" — which this path has no evidence for
+and which is usually false. A boundary message that invents a reason is how a
+model learns to discount boundary messages. `WriteTaint::write_notice()` moves the
+choice into the enum, so a fourth verdict is a non-exhaustive-match error rather
+than a silent reuse of the wrong sentence; the same discipline that made this an
+enum instead of a `bool` in the first place. Gated on `policy.quarantine` only,
+never on `policy.latch` — decision 16 keeps the two switches independent, and
+this is a quarantine decision.
+
+**Defect 2 — the wrong session attribution.** This is the worse of the two and it
+is *not* fixed by flagging the note. `scoped_session`'s most-recently-active
+fallback keys on `agent`, and `agent` on the loopback path is the request body's
+own `consumer` field — so an unattributable caller **chose** which tab's
+conversation its note was filed inside, by naming that tab's agent. Closed with
+`write_session`, a resolver used only by the write: the session the caller PROVED,
+or none. Decision 21 applied rather than cited — `session: None` does not mean
+"scope me to whatever is most recent", it means the live-session registry could
+not prove a session for this caller, and a write does not get to guess. The
+pinned/unpinned split is unchanged (F21): a pinned note is global, so there is no
+session to get wrong; an unpinned one is answered honestly instead of silently
+misfiled. Reads keep the fallback in full — that is V28's documented pre-upgrade
+behaviour and costs nothing.
+
+**Residual on defect 1:** the hold is only as good as the review queue that
+receives it, and M-23 (promote is one unconfirmed click, discard is behind a
+modal) is still OPEN — an unattributed note is exactly the kind a user should not
+be able to promote by reflex. **Residual on defect 2:** a caller with a *real*
+tab whose session the registry cannot currently resolve (TTL-stale, or a tab with
+no transcript activity yet) also loses the fallback and is told to retry or pin.
+That is stated in `write_session`'s doc rather than hidden: `session: None` is
+exactly as unproven in both cases, and this frame cannot tell them apart.
+
+**A test was pinning defect 1 as correct.**
+`a_local_latch_and_a_tabless_call_both_write_clean` asserted
+`Ok(WriteTaint::Clean)` for an identity-less `context_note` under the comment
+*"no tab identity ⇒ no scope to latch and none to taint"* — the first half locked,
+the second half the defect. Split into `a_local_latch_writes_clean` and
+`an_identityless_persistent_write_is_held_not_stored_clean`.
+`no_explicit_session_reproduces_the_pre_v28_fallback` pinned defect 2 the same
+way (it asserted the note landed in `ses_b`, "the most recent session for the
+agent"); it is now reads-only, with the write half stated as its own test.
+`an_identityless_call_is_never_gated` used `.is_ok()`, which is true of every
+verdict this function can return — tightened to assert the taint per name.
+
+### M-20 — the bound is structural now, and the comment was corrected too
+
+**The finding is exact and the PoC reproduces.** With the fix reverted, a
+`context_note` of 256 KiB of filler followed by `AKIAIOSFODNN7EXAMPLE` answers
+`Noted (pinned, kept across sessions).` and the credential is in ordinary,
+auto-injecting project memory.
+
+**Enforced structurally, not asserted.** `secrets::screen` no longer takes
+`&str`. It takes `&NoteText`, a newtype with a private field whose only
+constructor caps the input at `MAX_NOTE_BYTES` (64 KiB), which
+`const _: () = assert!(MAX_NOTE_BYTES <= signature::SCAN_PREFIX_BYTES)` pins at
+or below what the scanner actually reads. The screen is now *unable* to receive
+more than it can read — routing around it is a type error, and raising the cap
+past the scanner's prefix is a compile error. `parse` takes the `String` by
+value, so at the one call site the raw text is moved out of scope and the note
+that gets **stored** is necessarily the note that was **screened**. 64 KiB rather
+than 256 deliberately: well under the prefix so the normalized second pass keeps
+a wide margin against the 1 s scan budget, and the same figure the classifier
+already bounds its own input at.
+
+**The false claim is corrected, not merely relocated.** The old comment asserted
+the input "cannot reach either bound". Of the two: the **prefix** bound is now
+genuinely unreachable, and the comment says so *by pointing at the type and the
+static assert* rather than at an assumption about callers. The **timeout** bound
+is not proven unreachable and the comment no longer pretends otherwise — it
+states the residual (a bounded ≤64 KiB buffer against a 1 s ceiling on a path
+that routinely scans four times that), names the outcome if it is ever hit (the
+deliberate fail-open every screen here takes), and notes that it is no longer
+attacker-*selectable*, because padding past the cap means the note is not stored
+at all rather than stored unscreened.
+
+**The other two screens do not share this exposure on this path, and are
+disclosed on the path they are on.** `context_note` reaches only the secret
+screen — the classifier and the signature layer screen *fetched* content, not
+memory writes. On the fetch path both are bounded (`classifier::MAX_INPUT_BYTES`
++ `MAX_WINDOWS`, `signature::SCAN_PREFIX_BYTES` + `SCAN_TIMEOUT`) and both
+**report** their boundedness — `Scored.bounded`, `is_bounded`,
+`ScanOutcome::DidNotComplete` — so padding there degrades to a disclosed "we did
+not look at all of it" rather than a silent Clean. The secret screen was the only
+one whose bound had no disclosure channel at all, which is precisely why it
+needed one enforced at the input instead. (Whether that disclosure is *honest at
+the worker* is M-5, still OPEN, and untouched here.)
+
+**Cost, stated:** a note over 64 KiB is now refused at the parse boundary with a
+fixed message and nothing stored. This is argument validation in the same shape
+as `require_str`'s, not a security refusal, and it is composed from the constant
+so the number in the message cannot drift from the number in the check.
 
 ---
 
@@ -1726,3 +1841,45 @@ invalidation as covering the most hardened configuration. It does not:
 
 The mechanism is fine; the sentence describing it claims more than it delivers, which is
 the same class of defect the O-1 documentation audit found seven of.
+
+---
+
+### F-15 — `GraphIndex::mem_add_note` still takes a raw `&str`
+
+**Found by the M-20 fix run. Severity: MEDIUM.**
+
+M-20's `NoteText` closes the **screen's** input, not the **store's**. `mem_add_note` is
+still `pub` and takes a raw `&str`, so a future write path can store an unbounded,
+unscreened note by calling it directly — the screen is only reached by the one caller
+that happens to go through the `context_note` arm.
+
+This is the same shape as the tripwire-gap section's existing note that
+`mem_quarantined_notes` is a `pub` accessor returning tainted rows with no bound on its
+callers: the guard is on the *path*, not on the *store*. Threading `NoteText` through the
+storage signature would close it, at the cost of the index layer plus ~10 test call
+sites. Deliberately not done inside M-20 — it is a wider refactor than the finding, and
+it should be decided as one with the `mem_quarantined_notes` half rather than piecemeal.
+
+### F-16 — two of the three `MemoryQuarantine` row producers write an empty `root`
+
+**Found by the M-19 fix run. Severity: LOW, but it degrades a review surface.**
+
+`record_secret_screen_flag` already wrote `root: String::new()`, and M-19's
+`unattributed_write` matches it because `LatchRegistry::gate` has no scope to derive a
+root from. Retention is unaffected — lanes key on `Screen`, not root — but a
+**root-filtered Tool Activity view will not show these rows under any project**. So two
+of the three producers of the row a user is meant to review are invisible to a
+project-scoped reviewer, which is a consumer-quality gap of exactly the kind the
+tripwire-gap analysis flags for M-21 and H-10.
+
+### F-17 — stale test binaries wedge the linker (build reliability, not product)
+
+**Hit three times during the M-19/M-20 run. Severity: LOW for the product, HIGH for
+iteration speed.**
+
+After several `cargo test` runs a `cimp-<hash>.exe` from a *completed* run survives and
+the next link dies with `LNK1104: cannot open file …\deps\cimp-<hash>.exe`, needing a
+manual `Stop-Process`. Plausibly the same child-process leak behind the known
+`audit::runner::tests::{cancel_kills_child, timeout_kills_child_and_reports_timed_out}`
+flakes — which spawn real children and assert kill timing. If so, one fix closes both,
+and it would also make CI reruns less flaky.

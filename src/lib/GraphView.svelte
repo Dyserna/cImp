@@ -1399,7 +1399,14 @@
     // (graph disabled) are backlog, not live activity.
     historySeeded = false;
     void pollHistory();
-    historyTimer = setInterval(() => void pollHistory(), 1500);
+    // Gated on `visible`, per the app-view contract (appViews.ts): this
+    // component is kept alive for the app's lifetime, so an ungated tick polled
+    // the backend every 1.5s forever — including while the Graph view sub-tab
+    // was off-screen and every result was discarded. `updateVisibility` re-seeds
+    // on the way back so the skipped interval doesn't replay as a burst.
+    historyTimer = setInterval(() => {
+      if (visible) void pollHistory();
+    }, 1500);
   }
   function stopHistoryPoll(): void {
     if (historyTimer) { clearInterval(historyTimer); historyTimer = undefined; }
@@ -1482,8 +1489,20 @@
   }
   function updateVisibility(): void {
     const vis = intersecting && docVisible && containerHasSize;
-    if (vis && !visible) { visible = true; wake(); }
-    else if (!vis && visible) { visible = false; stopLoop(); }
+    if (vis && !visible) {
+      visible = true;
+      // Re-seed rather than replay: the history poll below is skipped while
+      // parked, so the high-water mark is stale on return and the next fetch
+      // would hand `applyActivity` every call that landed meanwhile as a burst
+      // of pulses. Seeding advances the mark and applies nothing — the same
+      // "no replayed backlog" contract the parked path used to get by polling
+      // through the whole time it was hidden.
+      historySeeded = false;
+      wake();
+    } else if (!vis && visible) {
+      visible = false;
+      stopLoop();
+    }
   }
   function handleIntersect(entries: IntersectionObserverEntry[]): void {
     const entry = entries[0];

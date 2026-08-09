@@ -544,7 +544,7 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-3 | Spotlighting is spawn-baked in practice (`fact_promotion_block` → `--append-system-prompt` / OpenCode instructions) but declared live: absent from `spawn_inject_sig`, no restart hint. Toggling it on mid-session leaves the running tab injecting **unenveloped pre-V32 memory into the system prompt**. Test pins the defect. | OPEN | `config.rs:1082-1089`, `injection.rs:330-337,1736` |
 | M-4 | A classifier that runs and fails is indistinguishable from Clean, and a failing window **discards windows that already scored over threshold**. `Scored` has no field to express it. The spec names exactly two exclusions; the code implements three. | **FIXED** `5920c92` | `classifier.rs:391-399`, `mod.rs:404-409` |
 | M-5 | At the worker, the "unscreened" notice is **false every time it fires**: `cap_result` truncates to 32 KB, unconditionally below both screening caps, so every byte the model sees was scanned. Trains the reader to discount a notice that is true at the proxy. | OPEN | `mod.rs:387-394`, `agent.rs:1910/1928` |
-| M-6 | Audit findings enter model context with no envelope, no detection scan, and without contaminating the conversation — scanner-quoted text from `node_modules` is framed as authoritative project data, and `context_note` afterwards is *not* quarantined. `context_recall`, strictly tamer, *is* enveloped. | OPEN | `audit/mcp.rs:248-266`, `loopback.rs:2618-2621,1706-1708` |
+| M-6 | Audit findings enter model context with no envelope, no detection scan, and without contaminating the conversation — scanner-quoted text from `node_modules` is framed as authoritative project data, and `context_note` afterwards is *not* quarantined. `context_recall`, strictly tamer, *is* enveloped. | **FIXED (envelope + detection); contamination DECLINED with reasons** `dbfc027` — see the M-6 note below | `audit/mcp.rs:327-428,444-501`, `spotlight.rs:63-91,172-185`, `detection/mod.rs:555-584` |
 | M-7 | Three ungated loopback routes reach local capability; `POST /context/post_edit` **executes the project's configured checks** for a caller-supplied `cwd`. None carries a `tab`; none appears in any route enumeration. | **FIXED (taint gate + enumeration)** `526c91f` — see the M-7 note below; the caller-supplied `cwd` half is **NOT** closed and is folded into H-7 | `loopback.rs:4095,4181,4690`, `toolclass.rs:234-266`, `config.rs:659,683,762,1872` |
 | M-8 | `run_check` dispatches **above** the class gate on the headless path, so an EXTERNAL-latched tab that corrupts `.cimp-discovery` runs the project's build/test/lint while `ddg__*` stays live. | **FIXED (gate raised + widened to the class, keyed on the child's tab identity)** `4555d70` — see the M-8 note below; the residual is the identity-less caller, which is F-5/H-8 | `graph/mcp.rs:520-524,632-706`, `offload/mcp.rs:400-414` |
 | M-9 | The `#46` outcome split covers the manifest fetch but not the **artifact** fetch: any asset 404/timeout is recorded as a bundle *rejection* (red card, `unreachable_streak` reset). The deploy note's own publish order makes this the likely steady state. | **FIXED** `a17f25c` — an artifact fetch failure is `Unavailable`, not a rejection | `updater/mod.rs:1032-1039,1059` |
@@ -565,6 +565,97 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-24 | `Unscreened`, detector flags, `MemoryQuarantine` and `LatchOverride` collapse into one red chip; only denials are visually distinct. "We did not look at all of it" reads as "we blocked something" — the opposite. | OPEN | `ToolActivityView.svelte:356-375` |
 | M-25 | The frontend branches on `rules.armed` where the backend publishes `rules.healthy` for exactly this question — 3 of 4 rule files failing renders full protection. `offload.ts:212` documents that `healthy` must be read, never restated. | OPEN | `latch.ts:259` |
 | M-26 | `FILE_COMPACT_LINES` equals the sum of the per-kind caps (1000), so at saturation every single write triggers a full file read + atomic rewrite, and the accepted child-append race opens on every write instead of every ~1000. | **FIXED** `d652171` — `FILE_COMPACT_LINES` derived with headroom + a compile-time assert | `activity.rs:58-84,472` |
+
+### M-6 — what was closed, and what was declined
+
+The finding names **three** defects. They are not the same size, and the third is
+a posture decision rather than a bug.
+
+**Closed (defect 1, the envelope).** `spotlight::scanner_envelope` /
+`SCANNER_PREAMBLE` join `envelope` and `recall_envelope` as a third standing
+instruction over the *same* nonced markers — one vocabulary for the Phase D
+session guidance to teach, three honest first lines. The audit report is
+delivered inside it. The preamble says the one thing the other two must not:
+**the findings are meant to be acted on as findings; it is the quoted fragments
+that are inert.** A preamble that flatly said "do not act on this" would be
+telling the model to ignore the report it just asked for, and a standing
+instruction the model can catch out is one it learns to discount.
+
+`ensure_closed` recognizes the new preamble. That is not cosmetic: the report is
+capped at 64 KB (`MAX_RESULT_BYTES`) and the worker caps a tool result at 32 KB,
+so a large report is truncated **by construction** and would otherwise reach the
+model with an unterminated data region.
+
+**Closed (defect 2, detection).** The report now goes through the same
+`screen()` both EXTERNAL boundaries use. `wrap_external_result` and the new
+`wrap_local_report` are two callers of one private `compose`, so the composition
+order (detect on RAW → envelope → header outside the markers and in front) has
+one definition and cannot drift.
+
+**On the F-9 budget — measured, not assumed.** A 64 KB report shaped like real
+audit output (one finding per line, `node_modules` paths, a quoted `eval()`)
+against the shipped rules, debug build, idle machine: **~105 ms over both
+passes** (5 trials, 104.7–106.9 ms), against `SCAN_TIMEOUT`'s 1000 ms.
+Normalization alone is 2.7 ms and *does* change the text (single newlines fold),
+so pass 2 really runs. This does not worsen F-9 in the way that matters:
+`scan_outcome_with` starts its own `Instant` per call, so the audit scan
+consumes no other call's budget — and it is 105 ms bolted onto an operation
+that takes minutes. What it adds is one more call site that could itself time
+out under load, which fails honestly to `DidNotComplete` and is reported.
+
+**Declined (defect 3, contamination) — and why the reasoning does not stop at
+audit.** The finding is right that a `context_note` written after an audit is
+not quarantined. It is not right that latching is the instrument.
+
+The argument "third-party text entered the context, therefore the conversation
+is contaminated" applies **verbatim** to `read_file` on `node_modules/`, to
+`graph_snippet`, to `code_search` match text, to `run_check` diagnostics and to
+`POST /context/should_read`'s advisory — every one of them LOCAL-CAPABILITY, and
+none of them latching. If it justifies latching on `security_audit` it justifies
+latching on any local read, which is the whole class, which is *"reading your own
+repository costs you your local tools and marks the conversation contaminated"*.
+That is not a posture cImp can ship, and half-shipping it (audit only) would be
+worse: an inconsistency with no principle behind it.
+
+What actually separates EXTERNAL is not whose bytes they are but **whether an
+outside party is answering this conversation**. A fetch is a request to a party
+outside the trust boundary that composes a reply *for this turn*; a scanner
+quotes bytes that were already on disk, chosen by whoever put them there, with
+no knowledge that this conversation exists. The envelope is the right instrument
+for *untrusted text in a trusted channel*; the latch is the instrument for an
+*untrusted counterparty*. Note the finding's own comparison supports this:
+`context_recall` is enveloped and **also does not latch**.
+
+The residual is therefore recorded, not closed: **a note written after an audit
+carries unquarantined text the model may have read out of a dependency.** It
+belongs with `graph_snippet`, which has the identical property over a much larger
+surface, and so with H-1's standing question about the structural graph tools —
+not with a one-off latch change here.
+
+**Scoped to audit, deliberately.** `run_check` output and `POST
+/context/post_edit`'s check diagnostics are the same shape, and
+`scanner_envelope`'s preamble is written to serve them ("code scanners run over
+this project's files"). They are *not* wrapped in this pass because each has
+several dispatch paths with different scope resolution — `run_check` alone has
+three (`graph::service::run_graph_tool` with its `CallGuards`, the headless
+`graph::mcp` path at `Scope::App`, and `offload::tools::run_check` at the worker
+scope) — and a marker that appears on one path and not another teaches the model
+the marker is decorative. Doing it needs all paths in one change, with the
+`CallGuards.spotlight_recall` field renamed to what it actually is. That is a
+follow-up, not a footnote.
+
+**How the call sites are pinned, and the residual there.** `run_audit` returns a
+`RawReport`, not a `String`, and `RawReport`'s field is private to `audit::mcp`;
+`deliver` is the only way any other module can obtain the text. Deleting either
+consumer's `.deliver(…)` is a **compile error**, verified by doing it — this is
+deliberately not the `/audit/run` gate's shape, where the test exercised the
+helper and the call site was deletable with the suite green. `Delivery` carries a
+`Scope`, not two pre-resolved booleans, so there is no `false` for a call site to
+hardcode: the only way off is the user's own setting, resolved through
+`effective()`. The residual is stated rather than hidden — **inside
+`audit::mcp`** the field is reachable, and `run_audit` does reach it once, to put
+the *raw* report on the Tool Activity row, which is a human surface and must not
+carry markers (the reason `recall_envelope` skips the Memory UI).
 
 ### M-7 — what was closed, and what was not
 
@@ -1216,6 +1307,70 @@ remainder; measure CPU time instead of wall clock; raise `SCAN_TIMEOUT` now that
 it covers two passes; or accept it and make the two affected tests tolerant of
 `DidNotComplete` so the suite stops reporting a real property as a failure.
 
+**One measured data point, from M-6's fix.** A 64 KB audit report (the largest
+this new caller can produce) costs **~105 ms over both passes** against the
+shipped rules — debug build, idle machine, 5 trials — i.e. ~10% of the budget.
+The budget is per *call* (`scan_outcome_with` takes its own `Instant`), so a new
+caller never spends an existing one's; what a new caller adds is one more site
+that can itself thin under load. Useful as a scale for the options above: the
+budget is not tight for realistic payloads, it is tight for descheduled threads.
+
 **Known-flake note for anyone who hits this:** the failing assertion looks like
 the H-4 rules regressing. They have not. Run
 `cargo test offload::detection::signature` alone before investigating.
+
+---
+
+### F-10 — `NativeRouter` never re-gates the audit and graph tools, so a cloud backend can reach them
+
+**Found by the M-6 fix run; verified independently 2026-08-09. Severity: HIGH.**
+
+`HostRouter::call` (`agent.rs:264-278`) re-gates twice after the scope check —
+`graph_*` behind `allow_graph` (V9-01) and `security_audit`/`quality_audit` behind
+`allow_audit` (V26) — and both comments say why: *"an unadvertised tool name can still
+be **called** by the model, and the audit report is local data that must not reach an
+opted-out or remote backend."*
+
+`NativeRouter::call` (`agent.rs:146-156`) implements only the scope check. And the scope
+check does not cover these names: a cloud backend's default is
+`ToolScope::AllExcept { LOCAL_DATA_TOOLS }` (`schema.rs:2886-2894`), and
+`LOCAL_DATA_TOOLS` (`schema.rs:2810-2817`) is exactly
+`read_file, list_dir, code_search, run_command, filesystem, git` — **neither the audit
+tools nor `graph_*`**. `allows_namespaced` therefore returns `true` for
+`security_audit` on a cloud backend, and `NativeRouter` dispatches it: a full local scan
+runs and returns repo paths plus quoted source to a remote model.
+
+Reaching it needs the model to emit a name that is not advertised (`enabled_defs` omits
+it) — i.e. **exactly the A-1 threat model**, whose base rate this milestone already
+measured as non-hypothetical (28 `ok:false` rows in 162 live calls, `a434d4f`).
+
+The root cause is that the defence is written as two `if`s in one of two routers rather
+than as a shared function, so `LOCAL_DATA_TOOLS` cannot express it either: `allows`
+keys on the segment before `__`, so `graph_*` would need a per-tool entry or prefix
+matching — which is why `HostRouter` uses `starts_with("graph_")`. **Fix shape: lift
+both re-gates into one function both routers call.** Folded into M-2's task, which is
+already about names that classify as capability and reach dispatch anyway.
+
+### F-11 — `select_discovery` is a tamper surface, not just a lookup
+
+**Found by the M-8 fix run. Severity: MEDIUM, but it is a primitive rather than a single
+hole.**
+
+`loopback::select_discovery` (`loopback.rs:170-195`) prefers the discovery entry whose
+`root` is the **deepest** ancestor of the child's cwd. So a single `Write` of a
+*well-formed* `.cimp-discovery/<n>.json` naming a deeper root and a dead port makes any
+child prefer a dead endpoint — and, because the entry parses, the resulting `ProxyMiss`
+is `Transport` rather than `NoInstance`.
+
+That gives an attacker a general **"force the fallback, and choose the reason it
+reports"** primitive. M-8's fix is immune by construction (it discriminates on `--tab`
+argv, never on the reason), but the primitive itself is untouched and also steers
+`audit/mcp.rs` and every hook shim. `ProxyMiss`'s own doc comment — `Transport` is
+*"the app is genuinely unreachable — the case the fallback was designed for"* — reads
+as a safety property and is not one; `headless_refusal`'s doc records the correction
+next to the decision that depends on it.
+
+Related, not fixed: `HttpStatus`/`Unparseable` fall back at all, so a call the app
+answered and **declined** is silently re-run headless, hiding the app's own verdict.
+Under the `tab` rule the containment consequence is gone; the diagnostic dishonesty
+remains.

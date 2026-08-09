@@ -49,12 +49,13 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | N-12 | 512 MiB aggregate-download exposure | **FIXED** | `5920c92` — died with the classifier component |
 | O-1 | The H-1 race guard is `#[ignore]`d and CI never runs `--ignored` | **OPEN** | one extra step in `tests.yml` |
 | — | Pre-existing 1-in-4 test flake on the global rule slot | **FIXED** | `5920c92` — guard made structural in `screen_blocking` |
-| F-3 | The primary contamination path writes no forensic record at all | **OPEN** | raised by the fix run; blocks the clear path |
+| F-3 | The primary contamination path writes no forensic record at all | **FIXED** | `ce7c54a` — `Screen::Contamination` on the transition, both paths, one helper |
 | F-4 | `is_configured_tab` is agent-agnostic — `(consumer, tab)` verified nowhere | **OPEN** | raised by the fix run |
 | F-5 | `/graph_run` + `/mcp/call` share H-8's tab half | **OPEN** | raised by the fix run; a decision, not a bug |
 | F-6 | H-2's decode proof degrades silently if the CLI drops `sessionId` | **OPEN** | raised by the fix run; wants a drift canary |
 | F-7 | Auto-injection still pushes signatures into a contaminated tab | **OPEN** | raised by the fix run; bounds what H-1 claims |
 | F-8 | A denied URL still leaks its hostname to DNS | **OPEN** | raised by the fix run; bounds what "denied" means |
+| F-9 | The signature scan's 1 s budget is wall clock spanning both passes | **OPEN** | pre-existing (H-4); fails honestly, but thins under load |
 
 Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
 

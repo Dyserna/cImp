@@ -1735,8 +1735,14 @@ pub async fn activity_clear() -> AppResult<()> {
     run_on_blocking_pool(crate::activity::clear).await
 }
 
-/// Run a synchronous activity-store operation on tokio's blocking pool —
-/// the store does file I/O under its lock (see the module's blocking note).
+/// Run a synchronous, potentially slow operation on tokio's blocking pool.
+///
+/// An `async fn` Tauri command runs ON a runtime worker, so calling synchronous
+/// store work from one parks that worker for the whole pass and starves every
+/// other IPC queued behind it. Originally the activity store's file-I/O-under-a-
+/// lock escape hatch; now the shared one for any command whose body blocks —
+/// notably the graph usage commands, whose Cozo passes have been measured in
+/// seconds against a large store and which the Overview polls on a timer.
 async fn run_on_blocking_pool<T, F>(f: F) -> AppResult<T>
 where
     T: Send + 'static,
@@ -1744,7 +1750,7 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| crate::error::AppError::Ipc(format!("activity task join: {e}")))
+        .map_err(|e| crate::error::AppError::Ipc(format!("blocking task join: {e}")))
 }
 
 /// V10: one candidate dead export (unused public symbol) for the Analyses tab.
@@ -2312,24 +2318,34 @@ pub async fn graph_usage(
     root: Option<String>,
 ) -> AppResult<crate::graph::UsageSnapshot> {
     let root = resolve_graph_root(root)?;
-    let mut snap = graph.usage_snapshot(&root);
-    // Offload local-task count: completed runs (not still `"running"`) on
-    // `local` backends only — "N tasks served locally" per the milestone's
-    // Effectiveness panel, distinct from a run still in flight. GraphService
-    // has no dependency on OffloadService, so this is filled in here rather
-    // than inside `usage_snapshot`.
-    snap.offload_local_tasks = offload
-        .server_metrics()
-        .into_iter()
-        .filter(|b| b.kind == "local")
-        .flat_map(|b| b.metrics.runs)
-        .filter(|r| r.outcome != "running")
-        .count() as u64;
-    // V17 Phase E: the advertised tool-surface size (both consumers), measured
-    // post-`lean_tools`-filter from live settings — another cross-cutting field
-    // GraphService can't fill (it depends on settings, not the index).
-    snap.surface = crate::graph::surface_stats();
-    Ok(snap)
+    // `usage_snapshot` is a multi-query Cozo pass measured in seconds against a
+    // large store, and the Overview polls it on a timer — so it runs on the
+    // blocking pool. Left on a runtime worker it parked one for the whole pass
+    // and every other IPC queued behind it, which is what made switching tabs
+    // feel sluggish while the dashboard was open.
+    let graph = graph.inner().clone();
+    let offload = offload.inner().clone();
+    run_on_blocking_pool(move || {
+        let mut snap = graph.usage_snapshot(&root);
+        // Offload local-task count: completed runs (not still `"running"`) on
+        // `local` backends only — "N tasks served locally" per the milestone's
+        // Effectiveness panel, distinct from a run still in flight. GraphService
+        // has no dependency on OffloadService, so this is filled in here rather
+        // than inside `usage_snapshot`.
+        snap.offload_local_tasks = offload
+            .server_metrics()
+            .into_iter()
+            .filter(|b| b.kind == "local")
+            .flat_map(|b| b.metrics.runs)
+            .filter(|r| r.outcome != "running")
+            .count() as u64;
+        // V17 Phase E: the advertised tool-surface size (both consumers), measured
+        // post-`lean_tools`-filter from live settings — another cross-cutting field
+        // GraphService can't fill (it depends on settings, not the index).
+        snap.surface = crate::graph::surface_stats();
+        snap
+    })
+    .await
 }
 
 /// V24 Phase B: full drill-in detail for ONE session under `root` — its totals
@@ -2346,7 +2362,9 @@ pub async fn graph_session_usage(
     session_id: String,
 ) -> AppResult<crate::graph::SessionUsageDetail> {
     let root = resolve_graph_root(root)?;
-    Ok(graph.session_usage_detail(&root, &session_id))
+    // Same store-pass cost profile as `graph_usage` — off the runtime workers.
+    let graph = graph.inner().clone();
+    run_on_blocking_pool(move || graph.session_usage_detail(&root, &session_id)).await
 }
 
 /// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s
@@ -2391,7 +2409,23 @@ pub async fn graph_usage_advice(
 ) -> AppResult<AdvisorSnapshot> {
     let root = resolve_graph_root(root)?;
     let settings = state.settings.current();
+    // A dozen bounded Datalog queries against the same single-connection store,
+    // on the Overview's poll cadence — off the runtime workers, same reasoning
+    // as `graph_usage`. The body is a plain sync fn (rather than an inline
+    // closure) so it stays readable and its `root`/`settings` stay owned.
+    let graph = graph.inner().clone();
+    run_on_blocking_pool(move || advisor_snapshot_blocking(&graph, root, settings)).await
+}
 
+/// The blocking body of [`graph_usage_advice`] — every signal read plus the
+/// `advisor::evaluate` call. Split out only so the command can hand it to
+/// [`run_on_blocking_pool`]; `root` and `settings` are owned because the
+/// closure that carries them must be `'static`.
+fn advisor_snapshot_blocking(
+    graph: &crate::graph::GraphService,
+    root: std::path::PathBuf,
+    settings: crate::settings::Settings,
+) -> AdvisorSnapshot {
     let (injection_follow_rate, injection_follow_samples) = match graph.injection_follow_rate(&root)
     {
         Some((r, n)) => (Some(r), n),
@@ -2554,10 +2588,10 @@ pub async fn graph_usage_advice(
         && (session_count < crate::advisor::MIN_SESSIONS
             || (injection_follow_samples < crate::advisor::MIN_INJECTIONS
                 && advisor_reread_samples < crate::advisor::MIN_REMINDS));
-    Ok(AdvisorSnapshot {
+    AdvisorSnapshot {
         proposals,
         collecting,
-    })
+    }
 }
 
 /// V16 Feature 1: the harness version + contract-verification state, read

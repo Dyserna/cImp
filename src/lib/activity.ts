@@ -74,3 +74,32 @@ export function activityDelete(id: number): Promise<void> {
 export function activityClear(): Promise<void> {
   return invoke<void>('activity_clear');
 }
+
+/// Splice a freshly-fetched feed onto the one already on screen, REUSING the
+/// object already held for any id that is already present.
+///
+/// **The invariant this rests on:** the backend assigns an id at record time
+/// and never rewrites an entry afterwards — `crate::activity` only ever
+/// appends, deletes, or clears — so an id already held identifies
+/// byte-identical content. If an update-in-place path is ever added there, this
+/// reuse goes stale and must be revisited.
+///
+/// Why it matters: reuse is what keeps each rendered row's expressions
+/// referentially stable. A freshly parsed IPC payload otherwise hands every row
+/// a NEW object identity on every poll, so the whole feed (up to ~1.4k rows at
+/// the per-lane caps, each with several helper calls) re-evaluates even though
+/// only the newest entry actually changed. That full-table churn is what shows
+/// up as hover lag once a second agent tab is filling the feed.
+///
+/// Returns `prev` itself when nothing moved, so the caller's assignment is a
+/// no-op reference write that Svelte skips entirely.
+export function mergeEntries(prev: ActivityEntry[], next: ActivityEntry[]): ActivityEntry[] {
+  const byId = new Map(prev.map((e) => [e.id, e]));
+  let identical = prev.length === next.length;
+  const merged = next.map((e, i) => {
+    const kept = byId.get(e.id) ?? e;
+    if (identical && kept !== prev[i]) identical = false;
+    return kept;
+  });
+  return identical ? prev : merged;
+}

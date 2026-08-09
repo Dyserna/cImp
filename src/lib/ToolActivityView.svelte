@@ -23,6 +23,7 @@
     activityDelete,
     activityDetail,
     activityList,
+    mergeEntries,
     type ActivityEntry,
     type ActivityRecord,
   } from './activity';
@@ -137,7 +138,11 @@
   // The unified feed is poll-based (same 2s cadence CodeIntelligenceView
   // used); both feed kinds land in the backend's single persistent store, so
   // one endpoint covers everything.
-  let entries = $state<ActivityEntry[]>([]);
+  // `$state.raw`: the feed holds up to ~1.4k rows (the per-lane caps in
+  // `crate::activity`) and is only ever REPLACED, never mutated in place, so
+  // plain `$state` would deep-proxy every row on every poll for no added
+  // reactivity — and then route each row's reads through a proxy trap.
+  let entries = $state.raw<ActivityEntry[]>([]);
   let poll: ReturnType<typeof setInterval> | null = null;
   // Bumped by every local mutation (delete/clear). A poll response that was
   // already in flight when a mutation landed is stale — applying it would
@@ -148,7 +153,9 @@
     const seq = mutationSeq;
     try {
       const list = await activityList();
-      if (seq === mutationSeq) entries = list;
+      // Reuse the rows we already hold (see `mergeEntries`) — a plain
+      // `entries = list` re-renders the whole feed on every 2s poll.
+      if (seq === mutationSeq) entries = mergeEntries(entries, list);
     } catch {
       /* backend unavailable mid-teardown — keep whatever we have */
     }

@@ -386,8 +386,16 @@
   // Usage (V14 Phase D/D2): the token X-ray + the budget-tuning advisor's
   // proposals card. Fetched only while the section is open (same posture as
   // Memory) — folded into `refresh()`'s poll below.
-  let usage = $state<UsageSnapshot | null>(null);
-  let advice = $state<AdvisorSnapshot | null>(null);
+  // `$state.raw`, not `$state`: the snapshot is a deep tree (every session row,
+  // and a turn series that runs to thousands of entries) and plain `$state`
+  // deep-proxies all of it on every assignment, then routes every read in the
+  // render path through a proxy trap. Nothing here ever mutates the snapshot in
+  // place — it is only ever REPLACED wholesale by `refreshUsage` — so the deep
+  // proxy buys no reactivity it doesn't already get from the reassignment.
+  let usage = $state.raw<UsageSnapshot | null>(null);
+  // Replaced wholesale like `usage` above (the three local proposal drops all
+  // build a fresh object), so the same `$state.raw` reasoning applies.
+  let advice = $state.raw<AdvisorSnapshot | null>(null);
   let advisorBusy = $state<string | null>(null); // rule_id currently applying/dismissing
   // Rendered in the Advisor card when an Apply can't be honored (e.g. a
   // proposal names a setting this build has no case for) — cleared on the
@@ -411,6 +419,44 @@
   // Was the LAST applied tick in the store-error state? Drives the
   // transition-only notice flash (see `decideUsageApply`).
   let usageErrored = false;
+  // Serialized form of the snapshot currently in `usage` — the change gate.
+  // Reassigning `$state` invalidates the WHOLE derived graph downstream
+  // (`originKindTotals` over the full turn series, the per-model cost rows,
+  // `usageCostMax`) and re-diffs the turn chart, which is up to
+  // `TURN_RENDER_CAP` columns of ~7 nodes each. Doing that every poll tick for
+  // a byte-identical payload is what made the Overview janky to scroll while a
+  // second agent tab was running. Comparing the serialized payload (rather
+  // than a hand-picked field list) is deliberate: a fingerprint that misses a
+  // field renders permanently stale data, and the stringify is orders of
+  // magnitude cheaper than the render it prevents.
+  let usageKey: string | null = null;
+  let adviceKey: string | null = null;
+
+  /// Drop one proposal from the card without waiting for the next poll, after
+  /// its action succeeded. Clearing `adviceKey` is load-bearing: the key gate
+  /// above compares against the last SERVER payload, so a local edit must
+  /// invalidate it — otherwise a best-effort action that did not actually
+  /// stick server-side (`advisorMarkApplied` documents itself as one) would
+  /// see an unchanged payload next tick, skip the apply, and leave the
+  /// proposal hidden forever instead of re-proposing.
+  function dropProposal(ruleId: string): void {
+    adviceKey = null;
+    advice = advice && {
+      ...advice,
+      proposals: advice.proposals.filter((x) => x.rule_id !== ruleId),
+    };
+  }
+  // When the last usage fetch FINISHED. The gap is measured from completion,
+  // not from start, so the effective cadence self-tunes: a fast store polls at
+  // roughly the tick rate, a slow one (a `graph_usage` pass has been measured
+  // in seconds) backs itself off instead of re-entering the moment it returns
+  // and pinning the store's single connection against the transcript taps.
+  let usageDoneAt = 0;
+  const USAGE_MIN_GAP_MS = 2000;
+
+  function usageDue(): boolean {
+    return Date.now() - usageDoneAt >= USAGE_MIN_GAP_MS;
+  }
 
   async function refreshUsage(): Promise<void> {
     if (usageInFlight) return;
@@ -434,6 +480,7 @@
       ]);
     } finally {
       usageInFlight = false;
+      usageDoneAt = Date.now();
     }
     if (seq <= usageApplied) return; // superseded by a later-started request
     usageApplied = seq;
@@ -444,8 +491,22 @@
     const d = decideUsageApply(u, usageErrored);
     usageErrored = d.errored;
     if (d.flash) flashSessionNotice('Usage store busy — showing last loaded data.');
-    if (u && d.apply) usage = u;
-    if (a) advice = a;
+    // Apply only what actually changed (see `usageKey`) — an unchanged payload
+    // must not touch `$state`, or the whole Overview re-renders for nothing.
+    if (u && d.apply) {
+      const key = JSON.stringify(u);
+      if (key !== usageKey) {
+        usageKey = key;
+        usage = u;
+      }
+    }
+    if (a) {
+      const key = JSON.stringify(a);
+      if (key !== adviceKey) {
+        adviceKey = key;
+        advice = a;
+      }
+    }
     // V16 Feature 8: the cost view's auto-match price table. Fetched once
     // per view lifetime here (not per poll — prices change rarely); Settings
     // edits land live via the `llm-pricing-changed` listener, and card opens
@@ -808,7 +869,7 @@
       // means the old always-re-propose behavior for this one apply.
       await advisorMarkApplied(p.rule_id).catch((e) => console.warn('advisor_mark_applied failed', e));
       // Drop the proposal locally rather than waiting for the next poll.
-      advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
+      dropProposal(p.rule_id);
     } finally {
       advisorBusy = null;
     }
@@ -818,7 +879,7 @@
     advisorBusy = p.rule_id;
     try {
       await advisorDismiss(p.rule_id, p.signature);
-      advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
+      dropProposal(p.rule_id);
     } catch (e) {
       console.error('advisor_dismiss failed', e);
     } finally {
@@ -1209,7 +1270,7 @@
     advisorBusy = p.rule_id;
     try {
       await harnessMarkVerified();
-      advice = advice && { ...advice, proposals: advice.proposals.filter((x) => x.rule_id !== p.rule_id) };
+      dropProposal(p.rule_id);
     } catch (e) {
       console.error('harness_mark_verified failed', e);
     } finally {
@@ -1299,7 +1360,9 @@
     else roots = [...roots, s];
   }
 
-  async function refresh(): Promise<void> {
+  /// `force` = a user-initiated refresh (section switch): bypass the usage
+  /// cadence gate below. The timer and the re-attach path pass `false`.
+  async function refresh(force = false): Promise<void> {
     try {
       roots = await graphStatus();
     } catch (e) {
@@ -1323,8 +1386,12 @@
       await refreshMemory();
     }
     // Usage (V14 Phase D/D2): same "only while visible" posture — the Usage
-    // cards now render inside the Overview section.
-    if (section === 'overview') {
+    // cards now render inside the Overview section. Unlike the fetches above,
+    // this one is NOT on the 2s tick: `usageDue` holds it to a minimum gap
+    // measured from the previous pass's completion (see `USAGE_MIN_GAP_MS`).
+    // `force` is the user-initiated path (section switch), which should never
+    // wait — the in-flight gate still keeps it from stacking.
+    if (section === 'overview' && (force || usageDue())) {
       await refreshUsage();
     }
   }

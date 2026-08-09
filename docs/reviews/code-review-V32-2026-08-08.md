@@ -553,7 +553,7 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-12 | Crash recovery only runs when the updater is enabled *and* something is due. A user who turns detection off after a crash strands a short/empty `rules.d` permanently — "never degrade to no rules" fails closed on an unrelated switch. | **FIXED** `a17f25c` — recovery no longer gated on enabled-and-due | `updater/mod.rs:1974-1999` |
 | M-13 | An identifier collision between a shipped rule and a user rule freezes the update channel forever and blames the user's file — U-4's exact symptom, in the case the README tells users to expect. | **FIXED** `a17f25c` — the user's rule is RENAMED (`custom_`), not dropped; **U-4 amendment due** | `updater/mod.rs:430-437` |
 | M-14 | The updater's run lock is process-local; two instances sharing an exe directory race the swap and can destroy the old bundle with the journal pointing at an empty archive. | **FIXED** `a17f25c` — `update.lock` via `create_new`, age-based staleness, never pid | `updater/mod.rs:490`, `store.rs:69` |
-| M-15 | H-1's gate-cache fix narrows the race but does not close it: the epoch is bumped *before* the beacon POST and never after it resolves, so a query issued **during** the POST caches an `open` verdict for a full 2 s TTL. | OPEN | `config.rs:1758-1772,1650-1680` |
+| M-15 | H-1's gate-cache fix narrows the race but does not close it: the epoch is bumped *before* the beacon POST and never after it resolves, so a query issued **during** the POST caches an `open` verdict for a full 2 s TTL. | **FIXED (the whole in-flight window is now a refusal, not just an un-cached verdict)** `d1cfc0b` — see the M-15 note below | `tabs/config.rs` (`opencode_plugin_source`: `CIMP_WEB_PENDING`, `cimpGateState`'s `settle`, the gate's `external`) |
 | M-16 | `read` is deliberately left unpinned to preserve OpenCode's `*.env` → "ask" carve-out — but last-match-wins applies to the *project* config too. A repo shipping `{"permission":{"read":"allow"}}` resolves `read * → allow` and `.env` is read with no prompt. Verified live. | OPEN | `config.rs:2038-2043` |
 | M-17 | `/mcp/call` and worker error paths carry the remote MCP server's `error.message` verbatim and up to 300 chars of raw response body — unscreened, unwrapped, unbudgeted — while both call sites' comments assert these are cImp-composed strings. | OPEN | `mcp_host.rs:1282-1314`, `loopback.rs:3804` |
 | M-18 | The SSRF widening reads CIDR notation and doc placeholders as fetch targets: `"RFC1918 (10.0.0.0/8)"` in a *search query* refuses the whole call with a security error. Compounds — each benign denial raises the power-of-two threshold that suppresses a later real one. | OPEN | `outbound.rs:386-415,660-684` |
@@ -563,7 +563,7 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-22 | The override popover renders a click-time snapshot that never updates while open — a tab that becomes contaminated while the user reads it keeps saying "Not latched." | OPEN | `TabBar.svelte:68-102` |
 | M-23 | Promote (unquarantines attacker-authored text into future sessions) is one unconfirmed click; Discard (which can only lose a note) is behind a modal. Polarity inverted vs. the latch UI, which gets it right. | OPEN | `CodeIntelligenceView.svelte:338-339` |
 | M-24 | `Unscreened`, detector flags, `MemoryQuarantine` and `LatchOverride` collapse into one red chip; only denials are visually distinct. "We did not look at all of it" reads as "we blocked something" — the opposite. | OPEN | `ToolActivityView.svelte:356-375` |
-| M-25 | The frontend branches on `rules.armed` where the backend publishes `rules.healthy` for exactly this question — 3 of 4 rule files failing renders full protection. `offload.ts:212` documents that `healthy` must be read, never restated. | OPEN | `latch.ts:259` |
+| M-25 | The frontend branches on `rules.armed` where the backend publishes `rules.healthy` for exactly this question — 3 of 4 rule files failing renders full protection. `offload.ts:212` documents that `healthy` must be read, never restated. | **FIXED (`healthy` is the gate; a fourth state for the partial set; the contract made mechanical)** `2ab5b86` — see the M-25 note below | `latch.ts` (`withSignatureHealth`, `startLatchPolling`), `offload.ts` (`RulesHealth`, `rulesHealth`), test `detectionContract.test.ts` |
 | M-26 | `FILE_COMPACT_LINES` equals the sum of the per-kind caps (1000), so at saturation every single write triggers a full file read + atomic rewrite, and the accepted child-append race opens on every write instead of every ~1000. | **FIXED** `d652171` — `FILE_COMPACT_LINES` derived with headroom + a compile-time assert | `activity.rs:58-84,472` |
 
 ### M-6 — what was closed, and what was declined
@@ -850,6 +850,166 @@ tab is gone too).
 
 ---
 
+### M-25 — H-10's other half, and why the fix is a fourth state
+
+**The defect is a lying indicator, not a wrong field name.** `armed` is
+`files_loaded > 0 && rules > 0` — *can this rule set match anything at all?* —
+and the question every one of these surfaces asks is `healthy`, *is the rule set
+on disk live?*. A `rules.d` of four files with three failing to compile is
+`armed` and not `healthy`: `scan` runs, matches on a quarter of the signatures,
+and returned **silence** to the status chip, the tab badges and the taint
+popover — silence being exactly what full protection looks like there. A user
+who checks the indicator before pasting a fetched page reads that as covered.
+H-10 closed the *unknown-vs-armed* half of this; this is the *partly-healthy*
+half, and it is the worse direction: a confident wrong claim rather than a
+missing one.
+
+**Fixed by moving the question, not the field.** `withSignatureHealth` gates on
+`healthy`, and the read arm of `SignatureHealth` now carries the backend's whole
+`RulesHealth` verdict (`armed`, `healthy`, `files_failed`) instead of one boolean
+this side chose to keep — a field that is not on the union cannot be branched on
+by mistake, which is the H-10 lesson applied one level up.
+
+**Why a fourth state and not a fourth reuse.** Rendering the partial set as the
+existing disarmed row would have told the user "the rules directory compiled to
+no usable rules" about a layer that *is* matching, and counted it as *switched on
+but inert* in the chip's sentence. That is the same family of lie in the
+understating direction, so the row carries `partial` alongside `unknown`, and the
+distinction survives to the pixels exactly as H-10 required of the third state:
+its own word in the popover (`partial`), its own sentence on the tab ("Running on
+only part of what it needs: …"), its own `reducedCounts` bucket and its own
+clause in the chip tooltip ("1 layer only partly loaded"). The row names the
+number of failed files, so the user is sent to the files rather than to a switch
+nobody flipped. The chip stays on the confident word `reduced` and stays
+un-degraded: `unverified` means *nobody could read this*, and reaching it with a
+perfectly-read partial set would understate a known loss of coverage. **No
+`.svelte` file needed a change** — every render decision already lives in
+`latch.ts`'s pure functions, which is the G-2 arrangement paying for itself.
+
+**The contract is now mechanical, which is the actual finding.** `offload.ts`
+already said `healthy` was the field to read and that it must never be restated;
+`latch.ts` read `armed` three lines under a comment pointing at that rule. A
+documented contract with no enforcement is a comment. So: `rulesHealth()` in
+`offload.ts` is the one extractor, and `src/lib/detectionContract.test.ts` scans
+every shipping `.ts`/`.svelte` (via `import.meta.glob`, since the app tsconfig
+has no node types) and fails the suite on any read of `rules.armed` /
+`rules.healthy` outside a two-entry allowlist — `offload.ts` (declares the type,
+owns the extractor) and `SettingsApp.svelte` (the panel whose job is to render
+the raw read: `healthy` drives the N-3 dot, `armed` adds the "nothing to match
+with" clause). It also asserts both allowlisted files still read it, so a stale
+exemption cannot be inherited, and that the scan found the tree it meant to —
+the failure mode of every source scan is passing by finding nothing.
+
+**A test pinned the defect, again.** `latch.test.ts`'s *"says nothing when the
+layer is armed"* asserted silence for `{ armed: true }`, which is true of the
+3-of-4-broken directory. Rewritten as *"says nothing only when the WHOLE rule set
+on disk is live"*, paired with the finding's own case and with a
+partial-vs-inert-vs-unreadable test in the shape H-10's pairing established.
+**RED-checked per mutation**: restoring the `armed` gate fails 5 tests; keeping
+the `healthy` gate but collapsing `partial` into the inert row fails 3;
+re-introducing a hand-lifted `rules.armed` at the poll site fails the contract
+scan with file and line. The rewritten silence test is green under the first
+mutation *by construction* (a live set is also armed) and RED under removal of
+the silence gate — its partner carries the finding.
+
+**Checked and clean, report only:** `SettingsApp.svelte` was already correct
+(N-3's dot binds `healthy`; its `armed` clause is a diagnostic beside the file
+counts, not a protection verdict). It is the only other frontend consumer of the
+detection status.
+
+### M-15 — what was closed, and why the epoch could never have closed it
+
+**The race is real and the finding's mechanism is exact.** H-1's epoch catches a
+query that is *already in flight* when a beacon fires. It is structurally unable
+to catch the other one: a query issued **during** the beacon POST starts at the
+already-bumped epoch, and the reply it gets is not stale at all — the app has
+genuinely not been told yet, because the POST that tells it is the one still in
+flight. Nothing about that verdict looks suspect, so `settle` cached it, and a
+`read` issued after a `webfetch` was admitted for a full `CIMP_GATE_TTL_MS`.
+Bumping the epoch a second time *after* the POST would not have closed it either:
+the racing query can commit before that second bump lands.
+
+**Fixed by making the window itself a first-class fact.** `CIMP_WEB_PENDING`
+counts native web calls of this tab that have been **admitted but not yet
+reported**. It is opened on the statement immediately after the epoch bump and
+closed in a `finally`, so it covers the POST, the disabled-beacon `return` and
+every throwing/aborting path. Two readers, and both only ever tighten:
+
+- **`settle` will not cache across it.** The query snapshots the counter at its
+  start; together with the epoch that covers *every* beacon overlapping the query
+  — one that starts mid-query moves the epoch, and one that started earlier was
+  by definition still pending at the snapshot. Two integers read at one instant
+  decide "did contamination touch my window".
+- **the gate treats it as an EXTERNAL latch**, and reads it at the *deny site* so
+  no cache path can bypass it — cached, fresh and fail-open verdicts all pass
+  through the one expression. Only the LOCAL direction consults it; folding it
+  into the web direction would relabel a `local` latch as `external` and turn
+  that line's refusal into an admission, which is the one way a local signal
+  could have *loosened* the gate. A test asserts that inversion never appears.
+
+This is decision 17's trust rule applied literally: authority to refuse **nothing**
+still comes from the app (`gate: true` is the app's word and nothing local can
+synthesize it); a signal that can only tighten is safe to take from a weak,
+in-process source.
+
+**`settle` also stopped answering `open`.** It now caches conditionally and
+returns the app's verdict unconditionally. Two reasons, and the first is a bug
+this fix would otherwise have had: `open` carries `gate: false`, so a query that
+answered with it skipped the deny site's `st.gate === true` guard entirely and
+admitted the very call the window exists to refuse. The second is that it was
+never load-bearing — the latch is **sticky** app-side (it only tightens and never
+re-opens), so any verdict that comes back is a *lower bound* on the real
+restriction. Applying one late can under-refuse, never over-refuse. Caching it is
+the only dangerous act, and that is what is now conditional.
+
+**Cost, measured rather than asserted** (node 25, 200 000 gated calls per arm,
+this plugin before and after the change, two runs):
+
+| | before | after |
+|---|---|---|
+| hot path, warm cache | 162.9 / 161.6 ns/call | 154.2 / 156.7 ns/call |
+| `/latch/state` round trips for 20 reads issued during one beacon POST | 1 (19 served from a pre-contamination cache, **all 20 admitted**) | 20 (nothing cached, **all 20 refused**) |
+
+The common path is unchanged — an integer compare, inside measurement noise, and
+the cache still serves 200 000 calls off one query. The whole cost is one extra
+loopback round trip per local tool call issued *while a beacon POST is in flight*,
+which is bounded by that POST's own `AbortSignal.timeout(2000)` ceiling and is in
+practice a sub-millisecond in-process POST.
+
+**Tests, and what they would still pass with.**
+`the_beacon_window_opens_beside_the_epoch_bump_and_always_closes` is the
+structural half: exactly one open and one close, the close in a `finally`, and —
+after stripping comments — **no `await` between the epoch bump and the window
+opening**, which is what makes the adjacency a guarantee rather than an ordering
+(the engine is single-threaded, so with nothing awaitable between them no query
+can start in the sliver where the epoch has moved and the window has not opened).
+`the_gate_refuses_local_tools_while_the_beacon_is_in_flight` is the executable
+half — a second node-driven interleaving beside H-1's, with the beacon POST parked
+and released by the driver, no sleeps and no timers anywhere, so it is
+load-insensitive by construction. It admits a control `read` first (a plugin that
+refuses everything cannot pass), compares both refusals against the shipped
+`REFUSAL_NATIVE_LOCAL_BLOCKED` constant rather than merely catching (a `TypeError`
+is not a pass), and asserts a **new** `/latch/state` query after the beacon lands,
+which is what distinguishes "the cache was left empty" from "the window never
+closed".
+
+**RED-checked per hunk:** reverting the deny-site clause fails the executable test
+at *"admitted a local tool while a web call was in flight"*; reverting `settle`
+fails it at *"admitted after the beacon landed"* — the finding's own sentence;
+removing the window fails both source and executable tests. **One honest gap,
+reported not hidden:** breaking only the `finally` decrement leaves the executable
+test GREEN (a leaked counter refuses correctly forever), and only the structural
+test catches it. That failure mode is a lockout of the tab's local tools, not a
+containment loss, and the deterministic guard for it is the source assertion; the
+alternative — asserting a cache hit within the 2 s TTL — would have been the one
+timing-dependent line in the file.
+
+**CI:** `.github/workflows/tests.yml`'s ignored-test inventory goes 3 → 4 and the
+node-backed step now runs both gate tests by name, one `--exact` run each (O-1's
+"a filter that matches nothing exits 0" guard applies per name).
+
+---
+
 ## Tripwire gap analysis
 
 The scanner→structural refactors (`62d1110`, `d6408fc`) did what they claimed — the
@@ -893,7 +1053,7 @@ consumer. Two have consumer-quality gaps (M-21, H-10).
 | G-2 chip vs raiser predicates | MEDIUM | **CLOSED** — one predicate, backend-published `default_on` |
 | G-3 reduced-protection fails silent | MEDIUM | **CLOSED** — `recordPoll` + unknown chip with a live consumer |
 | G-4 `/mcp/call` double snapshot | MEDIUM | Docs **CLOSED**, TOCTOU open by decision and honestly recorded |
-| H-1 gate cache clobber race | MEDIUM | **PARTIAL** (M-15) — original interleaving closed, second one open |
+| H-1 gate cache clobber race | MEDIUM | **CLOSED** — original interleaving closed by H-1, the in-flight-POST one by M-15 |
 | H-2 per-tab plugin flags | MEDIUM | **CLOSED**, with migration (not forward-only) |
 | A-1 hallucinated name latches | MEDIUM | **CLOSED** functionally; introduced M-2, now also closed (the fix stands, and its invariant is mechanical) |
 
@@ -1010,8 +1170,15 @@ lockfile bump.
   **pass** on a machine that has the Kokoro/espeak inputs (verified 2026-08-09,
   all three green locally), and neither input is on the runner, so a blanket
   `-- --ignored` would be red forever. The same step pins the ignored-test
-  INVENTORY at those three names, so the next `#[ignore]` forces a decision
-  instead of silently joining a never-run pile — which is how O-1 happened.
+  INVENTORY, so the next `#[ignore]` forces a decision instead of silently
+  joining a never-run pile — which is how O-1 happened.
+
+  *Updated by the M-15 fix:* the inventory is now **four** names and the step
+  runs **two** node-backed tests, one `--exact` run each —
+  `the_gate_cache_survives_a_beacon_racing_an_in_flight_query` (H-1) and
+  `the_gate_refuses_local_tools_while_the_beacon_is_in_flight` (M-15). The pin
+  worked exactly as designed: adding the second `#[ignore]` failed the step until
+  someone decided where it belonged.
 - Three tests pin the defect rather than the invariant (see "The pattern").
 - Deleting the gate call from `handle_audit_run` or `handle_run` leaves the suite
   green — decision 18's own enforcement has no test at its enforcement point, which
@@ -1520,3 +1687,42 @@ Note also that this is the third member of a family this review keeps meeting �
 `run_check` also drove **M-8** (headless latch bypass) and the un-enveloped check output
 behind **M-7's residual #1**. Any decision taken here should be checked against those
 two rather than made in isolation.
+
+---
+
+### F-13 — `/latch/state` publishes `contaminated` and the OpenCode plugin never reads it
+
+**Found by the M-15 fix run. Severity: MEDIUM. A published signal with no consumer —
+global principle 3.**
+
+`LatchRegistry::beacon` contaminates a `Local`-latched tab **without moving the latch**
+(`beacon_row`'s own else-branch says so), and `/latch/state` publishes `contaminated`
+alongside `latch` (`loopback.rs:5681`). The generated OpenCode plugin's gate reads only
+`st.latch`. So a tab that is **contaminated but not EXTERNAL** admits every local tool,
+and the bit that says so was on the wire the whole time.
+
+This is not M-15's race — it is the steady state after it. M-15 closed the window during
+which contamination has not yet been *reported*; F-13 is the case where it has been
+reported, is published, and is ignored.
+
+Deciding it needs care rather than a one-line read: `contaminated` is sticky for the
+tab's life (H-2 removed the only reset, and the clear path is a deliberate human
+authority action), so gating local tools on it would be much closer to a permanent
+withdrawal than the latch is. That may well be right — it is what the bit means — but it
+is a product decision, and it should be taken together with the contamination-clear path
+built in session 3 rather than bolted onto the plugin.
+
+### F-14 — H-1's "most hardened combination" rationale is overstated
+
+**Found by the M-15 fix run. Severity: LOW (a doc/claim defect, not a code one).**
+
+The comment at the epoch bump in `opencode_plugin_source` justifies the gate-cache
+invalidation as covering the most hardened configuration. It does not:
+
+- With **gate ON + beacon OFF**, the invalidation fires only for the tab's *own* web
+  tools — and in that mode there is no report, so the re-query returns `open` anyway.
+- A **proxied** `ddg` fetch that *does* move the latch app-side triggers **no**
+  invalidation in the plugin at all; it relies purely on the 2 s TTL.
+
+The mechanism is fine; the sentence describing it claims more than it delivers, which is
+the same class of defect the O-1 documentation audit found seven of.

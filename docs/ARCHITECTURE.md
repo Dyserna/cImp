@@ -267,19 +267,36 @@ for lack of identity, so there is no restart hint owed — and because the tab i
 is not Settings-derived and cannot change while a tab runs, it needs no
 `spawn_inject_sig` entry.
 
-**One case is not isolatable, and degrades to unscoped rather than guessing (H1,
-2026-08-05 review).** Claude's tap has no per-process discriminator: it tails the
-newest `*.jsonl` under `~/.claude/projects/<slug(cwd)>`, a root derived from the
-project dir alone. Two Claude tabs on the SAME project dir (the built-in `claude`
-+ `claude-local`, both `cwd: None`) therefore follow whichever session wrote
-last, so neither tab's registry entry proves anything. Each running Claude tap
+**Per-tab identity is pinned at spawn (V34, 2026-08-09).** cImp generates a UUID
+for each Claude tab and passes it as `--session-id`, so the tap follows exactly
+`<root>/<uuid>.jsonl` instead of racing for the newest file, and the tab's
+binding is provable no matter how many tabs share a project. Generated in
+`tabs::config::resolve_oob_source` beside the `OobSpec` that carries it, so the
+argv flag and the file the tap follows cannot drift; `oob/claude.rs::pin_step`
+governs the wait-vs-give-up decision, and `graph_tab_session` exposes tab →
+session so the Code Intelligence Overview can follow the focused tab rather than
+the most-recently-active session. A tab whose own args already select a
+conversation (`--resume`/`--continue`/…, see `args_select_session`) is left
+unpinned, as is one whose pinned transcript never appears within
+`PIN_GRACE_MS` — both fall back to the behaviour described next, which is also
+what a pinned tab reverts to after a `/clear` rolls its session over.
+
+**The unpinned case is not isolatable, and degrades to unscoped rather than
+guessing (H1, 2026-08-05 review).** Without a pin Claude's tap has no
+per-process discriminator: it tails the newest `*.jsonl` under
+`~/.claude/projects/<slug(cwd)>`, a root derived from the project dir alone. Two
+such Claude tabs on the SAME project dir therefore follow whichever session
+wrote last, so neither tab's registry entry proves anything. Each running Claude tap
 declares its root (`GraphService::mark_live_tab_root`, refreshed per poll tick,
 RAII-cleared on tab exit), and the single predicate
 `graph::service::tab_binding_is_ambiguous` — running tabs only, never merely
-configured ones — makes the registry withhold both answers while ≥2 tabs share a
-root: `live_session_for_tab` → `None` (⇒ fail-open to the pre-V28 recency lookup,
-never a tool error) and `live_claude_sessions` drops the pair, so NC-2's
-permission resolver refuses instead of flipping a badge/TTS on the wrong tab.
+configured ones, and never a PINNED one — makes the registry withhold both
+answers while ≥2 tabs share a root: `live_session_for_tab` → `None` (⇒ fail-open
+to the pre-V28 recency lookup, never a tool error) and `live_claude_sessions`
+drops the pair, so NC-2's permission resolver refuses instead of flipping a
+badge/TTS on the wrong tab. The pin exemption is deliberately one-sided: it
+clears the pinned tab only, since an unpinned neighbour is still the one
+guessing and may still grab the pinned tab's transcript.
 Claude tabs on different dirs, and OpenCode tabs anywhere, are unaffected. The
 spawn dir feeding both the transcript root and the hook's cwd fallback has one
 definition (`tabs::config::ai_working_dir`).

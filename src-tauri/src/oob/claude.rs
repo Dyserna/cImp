@@ -96,6 +96,11 @@ struct HeartbeatState {
     /// usually a finished session, and marking it live would report the wrong
     /// one; see [`LiveSessionGate`]).
     session: Option<String>,
+    /// V34: whether the drain loop is still honouring its `--session-id` pin.
+    /// Mirrored here so a heartbeat tick re-stamps the SAME pinned-ness the
+    /// drain last claimed — a tick that asserted `pinned` after the drain gave
+    /// up would re-arm a proof that no longer holds.
+    pinned: bool,
 }
 
 impl TapHeartbeat {
@@ -109,6 +114,16 @@ impl TapHeartbeat {
             if st.session.as_deref() != Some(session_id) {
                 st.session = Some(session_id.to_string());
             }
+        }
+    }
+
+    /// V34: seed the pin state, and later clear it if the drain gives up (the
+    /// harness never wrote the pinned transcript). Same discipline as
+    /// [`Self::note_session`] — the heartbeat only ever repeats a claim the
+    /// drain loop actually holds.
+    fn note_pinned(&self, pinned: bool) {
+        if let Ok(mut st) = self.state.lock() {
+            st.pinned = pinned;
         }
     }
 
@@ -137,7 +152,7 @@ impl TapHeartbeat {
         if st.retired {
             return false;
         }
-        ctx.mark_live_tab_root("claude", root);
+        ctx.mark_live_tab_root("claude", root, st.pinned);
         if let Some(sid) = st.session.as_deref() {
             ctx.mark_live_session(sid, "claude");
         }
@@ -296,7 +311,7 @@ impl LiveSessionGate {
 /// Tail the active transcript for `project_dir`, speaking new assistant text
 /// until the tab's cancel token fires. Resilient: if the project dir or any
 /// file is missing it simply waits; transient read/parse errors are skipped.
-pub async fn run(project_dir: PathBuf, ctx: OobContext) {
+pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobContext) {
     let root = match project_root(&project_dir) {
         Some(r) => r,
         None => {
@@ -353,6 +368,23 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
     // — a decoded record naming the session is the proof, on every attach and
     // every rotation alike (H-2). See [`LiveSessionGate`].
     let mut live = LiveSessionGate::default();
+    // V34: the session id cImp pinned on this child's command line, while we
+    // are still honouring it. Taken by value so `pin_step`'s `GiveUp` can clear
+    // it permanently for this tap. `pin_since` dates the grace window from the
+    // tap's start, not from the tab's.
+    let mut pin = pinned_session;
+    let pin_since = std::time::Instant::now();
+    // A pinned tab is provable from the moment it launches: cImp chose the id
+    // and passed it to the child, so — unlike the newest-wins path, which must
+    // wait for a decoded record to prove a file is ours ([`LiveSessionGate`]) —
+    // there is nothing to confirm. Publishing it here rather than on first
+    // transcript write is what makes per-tab scoping correct during the minutes
+    // a fresh tab may sit idle before it writes anything.
+    if let Some(sid) = pin.as_deref() {
+        hb.note_pinned(true);
+        hb.note_session(sid);
+        ctx.mark_live_session(sid, "claude");
+    }
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -369,9 +401,36 @@ pub async fn run(project_dir: PathBuf, ctx: OobContext) {
         // `newest_jsonl` so a tab is a known co-tenant from its tap's first
         // instruction, not from its first confirmed session — that is what
         // closes the launch-order window. Cleared by `_live_guard` on exit.
-        ctx.mark_live_tab_root("claude", &root);
+        ctx.mark_live_tab_root("claude", &root, pin.is_some());
 
-        match newest_jsonl(&root) {
+        // V34: a pinned tab follows exactly one file — the transcript named by
+        // the `--session-id` cImp put on this child's command line — so the
+        // "newest wins" race above simply does not apply to it. An unpinned tab
+        // (the user's own `--resume`/`--continue`, or a pin the harness
+        // ignored) keeps the historical behaviour.
+        let target = match pin.as_deref() {
+            Some(sid) => {
+                let path = root.join(format!("{sid}.jsonl"));
+                match pin_step(path.is_file(), pin_since.elapsed().as_millis() as u64) {
+                    PinStep::Follow => Some(path),
+                    PinStep::Wait => None,
+                    PinStep::GiveUp => {
+                        warn!(
+                            tab = ?ctx.tab,
+                            session = %sid,
+                            "Claude OOB: pinned transcript never appeared; \
+                             falling back to newest-wins (harness ignored --session-id?)"
+                        );
+                        pin = None;
+                        hb.note_pinned(false);
+                        newest_jsonl(&root)
+                    }
+                }
+            }
+            None => newest_jsonl(&root),
+        };
+
+        match target {
             Some(path) if Some(&path) != cur.as_ref() => {
                 // Rotated to a new (or first) transcript file. Either way the
                 // file must prove itself by yielding a DECODED record that
@@ -1655,6 +1714,48 @@ fn slug_for(dir: &Path) -> String {
 
 /// Newest `*.jsonl` (by mtime) under `root`, or `None` if the dir is missing
 /// or empty.
+/// How long a pinned tap waits for its own `<session-id>.jsonl` to appear
+/// before giving up the pin and reverting to newest-wins.
+///
+/// Generous on purpose. The file appears when Claude Code first writes the
+/// conversation, which can be minutes after launch if the user doesn't type —
+/// and while we wait, this tab reports no session at all. The deadline exists
+/// only for the case the pin genuinely did not take (a `--session-id` the
+/// harness ignored, i.e. contract drift), where waiting forever would silently
+/// cost the tab its TTS, usage and memory.
+///
+/// **Expiring is safe even when it fires wrongly**: the fallback is exactly the
+/// pre-V34 behaviour, so a false trigger costs the tab nothing it had before.
+/// That asymmetry is what lets the value be a plain timeout instead of a
+/// cleverer predicate that would have to guess about co-tenants.
+const PIN_GRACE_MS: u64 = 120_000;
+
+/// What a pinned tap should do this tick. Pure so the pin/fallback decision is
+/// unit-testable without a filesystem or a clock.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PinStep {
+    /// The pinned transcript exists — follow it, and nothing else.
+    Follow,
+    /// Not there yet, still inside the grace window: attach to NOTHING. A
+    /// pinned tap must never fall back to "newest" opportunistically — the
+    /// newest file under a shared root is very likely another tab's, which is
+    /// the exact mis-binding the pin exists to prevent.
+    Wait,
+    /// Grace exhausted with no pinned transcript: the pin did not take. Drop it
+    /// and degrade to newest-wins (and to ambiguous, if co-tenants exist).
+    GiveUp,
+}
+
+pub(crate) fn pin_step(pinned_present: bool, waited_ms: u64) -> PinStep {
+    if pinned_present {
+        PinStep::Follow
+    } else if waited_ms < PIN_GRACE_MS {
+        PinStep::Wait
+    } else {
+        PinStep::GiveUp
+    }
+}
+
 fn newest_jsonl(root: &Path) -> Option<PathBuf> {
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(root).ok()?.flatten() {
@@ -1755,6 +1856,36 @@ mod tests {
         assert_eq!(bump_skip(&mut seen, a), 2, "later skips count at debug");
         assert_eq!(bump_skip(&mut seen, a), 3);
         assert_eq!(bump_skip(&mut seen, b), 1, "a different file warns once too");
+    }
+
+    // ── V34: the `--session-id` pin ──────────────────────────────────────
+
+    #[test]
+    fn a_present_pinned_transcript_is_followed_immediately() {
+        assert_eq!(pin_step(true, 0), PinStep::Follow);
+        // Presence wins even past the grace window — the deadline only governs
+        // the absent case.
+        assert_eq!(pin_step(true, PIN_GRACE_MS * 10), PinStep::Follow);
+    }
+
+    #[test]
+    fn an_absent_pinned_transcript_waits_rather_than_grabbing_the_newest() {
+        // The load-bearing case: a co-tenant tab's transcript is very likely
+        // the newest file under a shared root, so a pinned tap that fell back
+        // opportunistically would bind to the WRONG session — the precise
+        // defect the pin exists to remove.
+        assert_eq!(pin_step(false, 0), PinStep::Wait);
+        assert_eq!(pin_step(false, PIN_GRACE_MS - 1), PinStep::Wait);
+    }
+
+    #[test]
+    fn the_pin_is_abandoned_once_the_grace_window_lapses() {
+        // Fail-open: if the harness ignored `--session-id`, waiting forever
+        // would cost this tab its TTS, usage and memory. Reverting to
+        // newest-wins is exactly the pre-V34 behaviour, so giving up is never
+        // worse than not having pinned at all.
+        assert_eq!(pin_step(false, PIN_GRACE_MS), PinStep::GiveUp);
+        assert_eq!(pin_step(false, PIN_GRACE_MS + 1), PinStep::GiveUp);
     }
 
     #[test]

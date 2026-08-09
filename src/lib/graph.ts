@@ -656,6 +656,14 @@ export function graphUsage(root?: string): Promise<UsageSnapshot> {
   return invoke<UsageSnapshot>('graph_usage', { root: root ?? null });
 }
 
+/// V34: the session the tab keyed `tab` is currently working in, or `null` when
+/// the app cannot PROVE one — an unpinned tab sharing a project with another
+/// agent tab, a tab that hasn't started, or a non-agent tab. Callers must treat
+/// `null` as "no answer" and fall back, never as "no session".
+export function graphTabSession(tab: string): Promise<string | null> {
+  return invoke<string | null>('graph_tab_session', { tab });
+}
+
 /// V24 Phase B: full drill-in detail for one session under `root` (defaults to
 /// the launch directory) — totals row, per-turn series, top-tools, and
 /// per-model totals with the S/A origin split. An unknown `sessionId` resolves

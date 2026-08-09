@@ -219,6 +219,15 @@ struct LiveTabRoot {
     /// routes through the same helper.
     root: PathBuf,
     last_seen_ms: i64,
+    /// V34: this tab's session id was PINNED by cImp at spawn (`--session-id`),
+    /// so its tap follows one known transcript file rather than whichever is
+    /// newest under `root`.
+    ///
+    /// This is what retires the V28 decision-4a degradation for the tab: the
+    /// co-tenancy that makes newest-wins unprovable says nothing about a tab
+    /// that never consults "newest" in the first place. See
+    /// [`tab_binding_is_ambiguous`].
+    pinned: bool,
 }
 
 /// The app-owned graph service. Held in `AppState` beside the offload service.
@@ -783,6 +792,20 @@ fn tab_binding_is_ambiguous(
     let Some(mine) = roots.get(tab).filter(|e| e.agent == agent).filter(|e| fresh(e)) else {
         return false;
     };
+    // V34: a PINNED tab is never ambiguous, however many co-tenants share its
+    // root. Ambiguity was only ever a property of the newest-wins binding — two
+    // taps racing for the same "newest `*.jsonl`" — and a pinned tap does not
+    // consult newest at all: cImp generated the session id, passed it on the
+    // child's own command line, and the tap follows that one file. A co-tenant
+    // cannot make an id we chose ourselves wrong.
+    //
+    // Deliberately asymmetric: this checks only `mine`. An UNPINNED tab stays
+    // ambiguous whenever any same-root co-tenant is running, pinned or not,
+    // because it is still the one doing the guessing — its tap can latch onto
+    // the pinned tab's transcript just as easily as onto another guesser's.
+    if mine.pinned {
+        return false;
+    }
     roots
         .iter()
         .any(|(k, e)| k != tab && e.agent == agent && e.root == mine.root && fresh(e))
@@ -863,6 +886,7 @@ fn upsert_live_tab_root(
     tab: &str,
     agent: &str,
     root: &Path,
+    pinned: bool,
     now: i64,
 ) {
     let key = crate::fsutil::norm_dir_key_path(root);
@@ -874,11 +898,17 @@ fn upsert_live_tab_root(
             e.last_seen_ms = now;
             e.agent = agent.to_string();
             e.root = key.clone();
+            // Kept current rather than sticky: a pinned tap DROPS its pin if
+            // the harness never wrote the pinned transcript (see
+            // `oob::claude`'s pin grace), and the tab must degrade back to
+            // ambiguous with it.
+            e.pinned = pinned;
         })
         .or_insert_with(|| LiveTabRoot {
             agent: agent.to_string(),
             root: key,
             last_seen_ms: now,
+            pinned,
         });
     roots.retain(|_, e| now.saturating_sub(e.last_seen_ms) <= LIVE_SESSION_TTL_MS);
 }
@@ -1674,10 +1704,14 @@ impl GraphService {
     /// loop parked in TTS backpressure can't let the claim age out (see
     /// [`LIVE_SESSION_TTL_MS`]). Idempotent and cheap either way; the decision
     /// (including the H1-R5 key normalization) lives in [`upsert_live_tab_root`].
-    pub fn mark_live_tab_root(&self, tab: &str, agent: &str, root: &Path) {
+    /// V34: `pinned` says this tab's tap follows a session id cImp chose and
+    /// passed to the child (`--session-id`), rather than whichever transcript is
+    /// newest under `root`. Passed on every tick rather than latched, so a tap
+    /// that gives up on its pin degrades the tab back to ambiguous.
+    pub fn mark_live_tab_root(&self, tab: &str, agent: &str, root: &Path, pinned: bool) {
         let now = crate::activity::now_ms() as i64;
         if let Ok(mut m) = self.live_tab_roots.lock() {
-            upsert_live_tab_root(&mut m, tab, agent, root, now);
+            upsert_live_tab_root(&mut m, tab, agent, root, pinned, now);
         }
     }
 
@@ -1722,6 +1756,23 @@ impl GraphService {
         let live = self.live_sessions.lock().ok()?;
         let roots = self.live_tab_roots.lock().ok()?;
         lookup_live_session_for_tab(&live, &roots, tab, agent, now)
+    }
+
+    /// V34: the session `tab` currently reports, whatever agent it runs.
+    ///
+    /// [`Self::live_session_for_tab`] is called by the MCP path, which already
+    /// knows which agent it is serving and passes it as the check. A UI asking
+    /// "what is the focused tab working on?" does not, and should not have to
+    /// re-derive it from settings — the registry entry already names its own
+    /// agent, so this reads it and applies the identical proof rules (exact key,
+    /// TTL, agent match, ambiguity). `None` carries the same meaning as there:
+    /// no proof, so callers fall back rather than guess.
+    pub fn live_session_for_any_agent(&self, tab: &str) -> Option<String> {
+        let now = crate::activity::now_ms() as i64;
+        let live = self.live_sessions.lock().ok()?;
+        let roots = self.live_tab_roots.lock().ok()?;
+        let agent = live.get(tab)?.agent.clone();
+        lookup_live_session_for_tab(&live, &roots, tab, &agent, now)
     }
 
     /// V24 Phase B: the "open tabs + recency" active set for `sessions` at
@@ -6104,12 +6155,88 @@ mod tests {
 
     // ── H1 (2026-08-05 review): same-root ambiguity degrades to unscoped ──
 
+    /// An UNPINNED tab claim — the newest-wins binding these H1 cases are all
+    /// about. V34's pinned tabs are covered separately below.
     fn root_at(agent: &str, root: &str, last_seen_ms: i64) -> LiveTabRoot {
         LiveTabRoot {
             agent: agent.to_string(),
             root: PathBuf::from(root),
             last_seen_ms,
+            pinned: false,
         }
+    }
+
+    /// The pre-V34 mark: no `--session-id` pin, so the tab binds by tailing
+    /// whichever transcript under `root` is newest.
+    fn mark_unpinned(
+        roots: &mut HashMap<String, LiveTabRoot>,
+        tab: &str,
+        agent: &str,
+        root: &Path,
+        now: i64,
+    ) {
+        upsert_live_tab_root(roots, tab, agent, root, false, now);
+    }
+
+    // ── V34: a pinned tab is provable regardless of co-tenants ──────────
+
+    /// Two Claude tabs on one project — the exact configuration V28 decision
+    /// 4a had to degrade — but tab A carries a `--session-id` pin. A pinned tap
+    /// never consults "newest", so a co-tenant cannot make its binding wrong,
+    /// and it must NOT be reported ambiguous.
+    #[test]
+    fn a_pinned_tab_is_never_ambiguous_however_many_co_tenants_share_its_root() {
+        let now = 10_000_000i64;
+        let shared = Path::new("/home/u/.claude/projects/P--proj");
+        let mut reg = HashMap::new();
+        upsert_live_tab_root(&mut reg, "claude", "claude", shared, true, now);
+        mark_unpinned(&mut reg, "claude-local", "claude", shared, now);
+
+        assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
+        // ...and the pin is what makes its session resolvable again.
+        let live = HashMap::from([(
+            "claude".to_string(),
+            LiveSession {
+                agent: "claude".to_string(),
+                session_id: "ses_pinned".to_string(),
+                last_seen_ms: now,
+            },
+        )]);
+        assert_eq!(
+            lookup_live_session_for_tab(&live, &reg, "claude", "claude", now),
+            Some("ses_pinned".to_string()),
+        );
+    }
+
+    /// The asymmetry is deliberate: pinning tab A does not rescue tab B. B is
+    /// still the one guessing, and the file it guesses at can just as easily be
+    /// A's transcript as another guesser's.
+    #[test]
+    fn an_unpinned_tab_stays_ambiguous_beside_a_pinned_co_tenant() {
+        let now = 10_000_000i64;
+        let shared = Path::new("/home/u/.claude/projects/P--proj");
+        let mut reg = HashMap::new();
+        upsert_live_tab_root(&mut reg, "claude", "claude", shared, true, now);
+        mark_unpinned(&mut reg, "claude-local", "claude", shared, now);
+
+        assert!(tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
+    }
+
+    /// The pin is re-asserted on every mark, not latched, so a tap that gives
+    /// up on its pin (the harness never wrote the pinned transcript) degrades
+    /// the tab back to ambiguous rather than keeping a proof it no longer has.
+    #[test]
+    fn dropping_the_pin_restores_ambiguity() {
+        let now = 10_000_000i64;
+        let shared = Path::new("/home/u/.claude/projects/P--proj");
+        let mut reg = HashMap::new();
+        upsert_live_tab_root(&mut reg, "claude", "claude", shared, true, now);
+        mark_unpinned(&mut reg, "claude-local", "claude", shared, now);
+        assert!(!tab_binding_is_ambiguous(&reg, "claude", "claude", now));
+
+        // The tap's next tick, after `pin_step` returned `GiveUp`.
+        mark_unpinned(&mut reg, "claude", "claude", shared, now);
+        assert!(tab_binding_is_ambiguous(&reg, "claude", "claude", now));
     }
 
     /// `n` running Claude tabs, all tailing the SAME transcript root.
@@ -6259,14 +6386,14 @@ mod tests {
     fn tab_root_keys_are_normalized_at_the_mark_site() {
         let now = 10_000_000i64;
         let mut reg = HashMap::new();
-        upsert_live_tab_root(
+        mark_unpinned(
             &mut reg,
             "claude",
             "claude",
             Path::new(r"C:\Users\u\.claude\projects\P--proj"),
             now,
         );
-        upsert_live_tab_root(
+        mark_unpinned(
             &mut reg,
             "claude-local",
             "claude",
@@ -6281,14 +6408,14 @@ mod tests {
         // Windows paths are case-insensitive, so a case variant is the SAME dir.
         if cfg!(windows) {
             let mut cased = HashMap::new();
-            upsert_live_tab_root(
+            mark_unpinned(
                 &mut cased,
                 "claude",
                 "claude",
                 Path::new(r"C:\Users\u\.claude\projects\P--Proj"),
                 now,
             );
-            upsert_live_tab_root(
+            mark_unpinned(
                 &mut cased,
                 "claude-local",
                 "claude",
@@ -6302,8 +6429,8 @@ mod tests {
         }
         // Genuinely different dirs still don't conflate.
         let mut split = HashMap::new();
-        upsert_live_tab_root(&mut split, "claude", "claude", Path::new("/u/p/one"), now);
-        upsert_live_tab_root(&mut split, "claude-local", "claude", Path::new("/u/p/two"), now);
+        mark_unpinned(&mut split, "claude", "claude", Path::new("/u/p/one"), now);
+        mark_unpinned(&mut split, "claude-local", "claude", Path::new("/u/p/two"), now);
         assert!(!tab_binding_is_ambiguous(&split, "claude", "claude", now));
     }
 
@@ -6318,21 +6445,21 @@ mod tests {
         let mut reg = HashMap::new();
         // Tab A marked long ago (its drain loop is parked in `speak`), tab B
         // ticking normally.
-        upsert_live_tab_root(
+        mark_unpinned(
             &mut reg,
             "claude",
             "claude",
             shared,
             now - LIVE_SESSION_TTL_MS - 1,
         );
-        upsert_live_tab_root(&mut reg, "claude-local", "claude", shared, now);
+        mark_unpinned(&mut reg, "claude-local", "claude", shared, now);
         // The starvation symptom: A aged out, so B looks unique and would get a
         // confident (wrong) binding.
         assert!(!reg.contains_key("claude"), "stale claim is evicted");
         assert!(!tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
         // A heartbeat tick re-marks A — independent of A's drain loop — and the
         // co-tenancy is visible again for BOTH tabs.
-        upsert_live_tab_root(&mut reg, "claude", "claude", shared, now);
+        mark_unpinned(&mut reg, "claude", "claude", shared, now);
         assert!(tab_binding_is_ambiguous(&reg, "claude", "claude", now));
         assert!(tab_binding_is_ambiguous(&reg, "claude-local", "claude", now));
     }

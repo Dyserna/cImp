@@ -23,6 +23,7 @@
     graphContextPreview,
     graphUsage,
     graphSessionUsage,
+    graphTabSession,
     graphUsageAdvice,
     advisorDismiss,
     advisorMarkApplied,
@@ -88,6 +89,8 @@
   import { computeChip } from './settings/checksEditor';
   import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
   import { revealTab } from './tabs/visibility';
+  import { get } from 'svelte/store';
+  import { activeTab } from './tabs/state';
   import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import {
@@ -512,6 +515,10 @@
     // edits land live via the `llm-pricing-changed` listener, and card opens
     // refetch too.
     if (costMode === 'cost' && pricingTable === null) void refreshPricingTable();
+    // V34: re-attempt the focus follow now that rows may have landed. The
+    // subscription only fires on a tab CHANGE, so without this a tab focused
+    // before its session had any rows would never be picked up.
+    void followActiveTab(get(activeTab));
     // Unawaited on purpose: commitCounts is independent $state that renders
     // when it lands — the poll's critical path shouldn't wait on a git
     // subprocess round trip.
@@ -572,7 +579,66 @@
     sessionNoticeTimer = setTimeout(() => (sessionNotice = null), 4000);
   }
 
-  async function selectSession(s: SessionUsageRow): Promise<void> {
+  // ── V34: follow the focused agent tab ────────────────────────────────
+  // `usage.current` is "the session with the most recent activity across all
+  // agents" — with two Claude tabs open that is whichever tab last WROTE, not
+  // the one being looked at, so the card appeared stuck on one tab's session.
+  // The fix is to select the focused tab's session automatically, using the
+  // same drill-in path a click uses.
+  //
+  // `following` is the mode bit: true until the user picks a row by hand, and
+  // restored by "back to live". While following, a tab switch re-selects; while
+  // not, the user's choice stands (their click is a stronger signal than focus).
+  let following = $state(true);
+  // The session id the follow last applied, so a re-resolve to the same session
+  // doesn't refetch on every poll.
+  let followedId: string | null = null;
+
+  /// Point the card at whatever the focused tab is working in. A `null` answer
+  /// means the app cannot PROVE which session that tab owns (an unpinned tab
+  /// sharing a project, a tab that hasn't started) — in that case we leave the
+  /// card exactly as it was rather than guessing, which is the same fail-open
+  /// posture the rest of the identity path takes.
+  async function followActiveTab(tab: string): Promise<void> {
+    if (!following) return;
+    let sid: string | null = null;
+    try {
+      sid = await graphTabSession(tab);
+    } catch (e) {
+      console.warn('graph_tab_session failed', e);
+      return;
+    }
+    if (!sid || !following || sid === followedId) return;
+    // The focused tab IS the live session ⇒ show the live card, not a drill-in.
+    if (usage?.current?.session_id === sid) {
+      followedId = sid;
+      clearSelection({ keepFollowing: true });
+      return;
+    }
+    const row = usage?.sessions.find((s) => s.session_id === sid);
+    // A known tab whose rows haven't landed yet (a fresh session, or the very
+    // first snapshot). `followedId` stays PUT so the retry below re-attempts
+    // once they do — recording it here would make this the one tab the follow
+    // never catches up with.
+    if (!row) return;
+    followedId = sid;
+    await selectSession(row, { auto: true });
+  }
+
+  // Re-resolve on every focus change. The store subscription (rather than an
+  // `$effect` over `$activeTab`) keeps this working while the view is detached:
+  // the app-view registry keeps this component mounted, so a tab switch that
+  // happens while Code Intelligence is off-screen must still be reflected when
+  // it comes back.
+  const unsubActiveTab = activeTab.subscribe((t) => void followActiveTab(t));
+
+  async function selectSession(
+    s: SessionUsageRow,
+    opts: { auto?: boolean } = {},
+  ): Promise<void> {
+    // A hand-picked row pins the card: stop following focus until the user
+    // explicitly goes back to live.
+    if (!opts.auto) following = false;
     selectedId = s.session_id;
     // Reveal the card so the freshly selected session is actually visible.
     sessionCardOpen = true;
@@ -585,8 +651,12 @@
       // empty-sentinel detail. Don't enter selected mode (its title would read
       // "Session ·  · 1970-01-01…"); stay live and surface a transient notice.
       if (isEmptyDetailRow(detail.row)) {
-        clearSelection();
-        flashSessionNotice('Session data no longer available.');
+        // An AUTO selection failing is not a user-facing event: nobody asked
+        // for this session, so stay live quietly and keep following. Notably we
+        // do NOT reset `followedId` — that would re-attempt (and re-flash) on
+        // every poll for as long as the focused tab has no stored detail.
+        clearSelection({ keepFollowing: opts.auto });
+        if (!opts.auto) flashSessionNotice('Session data no longer available.');
         return;
       }
       selectedRow = s;
@@ -597,15 +667,23 @@
       seedCostCustom(detail.per_model); // Cost card rows for this session.
     } catch (e) {
       console.warn('graph_session_usage failed', e);
-      if (selectedId === s.session_id) clearSelection();
+      if (selectedId === s.session_id) clearSelection({ keepFollowing: opts.auto });
     }
   }
 
-  function clearSelection(): void {
+  /// Back to live. `keepFollowing` is set by the follow path itself (which is
+  /// already in follow mode and must not be read as a user action); a user
+  /// clicking "back to live" RE-ENABLES following, since going live is exactly
+  /// a request to track whatever is current rather than a pinned session.
+  function clearSelection(opts: { keepFollowing?: boolean } = {}): void {
     selectedSession = null;
     selectedRow = null;
     selectedId = null;
     selectedFetchKey = '';
+    if (!opts.keepFollowing) {
+      following = true;
+      followedId = null;
+    }
   }
 
   // Keep a drilled-in session LIVE: the snapshot fetched at click time goes
@@ -1432,6 +1510,7 @@
   onDestroy(() => {
     if (poll) clearInterval(poll);
     unsubShown();
+    unsubActiveTab();
   });
 </script>
 
@@ -1707,10 +1786,20 @@
                come from the CLICKED row (always populated), not the fetched
                detail, so they're robust regardless of the detail's `row`. -->
           <span class="card-title"
-            >Session · {selectedRow.agent} · {fmtDate(selectedRow.started_ms)}
+            >{following ? 'Focused tab' : 'Session'} · {selectedRow.agent} · {fmtDate(
+              selectedRow.started_ms,
+            )}
             {fmtTime(selectedRow.started_ms)} ·
             <code>{selectedRow.session_id.slice(0, 8)}</code>…</span
           >
+          <!-- V34: say WHY this session is on screen. Following = it tracks
+               whichever agent tab has focus; pinned = the user picked this row
+               and it stays put until they go Live. Without this the two modes
+               look identical and a card that changed under a tab switch reads
+               as a glitch. -->
+          {#if following}
+            <span class="muted" title="Tracking whichever agent tab has focus">follows focus</span>
+          {/if}
           <button
             type="button"
             class="mini secondary"

@@ -2367,6 +2367,24 @@ pub async fn graph_session_usage(
     run_on_blocking_pool(move || graph.session_usage_detail(&root, &session_id)).await
 }
 
+/// V34: which session the tab keyed `tab` is currently working in, or `null`
+/// when the app cannot prove one.
+///
+/// This is what lets the Code Intelligence Overview follow the focused agent
+/// tab instead of always rendering the most-recently-active session — with two
+/// Claude tabs open, "most recent" is whichever tab last wrote, not the one the
+/// user is looking at. `null` is the honest answer for an unpinned tab sharing a
+/// project with a co-tenant (V28 decision 4a), a tab that has not started, or a
+/// non-agent tab; the caller falls back to its previous behaviour rather than
+/// showing a session it cannot attribute.
+#[tauri::command]
+pub async fn graph_tab_session(
+    graph: State<'_, std::sync::Arc<crate::graph::GraphService>>,
+    tab: String,
+) -> AppResult<Option<String>> {
+    Ok(graph.live_session_for_any_agent(&tab))
+}
+
 /// V14 Phase D2: the `graph_usage_advice` response. Wraps `advisor::evaluate`'s
 /// `Vec<Proposal>` with a `collecting` flag — NOT part of the milestone's
 /// literal `Vec<Proposal>` pseudocode, added because the Advisor card (D2.4)

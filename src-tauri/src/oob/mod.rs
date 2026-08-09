@@ -43,7 +43,21 @@ pub mod prose;
 #[derive(Debug, Clone)]
 pub enum OobSpec {
     /// Tail Claude Code's transcript JSONL for the project rooted at this dir.
-    ClaudeTranscript { project_dir: PathBuf },
+    ClaudeTranscript {
+        project_dir: PathBuf,
+        /// V34: the session id cImp pinned for this tab via `--session-id` at
+        /// spawn, when it was able to (see `tabs::config::resolve_oob_source`).
+        ///
+        /// This is what makes a tab's session binding *provable*. Without it the
+        /// tap can only tail the newest `*.jsonl` under a project-derived root,
+        /// which two Claude tabs on one project share — the V28 decision-4a
+        /// ambiguity that degrades memory scoping and permission attribution.
+        ///
+        /// `None` when the tab's own args already select a session
+        /// (`--resume`/`--continue`/an explicit `--session-id`/...), in which
+        /// case the tap falls back to exactly the pre-V34 newest-wins behaviour.
+        pinned_session: Option<String>,
+    },
     /// Subscribe to an OpenCode TUI's event stream on this loopback port (the
     /// `--port` cImp launched the TUI with).
     OpenCodeEvent { port: u16 },
@@ -77,9 +91,12 @@ pub struct OobContext {
 /// exit) or the source ends.
 pub fn spawn(spec: OobSpec, ctx: OobContext) {
     match spec {
-        OobSpec::ClaudeTranscript { project_dir } => {
-            debug!(tab = ?ctx.tab, ?project_dir, "spawning Claude transcript OOB source");
-            tauri::async_runtime::spawn(claude::run(project_dir, ctx));
+        OobSpec::ClaudeTranscript {
+            project_dir,
+            pinned_session,
+        } => {
+            debug!(tab = ?ctx.tab, ?project_dir, ?pinned_session, "spawning Claude transcript OOB source");
+            tauri::async_runtime::spawn(claude::run(project_dir, pinned_session, ctx));
         }
         OobSpec::OpenCodeEvent { port } => {
             debug!(tab = ?ctx.tab, port, "spawning OpenCode event OOB source");
@@ -246,9 +263,12 @@ impl OobContext {
     /// Only root-binding taps call this. The OpenCode tap must NOT: it reads the
     /// session id off its own per-tab SSE stream, so two OpenCode tabs on one
     /// project are genuinely distinguishable and must keep their scoping.
-    pub fn mark_live_tab_root(&self, agent: &str, root: &std::path::Path) {
+    /// V34: `pinned` = this tab's tap is following a cImp-chosen session id
+    /// (`--session-id`) rather than the newest transcript under `root`, which is
+    /// what lets the registry stop treating same-root co-tenants as ambiguous.
+    pub fn mark_live_tab_root(&self, agent: &str, root: &std::path::Path, pinned: bool) {
         if let Some(mem) = self.mem.as_ref() {
-            mem.mark_live_tab_root(self.tab.as_str(), agent, root);
+            mem.mark_live_tab_root(self.tab.as_str(), agent, root, pinned);
         }
     }
 

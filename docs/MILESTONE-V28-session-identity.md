@@ -2,7 +2,12 @@
 
 **Status:** IMPLEMENTED (Phases A–D, 2026-08-05; H1 review fix 2026-08-05 —
 decision 4a: same-root multi-tab Claude degrades to unscoped) — live
-verification below still pending. Closes GitHub issue #13 (NC-1/D-9 from the
+verification below still pending.
+**Superseded in part (V34, 2026-08-09):** decision 4a's degradation no longer
+applies to a tab cImp could pin. See **[4b](#4b-v34-pinned-session-ids-retire-the-degradation)**
+below — the tap now follows a `--session-id` cImp generated, so same-root
+co-tenancy stops making a tab's binding unprovable. 4a's rules still govern any
+tab that could not be pinned. Closes GitHub issue #13 (NC-1/D-9 from the
 2026-08-04 maintenance run) and the V10 residual "same-agent tabs share
 memory scope".
 **Builds on:** V10 context engine (`session`/`mem_event` relations,
@@ -86,6 +91,53 @@ reads and writes tab B's working set whenever B was active more recently.
    Wrong-scope is worse than unscoped: an ambiguous tab silently writing into
    another tab's memory is exactly the defect V28 exists to remove, whereas
    unscoped is the documented pre-V28 behavior and still answers every tool call.
+   #### 4b. V34: pinned session ids retire the degradation
+
+   **(2026-08-09.)** 4a treats same-root co-tenancy as fatal to a tab's identity
+   because the Claude tap binds by tailing the newest `*.jsonl` under a
+   *project*-derived root — "no per-process discriminator". That was true of the
+   binding, not of the harness: `claude --session-id <uuid>` sets the session id
+   for the conversation, and cImp composes the child's argv itself.
+
+   So cImp now **generates a UUID per Claude tab at spawn** and passes it
+   (`tabs/config.rs::resolve_oob_source`, alongside the `OobSpec` that carries
+   it — one function, so the flag and the file the tap follows cannot drift).
+   The tap then follows `<root>/<uuid>.jsonl` *and nothing else*
+   (`oob/claude.rs::pin_step`), and `tab_binding_is_ambiguous` returns `false`
+   for a pinned tab however many co-tenants share its root: ambiguity was only
+   ever a property of the newest-wins race, and a pinned tap never enters it.
+
+   Consequences: `context_*` memory scoping and the NC-2 permission resolver
+   work with two Claude tabs on one project, and the Code Intelligence Overview
+   can follow the *focused* tab (`graph_tab_session`) instead of the
+   most-recently-active session.
+
+   **Deliberately asymmetric.** Pinning tab A does not rescue an unpinned tab B
+   beside it: B is still the one guessing, and the newest file it grabs may well
+   be A's. B keeps 4a's rules exactly.
+
+   **Residuals — 4a still governs these:**
+   * *A tab that selects its own session.* `--resume` / `--continue` /
+     `--session-id` / `--fork-session` / `--from-pr` in the tab's args suppress
+     the pin (`args_select_session`): the user's selector names a conversation
+     that already exists, and a competing one would be rejected or fight it.
+   * *`/clear` (and any in-session rollover).* The pin names the session the tab
+     STARTED. After a clear, Claude writes a new session id, our pinned file
+     stops growing, and the tab degrades to newest-wins — i.e. back to 4a — for
+     the rest of its life. Re-pinning would need a rotation signal we do not
+     have; not attempted.
+   * *A harness that ignores `--session-id`.* The tap waits `PIN_GRACE_MS`
+     (120 s) for its transcript, then drops the pin and reverts to newest-wins,
+     re-marking the tab unpinned so ambiguity re-applies. Expiring is safe even
+     when it fires wrongly, because the fallback *is* the pre-V34 behaviour.
+   * *OpenCode.* Unchanged — it binds per-tab off its own SSE stream (decision
+     5) and was never degraded.
+
+   **Contract dependency (new tripwire surface).** This rests on Claude Code
+   honouring `--session-id` and naming the transcript `<session-id>.jsonl`. The
+   grace-window fallback keeps a drift non-fatal, but it is silent apart from a
+   `warn!`; if per-tab scoping ever looks wrong, check for that log first.
+
 5. **OpenCode tab binding (the one open question — Phase C spike).** The
    registry's OpenCode entries are currently keyed by *session id* (the
    loopback `/memory/event` path has no tab binding), so tab→session
@@ -260,15 +312,38 @@ fallback). Three lines; noted here rather than left as a silent inconsistency.
       working set. Cross-check `RUST_LOG=cimp=debug` shows the `/graph_run` body
       carrying `tab`, and the note lands under the session id the tab's
       transcript filename names.
-   b. *Two tabs, SAME project dir (ambiguous ⇒ unscoped, fail-open).* Open
-      `claude` and `claude-local` with no `cwd` override. `context_note` in A and
-      `context_recall` in B: the call must SUCCEED (never a tool error) and both
-      tabs behave as pre-V28 — most-recently-active session, i.e. B may well see
-      A's note. That is the *expected* result now, not a failure; the failure
-      mode to watch for is a tool error, or scoping that confidently attributes
-      A's writes to B's session. While both are open, permission prompts should
-      also fall back to the TUI-regex detector (no hook attribution) — a badge on
-      the WRONG tab is the regression.
+   b. *Two tabs, SAME project dir (**V34: now ISOLATED, not degraded**).* Open
+      `claude` and `claude-local` with no `cwd` override. **This recipe inverted
+      at V34 — it previously asserted the 4a fallback, so a stale copy of it
+      passes on a broken build.**
+      - `context_note` a distinctive fact in A, `context_recall` in B: B must
+        **NOT** see A's note, and each tab's notes must round-trip to itself.
+      - Confirm the mechanism, not just the outcome: `ls ~/.claude/projects/
+        <slug>/` shows **two** transcripts whose stems are the UUIDs cImp put on
+        the two children's command lines (`RUST_LOG=cimp=debug` logs each
+        `--session-id`). If both tabs are writing ONE file, the pin did not take.
+      - Permission prompts must now attribute to the right tab via the hook
+        (no TUI-regex fallback). A badge on the WRONG tab is still the
+        regression to watch for.
+      - Code Intelligence → Overview: the "This session" card must follow
+        whichever tab has focus (header reads "Focused tab · … follows focus"),
+        and switching tabs must switch the card. Clicking a session row pins it
+        ("Session ·", no follow chip) until **Live** is pressed.
+   b2. *Two tabs, SAME dir, one un-pinnable (4a still governs it).* Give
+      `claude-local` a `--continue` in its args, so only `claude` is pinned.
+      Expected: `claude` stays scoped (its own notes only); `claude-local`
+      degrades to unscoped exactly as in the pre-V34 recipe — succeeds, never
+      errors, may see the other's note. This is the asymmetry in decision 4b;
+      if BOTH degrade, the pinned tab is wrongly being treated as ambiguous.
+   b3. *Pin fallback (contract drift).* Hardest to stage — needs a `claude` that
+      ignores `--session-id`. If it ever happens in the field the symptom is a
+      tab with no TTS/usage/memory for two minutes, then a
+      `"pinned transcript never appeared"` warning and a silent return to
+      pre-V34 behaviour. Grep that string first when per-tab scoping misbehaves.
+   b4. *`/clear` rollover (known residual).* In a pinned tab, `/clear`, then
+      `context_note` + `context_recall`. The tab reverts to newest-wins for the
+      rest of its life, so with a co-tenant open it degrades to (b2)'s
+      behaviour. Documented, not fixed — see decision 4b's residuals.
    c. *Two tabs, DIFFERENT project dirs (isolated).* Give one tab a `cwd`
       override (a worktree). `context_note` in A → `context_recall` in B must NOT
       return it; B's own notes round-trip. Then close one tab and re-run (b)'s

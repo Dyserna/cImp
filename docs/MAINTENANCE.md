@@ -832,6 +832,16 @@ load-bearing.
 
 **What to re-check instead** (the seam this design leaves):
 
+- **`--session-id` must keep working (V34, 2026-08-09).** Per-tab identity for
+  two Claude tabs on ONE project now rests on cImp pinning each tab's session at
+  spawn (`claude --session-id <uuid>`) and the transcript being named
+  `<session-id>.jsonl`. If either changes upstream, the tap waits
+  `PIN_GRACE_MS` (120 s) and then silently reverts to the pre-V34 newest-wins
+  binding — degraded, never broken. **The tell is a
+  `"pinned transcript never appeared"` warning**; grep it first whenever per-tab
+  scoping, permission attribution, or the Overview's focused-tab card look
+  wrong. Check `--session-id` is still in `claude --help` on each harness
+  upgrade (see the V28 doc, decision 4b).
 - **The tab→session registry must stay fed.** Claude stamps it from the
   transcript drain tick (`oob/claude.rs`), OpenCode from the `/event` SSE tap
   (`oob/opencode.rs::Tracker::track_live_session`, keyed off

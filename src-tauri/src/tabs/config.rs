@@ -169,8 +169,33 @@ fn resolve_oob_source(
     extra_args: &mut Vec<String>,
 ) -> Option<crate::oob::OobSpec> {
     if command_is(&cfg.command, "claude") {
+        // V34: pin this tab's session id. `--session-id <uuid>` is the only
+        // per-process discriminator Claude Code offers, and without one the
+        // tap can only tail the newest `*.jsonl` under a project-derived root
+        // — which two Claude tabs on one project share, making every tab-keyed
+        // identity claim from either unprovable (V28 decision 4a). Generated
+        // here, next to the `OobSpec` that carries it, so the flag on the
+        // child's argv and the file the tap follows can never disagree.
+        //
+        // Skipped when the tab's own args already choose a session: `--resume`
+        // and friends name a conversation that already exists, so a second
+        // selector would either be rejected or silently fight the user's. Such
+        // a tab keeps the pre-V34 newest-wins binding (and its ambiguity).
+        let pinned_session = if args_select_session(extra_args) {
+            tracing::debug!(
+                tab = %cfg.id,
+                "claude tab selects its own session; leaving it unpinned"
+            );
+            None
+        } else {
+            let sid = uuid::Uuid::new_v4().to_string();
+            extra_args.push("--session-id".to_string());
+            extra_args.push(sid.clone());
+            Some(sid)
+        };
         return Some(crate::oob::OobSpec::ClaudeTranscript {
             project_dir: working_dir.to_path_buf(),
+            pinned_session,
         });
     }
     if command_is(&cfg.command, "opencode") {
@@ -1321,6 +1346,33 @@ fn build_extra_args(
 /// spelling can survive into a launch that also carries `--port`.
 fn is_mini_flag(arg: &str) -> bool {
     arg == "--mini" || arg.starts_with("--mini=")
+}
+
+/// V34: does this arg list already choose which conversation Claude Code runs?
+///
+/// If so, cImp must not add a `--session-id` of its own — the user's selector
+/// names an existing session, and ours would either be rejected outright or
+/// silently compete with it. The tab then keeps the pre-V34 newest-wins
+/// binding, which is correct-if-ambiguous rather than confidently wrong.
+///
+/// Matches the `=` spellings too (`--resume=<id>`), same as [`is_mini_flag`],
+/// and the short forms Claude Code documents (`-c`, `-r`). Erring toward
+/// over-matching is deliberate: a false positive costs only the pin, while a
+/// false negative hands the child two conflicting session selectors.
+fn args_select_session(args: &[String]) -> bool {
+    const SELECTORS: [&str; 7] = [
+        "--session-id",
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--fork-session",
+        "--from-pr",
+    ];
+    args.iter().any(|a| {
+        let head = a.split_once('=').map_or(a.as_str(), |(k, _)| k);
+        SELECTORS.contains(&head)
+    })
 }
 
 /// Deterministic path of the managed OpenCode instructions file for `cfg`.
@@ -3014,9 +3066,22 @@ mod tests {
             let mut extra: Vec<String> = Vec::new();
             // Exactly what `build_ai_tool_spec` hands the oob resolver.
             let source = resolve_oob_source(&cfg, &ai_working_dir(&cfg, launch), &mut extra);
-            let Some(crate::oob::OobSpec::ClaudeTranscript { project_dir }) = source else {
+            let Some(crate::oob::OobSpec::ClaudeTranscript {
+                project_dir,
+                pinned_session,
+            }) = source
+            else {
                 panic!("a Claude tab must resolve a transcript source");
             };
+            // V34: the pin the tap will follow must be the one actually put on
+            // the child's argv — the two are produced together precisely so
+            // they cannot drift, and this is the assertion that keeps it so.
+            let sid = pinned_session.expect("a plain Claude tab must be pinned");
+            assert_eq!(
+                extra.windows(2).find(|w| w[0] == "--session-id").map(|w| &w[1]),
+                Some(&sid),
+                "tab {id}: --session-id on argv must match the pinned session"
+            );
             let hook_dir = dirs
                 .iter()
                 .find(|(t, _)| t == id)
@@ -3934,6 +3999,46 @@ mod tests {
             vec!["--mini".to_string()],
             "non-opencode tabs keep their own args verbatim",
         );
+    }
+
+    #[test]
+    fn args_select_session_spots_every_documented_selector() {
+        for sel in [
+            "--session-id",
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--fork-session",
+            "--from-pr",
+        ] {
+            assert!(
+                args_select_session(&[sel.to_string()]),
+                "{sel} must suppress the pin"
+            );
+        }
+        // `=` spellings count too, long and short.
+        assert!(args_select_session(&["--resume=abc123".to_string()]));
+        assert!(args_select_session(&["-r=abc123".to_string()]));
+        // ...and the selector is found wherever it sits in the list.
+        assert!(args_select_session(&[
+            "--model".to_string(),
+            "opus".to_string(),
+            "--continue".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn args_select_session_does_not_over_match_ordinary_flags() {
+        // A false positive only costs the pin, but a flag that merely starts
+        // with a selector's letters must not silently disable per-tab identity.
+        assert!(!args_select_session(&[]));
+        assert!(!args_select_session(&[
+            "--model".to_string(),
+            "opus".to_string()
+        ]));
+        assert!(!args_select_session(&["--resumable".to_string()]));
+        assert!(!args_select_session(&["--continue-on-error".to_string()]));
     }
 
     #[test]

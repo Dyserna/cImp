@@ -1681,6 +1681,31 @@ let CIMP_GATE_STATE = {{ at: 0, gate: false, latch: "open" }};
 // against an `open` latch the beacon had already moved to EXTERNAL. Both halves
 // now move this counter instead, so a stale reply is recognizable as stale.
 let CIMP_GATE_EPOCH = 0;
+// Native WEB tool calls of THIS tab that have been admitted but whose beacon
+// POST has not landed yet (#48, M-15).
+//
+// The epoch above closes one half of the race — a query already IN FLIGHT when
+// the beacon fires. It cannot close the other half: a query issued DURING the
+// beacon POST starts at the already-bumped epoch, and the app has not engaged
+// the latch yet (the POST that engages it is the one still in flight), so the
+// reply is a truthful, genuinely pre-contamination `open`. `settle` saw nothing
+// wrong with it and cached it for a full CIMP_GATE_TTL_MS — the exact window
+// the latch exists to close, with a `read` admitted after a `webfetch` was.
+//
+// This counter is what makes that window visible locally. It is read in two
+// places and TIGHTENS in both: `settle` refuses to cache across it, and the
+// gate treats it as an EXTERNAL latch for local-capability tools. It never
+// loosens anything, which is why an unauthenticated in-process counter is
+// allowed to drive it at all — the authority to REFUSE nothing (`gate: false`)
+// still comes from the app, and this can only ever add a refusal on top of a
+// `gate: true` the app issued.
+//
+// Bounded by the beacon POST's own `AbortSignal.timeout(2000)` and decremented
+// in a `finally`, so it cannot leak. A beacon whose promise never settles at
+// all would pin it — but that same promise is awaited by the hook, so the web
+// tool call itself would already be hung; the counter outliving it is not a new
+// failure mode.
+let CIMP_WEB_PENDING = 0;
 
 // Resolve this tab's gate verdict from the app, cached for CIMP_GATE_TTL_MS.
 //
@@ -1700,14 +1725,33 @@ async function cimpGateState() {{
   // it, so a reply that resolves after an invalidation is recognizably about a
   // latch that has already moved.
   const epoch = CIMP_GATE_EPOCH;
+  // …and whether a beacon was ALREADY in flight when it started (#48, M-15).
+  // Together the two cover every beacon that overlaps this query at all: one
+  // that starts while the query is in flight moves the epoch, and one that
+  // started earlier but overlaps was, by definition of overlapping, still
+  // pending right here. So `settle` below can decide "did any contamination
+  // event touch my window" from two integers read at the same instant.
+  const pendingAtStart = CIMP_WEB_PENDING;
   const open = {{ at: now, gate: false, latch: "open" }};
-  // Commit a verdict to the cache ONLY if nothing invalidated while it was in
-  // flight; otherwise drop it and answer `open`. Dropping is the fail-open
-  // direction twice over — `open` denies nothing, and an empty cache re-queries
-  // on the very next tool call rather than serving a stale verdict for a TTL.
+  // Commit a verdict to the CACHE only if no contamination event touched this
+  // query's window; answer with it either way.
+  //
+  // The asymmetry is deliberate (#48, M-15). App-side the latch is STICKY — it
+  // only ever tightens, open → external/local, and never re-opens — so any
+  // verdict that comes back is a LOWER BOUND on the real restriction. Applying
+  // one late can therefore under-refuse but never over-refuse, which is exactly
+  // the fail-open posture this control is required to have, and it is what this
+  // caller got before #48 anyway. What must never happen is CACHING it: that is
+  // what turned a single pre-contamination `open` into a full CIMP_GATE_TTL_MS
+  // of admitted local tools. Leaving the cache empty costs one round trip on
+  // the next tool call and re-reads a latch that has by then moved.
+  //
+  // Returning `v` rather than `open` also keeps the in-flight window
+  // enforceable: `open` carries `gate: false`, so a query that answered with it
+  // would skip the deny site's `st.gate === true` guard entirely and admit the
+  // very call the window exists to refuse.
   const settle = (v) => {{
-    if (CIMP_GATE_EPOCH !== epoch) return open;
-    CIMP_GATE_STATE = v;
+    if (CIMP_GATE_EPOCH === epoch && pendingAtStart === 0) CIMP_GATE_STATE = v;
     return v;
   }};
   try {{
@@ -1789,7 +1833,19 @@ export default async (input) => ({{
       if (local || web) {{
         const st = await cimpGateState();
         if (st.gate === true) {{
-          if (local && st.latch === "external") throw new Error(CIMP_REFUSAL_NATIVE_LOCAL);
+          // #48 (M-15): a native web tool of this tab that has ALREADY been
+          // admitted, and whose beacon POST is still in flight, contaminates
+          // this conversation exactly as much as one the app has heard about —
+          // the app's reply merely predates it. Read here, at the deny site, so
+          // NO cache path can bypass it: a cached verdict, a fresh verdict and a
+          // fail-open verdict all pass through this one expression.
+          //
+          // Tighten-only, and deliberately only in the LOCAL direction. It ADDS
+          // "external" to the local test and touches nothing else, so it can
+          // never turn a `local` latch's web refusal (the line below) into an
+          // admission — the one way a local signal could have loosened the gate.
+          const external = st.latch === "external" || CIMP_WEB_PENDING > 0;
+          if (local && external) throw new Error(CIMP_REFUSAL_NATIVE_LOCAL);
           if (web && st.latch === "local") throw new Error(CIMP_REFUSAL_NATIVE_WEB);
         }}
       }}
@@ -1812,19 +1868,33 @@ export default async (input) => ({{
       // can no longer commit its pre-beacon verdict on top of this.
       CIMP_GATE_EPOCH++;
       CIMP_GATE_STATE = {{ at: 0, gate: false, latch: "open" }};
-      if (!CIMP_BEACON_ENABLED) return;
-      await fetch(CIMP_LOOPBACK + "/latch/beacon", {{
-        method: "POST",
-        headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
-        body: JSON.stringify({{
-          tab: CIMP_TAB_ID,
-          consumer: "opencode",
-          tool: inp.tool,
-          cwd: input.directory,
-          session_id: inp.sessionID,
-        }}),
-        signal: AbortSignal.timeout(2000),
-      }});
+      // #48 (M-15): open the in-flight window HERE, on the statement after the
+      // epoch bump, and close it in the `finally` below. The adjacency is the
+      // whole guarantee — there is no `await` between the two, so this engine
+      // cannot run another hook in between, and therefore no gate query can
+      // start in the sliver where the epoch has moved but the window is not yet
+      // open. A test pins that no `await` appears between them. It is raised
+      // above the enable guard for the same reason the epoch bump is, and the
+      // `try` starts before the guard so the `return` for a disabled beacon
+      // closes the window on its way out.
+      CIMP_WEB_PENDING++;
+      try {{
+        if (!CIMP_BEACON_ENABLED) return;
+        await fetch(CIMP_LOOPBACK + "/latch/beacon", {{
+          method: "POST",
+          headers: {{ authorization: "Bearer " + CIMP_TOKEN, "content-type": "application/json" }},
+          body: JSON.stringify({{
+            tab: CIMP_TAB_ID,
+            consumer: "opencode",
+            tool: inp.tool,
+            cwd: input.directory,
+            session_id: inp.sessionID,
+          }}),
+          signal: AbortSignal.timeout(2000),
+        }});
+      }} finally {{
+        CIMP_WEB_PENDING--;
+      }}
     }} catch (_e) {{}}
   }},
   "tool.execute.after": async (inp) => {{
@@ -4471,9 +4541,23 @@ mod tests {
             assert!(!js.contains(&format!("\"{n}\"")), "{n} must not be gated");
         }
 
-        // The two directions, keyed on the live latch label.
-        assert!(js.contains(r#"if (local && st.latch === "external") throw new Error(CIMP_REFUSAL_NATIVE_LOCAL);"#));
-        assert!(js.contains(r#"if (web && st.latch === "local") throw new Error(CIMP_REFUSAL_NATIVE_WEB);"#));
+        // The two directions, keyed on the live latch label — plus, on the local
+        // side only, the in-flight beacon window (#48, M-15).
+        assert!(js.contains(r#"const external = st.latch === "external" || CIMP_WEB_PENDING > 0;"#));
+        assert!(
+            js.contains(r#"if (local && external) throw new Error(CIMP_REFUSAL_NATIVE_LOCAL);"#)
+        );
+        assert!(js.contains(
+            r#"if (web && st.latch === "local") throw new Error(CIMP_REFUSAL_NATIVE_WEB);"#
+        ));
+        // The web direction must NOT consult the pending counter: a beacon is
+        // in flight only for a web call this gate already admitted, so folding
+        // it in there would relabel a `local` latch as `external` and turn that
+        // line's refusal into an admission — a local signal LOOSENING the gate.
+        assert!(
+            !js.contains(r#"if (web && external)"#),
+            "the pending-beacon signal is tighten-only, local direction only: {js}"
+        );
         // Deny by THROW only — never by rewriting args (the buggy upstream
         // path: #31680/#39674/#37963).
         assert!(!js.contains("output.args"), "args must never be rewritten");
@@ -4507,12 +4591,19 @@ mod tests {
             helper.contains("return settle(open);\n  }\n}"),
             "the catch arm must return the fail-open verdict: {helper}"
         );
-        // …and `settle` itself never denies on doubt: a raced verdict is
-        // dropped, not applied and not cached.
+        // …and `settle` itself never denies on doubt. It caches only a verdict
+        // no contamination event raced (#48, H-1 + M-15) and otherwise leaves
+        // the cache empty; the verdict it hands back is the app's own, which —
+        // the latch being sticky — can only ever under-refuse.
         assert!(
-            helper.contains("if (CIMP_GATE_EPOCH !== epoch) return open;"),
+            helper.contains(
+                "if (CIMP_GATE_EPOCH === epoch && pendingAtStart === 0) CIMP_GATE_STATE = v;"
+            ),
             "{helper}"
         );
+        // The fail-open value must reach the caller UNCONDITIONALLY on every
+        // error path — not merely be the value `settle` falls back to.
+        assert!(helper.contains("return v;\n  };"), "{helper}");
         // The fail-open verdict is what `open` means: no gate, nothing latched.
         assert!(helper.contains(r#"const open = { at: now, gate: false, latch: "open" };"#));
         // The gate half only ever acts on `gate === true` — never on absence.
@@ -4562,6 +4653,102 @@ mod tests {
                 .is_some_and(|w| w < bump),
             "only a native WEB tool invalidates: {hook}"
         );
+    }
+
+    /// #48 (M-15): the in-flight beacon window, and the three structural
+    /// properties that make it airtight.
+    ///
+    /// H-1's epoch closes one half of the gate-cache race — a query already IN
+    /// FLIGHT when a beacon fires. It cannot close the other half: a query
+    /// issued DURING the beacon POST starts at the already-bumped epoch and
+    /// gets a *truthful* pre-contamination `open` from an app that has not been
+    /// told yet, so nothing about it looks stale and it was cached for a full
+    /// TTL. `CIMP_WEB_PENDING` is what makes that window visible in-process.
+    ///
+    /// **What this test would still pass with:** a counter that is incremented
+    /// and never decremented — hence the `finally` (2), whose absence would
+    /// refuse this tab's local tools for the rest of the session the first time
+    /// a beacon threw. A counter opened *after* the first `await`, which
+    /// re-opens the exact sliver it exists to close — hence (1), which pins the
+    /// adjacency to the epoch bump rather than merely the order. And a `settle`
+    /// that ignores it, which would keep caching the pre-contamination verdict
+    /// — hence (3).
+    ///
+    /// What it deliberately does NOT reach: whether the window actually refuses
+    /// anything. That is not a string property;
+    /// `the_gate_refuses_local_tools_while_the_beacon_is_in_flight` runs the
+    /// file.
+    #[test]
+    fn the_beacon_window_opens_beside_the_epoch_bump_and_always_closes() {
+        let js = opencode_plugin_source(1, "t", "opencode", ALL_ON);
+        assert!(js.contains("let CIMP_WEB_PENDING = 0;"), "{js}");
+        let hook = &js[js.find(r#""tool.execute.before""#).expect("hook")..];
+        let hook = &hook[..hook.find(r#""tool.execute.after""#).expect("hook ends")];
+
+        // Exactly one open and one close — a second of either is a leak or a
+        // double-close, and both are silent.
+        assert_eq!(hook.matches("CIMP_WEB_PENDING++").count(), 1, "{hook}");
+        assert_eq!(hook.matches("CIMP_WEB_PENDING--").count(), 1, "{hook}");
+
+        let bump = hook.find("CIMP_GATE_EPOCH++;").expect("epoch bump");
+        let inc = hook.find("CIMP_WEB_PENDING++;").expect("window opens");
+        let dec = hook.find("CIMP_WEB_PENDING--;").expect("window closes");
+        let guard = hook
+            .find("if (!CIMP_BEACON_ENABLED) return;")
+            .expect("beacon enable guard");
+        let post = hook.find("/latch/beacon").expect("beacon post");
+
+        // (1) The window opens after the epoch bump with NO `await` in between.
+        // The engine is single-threaded, so with nothing awaitable separating
+        // them no other hook can run in the sliver where the epoch has already
+        // moved but the window is not yet open — which is the one place a gate
+        // query could still start and see neither signal.
+        assert!(bump < inc, "the window must open after the bump: {hook}");
+        // Comments are stripped first: the rationale sitting between these two
+        // statements necessarily talks *about* awaiting, and a test that a
+        // comment can turn red is a test people delete.
+        let between: String = hook[bump..inc]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !between.contains("await"),
+            "no await may separate the epoch bump from the window: {between}"
+        );
+        // …and before the POST it is about, so the window covers the whole of it.
+        assert!(inc < post, "the window must open before the POST: {hook}");
+
+        // (2) It closes in a `finally` that also covers the disabled-beacon
+        // `return`, so every exit — thrown fetch, aborted fetch, beacon off —
+        // closes it.
+        assert!(
+            inc < guard && guard < dec,
+            "the guard must sit inside the window: {hook}"
+        );
+        assert!(post < dec, "the window must close after the POST: {hook}");
+        let fin = hook[inc..dec].rfind("finally {").map(|f| f + inc);
+        assert!(
+            fin.is_some_and(|f| f < dec),
+            "the close must be in a `finally`, not on the happy path: {hook}"
+        );
+
+        // (3) `settle` reads it at query START and refuses to cache across it.
+        let helper = {
+            let s = js
+                .find("async function cimpGateState()")
+                .expect("state helper");
+            let e = js[s..].find("\nexport default").expect("helper ends") + s;
+            &js[s..e]
+        };
+        let read = helper
+            .find("const pendingAtStart = CIMP_WEB_PENDING;")
+            .expect("the query snapshots the window at its start");
+        assert!(
+            read < helper.find("await fetch").expect("the state query"),
+            "the snapshot must be taken BEFORE the query, not after it: {helper}"
+        );
+        assert!(helper.contains("pendingAtStart === 0"), "{helper}");
     }
 
     /// **The one property no source assertion can reach** (#48, H-1): the gate
@@ -4663,6 +4850,157 @@ try {
   if (!String(e && e.message).length) { console.log("FAIL: empty refusal"); process.exit(1); }
   console.log("OK: refused after the beacon");
 }
+"#;
+
+    /// **#48 (M-15), executed**: a local tool issued while a native web call's
+    /// beacon POST is still in flight.
+    ///
+    /// The sibling test above stages a query that is in flight when the beacon
+    /// fires — H-1's half. This stages the other one, which H-1's epoch cannot
+    /// see: the `read` starts *after* the epoch bump, and the `/latch/state`
+    /// reply it gets is a truthful, correctly-ordered pre-contamination `open`,
+    /// because the POST that would tell the app is the one still parked. Under
+    /// H-1 alone nothing looks stale, so that `open` is both applied AND cached
+    /// for a full 2 s TTL — the lethal-trifecta window this latch exists to
+    /// close, held open by the invalidation's own timing.
+    ///
+    /// **Deterministic by construction, not by timing.** There is no sleep and
+    /// no timer anywhere in the driver. The stub parks the beacon POST and
+    /// resolves `beaconStarted` at the instant the plugin enters it, so the
+    /// driver continues exactly when the window is open; `releaseBeacon()` is
+    /// the only thing that ever closes it. Every step is a promise handoff on a
+    /// single thread, so the interleaving is identical on every machine and
+    /// under any load.
+    ///
+    /// **What this would still pass with — and the guards against it:** a
+    /// plugin that refuses every local tool unconditionally (step 0 admits a
+    /// `read` and fails if it is refused); a plugin that throws a `TypeError`
+    /// somewhere in the hook (both refusals are compared against the exact
+    /// `REFUSAL_NATIVE_LOCAL_BLOCKED` constant, not merely caught); and a
+    /// plugin that refuses step 4 because the window never closed rather than
+    /// because the cache was left empty (step 4 asserts a NEW `/latch/state`
+    /// query was made, which under the bug was served from cache).
+    ///
+    /// Ignored by default: `cargo test` must not require a `node` on PATH. CI
+    /// runs it by name beside its sibling — see `.github/workflows/tests.yml`.
+    ///
+    /// Run: `cargo test --bin cimp -- --ignored --nocapture in_flight`
+    #[test]
+    #[ignore]
+    fn the_gate_refuses_local_tools_while_the_beacon_is_in_flight() {
+        // A directory of its own: the sibling node test uses the same pid and
+        // removes its whole temp dir when it finishes.
+        let dir = std::env::temp_dir().join(format!("cimp-plugin-inflight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("plugin.mjs"),
+            opencode_plugin_source(1, "tok", "opencode", ALL_ON),
+        )
+        .expect("write plugin");
+        // The refusal is injected rather than re-typed, so the driver compares
+        // against the shipped constant and cannot drift from it.
+        let refusal =
+            serde_json::to_string(crate::offload::toolclass::REFUSAL_NATIVE_LOCAL_BLOCKED)
+                .expect("the refusal is JSON-quotable");
+        std::fs::write(
+            dir.join("driver.mjs"),
+            GATE_INFLIGHT_DRIVER.replace("__REFUSAL__", &refusal),
+        )
+        .expect("write driver");
+
+        let out = std::process::Command::new("node")
+            .arg("driver.mjs")
+            .current_dir(&dir)
+            .output()
+            .expect("node on PATH — this test is #[ignore]d precisely because it needs one");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "driver failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("OK: refused during and after the in-flight beacon"),
+            "the in-flight window admitted a local tool\
+             \n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
+    /// The driver for [`the_gate_refuses_local_tools_while_the_beacon_is_in_flight`].
+    const GATE_INFLIGHT_DRIVER: &str = r#"
+// Stubbed loopback, driven entirely by explicit promise handoffs — no timers,
+// no sleeps, nothing load-sensitive.
+//
+//   * /latch/state answers IMMEDIATELY with the latch AS IT IS AT REQUEST TIME.
+//     That is what makes the reply inside the window a *truthful*
+//     pre-contamination verdict rather than a stale one: the app has genuinely
+//     not been told yet, so no epoch and no timestamp can mark it suspect.
+//   * /latch/beacon PARKS. `beaconStarted` resolves the moment the plugin
+//     enters it, so the driver proceeds exactly when the window is open;
+//     `releaseBeacon()` is the only thing that engages EXTERNAL app-side.
+const REFUSAL = __REFUSAL__;
+let latch = "open";
+let releaseBeacon = null;
+let beaconEntered = null;
+const beaconStarted = new Promise((r) => { beaconEntered = r; });
+let stateQueries = 0;
+globalThis.fetch = (url) => {
+  const u = String(url);
+  if (u.endsWith("/latch/state")) {
+    stateQueries++;
+    const answered = latch;
+    return Promise.resolve({ ok: true, json: async () => ({ gate: true, latch: answered }) });
+  }
+  if (u.endsWith("/latch/beacon")) {
+    return new Promise((resolve) => {
+      releaseBeacon = () => { latch = "external"; resolve({ ok: true, json: async () => ({}) }); };
+      beaconEntered();
+    });
+  }
+  return Promise.resolve({ ok: true, json: async () => ({}) });
+};
+process.env.CIMP_TAB_ID = "opencode";
+
+const fail = (m) => { console.log("FAIL: " + m); process.exit(1); };
+const refusalFor = async (tool) => {
+  try { await before({ tool, sessionID: "s" }); return null; }
+  catch (e) { return String(e && e.message); }
+};
+
+const hooks = await (await import("./plugin.mjs")).default({ directory: "." });
+const before = hooks["tool.execute.before"];
+
+// 0. Control. Nothing latched, no beacon in flight: `read` is ADMITTED. A
+//    plugin that simply refuses every local tool cannot pass from here on.
+const control = await refusalFor("read");
+if (control !== null) fail("the control read was refused: " + control);
+
+// 1. A webfetch is admitted and its beacon POST parks. The window is now open:
+//    the tool has been let through, the app has not been told.
+const web = before({ tool: "webfetch", sessionID: "s" });
+await beaconStarted;
+if (latch !== "open") fail("the app must not have been told yet");
+
+// 2. The read that races the POST — the finding itself.
+const during = await refusalFor("read");
+if (during === null) fail("admitted a local tool while a web call was in flight");
+if (during !== REFUSAL) fail("refused for the wrong reason: " + during);
+
+// 3. The beacon lands; EXTERNAL is engaged app-side and the window closes.
+releaseBeacon();
+await web;
+if (latch !== "external") fail("the beacon did not engage");
+
+// 4. …and the next read must still be refused — this time by the app's own
+//    verdict. Under the bug, step 2 committed `{gate:true, latch:"open"}` to
+//    the cache stamped with a fresh `now`, and this read was served from it
+//    without asking anyone for a full 2 s TTL.
+const queries = stateQueries;
+const after = await refusalFor("read");
+if (after !== REFUSAL) fail("admitted after the beacon landed: " + after);
+if (stateQueries === queries) fail("served from cache — the raced verdict was committed");
+console.log("OK: refused during and after the in-flight beacon");
 "#;
 
     /// One file per tab (#48, H-2), and every handler inert in any other tab's

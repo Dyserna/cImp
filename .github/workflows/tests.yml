@@ -117,15 +117,16 @@ jobs:
         # `--locked` so CI tests the committed Cargo.lock resolution.
         run: cargo test --locked --bin cimp
 
-      # Code review 2026-08-08, finding O-1. The suite has three `#[ignore]`d
-      # tests and CI ran NONE of them, so the only *executable* guard for the
-      # Phase H gate-cache race (#48, H-1) — every other test in that file greps
+      # Code review 2026-08-08, finding O-1. The suite has `#[ignore]`d tests and
+      # CI ran NONE of them, so the only *executable* guards for the Phase H
+      # gate-cache race (#48, H-1 and M-15) — every other test in that file greps
       # the generated plugin source — fired only when a human remembered
       # `--ignored`.
       #
-      # Exactly one of the three can run here, deliberately:
+      # Only the node-backed ones can run here, deliberately:
       #  * `tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query`
-      #    needs `node` on PATH, which this job has unconditionally — `npx
+      #    (H-1) and `tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight`
+      #    (M-15) need `node` on PATH, which this job has unconditionally — `npx
       #    vitest run` is ten steps up. That is the whole reason O-1 is cheap.
       #  * `tts::engine::tests::synthesizes` needs the Kokoro model + voicepack
       #    and `tts::phonemize::tests::espeak_fallback_engages_on_oov` needs the
@@ -139,7 +140,7 @@ jobs:
       #  1. The ignored INVENTORY is pinned. A new `#[ignore]` fails this step,
       #    so somebody decides whether it belongs in CI instead of it joining a
       #    never-run pile — which is how O-1 happened in the first place.
-      #  2. The run is checked for `1 passed`. `cargo test` exits 0 when a
+      #  2. Each run is checked for `1 passed`. `cargo test` exits 0 when a
       #    filter matches nothing, so a rename would otherwise leave a green
       #    step that executed no test at all.
       - name: cargo test (ignored, node-backed)
@@ -147,11 +148,15 @@ jobs:
         env:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
         run: |
-          $expected = @(
+          # The node-backed ones, run below one at a time.
+          $nodeBacked = @(
             'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query',
+            'tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight'
+          )
+          $expected = ($nodeBacked + @(
             'tts::engine::tests::synthesizes',
             'tts::phonemize::tests::espeak_fallback_engages_on_oov'
-          ) | Sort-Object
+          )) | Sort-Object
 
           $listed = @(
             cargo test --locked --bin cimp -- --ignored --list |
@@ -166,11 +171,15 @@ jobs:
             exit 1
           }
 
-          $name = 'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query'
-          $log = Join-Path $env:RUNNER_TEMP 'ignored-tests.log'
-          cargo test --locked --bin cimp -- --ignored --exact $name 2>&1 | Tee-Object -FilePath $log
+          # One `--exact` run each, not one filtered run: two tests reported as
+          # "2 passed" would also be reported that way if a third was silently
+          # added, and a per-name run is what makes the rename check bite.
+          foreach ($name in $nodeBacked) {
+            $log = Join-Path $env:RUNNER_TEMP "ignored-$($name.GetHashCode()).log"
+            cargo test --locked --bin cimp -- --ignored --exact $name 2>&1 | Tee-Object -FilePath $log
 
-          if (-not (Select-String -Path $log -Pattern 'test result: ok\. 1 passed' -Quiet)) {
-            Write-Host "::error::$name did not report '1 passed' — it either failed, or the filter matched nothing because the test was renamed."
-            exit 1
+            if (-not (Select-String -Path $log -Pattern 'test result: ok\. 1 passed' -Quiet)) {
+              Write-Host "::error::$name did not report '1 passed' — it either failed, or the filter matched nothing because the test was renamed."
+              exit 1
+            }
           }

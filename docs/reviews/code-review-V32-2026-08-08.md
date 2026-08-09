@@ -545,7 +545,7 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-4 | A classifier that runs and fails is indistinguishable from Clean, and a failing window **discards windows that already scored over threshold**. `Scored` has no field to express it. The spec names exactly two exclusions; the code implements three. | **FIXED** `5920c92` | `classifier.rs:391-399`, `mod.rs:404-409` |
 | M-5 | At the worker, the "unscreened" notice is **false every time it fires**: `cap_result` truncates to 32 KB, unconditionally below both screening caps, so every byte the model sees was scanned. Trains the reader to discount a notice that is true at the proxy. | OPEN | `mod.rs:387-394`, `agent.rs:1910/1928` |
 | M-6 | Audit findings enter model context with no envelope, no detection scan, and without contaminating the conversation — scanner-quoted text from `node_modules` is framed as authoritative project data, and `context_note` afterwards is *not* quarantined. `context_recall`, strictly tamer, *is* enveloped. | OPEN | `audit/mcp.rs:248-266`, `loopback.rs:2618-2621,1706-1708` |
-| M-7 | Three ungated loopback routes reach local capability; `POST /context/post_edit` **executes the project's configured checks** for a caller-supplied `cwd`. None carries a `tab`; none appears in any route enumeration. | OPEN | `loopback.rs:3297-3328,2659,2768` |
+| M-7 | Three ungated loopback routes reach local capability; `POST /context/post_edit` **executes the project's configured checks** for a caller-supplied `cwd`. None carries a `tab`; none appears in any route enumeration. | **FIXED (taint gate + enumeration)** `526c91f` — see the M-7 note below; the caller-supplied `cwd` half is **NOT** closed and is folded into H-7 | `loopback.rs:4095,4181,4690`, `toolclass.rs:234-266`, `config.rs:659,683,762,1872` |
 | M-8 | `run_check` dispatches **above** the class gate on the headless path, so an EXTERNAL-latched tab that corrupts `.cimp-discovery` runs the project's build/test/lint while `ddg__*` stays live. | OPEN | `graph/mcp.rs:516-529` |
 | M-9 | The `#46` outcome split covers the manifest fetch but not the **artifact** fetch: any asset 404/timeout is recorded as a bundle *rejection* (red card, `unreachable_streak` reset). The deploy note's own publish order makes this the likely steady state. | **FIXED** `a17f25c` — an artifact fetch failure is `Unavailable`, not a rejection | `updater/mod.rs:1032-1039,1059` |
 | M-10 | A crash *during* rollback deletes the files the rollback already restored — the journal has two phases and the rollback is an unrepresented third state. Permanent, uncarded, and `warn!`s "the previous version was restored". | **FIXED** `a17f25c` — `Phase::Restoring`; recovery no longer deletes what the rollback restored | `updater/mod.rs:1423-1434,1365-1370` |
@@ -566,6 +566,67 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | M-25 | The frontend branches on `rules.armed` where the backend publishes `rules.healthy` for exactly this question — 3 of 4 rule files failing renders full protection. `offload.ts:212` documents that `healthy` must be read, never restated. | OPEN | `latch.ts:259` |
 | M-26 | `FILE_COMPACT_LINES` equals the sum of the per-kind caps (1000), so at saturation every single write triggers a full file read + atomic rewrite, and the accepted child-append race opens on every write instead of every ~1000. | **FIXED** `d652171` — `FILE_COMPACT_LINES` derived with headroom + a compile-time assert | `activity.rs:58-84,472` |
 
+### M-7 — what was closed, and what was not
+
+**Closed (hazard 1, the taint gate).** All three routes now resolve a latch scope and
+gate before they reach `GraphService`, in `/graph_run`'s shape. The gate needed an
+identity to resolve, so `--tab <id>` is baked into the `--precompact-hook`,
+`--read-hook` and `--postedit-hook` commands at spawn (as `--context-hook` and
+`--taint-beacon` already were), the three shims forward it, and the generated
+OpenCode plugin sends `CIMP_TAB_ID` on its `post_edit` POST. Under an EXTERNAL latch,
+`post_edit` no longer runs the project's checks and `should_read` no longer returns
+source text; each answers with its own fail-safe (empty text / verdict `pass`), so no
+hook can perturb the turn it observes.
+
+They gate on a new `LatchRoute::Hook`, whose one rule is **a hook may be refused by a
+latch but must never move one**. Gating them as elective calls would have latched every
+tab with the read advisor or auto-check enabled to `Local` at its first read or edit,
+silently refusing every proxied web/MCP tool for the rest of the session — a worse
+regression than the hole.
+
+**Closed (the enumeration).** The three routes did appear in the pinned path list; what
+they appeared in was an enumeration of *strings*. `ROUTE_CONTAINMENT` now records, per
+route, whether it gates and — for the fixed-tool routes — whether an EXTERNAL-latched
+conversation is refused there, computed from `toolclass` rather than restated. The two
+route tests read the same list.
+
+**NOT closed (hazard 2, the caller-supplied `cwd`).** `post_edit` still runs the user's
+vetted check commands in whatever directory the body names, and a caller that simply
+omits `tab` is not gated at all (the locked fail-open of `latch_scope`, tracked by
+F-5/H-8). Any narrowing keyed on the caller's own `tab` is walked around by omitting
+it, so the only sound closures are (a) fail-closed without identity — an F-5 decision —
+or (b) an allowlist of roots cImp will execute in, derived from configured tabs rather
+than from the request. (b) is H-7's shape and is **folded into H-7's pending
+V32-vs-V33 decision** rather than half-built here.
+
+**Adjacent, recorded not fixed.** `POST /context/retrieve` is ungated for a stated
+reason (auto-injection, contained by the spotlight/quarantine envelope), but its digest
+carries exported signatures — the same content H-1 demoted `graph_repo_map` for. The
+`ROUTE_CONTAINMENT` row says so; it is a standing question, not a settled one.
+
+**Two residuals found in orchestrator review of the fix, neither a regression.**
+
+1. **`Hook`'s non-engagement leaves the read-then-fetch ordering open for `post_edit`.**
+   `post_edit` returns check diagnostics — which quote source — into the context while
+   the latch stays where it was, so a later `ddg__fetch_content` can carry that text
+   out. Under `LatchRoute::Native` the equivalent (`run_check`) would have engaged
+   `Local` and blocked the fetch. This is *pre-existing* (the route was previously
+   ungated **and** non-engaging), and the alternative is the session-killing regression
+   `LatchRoute::Hook` exists to avoid. A narrower option, if this is judged worth
+   closing: **engage only when `post_edit` actually returns non-empty check output** —
+   a no-op in the default config (`graph.auto_check` defaults off, so `post_edit`
+   returns `None`) and containment restored when it is on. Costs a user with auto-check
+   enabled their web tools from the first edit that produces findings, which is why it
+   is a decision and not applied.
+2. **`hook_*` are the first `TABLE` rows that are classified but not dispatchable.**
+   A model emitting the bare name `hook_post_edit` on `LatchRoute::Native` now
+   classifies LOCAL-CAPABILITY and **latches the tab to `Local` before dispatch rejects
+   the name** — the A-1 harm (one hallucinated name costs a tab its tools) in the
+   direction the A-1 fix did not cover. Low probability (the name is in no tool list),
+   but it is exactly M-2's subject: **M-2's tripwire must assert `TABLE` ↔
+   dispatchable-name correspondence, with the three `hook_*` names as a documented
+   exception.**
+
 ---
 
 ## Tripwire gap analysis
@@ -582,7 +643,7 @@ narrower than the sentences describing them.
 | #44 / private injection switches | every enforcement site resolves through `effective()` | **Five V32-era controls on the same struct are fully `pub` and read raw today** — `session_push`, `detection_update_rules_mode`, `_classifier_mode`, `_interval_hours`, `_manifest_url` (raw reads in `updater/mod.rs`, `graph/service.rs`, `audit/runner.rs`, `oob/mod.rs`). The structural invariant covers Phases B/C/D/F/G/H and *not* Phase C3 or decision 9's own master gate. Privacy cannot express "and the next one". |
 | `every_feature_has_a_guarded_l2_field` | every Feature has its own storage | Guards **L2 only**. Writing a new feature's L3 arms as `Feature::NewThing => self.taint_latch` passes every existing test — and a user setting NewThing's per-tab override to `off` silently switches the taint latch off on that tab. |
 | Claude `--settings` overlay key-set pin | asserted "against the largest overlay we can emit" | Built from `Settings::default()` (= `sensor`). In `deny` mode a **third** top-level key `permissions` is emitted, so the test never runs against the largest overlay. Part 4's LOW is confirmed still open. |
-| `/audit/run` gate | route is LOCAL-CAPABILITY gated | Tests exercise `gate()` and `tool_name_for` **directly**; deleting the `latches().gate(…)` block from `handle_audit_run` leaves the suite green. Same for the three lines in `audit/mcp.rs` that put `tab` in the body — deleting them produces H-8. |
+| `/audit/run` gate | route is LOCAL-CAPABILITY gated | ~~Tests exercise `gate()` and `tool_name_for` **directly**; deleting the `latches().gate(…)` block from `handle_audit_run` leaves the suite green.~~ **Half closed by M-7's fix:** `every_loopback_route_declares_what_it_does_about_the_latch` fails if any route declared as gating stops reaching `latches()`, `handle_audit_run` included (RED-checked against `handle_post_edit`). Still open: the three lines in `audit/mcp.rs` that put `tab` in the body — deleting them produces H-8 and nothing fails. |
 | `Screen` wire values / `is_denial` | the variant set is pinned | The same fix run built `declare_origins!` **100 lines below `Screen` in the same file** and did not apply it. The label test iterates a hand-written 10-element array; `Screen` has 11 — `Screen::Unscreened`, the D-1 addition, is missing. `is_denial` is a `!matches!` with fall-through, so a new variant silently defaults to *denial*. |
 
 No dead canary was found: all five V32 detection signals have a live Advisor

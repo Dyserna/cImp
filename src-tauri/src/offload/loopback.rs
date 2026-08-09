@@ -1785,12 +1785,36 @@ pub(super) enum LatchRoute {
     /// EXTERNAL neither latches nor is refused, and dispatch answers with its
     /// own error.
     Native,
+    /// A **cImp-initiated hook**: the three `/context/*` shim routes (#48,
+    /// finding M-7). Like [`LatchRoute::Native`] in what an EXTERNAL
+    /// classification means — these routes serve fixed, cImp-owned names and
+    /// physically cannot carry a proxied server's content — and different in
+    /// exactly one respect, which is the whole reason the variant exists:
+    /// **a hook may be REFUSED by a latch but must never MOVE one.**
+    ///
+    /// The calls arriving here are not tool calls. `PreToolUse`/`PreCompact`/
+    /// `PostToolUse` fire automatically, for cImp's own automation, over work
+    /// the harness has *already* permitted. Letting them engage would latch
+    /// every tab with the read advisor or auto-check enabled to `Local` at its
+    /// first read or edit, and every proxied web/MCP tool would be refused from
+    /// that moment for a choice the model never made. The latch records what a
+    /// CONVERSATION elected to do; cImp advising on a read the model had
+    /// already been granted is not the conversation electing anything.
+    ///
+    /// It still *reads* the latch, because the other direction is the one M-7
+    /// is about: under an EXTERNAL latch cImp must not execute the project's
+    /// configured checks, or hand back repo source text, on behalf of a
+    /// conversation that has ingested untrusted content.
+    Hook,
 }
 
 impl LatchRoute {
     /// The route a tool name arrives on, by the one convention both dispatchers
     /// use: a namespaced `<server>__<tool>` id is proxied, a bare name is
     /// native (`agent.rs::HostRouter::call`, `mcp_host::call_for_consumer`).
+    ///
+    /// Never answers [`LatchRoute::Hook`]: that is a property of the ROUTE and
+    /// not of the name, so the three hook handlers state it themselves.
     pub(super) fn of_tool(name: &str) -> Self {
         if name.contains("__") {
             LatchRoute::Proxied
@@ -1799,10 +1823,21 @@ impl LatchRoute {
         }
     }
 
+    /// Whether an admitted call on this route may **move** the scope's latch.
+    ///
+    /// `false` only on [`LatchRoute::Hook`] — see that variant. A separate axis
+    /// from [`external_is_content`](Self::external_is_content), deliberately: a
+    /// hook has to be classified and gated (so it can be refused) without being
+    /// elective (so it must not latch).
+    pub(super) fn engages(self) -> bool {
+        self != LatchRoute::Hook
+    }
+
     /// Whether an [`ToolClass::External`] classification on this route really
     /// means **external content**.
     ///
-    /// `false` on [`LatchRoute::Native`] is the whole rule, and it is not a
+    /// `false` on [`LatchRoute::Native`] and [`LatchRoute::Hook`] is the whole
+    /// rule, and it is not a
     /// weakening of the unknown-⇒-EXTERNAL invariant: every proxied id contains
     /// `__` by construction, so the restrictive default still governs every
     /// name that can carry external content. What it excludes is the name that
@@ -2433,7 +2468,14 @@ impl LatchRegistry {
         // microsecond earlier. Nothing can observe the entry between the two
         // (both run under the one lock), so the order is a choice about the row,
         // not about the semantics.
-        let engaged = policy.latch && entry.latch.engage(class);
+        //
+        // #48 (M-7): …and only on a route whose calls are ELECTIVE. A
+        // [`LatchRoute::Hook`] call is cImp's own automation firing over work
+        // the harness already permitted, so it reads the latch (it can be
+        // refused, three lines up) and never moves it. `engages()` is checked
+        // here rather than inside `Latch::engage` because it is a fact about
+        // the route, not about the class.
+        let engaged = policy.latch && route.engages() && entry.latch.engage(class);
         let contamination = if class == ToolClass::External {
             note_contamination(entry, scope, name, prov)
         } else {
@@ -3926,6 +3968,98 @@ async fn handle_context_retrieve(
     .await
 }
 
+// ── #48, finding M-7: the three `/context/*` hook routes' taint gate ───────
+//
+// The finding: `/context/post_edit`, `/context/should_read` and
+// `/context/compaction` reached local capability with no `latches()` call of
+// any kind and no `tab` in their bodies. `post_edit` in particular EXECUTES the
+// project's configured check commands. "Only our own shim calls this route" is
+// a convention, not a security property: the listener is reachable by any
+// process running as this user, and the bearer token is in a discovery file
+// that same process can read.
+//
+// The fix has two halves, and both were needed — a gate with no identity to
+// resolve would have been ceremony:
+//
+// 1. **Identity now rides the wire.** `--tab <id>` is baked into all three hook
+//    commands at spawn (`tabs::config::build_pre_args`, the same treatment
+//    `--context-hook` and `--taint-beacon` already had), the shims forward it,
+//    and the generated OpenCode plugin sends `CIMP_TAB_ID` on its `post_edit`
+//    POST.
+// 2. **The gate**, below — `/graph_run`'s shape, on [`LatchRoute::Hook`].
+//
+// **The residual, stated rather than papered over:** a body with no usable
+// `tab` still resolves to no scope and is ADMITTED. That is the locked
+// fail-open posture every tool-serving route here takes (`latch_scope`), and
+// tightening it is the open decision F-5/H-8 tracks, not something to settle
+// route-by-route: a shim from a build before this commit sends no `tab`, and
+// failing closed would silently disable the read advisor and auto-check for
+// every such tab. So a forged POST that simply omits `tab` is ungated here,
+// exactly as it is on `/graph_run` and `/mcp/call`.
+
+/// The class-table name `POST /context/post_edit` gates under. See its
+/// [`toolclass::TABLE`] row for why it is LOCAL-CAPABILITY.
+const HOOK_TOOL_POST_EDIT: &str = "hook_post_edit";
+/// The class-table name `POST /context/should_read` gates under.
+const HOOK_TOOL_SHOULD_READ: &str = "hook_should_read";
+/// The class-table name `POST /context/compaction` gates under. TRUSTED, so
+/// this gate admits every call today — see the row.
+const HOOK_TOOL_COMPACTION: &str = "hook_compaction";
+
+/// The taint decision the three `/context/*` hook routes take before they reach
+/// [`crate::graph::GraphService`], as one function taking its dependencies as
+/// arguments — the [`audit_admit`] shape, for the same two reasons: a handler
+/// cannot reach capability without passing through it, and the decision is
+/// testable without a `TcpStream` or an `AppHandle` (this crate has no
+/// `tauri::test` mock — see [`latch_state_reply`]).
+///
+/// `Err(refusal)` means *this conversation may not have this*. Every caller
+/// answers it with the route's own fail-safe reply — empty text, or a `pass`
+/// verdict — and never with the refusal string: these are hooks, and a hook
+/// that returns an error perturbs the turn it was supposed to be invisible to.
+/// The refusal is not silent even so: [`LatchRegistry::gate`] writes the
+/// [`Screen::LatchRefusal`](outbound::Screen) row (once per scope) that gives
+/// it a user-visible consumer.
+///
+/// `agent` is caller-asserted, exactly as `consumer` is on `/graph_run`. It
+/// selects which agent's key the scope is built under and nothing else; F-4
+/// (`(consumer, tab)` is a verified pair on no route) is unchanged here, not
+/// worked around.
+fn hook_admit(
+    reg: &LatchRegistry,
+    tool: &'static str,
+    agent: &'static str,
+    tab: Option<&str>,
+    scope_of: impl FnOnce(&'static str, Option<&str>) -> LatchScoping,
+    policy_of: impl FnOnce(Option<&LatchScope>) -> GatePolicy,
+) -> Result<(), &'static str> {
+    let scoping = scope_of(agent, tab);
+    let scope = scoping.scope();
+    let policy = policy_of(scope);
+    // `CallProvenance::http()`, not `internal()`: this is a POST from a local
+    // process, and the launch token is readable by anything running as this
+    // user, so it is never evidence that cImp itself decided the call (#45's
+    // reasoning for the beacon route). It reaches no row today — provenance is
+    // read only when an admitted call is EXTERNAL, and no name gated here is —
+    // but stating it by omission is how the wrong origin gets inherited later.
+    reg.gate(
+        scope,
+        LatchRoute::Hook,
+        tool,
+        policy,
+        CallProvenance::http(),
+    )
+    .map(|_| ())
+}
+
+/// The agent key a hook body's caller-asserted `agent` resolves to. Absent ⇒
+/// `claude`: `--precompact-hook` and `--read-hook` are installed only into
+/// Claude's settings overlay, and a `post_edit` body with no `agent` is a shim
+/// from a build before this field existed, which was a Claude shim.
+fn hook_agent(agent: Option<&str>) -> &'static str {
+    crate::graph::source_for_consumer(agent.unwrap_or("claude"))
+}
+
 /// A `POST /context/compaction` request body (the Claude `PreCompact` shim).
 #[derive(Deserialize)]
 struct ContextCompactionBody {
@@ -3937,12 +4071,27 @@ struct ContextCompactionBody {
     #[serde(default)]
     #[allow(dead_code)]
     trigger: Option<String>,
+    /// #48 (M-7): which shim is calling. See [`hook_agent`].
+    #[serde(default)]
+    agent: Option<String>,
+    /// #48 (M-7): the cImp TAB this hook serves, baked into argv at spawn.
+    /// `#[serde(default)]` because a shim from an older build sends none — see
+    /// the residual note above.
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 /// `POST /context/compaction` (V11 Phase D): always runs the session's
 /// compaction side effects (clear injection dedup, mark post-compaction) and
 /// returns a compact working-set/notes block as `{ ok, text }` to carry through
 /// the summary. Never blocks — an empty block is returned as empty text.
+///
+/// #48 (M-7): gated through [`hook_admit`] on [`HOOK_TOOL_COMPACTION`], which
+/// classifies TRUSTED — so this gate admits every call today, and the route is
+/// inside the mechanism rather than beside it (demoting that one row is all it
+/// takes to close the route, and its comment states what else a demotion must
+/// do first). The block's content is why: paths, symbol NAMES and memory-note
+/// text, no source text, with quarantined notes already excluded.
 async fn handle_context_compaction(
     stream: &mut TcpStream,
     app: &AppHandle,
@@ -3960,6 +4109,19 @@ async fn handle_context_compaction(
         }
     };
     let empty = serde_json::json!({ "ok": true, "text": "" });
+    let settings = live_settings(app);
+    if hook_admit(
+        latches(),
+        HOOK_TOOL_COMPACTION,
+        hook_agent(body.agent.as_deref()),
+        body.tab.as_deref(),
+        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |scope| GatePolicy::resolve(&settings, scope),
+    )
+    .is_err()
+    {
+        return write_json(stream, 200, &empty).await;
+    }
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return write_json(stream, 200, &empty).await;
     };
@@ -3994,12 +4156,28 @@ struct ShouldReadBody {
     /// deliberate slice always passes — Phase C's first-read branch).
     #[serde(default)]
     limit: Option<u32>,
+    /// #48 (M-7): which shim is calling. See [`hook_agent`].
+    #[serde(default)]
+    agent: Option<String>,
+    /// #48 (M-7): the cImp TAB this hook serves, baked into argv at spawn.
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 /// `POST /context/should_read` (V11 Phase E): the read-advisor verdict for a
 /// `Read`. Returns `{ ok, verdict: "pass" }` to let the read through, or
 /// `{ ok, verdict: "remind", text }` to deny-with-content. Fails open to `pass`
 /// on any missing state — the advisor must never block a legitimate read.
+///
+/// #48 (M-7): gated through [`hook_admit`] on [`HOOK_TOOL_SHOULD_READ`]
+/// (LOCAL-CAPABILITY — the verdict hands back the file's outline, its symbol
+/// body, or a unified diff of it, which is repo source text). **This does not
+/// weaken the sentence above.** The gate's only reachable effect is to turn a
+/// `remind` into a `pass`, because `pass` is the fail-safe every arm of this
+/// route falls back to: a latched conversation gets its read through untouched
+/// and pays only the tokens the advisor would have saved. The advisor can still
+/// never block a legitimate read — after this change it can block strictly
+/// fewer of them.
 async fn handle_should_read(
     stream: &mut TcpStream,
     app: &AppHandle,
@@ -4017,6 +4195,19 @@ async fn handle_should_read(
             .await;
         }
     };
+    let settings = live_settings(app);
+    if hook_admit(
+        latches(),
+        HOOK_TOOL_SHOULD_READ,
+        hook_agent(body.agent.as_deref()),
+        body.tab.as_deref(),
+        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |scope| GatePolicy::resolve(&settings, scope),
+    )
+    .is_err()
+    {
+        return write_json(stream, 200, &pass).await;
+    }
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return write_json(stream, 200, &pass).await;
     };
@@ -4465,6 +4656,14 @@ struct ContextPostEditBody {
     #[serde(default)]
     #[allow(dead_code)]
     tool_name: Option<String>,
+    /// #48 (M-7): which shim is calling — `"claude"` (the `--postedit-hook`
+    /// shim) or `"opencode"` (the generated plugin). See [`hook_agent`].
+    #[serde(default)]
+    agent: Option<String>,
+    /// #48 (M-7): the cImp TAB this hook serves — `--tab <id>` from argv on the
+    /// Claude side, `CIMP_TAB_ID` on the OpenCode side.
+    #[serde(default)]
+    tab: Option<String>,
 }
 
 /// `POST /context/post_edit` (V12 Phase F): debounce this session's edits, run
@@ -4472,6 +4671,22 @@ struct ContextPostEditBody {
 /// session's own baseline, and return only NEW/worsened diagnostics (plus an
 /// optional auto-impact note) as `{ ok, text }`. Fails open to empty text on
 /// any missing state — the hook must never block or perturb an edit.
+///
+/// #48 (M-7): gated through [`hook_admit`] on [`HOOK_TOOL_POST_EDIT`]. This is
+/// the route the finding is really about — it **executes the project's
+/// configured check commands**, which is the definition of LOCAL-CAPABILITY
+/// under decision 1, and it did so with no `latches()` call at all. A refusal
+/// answers with the route's own fail-safe (empty text), so a contaminated
+/// conversation loses its auto-check diagnostics and nothing else; the edit
+/// itself is never perturbed.
+///
+/// **Not closed by this fix:** the `cwd` those commands run in is still
+/// caller-supplied and unvalidated, so a caller that names an untrusted
+/// directory gets the user's vetted commands executed *there* — and a caller
+/// that omits `tab` is not gated at all. That is finding H-7's territory
+/// (executed configuration in a cloned repo) and is deliberately left to the
+/// decision H-7 is waiting on rather than half-answered here: any narrowing
+/// keyed on the caller's own `tab` is walked around by omitting it.
 async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
     let empty = serde_json::json!({ "ok": true, "text": "" });
     let body: ContextPostEditBody = match serde_json::from_slice(&req.body) {
@@ -4485,6 +4700,19 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
             .await;
         }
     };
+    let settings = live_settings(app);
+    if hook_admit(
+        latches(),
+        HOOK_TOOL_POST_EDIT,
+        hook_agent(body.agent.as_deref()),
+        body.tab.as_deref(),
+        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |scope| GatePolicy::resolve(&settings, scope),
+    )
+    .is_err()
+    {
+        return write_json(stream, 200, &empty).await;
+    }
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return write_json(stream, 200, &empty).await;
     };
@@ -9965,6 +10193,596 @@ mod tests {
         assert!(d.contains("`/clear`"), "the user is told what to do: {d}");
     }
 
+    // ── #48, finding M-7 — the route enumeration, by containment property ──
+    //
+    // The finding's third clause was that the three `/context/*` hook routes
+    // "appear in no route enumeration". They did appear in the pinned path list
+    // below — what they appeared in was an enumeration of STRINGS, which cannot
+    // tell a route that gates from a route that walks straight into
+    // `GraphService`. So the enumeration now records, per route, what it does
+    // about the taint latch, and the test checks that claim against the
+    // handler's own source rather than restating it.
+
+    /// What one HTTP route does about the V32 session taint latch.
+    #[derive(Debug)]
+    enum Containment {
+        /// Gates, on a tool name the REQUEST supplies (`/run`, `/graph_run`,
+        /// `/audit/run`, `/mcp/call`). Which class the call lands in is the
+        /// caller's tool's business; that the registry is consulted at all is
+        /// this route's.
+        GatesRequestTool,
+        /// Gates, on a FIXED [`toolclass::TABLE`] name — the three hook routes.
+        /// `refused_under_external` states the security-relevant consequence:
+        /// whether a conversation that has ingested untrusted content is
+        /// REFUSED here. It is checked against `toolclass`, not restated, so a
+        /// demotion of the row shows up as a failure of this test.
+        GatesFixedTool {
+            tool: &'static str,
+            refused_under_external: bool,
+        },
+        /// Touches the registry for something that is not a capability gate —
+        /// a state read, or the beacon (which can only ever tighten). The
+        /// string says which.
+        RegistryNoGate(&'static str),
+        /// Never consults the registry. The string is the reason, and it is the
+        /// claim a reviewer has to disagree with in order to add a route here.
+        NoRegistry(&'static str),
+    }
+
+    struct RouteRow {
+        path: &'static str,
+        method: &'static str,
+        /// The handler function the dispatch table routes to. `""` for the two
+        /// routes answered inline in the dispatch arm itself.
+        handler: &'static str,
+        containment: Containment,
+    }
+
+    const fn route(
+        path: &'static str,
+        method: &'static str,
+        handler: &'static str,
+        containment: Containment,
+    ) -> RouteRow {
+        RouteRow {
+            path,
+            method,
+            handler,
+            containment,
+        }
+    }
+
+    /// **Every route this listener serves, and what it does about containment.**
+    ///
+    /// This is the single enumeration: `no_http_route_can_reach_a_contamination_clear`
+    /// pins the SURFACE from it and
+    /// `every_loopback_route_declares_what_it_does_about_the_latch` pins the
+    /// PROPERTY. A new route therefore cannot be added by editing one list.
+    const ROUTE_CONTAINMENT: &[RouteRow] = &[
+        route("/run", "POST", "handle_run", Containment::GatesRequestTool),
+        route(
+            "/graph_run",
+            "POST",
+            "handle_graph_run",
+            Containment::GatesRequestTool,
+        ),
+        route(
+            "/audit/run",
+            "POST",
+            "handle_audit_run",
+            Containment::GatesRequestTool,
+        ),
+        // RECORDED RESIDUAL, not a clean case. The auto-injection channel: its
+        // V32 containment is the spotlighting / memory-quarantine envelope
+        // (locked decisions 10/12), not refusal, and it fires on every prompt
+        // rather than on a model's election. But its digest carries exported
+        // SIGNATURES — the same content H-1 demoted `graph_repo_map` for — so
+        // "ungated" here is a standing question, not a settled one. M-7 named
+        // three routes and this is not one of them; it is written down so the
+        // next reviewer inherits the question instead of rediscovering it.
+        route(
+            "/context/retrieve",
+            "POST",
+            "handle_context_retrieve",
+            Containment::NoRegistry(
+                "auto-injection; contained by the spotlight/quarantine envelope, not by refusal",
+            ),
+        ),
+        route(
+            "/context/compaction",
+            "POST",
+            "handle_context_compaction",
+            Containment::GatesFixedTool {
+                tool: HOOK_TOOL_COMPACTION,
+                // TRUSTED: paths, symbol names and memory-note text, no source
+                // text. Gated so the class table stays the one place this can
+                // change.
+                refused_under_external: false,
+            },
+        ),
+        route(
+            "/context/should_read",
+            "POST",
+            "handle_should_read",
+            Containment::GatesFixedTool {
+                tool: HOOK_TOOL_SHOULD_READ,
+                refused_under_external: true,
+            },
+        ),
+        route(
+            "/context/post_edit",
+            "POST",
+            "handle_post_edit",
+            Containment::GatesFixedTool {
+                tool: HOOK_TOOL_POST_EDIT,
+                refused_under_external: true,
+            },
+        ),
+        route(
+            "/memory/event",
+            "POST",
+            "handle_memory_event",
+            // Ingress, not egress: it records the caller's OWN tool/usage events
+            // and returns no project data. Nothing to refuse — a latch here
+            // would only lose the record of what the tab did.
+            Containment::NoRegistry("records the caller's own events; returns no local data"),
+        ),
+        route(
+            "/activity/contract_drift",
+            "POST",
+            "handle_contract_drift",
+            Containment::NoRegistry("a shim reporting its own broken payload; returns nothing"),
+        ),
+        route(
+            "/permission/event",
+            "POST",
+            "handle_permission_event",
+            Containment::NoRegistry("a hook reporting a permission prompt; returns nothing"),
+        ),
+        route(
+            "/latch/beacon",
+            "POST",
+            "handle_latch_beacon",
+            Containment::RegistryNoGate(
+                "engages the EXTERNAL latch for a harness-native web tool; it can only tighten",
+            ),
+        ),
+        route(
+            "/latch/state",
+            "POST",
+            "handle_latch_state",
+            Containment::RegistryNoGate(
+                "reads this tab's view for the plugin gate; creates nothing",
+            ),
+        ),
+        route(
+            "/mcp/list",
+            "POST",
+            "handle_mcp_list",
+            // Advertisement only. Consumers cache `tools/list` at connect, which
+            // is exactly why the proxy enforces by REFUSAL at `/mcp/call`
+            // instead of by removing defs here (decision 3).
+            Containment::NoRegistry("tool advertisement; enforcement is by refusal at /mcp/call"),
+        ),
+        route(
+            "/mcp/call",
+            "POST",
+            "handle_mcp_call",
+            Containment::GatesRequestTool,
+        ),
+        route(
+            "/describe",
+            "GET",
+            "",
+            Containment::NoRegistry("the proxy's own tool list as text; no project data"),
+        ),
+        route(
+            "/events",
+            "GET",
+            "handle_events",
+            Containment::NoRegistry("the offload service's own event stream"),
+        ),
+        route(
+            "/health",
+            "GET",
+            "",
+            Containment::NoRegistry("a fixed `ok`"),
+        ),
+        route(
+            "/status",
+            "GET",
+            "handle_status",
+            // Reads latch state through `latch_snapshot`, not through the
+            // registry handle — a debug view over cImp's own identifiers, with
+            // no capability behind it.
+            Containment::NoRegistry("a debug view of cImp's own identifiers"),
+        ),
+    ];
+
+    /// Every path the dispatch table routes, sorted and deduped — scanned from
+    /// the source because the `match` is not reachable from a test.
+    fn dispatched_routes(src: &str) -> Vec<&str> {
+        let mut routes: Vec<&str> = Vec::new();
+        for marker in ["(\"POST\", \"", "(\"GET\", \""] {
+            for part in src.split(marker).skip(1) {
+                routes.push(part.split('"').next().expect("a closing quote"));
+            }
+        }
+        routes.sort_unstable();
+        routes.dedup();
+        routes
+    }
+
+    /// The source text of one top-level `async fn`, signature to closing brace,
+    /// with line endings normalised to `\n` (this file is checked out CRLF on
+    /// Windows, and a needle written with `\n` would silently match nothing —
+    /// which for a security assertion means silently passing).
+    ///
+    /// Starts at the SIGNATURE, so a handler's doc comment is deliberately not
+    /// part of it: a route must not be able to claim a gate in prose.
+    fn handler_body(src: &str, name: &str) -> String {
+        let sig = format!("async fn {name}(");
+        let mut out = String::new();
+        let mut inside = false;
+        for line in src.lines() {
+            if !inside {
+                if !line.starts_with(&sig) {
+                    continue;
+                }
+                inside = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            // The closing brace of a top-level item is the only `}` in column 0.
+            if line == "}" {
+                break;
+            }
+        }
+        assert!(!out.is_empty(), "no top-level `async fn {name}`");
+        assert!(
+            out.ends_with("}\n"),
+            "`async fn {name}` was not terminated — the scan would read past it"
+        );
+        out
+    }
+
+    /// **M-7's third clause.** Every route the listener serves declares what it
+    /// does about the taint latch, and the declaration is checked against the
+    /// handler rather than believed.
+    ///
+    /// The four checks, and what each one catches:
+    ///
+    /// 1. Every dispatched path is declared, and every declared path is
+    ///    dispatched — so a new route cannot slip in unclassified.
+    /// 2. A route that claims to gate must actually reach `latches()`. **This
+    ///    is the check that would have failed before this commit** for the
+    ///    three `/context/*` hooks, and it is what stops the classic failure of
+    ///    a gate tested through its helper while the call site is deleted.
+    /// 3. A route that claims NOT to touch the registry must not — so a gate
+    ///    added without a review of what it means to that route also fails.
+    /// 4. A fixed-tool route names a real class-table row, uses that constant
+    ///    in its own body, and the declared "refused under EXTERNAL" answer is
+    ///    computed from [`toolclass`], not restated. Demoting
+    ///    `hook_post_edit` to TRUSTED therefore fails here.
+    #[test]
+    fn every_loopback_route_declares_what_it_does_about_the_latch() {
+        let src = include_str!("loopback.rs");
+
+        // 1. Surface ↔ declaration, both directions.
+        let mut declared: Vec<&str> = ROUTE_CONTAINMENT.iter().map(|r| r.path).collect();
+        declared.sort_unstable();
+        assert_eq!(
+            dispatched_routes(src),
+            declared,
+            "a route is dispatched but undeclared (or the reverse)"
+        );
+
+        for row in ROUTE_CONTAINMENT {
+            // The declared handler really is the one the dispatch routes to.
+            let arm = format!("(\"{}\", \"{}\") =>", row.method, row.path);
+            let arm_at = src
+                .find(&arm)
+                .unwrap_or_else(|| panic!("no dispatch arm for {}", row.path));
+            if !row.handler.is_empty() {
+                assert!(
+                    src[arm_at..].starts_with(&format!("{arm} {}(", row.handler)),
+                    "{} does not dispatch to `{}`",
+                    row.path,
+                    row.handler
+                );
+            }
+            // The two inline arms have no handler to scan; nothing behind them
+            // can gate, which is why they are the only rows allowed to omit one.
+            if row.handler.is_empty() {
+                assert!(
+                    matches!(row.containment, Containment::NoRegistry(_)),
+                    "{} is answered inline, so it cannot be gating anything",
+                    row.path
+                );
+                continue;
+            }
+            let body = handler_body(src, row.handler);
+            let reaches_registry = body.contains("latches()");
+            let gates = body.contains("latches().gate(")
+                || body.contains("hook_admit(\n        latches(),")
+                || body.contains("audit_admit(\n        latches(),");
+
+            match row.containment {
+                Containment::GatesRequestTool => assert!(
+                    gates,
+                    "{} claims to gate but its handler never reaches the latch registry",
+                    row.path
+                ),
+                Containment::GatesFixedTool {
+                    tool,
+                    refused_under_external,
+                } => {
+                    assert!(
+                        gates,
+                        "{} claims to gate but its handler never reaches the latch registry",
+                        row.path
+                    );
+                    assert!(
+                        body.contains(tool_const(tool)),
+                        "{} must gate on `{tool}`'s constant in its own body",
+                        row.path
+                    );
+                    // The security-relevant property, computed rather than
+                    // restated: is a contaminated conversation refused here?
+                    assert_eq!(
+                        Latch::External.blocks(toolclass::classify(tool)),
+                        refused_under_external,
+                        "`{tool}`'s class no longer matches what {} declares",
+                        row.path
+                    );
+                }
+                Containment::RegistryNoGate(why) => {
+                    assert!(
+                        reaches_registry,
+                        "{} claims to reach the registry ({why}) and does not",
+                        row.path
+                    );
+                    assert!(
+                        !gates,
+                        "{} now gates capability — declare it, don't leave it as a state read",
+                        row.path
+                    );
+                }
+                Containment::NoRegistry(why) => assert!(
+                    !reaches_registry,
+                    "{} is declared ungated ({why}) but now reaches the latch registry",
+                    row.path
+                ),
+            }
+        }
+    }
+
+    /// The identifier a hook tool-name constant is written as at the call site.
+    /// The handler bodies use the CONSTANT, not the string, so the check above
+    /// has to look for the same thing a reader would.
+    fn tool_const(tool: &str) -> &'static str {
+        match tool {
+            "hook_post_edit" => "HOOK_TOOL_POST_EDIT",
+            "hook_should_read" => "HOOK_TOOL_SHOULD_READ",
+            "hook_compaction" => "HOOK_TOOL_COMPACTION",
+            other => panic!("no constant known for `{other}`"),
+        }
+    }
+
+    /// **M-7's first clause: an EXTERNAL-latched tab reaches local capability
+    /// through these routes.** Now it does not.
+    ///
+    /// `post_edit` executes the project's configured check commands and
+    /// `should_read` hands back repo source text, so a conversation that has
+    /// ingested untrusted content is refused both. The compaction carry-over is
+    /// admitted, and that is stated here rather than left to be inferred from a
+    /// missing assertion — it is TRUSTED content (paths, symbol names, note
+    /// text) and refusing it would also skip the route's dedup-clear side
+    /// effects.
+    #[test]
+    fn a_contaminated_conversation_is_refused_the_executing_hook_routes() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        // One proxied fetch contaminates the conversation.
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        assert_eq!(reg.snapshot()[0].latch(), "external");
+
+        let admit = |tool: &'static str| {
+            hook_admit(
+                &reg,
+                tool,
+                "claude",
+                Some("claude-1"),
+                |_, _| LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+                |_| ON,
+            )
+        };
+        assert_eq!(
+            admit(HOOK_TOOL_POST_EDIT),
+            Err(REFUSAL_LOCAL_BLOCKED),
+            "a contaminated conversation must not have the project's checks executed for it"
+        );
+        assert_eq!(
+            admit(HOOK_TOOL_SHOULD_READ),
+            Err(REFUSAL_LOCAL_BLOCKED),
+            "…nor be handed repo source text by the read advisor"
+        );
+        assert_eq!(
+            admit(HOOK_TOOL_COMPACTION),
+            Ok(()),
+            "the carry-over is TRUSTED content and stays admitted"
+        );
+        // A refused hook never redefines which side of the boundary the
+        // conversation is on.
+        assert_eq!(reg.snapshot()[0].latch(), "external");
+    }
+
+    /// **A hook may be refused by a latch but must never move one.**
+    ///
+    /// This is what [`LatchRoute::Hook`] exists for, and getting it wrong would
+    /// have been worse than the hole: `post_edit`/`should_read` classify
+    /// LOCAL-CAPABILITY, so gating them on `LatchRoute::Native` would latch
+    /// every tab with the read advisor or auto-check on to `Local` at its first
+    /// read or edit — silently refusing every proxied web/MCP tool for the rest
+    /// of the session, for a choice the model never made.
+    ///
+    /// The `Native` half of the assertion is the control: the same registry,
+    /// the same scope, the same tool name, and it DOES latch — so this test
+    /// cannot pass by the gate having done nothing at all.
+    #[test]
+    fn a_hook_route_reads_the_latch_and_never_engages_it() {
+        let reg = LatchRegistry::default();
+        for tool in [HOOK_TOOL_POST_EDIT, HOOK_TOOL_SHOULD_READ] {
+            assert_eq!(
+                hook_admit(
+                    &reg,
+                    tool,
+                    "claude",
+                    Some("claude-1"),
+                    |_, _| LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+                    |_| ON,
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            reg.snapshot()[0].latch(),
+            "open",
+            "the hooks fired on cImp's own automation — the conversation elected nothing"
+        );
+        // …and the proxied web side is therefore still available, which is the
+        // user-visible fact the previous assertion protects.
+        assert!(reg
+            .gate(
+                Some(&scope("claude-1", Some("sess-a"))),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+
+        // The control: the SAME name on the elective route does latch.
+        let elective = LatchRegistry::default();
+        assert!(elective
+            .gate(
+                Some(&scope("claude-2", Some("sess-b"))),
+                LatchRoute::Native,
+                HOOK_TOOL_POST_EDIT,
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        assert_eq!(elective.snapshot()[0].latch(), "local");
+    }
+
+    /// The residual, pinned so it is a decision and not an accident: a hook POST
+    /// with no usable tab identity resolves no scope and is ADMITTED.
+    ///
+    /// That is the locked fail-open posture of `latch_scope` (a shim from a
+    /// build before `--tab` was baked in must not lose the feature), and it is
+    /// what finding F-5/H-8 tracks. Pinned here so that a future change to it is
+    /// a deliberate edit to this test, and so the residual cannot be read as
+    /// "someone forgot".
+    #[test]
+    fn a_hook_post_without_a_tab_is_admitted_and_keys_nothing() {
+        for scoping in [
+            LatchScoping::Anonymous,
+            LatchScoping::Unknown("ghost".into()),
+        ] {
+            let reg = LatchRegistry::default();
+            // Contaminate a real tab first: the point is that the ungated call
+            // is ungated because it has no identity, not because nothing was
+            // latched anywhere.
+            assert!(reg
+                .gate(
+                    Some(&scope("claude-1", Some("sess-a"))),
+                    LatchRoute::Proxied,
+                    "ddg__fetch_content",
+                    ON,
+                    NO_CONTENT
+                )
+                .is_ok());
+            assert_eq!(
+                hook_admit(
+                    &reg,
+                    HOOK_TOOL_POST_EDIT,
+                    "claude",
+                    None,
+                    |_, _| scoping,
+                    |_| ON,
+                ),
+                Ok(())
+            );
+            // #45's bound: no identity ⇒ no registry row of its own.
+            assert_eq!(
+                reg.snapshot().len(),
+                1,
+                "only the contaminated tab is keyed"
+            );
+        }
+    }
+
+    /// `agent` is caller-asserted and absent on a pre-#48 shim. Absent ⇒
+    /// `claude`, because all three Claude hooks are installed from Claude's own
+    /// settings overlay; `opencode` is the only other answer, and it is the one
+    /// the generated plugin's `post_edit` POST sends.
+    #[test]
+    fn a_hook_bodys_agent_narrows_to_the_two_that_exist() {
+        assert_eq!(hook_agent(None), "claude");
+        assert_eq!(hook_agent(Some("claude")), "claude");
+        assert_eq!(hook_agent(Some("opencode")), "opencode");
+        assert_eq!(hook_agent(Some("OpenCode")), "opencode");
+        // Anything invented lands on `claude` rather than inventing an agent —
+        // `source_for_consumer`'s locked behaviour, shared verbatim with
+        // `/graph_run`'s `consumer`. Padding is NOT trimmed (that narrowing
+        // lives in `audit_consumer`, whose route requires identity); no shim
+        // sends any, and trimming would buy nothing here because `agent` is
+        // caller-asserted either way — F-4 still holds, the (agent, tab) pair
+        // is verified on no route, and this fix neither relies on it nor makes
+        // it worse.
+        assert_eq!(hook_agent(Some("offload")), "claude");
+        assert_eq!(hook_agent(Some(" opencode ")), "claude");
+    }
+
+    /// All three hook bodies still parse without the two new fields — a shim or
+    /// plugin file from an older build must not start failing at the parse
+    /// boundary and lose the feature outright.
+    #[test]
+    fn pre_48_hook_bodies_still_parse_without_tab_or_agent() {
+        let compaction: ContextCompactionBody =
+            serde_json::from_slice(br#"{"cwd":"P:\\p","session_id":"s","trigger":"auto"}"#)
+                .expect("pre-#48 compaction body");
+        assert!(compaction.tab.is_none() && compaction.agent.is_none());
+
+        let read: ShouldReadBody =
+            serde_json::from_slice(br#"{"cwd":"P:\\p","session_id":"s","file_path":"a.rs"}"#)
+                .expect("pre-#48 should_read body");
+        assert!(read.tab.is_none() && read.agent.is_none());
+
+        let edit: ContextPostEditBody = serde_json::from_slice(
+            br#"{"cwd":"P:\\p","session_id":"s","file_path":"a.rs","tool_name":"Edit"}"#,
+        )
+        .expect("pre-#48 post_edit body");
+        assert!(edit.tab.is_none() && edit.agent.is_none());
+
+        // …and the new fields do arrive when sent.
+        let edit: ContextPostEditBody = serde_json::from_slice(
+            br#"{"session_id":"s","file_path":"a.rs","tab":"claude-1","agent":"opencode"}"#,
+        )
+        .expect("post-#48 post_edit body");
+        assert_eq!(edit.tab.as_deref(), Some("claude-1"));
+        assert_eq!(edit.agent.as_deref(), Some("opencode"));
+    }
+
     /// **Neither clear is reachable over HTTP**, which is the invariant the whole
     /// design rests on: a model with a shell that could POST its way to a clear
     /// would defeat every part of this.
@@ -9976,37 +10794,20 @@ mod tests {
         //    listed here; a new one fails this test until someone names it, and
         //    the point of naming it is to notice if it is an override door.
         //    (#45 removed `POST /latch/override` for exactly this reason.)
+        //
+        //    #48 (M-7): the list is no longer a literal here — it is
+        //    [`ROUTE_CONTAINMENT`], which is the same enumeration answering one
+        //    more question per route (does it gate?). ONE list, so a new route
+        //    cannot satisfy one enumeration and be missing from the other.
         let src = include_str!("loopback.rs");
-        let mut routes: Vec<&str> = Vec::new();
-        for marker in ["(\"POST\", \"", "(\"GET\", \""] {
-            for part in src.split(marker).skip(1) {
-                routes.push(part.split('"').next().expect("a closing quote"));
-            }
-        }
-        routes.sort_unstable();
-        routes.dedup();
+        let routes = dispatched_routes(src);
+        let declared: Vec<&str> = {
+            let mut v: Vec<&str> = ROUTE_CONTAINMENT.iter().map(|r| r.path).collect();
+            v.sort_unstable();
+            v
+        };
         assert_eq!(
-            routes,
-            [
-                "/activity/contract_drift",
-                "/audit/run",
-                "/context/compaction",
-                "/context/post_edit",
-                "/context/retrieve",
-                "/context/should_read",
-                "/describe",
-                "/events",
-                "/graph_run",
-                "/health",
-                "/latch/beacon",
-                "/latch/state",
-                "/mcp/call",
-                "/mcp/list",
-                "/memory/event",
-                "/permission/event",
-                "/run",
-                "/status",
-            ],
+            routes, declared,
             "the loopback's HTTP surface changed — is the new route a door onto the \
              latch override or the contamination clear?"
         );

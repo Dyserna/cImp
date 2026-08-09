@@ -230,6 +230,36 @@ pub const TABLE: &[ClassRow] = &[
     // output — they return names, kinds, paths, lines and edges only.
     row("graph_struct_search", ToolClass::LocalCapability, false),
     row("graph_repo_map", ToolClass::LocalCapability, false),
+    // ── The cImp-initiated HOOK routes (#48, finding M-7) ──────────────────
+    //
+    // Not model-callable tools: these three names exist so the `/context/*`
+    // hook routes have something to gate ON
+    // (`offload/loopback.rs::hook_admit`). They are declared HERE, in the one
+    // reviewed place, because the unknown-⇒-EXTERNAL default is not a safe
+    // default for them: they arrive on [`LatchRoute::Hook`], where an EXTERNAL
+    // classification means "typo or hallucination" and is waved through.
+    //
+    // `hook_post_edit` — `POST /context/post_edit` runs the project's
+    // CONFIGURED CHECK COMMANDS (`GraphService::post_edit` →
+    // `checks::RootRunner`). Process execution is the definition of
+    // LOCAL-CAPABILITY under decision 1 — the same sentence that put
+    // `run_check` in this class — and `mutates_fs` mirrors `run_check`'s row
+    // for the same locked reason.
+    row("hook_post_edit", ToolClass::LocalCapability, false),
+    // `hook_should_read` — `POST /context/should_read` answers a `Read` with
+    // the file's outline, its symbol BODY (substitute mode), or a unified DIFF
+    // against what the agent last read. That is repo source text, which is the
+    // line H-1 restated between this class and TRUSTED.
+    //
+    // The counter-argument, RECORDED rather than acted on: the advisor is not
+    // model-callable through any tool surface — it intercepts a read the
+    // harness has already permitted and can only ever return a subset of it,
+    // so a refusal hands the model the whole file instead and buys nothing.
+    // It is classified on what it hands back, not on who may ask for it,
+    // because "the framing is app-composed" is precisely the reasoning the C-1
+    // and H-1 amendments reversed. If that trade is ever judged the wrong way
+    // round, this row — not a route-local exception — is the place to change.
+    row("hook_should_read", ToolClass::LocalCapability, false),
     // ── TRUSTED — structural graph + app-composed reads ────────────────────
     row("graph_find_symbol", ToolClass::Trusted, false),
     row("graph_callers", ToolClass::Trusted, false),
@@ -256,6 +286,20 @@ pub const TABLE: &[ClassRow] = &[
     // mitigations that keep them here are weaker than the structural tools'.
     row("context_recall", ToolClass::Trusted, false),
     row("context_notes", ToolClass::Trusted, false),
+    // The third hook route (#48, finding M-7). `POST /context/compaction`
+    // returns the session's working set — file paths, touch counts and symbol
+    // NAMES — plus that session's memory notes. That is exactly the union of
+    // two rows already in this class (`graph_outline`'s "names, kinds, paths,
+    // lines" and `context_notes`' note text) and no source text, so it is
+    // classified with them and inherits the memory reads' RECORDED RESIDUAL —
+    // see the module docs' TRUSTED paragraph. Quarantined notes are already
+    // excluded from this carry-over (V32 Phase C2 / #48 finding M-1).
+    //
+    // TRUSTED means the gate on that route admits every call today. It is
+    // still gated, so that demoting this row is all it takes to close the
+    // route — but note that a refusal there also skips the route's dedup-clear
+    // side effects, so a demotion must split those out first.
+    row("hook_compaction", ToolClass::Trusted, false),
     // ── PERSISTENT-WRITE ───────────────────────────────────────────────────
     row("context_note", ToolClass::PersistentWrite, false),
     // ── Harness-native tools — classified, NOT enforced ─────────────────────
@@ -780,6 +824,13 @@ mod tests {
             // first-source-line signatures to a 200k-clamped budget.
             "graph_struct_search",
             "graph_repo_map",
+            // #48, finding M-7: the two cImp-initiated hook routes that reach
+            // local capability — `/context/post_edit` executes the configured
+            // check commands, `/context/should_read` hands back source text.
+            // Left unclassified they would be EXTERNAL, which on
+            // `LatchRoute::Hook` means "waved through".
+            "hook_post_edit",
+            "hook_should_read",
         ] {
             assert_eq!(classify(n), ToolClass::LocalCapability, "{n}");
         }
@@ -802,6 +853,7 @@ mod tests {
             "graph_architecture",
             "context_recall",
             "context_notes",
+            "hook_compaction",
         ] {
             assert_eq!(classify(n), ToolClass::Trusted, "{n}");
         }
@@ -809,12 +861,14 @@ mod tests {
         // class that never latches and is never blocked has to change this
         // count, which is the review step the C-1/C-1c/H-1 findings needed.
         //
-        // 16 since the H-1 demotion (2026-08-08): 14 graph tools —
-        // find_symbol, callers, callees, references, imports, outline,
-        // transitive, impact, tests_for, recent_changes, dead_exports, cycles,
-        // path, architecture — plus the two memory reads. Counted against the
-        // table below rather than against the list above, so dropping a name
-        // from BOTH lists cannot pass silently.
+        // 17 since #48's M-7 fix: 14 graph tools — find_symbol, callers,
+        // callees, references, imports, outline, transitive, impact, tests_for,
+        // recent_changes, dead_exports, cycles, path, architecture — plus the
+        // two memory reads, plus `hook_compaction` (the compaction carry-over,
+        // whose content is the union of `graph_outline`'s and `context_notes`'
+        // — see its row). Counted against the table below rather than against
+        // the list above, so dropping a name from BOTH lists cannot pass
+        // silently.
         let trusted: Vec<&str> = TABLE
             .iter()
             .filter(|r| r.class == ToolClass::Trusted)
@@ -822,7 +876,7 @@ mod tests {
             .collect();
         assert_eq!(
             trusted.len(),
-            16,
+            17,
             "TRUSTED membership changed — re-read the module docs' membership rule: {trusted:?}"
         );
         // H-1: the two demoted names are the ones a regression would put back,

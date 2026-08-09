@@ -29,7 +29,7 @@
 
 use std::io::{Read, Write};
 
-use crate::context_hook::post_loopback;
+use crate::context_hook::{post_loopback, tab_arg};
 
 pub fn run() {
     let mut input = String::new();
@@ -71,6 +71,13 @@ pub fn run() {
         "session_id": session_id,
         "file_path": file_path,
         "tool_name": tool_name,
+        // #48 (M-7): the identity the route's taint gate resolves a latch scope
+        // from. This route EXECUTES the project's configured checks, so it is
+        // the one the finding is really about — baked into argv at spawn, like
+        // `--context-hook`'s. `null` without it, which the route admits (the
+        // pre-#48 behaviour).
+        "agent": "claude",
+        "tab": tab_arg(&std::env::args().skip(1).collect::<Vec<_>>()),
     })
     .to_string();
 

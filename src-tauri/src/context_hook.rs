@@ -200,3 +200,48 @@ fn post_context(port: u16, token: &str, path: &str, body: &str) -> Option<String
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    /// #48 (M-7): **every hook shim that POSTs to a gated `/context/*` route
+    /// puts its baked tab id in the body.**
+    ///
+    /// Baking `--tab` into argv (`tabs::config`) and parsing it ([`tab_arg`])
+    /// are both already pinned; this is the link between them — the one that,
+    /// if dropped, leaves the flag on the command line, the parser in place,
+    /// and the route resolving no scope at all. The three routes then admit
+    /// everything and every test above still passes.
+    ///
+    /// A source scan, because a shim's `run()` reads stdin and opens a socket
+    /// and this crate cannot drive either. It is scoped to the `json!` body of
+    /// each shim so a `tab_arg` call anywhere else in the file cannot satisfy
+    /// it.
+    #[test]
+    fn every_hook_shim_puts_its_tab_in_the_body_it_posts() {
+        for (shim, src) in [
+            ("--context-hook", include_str!("context_hook.rs")),
+            ("--precompact-hook", include_str!("compact_hook.rs")),
+            ("--read-hook", include_str!("read_hook.rs")),
+            ("--postedit-hook", include_str!("postedit_hook.rs")),
+        ] {
+            let start = src
+                .find("let body = serde_json::json!({")
+                .unwrap_or_else(|| panic!("{shim}: no POST body"));
+            let end = src[start..]
+                .find("})\n    .to_string();")
+                .or_else(|| src[start..].find("})\r\n    .to_string();"))
+                .map(|e| start + e)
+                .unwrap_or_else(|| panic!("{shim}: the body is not terminated"));
+            let body = &src[start..end];
+            assert!(
+                body.contains("\"tab\": tab_arg("),
+                "{shim} must send the tab it was spawned for: {body}"
+            );
+            assert!(
+                body.contains("\"agent\": \"claude\""),
+                "{shim} must say which harness it is, or the scope is keyed \
+                 under the wrong agent: {body}"
+            );
+        }
+    }
+}

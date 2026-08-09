@@ -657,10 +657,14 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
                 && settings.graph.compaction_context
             {
                 if let Some(command) = crate::statusline::hook_command("--precompact-hook") {
+                    // #48 (M-7): `--tab` for the same reason `--context-hook`'s
+                    // is baked in — the payload names no cImp tab, and
+                    // `/context/compaction`'s taint gate has no scope to
+                    // resolve without one.
                     hooks.insert(
                         "PreCompact".to_string(),
                         serde_json::json!([ { "hooks": [
-                            { "type": "command", "command": command, "timeout": 5 }
+                            { "type": "command", "command": format!("{command} --tab {tab}"), "timeout": 5 }
                         ] } ]),
                     );
                 }
@@ -681,6 +685,11 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
                 && !settings.harness_versions.e1_blocked()
             {
                 if let Some(command) = crate::statusline::hook_command("--read-hook") {
+                    // #48 (M-7): `--tab` baked in, as on every other hook —
+                    // `/context/should_read`'s taint gate needs a scope, and
+                    // BOTH matchers below reach the same route, so it rides the
+                    // shared command string rather than being added twice.
+                    let command = format!("{command} --tab {tab}");
                     pre_tool_use.push(serde_json::json!({
                         "matcher": "Read",
                         "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
@@ -760,10 +769,13 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             // (nothing to run otherwise). Matches the edit-class tools.
             if settings.graph.enabled && settings.graph.auto_check && !settings.checks.is_empty() {
                 if let Some(command) = crate::statusline::hook_command("--postedit-hook") {
+                    // #48 (M-7): `--tab` baked in. This is the hook whose route
+                    // EXECUTES the project's configured checks, so it is the
+                    // one whose taint gate most needs a scope to resolve.
                     hooks.insert(
                         "PostToolUse".to_string(),
                         serde_json::json!([ { "matcher": "Edit|Write|MultiEdit", "hooks": [
-                            { "type": "command", "command": command, "timeout": 5 }
+                            { "type": "command", "command": format!("{command} --tab {tab}"), "timeout": 5 }
                         ] } ]),
                     );
                 }
@@ -1853,6 +1865,11 @@ export default async (input) => ({{
           session_id: inp.sessionID,
           file_path: filePath,
           tool_name: inp.tool,
+          // #48 (M-7): the identity `/context/post_edit`'s taint gate resolves
+          // a latch scope from. This route executes the project's configured
+          // checks; without a tab it resolves no scope and is ungated.
+          agent: "opencode",
+          tab: CIMP_TAB_ID,
         }}),
         signal: AbortSignal.timeout(600),
       }}).catch((_e) => {{}});
@@ -2488,7 +2505,9 @@ mod tests {
         let cmd = overlay["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
             .as_str()
             .expect("hook command is a string");
-        assert!(cmd.ends_with(" --read-hook"), "got: {cmd}");
+        // #48 (M-7) appended ` --tab <id>`; the flag itself is pinned by
+        // `every_context_hook_carries_the_tab_its_route_gates_on`.
+        assert!(cmd.contains(" --read-hook "), "got: {cmd}");
         assert_eq!(overlay["hooks"]["PreToolUse"][0]["matcher"], "Read");
 
         // E1 recorded as failed ⇒ no PreToolUse hook even with the toggle on.
@@ -2663,7 +2682,97 @@ mod tests {
         let cmd = hook["hooks"][0]["command"]
             .as_str()
             .expect("hook command is a string");
-        assert!(cmd.ends_with(" --postedit-hook"), "got: {cmd}");
+        // #48 (M-7) appended ` --tab <id>`; the flag itself is pinned by
+        // `every_context_hook_carries_the_tab_its_route_gates_on`.
+        assert!(cmd.contains(" --postedit-hook "), "got: {cmd}");
+    }
+
+    /// #48 (M-7): **every** shim whose loopback route now resolves a taint
+    /// scope carries the cImp TAB it serves in argv.
+    ///
+    /// `--context-hook` already did (V33). `--precompact-hook`, `--read-hook`
+    /// and `--postedit-hook` did not, which is why `/context/compaction`,
+    /// `/context/should_read` and `/context/post_edit` had no identity to gate
+    /// against — the second half of the finding. A hook payload names no cImp
+    /// tab (the E2 spike), so argv is the only channel.
+    ///
+    /// **What this would still pass with:** a build that baked one constant id
+    /// into every tab's commands — hence the two ids and the inequality
+    /// assertion, the same guard `the_context_hook_carries_its_own_tab_id` uses.
+    /// And a build that baked the flag into only SOME of the four hooks —
+    /// hence all four in one loop rather than one assertion per test.
+    #[test]
+    fn every_context_hook_carries_the_tab_its_route_gates_on() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = false;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        settings.graph.compaction_context = true;
+        settings.graph.read_advisor = true;
+        settings.graph.read_advisor_shell = true;
+        settings.graph.auto_check = true;
+        settings.checks = vec![crate::checks::CheckDef {
+            name: "cargo".to_string(),
+            cmd: "cargo check".to_string(),
+            ..Default::default()
+        }];
+        // Keep the sensor beacon out of `PreToolUse` so the entries below are
+        // the read advisor's two matchers and nothing else.
+        settings.set_native_web_mode_for_test(NativeWebVisibility::Off);
+
+        // Every hook command the overlay installs, flattened across events and
+        // matchers — so a hook that stops being installed at all fails the
+        // count below rather than silently passing the loop.
+        let commands = |tab: &str| -> Vec<String> {
+            let args = build_pre_args(&claude_cfg(), &settings, tab);
+            let overlay = settings_overlay(&args).expect("overlay present");
+            let hooks = overlay["hooks"].clone();
+            let mut out = Vec::new();
+            for event in [
+                "UserPromptSubmit",
+                "PreCompact",
+                "PreToolUse",
+                "PostToolUse",
+            ] {
+                let entries = hooks[event].as_array().cloned().unwrap_or_default();
+                for entry in entries {
+                    for h in entry["hooks"].as_array().cloned().unwrap_or_default() {
+                        out.push(h["command"].as_str().unwrap_or_default().to_string());
+                    }
+                }
+            }
+            out
+        };
+
+        for tab in ["claude", "claude-local"] {
+            let cmds = commands(tab);
+            for shim in [
+                "--context-hook",
+                "--precompact-hook",
+                "--read-hook",
+                "--postedit-hook",
+            ] {
+                // Matched WITHOUT a trailing space, so a command that has lost
+                // its `--tab` suffix is still found and fails on the assertion
+                // that names the real problem rather than on "not installed".
+                let hits: Vec<&String> = cmds
+                    .iter()
+                    .filter(|c| c.contains(&format!(" {shim}")))
+                    .collect();
+                assert!(!hits.is_empty(), "{shim} is not installed at all: {cmds:?}");
+                for cmd in hits {
+                    assert!(
+                        cmd.ends_with(&format!(" --tab {tab}")),
+                        "{shim} must carry its tab, got: {cmd}"
+                    );
+                }
+            }
+        }
+        assert_ne!(
+            commands("claude"),
+            commands("claude-local"),
+            "two tabs must not spawn identical hook commands"
+        );
     }
 
     #[test]
@@ -3116,6 +3225,41 @@ mod tests {
         assert!(
             retrieve_pos < body_pos,
             "the tab id must ride the /context/retrieve body"
+        );
+    }
+
+    /// #48 (M-7): the OpenCode side of the post-edit identity. `post_edit` is
+    /// the route that EXECUTES the project's configured checks, and the plugin
+    /// is its second caller — so its body has to carry the same `CIMP_TAB_ID`
+    /// the beacon and the native gate already use, or the route resolves no
+    /// scope and the gate is inert for every OpenCode tab.
+    ///
+    /// **What this would still pass with:** a bare `js.contains("tab:
+    /// CIMP_TAB_ID")` — there are four such bodies in this file now. So the
+    /// search is scoped to the text between the `/context/post_edit` URL and
+    /// the end of its `fetch(...)` call.
+    #[test]
+    fn opencode_post_edit_posts_its_own_tab_id() {
+        let js = opencode_plugin_source(1, "x", "opencode-2", ALL_ON);
+        let start = js
+            .find("/context/post_edit")
+            .expect("post_edit POST present");
+        let end = js[start..]
+            .find("signal: AbortSignal")
+            .map(|e| start + e)
+            .expect("the fetch options end the call");
+        let body = &js[start..end];
+        assert!(
+            body.contains("tab: CIMP_TAB_ID"),
+            "the post_edit POST must carry this tab's id: {body}"
+        );
+        assert!(
+            body.contains(r#"agent: "opencode""#),
+            "…and say which harness it is, so the scope is keyed under the right agent: {body}"
+        );
+        assert!(
+            js.contains(r#"const CIMP_TAB_ID = "opencode-2""#),
+            "CIMP_TAB_ID must come from the generator's tab argument: {js}"
         );
     }
 

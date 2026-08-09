@@ -20,7 +20,9 @@
 
 use std::io::{Read, Write};
 
-use crate::context_hook::{missing_fields, post_loopback, report_contract_drift, resolve_cwd};
+use crate::context_hook::{
+    missing_fields, post_loopback, report_contract_drift, resolve_cwd, tab_arg,
+};
 
 pub fn run() {
     let mut input = String::new();
@@ -51,6 +53,14 @@ pub fn run() {
         "cwd": cwd,
         "session_id": session_id,
         "trigger": trigger,
+        // #48 (M-7): the identity the route's taint gate resolves a latch scope
+        // from. A `PreCompact` payload carries `session_id` and `cwd` and
+        // nothing that names a cImp tab (the E2 spike's finding), so the tab id
+        // is baked into argv at spawn — exactly like `--context-hook`'s and
+        // `--taint-beacon`'s. `null` without it: the route then resolves no
+        // scope and admits the call, which is the pre-#48 behaviour.
+        "agent": "claude",
+        "tab": tab_arg(&std::env::args().skip(1).collect::<Vec<_>>()),
     })
     .to_string();
 

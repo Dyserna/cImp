@@ -346,6 +346,17 @@ wired in `main.rs`:
 
 All of them are dependency-light, synchronous, and fail open (print nothing,
 exit 0) on any error — a hook must never block or perturb the agent's turn.
+
+**Every `/context/*` shim carries `--tab <id>`** (#48, finding M-7), baked into
+argv at spawn by `tabs/config.rs` — a Claude hook payload names `session_id`
+and `cwd` and nothing that identifies a cImp tab, and the four `/context/*`
+routes need a tab to resolve the V32 taint latch scope against. Three of those
+routes (`compaction`, `should_read`, `post_edit`) gate on it: under an EXTERNAL
+latch `post_edit` will not run the project's configured checks and
+`should_read` will not return source text, each answering with its own
+fail-safe rather than an error. A shim from an older build sends no `tab`,
+resolves no scope, and is admitted — the same locked fail-open every
+tool-serving loopback route takes.
 `tabs/config.rs` adds the `PreCompact` hook to the Claude settings overlay
 whenever `context_injection && compaction_context`, and the `PreToolUse` hook
 whenever `context_injection && read_advisor` (independent toggles — a project

@@ -23,7 +23,9 @@
 
 use std::io::{Read, Write};
 
-use crate::context_hook::{missing_fields, post_loopback, report_contract_drift, resolve_cwd};
+use crate::context_hook::{
+    missing_fields, post_loopback, report_contract_drift, resolve_cwd, tab_arg,
+};
 
 pub fn run() {
     let mut input = String::new();
@@ -75,6 +77,11 @@ pub fn run() {
         "file_path": reqst.file_path,
         "offset": reqst.offset,
         "limit": reqst.limit,
+        // #48 (M-7): the identity the route's taint gate resolves a latch scope
+        // from — baked into argv at spawn, like `--context-hook`'s. `null`
+        // without it, which the route admits (the pre-#48 behaviour).
+        "agent": "claude",
+        "tab": tab_arg(&std::env::args().skip(1).collect::<Vec<_>>()),
     })
     .to_string();
 

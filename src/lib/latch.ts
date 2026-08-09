@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { writable, derived, type Readable } from 'svelte/store';
 import type { TabId } from './tabs/types';
-import { fetchDetectionStatus } from './offload';
+import { fetchDetectionStatus, rulesHealth, type RulesHealth } from './offload';
 
 /// V32 Phase F (locked decisions 14 + 15): the per-tab taint-latch state that
 /// drives the tab-chrome badge and its override popover.
@@ -119,6 +119,18 @@ export interface FeatureState {
   /// `effective` alone collapses the third state back into the second, which is
   /// the same family of bug one layer down.
   unknown?: boolean;
+  /// This row's subject is PARTLY live — on, matching, and missing part of what
+  /// it should be matching with (#48, M-25).
+  ///
+  /// Absent on every backend row for the same reason `unknown` is: a setting is
+  /// on or off. Present only on the frontend-composed signature row, whose
+  /// subject is a directory of files that can fail one at a time.
+  ///
+  /// `effective` is `false` here too — a rule set with 3 of its 4 files failing
+  /// is not intact protection and nothing may render it as such — but it is not
+  /// the inert layer and nobody switched it off, so it is a fourth sentence and
+  /// every surface below phrases it as one.
+  partial?: boolean;
 }
 
 /// One scope's rows. `scope` is `app`, `offload-worker`, or a tab id.
@@ -259,6 +271,12 @@ export interface ReducedCounts {
   /// and a surface that says the first when it means the second is the defect
   /// this counter exists to make impossible.
   unreadable: number;
+  /// Rows that are on and working with only part of what they need (#48,
+  /// M-25). Its own bucket for the reason `unreadable` is one: counting a rule
+  /// set that lost 3 of 4 files as `inert` would tell the user the layer is
+  /// doing nothing when it is doing some of it, and counting it as `switched`
+  /// would send them to a control nobody touched.
+  partial: number;
 }
 
 /// [`reducedSummary`]'s counts, for surfaces that must BRANCH on the shape of
@@ -268,23 +286,32 @@ export function reducedCounts(status: InjectionStatus | null): ReducedCounts {
   const switched = new Set<string>();
   const inert = new Set<string>();
   const unreadable = new Set<string>();
+  const partial = new Set<string>();
   for (const scope of status?.scopes ?? []) {
     for (const f of scope.features) {
       if (!isReducedRow(f)) continue;
-      (f.unknown ? unreadable : f.reason ? inert : switched).add(f.feature);
+      (f.unknown ? unreadable : f.partial ? partial : f.reason ? inert : switched).add(f.feature);
     }
   }
-  return { switched: switched.size, inert: inert.size, unreadable: unreadable.size };
+  return {
+    switched: switched.size,
+    inert: inert.size,
+    unreadable: unreadable.size,
+    partial: partial.size,
+  };
 }
 
 export function reducedSummary(status: InjectionStatus | null): string {
-  const { switched, inert, unreadable } = reducedCounts(status);
+  const { switched, inert, unreadable, partial } = reducedCounts(status);
   const parts: string[] = [];
   if (switched > 0) {
     parts.push(`${switched} control${switched === 1 ? '' : 's'} switched off`);
   }
   if (inert > 0) {
     parts.push(`${inert} layer${inert === 1 ? '' : 's'} switched on but inert`);
+  }
+  if (partial > 0) {
+    parts.push(`${partial} layer${partial === 1 ? '' : 's'} only partly loaded`);
   }
   if (unreadable > 0) {
     parts.push(`${unreadable} layer${unreadable === 1 ? '' : 's'} whose state could not be read`);
@@ -348,7 +375,12 @@ export function injectionChipState(
     };
   }
   const unreadable = counts.unreadable > 0;
-  const onlyUnreadable = unreadable && counts.switched === 0 && counts.inert === 0;
+  // A partly-loaded layer is a thing we DID read and that IS reduced, so it
+  // keeps the chip on the confident word (#48, M-25) — `unverified` is reserved
+  // for "nobody could tell", and reaching it with a known partial set would
+  // understate a real loss of coverage.
+  const onlyUnreadable =
+    unreadable && counts.switched === 0 && counts.inert === 0 && counts.partial === 0;
   return {
     visible,
     label: onlyUnreadable ? 'unverified' : 'reduced',
@@ -362,22 +394,30 @@ export function injectionChipState(
 }
 
 /// How one reduced row reads in a list: `off` for a switch, `unknown` for a
-/// state nobody could read. The popover and the tab tooltip both call it, so
-/// they cannot describe the same row differently (#48, H-10 / G-2).
-export function featureStateWord(f: FeatureState): 'off' | 'unknown' {
-  return f.unknown ? 'unknown' : 'off';
+/// state nobody could read, `partial` for a layer running on part of what it
+/// needs (#48, M-25). The popover and the tab tooltip both call it, so they
+/// cannot describe the same row differently (#48, H-10 / G-2).
+export function featureStateWord(f: FeatureState): 'off' | 'unknown' | 'partial' {
+  return f.unknown ? 'unknown' : f.partial ? 'partial' : 'off';
 }
 
 /// The tab badge's tooltip sentence for its reduced rows.
 ///
-/// Two sentences rather than one list, because the old single sentence ended in
-/// the word "off" and would have said it of a row whose state we failed to read.
+/// One sentence per KIND of claim, because the old single sentence ended in the
+/// word "off" and would have said it of a row whose state we failed to read
+/// (#48, H-10) — and, later, of one that is running on a partial rule set (#48,
+/// M-25). Neither is off, and a tooltip that says so points the user at a
+/// switch instead of at the files.
 export function reducedTabLine(reduced: FeatureState[]): string {
-  const off = reduced.filter((f) => !f.unknown).map((f) => f.label);
+  const off = reduced.filter((f) => !f.unknown && !f.partial).map((f) => f.label);
+  const partial = reduced.filter((f) => !f.unknown && f.partial).map((f) => f.label);
   const unreadable = reduced.filter((f) => f.unknown).map((f) => f.label);
   const parts: string[] = [];
   if (off.length > 0) {
     parts.push(`Injection protection reduced for this tab: ${off.join(', ')} off.`);
+  }
+  if (partial.length > 0) {
+    parts.push(`Running on only part of what it needs: ${partial.join(', ')}.`);
   }
   if (unreadable.length > 0) {
     parts.push(`cImp could not read the state of: ${unreadable.join(', ')}.`);
@@ -399,7 +439,10 @@ export const SIGNATURE_RULES_FEATURE = 'signature_rules_live';
 /// What one poll knows about the signature layer — THREE outcomes, spelled out
 /// because two of them used to share a `null` (#48, H-10).
 ///
-/// - `{ armed }` — we read it. `true` is the only value that renders protected.
+/// - [`RulesHealth`] — we read it. `healthy` is the only field that renders
+///   protected (#48, M-25); `armed` answers the weaker question "can it match
+///   anything at all?" and this union used to carry nothing else, so a rule
+///   directory with 3 of 4 files failing rendered as full protection.
 /// - `'unknown'` — we could not read it, for long enough to say so
 ///   ([`UNKNOWN_AFTER_FAILURES`] consecutive failures). Renders as its own state,
 ///   never as armed and never as "switched off".
@@ -412,7 +455,11 @@ export const SIGNATURE_RULES_FEATURE = 'signature_rules_live';
 /// failure and by "nothing to add", so a broken `detection_status` rendered the
 /// signature layer as fully armed indefinitely. Anything that wants the
 /// pass-through has to type the word `'pending'` and mean it.
-export type SignatureHealth = { armed: boolean } | 'unknown' | 'pending';
+///
+/// The read arm carries the backend's whole verdict rather than one boolean
+/// this side picked, for the same reason: a member of the union that is not on
+/// it cannot be branched on by mistake, and `rules.armed` was the wrong member.
+export type SignatureHealth = RulesHealth | 'unknown' | 'pending';
 
 /// One tick's detection read, folded into the running health.
 ///
@@ -438,7 +485,7 @@ export type SignatureHealth = { armed: boolean } | 'unknown' | 'pending';
 export interface SignatureRead {
   health: PollHealth;
   /// The last reading that actually landed, or `null` before the first one.
-  last: { armed: boolean } | null;
+  last: RulesHealth | null;
   /// What [`withSignatureHealth`] should be told this tick.
   rules: SignatureHealth;
 }
@@ -454,7 +501,7 @@ export const SIGNATURE_UNREAD: SignatureRead = {
 /// IPC call FAILED — the one thing the old code could not say.
 export function recordSignatureRead(
   prev: SignatureRead,
-  read: { armed: boolean } | null,
+  read: RulesHealth | null,
 ): SignatureRead {
   if (read) return { health: recordPoll(prev.health, true), last: read, rules: read };
   const health = recordPoll(prev.health, false);
@@ -486,6 +533,17 @@ export function recordSignatureRead(
 /// flag is what makes the surfaces speak at all and silence is the one rendering
 /// an unreadable state must never get.
 ///
+/// **And why it now takes four (#48, M-25).** The pass-through was gated on
+/// `armed` — "can this rule set match anything at all?" — where the question
+/// being asked is "is the rule set on disk live?", which is `healthy`. A
+/// directory of 4 rule files with 3 failing to compile is `armed` and not
+/// `healthy`: it matches with a quarter of the signatures the user believes are
+/// running, and every surface here rendered it as full protection. That is the
+/// H-10 family of bug in its worst direction — not a missing indicator but a
+/// confident, wrong one — so `healthy` is the gate, and the partial case gets
+/// its own `partial` flag rather than borrowing the disarmed row's sentence
+/// ("compiled to no usable rules", which would be false of it).
+///
 /// Added **only to scopes where the detection feature both applies and
 /// resolves on**: a scope that never screens, or one the user switched off, is
 /// not reduced by a rules directory it does not read — and is not made
@@ -497,13 +555,37 @@ export function withSignatureHealth(
 ): InjectionStatus | null {
   if (!status || rules === 'pending') return status;
   const unreadable = rules === 'unknown';
-  if (!unreadable && rules.armed) return status;
+  // `healthy`, never `armed` and never a local restatement of it: the backend
+  // owns this predicate (#48, N-3 / M-25) and `offload.ts::rulesHealth` is the
+  // only place it is read.
+  if (!unreadable && rules.healthy) return status;
+  // Read, matching, and incomplete — the fourth state. `armed` earns its keep
+  // only here, once `healthy` has already said the set is not whole.
+  const partial = !unreadable && rules.armed;
+  let reason: string;
+  if (unreadable) {
+    reason = 'cImp could not read the detection layer’s status';
+  } else if (!partial) {
+    reason = 'the rules directory compiled to no usable rules';
+  } else if (rules.files_failed > 0) {
+    const n = rules.files_failed;
+    reason = `${n} rule file${n === 1 ? '' : 's'} failed to compile — those signatures are not matching`;
+  } else {
+    // `healthy` is the backend's to define and this side must not argue with
+    // it: if it ever says "armed but not whole" for a reason the file counts do
+    // not show, say the true general thing rather than invent a number.
+    reason = 'part of the rule set on disk is not live';
+  }
   const row: FeatureState = {
     feature: SIGNATURE_RULES_FEATURE,
     label: 'Signature rules loaded',
     // Nothing may claim the layer is working. When the state is UNREADABLE this
     // is "we cannot say it is on", not "it is off" — `unknown` below carries
-    // that distinction, and every surface renders the two differently.
+    // that distinction, and every surface renders the two differently. When it
+    // is PARTIAL it is "not all of it is working": still not something any
+    // surface may render as protection, which is why this stays `false` (it is
+    // also what keeps the row inside `isReducedRow` and therefore visible at
+    // all), with `partial` carrying the difference.
     effective: false,
     decided_by: 'feature',
     override_value: 'inherit',
@@ -514,9 +596,8 @@ export function withSignatureHealth(
     // directory, not a switch. It never reaches the Settings matrix.
     spawn_baked: false,
     unknown: unreadable,
-    reason: unreadable
-      ? 'cImp could not read the detection layer’s status'
-      : 'the rules directory compiled to no usable rules',
+    partial,
+    reason,
   };
   let anywhere = false;
   const scopes = status.scopes.map((s) => {
@@ -614,9 +695,15 @@ export function startLatchPolling(): () => void {
       // as long as the app ran. Caught HERE rather than left to the outer
       // `catch`, because the hierarchy the backend just handed us is still good
       // and still wants publishing — with the uncertainty attached to it.
-      let read: { armed: boolean } | null = null;
+      //
+      // #48/M-25: through `rulesHealth`, which is the only reader of the rule
+      // fields. This line used to lift `rules.armed` out of the status by hand
+      // — the weaker predicate, three lines under the comment saying `healthy`
+      // is the one to read — so a partly-broken rules directory reached every
+      // surface as "armed" and every surface believed it.
+      let read: RulesHealth | null = null;
       try {
-        read = { armed: (await fetchDetectionStatus()).rules.armed };
+        read = rulesHealth(await fetchDetectionStatus());
       } catch (e) {
         console.warn(
           `detection_status poll failed (${signature.health.failures + 1} in a row)`,

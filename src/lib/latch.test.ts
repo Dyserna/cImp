@@ -18,7 +18,18 @@ import {
   type FeatureState,
   type InjectionStatus,
 } from './latch';
+import type { RulesHealth } from './offload';
 import type { TabId } from './tabs/types';
+
+/// The three readings the backend can hand us, named (#48, M-25).
+///
+/// `PARTIAL` is the finding: a rules directory of four files where three fail
+/// to compile is `armed` — one file loaded, rules > 0, `scan` matches with a
+/// quarter of the signatures — and NOT `healthy`. Branching on `armed` rendered
+/// it as full protection.
+const LIVE: RulesHealth = { armed: true, healthy: true, files_failed: 0 };
+const PARTIAL: RulesHealth = { armed: true, healthy: false, files_failed: 3 };
+const INERT: RulesHealth = { armed: false, healthy: false, files_failed: 0 };
 
 /// V32 Phase G/H — the tab badge's "what is switched off here?" filter.
 ///
@@ -138,13 +149,11 @@ describe('reducedSummary', () => {
         feature({ feature: 'detection', label: 'Injection detection' }),
         feature({ feature: 'taint_latch', effective: false }),
       ]),
-      { armed: false },
+      INERT,
     );
     expect(reducedSummary(s)).toBe('1 control switched off, 1 layer switched on but inert');
     // …and on its own it never claims a switch was flipped.
-    const only = withSignatureHealth(status([feature({ feature: 'detection' })]), {
-      armed: false,
-    });
+    const only = withSignatureHealth(status([feature({ feature: 'detection' })]), INERT);
     expect(reducedSummary(only)).toBe('1 layer switched on but inert');
   });
 
@@ -202,7 +211,7 @@ describe('withSignatureHealth', () => {
     feature({ feature: 'detection', label: 'Injection detection', ...over });
 
   it('adds a reduced row where detection applies and is on, and raises `reduced`', () => {
-    const s = withSignatureHealth(status([detection()]), { armed: false });
+    const s = withSignatureHealth(status([detection()]), INERT);
     expect(s?.reduced).toBe(true);
     const rows = reducedFeaturesFor(s, TAB);
     expect(rows.map((f) => f.feature)).toEqual([SIGNATURE_RULES_FEATURE]);
@@ -211,23 +220,54 @@ describe('withSignatureHealth', () => {
     expect(rows[0].reason).toContain('no usable rules');
   });
 
-  it('says nothing when the layer is armed', () => {
-    const s = withSignatureHealth(status([detection()]), { armed: true });
+  /// #48, M-25 — THE REWRITTEN TEST.
+  ///
+  /// This read `withSignatureHealth(status([detection()]), { armed: true })` and
+  /// was titled "says nothing when the layer is armed". It pinned the defect:
+  /// `armed` is the weaker predicate ("can this match ANYTHING?") and the
+  /// question these surfaces ask is `healthy` ("is the rule set on disk live?"),
+  /// so the test asserted silence for a state that includes a rules directory
+  /// three quarters of which failed to compile — tested, green, and rendering
+  /// full protection over a quarter of the signatures.
+  it('says nothing only when the WHOLE rule set on disk is live', () => {
+    const s = withSignatureHealth(status([detection()]), LIVE);
     expect(s?.reduced).toBe(false);
     expect(reducedFeaturesFor(s, TAB)).toEqual([]);
+    expect(injectionChipState(s, false).visible).toBe(false);
+  });
+
+  /// The finding itself, phrased as the user sees it.
+  it('renders 3 of 4 rule files failing as REDUCED, not as full protection', () => {
+    const s = withSignatureHealth(status([detection()]), PARTIAL);
+    // Silence is what full protection looks like here, and this state is not it.
+    expect(s?.reduced).toBe(true);
+    expect(injectionChipState(s, false).visible).toBe(true);
+    const rows = reducedFeaturesFor(s, TAB);
+    expect(rows.map((f) => f.feature)).toEqual([SIGNATURE_RULES_FEATURE]);
+    // Nothing anywhere may claim the layer is intact…
+    expect(rows[0].effective).toBe(false);
+    // …and the row says how much of it is missing, in files the user can open.
+    expect(rows[0].reason).toContain('3 rule files failed to compile');
+    // The disarmed row's sentence would be false of this one: it IS matching.
+    expect(rows[0].reason).not.toContain('no usable rules');
   });
 
   it('says nothing for a scope where detection is switched off or does not apply', () => {
     for (const off of [detection({ effective: false }), detection({ in_scope: false })]) {
-      const s = withSignatureHealth(status([off]), { armed: false });
-      expect(
-        reducedFeaturesFor(s, TAB).some((f) => f.feature === SIGNATURE_RULES_FEATURE),
-      ).toBe(false);
+      for (const read of [INERT, PARTIAL]) {
+        const s = withSignatureHealth(status([off]), read);
+        expect(
+          reducedFeaturesFor(s, TAB).some((f) => f.feature === SIGNATURE_RULES_FEATURE),
+        ).toBe(false);
+      }
     }
     // …and a scope that switched detection off is not "reduced" by a rules
     // directory it never reads, so the chip stays silent too.
-    const s = withSignatureHealth(status([detection({ effective: false })]), { armed: false });
+    const s = withSignatureHealth(status([detection({ effective: false })]), INERT);
     expect(s?.reduced).toBe(false);
+    expect(withSignatureHealth(status([detection({ effective: false })]), PARTIAL)?.reduced).toBe(
+      false,
+    );
   });
 
   it('passes the backend status through untouched before the first reading lands', () => {
@@ -237,7 +277,7 @@ describe('withSignatureHealth', () => {
     // below.
     const base = status([detection()]);
     expect(withSignatureHealth(base, 'pending')).toBe(base);
-    expect(withSignatureHealth(null, { armed: false })).toBeNull();
+    expect(withSignatureHealth(null, INERT)).toBeNull();
     expect(withSignatureHealth(null, 'unknown')).toBeNull();
   });
 
@@ -270,7 +310,7 @@ describe('withSignatureHealth', () => {
   /// on, and states as fact something nobody read.
   it('keeps UNREADABLE distinguishable from NOT-ARMED, not just from armed', () => {
     const unread = withSignatureHealth(status([detection()]), 'unknown');
-    const disarmed = withSignatureHealth(status([detection()]), { armed: false });
+    const disarmed = withSignatureHealth(status([detection()]), INERT);
     const [u] = reducedFeaturesFor(unread, TAB);
     const [d] = reducedFeaturesFor(disarmed, TAB);
 
@@ -282,13 +322,76 @@ describe('withSignatureHealth', () => {
     expect(featureStateWord(d)).toBe('off');
     expect(reducedTabLine([u])).not.toBe(reducedTabLine([d]));
     // The counts the chip branches on: a different bucket, not a bigger one.
-    expect(reducedCounts(unread)).toEqual({ switched: 0, inert: 0, unreadable: 1 });
-    expect(reducedCounts(disarmed)).toEqual({ switched: 0, inert: 1, unreadable: 0 });
+    expect(reducedCounts(unread)).toEqual({ switched: 0, inert: 0, unreadable: 1, partial: 0 });
+    expect(reducedCounts(disarmed)).toEqual({ switched: 0, inert: 1, unreadable: 0, partial: 0 });
     expect(reducedSummary(unread)).toBe('1 layer whose state could not be read');
     expect(reducedSummary(disarmed)).toBe('1 layer switched on but inert');
     // …and the chip says two different words.
     expect(injectionChipState(unread, false).label).toBe('unverified');
     expect(injectionChipState(disarmed, false).label).toBe('reduced');
+  });
+
+  /// #48, M-25 — the same argument one state along. A fix that made "not
+  /// healthy" reuse the disarmed row would satisfy the finding's test above by
+  /// telling the user the layer is doing NOTHING when it is doing a quarter of
+  /// it, and one that reused `unknown` would say nobody could read a state we
+  /// read perfectly well. Three readings, three sentences, three buckets.
+  it('keeps PARTLY-LIVE distinguishable from inert and from unreadable', () => {
+    const partial = withSignatureHealth(status([detection()]), PARTIAL);
+    const inert = withSignatureHealth(status([detection()]), INERT);
+    const unread = withSignatureHealth(status([detection()]), 'unknown');
+    const [p] = reducedFeaturesFor(partial, TAB);
+    const [i] = reducedFeaturesFor(inert, TAB);
+    const [u] = reducedFeaturesFor(unread, TAB);
+
+    expect(p.partial).toBe(true);
+    expect(p.unknown).toBe(false);
+    expect(i.partial).toBe(false);
+    expect(u.partial).toBe(false);
+    expect(p.reason).not.toBe(i.reason);
+    expect(p.reason).not.toBe(u.reason);
+
+    // The word in the popover: not "off" (nobody switched it, and it is
+    // matching), not "unknown" (we read it).
+    expect(featureStateWord(p)).toBe('partial');
+    // The sentence on the tab, which must not end in the word "off" either.
+    expect(reducedTabLine([p])).toBe(
+      'Running on only part of what it needs: Signature rules loaded.',
+    );
+    expect(reducedTabLine([p])).not.toContain(' off');
+    expect(reducedTabLine([p])).not.toBe(reducedTabLine([i]));
+    expect(reducedTabLine([p])).not.toBe(reducedTabLine([u]));
+
+    // Its own bucket and its own phrase in the chip's tooltip.
+    expect(reducedCounts(partial)).toEqual({ switched: 0, inert: 0, unreadable: 0, partial: 1 });
+    expect(reducedSummary(partial)).toBe('1 layer only partly loaded');
+    const chip = injectionChipState(partial, false);
+    // A read fact about a real loss of coverage: the confident word, and never
+    // `unverified` — nobody failed to read anything here.
+    expect(chip.label).toBe('reduced');
+    expect(chip.degraded).toBe(false);
+    expect(chip.title).toContain('1 layer only partly loaded');
+    expect(chip.title).not.toMatch(/\d+ controls? switched off/);
+  });
+
+  /// The mixed case: a switched-off control must not swallow the partial layer,
+  /// and vice versa. Two facts, two clauses, one sentence.
+  it('states a switched-off control and a partly-loaded layer as separate claims', () => {
+    const s = withSignatureHealth(
+      status([detection(), feature({ feature: 'taint_latch', effective: false })]),
+      PARTIAL,
+    );
+    expect(reducedCounts(s)).toEqual({ switched: 1, inert: 0, unreadable: 0, partial: 1 });
+    expect(reducedSummary(s)).toBe('1 control switched off, 1 layer only partly loaded');
+    const chip = injectionChipState(s, false);
+    expect(chip.label).toBe('reduced');
+    // Nothing here is unread, so the chip stays a confident claim.
+    expect(chip.degraded).toBe(false);
+    // …and the tab tooltip keeps them in separate sentences.
+    expect(reducedTabLine(reducedFeaturesFor(s, TAB))).toBe(
+      'Injection protection reduced for this tab: Taint latch off. ' +
+        'Running on only part of what it needs: Signature rules loaded.',
+    );
   });
 
   /// The cross-module invariant from the brief: "off by configuration" is state
@@ -320,18 +423,19 @@ describe('recordSignatureRead', () => {
     expect(withSignatureHealth(status([]), SIGNATURE_UNREAD.rules)).toBeTruthy();
   });
 
-  it('reports what it read', () => {
-    expect(recordSignatureRead(SIGNATURE_UNREAD, { armed: true }).rules).toEqual({ armed: true });
-    expect(recordSignatureRead(SIGNATURE_UNREAD, { armed: false }).rules).toEqual({
-      armed: false,
-    });
+  it('reports what it read — the whole verdict, not one field of it', () => {
+    // #48/M-25: the reading travels as the backend's own `RulesHealth`, so a
+    // consumer cannot branch on a field this side decided to keep.
+    for (const read of [LIVE, PARTIAL, INERT]) {
+      expect(recordSignatureRead(SIGNATURE_UNREAD, read).rules).toEqual(read);
+    }
   });
 
   it('a transient failure keeps the last reading instead of alarming anyone', () => {
-    let s = recordSignatureRead(SIGNATURE_UNREAD, { armed: true });
+    let s = recordSignatureRead(SIGNATURE_UNREAD, LIVE);
     for (let i = 1; i < UNKNOWN_AFTER_FAILURES; i++) {
       s = recordSignatureRead(s, null);
-      expect(s.rules).toEqual({ armed: true });
+      expect(s.rules).toEqual(LIVE);
       expect(s.health.failures).toBe(i);
     }
     // …and the Nth consecutive failure stops claiming.
@@ -340,12 +444,16 @@ describe('recordSignatureRead', () => {
     expect(recordSignatureRead(s, null).rules).toBe('unknown');
   });
 
-  it('holds a DISARMED reading across the grace window too, not just an armed one', () => {
-    // The debounce must not be a back door to forgetting bad news either.
-    let s = recordSignatureRead(SIGNATURE_UNREAD, { armed: false });
-    for (let i = 1; i < UNKNOWN_AFTER_FAILURES; i++) {
-      s = recordSignatureRead(s, null);
-      expect(s.rules).toEqual({ armed: false });
+  it('holds a DISARMED or PARTIAL reading across the grace window too, not just a live one', () => {
+    // The debounce must not be a back door to forgetting bad news either — and
+    // a partly-loaded rule set is bad news the grace window used to be unable
+    // to carry at all (#48, M-25).
+    for (const bad of [INERT, PARTIAL]) {
+      let s = recordSignatureRead(SIGNATURE_UNREAD, bad);
+      for (let i = 1; i < UNKNOWN_AFTER_FAILURES; i++) {
+        s = recordSignatureRead(s, null);
+        expect(s.rules).toEqual(bad);
+      }
     }
   });
 
@@ -364,15 +472,22 @@ describe('recordSignatureRead', () => {
     let s = SIGNATURE_UNREAD;
     for (let i = 0; i < UNKNOWN_AFTER_FAILURES + 4; i++) s = recordSignatureRead(s, null);
     expect(s.rules).toBe('unknown');
-    // Armed again, and the surfaces go quiet.
-    s = recordSignatureRead(s, { armed: true });
-    expect(s).toEqual({ health: HEALTHY_POLL, last: { armed: true }, rules: { armed: true } });
+    // Whole rule set live again, and the surfaces go quiet.
+    s = recordSignatureRead(s, LIVE);
+    expect(s).toEqual({ health: HEALTHY_POLL, last: LIVE, rules: LIVE });
     expect(withSignatureHealth(status([feature({ feature: 'detection' })]), s.rules)?.reduced).toBe(
       false,
     );
-    // …and recovery to a DISARMED layer reports the disarmed row, not silence.
-    const bad = recordSignatureRead(s, { armed: false });
-    expect(bad.rules).toEqual({ armed: false });
+    // …and recovery to a DISARMED or PARTLY-LOADED layer reports its row rather
+    // than silence: the surfaces must not go quiet on the strength of having
+    // been quiet before.
+    for (const bad of [INERT, PARTIAL]) {
+      const next = recordSignatureRead(s, bad);
+      expect(next.rules).toEqual(bad);
+      expect(
+        withSignatureHealth(status([feature({ feature: 'detection' })]), next.rules)?.reduced,
+      ).toBe(true);
+    }
   });
 });
 
@@ -386,10 +501,14 @@ describe('injectionChipState', () => {
     feature({ feature: 'detection', label: 'Injection detection', ...over });
 
   it('is silent only when everything is on AND we can see that it is', () => {
-    const healthy = withSignatureHealth(status([detection()]), { armed: true });
+    const healthy = withSignatureHealth(status([detection()]), LIVE);
     const chip = injectionChipState(healthy, false);
     expect(chip.visible).toBe(false);
     expect(chip.degraded).toBe(false);
+    // …and "everything is on" means the whole rule set, not merely a rule set
+    // that can match something (#48, M-25).
+    expect(injectionChipState(withSignatureHealth(status([detection()]), PARTIAL), false).visible)
+      .toBe(true);
   });
 
   it('shows UNVERIFIED — not silence, not "reduced" — when only the read failed', () => {

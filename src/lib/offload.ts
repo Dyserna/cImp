@@ -260,6 +260,45 @@ export interface DetectionStatus {
   } | null;
 }
 
+/// The one answer to "is the signature layer actually protecting this app?",
+/// read off a detection status in exactly ONE place (#48, M-25).
+///
+/// Three states, because the rule set on disk has three — whole, partly live,
+/// and matching nothing at all — and only the first is protection. The comment
+/// on `healthy` above already said which field answers this question;
+/// `latch.ts` branched on `armed` anyway and a rules directory with 3 of its 4
+/// files failing to compile rendered as FULL protection. The type is the fix
+/// the comment could not be: a caller that wants the safety question answered
+/// takes this whole value, and `detectionContract.test.ts` fails the suite if a
+/// second reader of `rules.armed` / `rules.healthy` appears.
+export interface RulesHealth {
+  /// `files_loaded > 0 && rules > 0` — the layer can match *something*.
+  ///
+  /// **Never the protected-or-not predicate on its own.** Its only job here is
+  /// to separate *partly live* from *inert* once `healthy` has already said the
+  /// set is not whole.
+  armed: boolean;
+  /// `armed && files_failed === 0` — the whole rule set on disk is live. THE
+  /// predicate for "is this protection intact?", computed in Rust and never
+  /// restated (#48, N-3).
+  healthy: boolean;
+  /// Rule files found and rejected, so a partial set can say how partial it is.
+  /// Phrasing only: `files_failed === 0` is also true of an empty directory,
+  /// which is why it cannot stand in for `healthy`.
+  files_failed: number;
+}
+
+/// Read a detection status as [`RulesHealth`] — the sanctioned reader of
+/// `rules.armed` / `rules.healthy`, alongside the Settings panel that renders
+/// both raw.
+export function rulesHealth(s: DetectionStatus): RulesHealth {
+  return {
+    armed: s.rules.armed,
+    healthy: s.rules.healthy,
+    files_failed: s.rules.files_failed,
+  };
+}
+
 /// One updatable detection component's update state.
 export interface DetectionComponentStatus {
   /// `rules` | `classifier` — the wire name every updater command takes.

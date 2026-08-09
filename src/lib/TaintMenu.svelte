@@ -211,9 +211,12 @@
     <ul class="reduced">
       {#each reduced as f (f.feature)}
         <!-- "off" for a switch, "unknown" for a state cImp could not read
-             (#48, H-10). Rendering the second as the first is a smaller lie
-             than rendering it as protected, but it is still a lie: it points
-             the user at a switch to flip. -->
+             (#48, H-10), "partial" for a layer running on part of what it needs
+             (#48, M-25). Rendering either of the last two as the first is a
+             smaller lie than rendering it as protected, but it is still a lie:
+             it points the user at a switch to flip. The word comes from
+             `featureStateWord` and the sentence from the row's own `reason`, so
+             this list cannot describe a row differently from the tab tooltip. -->
         <li class:unknown={f.unknown}>
           {f.label} — {featureStateWord(f)}
           <span class="why">({whyOff(f)})</span>

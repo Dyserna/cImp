@@ -1004,3 +1004,52 @@ fast-path rejects, cache negative verdicts per host, or route screening
 resolution through a resolver whose queries are themselves screened — none
 obviously worth it for a channel this narrow, which is why this is recorded and
 not scheduled.
+
+### F-9 — the signature scan's 1 s budget is wall clock spanning both passes
+
+`offload/detection/signature.rs:72` (`SCAN_TIMEOUT`) · `:602-634`
+(`scan_outcome_with`)
+
+Surfaced 2026-08-09 while verifying the contamination clear path. Under a
+saturated machine the shipped-rules scan returns
+`DidNotComplete("the signature scan did not complete: timeout")` where it
+normally matches.
+
+**Mechanism.** `SCAN_TIMEOUT` is **1 second of wall clock** measured with
+`Instant::now()` across *both* of H-4's passes: pass 1 over the raw bytes, then
+`remaining = SCAN_TIMEOUT.saturating_sub(started.elapsed())` for the normalized
+pass. It is not a CPU-time budget, so a thread descheduled under load burns it
+without doing any work. H-4 (`5920c92`) added the second pass without widening
+the budget, so the same 1 s now covers twice the scanning.
+
+**Two symptoms, one cause**, both observed: the obfuscation test losing its
+second-pass budget (`remaining.is_zero()`), and a benign-page test whose *first*
+pass timed out outright.
+
+**Proven pre-existing, not caused by the clear path.** The step-5 working tree
+was stashed and the failure reproduced at clean `HEAD` `05e613f` — 1842 passed
+/ 1 failed, same test. The module passes **17/17 when run alone**; it fails only
+under full-suite load.
+
+**Containment is not bypassed.** The exhausted-budget path returns
+`first.merged_with(ScanOutcome::DidNotComplete(...))` and the timeout path
+returns `DidNotComplete` — never `Clean`. This is exactly what `ScanOutcome`'s
+three-way split exists for, and the detection boundary treats it as incomplete.
+
+**But it degrades where the adversary has leverage, which is worth a decision.**
+The layer that is dropped first under load is the *normalized* pass — the
+obfuscation defence — and obfuscation is the thing an attacker controls. An
+attacker who can make the machine busy (any expensive local operation) raises
+the probability that the pass which would have caught them does not run. It
+fails honestly, so this is a detection-availability issue rather than a
+containment hole, but "the defence thins exactly when someone is pushing on it"
+should be chosen, not inherited.
+
+Options, none taken: give the normalized pass its own budget rather than the
+remainder; measure CPU time instead of wall clock; raise `SCAN_TIMEOUT` now that
+it covers two passes; or accept it and make the two affected tests tolerant of
+`DidNotComplete` so the suite stops reporting a real property as a failure.
+
+**Known-flake note for anyone who hits this:** the failing assertion looks like
+the H-4 rules regressing. They have not. Run
+`cargo test offload::detection::signature` alone before investigating.

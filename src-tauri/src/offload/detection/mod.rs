@@ -663,6 +663,13 @@ fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Opti
 /// Cheap and infallible: both layers degrade to inert rather than erroring, so
 /// there is nothing for the caller to handle.
 pub fn init() {
+    // #48, M-12 — BEFORE the compile, and gated on nothing. A crash mid-swap
+    // leaves `rules.d` short; recovery used to live only inside a scheduler
+    // tick that returns early when detection is switched off or nothing is due,
+    // so turning the feature off after a crash stranded the short set
+    // permanently. "Never degrade to no rules" is not a preference, so its
+    // repair is not gated on one.
+    updater::recover_on_launch();
     signature::reload();
     classifier::log_availability();
 }

@@ -57,6 +57,15 @@
 //!   both modes `off`, the scheduler tick returns before touching the network,
 //!   the disk, or anything but those switches — and the three Settings buttons
 //!   refuse for the same reason, through the same [`updates_enabled`] call.
+//!
+//!   **One deliberate exception, and it is not about updating**:
+//!   [`recover_on_launch`] finishes a swap a crash interrupted, whatever the
+//!   switches say (#48, M-12). Gating THAT on the updater's own settings is how
+//!   a user who turned detection off after a crash stranded a short `rules.d`
+//!   permanently — the repair is about the completeness of the data on disk,
+//!   not about whether new data is wanted. It is still silent and writes
+//!   nothing on a healthy install: an existence check on the journal file
+//!   returns before the lock, the state file or the rules directory is touched.
 //! - **A refusal and an outage are different events.** [`Outcome::Rejected`]
 //!   means a document reached us and a check said no; [`Outcome::Unavailable`]
 //!   means the channel never answered. Collapsing them made every install
@@ -334,8 +343,10 @@ pub fn live_reload(c: Component, dir: &Path) -> Result<String, String> {
 /// hard failure here is the never-degrade-to-nothing gate, so it must have
 /// exactly one definition and every surface must bind that one.
 /// The prefix [`super::signature::read_sources`] gives a file it read from the
-/// user-owned overlay. One definition, because the whole U-4 fix keys on it.
-const LOCAL_PREFIX: &str = "local/";
+/// user-owned overlay. One definition, because the whole U-4 fix keys on it —
+/// and since #48/M-13 so does the collision rename, which lives beside the
+/// reader, so the definition lives there too and this is the alias.
+const LOCAL_PREFIX: &str = super::signature::LOCAL_PREFIX;
 
 /// V32 Phase C3, #48 finding U-4 — which `rules.d/local/` files were **already
 /// failing to compile before** an activation.
@@ -356,10 +367,38 @@ const LOCAL_PREFIX: &str = "local/";
 ///
 /// # What is forgiven, and what is not
 ///
-/// Only a `local/` failure that was **present before this swap**. A `local/`
-/// file that compiled before and fails after is a collision *the bundle
-/// introduced*, and decision 13's rollback is exactly right for it. A failure
-/// in a bundle file is never forgiven at all — the prefix test excludes it.
+/// **Every `local/` failure, whether or not it predates the swap** (#48, M-13).
+/// A failure in a bundle file is never forgiven at all — the prefix test
+/// excludes it.
+///
+/// The original fix forgave only failures *present before the swap*, on the
+/// reasoning that a `local/` file which compiled before and fails after is a
+/// collision the bundle introduced and therefore the publisher's fault. That
+/// reproduces U-4's exact symptom in the case the README tells users to expect.
+/// The README's advice is "put your own rules in `rules.d/local/`"; a user who
+/// takes it and happens to name a rule the way a future shipped rule is named
+/// gets: bundle downloaded, validated, swapped, health check fails on their
+/// file, rolled back, blamed on the publisher — every 24 h, forever. The update
+/// channel is frozen by a file the updater is contractually forbidden to touch,
+/// and the user is never told which file did it or that anything is wrong.
+///
+/// Rolling back was also incoherent with the ordering the rest of the layer
+/// already commits to. [`super::signature::read_sources`] reads the shipped
+/// bundle FIRST precisely so that on an identifier collision it is the *local*
+/// file that loses — "losing a shipped rule to a stranger's typo would silently
+/// weaken the layer". Having decided that the shipped rule wins the collision,
+/// vetoing the shipped bundle over it says the opposite.
+///
+/// So the collision resolves the way `read_sources` already says it does: the
+/// bundle goes live, the one colliding user file is skipped, and the skip is
+/// **reported** — the returned sentence names it in the activity row and
+/// Settings, `detection.local_rules_broken.v1` cards it with the file name and
+/// the folder, and renaming one rule fixes it. That is U-4's other half doing
+/// the job it was built for.
+///
+/// The baseline is still taken, and still matters: it is what lets the message
+/// distinguish "this was already broken" from "this bundle collided with it",
+/// which is the difference between a note and an apology.
 ///
 /// And the never-degrade-to-nothing gate is untouched: `files_loaded == 0 ||
 /// rules == 0` (i.e. `!Status::armed`) stays a hard failure whatever the
@@ -419,30 +458,68 @@ impl LocalBaseline {
             // The never-degrade-to-nothing gate. Not forgivable, ever.
             return Err(why);
         }
+        // Only a BUNDLE file's failure vetoes. A `local/` file is the user's,
+        // and it can neither be fixed by rolling back nor be blamed on the
+        // publisher without freezing the channel (#48, M-13).
         let unforgiven: Vec<&String> = status
             .failed
             .iter()
-            .filter(|f| !(f.starts_with(LOCAL_PREFIX) && self.already_failing.contains(*f)))
+            .filter(|f| !f.starts_with(LOCAL_PREFIX))
             .collect();
         if !unforgiven.is_empty() {
             return Err(why);
         }
+        let (pre_existing, introduced): (Vec<&String>, Vec<&String>) = status
+            .failed
+            .iter()
+            .partition(|f| self.already_failing.contains(*f));
         warn!(
             target: "offload",
-            already_failing = %status.failed.join(", "),
+            already_failing = %join_names(&pre_existing),
+            newly_failing = %join_names(&introduced),
             dir = %dir.display(),
-            "detection updater: the new bundle is live; these user rules in rules.d/local/ were \
-             already failing to compile before the update and still are"
+            "detection updater: the new bundle is live; these user rules in rules.d/local/ are \
+             being skipped (detection.local_rules_broken.v1 names them to the user)"
         );
-        Ok(format!(
-            "{} file(s), {} rule(s) live; {} pre-existing broken file(s) in `rules.d/local/` \
-             ({}) were skipped, as they already were before this update",
+        let mut note = format!(
+            "{} file(s), {} rule(s) live{}",
             status.files_loaded,
             status.rules,
-            status.failed.len(),
-            status.failed.join(", ")
-        ))
+            status.rename_note()
+        );
+        if !pre_existing.is_empty() {
+            note.push_str(&format!(
+                "; {} pre-existing broken file(s) in `rules.d/local/` ({}) were skipped, as they \
+                 already were before this update",
+                pre_existing.len(),
+                join_names(&pre_existing)
+            ));
+        }
+        if !introduced.is_empty() {
+            note.push_str(&format!(
+                "; {} file(s) in `rules.d/local/` ({}) stopped compiling with this bundle and are \
+                 being skipped. An identifier a shipped rule has taken is normally handled by \
+                 loading YOUR rule under a `{}` name instead (#48, M-13), so reaching this means \
+                 the rename did not apply — the file has another compile error, or every renamed \
+                 form of the identifier is taken as well. The update was NOT rolled back, because \
+                 rolling it back would freeze every future update behind one file of yours",
+                introduced.len(),
+                join_names(&introduced),
+                super::signature::CUSTOM_PREFIX
+            ));
+        }
+        Ok(note)
     }
+}
+
+/// `", "`-join borrowed names — the one formatting helper the forgiveness note
+/// needs, so the three lists in it are spelled identically.
+fn join_names(names: &[&String]) -> String {
+    names
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn health_from_rules(s: &super::signature::Status, dir: &Path) -> Result<String, String> {
@@ -456,7 +533,17 @@ pub fn health_from_rules(s: &super::signature::Status, dir: &Path) -> Result<Str
             dir.display()
         ));
     }
-    Ok(format!("{} file(s), {} rule(s) live", s.files_loaded, s.rules))
+    // #48/M-13: `rename_note` is empty unless a user rule is live under a
+    // renamed identifier, so the ordinary sentence is unchanged — and when it
+    // is not empty, the fact rides the ONE string every caller propagates (the
+    // activation detail, the activity row, the Settings "Last check" line)
+    // rather than needing a new channel of its own.
+    Ok(format!(
+        "{} file(s), {} rule(s) live{}",
+        s.files_loaded,
+        s.rules,
+        s.rename_note()
+    ))
 }
 
 // ── Cached state ───────────────────────────────────────────────────────────
@@ -544,6 +631,12 @@ pub struct ComponentStatus {
     /// been going on rather than repeating one 404 forever.
     pub unreachable_streak: u32,
     pub last_failure: String,
+    /// Files a rollback could not put back, so the live set is short of them
+    /// (#48, M-11). Empty is the healthy steady state; non-empty means reduced
+    /// coverage that no other field on this struct can express — `last_ok` is
+    /// about the last CHECK, and the rule counts are about what compiled, not
+    /// about what should have been there.
+    pub unrestored_files: Vec<String>,
 }
 
 /// The whole updater surface, folded into `DetectionStatus` so the Settings
@@ -584,6 +677,7 @@ pub fn status(settings: &Settings) -> UpdaterStatus {
                     last_outcome_kind: cs.last_outcome_kind.clone(),
                     unreachable_streak: cs.unreachable_streak,
                     last_failure: cs.last_failure.clone(),
+                    unrestored_files: cs.unrestored_files.clone(),
                 }
             })
             .collect(),
@@ -773,40 +867,102 @@ pub struct StalledUpdate {
     pub reason: String,
 }
 
-/// The three Advisor inputs, read from the cached state — no disk, no clock, so
+/// A component whose live directory is **short of files a rollback could not
+/// put back** (#48, M-11).
+///
+/// Its own signal, not a variant of [`FailedUpdate`], because the two say
+/// opposite things about the present. A refusal card's whole reassurance is
+/// "nothing is degraded right now, the previous data is still live"; this one
+/// exists precisely because that sentence is false. And it is not
+/// `detection.signature_down.v1` either: the layer is armed and matching, it is
+/// simply matching with fewer rules than it has on disk — a state neither
+/// existing card can see, since the files are absent rather than broken.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RulesIncomplete {
+    pub component: String,
+    /// The names the live directory is missing.
+    pub files: Vec<String>,
+    /// Where they should be, so the card names a folder the user can open.
+    pub dir: String,
+}
+
+/// The four Advisor inputs, read from the cached state — no disk, no clock, so
 /// they are safe on the advice poll's cadence.
 pub fn advisor_signals() -> (Vec<AvailableUpdate>, Vec<FailedUpdate>, Vec<StalledUpdate>) {
     signals_from(&state())
 }
 
-/// A `rules.d/local/` file that is on disk and does not compile — the consumer
-/// for U-4's other half (#48).
+/// The consumer for [`store::ComponentState::unrestored_files`] — separate from
+/// [`advisor_signals`] only so that tuple does not grow a fourth element every
+/// call site has to re-destructure.
+pub fn rules_incomplete() -> Vec<RulesIncomplete> {
+    incomplete_from(&state())
+}
+
+/// The pure half, so the rule that consumes this can be tested from a state
+/// value.
+pub fn incomplete_from(st: &State) -> Vec<RulesIncomplete> {
+    let mut out = Vec::new();
+    for c in Component::ALL {
+        let cs = st.get(c);
+        if cs.unrestored_files.is_empty() {
+            continue;
+        }
+        out.push(RulesIncomplete {
+            component: c.as_str().to_string(),
+            files: cs.unrestored_files.clone(),
+            dir: store::destination(c)
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// **The state of the user's own rules in `rules.d/local/`**, when it is
+/// something they need to know — the consumer for U-4's other half (#48), and
+/// since M-13 for the collision rename as well.
 ///
-/// Once a broken `local/` rule stops vetoing the update channel, it stops being
-/// loud. Before this it was loud for the wrong reason (a daily update, applied
-/// and rolled back, blaming the publisher); after the fix its only trace is a
-/// `warn!` line in a log nobody has open. The user's own file is silently not
-/// protecting them, which is `files_failed` doing exactly what its doc comment
-/// says it is for: *"it means rules the user believes are active are not"*.
+/// Two conditions, one signal, deliberately:
+///
+/// - `failed` — a file that does not compile. Once a broken `local/` rule
+///   stopped vetoing the update channel it stopped being loud: before, it was
+///   loud for the wrong reason (a daily update, applied and rolled back,
+///   blaming the publisher); after, its only trace was a `warn!` in a log
+///   nobody has open. The user's own file is silently not protecting them.
+/// - `renamed` — a rule that IS live, under a different identifier than the one
+///   their file spells, because a shipped rule took the name (M-13). Nothing is
+///   degraded, but the identifier they will see in a hit, in an activity row
+///   and in their own grep is not the one they wrote.
+///
+/// They share one signal because they share one folder and one audience, and
+/// because this module has already decided that *"two cards about one folder is
+/// how a user learns to dismiss both"*. The card and the Settings row read the
+/// two lists separately, so neither is described in the other's words.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct BrokenLocalRules {
     /// Where the rules live, so the card names a folder the user can open.
     pub dir: String,
     /// The rejected file names, `local/`-prefixed as `read_sources` spells them.
     pub failed: Vec<String>,
+    /// Rules loaded under a renamed identifier (#48, M-13). Empty is the
+    /// ordinary case.
+    pub renamed: Vec<super::signature::RenamedRule>,
     /// What IS live — the card must not read as "detection is off".
     pub files_loaded: usize,
     pub rules: usize,
 }
 
-/// Whether any user rule file is currently failing to compile.
+/// Whether the user's own rule files need their attention: any of them failing
+/// to compile, or any of them live under a renamed identifier.
 ///
 /// `None` in every healthy or irrelevant case: the layer is switched off (the
 /// switch is resolved through [`super::Config::from_settings`], the same call
 /// [`super::signature::advisor_signal`] uses, so the L1 master and the per-layer
 /// toggle compose exactly once and never as a second opinion), the whole set
-/// compiles, or the failure is in a BUNDLE file — that is the updater's problem
-/// and already has three cards; this one is about the file only the user can fix.
+/// compiles with no collisions, or the failure is in a BUNDLE file — that is the
+/// updater's problem and already has three cards; this one is about the files
+/// only the user can change.
 ///
 /// It also stays quiet when the layer is disarmed, because
 /// `detection.signature_down.v1` is already saying something louder and more
@@ -816,7 +972,12 @@ pub fn broken_local_rules(s: &Settings) -> Option<BrokenLocalRules> {
     if !super::Config::from_settings(s, crate::settings::injection::Scope::App).signature {
         return None;
     }
-    let st = super::signature::status();
+    from_status(super::signature::status())
+}
+
+/// The pure half, so a test can drive the predicate from the `Status` a real
+/// collision produced instead of the process-wide slot it must not disturb.
+pub fn from_status(st: super::signature::Status) -> Option<BrokenLocalRules> {
     if !st.armed {
         return None;
     }
@@ -826,12 +987,16 @@ pub fn broken_local_rules(s: &Settings) -> Option<BrokenLocalRules> {
         .filter(|f| f.starts_with(LOCAL_PREFIX))
         .cloned()
         .collect();
-    if failed.is_empty() {
+    // Renames are `local/`-only by construction (`rename_colliding_local_rules`
+    // rewrites nothing else), so there is no second prefix filter to keep in
+    // step with the one above.
+    if failed.is_empty() && st.renamed.is_empty() {
         return None;
     }
     Some(BrokenLocalRules {
         dir: st.dir,
         failed,
+        renamed: st.renamed,
         files_loaded: st.files_loaded,
         rules: st.rules,
     })
@@ -1021,7 +1186,9 @@ pub async fn run_component(
     store::wipe_dir(&staging);
     match applied {
         Ok(detail) => finish(c, &root, now, Outcome::Applied, entry.version.clone(), detail),
-        Err(detail) => finish(
+        // The version rides along for the row label in both cases; `finish`
+        // decides what, if anything, is recorded about the DATA.
+        Err(ApplyFailure::Rejected(detail)) => finish(
             c,
             &root,
             now,
@@ -1029,6 +1196,55 @@ pub async fn run_component(
             entry.version.clone(),
             detail,
         ),
+        Err(ApplyFailure::Unreachable(detail)) => finish(
+            c,
+            &root,
+            now,
+            Outcome::Unavailable,
+            entry.version.clone(),
+            detail,
+        ),
+    }
+}
+
+/// Why an apply did not happen — the #46 outcome split, applied to the
+/// **artifact** fetch this time (#48, M-9).
+///
+/// #46 split "the channel never answered" from "a document reached us and a
+/// check said no" at the manifest fetch, and stopped there. Everything after it
+/// funnelled through one `Result<String, String>` that
+/// [`run_component`] recorded as [`Outcome::Rejected`], so an artifact 404, a
+/// timeout, a proxy login page, a dropped connection mid-download — none of
+/// which is a bundle being refused, and none of which is a decision anyone
+/// made — raised the security card that means *someone published something we
+/// would not take*, wrote an `ok:false` row, and **reset `unreachable_streak`**,
+/// which is the counter whose whole job is to notice that the channel has gone
+/// quiet.
+///
+/// That is not a corner case here. The deploy note publishes the manifest and
+/// the artifacts as separate steps, so "manifest reachable, artifact not yet"
+/// is the ordinary state of a half-published channel — the likely steady state
+/// on the day `detection-v1` first goes up, and a daily red card for a bundle
+/// that is perfectly fine.
+///
+/// Exactly one thing maps to `Unreachable`: a [`Fetcher::get`] transport error
+/// on an artifact URL. A response that ARRIVED and disagrees with the manifest
+/// — wrong size, wrong digest — is a refusal, because a document reached us and
+/// a check said no. Stated as a two-variant enum rather than a string prefix so
+/// a future call site has to answer the question.
+enum ApplyFailure {
+    /// A bundle reached us and a check refused it.
+    Rejected(String),
+    /// The artifact could not be fetched at all. Nothing was refused.
+    Unreachable(String),
+}
+
+impl From<String> for ApplyFailure {
+    /// Every `?` inside [`apply_component`] that is not the artifact fetch
+    /// itself is a refusal. Deliberately the default, so forgetting to classify
+    /// fails toward the louder card rather than toward silence.
+    fn from(s: String) -> Self {
+        ApplyFailure::Rejected(s)
     }
 }
 
@@ -1041,30 +1257,53 @@ async fn apply_component(
     layout: &Layout,
     staging: &Path,
     reload: Reloader<'_>,
-) -> Result<String, String> {
+) -> Result<String, ApplyFailure> {
     std::fs::create_dir_all(staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
 
     // Fetch each artifact into memory, verify its size and digest, and only
     // then write it. Nothing untrusted touches disk before its checksum is
     // confirmed, and nothing reaches a parser before that either.
     for f in &entry.files {
-        let bytes = fetcher.get(&f.url, f.size).await?;
+        let bytes = match fetcher.get(&f.url, f.size).await {
+            Ok(b) => b,
+            // Transport, on an artifact. The manifest answered and this did
+            // not; nothing was refused (#48, M-9).
+            Err(e) if e.kind == manifest::FetchErrorKind::Transport => {
+                return Err(ApplyFailure::Unreachable(format!(
+                    "`{}` from version `{}` could not be downloaded ({e}). Nothing was written and \
+                     the current detection data is still live.",
+                    f.name, entry.version
+                )))
+            }
+            // A body arrived and is bigger than the manifest says it is. The
+            // symmetric case — a body SHORT of its declared size — is caught by
+            // the length check below and refused, so this one must be refused
+            // too, or the same disagreement would be an outage in one direction
+            // and a refusal in the other.
+            Err(e) => {
+                return Err(ApplyFailure::Rejected(format!(
+                    "`{}` is larger than the {} bytes the manifest declares ({e}) — rejected \
+                     before the content was written or parsed",
+                    f.name, f.size
+                )))
+            }
+        };
         if bytes.len() as u64 != f.size {
-            return Err(format!(
+            return Err(ApplyFailure::Rejected(format!(
                 "`{}` is {} bytes but the manifest declares {} — rejected before the content was \
                  written or parsed",
                 f.name,
                 bytes.len(),
                 f.size
-            ));
+            )));
         }
         let got = manifest::sha256_hex(&bytes);
         if got != f.sha256 {
-            return Err(format!(
+            return Err(ApplyFailure::Rejected(format!(
                 "checksum mismatch on `{}` (expected {}, got {}) — rejected before the content \
                  was written or parsed",
                 f.name, f.sha256, got
-            ));
+            )));
         }
         std::fs::write(staging.join(&f.name), &bytes)
             .map_err(|e| format!("stage `{}`: {e}", f.name))?;
@@ -1081,7 +1320,9 @@ async fn apply_component(
     match c {
         Component::Rules => {
             let _ = &names;
+            // Past the fetch, every failure is a document being refused.
             validate_and_activate_rules(staging, layout, &entry.version, reload)
+                .map_err(ApplyFailure::Rejected)
         }
     }
 }
@@ -1166,15 +1407,22 @@ fn validate_and_activate_rules(
         Ok(live) => Ok(live),
         Err(why) => baseline.forgive(dir, why),
     };
-    activate(Component::Rules, staging, layout, version, &judged)?;
+    // The live description, not the validation report's counts (#48, M-13).
+    // They are close but not the same number — validation compiles the bundle
+    // alone, the live set includes `rules.d/local/` — and only this one can say
+    // that a user file was skipped, which after M-13 is a thing an APPLIED
+    // update has to be able to report. Dropping it on the floor is how U-4's
+    // forgiveness message stayed invisible for two fix rounds.
+    let live = activate(Component::Rules, staging, layout, version, &judged)?;
     Ok(format!(
-        "activated rules `{version}`: {} file(s), {} rule(s), validated against {} benign + {} \
-         hostile control document(s) (compile {} ms, slowest scan {} ms). The previous bundle is \
-         retained and can be reverted from Settings; `rules.d/local/` was not touched.",
-        report.files,
-        report.rules,
+        "activated rules `{version}`: {live}. Validated against {} benign + {} hostile control \
+         document(s) ({} bundle file(s), {} rule(s); compile {} ms, slowest scan {} ms). The \
+         previous bundle is retained and can be reverted from Settings; `rules.d/local/` was not \
+         touched.",
         report.benign_samples,
         report.hostile_samples,
+        report.files,
+        report.rules,
         report.compile_ms,
         report.slowest_scan_ms
     ))
@@ -1220,7 +1468,7 @@ fn activate(
     layout: &Layout,
     version: &str,
     reload: Reloader<'_>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let dest = layout.dest(c);
     let root = &layout.state_root;
     std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
@@ -1237,21 +1485,18 @@ fn activate(
         installed
     };
     let archive = store::previous_dir(root, c, &outgoing_version);
-    store::wipe_dir(&archive);
+    let mut archived: Vec<(PathBuf, PathBuf)> = prepare_archive(c, &archive, dest);
 
     // Archive the current managed set. For rules this is the top level of
     // `rules.d` only, so `local/` is untouched by construction.
     journal(root, c, store::Phase::Archiving, &archive, dest);
-    let mut archived: Vec<(PathBuf, PathBuf)> = Vec::new();
     for p in store::managed_files(dest, c) {
         let name = p.file_name().unwrap_or_default().to_os_string();
         let to = archive.join(&name);
         if let Err(e) = store::move_file(&p, &to) {
             // Restore-only: the files this loop has NOT reached are still at
             // `dest` and are the only copy of themselves.
-            restore_archived(&archived);
-            let note = reload_note(c, dest, reload);
-            store::clear_journal(root);
+            let note = restore_only(c, root, dest, &archived, reload);
             return Err(format!(
                 "archiving the current bundle failed ({e}); nothing was replaced and the previous \
                  version is still live{note}"
@@ -1265,8 +1510,7 @@ fn activate(
     for p in store::managed_files(staging, c) {
         let name = p.file_name().unwrap_or_default().to_os_string();
         if let Err(e) = store::move_file(&p, &dest.join(&name)) {
-            let note = roll_back(c, dest, &archived, reload);
-            store::clear_journal(root);
+            let note = roll_back(c, root, &archive, dest, &archived, reload);
             return Err(format!(
                 "activating the staged bundle failed ({e}); the previous version was restored{note}"
             ));
@@ -1285,6 +1529,11 @@ fn activate(
                 let cs = s.get_mut(c);
                 cs.previous_version = outgoing_version.clone();
                 cs.installed_version = version.to_string();
+                // A full swap resolves any outstanding restore debt by
+                // construction: `dest` now holds a complete validated set and
+                // `archive` holds a complete outgoing one (see
+                // `prepare_archive`). Nothing is missing, so nothing is owed.
+                cs.unrestored_files.clear();
             });
             info!(
                 target: "offload",
@@ -1293,17 +1542,70 @@ fn activate(
                 live = %live,
                 "detection updater: bundle activated"
             );
-            Ok(())
+            Ok(live)
         }
         Err(why) => {
-            let note = roll_back(c, dest, &archived, reload);
-            store::clear_journal(root);
+            let note = roll_back(c, root, &archive, dest, &archived, reload);
             Err(format!(
                 "the activated bundle did not load cleanly ({why}); the previous version was \
                  restored{note}"
             ))
         }
     }
+}
+
+/// Ready `archive` to receive the outgoing set, **keeping any file the
+/// destination is missing** (#48, M-11's other half).
+///
+/// This used to be a bare [`store::wipe_dir`], and with M-11 fixed that becomes
+/// a data-loss path rather than hygiene. A rollback that could not put
+/// `core.yar` back leaves it in `previous/<outgoing>/` — the archive of the very
+/// version being replaced — as the only copy in existence. The next check then
+/// downloads a newer bundle, computes the same archive path from the same
+/// unchanged `installed_version`, and wipes it.
+///
+/// The file belongs where it already is: this archive is the outgoing version's
+/// archive, and a file the destination lacks is part of that version and
+/// nothing else. So it stays, and the returned `archived` list starts with it —
+/// which also means a rollback puts the COMPLETE old set back, repairing the
+/// debt rather than perpetuating it.
+///
+/// Everything else in the archive is a stale copy of a file that is still live
+/// at `dest` (the previous run's archive of the same version) and is removed,
+/// so the archive never accumulates.
+///
+/// Returns the `(in-archive, restore-to)` pairs for the files kept, in the same
+/// shape the archive loop appends to.
+fn prepare_archive(c: Component, archive: &Path, dest: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let live: BTreeSet<std::ffi::OsString> = store::managed_files(dest, c)
+        .iter()
+        .map(|p| p.file_name().unwrap_or_default().to_os_string())
+        .collect();
+    let mut kept = Vec::new();
+    for p in store::managed_files(archive, c) {
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        if live.contains(&name) {
+            let _ = std::fs::remove_file(&p);
+        } else {
+            kept.push((p.clone(), dest.join(&name)));
+        }
+    }
+    if kept.is_empty() {
+        // Nothing worth keeping: wipe the directory itself so non-rule
+        // leftovers (a partial download, a file from a build that managed a
+        // different extension set) do not accumulate either.
+        store::wipe_dir(archive);
+    } else {
+        warn!(
+            target: "offload",
+            component = c.as_str(),
+            archive = %archive.display(),
+            files = kept.len(),
+            "detection updater: the retained copy still holds file(s) the live set is missing \
+             from an earlier failed restore; keeping them rather than wiping the last copy"
+        );
+    }
+    kept
 }
 
 /// Record an in-flight swap so a crash between the two loops is recoverable
@@ -1368,32 +1670,58 @@ fn recover_interrupted(layout: &Layout, reload: Reloader<'_>) {
         })
         .collect();
     if archived.is_empty() {
-        // Nothing was archived before the interruption (or the archive is
-        // already back). There is nothing to undo and nothing to lose.
-        store::clear_journal(root);
+        // Nothing was archived before the interruption, or the archive is
+        // already back. There is nothing to undo and nothing to lose — and no
+        // debt either, so the state field is cleared with the journal.
+        // Nothing owed and nothing to say: the note is for a caller composing
+        // an error message, and this path has none.
+        let _ = settle_restore(root, c, &[]);
         return;
     }
     match j.phase {
         // The destination still holds every file the archive loop did not
         // reach; clearing it would destroy them.
-        store::Phase::Archiving => restore_archived(&archived),
+        store::Phase::Archiving => {}
         // The destination holds however many staged files landed. They must go:
         // old-plus-some-new is a set no curation step ever validated.
         store::Phase::Moving => {
             for p in store::managed_files(dest, c) {
                 let _ = std::fs::remove_file(&p);
             }
-            restore_archived(&archived);
         }
+        // **A rollback was itself in flight (#48, M-10).** The destination has
+        // already been cleared of staged files and holds however much of the
+        // archive got put back. Deleting `managed_files(dest)` here — which is
+        // what `Moving` does, and what this state used to be misread as — would
+        // destroy exactly those restored files, and the archive no longer holds
+        // a second copy. Restore-only, and idempotent, so running it again over
+        // a rollback that actually finished is a no-op.
+        store::Phase::Restoring => {}
     }
-    store::clear_journal(root);
-    warn!(
-        target: "offload",
-        component = c.as_str(),
-        phase = ?j.phase,
-        files = archived.len(),
-        "detection updater: an update was interrupted mid-swap; the previous version was restored"
-    );
+    let unrestored = restore_archived(&archived);
+    let debt = settle_restore(root, c, &unrestored);
+    if debt.is_empty() {
+        warn!(
+            target: "offload",
+            component = c.as_str(),
+            phase = ?j.phase,
+            files = archived.len(),
+            "detection updater: an update was interrupted mid-swap; the previous version was \
+             restored"
+        );
+    } else {
+        // Deliberately NOT the reassuring sentence above: `settle_restore` has
+        // already kept the journal, so this repeats on the next run — and the
+        // Advisor card is what the user actually sees.
+        warn!(
+            target: "offload",
+            component = c.as_str(),
+            phase = ?j.phase,
+            files = %unrestored.join(", "),
+            "detection updater: an interrupted update could only be PARTLY undone; the live set \
+             is short of these files and the retry is queued"
+        );
+    }
     if let Err(e) = reload(c, dest) {
         warn!(
             target: "offload",
@@ -1404,18 +1732,110 @@ fn recover_interrupted(layout: &Layout, reload: Reloader<'_>) {
     }
 }
 
+/// Finish an interrupted swap against `layout`, taking the run lock — the entry
+/// point for callers that are not already inside a [`run`].
+///
+/// Only [`store::acquire_run_lock`] is taken, not the process-local
+/// [`run_lock`] mutex as well, and that is deliberate: the file lock excludes
+/// **every** contender including this process (its staleness rule is age, never
+/// pid — see [`store::acquire_run_lock`]), so it is sufficient on its own, and
+/// taking the async mutex from a synchronous launch path would mean either
+/// `blocking_lock` (which panics if a runtime is ever wrapped around startup)
+/// or `try_lock` (which would silently skip the repair whenever anything else
+/// happened to hold it). One lock, one story.
+///
+/// Declining is safe: a peer holding the lock is inside `run`, which does this
+/// same recovery on the way in.
+pub fn recover_now(layout: &Layout, reload: Reloader<'_>) {
+    let file_lock = match store::acquire_run_lock(&layout.state_root, crate::activity::now_ms()) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                target: "offload",
+                error = %e,
+                "detection updater: skipping crash recovery; another instance holds the run lock"
+            );
+            return;
+        }
+    };
+    recover_interrupted(layout, reload);
+    drop(file_lock);
+}
+
+/// **Crash recovery at launch, unconditionally (#48, M-12).**
+///
+/// Recovery used to reach the disk from exactly one place: [`run`], which
+/// [`tick_once`] calls only when [`updates_enabled`] resolves true AND a
+/// component is `check`/`auto` AND [`is_due`] says so. Every one of those is a
+/// question about *fetching updates*, and none of them is a question about
+/// *whether the rule set on disk is complete*.
+///
+/// So the failure was: a crash mid-swap leaves `rules.d` short; the user — quite
+/// reasonably, having just seen the app die — switches detection off, or sets
+/// the component to `off`, or simply is not due for another 23 hours. The
+/// journal then sits there and `rules.d` stays short across every restart,
+/// which is the silent permanent degradation decision 13 exists to forbid,
+/// reached by a switch that has nothing to do with it. "Never degrade to no
+/// rules" must not be conditional on an unrelated preference.
+///
+/// Called from [`detection::init`](super::init), before the first
+/// [`signature::reload`](super::signature::reload), so the set that compiles at
+/// startup is the repaired one. Takes no `Settings` **by construction** — there
+/// is no switch it could consult and no way for a future edit to gate it on one
+/// without changing this signature.
+pub fn recover_on_launch() {
+    let Some(layout) = Layout::resolve() else {
+        return;
+    };
+    // An unlocked peek first, so the overwhelmingly common case — no journal —
+    // costs one failed `read_to_string` and writes NOTHING. Taking the lock
+    // straight away would create `detection-updates/` on every launch of every
+    // install, including one with detection switched off, which would quietly
+    // spend the module header's "inert when off" promise on a repair that is
+    // almost never needed.
+    //
+    // Not a race: this only decides whether to bother. If a peer wrote the
+    // journal a moment ago we take the lock and act; if a peer cleared it, the
+    // authoritative re-read inside `recover_interrupted` (under the lock) finds
+    // nothing and returns. The unsafe direction — acting on a stale read — is
+    // the one the lock covers.
+    // `has_journal`, not `read_journal`: the latter deletes what it cannot
+    // parse, and `write_journal` is a plain `fs::write`, so an unlocked reader
+    // can catch a peer's journal half-written and destroy the record of a swap
+    // that is in flight.
+    if !store::has_journal(&layout.state_root) {
+        return;
+    }
+    recover_now(&layout, &live_reload);
+}
+
 /// The label recorded for the bundle that shipped with the app — the one
 /// version that has no manifest entry. Displayed in Settings as the revert
 /// target, so it has to read as something a user recognizes.
 pub const SHIPPED_VERSION: &str = "(shipped)";
 
-/// Put archived files back where they came from.
+/// Put archived files back where they came from, and report the ones that
+/// would not go (#48, M-11).
 ///
 /// The half of a rollback that is safe at **any** point of a swap, because it
-/// only ever writes files the archive already holds. [`roll_back`] adds the
-/// destructive half on top of it, and the archive loop's undo deliberately does
-/// not (see [`activate`]).
-fn restore_archived(archived: &[(PathBuf, PathBuf)]) {
+/// only ever writes files the archive already holds — and therefore idempotent,
+/// which is what makes [`store::Phase::Restoring`] recoverable by simply
+/// running it again.
+///
+/// **The return value is the whole of M-11.** This used to be `-> ()` with a
+/// `warn!` per failure, and every caller then reported "the previous version
+/// was restored" verbatim. Nothing downstream could contradict it: the
+/// post-rollback health check compiles what IS on disk, and a file that is
+/// absent contributes no compile error, no `files_failed`, and no missing
+/// `rules` beyond the ones it carried — so `Status::healthy` came back true
+/// about a rule set that had silently lost a file. The one outcome that
+/// permanently reduces coverage had the most reassuring message in the module.
+///
+/// A failed restore leaves the file in the archive, which is why it is
+/// recoverable at all: see [`settle_restore`] for what is done with this list.
+#[must_use]
+fn restore_archived(archived: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    let mut unrestored = Vec::new();
     for (from, to) in archived {
         if let Err(e) = store::move_file(from, to) {
             warn!(
@@ -1425,8 +1845,70 @@ fn restore_archived(archived: &[(PathBuf, PathBuf)]) {
                 error = %e,
                 "detection updater: could not restore a previous file"
             );
+            unrestored.push(
+                to.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
     }
+    unrestored
+}
+
+/// Record what a restore attempt achieved, and leave the disk in a state the
+/// next run can finish (#48, M-10 + M-11).
+///
+/// # Loud and degraded, not escalated
+///
+/// A restore that could not put every file back leaves the layer running on a
+/// short rule set. The tempting "escalate" — refuse to run the updater, or
+/// disarm the layer until a human intervenes — is exactly backwards: it would
+/// trade a *partial* rule set for *no* rule set, which is the one thing
+/// decision 13 forbids, over a condition whose overwhelmingly likely cause
+/// (a sharing violation from AV real-time scanning, or a file held open through
+/// the panel's own *Open rules folder* button) clears by itself within minutes.
+///
+/// So: loud, degraded, and repaired automatically.
+///
+/// - **Durable.** The `Restoring` journal is left on disk, so the missing files
+///   stay in the archive and every later run — and, since M-12, every launch —
+///   retries the move. The retry is [`restore_archived`] itself, which is
+///   idempotent.
+/// - **Visible.** The names land in
+///   [`store::ComponentState::unrestored_files`], which Settings renders and
+///   `detection.rules_incomplete.v1` cards. The rule set really is short, and
+///   the user is the only one who can unlock a locked file.
+/// - **Honest.** The returned sentence is appended to the caller's own message,
+///   so no path can say "the previous version was restored" full stop while
+///   this is non-empty.
+///
+/// Empty on the ordinary path: the journal is cleared, the state field is
+/// cleared, and the returned note is the empty string, so every existing
+/// message is unchanged.
+#[must_use]
+fn settle_restore(root: &Path, c: Component, unrestored: &[String]) -> String {
+    update_state_at(root, |s| {
+        s.get_mut(c).unrestored_files = unrestored.to_vec();
+    });
+    if unrestored.is_empty() {
+        store::clear_journal(root);
+        return String::new();
+    }
+    warn!(
+        target: "offload",
+        component = c.as_str(),
+        files = %unrestored.join(", "),
+        "detection updater: a rollback could not put every file back; the live set is short of \
+         them and the journal is kept so the next run retries"
+    );
+    format!(
+        " — but {} file(s) could not be put back ({}), so the live set is running SHORT of them; \
+         they are still in the retained copy and every later check (and the next launch) retries \
+         the restore",
+        unrestored.len(),
+        unrestored.join(", ")
+    )
 }
 
 /// Remove whatever is at `dest` for this component, put the archive back, and
@@ -1436,9 +1918,25 @@ fn restore_archived(archived: &[(PathBuf, PathBuf)]) {
 /// the files back but could not recompile them is a second, separate problem,
 /// and it used to be visible only as a `warn!` in a log nobody was reading
 /// (#48). Empty on the ordinary path, so the existing messages are unchanged.
+///
+/// # The journal moves to `Restoring` between the two halves (#48, M-10)
+///
+/// The destructive half runs while the journal still reads `Moving`, which is
+/// the correct undo for a kill inside it: the destination holds staged files
+/// and the archive holds the complete outgoing set, so "clear the destination,
+/// restore the archive" is right whether or not the delete loop finished.
+///
+/// The moment the destination is clear, that stops being true — from here on
+/// the destination holds RESTORED files, and `Moving`'s recovery would delete
+/// them and then restore only whatever remained in the archive. That is M-10:
+/// a crash mid-rollback destroyed the difference, permanently, and reported
+/// "the previous version was restored". So the phase is advanced first, and
+/// `Restoring`'s recovery never deletes anything.
 #[must_use]
 fn roll_back(
     c: Component,
+    root: &Path,
+    archive: &Path,
     dest: &Path,
     archived: &[(PathBuf, PathBuf)],
     reload: Reloader<'_>,
@@ -1446,8 +1944,29 @@ fn roll_back(
     for p in store::managed_files(dest, c) {
         let _ = std::fs::remove_file(&p);
     }
-    restore_archived(archived);
-    reload_note(c, dest, reload)
+    journal(root, c, store::Phase::Restoring, archive, dest);
+    let unrestored = restore_archived(archived);
+    let debt = settle_restore(root, c, &unrestored);
+    format!("{}{debt}", reload_note(c, dest, reload))
+}
+
+/// The archive loop's undo: restore only, never clear the destination (see
+/// [`activate`]), with the same debt handling as [`roll_back`].
+///
+/// No phase change is needed on the way in — the journal already reads
+/// `Archiving`, whose recovery is restore-only too, so a kill anywhere in here
+/// recovers to exactly the place this is heading.
+#[must_use]
+fn restore_only(
+    c: Component,
+    root: &Path,
+    dest: &Path,
+    archived: &[(PathBuf, PathBuf)],
+    reload: Reloader<'_>,
+) -> String {
+    let unrestored = restore_archived(archived);
+    let debt = settle_restore(root, c, &unrestored);
+    format!("{}{debt}", reload_note(c, dest, reload))
 }
 
 /// Reload after a rollback and turn a failure into a sentence the caller can
@@ -1635,6 +2154,21 @@ pub async fn run(
     // skipped: a click that has to wait for a tick still does what the user
     // asked, whereas a click that silently no-ops does not.
     let _run_guard = run_lock().lock().await;
+    // …and one run at a time across PROCESSES, which the mutex above cannot
+    // reach (#48, M-14). Nothing is recorded on contention: the peer holding
+    // the lock is doing this same work against the same directories, so a
+    // state write here would be a second opinion about a run in flight.
+    let _file_guard = match store::acquire_run_lock(&layout.state_root, crate::activity::now_ms()) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                target: "offload",
+                error = %e,
+                "detection updater: skipping this run; another instance holds the run lock"
+            );
+            return Vec::new();
+        }
+    };
     // Finish any swap a crash interrupted before this run can wipe the archive
     // it would have been recovered from (#48, U-2).
     recover_interrupted(layout, reload);
@@ -1656,7 +2190,23 @@ pub async fn run(
     let raw = match fetcher.get(manifest_url, manifest::MAX_MANIFEST_BYTES).await {
         Ok(b) => b,
         // Transport. Nothing was refused; the channel did not answer (#46).
-        Err(e) => return fail_all(components, sched, &root, Outcome::Unavailable, &e),
+        //
+        // Both `FetchErrorKind`s land here, deliberately, and this is the one
+        // place the artifact split (#48, M-9) does NOT apply. An artifact's
+        // ceiling is a size the manifest itself declares, so exceeding it is a
+        // document contradicting its own index; the manifest's ceiling is a
+        // blanket sanity bound, and the thing most likely to exceed it is
+        // precisely what #46 is about — a proxy login page or a GitHub 404,
+        // neither of which is anybody publishing anything.
+        Err(e) => {
+            return fail_all(
+                components,
+                sched,
+                &root,
+                Outcome::Unavailable,
+                &e.to_string(),
+            )
+        }
     };
     let text = match String::from_utf8(raw) {
         Ok(t) => t,
@@ -1773,10 +2323,27 @@ fn fail_all(
 /// version they represent, so a revert is itself revertible.
 pub fn revert(c: Component, layout: &Layout, reload: Reloader<'_>) -> RunResult {
     let now = crate::activity::now_ms();
-    // Same reason as in `run`: a revert also wipes an archive directory, so an
-    // interrupted swap has to be finished first (#48, U-2).
-    recover_interrupted(layout, reload);
     let root = layout.state_root.clone();
+    // A revert rewrites the same two directories a run does, so it needs the
+    // same cross-process exclusion (#48, M-14). `RevertFailed`, not `Rejected`:
+    // nothing was fetched and nothing about the DATA is being recorded — the
+    // user pressed a button at the wrong moment and should press it again.
+    let _file_guard = match store::acquire_run_lock(&root, now) {
+        Ok(l) => l,
+        Err(e) => {
+            return finish(
+                c,
+                &root,
+                now,
+                Outcome::RevertFailed,
+                String::new(),
+                format!("revert failed: {e}; nothing was changed — try again in a moment"),
+            )
+        }
+    };
+    // Same reason as in `run`: a revert also rewrites an archive directory, so
+    // an interrupted swap has to be finished first (#48, U-2).
+    recover_interrupted(layout, reload);
     let st = state_at(&root);
     let cs = st.get(c);
     let previous_version = cs.previous_version.clone();
@@ -1901,21 +2468,21 @@ fn revert_inner(
             archive.display()
         ));
     }
-    // Archive what is live now under ITS version, so this revert can be undone.
-    store::wipe_dir(&keep);
-    // The same two-loop shape as `activate`, and therefore the same two undos
-    // and the same journal (#48, U-2): a bare `?` in either loop left the live
+    // Archive what is live now under ITS version, so this revert can be undone
+    // — keeping anything the live set is missing, for the same reason
+    // `activate` does (#48, M-11): those files are the current version's own
+    // and this is the only copy of them.
+    let mut archived: Vec<(PathBuf, PathBuf)> = prepare_archive(c, &keep, dest);
+    // The same two-loop shape as `activate`, and therefore the same undos and
+    // the same journal (#48, U-2): a bare `?` in either loop left the live
     // directory holding a subset with nothing put back, and this path is the
     // one a user triggers by hand.
     journal(root, c, store::Phase::Archiving, &keep, dest);
-    let mut archived: Vec<(PathBuf, PathBuf)> = Vec::new();
     for p in store::managed_files(dest, c) {
         let name = p.file_name().unwrap_or_default().to_os_string();
         let to = keep.join(&name);
         if let Err(e) = store::move_file(&p, &to) {
-            restore_archived(&archived);
-            let note = reload_note(c, dest, reload);
-            store::clear_journal(root);
+            let note = restore_only(c, root, dest, &archived, reload);
             return Err(format!(
                 "archiving the current `{current_version}` files failed ({e}); nothing was \
                  restored and the current version is still live{note}"
@@ -1927,8 +2494,7 @@ fn revert_inner(
     for p in &restoring {
         let name = p.file_name().unwrap_or_default().to_os_string();
         if let Err(e) = store::move_file(p, &dest.join(&name)) {
-            let note = roll_back(c, dest, &archived, reload);
-            store::clear_journal(root);
+            let note = roll_back(c, root, &keep, dest, &archived, reload);
             return Err(format!(
                 "restoring `{previous_version}` failed ({e}); `{current_version}` was put \
                  back{note}"
@@ -1938,8 +2504,7 @@ fn revert_inner(
     let live = match reload(c, dest) {
         Ok(live) => live,
         Err(why) => {
-            let note = roll_back(c, dest, &archived, reload);
-            store::clear_journal(root);
+            let note = roll_back(c, root, &keep, dest, &archived, reload);
             return Err(format!(
                 "the restored `{previous_version}` version did not load cleanly ({why}); \
                  `{current_version}` was put back{note}"
@@ -1951,6 +2516,9 @@ fn revert_inner(
         let cs = s.get_mut(c);
         cs.installed_version = previous_version.to_string();
         cs.previous_version = current_version.to_string();
+        // Same reasoning as `activate`'s success path: the live set has been
+        // rewritten whole from a complete retained copy, so nothing is owed.
+        cs.unrestored_files.clear();
     });
     Ok(format!(
         "reverted `{}` to `{previous_version}` ({live}); `{current_version}` is retained and can \

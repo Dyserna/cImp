@@ -704,7 +704,61 @@ pub trait Fetcher: Send + Sync {
     ///
     /// The cap is enforced by the implementation, not by the caller checking
     /// afterwards: "download it all, then notice it was too big" is not a cap.
-    async fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String>;
+    async fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, FetchError>;
+}
+
+/// Why a fetch did not produce bytes, in the one dimension the caller has to
+/// branch on (#48, M-9).
+///
+/// A `String` could not carry this, and the caller cannot re-derive it: the cap
+/// is enforced *inside* the implementation, so "the response was too big" and
+/// "there was no response" arrive at the same `Err` with nothing but prose to
+/// tell them apart. That is fine for a log line and wrong for an outcome —
+/// `Outcome::Rejected` versus `Outcome::Unavailable` turns on exactly this
+/// question, and a string match on our own wording would be a contract nobody
+/// could see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchErrorKind {
+    /// No usable answer: DNS, TLS, a timeout, a non-2xx status, a redirect this
+    /// fetcher will not follow, a connection dropped mid-body. Nothing reached
+    /// us that could be judged.
+    Transport,
+    /// A response arrived and **broke the ceiling the caller set for it**. For
+    /// an artifact that ceiling is the size the manifest itself declares, so
+    /// this is a document disagreeing with its own index — a refusal, exactly
+    /// like a checksum mismatch, and the asymmetry worth naming: a body SHORT
+    /// of its declared size arrives intact and is refused by the length check,
+    /// so a body OVER it must not slip out as an outage.
+    OverCeiling,
+}
+
+/// A fetch failure: what to tell the user, and which class it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchError {
+    pub message: String,
+    pub kind: FetchErrorKind,
+}
+
+impl FetchError {
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: FetchErrorKind::Transport,
+        }
+    }
+
+    pub fn over_ceiling(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: FetchErrorKind::OverCeiling,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// The real fetcher: HTTPS via the same `reqwest` + rustls stack the rest of
@@ -748,23 +802,26 @@ impl HttpFetcher {
 
 #[async_trait::async_trait]
 impl Fetcher for HttpFetcher {
-    async fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    async fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, FetchError> {
         let mut resp = Self::client()
             .get(url)
             .send()
             .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
+            .map_err(|e| FetchError::transport(format!("GET {url}: {e}")))?;
         if !resp.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", resp.status()));
+            return Err(FetchError::transport(format!(
+                "GET {url}: HTTP {}",
+                resp.status()
+            )));
         }
         // `Content-Length` is used only to fail EARLY. The streaming cap below
         // is what actually bounds memory, because the header is remote input:
         // it may be absent (chunked) or simply a lie.
         if let Some(len) = resp.content_length() {
             if len > max_bytes {
-                return Err(format!(
+                return Err(FetchError::over_ceiling(format!(
                     "GET {url}: response declares {len} bytes, over the {max_bytes}-byte ceiling"
-                ));
+                )));
             }
         }
         // `Response::chunk` rather than a `Stream`: it is the same loop without
@@ -774,14 +831,14 @@ impl Fetcher for HttpFetcher {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
                     if out.len() as u64 + chunk.len() as u64 > max_bytes {
-                        return Err(format!(
+                        return Err(FetchError::over_ceiling(format!(
                             "GET {url}: response exceeded the {max_bytes}-byte ceiling mid-stream"
-                        ));
+                        )));
                     }
                     out.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                Err(e) => return Err(format!("GET {url}: {e}")),
+                Err(e) => return Err(FetchError::transport(format!("GET {url}: {e}"))),
             }
         }
         Ok(out)
@@ -813,7 +870,7 @@ impl MapFetcher {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Fetcher for MapFetcher {
-    async fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    async fn get(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, FetchError> {
         self.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -821,11 +878,11 @@ impl Fetcher for MapFetcher {
         let body = self
             .files
             .get(url)
-            .ok_or_else(|| format!("GET {url}: HTTP 404"))?;
+            .ok_or_else(|| FetchError::transport(format!("GET {url}: HTTP 404")))?;
         if body.len() as u64 > max_bytes {
-            return Err(format!(
+            return Err(FetchError::over_ceiling(format!(
                 "GET {url}: response exceeded the {max_bytes}-byte ceiling mid-stream"
-            ));
+            )));
         }
         Ok(body.clone())
     }
@@ -1309,8 +1366,13 @@ mod tests {
             .await
             .expect_err("a redirect is reported, never followed");
         assert!(
-            err.contains("302"),
+            err.message.contains("302"),
             "the redirect must surface as its own status, not be chased: {err}"
+        );
+        assert_eq!(
+            err.kind,
+            FetchErrorKind::Transport,
+            "a redirect never got as far as being a document (#48, M-9)"
         );
         served.await.ok();
     }
@@ -1321,6 +1383,16 @@ mod tests {
         m.insert("u".to_string(), vec![0u8; 100]);
         let f = MapFetcher::new(m);
         assert!(f.get("u", 100).await.is_ok());
+        // …and classifies the two failures the way the real one does, or the
+        // in-memory pipeline would exercise a different outcome split (M-9).
+        assert_eq!(
+            f.get("u", 99).await.unwrap_err().kind,
+            FetchErrorKind::OverCeiling
+        );
+        assert_eq!(
+            f.get("missing", 100).await.unwrap_err().kind,
+            FetchErrorKind::Transport
+        );
         assert!(f.get("u", 99).await.is_err());
         assert!(f.get("missing", 100).await.is_err());
     }

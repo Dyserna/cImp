@@ -2488,6 +2488,12 @@ pub async fn graph_usage_advice(
     // fixes; the updater suppresses this one while that one is up.
     let detection_local_rules_broken =
         crate::offload::detection::updater::broken_local_rules(&settings);
+    // #48/M-11: the sixth — the live rule directory is SHORT of files a
+    // rollback could not put back. Deliberately not gated on the detection
+    // switch: the files are missing from disk whether or not the layer is
+    // currently screening with them, and a user who switches detection back on
+    // must not silently get a short set.
+    let detection_rules_incomplete = crate::offload::detection::updater::rules_incomplete();
 
     // Apply-cooldown records are stored per (rule, root) — hand `evaluate`
     // only THIS root's, so an Apply in one project never mutes another
@@ -2533,6 +2539,7 @@ pub async fn graph_usage_advice(
         detection_update_stalled,
         detection_signature_down,
         detection_local_rules_broken,
+        detection_rules_incomplete,
     };
     let proposals = crate::advisor::evaluate(&sig);
     // "Collecting" = nothing has cleared the cold-start floor yet: not

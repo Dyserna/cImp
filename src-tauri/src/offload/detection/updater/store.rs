@@ -200,6 +200,13 @@ pub fn move_file(from: &Path, to: &Path) -> Result<(), String> {
 /// because `cargo test` runs these on threads of one process and a global
 /// switch would fail whatever move another test happened to be making. A test
 /// arms a name only it uses.
+///
+/// [`fail_moves_to_path`] arms a full destination PATH instead, for the one
+/// case a name cannot express (#48, M-10/M-11): a swap moves the same file name
+/// out to the archive and back again, so arming the name fails the archive loop
+/// before the interesting failure can happen. The rollback's restore and the
+/// staged move share one destination path and the archive move does not, which
+/// is exactly the discrimination needed to drive a *partial* rollback.
 #[cfg(test)]
 pub mod fault {
     use std::path::Path;
@@ -220,6 +227,17 @@ pub mod fault {
         Guard(file_name.to_string())
     }
 
+    /// Make every [`super::move_file`] whose destination is exactly `path`
+    /// fail, until the returned guard drops.
+    pub fn fail_moves_to_path(path: &Path) -> Guard {
+        let key = path.display().to_string();
+        armed()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(key.clone());
+        Guard(key)
+    }
+
     /// Disarms on drop, so a panicking test cannot poison the ones after it.
     pub struct Guard(String);
 
@@ -234,11 +252,12 @@ pub mod fault {
 
     pub(super) fn injected_failure(to: &Path) -> Option<String> {
         let name = to.file_name()?.to_string_lossy().to_string();
+        let full = to.display().to_string();
         let hit = armed()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|n| n == &name);
+            .any(|n| n == &name || n == &full);
         hit.then(|| {
             format!(
                 "copy -> {}: injected fault (the shape of a sharing violation)",
@@ -342,6 +361,29 @@ pub struct ComponentState {
     /// violation. See [`super::failure_signature`].
     #[serde(default)]
     pub last_failure_signature: String,
+    /// **Files a rollback could not put back** — the live directory is short of
+    /// them and the archive under `previous/` still holds them (#48, M-11).
+    ///
+    /// [`super::restore_archived`] used to swallow a per-file failure with a
+    /// `warn!` while its caller reported "the previous version was restored"
+    /// verbatim, and the post-rollback health check could not contradict it:
+    /// `signature::Status::healthy` compiles what IS on disk and a file that is
+    /// simply absent compiles to nothing at all. So the one failure mode that
+    /// permanently reduces coverage was the one with the most reassuring
+    /// message.
+    ///
+    /// This is the **reporting mirror**; the durable truth is on disk (the
+    /// files still in `previous/<version>/`, plus a `Phase::Restoring` journal
+    /// that survives the run). Both are written by the same helper
+    /// (`super::settle_restore`), and the disk copy is what drives the retry —
+    /// a state file lost to corruption costs a card, never a file.
+    ///
+    /// Consumed by `detection.rules_incomplete.v1` in `advisor.rs` and by the
+    /// Settings → Tools → Detection readout, and cleared the moment a retry (or
+    /// a later full activation, which rewrites the whole set anyway) makes it
+    /// untrue.
+    #[serde(default)]
+    pub unrestored_files: Vec<String>,
 }
 
 /// The whole state file.
@@ -482,11 +524,11 @@ fn heal_pre_split_failure(cs: &mut ComponentState, c: Component) {
 /// The journal file, beside `state.json` under the same root.
 pub const JOURNAL_FILE: &str = "activation.json";
 
-/// Which half of a two-loop swap was in flight, and therefore how to undo it
-/// (#48, U-2).
+/// Which part of a swap was in flight, and therefore how to undo it
+/// (#48, U-2; third state added for #48 M-10).
 ///
-/// The two halves need **opposite** recoveries, and that is the whole reason
-/// this is recorded rather than inferred from what is on disk:
+/// The phases need **different** recoveries, and that is the whole reason this
+/// is recorded rather than inferred from what is on disk:
 ///
 /// - [`Phase::Archiving`]: the destination still holds every file that has not
 ///   been archived yet. Restoring the archive on top of it is right; *wiping*
@@ -496,11 +538,26 @@ pub const JOURNAL_FILE: &str = "activation.json";
 ///   before the interruption, and the archive holds the complete outgoing set.
 ///   Here the destination MUST be cleared first, or recovery leaves a mixture
 ///   of old and new that no curation step ever validated as a set.
+/// - [`Phase::Restoring`]: **a rollback is itself in flight** — the destination
+///   has already been cleared of staged files and the archive is being moved
+///   back into it, file by file. This is the state M-10 found unrepresented:
+///   a kill here left the journal still reading `Moving`, so the next run's
+///   recovery deleted every file the rollback had ALREADY restored (they are
+///   `managed_files(dest)` like any other) and then restored only the remainder
+///   of the archive. Permanent loss of the difference, reported as "the
+///   previous version was restored". Recovery here is restore-only, never
+///   destructive, and — because `restore_archived` is idempotent — it is also
+///   what a *completed* rollback recovers to, safely, as a no-op.
+///
+/// A `Restoring` journal that OUTLIVES its run is the durable record of a
+/// rollback that could not put every file back (M-11): it is deliberately left
+/// on disk so the next run — and, since M-12, the next launch — retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Archiving,
     Moving,
+    Restoring,
 }
 
 /// A swap that was in flight when the process stopped.
@@ -570,9 +627,22 @@ pub fn clear_journal(root: &Path) {
     }
 }
 
+/// Whether a journal file exists at all — no parse, and **no side effects**.
+///
+/// [`read_journal`] deletes what it cannot parse, which is right under the run
+/// lock and wrong outside it: [`write_journal`] is a plain `fs::write`, so a
+/// reader without the lock can catch a peer's journal half-written and would
+/// delete the record of a swap that is in flight. [`super::recover_on_launch`]
+/// needs only "is there anything to do?" before deciding whether to take the
+/// lock, so it asks this instead.
+pub fn has_journal(root: &Path) -> bool {
+    journal_path(root).exists()
+}
+
 /// The in-flight swap recorded under `root`, if any. An unreadable or
 /// unparseable journal reads as absent and is removed: it cannot be acted on,
-/// and leaving it would make every future run try again.
+/// and leaving it would make every future run try again. **Call under the run
+/// lock** — see [`has_journal`] for the unlocked question.
 pub fn read_journal(root: &Path) -> Option<Journal> {
     let path = journal_path(root);
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -589,6 +659,203 @@ pub fn read_journal(root: &Path) -> Option<Journal> {
             None
         }
     }
+}
+
+// ── The cross-process run lock (#48, M-14) ─────────────────────────────────
+
+/// The lock file, beside `state.json` under the same root.
+pub const LOCK_FILE: &str = "update.lock";
+
+/// How long a lock file may go unrefreshed before it is treated as abandoned.
+///
+/// The staleness story a lockfile owes: a hard kill (task manager, power loss,
+/// the OS reclaiming a hung process) leaves the file behind, and a lock nobody
+/// holds must never wedge the updater permanently — that would be the
+/// never-degrade-to-no-rules invariant lost to a crash, which is the very thing
+/// the journal exists to prevent.
+///
+/// Thirty minutes, chosen to be comfortably longer than any legitimate run and
+/// comfortably shorter than the 24 h check interval. A run's ceiling is a
+/// handful of artifacts at [`HttpFetcher`](super::manifest::HttpFetcher)'s
+/// 300 s per-request timeout plus a YARA compile bounded by
+/// `validate::COMPILE_BUDGET`; 30 minutes covers a pathological one several
+/// times over, and a user who hits Check now half an hour after a crash gets
+/// their click rather than a permanent refusal.
+pub const LOCK_MAX_AGE_MS: u64 = 30 * 60 * 1000;
+
+/// What a held lock records — `pid` for the same reason the loopback discovery
+/// files carry one: so a human looking at a stuck updater can see who has it.
+///
+/// Deliberately **not** used to decide staleness. "A lock naming our own pid is
+/// a leftover" is true of the discovery files and false here: this lock is the
+/// only thing standing between an in-flight `run` and a concurrent
+/// [`super::recover_now`] in the SAME process, so self-exclusion is the
+/// property, not the exception.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LockRecord {
+    pid: u32,
+    started_ms: u64,
+}
+
+/// A held cross-process lock. Released on drop, including on unwind.
+#[derive(Debug)]
+pub struct RunLock {
+    path: PathBuf,
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    target: "offload",
+                    path = %self.path.display(),
+                    error = %e,
+                    "detection updater: could not release the run lock"
+                );
+            }
+        }
+    }
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    root.join(LOCK_FILE)
+}
+
+/// How long ago `path` was last written, in ms. `None` when the filesystem
+/// cannot say (no mtime, or a clock that puts it in the future).
+fn file_age_ms(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let age = std::time::SystemTime::now().duration_since(modified).ok()?;
+    Some(age.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Take the run lock for `root`, or report why not.
+///
+/// # Why a file and not a mutex (#48, M-14)
+///
+/// `super::run_lock` is a `tokio::sync::Mutex` in *this* process's address
+/// space. Two cImp instances started from one exe directory — a portable build
+/// on a shared drive, a second launch while the first is minimised — share
+/// `<exe-dir>/detection-updates` and `<exe-dir>/detection/rules.d` and are
+/// invisible to each other's mutex. Both would archive to the same
+/// `previous/<version>/` path, and [`wipe_dir`] on the second one destroys the
+/// only copy of the old bundle *while the first one's journal still points at
+/// it* — recovery then finds an empty archive and clears the journal, which is
+/// the permanent loss of the live rule set that decision 13 forbids.
+///
+/// # The mechanism
+///
+/// `create_new` — the O_EXCL create the attach allocator
+/// ([`crate::attach`]) already uses for exactly this "no other process may
+/// observe the same slot" property. Atomic on both Windows and POSIX, needs no
+/// new dependency, and leaves an inspectable file behind rather than an
+/// invisible OS handle.
+///
+/// A lock is broken (and re-taken) only on **age**: older than
+/// [`LOCK_MAX_AGE_MS`], or a start time in the FUTURE — the same
+/// clock-went-backwards case [`super::is_due`] defends against, and for the
+/// same reason: a state directory copied from another machine must not park the
+/// updater forever.
+///
+/// A lock whose body will not parse is aged by its **mtime**, not treated as
+/// stale outright. The create and the write cannot be one operation under
+/// `create_new` (a write-then-rename would overwrite, which is the opposite of
+/// what is wanted), so there is a window in which a live peer's lock is a
+/// zero-byte file — and "unparseable ⇒ break it" would race exactly into it.
+/// mtime closes that window and still guarantees no lock outlives the ceiling.
+///
+/// The pid is **not** consulted, deliberately: see [`LockRecord`].
+pub fn acquire_run_lock(root: &Path, now_ms: u64) -> Result<RunLock, String> {
+    let path = lock_path(root);
+    std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
+    // Two attempts at most: take it, or break exactly one stale lock and take
+    // it. A loop here would be a race against a peer that is legitimately
+    // re-taking the lock, and losing that race is not an error worth retrying.
+    for attempt in 0..2 {
+        let record = LockRecord {
+            pid: std::process::id(),
+            started_ms: now_ms,
+        };
+        let body = serde_json::to_string(&record).unwrap_or_default();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                // A lock whose body could not be written is still a held lock:
+                // the exclusion comes from the file existing. Only the
+                // staleness metadata is lost, and an unreadable record reads as
+                // stale, which fails safe (a peer may break it after
+                // `LOCK_MAX_AGE_MS`, never before).
+                if let Err(e) = f.write_all(body.as_bytes()) {
+                    warn!(
+                        target: "offload",
+                        path = %path.display(),
+                        error = %e,
+                        "detection updater: took the run lock but could not record its owner"
+                    );
+                }
+                return Ok(RunLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if attempt > 0 {
+                    return Err("another cImp instance is updating detection data".to_string());
+                }
+                let held = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<LockRecord>(&s).ok());
+                let stale_reason = match &held {
+                    Some(r) if r.started_ms > now_ms => Some(format!(
+                        "it was taken {} ms in the future (the clock moved, or the state \
+                         directory came from another machine)",
+                        r.started_ms.saturating_sub(now_ms)
+                    )),
+                    Some(r) if now_ms.saturating_sub(r.started_ms) > LOCK_MAX_AGE_MS => {
+                        Some(format!(
+                            "it has been held for {} ms, past the {LOCK_MAX_AGE_MS} ms ceiling",
+                            now_ms.saturating_sub(r.started_ms)
+                        ))
+                    }
+                    Some(_) => None,
+                    // No readable record: age it by mtime rather than breaking
+                    // it, so the create/write window of a live peer is not a
+                    // race. A file we cannot even stat has nothing left to
+                    // vouch for it.
+                    None => match file_age_ms(&path) {
+                        Some(age) if age > LOCK_MAX_AGE_MS => Some(format!(
+                            "its owner is unreadable and it was last touched {age} ms ago, past \
+                             the {LOCK_MAX_AGE_MS} ms ceiling"
+                        )),
+                        Some(_) => None,
+                        None => Some("its owner is unreadable and it cannot be aged".to_string()),
+                    },
+                };
+                let Some(why) = stale_reason else {
+                    return Err(match held {
+                        Some(r) => format!(
+                            "another cImp instance (pid {}) is updating detection data",
+                            r.pid
+                        ),
+                        None => "another cImp instance is updating detection data".to_string(),
+                    });
+                };
+                warn!(
+                    target: "offload",
+                    path = %path.display(),
+                    reason = %why,
+                    "detection updater: breaking a stale run lock"
+                );
+                if let Err(e) = std::fs::remove_file(&path) {
+                    return Err(format!("could not break the stale run lock: {e}"));
+                }
+            }
+            Err(e) => return Err(format!("take {}: {e}", path.display())),
+        }
+    }
+    Err("another cImp instance is updating detection data".to_string())
 }
 
 /// Persist `state`. Written whole, via a temp file and a rename, so a crash

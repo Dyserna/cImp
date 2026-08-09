@@ -4635,7 +4635,7 @@
                     : ''}
                 </span>
               </li>
-              {#if detection.local_rules_broken}
+              {#if detection.local_rules_broken?.failed.length}
                 <!-- #48/U-4's other half: once a broken `local/` rule stopped
                      vetoing the update channel it stopped being loud, and its
                      only trace was a `warn!` line in a log nobody has open.
@@ -4651,6 +4651,29 @@
                     {detection.local_rules_broken.failed.join(', ')} — the rest of the
                     set ({detection.local_rules_broken.rules} rule(s)) is live. Fix the
                     file and press Reload rules.
+                  </span>
+                </li>
+              {/if}
+              {#if detection.local_rules_broken?.renamed.length}
+                <!-- #48/M-13: a rule of the user's whose identifier a shipped
+                     rule has taken. It IS live and IS matching, so this is
+                     deliberately NOT the `down` row above — describing it in
+                     the broken file's words would be the same "degraded path
+                     reporting the wrong thing" shape this milestone keeps
+                     finding. It still needs a row: the identifier a hit
+                     reports is no longer the one their file spells. -->
+                <li class="healthy">
+                  <span class="mcp-dot" aria-hidden="true"></span>
+                  <span class="mcp-name">Your renamed rules</span>
+                  <span class="mcp-detail" title={detection.local_rules_broken.dir}>
+                    {detection.local_rules_broken.renamed.length} rule(s) in
+                    <code>rules.d/local/</code> declare an identifier the shipped bundle
+                    also uses, so cImp loaded yours under a renamed one and they keep
+                    matching:
+                    {detection.local_rules_broken.renamed
+                      .map((r) => `${r.from} → ${r.to} (${r.file})`)
+                      .join(', ')} — a hit reports the NEW identifier. Your files were
+                    not modified; rename the rule yourself to take the name back.
                   </span>
                 </li>
               {/if}
@@ -4877,6 +4900,23 @@
                 {:else if comp.last_outcome}
                   <small class="hint" class:down={!comp.last_ok}>
                     Last check: {comp.last_outcome}
+                  </small>
+                {/if}
+                {#if comp.unrestored_files.length}
+                  <!--
+                    #48/M-11: the only line in this block that means "degraded
+                    RIGHT NOW". A failed rollback left the live directory short
+                    of files that are still in the retained copy — the state no
+                    other readout here can express, because everything that is
+                    present compiles clean. Unhealthy colour, unconditionally:
+                    unlike a refusal, this is not "the old data is still live".
+                  -->
+                  <small class="hint down">
+                    Incomplete rule set: {comp.unrestored_files.length} file(s) could
+                    not be restored ({comp.unrestored_files.join(', ')}) and are
+                    missing from the live folder. They are still retained, and cImp
+                    retries on every check and every launch — close anything holding
+                    them open (antivirus, an editor) and restart.
                   </small>
                 {/if}
                 {#if comp.available_notes}

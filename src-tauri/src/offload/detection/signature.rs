@@ -28,6 +28,13 @@
 //! the milestone's decision 13 forbids — so the failure is per-file, logged at
 //! WARN, and counted in the [`Status`] the Settings block reads.
 //!
+//! **An identifier collision is not a failure at all** (#48, M-13). YARA
+//! identifiers are unique across the set, so a bundle that starts shipping a
+//! rule the user had already named would otherwise cost the user their whole
+//! file. Instead the user's rule is loaded under a `custom_` identifier and
+//! keeps matching — see [`rename_colliding_local_rules`]. Nothing on disk is
+//! rewritten; the rename lives only in the compiled set.
+//!
 //! # Bounded work
 //!
 //! Only [`SCAN_PREFIX_BYTES`] of a result is scanned, and the scanner runs
@@ -35,6 +42,7 @@
 //! "no verdict", never to a stalled fetch — detection is surface-only
 //! (decision 5), so a missing verdict costs a warning header, not correctness.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -75,6 +83,54 @@ pub const SCAN_TIMEOUT: Duration = Duration::from_secs(1);
 /// updater's bundles may use either.
 const RULE_EXTENSIONS: [&str; 2] = ["yar", "yara"];
 
+/// The prefix [`read_sources`] gives a file it read from the user-owned
+/// `local/` overlay, and therefore the test for "this file is the user's, not
+/// the bundle's".
+///
+/// One definition, re-exported rather than restated, because three separate
+/// behaviours key on it: the updater's `local/` forgiveness, the Settings card
+/// about the user's own rules, and M-13's collision rename.
+pub const LOCAL_PREFIX: &str = "local/";
+
+/// The prefix a `local/` rule is loaded under when the identifier it declares
+/// is already taken (#48, M-13).
+///
+/// `custom_` and not `local_`: the word the user reads in a hit, an activity
+/// row or the Settings panel should say *whose* rule fired, and "custom" is the
+/// word the owner used. It is also the prefix least likely to appear in a
+/// curated public bundle, which matters because a bundle rule named
+/// `custom_Foo` would push the escalation in [`rename_candidates`] one step
+/// further out for a user rule named `Foo`.
+pub const CUSTOM_PREFIX: &str = "custom_";
+
+/// How far [`rename_candidates`] walks before giving up on one identifier.
+///
+/// A ceiling rather than an unbounded loop because the search runs over
+/// attacker-adjacent input (a bundle chooses its own identifiers), and because
+/// a set that needs 64 escalations for one name is not a collision — it is a
+/// bundle deliberately squatting every candidate, and the honest answer there
+/// is the pre-M-13 behaviour: leave the file alone and report it as skipped.
+const MAX_RENAME_ATTEMPTS: u32 = 64;
+
+/// The identifiers a `local/` rule may be loaded under, in the order they are
+/// tried: `custom_Foo`, then `custom_2_Foo`, `custom_3_Foo`, …
+///
+/// **Deterministic and idempotent by construction.** The sequence is a pure
+/// function of the identifier the user's file declares, and that file is never
+/// rewritten (see [`rename_colliding_local_rules`]), so every load of the same
+/// directory derives the same name — there is no accumulated state for a second
+/// load to prefix twice.
+///
+/// A user rule already named `custom_Foo` that collides with a *shipped*
+/// `custom_Foo` becomes `custom_custom_Foo`, which is ugly and correct. The
+/// tidier-looking alternative — stripping a `custom_` the user may have chosen
+/// deliberately before prefixing — would let two different user rules resolve
+/// to one name, which is the bug this whole function exists to avoid.
+fn rename_candidates(ident: &str) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(format!("{CUSTOM_PREFIX}{ident}"))
+        .chain((2..=MAX_RENAME_ATTEMPTS).map(move |n| format!("{CUSTOM_PREFIX}{n}_{ident}")))
+}
+
 /// What the Settings → Tools → Detection block reads: how much of the layer is
 /// actually live. `files_failed` non-zero is the signal that matters — it means
 /// rules the user believes are active are not.
@@ -96,6 +152,16 @@ pub struct Status {
     pub rules: usize,
     /// Names of the rejected files, for the Settings tooltip.
     pub failed: Vec<String>,
+    /// User rules that are live under a **different identifier** than the one
+    /// their file spells, because the one it spells was already taken (#48,
+    /// M-13). Empty in every ordinary case.
+    ///
+    /// Deliberately NOT part of [`Status::healthy`]: a renamed rule compiled,
+    /// loaded, and matches. Making it unhealthy would hand the updater's
+    /// post-activation gate a reason to roll back — which is the exact channel
+    /// freeze M-13 exists to remove. It is a *notice*, and it needs a consumer
+    /// rather than a veto: [`updater::broken_local_rules`](super::updater::broken_local_rules).
+    pub renamed: Vec<RenamedRule>,
     /// The directory scanned, so "0 files" is diagnosable ("…and here is where
     /// I looked").
     pub dir: String,
@@ -124,6 +190,64 @@ impl Status {
         self.armed = self.files_loaded > 0 && self.rules > 0;
         self.healthy = self.armed && self.files_failed == 0;
         self
+    }
+
+    /// One clause naming the rules that are live under a renamed identifier —
+    /// **empty when there are none**, so every existing message this is
+    /// appended to is byte-for-byte unchanged in the ordinary case.
+    ///
+    /// The one sentence every updater surface shares (#48, M-13), so the
+    /// activation row, the forgiveness note and the Settings detail cannot
+    /// describe the same rename three different ways.
+    pub fn rename_note(&self) -> String {
+        if self.renamed.is_empty() {
+            return String::new();
+        }
+        format!(
+            "; {} user rule(s) in `{LOCAL_PREFIX}` collide with a shipped rule identifier and are \
+             live under a renamed one ({}) so they keep matching — your files on disk were not \
+             modified",
+            self.renamed.len(),
+            self.renamed
+                .iter()
+                .map(RenamedRule::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// A rule the user wrote in `rules.d/local/` that is live under a **different
+/// identifier** than the one in their file (#48, M-13).
+///
+/// # Why this exists at all
+///
+/// YARA identifiers are unique across a compiled set, so when a bundle starts
+/// shipping a rule with a name a user had already used, something has to give.
+/// The three options were: refuse the bundle (freezes the update channel
+/// forever, and blames the publisher for the user's file — U-4's exact
+/// symptom), drop the user's rule (their protection silently stops, and the
+/// README told them to write that file), or rename the user's rule. Only the
+/// third loses nothing.
+///
+/// The rename is applied **at load time only**. See
+/// [`rename_colliding_local_rules`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RenamedRule {
+    /// The file it came from, `local/`-prefixed as [`read_sources`] spells it.
+    pub file: String,
+    /// The identifier the user wrote, and the one their file still contains.
+    pub from: String,
+    /// The identifier it is live under — and therefore the identifier a hit is
+    /// reported with, which is why the user has to be told.
+    pub to: String,
+}
+
+impl RenamedRule {
+    /// `Foo → custom_Foo (local/mine.yar)`. One spelling, shared by every
+    /// surface that names a rename.
+    pub fn describe(&self) -> String {
+        format!("{} → {} ({})", self.from, self.to, self.file)
     }
 }
 
@@ -172,9 +296,14 @@ pub fn rules_dir() -> Option<PathBuf> {
 /// recursing would make the updater's "replace the bundle" contract ambiguous.
 ///
 /// The shipped bundle is read first so that on an identifier collision it is
-/// the *local* file that gets rejected — the user's own file names its own
+/// the *local* rule that yields the name — the user's own file names its own
 /// rules, and losing a shipped rule to a stranger's typo would silently
 /// weaken the layer.
+///
+/// "Yields the name", not "is rejected": since #48/M-13 the local rule is
+/// loaded under a `custom_` identifier instead of dropped
+/// ([`rename_colliding_local_rules`]). The ordering still decides which side
+/// keeps its identifier, which is why it is still a contract and still sorted.
 ///
 /// Public because the C3 updater reads a **staged** bundle with exactly this
 /// function: "what counts as a rule file, and in what order" must have one
@@ -183,7 +312,7 @@ pub fn rules_dir() -> Option<PathBuf> {
 /// subdirectory, so the second pass finds nothing there.
 pub fn read_sources(dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for (label, d) in [("", dir.to_path_buf()), ("local/", dir.join("local"))] {
+    for (label, d) in [("", dir.to_path_buf()), (LOCAL_PREFIX, dir.join("local"))] {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -277,6 +406,293 @@ fn try_compile<'a>(sources: impl Iterator<Item = &'a str>) -> Option<yara_x::Rul
     Some(compiler.build())
 }
 
+/// The rule identifiers a single source declares, or `None` if it does not
+/// compile on its own.
+///
+/// Asked of the compiler rather than of a parser of ours: `Rules::iter` is the
+/// authority on what a source defines (including `private` rules, which never
+/// appear in a scan result and collide exactly like any other), so the set this
+/// returns cannot drift from the set YARA will refuse a duplicate of.
+fn rule_identifiers(src: &str) -> Option<Vec<String>> {
+    let mut compiler = yara_x::Compiler::new();
+    compiler.add_source(src).ok()?;
+    Some(
+        compiler
+            .build()
+            .iter()
+            .map(|r| r.identifier().to_string())
+            .collect(),
+    )
+}
+
+/// What [`rename_colliding_local_rules`] produces: the sources to compile
+/// (identical to its input except for the rewritten `local/` files) and the
+/// record of what it changed, which is the half every reporting surface reads.
+pub type Renamed = (Vec<(String, String)>, Vec<RenamedRule>);
+
+/// Load a user rule whose identifier a shipped rule has taken **under a
+/// `custom_` name**, instead of dropping it (#48, M-13).
+///
+/// # The decision
+///
+/// YARA identifiers are unique across the compiled set, so a bundle that starts
+/// shipping `CImp_Injection_Foo` when the user already wrote a rule by that
+/// name forces a choice. Refusing the bundle wedges the update channel forever
+/// (every later fetch collides again) and blames the publisher for a file the
+/// updater is contractually forbidden to touch. Dropping the user's rule
+/// silently stops protecting them — with a file the README told them to write.
+/// So: **the user's rule is renamed and the update proceeds.** Nothing is lost
+/// and nothing wedges.
+///
+/// # Conditional, never blanket
+///
+/// Only an identifier that is **already claimed** is renamed. Namespacing every
+/// `local/` rule would change identifiers users already rely on — in hit lists,
+/// in activity rows, in whatever they grep their logs for — to solve a problem
+/// almost none of them have.
+///
+/// # Nothing on disk is rewritten
+///
+/// The rename is applied to the source text *in memory*, on the way to the
+/// compiler. A security tool silently editing a file the user may hold in
+/// version control or a sync folder is a worse problem than the one being
+/// solved, and it would also destroy the property that makes this idempotent:
+/// the input is a file that never changes, so every load re-derives the same
+/// name and there is no accumulated prefix to double.
+///
+/// # Ordering, and the second-order collision
+///
+/// Sources arrive bundle-first ([`read_sources`]), and each file's identifiers
+/// are claimed in that order. A `local/` identifier that is already claimed —
+/// by the bundle, or by an *earlier* `local/` file — walks
+/// [`rename_candidates`] until it finds a name claimed by nothing, including
+/// nothing else in its own file and nothing already handed to a sibling. So a
+/// user rule literally named `custom_Foo` does not lose to a rename of `Foo`:
+/// `Foo` escalates to `custom_2_Foo` and both stay live.
+///
+/// # It can only ever fail safe
+///
+/// Every rewrite is verified before it is accepted: the rewritten source must
+/// compile on its own AND declare exactly the identifiers planned for it. A
+/// source this cannot rewrite (a shape the scanner does not model, a name that
+/// exhausts [`MAX_RENAME_ATTEMPTS`]) is passed through untouched and meets the
+/// pre-M-13 behaviour — skipped by [`compile_sources`] and reported as a broken
+/// `local/` file. Never a panic, never a silent drop.
+///
+/// Returns `None` when nothing was renamed, so the caller can keep the sources
+/// it already has, and a [`Renamed`] otherwise.
+pub fn rename_colliding_local_rules(sources: &[(String, String)]) -> Option<Renamed> {
+    // Nothing of the user's in this set: a staging directory being validated,
+    // the graph's single-source secret screen, a bundle-only compile. There is
+    // nothing to protect, so there is nothing to rename.
+    if !sources.iter().any(|(n, _)| n.starts_with(LOCAL_PREFIX)) {
+        return None;
+    }
+    // What each source declares, computed once. `None` for a source that does
+    // not compile alone: it declares nothing this can reason about, and its
+    // failure is not a collision — `compile_sources` skips it and
+    // `broken_local_rules` reports it, exactly as before.
+    let declared: Vec<Option<Vec<String>>> =
+        sources.iter().map(|(_, s)| rule_identifiers(s)).collect();
+    // **Every identifier the user wrote anywhere in `local/`, reserved up
+    // front.** A rename must never take a name the user chose deliberately: a
+    // set where `a.yar` declares `Foo` and `b.yar` declares `custom_Foo` must
+    // resolve to `custom_2_Foo` for `a.yar`, not to `a.yar` squatting
+    // `custom_Foo` and pushing `b.yar` out to `custom_custom_Foo`. Only a
+    // whole-overlay pre-pass can know that, because the file that owns the name
+    // may be read after the file that would take it.
+    let user_declared: BTreeSet<&str> = sources
+        .iter()
+        .zip(&declared)
+        .filter(|((n, _), _)| n.starts_with(LOCAL_PREFIX))
+        .filter_map(|(_, ids)| ids.as_ref())
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    let mut renamed: Vec<RenamedRule> = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(sources.len());
+
+    for ((name, src), ids) in sources.iter().zip(&declared) {
+        let Some(ids) = ids else {
+            out.push((name.clone(), src.clone()));
+            continue;
+        };
+        if !name.starts_with(LOCAL_PREFIX) {
+            claimed.extend(ids.iter().cloned());
+            out.push((name.clone(), src.clone()));
+            continue;
+        }
+        // Reserved = everything already claimed (the bundle, and the `local/`
+        // files read before this one) plus every identifier the user wrote
+        // anywhere. Names chosen for THIS file are added as they are picked.
+        let mut reserved: BTreeSet<&str> = claimed.iter().map(String::as_str).collect();
+        reserved.extend(user_declared.iter().copied());
+        let mut chosen: Vec<String> = Vec::new();
+        let mut plan: BTreeMap<String, String> = BTreeMap::new();
+        for id in ids {
+            if !claimed.contains(id) {
+                continue;
+            }
+            let Some(to) = rename_candidates(id)
+                .find(|c| !reserved.contains(c.as_str()) && !chosen.iter().any(|k| k == c))
+            else {
+                warn!(
+                    target: "offload",
+                    file = %name,
+                    rule = %id,
+                    attempts = MAX_RENAME_ATTEMPTS,
+                    "detection: a user rule collides on its identifier and every renamed form is \
+                     taken too; leaving the file alone, which means it is skipped and reported"
+                );
+                plan.clear();
+                break;
+            };
+            chosen.push(to.clone());
+            plan.insert(id.clone(), to);
+        }
+        if plan.is_empty() {
+            claimed.extend(ids.iter().cloned());
+            out.push((name.clone(), src.clone()));
+            continue;
+        }
+        // What the rewritten file must declare, exactly: renamed where planned,
+        // untouched everywhere else.
+        let mut expect: Vec<String> = ids
+            .iter()
+            .map(|i| plan.get(i).cloned().unwrap_or_else(|| i.clone()))
+            .collect();
+        expect.sort();
+        let rewritten = rewrite_rule_declarations(src, &plan).filter(|s| {
+            let mut got = rule_identifiers(s).unwrap_or_default();
+            got.sort();
+            got == expect
+        });
+        let Some(rewritten) = rewritten else {
+            warn!(
+                target: "offload",
+                file = %name,
+                rules = %plan.keys().cloned().collect::<Vec<_>>().join(", "),
+                "detection: a user rule collides on its identifier but the file could not be \
+                 safely rewritten; leaving it alone, which means it is skipped and reported"
+            );
+            claimed.extend(ids.iter().cloned());
+            out.push((name.clone(), src.clone()));
+            continue;
+        };
+        for (from, to) in &plan {
+            renamed.push(RenamedRule {
+                file: name.clone(),
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+        claimed.extend(expect);
+        out.push((name.clone(), rewritten));
+    }
+    (!renamed.is_empty()).then_some((out, renamed))
+}
+
+/// Rewrite the **top-level** `rule <ident>` declarations named in `plan`, and
+/// nothing else. `None` unless every planned rename was applied exactly once.
+///
+/// # Why a scanner and not a regex
+///
+/// The text to change is a declaration, and the same characters appear in
+/// comments and in string literals — a rules file that documents itself with
+/// `// rule Foo is the strict variant`, or that matches on the literal
+/// `"rule Foo"`, is ordinary. A regex cannot tell those apart; this walks the
+/// source keeping enough state to skip comments, string literals and rule
+/// bodies, and only rewrites at **brace depth zero**, where a string literal
+/// cannot occur at all.
+///
+/// # Its failure mode is a refusal, not a corruption
+///
+/// The lexer is deliberately partial: it does not model regexp literals, so a
+/// pattern like `/[{]/` (an unbalanced brace inside a character class) leaves
+/// the depth counter high and every later declaration invisible to it. That
+/// case returns `None` — the count of applied renames no longer matches the
+/// plan — and the caller keeps the original file. Every path out of here is
+/// either "exactly the planned renames" or "nothing".
+fn rewrite_rule_declarations(src: &str, plan: &BTreeMap<String, String>) -> Option<String> {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 16 * plan.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    let mut depth: i32 = 0;
+    let mut applied = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if depth != 0 || &src[start..i] != "rule" {
+                    continue;
+                }
+                // Only plain whitespace between the keyword and the name. A
+                // comment there is legal YARA and vanishingly rare, and not
+                // renaming it is the safe half of the trade.
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let id_start = j;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if let Some(to) = plan.get(&src[id_start..j]) {
+                    out.push_str(&src[copied..id_start]);
+                    out.push_str(to);
+                    copied = j;
+                    applied += 1;
+                }
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    if applied != plan.len() {
+        return None;
+    }
+    out.push_str(&src[copied..]);
+    Some(out)
+}
+
 /// Compile the rule set that `dir` (plus its `local/` overlay) would produce,
 /// and report it — **without** touching the live slot.
 ///
@@ -293,7 +709,27 @@ pub fn compile_report(dir: Option<&Path>) -> (Option<Arc<yara_x::Rules>>, Status
         ..Status::default()
     };
     let sources = dir.map(read_sources).unwrap_or_default();
-    let (rules, failed) = compile_sources(&sources);
+    let (mut rules, mut failed) = compile_sources(&sources);
+    // #48/M-13 — the rename pass, gated on the one condition that can possibly
+    // need it. A duplicate identifier makes `add_source` error, so the
+    // all-at-once fast path fails and the incremental one rejects a file: a
+    // collision ALWAYS shows up as a non-empty `failed`. Gating on it keeps the
+    // overwhelmingly common load (nothing failed) at exactly the compiles it
+    // cost before this fix.
+    if !failed.is_empty() {
+        if let Some((resolved, renamed)) = rename_colliding_local_rules(&sources) {
+            let (r, f) = compile_sources(&resolved);
+            // Never accept a rewrite that loads LESS than leaving the files
+            // alone would. Verification in `rename_colliding_local_rules`
+            // should make this unreachable; it is two lines to make it
+            // structurally true rather than argued.
+            if f.len() <= failed.len() {
+                rules = r;
+                failed = f;
+                status.renamed = renamed;
+            }
+        }
+    }
     status.files_failed = failed.len();
     status.files_loaded = sources.len() - failed.len();
     status.failed = failed;
@@ -339,6 +775,15 @@ pub fn reload() -> Status {
             failed = %status.failed.join(", "),
             loaded = status.files_loaded,
             "detection: some rules files were rejected; the rest of the signature layer is live"
+        );
+    }
+    if !status.renamed.is_empty() {
+        warn!(
+            target: "offload",
+            renamed = %status.renamed.iter().map(RenamedRule::describe).collect::<Vec<_>>().join(", "),
+            "detection: user rules whose identifier a shipped rule has taken are live under a \
+             renamed identifier; the files on disk were not modified \
+             (detection.local_rules_broken.v1 names them to the user)"
         );
     }
     info!(
@@ -1060,6 +1505,11 @@ anything automatically.\n";
     /// identifier: YARA rejects the *set*, so per-file validation in isolation
     /// would have accepted both and left the layer with no rules at all. The
     /// later file loses, which is why the shipped bundle is read first.
+    ///
+    /// This is [`compile_sources`] alone — the raw compiler discipline, with no
+    /// rename pass in front of it. What a rules DIRECTORY does with the same
+    /// collision is [`compile_report`]'s job and #48/M-13's answer; see
+    /// `a_collision_renames_the_users_rule_and_it_still_matches`.
     #[test]
     fn an_identifier_collision_drops_only_the_later_file() {
         let rule = |body: &str| format!("rule Dup {{ strings: $a = \"{body}\" condition: $a }}");
@@ -1074,6 +1524,317 @@ anything automatically.\n";
         assert_eq!(
             scan_outcome_with(&rules, "xx second xx"),
             ScanOutcome::Clean
+        );
+    }
+
+    // ── #48/M-13 — a collision renames the user's rule ─────────────────────
+
+    /// A rules directory with `bundle` at the top level and `local` under
+    /// `local/`, compiled through the real [`compile_report`]. Returns the
+    /// compiled set and the status, then removes the directory.
+    fn dir_report(
+        bundle: &[(&str, &str)],
+        local: &[(&str, &str)],
+    ) -> (Option<Arc<yara_x::Rules>>, Status) {
+        let dir = std::env::temp_dir().join(format!("cimp-sig-m13-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("local")).unwrap();
+        for (name, src) in bundle {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        for (name, src) in local {
+            std::fs::write(dir.join("local").join(name), src).unwrap();
+        }
+        let out = compile_report(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    /// A rule with a distinctive marker, so "did it still fire?" is answerable.
+    fn marker_rule(ident: &str, marker: &str) -> String {
+        format!("rule {ident} {{\n    strings:\n        $a = \"{marker}\"\n    condition:\n        $a\n}}")
+    }
+
+    /// **#48/M-13 — the invariant: a user rule is never lost to a name clash,
+    /// and the update is never blocked by one.**
+    ///
+    /// A bundle starts shipping `Dup_Rule`; the user already had one. Both must
+    /// be live, the user's must still MATCH ITS PAYLOAD under the new name, and
+    /// nothing may be reported as failed — a failure here is what used to
+    /// freeze the update channel.
+    ///
+    /// What would this still pass with? Very little. A fix that dropped the
+    /// user's rule fails on `custom_marker`. A fix that dropped the shipped one
+    /// fails on `shipped_marker`. A fix that renamed but broke the pattern
+    /// fails on the same assertion — this checks a *hit*, not a rule count, so
+    /// a rename that produced a syntactically valid rule matching nothing (the
+    /// obvious way to get this wrong) is caught. A fix that blanket-namespaced
+    /// everything fails on the untouched `Solo_Rule` below.
+    #[test]
+    fn a_collision_renames_the_users_rule_and_it_still_matches() {
+        let (rules, status) = dir_report(
+            &[("core.yar", &marker_rule("Dup_Rule", "shipped_marker"))],
+            &[(
+                "mine.yar",
+                &format!(
+                    "{}\n{}",
+                    marker_rule("Dup_Rule", "custom_marker"),
+                    marker_rule("Solo_Rule", "solo_marker")
+                ),
+            )],
+        );
+        let rules = rules.expect("both files load");
+
+        // Nothing was dropped and nothing is reported broken: the update path's
+        // health gate reads exactly this.
+        assert!(status.healthy, "{status:?}");
+        assert_eq!(status.files_failed, 0, "{status:?}");
+        assert_eq!(status.rules, 3, "{status:?}");
+
+        // The shipped rule kept its identifier…
+        assert_eq!(
+            scan_outcome_with(&rules, "xx shipped_marker xx").matched(),
+            ["Dup_Rule"]
+        );
+        // …the user's is live under the renamed one AND STILL FIRES…
+        assert_eq!(
+            scan_outcome_with(&rules, "xx custom_marker xx").matched(),
+            ["custom_Dup_Rule"]
+        );
+        // …and their rule that never collided is untouched: the rename is
+        // conditional, not a blanket namespacing of `local/`.
+        assert_eq!(
+            scan_outcome_with(&rules, "xx solo_marker xx").matched(),
+            ["Solo_Rule"]
+        );
+
+        assert_eq!(
+            status.renamed,
+            vec![RenamedRule {
+                file: "local/mine.yar".to_string(),
+                from: "Dup_Rule".to_string(),
+                to: "custom_Dup_Rule".to_string(),
+            }],
+            "the user has to be able to learn the new identifier"
+        );
+    }
+
+    /// **Idempotence.** The user's file is never rewritten, so a second load of
+    /// the same directory must derive exactly the same name — no
+    /// `custom_custom_`, no drift, no growth. Proved by loading twice AND by
+    /// feeding the resolver its own output, which is the state a fix that DID
+    /// write to disk would leave behind.
+    #[test]
+    fn renaming_is_idempotent_across_loads_and_over_its_own_output() {
+        let bundle = [("core.yar", marker_rule("Dup_Rule", "shipped_marker"))];
+        let local = [("mine.yar", marker_rule("Dup_Rule", "custom_marker"))];
+        let as_refs = |v: &[(&'static str, String)]| -> Vec<(&'static str, String)> { v.to_vec() };
+        let b = as_refs(&bundle);
+        let l = as_refs(&local);
+        let call = || {
+            dir_report(
+                &b.iter().map(|(n, s)| (*n, s.as_str())).collect::<Vec<_>>(),
+                &l.iter().map(|(n, s)| (*n, s.as_str())).collect::<Vec<_>>(),
+            )
+            .1
+        };
+        let first = call();
+        let second = call();
+        assert_eq!(
+            first.renamed, second.renamed,
+            "a second load must not drift"
+        );
+        assert_eq!(first.renamed[0].to, "custom_Dup_Rule");
+
+        // And the resolver over an already-resolved set is a no-op: nothing is
+        // claimed twice any more, so there is nothing left to rename.
+        let sources = vec![
+            ("core.yar".to_string(), bundle[0].1.clone()),
+            ("local/mine.yar".to_string(), local[0].1.clone()),
+        ];
+        let (resolved, _) = rename_colliding_local_rules(&sources).expect("the first pass renames");
+        assert!(
+            rename_colliding_local_rules(&resolved).is_none(),
+            "a second pass must find nothing to do — this is what stops a double prefix"
+        );
+    }
+
+    /// **The second-order collision.** The renamed identifier is itself already
+    /// taken — here by another rule the user wrote. The escalation must be
+    /// deterministic, must not panic, and must not silently drop either rule.
+    ///
+    /// Two files at once, so the case also covers "the claim came from a
+    /// sibling `local/` file", not only "from the bundle".
+    #[test]
+    fn a_rename_that_would_collide_again_escalates_deterministically() {
+        let run = || {
+            dir_report(
+                &[("core.yar", &marker_rule("Dup_Rule", "shipped_marker"))],
+                &[
+                    ("a_mine.yar", &marker_rule("Dup_Rule", "mine_marker")),
+                    (
+                        "b_theirs.yar",
+                        &marker_rule("custom_Dup_Rule", "squatter_marker"),
+                    ),
+                ],
+            )
+        };
+        let (rules, status) = run();
+        let rules = rules.expect("all three files load");
+        assert!(status.healthy, "{status:?}");
+        assert_eq!(status.rules, 3, "{status:?}");
+
+        // Every payload still finds its own rule, under a name that is unique.
+        assert_eq!(
+            scan_outcome_with(&rules, "xx shipped_marker xx").matched(),
+            ["Dup_Rule"]
+        );
+        assert_eq!(
+            scan_outcome_with(&rules, "xx squatter_marker xx").matched(),
+            ["custom_Dup_Rule"],
+            "the user rule that already owned `custom_Dup_Rule` keeps it"
+        );
+        assert_eq!(
+            scan_outcome_with(&rules, "xx mine_marker xx").matched(),
+            ["custom_2_Dup_Rule"],
+            "the escalation, and it still matches"
+        );
+        assert_eq!(
+            status.renamed,
+            vec![RenamedRule {
+                file: "local/a_mine.yar".to_string(),
+                from: "Dup_Rule".to_string(),
+                to: "custom_2_Dup_Rule".to_string(),
+            }]
+        );
+        // Deterministic: `read_sources` sorts, so the same directory resolves
+        // the same way every time rather than however the filesystem enumerated.
+        assert_eq!(run().1.renamed, status.renamed);
+    }
+
+    /// The rewrite must find the DECLARATION and nothing that merely looks like
+    /// one. A rules file that documents itself in a comment, or matches on the
+    /// literal text of a rule header, is ordinary — and a regex over the source
+    /// would corrupt both.
+    #[test]
+    fn the_rename_touches_the_declaration_and_never_a_comment_or_a_string() {
+        let user = "// rule Dup_Rule is the strict variant, see rule Dup_Rule below\n\
+                    /* rule Dup_Rule */\n\
+                    rule Dup_Rule {\n\
+                        strings:\n\
+                            $a = \"rule Dup_Rule {\"\n\
+                        condition:\n\
+                            $a\n\
+                    }\n";
+        let (rules, status) = dir_report(
+            &[("core.yar", &marker_rule("Dup_Rule", "shipped_marker"))],
+            &[("mine.yar", user)],
+        );
+        let rules = rules.expect("both load");
+        assert!(status.healthy, "{status:?}");
+        assert_eq!(status.renamed.len(), 1, "{status:?}");
+        // The pattern still matches the text it was written to match — which it
+        // would not if the string literal had been rewritten too.
+        assert_eq!(
+            scan_outcome_with(&rules, "here is rule Dup_Rule { and more").matched(),
+            ["custom_Dup_Rule"]
+        );
+    }
+
+    /// A `local/` file that does not compile is **not** a collision, and the
+    /// rename pass must leave it exactly where the pre-M-13 discipline put it:
+    /// skipped, counted, and named in `failed` so the card can report it.
+    /// Meanwhile a colliding rule in a DIFFERENT file is still rescued.
+    #[test]
+    fn a_broken_local_file_is_still_skipped_and_reported_alongside_a_rename() {
+        let (rules, status) = dir_report(
+            &[("core.yar", &marker_rule("Dup_Rule", "shipped_marker"))],
+            &[
+                ("a_broken.yar", "rule Nope { this is not yara at all }"),
+                ("b_mine.yar", &marker_rule("Dup_Rule", "custom_marker")),
+            ],
+        );
+        let rules = rules.expect("the rest still loads");
+        assert_eq!(status.failed, vec!["local/a_broken.yar".to_string()]);
+        assert!(status.armed && !status.healthy, "{status:?}");
+        assert_eq!(status.renamed.len(), 1, "{status:?}");
+        assert_eq!(
+            scan_outcome_with(&rules, "xx custom_marker xx").matched(),
+            ["custom_Dup_Rule"]
+        );
+    }
+
+    /// The rename is for the USER's rules only. Two bundle files colliding with
+    /// each other is a broken bundle, and papering over it would hide exactly
+    /// the defect the updater's health gate exists to catch.
+    #[test]
+    fn a_collision_between_two_bundle_files_is_not_renamed() {
+        let (_, status) = dir_report(
+            &[
+                ("a_core.yar", &marker_rule("Dup_Rule", "one")),
+                ("b_extra.yar", &marker_rule("Dup_Rule", "two")),
+            ],
+            &[],
+        );
+        assert!(status.renamed.is_empty(), "{status:?}");
+        assert_eq!(status.failed, vec!["b_extra.yar".to_string()]);
+    }
+
+    /// **The fallback, and the reason the whole rename is safe to attempt.**
+    ///
+    /// A user file whose FIRST rule carries an unbalanced brace in a regexp
+    /// (`/[{]/`) is perfectly valid YARA and defeats the declaration scanner's
+    /// depth counter for everything after it — the shape the scanner
+    /// deliberately does not model. The colliding declaration that follows is
+    /// therefore invisible to the rewriter, and the pass must resolve to the
+    /// pre-M-13 behaviour and nothing worse: the file is left exactly as
+    /// written, `compile_sources` skips it, `failed` names it, and `renamed`
+    /// claims nothing. A rewrite accepted here would corrupt a user's rules,
+    /// which is why the verification step exists.
+    ///
+    /// What would this still pass with? Not a fix that "usually works": the
+    /// assertion is that `renamed` is EMPTY, so a rewrite that silently mangled
+    /// this file into something that happened to compile would fail here.
+    #[test]
+    fn a_collision_this_cannot_safely_rewrite_falls_back_to_the_old_behaviour() {
+        let unrewritable = "rule First_Rule {\n    strings:\n        $a = /open[{]brace/\n    \
+                            condition:\n        $a\n}\n\
+                            rule Dup_Rule {\n    strings:\n        $b = \"custom_marker\"\n    \
+                            condition:\n        $b\n}\n";
+        let (rules, status) = dir_report(
+            &[("core.yar", &marker_rule("Dup_Rule", "shipped_marker"))],
+            &[("mine.yar", unrewritable)],
+        );
+        // Precondition: the file really is valid YARA on its own, so this is
+        // testing the rewriter's refusal and not a broken fixture.
+        assert!(
+            rule_identifiers(unrewritable).is_some(),
+            "the fixture must compile alone, or it proves nothing"
+        );
+        assert!(status.renamed.is_empty(), "{status:?}");
+        assert_eq!(status.failed, vec!["local/mine.yar".to_string()]);
+        assert!(status.armed && !status.healthy, "{status:?}");
+        // The shipped rule is unharmed, which is the half that must never be
+        // traded away.
+        assert_eq!(
+            scan_outcome_with(
+                &rules.expect("the bundle still loads"),
+                "xx shipped_marker xx"
+            )
+            .matched(),
+            ["Dup_Rule"]
+        );
+    }
+
+    /// The candidate sequence itself: stated once, so a change to the scheme
+    /// has to be a deliberate edit here rather than a silent drift in behaviour.
+    #[test]
+    fn the_rename_scheme_is_custom_then_numbered() {
+        let got: Vec<String> = rename_candidates("Foo").take(3).collect();
+        assert_eq!(got, ["custom_Foo", "custom_2_Foo", "custom_3_Foo"]);
+        assert_eq!(
+            rename_candidates("Foo").count(),
+            MAX_RENAME_ATTEMPTS as usize,
+            "bounded, so a bundle that squats every candidate cannot spin"
         );
     }
 

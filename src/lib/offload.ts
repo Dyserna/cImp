@@ -203,6 +203,12 @@ export interface DetectionStatus {
     rules: number;
     /// Names of the rejected files.
     failed: string[];
+    /// User rules from `rules.d/local/` that are live under a DIFFERENT
+    /// identifier than their file spells, because a shipped rule already
+    /// declares that identifier (#48, M-13). They compiled and they match —
+    /// this is a notice, not a failure, which is why it is not part of
+    /// `healthy`. The rename is applied on load; the file on disk is untouched.
+    renamed: { file: string; from: string; to: string }[];
     /// Where cImp looked, so "0 files" is diagnosable.
     dir: string;
     /// `files_loaded > 0 && rules > 0` — this rule set can match something at
@@ -231,16 +237,23 @@ export interface DetectionStatus {
   /// the auto-updater stands for each component. Rides this same status so the
   /// Settings poller gets it in one round trip.
   updater: UpdaterStatus;
-  /// #48: the user's OWN `rules.d/local/` files that do not compile, when the
-  /// signature layer is on and armed — `null` in every healthy or irrelevant
-  /// case. The same value the Advisor's `detection.broken_local_rules.v1` card
+  /// #48: the state of the user's OWN `rules.d/local/` rules, when it is
+  /// something they need to know — a file that does not compile, or a rule live
+  /// under a renamed identifier (M-13). `null` in every healthy or irrelevant
+  /// case. The same value the Advisor's `detection.local_rules_broken.v1` card
   /// is built from, so the Settings line and the card cannot disagree about
   /// whether the user's rules are live.
+  ///
+  /// The two lists are rendered separately: a renamed rule IS matching, and
+  /// describing it in the broken file's words would be the same silent-lie
+  /// shape the card exists to stop.
   local_rules_broken: {
     /// The folder the user can open to fix them.
     dir: string;
     /// Rejected file names, `local/`-prefixed.
     failed: string[];
+    /// Rules live under a renamed identifier — empty in the ordinary case.
+    renamed: { file: string; from: string; to: string }[];
     /// What IS live, so the line does not read as "detection is off".
     files_loaded: number;
     rules: number;
@@ -281,6 +294,13 @@ export interface DetectionComponentStatus {
   /// Non-empty when the last attempt was refused — a document arrived and a
   /// check said no. The old data is still live.
   last_failure: string;
+  /// Rule files a rollback could not put back, so the live directory is SHORT
+  /// of them (#48, M-11). The one field here that means "degraded right now":
+  /// `last_ok` is about the last CHECK, and the rule counts describe what
+  /// compiled, not what should have been present. Empty is healthy; the
+  /// updater retries the restore on every check and every launch, and
+  /// `detection.rules_incomplete.v1` cards it.
+  unrestored_files: string[];
 }
 
 export interface UpdaterStatus {

@@ -225,21 +225,51 @@ pub const RULE_DETECTION_UPDATE_STALLED: &str = "detection.update_stalled.v1";
 /// holds for the state the user looked at and re-raises when it changes.
 pub const RULE_DETECTION_SIGNATURE_DOWN: &str = "detection.signature_down.v1";
 
-/// `detection.local_rules_broken.v1`: a rule file the USER wrote in
-/// `rules.d/local/` does not compile, so it is being skipped while the rest of
-/// the layer runs.
+/// `detection.local_rules_broken.v1`: the user's own rules in `rules.d/local/`
+/// need their attention — one does not compile and is being skipped, or one is
+/// live under a **renamed** identifier because a shipped rule took the name it
+/// declares (#48, M-13).
 ///
 /// The consumer for the second half of #48's U-4. The first half stopped a
 /// broken `local/` file from vetoing every bundle update forever; that fix has
 /// to come with a way for the user to find out the file is broken, or it just
 /// trades a loud wrong signal for a quiet absent one — a `warn!` in a log
 /// nobody opens, and rules the user believes are protecting them that are not.
+/// M-13 rides the same card for the same reason: a rename is a silent success
+/// otherwise, and a silent success is what every finding in this milestone
+/// turned out to be.
 ///
-/// Warn-only and signed by the failing file names, so a dismissal holds for the
-/// files the user looked at and re-raises when the set changes. Deliberately
-/// suppressed while `detection.signature_down.v1` is up: the disarmed-layer card
-/// is louder and about the same folder.
+/// The two are described in their own words inside the card, never folded into
+/// one sentence: a renamed rule IS matching, and saying otherwise would be the
+/// same class of lie the card exists to stop.
+///
+/// Warn-only and signed by the failing file names AND the renames, so a
+/// dismissal holds for the state the user looked at and re-raises when either
+/// set changes. Deliberately suppressed while `detection.signature_down.v1` is
+/// up: the disarmed-layer card is louder and about the same folder.
 pub const RULE_DETECTION_LOCAL_RULES_BROKEN: &str = "detection.local_rules_broken.v1";
+/// `detection.rules_incomplete.v1`: a rollback could not put every file back,
+/// so `rules.d` is **missing** shipped rule files that still exist in the
+/// retained copy (#48, M-11).
+///
+/// The consumer for the one updater failure mode that permanently reduces
+/// coverage while every other surface reports success. `restore_archived`
+/// swallowed a per-file failure with a `warn!`; the caller said "the previous
+/// version was restored"; and the post-rollback health check could not
+/// disagree, because a file that is absent produces no compile error and no
+/// `files_failed` — `signature::Status::healthy` was true about a set that had
+/// silently lost a file.
+///
+/// Distinct from `detection.signature_down.v1` (the layer has NOTHING to match
+/// with) and from `detection.local_rules_broken.v1` (a file the user wrote is
+/// on disk and broken): here the layer is armed, every file present compiles,
+/// and the problem is one nobody can see by looking at what is there.
+///
+/// Signed by the missing file names, so a dismissal holds for the set the user
+/// looked at and re-raises if it grows. Not `warn_only`-quiet about the fix: the
+/// updater retries the restore on every check and every launch, so the usual
+/// resolution is "close whatever is holding the file open and restart".
+pub const RULE_DETECTION_RULES_INCOMPLETE: &str = "detection.rules_incomplete.v1";
 
 /// `drift.read_reason.v1`: reminders observed before the ~100%-reread check
 /// can speak. Lower than the tuning rule's `MIN_REMINDS` (20) — this is a
@@ -409,6 +439,11 @@ pub struct Signals {
     /// only became a silent condition once U-4 stopped letting it veto the
     /// update channel — before that it was loud, and wrong about why.
     pub detection_local_rules_broken: Option<crate::offload::detection::updater::BrokenLocalRules>,
+    /// Components whose live rule directory is SHORT of files a rollback could
+    /// not put back (#48, M-11). Unlike the field above, the files are not
+    /// broken — they are absent, which is why nothing that compiles what is on
+    /// disk can report it. Empty is the healthy steady state.
+    pub detection_rules_incomplete: Vec<crate::offload::detection::updater::RulesIncomplete>,
 }
 
 /// One budget-tuning proposal: a setting, its current and proposed values
@@ -934,38 +969,122 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     // folder, louder problem) — the updater's `broken_local_rules` applies that
     // suppression at the source, so the two can never both fire.
     if let Some(b) = &sig.detection_local_rules_broken {
-        let signature = b.failed.join(",");
+        // The signature covers BOTH lists (#48, M-13): a dismissal of "your
+        // file does not compile" must not also silence "and this other rule of
+        // yours is now live under a different name", and a rename appearing
+        // later must re-raise a card the user already dismissed.
+        let renamed_sig: Vec<String> = b.renamed.iter().map(|r| r.describe()).collect();
+        // Unchanged when there are no renames, so an existing dismissal of the
+        // broken-file card survives this change rather than re-firing once for
+        // everyone.
+        let signature = if renamed_sig.is_empty() {
+            b.failed.join(",")
+        } else {
+            format!("{}|{}", b.failed.join(","), renamed_sig.join(","))
+        };
         if !is_dismissed(
             &sig.dismissed,
             RULE_DETECTION_LOCAL_RULES_BROKEN,
             &signature,
         ) {
-            out.push(Proposal {
-                setting: String::new(),
-                current: format!(
-                    "{} rejected: {} ({} file(s), {} rule(s) still live)",
+            // Two conditions, described in their own words. Folding them into
+            // one sentence is how a rule that IS matching ends up reported as
+            // "not screening anything" — the family of bug this milestone keeps
+            // finding, in miniature.
+            let mut current = Vec::new();
+            if !b.failed.is_empty() {
+                current.push(format!(
+                    "{} rejected: {}",
                     b.failed.len(),
-                    b.failed.join(", "),
-                    b.files_loaded,
-                    b.rules
-                ),
-                proposed: "a `rules.d/local/` that compiles".to_string(),
-                rationale: format!(
+                    b.failed.join(", ")
+                ));
+            }
+            if !b.renamed.is_empty() {
+                current.push(format!(
+                    "{} renamed: {}",
+                    b.renamed.len(),
+                    renamed_sig.join(", ")
+                ));
+            }
+            // The counts ride the `current` line in both cases, because without
+            // them the card reads as an outage.
+            current.push(format!(
+                "{} file(s), {} rule(s) still live",
+                b.files_loaded, b.rules
+            ));
+            let mut rationale = String::new();
+            if !b.failed.is_empty() {
+                rationale.push_str(
                     "Your own detection rule file(s) in `rules.d/local/` do not compile, so they \
                      are being skipped: the patterns you wrote are not screening anything, while \
-                     the rest of the layer runs normally and reports nothing wrong. A rule file is \
-                     also rejected when it collides on a rule IDENTIFIER with the shipped bundle, \
-                     which an update can introduce without your file changing at all. cImp looked \
-                     in {}. Fix or rename the rule(s), then press Reload rules in Settings → Tools \
-                     → Detection.",
-                    b.dir
-                ),
+                     the rest of the layer runs normally and reports nothing wrong. A file is also \
+                     rejected when it collides on a rule IDENTIFIER that cImp could not rename \
+                     around — another compile error in the same file, or every renamed form taken \
+                     too. ",
+                );
+            }
+            if !b.renamed.is_empty() {
+                rationale.push_str(
+                    "A rule you wrote in `rules.d/local/` declares an IDENTIFIER the shipped \
+                     bundle now also uses, and YARA identifiers must be unique across the set. \
+                     Rather than drop your rule or refuse the update, cImp loaded your rule under \
+                     a `custom_` identifier — it is live and still matching, but a hit reports the \
+                     renamed identifier, so anything of yours keyed on the old name (a saved \
+                     search, a log filter) will not see it. Your file on disk was NOT modified. \
+                     Renaming the rule in your own file takes the name back. ",
+                );
+            }
+            rationale.push_str(&format!(
+                "cImp looked in {}. After editing, press Reload rules in Settings → Tools → \
+                 Detection.",
+                b.dir
+            ));
+            out.push(Proposal {
+                setting: String::new(),
+                current: current.join("; "),
+                proposed: "a `rules.d/local/` that compiles under its own names".to_string(),
+                rationale,
                 rule_id: RULE_DETECTION_LOCAL_RULES_BROKEN,
                 signature,
                 warn_only: true,
                 action: None,
             });
         }
+    }
+
+    // V32 Phase C3 / #48 M-11 — detection.rules_incomplete.v1: a rollback could
+    // not put every file back, so the live set is genuinely short. NOT
+    // suppressed by any of the cards above: this one is the only signal in the
+    // module that says something is degraded RIGHT NOW, and the refusal card it
+    // most often accompanies says the opposite in so many words.
+    for r in &sig.detection_rules_incomplete {
+        let signature = format!("{}:{}", r.component, r.files.join(","));
+        if is_dismissed(&sig.dismissed, RULE_DETECTION_RULES_INCOMPLETE, &signature) {
+            continue;
+        }
+        out.push(Proposal {
+            setting: String::new(),
+            current: format!("{} missing: {}", r.component, r.files.join(", ")),
+            proposed: "a complete rule set".to_string(),
+            rationale: format!(
+                "An interrupted or failed detection update could not put {} rule file(s) back \
+                 into {} ({}), so the signature layer is running with FEWER rules than it should \
+                 — a real, current reduction in coverage, not a stale warning. The files are not \
+                 lost: they are still in the retained copy under `detection-updates/previous/`, \
+                 and cImp retries the restore on every update check and every launch. The usual \
+                 cause is something holding the file open — antivirus real-time scanning, an \
+                 editor, or a file manager sitting in that folder. Close it and restart cImp; if \
+                 that does not clear it, Revert from Settings → Tools → Detection restores the \
+                 retained copy whole.",
+                r.files.len(),
+                r.dir,
+                r.files.join(", ")
+            ),
+            rule_id: RULE_DETECTION_RULES_INCOMPLETE,
+            signature,
+            warn_only: true,
+            action: None,
+        });
     }
 
     // Feature 4 — drift.read_bypass.v1: the agent routes around the advisor
@@ -2554,13 +2673,26 @@ mod tests {
 
     // ── #48 U-4 — a user rule that does not compile ─────────────────────
 
+    use crate::offload::detection::signature::RenamedRule;
     use crate::offload::detection::updater::BrokenLocalRules;
 
     fn broken_local(files: &[&str]) -> Signals {
+        local_rules(files, &[])
+    }
+
+    fn local_rules(files: &[&str], renamed: &[(&str, &str, &str)]) -> Signals {
         Signals {
             detection_local_rules_broken: Some(BrokenLocalRules {
                 dir: r"C:\cimp\detection\rules.d".into(),
                 failed: files.iter().map(|f| (*f).to_string()).collect(),
+                renamed: renamed
+                    .iter()
+                    .map(|(file, from, to)| RenamedRule {
+                        file: (*file).to_string(),
+                        from: (*from).to_string(),
+                        to: (*to).to_string(),
+                    })
+                    .collect(),
                 files_loaded: 3,
                 rules: 12,
             }),
@@ -2625,13 +2757,175 @@ mod tests {
         );
     }
 
+    /// **#48/M-13 — a renamed rule is a NOTICE, not an outage, and it must
+    /// still reach the user.**
+    ///
+    /// The collision that used to freeze the update channel now resolves by
+    /// loading the user's rule under a `custom_` identifier. That is a silent
+    /// success unless something says so, and a silent success is what every
+    /// finding in this milestone turned out to be. So the card fires with no
+    /// broken file at all, and it must describe the rename in the rename's own
+    /// words — never in the broken file's.
+    ///
+    /// What would this still pass with? Not a card that merely mentions the
+    /// file: it pins the OLD and NEW identifiers (the actionable half — the old
+    /// name is what a user's saved search keys on), the "not modified" promise
+    /// that justifies not touching their file, and the absence of the
+    /// "do not compile" sentence, which would be false about a rule that is
+    /// matching.
+    #[test]
+    fn a_renamed_user_rule_raises_a_card_that_does_not_call_it_broken() {
+        let p = evaluate(&local_rules(
+            &[],
+            &[("local/mine.yar", "Dup_Rule", "custom_Dup_Rule")],
+        ))
+        .into_iter()
+        .find(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN)
+        .expect("a renamed user rule must say so");
+        assert!(p.warn_only, "the fix is a file on disk");
+        assert!(p.current.contains("Dup_Rule"), "{}", p.current);
+        assert!(p.current.contains("custom_Dup_Rule"), "{}", p.current);
+        assert!(p.current.contains("local/mine.yar"), "{}", p.current);
+        assert!(
+            p.current.contains("12 rule(s) still live"),
+            "the card must not read as an outage: {}",
+            p.current
+        );
+        assert!(
+            !p.rationale.contains("do not compile"),
+            "a renamed rule IS matching; describing it as broken is the exact lie this \
+             milestone keeps finding: {}",
+            p.rationale
+        );
+        assert!(p.rationale.contains("still matching"), "{}", p.rationale);
+        assert!(
+            p.rationale.contains("NOT modified"),
+            "the promise that justifies renaming at load time must be stated: {}",
+            p.rationale
+        );
+    }
+
+    /// A dismissal of the broken-file card must not also silence a rename that
+    /// shows up later — the two are different facts on one card, so the
+    /// signature carries both.
+    #[test]
+    fn a_dismissed_broken_rule_card_refires_when_a_rule_is_renamed() {
+        let dismissed = vec![DismissedRule {
+            rule_id: RULE_DETECTION_LOCAL_RULES_BROKEN.to_string(),
+            signature: "local/mine.yar".to_string(),
+        }];
+        let fires = |renamed: &[(&str, &str, &str)]| {
+            let mut s = local_rules(&["local/mine.yar"], renamed);
+            s.dismissed = dismissed.clone();
+            evaluate(&s)
+                .iter()
+                .any(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN)
+        };
+        assert!(!fires(&[]), "dismissed for exactly what it named");
+        assert!(
+            fires(&[("local/other.yar", "Dup", "custom_Dup")]),
+            "a rename is a new fact the dismissal never covered"
+        );
+    }
+
     /// `None` is the healthy steady state, and the producer owns every reason to
-    /// stay quiet (layer off, everything compiles, the failure is in a bundle
-    /// file, or the layer is disarmed and the louder card is already up).
+    /// stay quiet (layer off, everything compiles with no collision, the failure
+    /// is in a bundle file, or the layer is disarmed and the louder card is
+    /// already up).
     #[test]
     fn no_broken_rule_signal_means_no_card() {
         assert!(!evaluate(&Signals::default())
             .iter()
             .any(|p| p.rule_id == RULE_DETECTION_LOCAL_RULES_BROKEN));
+    }
+
+    // ── #48 M-11 — the live rule set is SHORT of files ──────────────────
+
+    use crate::offload::detection::updater::RulesIncomplete;
+
+    fn incomplete(files: &[&str]) -> Signals {
+        Signals {
+            detection_rules_incomplete: vec![RulesIncomplete {
+                component: "rules".into(),
+                files: files.iter().map(|f| (*f).to_string()).collect(),
+                dir: r"C:\cimp\detection\rules.d".into(),
+            }],
+            ..Signals::default()
+        }
+    }
+
+    /// The consumer M-11 needs, and the reason it could not be folded into
+    /// `detection.update_failed.v1`: that card's whole reassurance is "nothing
+    /// is degraded right now, the previous data is still live", and this one
+    /// exists because that sentence is false.
+    #[test]
+    fn an_incomplete_rule_set_raises_its_own_card_naming_the_missing_files() {
+        let p = evaluate(&incomplete(&["core.yar"]))
+            .into_iter()
+            .find(|p| p.rule_id == RULE_DETECTION_RULES_INCOMPLETE)
+            .expect("a short rule set must say so");
+        assert!(p.warn_only, "the fix is a file handle, not a setting");
+        assert!(p.setting.is_empty());
+        assert!(p.action.is_none());
+        assert!(p.current.contains("core.yar"), "{}", p.current);
+        assert!(
+            p.rationale.contains("FEWER rules"),
+            "the card must say it is degraded NOW: {}",
+            p.rationale
+        );
+        assert!(
+            p.rationale.contains("not lost") && p.rationale.contains("retries"),
+            "…and that it is recoverable, or the user will not wait for it: {}",
+            p.rationale
+        );
+        assert!(
+            p.rationale.contains(r"C:\cimp\detection\rules.d"),
+            "{}",
+            p.rationale
+        );
+    }
+
+    /// Signed by the missing file names, so a dismissal holds for the set the
+    /// user looked at and re-raises if it grows.
+    #[test]
+    fn a_dismissed_incomplete_card_refires_when_more_files_go_missing() {
+        let dismissed = vec![DismissedRule {
+            rule_id: RULE_DETECTION_RULES_INCOMPLETE.to_string(),
+            signature: "rules:core.yar".to_string(),
+        }];
+        let fires = |files: &[&str]| {
+            let mut s = incomplete(files);
+            s.dismissed = dismissed.clone();
+            evaluate(&s)
+                .iter()
+                .any(|p| p.rule_id == RULE_DETECTION_RULES_INCOMPLETE)
+        };
+        assert!(!fires(&["core.yar"]), "dismissed for what it named");
+        assert!(
+            fires(&["core.yar", "extra.yar"]),
+            "a wider gap is a new fact"
+        );
+    }
+
+    /// Empty is the healthy steady state, and — unlike the two cards above —
+    /// this one is NOT suppressed by any of them: it is the only signal in the
+    /// detection family that reports a present, ongoing loss of coverage, so it
+    /// has to be able to fire alongside a refusal card that says the opposite.
+    #[test]
+    fn an_incomplete_card_fires_even_beside_a_refusal_card() {
+        assert!(!evaluate(&Signals::default())
+            .iter()
+            .any(|p| p.rule_id == RULE_DETECTION_RULES_INCOMPLETE));
+
+        let mut s = incomplete(&["core.yar"]);
+        s.detection_update_failures = vec![crate::offload::detection::updater::FailedUpdate {
+            component: "rules".into(),
+            version: "2026.08.09".into(),
+            signature: "2026.08.09".into(),
+            reason: "the activated bundle did not load cleanly".into(),
+        }];
+        let ids: Vec<&str> = evaluate(&s).iter().map(|p| p.rule_id).collect();
+        assert!(ids.contains(&RULE_DETECTION_RULES_INCOMPLETE), "{ids:?}");
+        assert!(ids.contains(&RULE_DETECTION_UPDATE_FAILED), "{ids:?}");
     }
 }

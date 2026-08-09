@@ -116,3 +116,61 @@ jobs:
         # `--bin cimp` because there is no lib target (see the header note).
         # `--locked` so CI tests the committed Cargo.lock resolution.
         run: cargo test --locked --bin cimp
+
+      # Code review 2026-08-08, finding O-1. The suite has three `#[ignore]`d
+      # tests and CI ran NONE of them, so the only *executable* guard for the
+      # Phase H gate-cache race (#48, H-1) — every other test in that file greps
+      # the generated plugin source — fired only when a human remembered
+      # `--ignored`.
+      #
+      # Exactly one of the three can run here, deliberately:
+      #  * `tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query`
+      #    needs `node` on PATH, which this job has unconditionally — `npx
+      #    vitest run` is ten steps up. That is the whole reason O-1 is cheap.
+      #  * `tts::engine::tests::synthesizes` needs the Kokoro model + voicepack
+      #    and `tts::phonemize::tests::espeak_fallback_engages_on_oov` needs the
+      #    `espeak-ng-data` dir; neither is on the runner (see the header note).
+      #    Both PASS on a dev machine that has them (verified 2026-08-09), so
+      #    they are ignored-for-inputs, not ignored-because-broken — but a
+      #    blanket `-- --ignored` here would be red forever.
+      #
+      # Two assertions, because each covers a way this step could go quietly
+      # useless:
+      #  1. The ignored INVENTORY is pinned. A new `#[ignore]` fails this step,
+      #    so somebody decides whether it belongs in CI instead of it joining a
+      #    never-run pile — which is how O-1 happened in the first place.
+      #  2. The run is checked for `1 passed`. `cargo test` exits 0 when a
+      #    filter matches nothing, so a rename would otherwise leave a green
+      #    step that executed no test at all.
+      - name: cargo test (ignored, node-backed)
+        working-directory: src-tauri
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: |
+          $expected = @(
+            'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query',
+            'tts::engine::tests::synthesizes',
+            'tts::phonemize::tests::espeak_fallback_engages_on_oov'
+          ) | Sort-Object
+
+          $listed = @(
+            cargo test --locked --bin cimp -- --ignored --list |
+              Select-String -Pattern '^(?<n>\S+): test$' |
+              ForEach-Object { $_.Matches[0].Groups['n'].Value }
+          ) | Sort-Object
+
+          if ($listed.Count -ne $expected.Count -or (Compare-Object $expected $listed)) {
+            Write-Host "::error::the set of #[ignore]d tests changed — decide whether the new one runs in CI, then update this step."
+            Write-Host "expected: $($expected -join ', ')"
+            Write-Host "found:    $($listed -join ', ')"
+            exit 1
+          }
+
+          $name = 'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query'
+          $log = Join-Path $env:RUNNER_TEMP 'ignored-tests.log'
+          cargo test --locked --bin cimp -- --ignored --exact $name 2>&1 | Tee-Object -FilePath $log
+
+          if (-not (Select-String -Path $log -Pattern 'test result: ok\. 1 passed' -Quiet)) {
+            Write-Host "::error::$name did not report '1 passed' — it either failed, or the filter matched nothing because the test was renamed."
+            exit 1
+          }

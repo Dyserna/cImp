@@ -47,7 +47,8 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | N-8 | Unbounded `previous/classifier/<version>` retention | **FIXED** | `5920c92` — died with the classifier component |
 | N-10 | Corpus-echo bundle passes the whole gauntlet | **PARTIAL** | `5920c92` — `coverage_floor` catches the curation case, not a hostile publisher |
 | N-12 | 512 MiB aggregate-download exposure | **FIXED** | `5920c92` — died with the classifier component |
-| O-1 | The H-1 race guard is `#[ignore]`d and CI never runs `--ignored` | **OPEN** | one extra step in `tests.yml` |
+| O-1 | The H-1 race guard is `#[ignore]`d and CI never runs `--ignored` | **FIXED** | 2026-08-09 — `tests.yml` gains a `cargo test (ignored, node-backed)` step; see *Test & CI gaps* |
+| S-1 | No dependency-advisory job in CI | **FIXED (detector only)** | 2026-08-09 — new `.github/workflows/advisories.yml`. The 16 wasmtime advisories are **still open and still undecided** (open question 4) |
 | — | Pre-existing 1-in-4 test flake on the global rule slot | **FIXED** | `5920c92` — guard made structural in `screen_blocking` |
 | F-3 | The primary contamination path writes no forensic record at all | **FIXED** | `ce7c54a` — `Screen::Contamination` on the transition, both paths, one helper |
 | F-4 | `is_configured_tab` is agent-agnostic — `(consumer, tab)` verified nowhere | **OPEN** | raised by the fix run |
@@ -635,6 +636,21 @@ three claims that describe closed holes as open and the shipped gate as unbuilt:
   *engages* the LOCAL latch and is outright refused from the state it is
   recommended for
 
+**Closed 2026-08-09.** The whole document was re-audited against the code at
+`0db5739`, not only the three claims above. **Seven** claims were false: those
+three, plus (4) the latch bullet also named `read_file`/`code_search`/
+`run_command` as things a *tab* loses, which were never on a tab's proxied
+surface at all (worker-native tools), and omitted the `graph_struct_search` /
+`graph_repo_map` demotion; (5) the exit-path paragraph still said an app restart
+was the only clean reset, which `05e613f`'s user-driven clear path replaced;
+(6) pre-flight step 5 told the reader to confirm the OpenCode plugin is written
+out under `deny`, where `opencode_plugin_wanted` deliberately does not want one;
+(7) "every EXTERNAL result is spotlight-enveloped", now a per-scope Phase G
+toggle. The file carries a scope note saying what was and was not re-verified —
+§§2–4 (harness tool surfaces, live MCP probes) were **not** re-probed and still
+carry their 2026-08-07 basis. F-7 is now recorded there as a named residual, so
+the H-1 fix is not read as "no signature reaches a contaminated session".
+
 Also: two stale "the unfixed H-2" rationales in the spec and three in `loopback.rs`;
 one named test that does not exist (`an_untouched_config_resolves_every_feature_on`,
 renamed); a 750 ms scan budget cited in two places where the constant is 1 s
@@ -674,16 +690,46 @@ All 106 added lock entries are crates.io; no `[patch]`, git, or path overrides.
 add a `cargo audit` / `cargo deny advisories` job reading the existing `audit.toml`,
 and record the wasmtime exposure as an explicit accept-or-defer.
 
+**Progress 2026-08-09 — the detector exists; the exposure is unchanged.**
+`.github/workflows/advisories.yml` runs `cargo audit` from `src-tauri/` (so it
+honours `.cargo/audit.toml`) on lockfile changes, weekly, and on demand. It
+blocks on the **delta**, not on the absolute count: an advisory against any crate
+other than `wasmtime`, a rise above the recorded floor of 16, or `cargo audit`
+producing unparseable JSON all fail the job; the recorded set passes with a
+`::warning::` and the full table in the job summary on every run. The deferral
+carries an expiry (`KNOWN_REVIEW_BY: 2026-10-01`) and the job goes red past it,
+so this cannot quietly become permanent.
+
+**Still open, and deliberately not decided by CI:** open question 4. The 16 were
+NOT baselined into `.cargo/audit.toml` — that file is the *accepted*-risk log,
+each entry carrying a rationale and a revisit trigger, and moving an undecided
+exposure into it would be laundering a deferral into an acceptance. `yara-x` is
+also still unpinned, and the count is still 16 (verified 2026-08-09 at `0db5739`,
+909 crates, plus 23 informational warnings). An upgrade means moving `yara-x` off
+its hard `wasmtime = "38.0.4"` pin — no patched 38.x line exists, so the nearest
+fixed series are 36.0.13 / 42.0.2 / 43.0.1+, i.e. a yara-x major move, not a
+lockfile bump.
+
 ---
 
 ## Test & CI gaps
 
-- **O-1 — the H-1 regression guard never runs in CI.**
+- **O-1 — the H-1 regression guard never runs in CI. FIXED 2026-08-09.**
   `the_gate_cache_survives_a_beacon_racing_an_in_flight_query` (`config.rs:4329`) is
-  `#[ignore]`d because it needs `node` on PATH. CI runs `cargo test --locked --bin
+  `#[ignore]`d because it needs `node` on PATH. CI ran `cargo test --locked --bin
   cimp` with no `--ignored` pass — **on a job that runs `npx vitest run` twelve lines
-  earlier**, so node is unconditionally present. I ran it manually: it passes. One
-  extra step in `tests.yml` fixes it.
+  earlier**, so node is unconditionally present.
+
+  `tests.yml` now carries a `cargo test (ignored, node-backed)` step that runs
+  it by exact name and asserts `1 passed` (a `cargo test` filter matching
+  nothing still exits 0, so the exit code alone would let a rename pass green).
+  The other two ignored tests — `tts::engine::tests::synthesizes` and
+  `tts::phonemize::tests::espeak_fallback_engages_on_oov` — stay out: both
+  **pass** on a machine that has the Kokoro/espeak inputs (verified 2026-08-09,
+  all three green locally), and neither input is on the runner, so a blanket
+  `-- --ignored` would be red forever. The same step pins the ignored-test
+  INVENTORY at those three names, so the next `#[ignore]` forces a decision
+  instead of silently joining a never-run pile — which is how O-1 happened.
 - Three tests pin the defect rather than the invariant (see "The pattern").
 - Deleting the gate call from `handle_audit_run` or `handle_run` leaves the suite
   green — decision 18's own enforcement has no test at its enforcement point, which

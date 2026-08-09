@@ -1,6 +1,9 @@
 # V33 — OS Sandboxing & Max Paranoia Mode
 
 **Status:** SPEC — not yet coded (2026-08-06). GitHub: milestone 6, umbrella #30.
+**Amendments:** 2026-08-09 — Phase F's throttling note, made false by V32's
+`946d7d1` (checkpoint throttle re-keyed per `(root, tab)`). Amendments are
+dated in place rather than edited silently, matching the V32 spec's convention.
 **Builds on:** the two spawn seams cImp owns — `pty/manager.rs::PtyLaunchSpec:20`
 (every AI tab: Claude, OpenCode, future harnesses) and the offload worker's
 `run_command` children (`offload/tools/run_command.rs`, plain non-PTY `Stdio`
@@ -265,7 +268,31 @@ Settings → Workbench toggle is the only action needed).
   `tool.execute.before` — the SAME unverified hook as V32 spike E2 (one
   spike answers both; negative ⇒ OpenCode keeps prompt+burst coverage
   only, documented). No new throttling: shares `checkpoint_min_gap_s` and
-  the identical-tree dedupe (first call after a prompt no-ops naturally).
+  the identical-tree dedupe.
+
+  > **Amendment 2026-08-09 (V32 `946d7d1`).** The parenthetical here used to
+  > read "(first call after a prompt no-ops naturally)". That was true when the
+  > `checkpoint_min_gap_s` throttle was keyed per **root**; `946d7d1` re-keyed
+  > it per **(root, tab)** — see `workbench::CheckpointKey` and
+  > `Workbench::maybe_snapshot`. A Phase F pre-tool checkpoint carries a tab,
+  > so it lands in that tab's bucket: still debounced by that tab's own
+  > prompt-tap, **no longer** debounced by a different tab's. The
+  > identical-tree dedupe is unaffected — `shadow::snapshot` compares against
+  > the last checkpoint's tree regardless of bucket, so a second tab's first
+  > pre-tool checkpoint over an unchanged tree still returns that existing
+  > checkpoint and commits nothing.
+  >
+  > **Design consequence for whoever schedules Phase F** (flagged, not
+  > redesigned): the worst case is N tabs on one root each taking their own
+  > pre-tool checkpoint inside one `checkpoint_min_gap_s` window, where the
+  > pre-`946d7d1` reading of this line promised one. Every one of those is
+  > deduped away *if* the tree is unchanged, so the cost only appears when the
+  > tabs are genuinely interleaving edits on a shared root — which is also the
+  > case where per-tab attribution is the point of the feature. Decide
+  > explicitly whether that is the wanted behaviour, or whether the tool
+  > trigger should consult the root-wide gap instead of its tab's; do not
+  > assume the old sentence still covers it.
+
   Metadata-format care: the fields parser must tolerate a missing `source`
   (old checkpoints) — and old readers parse `"tool"` as `Manual`, an
   accepted degradation. Timeline UI renders the source on the row.

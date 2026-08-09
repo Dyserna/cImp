@@ -9,6 +9,22 @@ project config actually points at. Tool lists drift on every harness release —
 re-verify with the recipes in [§1](#1-verification-basis) before trusting an
 older copy of this file.
 
+**Re-audited 2026-08-09 at `0db5739`**, after the two V32 fix runs and Phase H.
+Scope of that re-audit, so the next reader knows what was and was not re-checked:
+
+* **Re-checked against code** — every claim about tool classes, what an engaged
+  latch removes, which routes enforce it, and whether the natives are gated.
+  The authority is `offload/toolclass.rs::TABLE` plus the five places that read
+  it: the worker (`filter_defs` + `Latch::refusal`) and `loopback.rs`'s four
+  gated routes `/run`, `/graph_run`, `/mcp/call` and `/audit/run` (all via
+  `Latch::proxy_gate`). Corrections are marked **(2026-08-09)** inline. Seven
+  claims were false — the three the review named, plus four more found by
+  reading the rest of the file.
+* **NOT re-checked** — §2 and §3, the harness-native tool *surfaces*. No
+  `claude --version` / `/experimental/tool/ids` probe was re-run, so those two
+  sections still carry their 2026-08-07 basis and may have drifted with a
+  harness release. §4's live MCP-endpoint probes were likewise not repeated.
+
 ## Why this document exists
 
 The V32 taint latch governs tools that flow through cImp: the worker's own
@@ -284,11 +300,26 @@ Four consequences, in decreasing order of how much they should influence the
    makes reading ten pages cheap. Replacing it with raw extracted text turns a
    research loop into a context-window problem. **The substitute is not a
    different fetch tool, it is `offload_task(profile="research")`**: the local
-   worker fetches, reads and synthesizes, and only the synthesis returns. This
-   is strictly better for V32 — the untrusted bytes never enter the
-   code-latched session at all, and the worker's own latch (Phase A) contains
-   the trifecta at the point of contact. Treat delegation as the primary
-   research pattern under `deny`, not as a fallback.
+   worker fetches, reads and synthesizes, and only the synthesis returns. The
+   untrusted bytes never enter the calling session at all, and the worker's own
+   latch (Phase A) contains the trifecta at the point of contact.
+
+   **Corrected 2026-08-09.** This paragraph used to end "treat delegation as the
+   primary research pattern under `deny`, not as a fallback", and that is no
+   longer free. `ada4bae` demoted `offload_task`/`offload_batch` to
+   LOCAL-CAPABILITY (`toolclass.rs` — the delegated sub-task holds exactly the
+   class the caller would otherwise have given up), so from the caller's side
+   delegation is now a **latching** call, gated at `loopback.rs::handle_run`:
+   * from a tab that has already used an EXTERNAL tool, `offload_task` is
+     **refused** with `REFUSAL_LOCAL_BLOCKED` — the state this pattern was
+     recommended *for*;
+   * from a clean tab it succeeds and **latches the tab LOCAL**, which closes
+     every proxied EXTERNAL tool (`ddg__*`, `context7__*`) for the rest of that
+     tab's session.
+
+   So the pattern is still the right one, but it is a **one-way door taken
+   first**: delegate before the session touches the web itself, and accept that
+   the tab then has no proxied web of its own. It is not a way to keep both.
 2. **Losing the redirect stop is a security downgrade.** `WebFetch` hands a
    cross-host redirect back as text; `fetch_content` follows it inside a
    third-party process cImp does not observe. This is precisely the documented
@@ -340,28 +371,46 @@ its corpus.
 
 ---
 
-## 6. Non-web natives are out of scope — deliberately
+## 6. Non-web natives — Claude's are out of scope, OpenCode's are gatable
 
 `sensor` and `deny` act on `WebFetch`/`WebSearch` and `webfetch`/`websearch`
-only. **Claude's `Read`/`Write`/`Edit`/`Bash`/`Glob`/`Grep`/`LSP`/`Monitor` and
-OpenCode's `read`/`write`/`edit`/`bash`/`glob`/`grep`/`apply_patch` remain
-completely ungated in every mode.** That is stated here so the document does
-not overpromise:
+only. **Corrected 2026-08-09** — this section used to say that *both* harnesses'
+file/shell tools "remain completely ungated in every mode" and that gating them
+was unscheduled Phase E. Phase H shipped the OpenCode half (`f5fb221`), so the
+two harnesses now differ and the difference is the whole point of this section:
 
-* Gating them is optional **Phase E**, spike-gated, and currently unscheduled.
-  The **E2 spike verdict (2026-08-07) was GO-with-caveats**: OpenCode's
-  `tool.execute.before` hook is real and stable, but a live probe showed the
-  model **routes around partial gating** (block `write`, it uses `bash`), so any
-  real gate must be whole-surface deny-by-default. Policy, not containment —
-  `OPENCODE_PURE` and user-typed `!shell` bypass it entirely.
-* E1 (Claude-side `PreToolUse` gating of `Read`/`Grep`/`Bash`) has not had its
-  latency spike. Phase F's sensor hook is matched on web tools only, so it
-  levies no per-call tax on `Read`/`Grep`/`Bash` and does not need E1.
-* OS-level containment of the local natives is **V33**, not V32.
+**Claude:** `Read`/`Write`/`Edit`/`Bash`/`Glob`/`Grep`/`LSP`/`Monitor` are
+**ungated in every mode**, unchanged. E1 (Claude-side `PreToolUse` gating) has
+still not had its latency spike and is still deferred by locked decision 17.
+Phase F's sensor hook is matched on web tools only, so it levies no per-call tax
+on `Read`/`Grep`/`Bash` and does not need E1.
 
-The practical reading: the latch protects against a compromised model
-*exfiltrating through cImp's tools*. A compromised model with `Bash` can still
-`curl`. `deny` narrows the model's easiest route; it does not build a wall.
+**OpenCode:** the eight ids in `toolclass.rs::OPENCODE_NATIVE_TABLE` —
+`bash`, `read`, `glob`, `grep`, `edit`, `write`, `patch`, `apply_patch` — are
+gated as LOCAL-CAPABILITY, and `webfetch`/`websearch` as EXTERNAL, by the
+generated plugin's `tool.execute.before` handler against this tab's latch
+(`POST /latch/state`). Checkable properties:
+
+* **Default OFF.** `Feature::OpencodeNativeGate::default_enabled() == false` —
+  the only V32 control that is; "off" is exactly the pre-V32 behaviour. It is a
+  per-feature (L2) + per-tab (L3) switch in the Phase G hierarchy, and it is
+  **spawn-baked**, so turning it on needs a tab restart.
+* **Allowlist-only, deliberately.** A name absent from that table is UNGATED —
+  the `unknown ⇒ EXTERNAL` invariant that governs `TABLE` is wrong for a
+  harness registry and would refuse `todowrite`. `task` (sub-agent spawn) is
+  ungated by the same reasoning: the child's own `bash`/`read`/`webfetch` fire
+  the same hook against the same `CIMP_TAB_ID`, so the leaves are closed.
+* **Policy, not containment.** It runs inside the agent's process. The E2 spike
+  (2026-08-07, GO-with-caveats) showed the model **routes around partial
+  gating** — block `write`, it uses `bash` — which is why the gate is
+  whole-surface; and `OPENCODE_PURE`, an ungated `opencode` binary, user-typed
+  `!shell` and the PTY route all walk around it.
+* OS-level containment of the local natives is still **V33**, not V32.
+
+The practical reading is unchanged: the latch protects against a compromised
+model *exfiltrating through cImp's tools*. A compromised Claude tab with `Bash`
+can still `curl`, and so can an OpenCode tab with the gate off — which is the
+default. `deny` narrows the model's easiest route; it does not build a wall.
 
 ---
 
@@ -404,9 +453,18 @@ raises the hint.
    from the capability set silently.
 4. `172.21.1.11:17201` / `:17202` are carved out of the SSRF screen by exact
    `host:port` (they sit inside `172.16/12`, which is denied wholesale).
-5. OpenCode only: the plugin is written out. Phase F decouples plugin presence
-   from `graph.enabled` (the E2 spike's fail-open trap) — confirm the decoupled
-   build is the one running.
+5. OpenCode only: **nothing to check here in `deny`, corrected 2026-08-09.**
+   This step used to say "the plugin is written out … confirm the decoupled
+   build is the one running", which is a `sensor`-mode step written into the
+   `deny` checklist. `tabs/config.rs::opencode_plugin_wanted` writes the plugin
+   for `graph.enabled` **or** `native_web_for(..) == Sensor` **or** the Phase H
+   gate — `deny` is deliberately not a disjunct, because the pinned
+   `permission.webfetch/websearch = "deny"` block does that work at spawn and
+   needs no plugin. So under `deny` a tab with the graph off and the Phase H
+   gate off correctly has **no plugin file at all**, and its absence is not a
+   fault. What Phase F actually decoupled is the *other* direction (turning the
+   graph off must not delete a plugin carrying a security handler); that
+   property is still live and is what `opencode_plugin_wanted` exists to hold.
 
 **UX changes to expect, and to tell the user about:**
 
@@ -414,39 +472,103 @@ raises the hint.
   to `max_length` (8000 chars) per call, paginated. Budget context accordingly.
 * **No citations-with-answer.** `WebFetch` returned a cited answer; the
   proxied path returns text you must read.
-* **Every EXTERNAL result is spotlight-enveloped** with a per-result nonce and
-  a data-not-instructions preamble, and may carry a detection warning header.
-* **Latch semantics apply from the first fetch.** After one `ddg__*` call the
-  tab loses `read_file`/`code_search`/`run_command` **and** the content-bearing
-  graph tools (`graph_snippet`, `graph_search_docs`, `graph_semantic_docs`,
-  `graph_semantic_code`) through the proxy. Structural graph tools, `run_check`
-  and the audit tools keep working. Claude's *native* `Read`/`Grep` are
-  unaffected — that is the honest limit, not a bug.
+* **EXTERNAL results are spotlight-enveloped** with a per-result nonce and a
+  data-not-instructions preamble, and may carry a detection warning header —
+  when `Feature::Spotlighting` / `Feature::Detection` resolve on for this scope,
+  which is the default but is a per-tab switch since Phase G.
+* **Latch semantics apply from the first fetch — and the list of what survives
+  is shorter than it was (corrected 2026-08-09).** This bullet used to say the
+  tab loses `read_file`/`code_search`/`run_command` plus the content-bearing
+  graph tools, and that "structural graph tools, `run_check` and the audit tools
+  keep working". Both halves were wrong. The authority is
+  `toolclass.rs::TABLE`; against it, after one `ddg__*` call an OpenCode/Claude
+  tab **loses**, refused with `REFUSAL_LOCAL_BLOCKED`:
+
+  | Tool | Route that refuses it | Since |
+  |---|---|---|
+  | `graph_snippet`, `graph_search_docs`, `graph_semantic_docs`, `graph_semantic_code` | `/graph_run` | Phase B |
+  | `run_check` | `/graph_run` | `b80f5b8` (2026-08-07 review) |
+  | `security_audit`, `quality_audit` | `/audit/run` | `b80f5b8`, routes closed by `ada4bae`; `tab` + a known `consumer` now **required** (H-8, `80375a9`) |
+  | `offload_task`, `offload_batch` | `/run` | `ada4bae` (finding C-1c) |
+  | `graph_struct_search`, `graph_repo_map` | `/graph_run` | `0169d10` (finding H-1, locked decision 29) |
+
+  `read_file` / `code_search` / `run_command` are **not** on this list and never
+  were: they are worker-native tools (`offload/tools/`), not advertised to a tab
+  at all — a tab's proxied surface is `offload_*`, `graph_*`, `context_*`,
+  `run_check` and the `<server>__<tool>` ids. Naming them here read as coverage
+  the proxy does not provide.
+
+  What **keeps working** is the 16 TRUSTED rows: the fourteen structural graph
+  tools (`graph_find_symbol`, `graph_callers`, `graph_callees`,
+  `graph_references`, `graph_imports`, `graph_outline`, `graph_transitive`,
+  `graph_impact`, `graph_tests_for`, `graph_recent_changes`,
+  `graph_dead_exports`, `graph_cycles`, `graph_path`, `graph_architecture`)
+  plus `context_recall` / `context_notes`. The membership rule is now a property
+  a reviewer can check row by row — **no source text on any path** — and
+  `0169d10` had to strip `signature` from `graph/mcp.rs::fmt_symbols` to make it
+  true of the four symbol tools, because a signature is the definition's first
+  source line and `graph_find_symbol{name:"STRIPE_SECRET"}` answered it
+  verbatim. A `TABLE` test pins the count at 16 and names the two demoted tools,
+  so a silent re-promotion fails the build.
+
+  **Known-open residual (review finding F-7):** the strip is at the model-facing
+  MCP output only. The index still stores signatures, and the read advisor and
+  context auto-injection still render them — so a contaminated tab can still be
+  *handed* signatures by cImp's own injection path even though it can no longer
+  *ask* for them. Do not read the H-1 fix as "no signature reaches a
+  contaminated session".
+
+  Claude's *native* `Read`/`Grep` are unaffected by any of this — that is the
+  honest limit, not a bug.
 * **`context_note` writes made under an EXTERNAL latch are quarantined** —
   stored, flagged, excluded from recall and auto-injection, awaiting
   promote-or-discard in the Memory UI.
-* **Exit path:** *Switch to local* (decision 15) flips the latch — external
-  closes, local reopens, never both at once. That is the intended
-  "research done, now apply it" button. *Full unlatch* recreates the trifecta
-  and asks for confirmation. Restarting cImp is the only truly clean reset —
-  since H-2 (2026-08-08) a new harness session no longer clears the
-  contamination bit, because "the session rotated" is inferred from a transcript
-  file the model's own shell can create.
+* **Exit paths (rewritten 2026-08-09 — an app restart is no longer the only
+  clean reset).** Two independent things can be stuck: the *latch* (which class
+  the scope may still use) and the *contamination bit* (the taint badge, and
+  what memory quarantine keys off).
+  * *Switch to local* (decision 15) flips the **latch** — external closes,
+    local reopens, never both at once. The intended "research done, now apply
+    it" button. *Full unlatch* recreates the trifecta and asks for confirmation.
+  * The **contamination bit** is cleared by the user, in cImp's own UI
+    (`05e613f`). *Resume* clears it now and touches nothing else; *Restore* arms
+    a one-shot wait and lifts it only when a genuine session rotation is
+    observed, because restoring a checkpoint rolls back files and cannot remove
+    injected text from the context window. The trust root is **authority, not
+    evidence** — a human clicking in cImp is a fact no shell can fabricate,
+    which is why H-2 (`2c40136`) removed the automatic reset: "the session
+    rotated" was inferred from a transcript file the model's own shell can
+    write. Neither clear path is reachable over HTTP; `/latch/beacon` can only
+    tighten.
+  * **Clearing the bit does not by itself reopen persistent memory** while the
+    latch is still EXTERNAL — `proxy_gate` quarantines a `context_note` on the
+    latch's own authority. A resume on an EXTERNAL-latched tab leaves notes held
+    until the user also switches to local or unlatches.
 
-**The recommended research pattern under `deny`:**
+**The recommended research pattern under `deny` (revised 2026-08-09):**
 
-> Do not fetch from the code session. Call
+> Delegate **before** the session touches the web, not after:
 > `offload_task(profile="research", instructions=…)`.
 
-The worker fetches, reads and synthesizes on the local model; only the
-synthesis returns. The untrusted bytes never enter the code session, the
-worker's own def-list filtering means it holds either private-data reads or web
-access but never both, and the code session's latch is never engaged — so it
-keeps `graph_snippet` and the proxied local-capability tools. Two rules that
-belong in the guidance addendum: **never put secrets or proprietary code in a
-research task's text** (it is visible to whatever the task fetches, and prompt
-exfiltration cannot be blocked), and **treat the returned synthesis as
-untrusted** — it is a summary of attacker-reachable text.
+The worker fetches, reads and synthesizes on the local model; only the synthesis
+returns. The untrusted bytes never enter the code session, and the worker's own
+def-list filtering means it holds either private-data reads or web access but
+never both.
+
+What changed: `offload_task` is itself LOCAL-CAPABILITY since `ada4bae`, so the
+sentence this section used to carry — "the code session's latch is never
+engaged" — is false. The call **latches the calling tab LOCAL**, which costs it
+every proxied EXTERNAL tool for the rest of the session (it keeps
+`graph_snippet` and the rest of the local-capability set, which is the half that
+was right), and from a tab that has already fetched it is refused outright. From
+an EXTERNAL-latched tab the only routes back to delegation are *Switch to local*
+/ *Full unlatch* (they move the **latch**; clearing the contamination bit does
+not) or a fresh tab.
+
+Two rules that belong in the guidance addendum, unchanged: **never put secrets
+or proprietary code in a research task's text** (it is visible to whatever the
+task fetches, and prompt exfiltration cannot be blocked), and **treat the
+returned synthesis as untrusted** — it is a summary of attacker-reachable text.
 
 ### 7.3 Escape hatch — `native_web_visibility: off`
 

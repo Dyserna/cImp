@@ -1,0 +1,213 @@
+name: Advisories
+
+# Dependency-advisory gate (code review 2026-08-08, finding S-1). `cargo audit`
+# went from 0 to 16 vulnerabilities across V32 — every one in `wasmtime 38.0.4`,
+# reachable solely through `yara-x` — and nothing in CI noticed, because there
+# was no supply-chain job at all (clippy, tests, release; no dependabot). The
+# 16 were found by a human running `cargo audit` by hand during a review. This
+# job is the consumer that finding asked for.
+#
+# WHAT IT BLOCKS ON, and why it is shaped this way. A plain `cargo audit` here
+# would be red on day one and stay red, which trains everyone to ignore it; and
+# baselining the 16 into `src-tauri/.cargo/audit.toml` would be *making* the
+# accept-or-defer decision that is still open (review "Open questions needing a
+# decision", item 4) — that decision belongs to the owner, not to CI. So this
+# job blocks on the DELTA and time-boxes the gap:
+#
+#   * any advisory against a crate other than the recorded known-open one  -> RED
+#   * the known-open crate's advisory count rising above the recorded floor -> RED
+#   * `cargo audit` producing no parseable JSON (the detector itself failing) -> RED
+#   * today past KNOWN_REVIEW_BY (the deferral's expiry)                    -> RED
+#   * the recorded set, unchanged                                           -> green,
+#     with a `::warning::` and a full advisory table in the job summary on
+#     EVERY run, so "known" never becomes "invisible".
+#
+# The expiry is the important half. A permanent ignore-list is how advisories
+# get forgotten; this one cannot outlive its review date without somebody
+# editing this file and saying why.
+#
+# `.cargo/audit.toml` is deliberately NOT touched. It carries three genuinely
+# ACCEPTED advisories, each with a rationale and a revisit trigger, and its own
+# header says it is a decision log rather than a mute button. The wasmtime set
+# is not accepted — it is deferred — so it is recorded here, in the detector,
+# instead of being laundered into the accept list.
+#
+# Tooling choices:
+#  * `cargo audit`, not `cargo deny` or a third-party action. The repo already
+#    uses cargo-audit as the maintenance run's cross-check and already has a
+#    `.cargo/audit.toml` whose semantics this job must honour; `cargo audit`
+#    reads that file when run from `src-tauri/`, and nothing else does.
+#    `rustsec/audit-check` is additionally unusable as-is: it runs at the repo
+#    ROOT, which holds no Cargo.toml or Cargo.lock (the crate lives in
+#    `src-tauri/`).
+#  * ubuntu-latest, unlike every other job here. `cargo audit` reads
+#    `Cargo.lock` and never builds the crate, so it needs no LLVM, no Vulkan,
+#    no frontend bundle and no Windows — minutes instead of the ~15 the Windows
+#    cargo cache costs, and independent of that toolchain entirely.
+#  * The gate is a small Node script rather than a jq pipeline purely so that it
+#    can be run verbatim against real `cargo audit --json` output off-CI, which
+#    is how its five failure modes were checked before this file was committed.
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/.cargo/audit.toml'
+      - '.github/workflows/advisories.yml'
+  pull_request:
+    paths:
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/.cargo/audit.toml'
+      - '.github/workflows/advisories.yml'
+  # New advisories land against an UNCHANGED lockfile, so a push trigger alone
+  # would never see them. Mondays, early UTC.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisories-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # ── The recorded known-open exposure (review finding S-1) ──────────────
+      # 16 advisories, all `wasmtime 38.0.4`, reached only via
+      # `wasmtime -> yara-x -> cimp`. `yara-x 1.12.0` hard-pins `wasmtime
+      # 38.0.4` and there is no patched 38.x line, so there is no upgrade that
+      # is not a yara-x major move — explicitly out of scope for the detector.
+      # Most are unreachable at the enabled feature set (Winch, component
+      # model, WASI and pooling are all off); the two not clearly excluded are
+      # RUSTSEC-2026-0006 and RUSTSEC-2026-0087, Cranelift **x86-64**
+      # miscompilations, which is the backend and architecture we ship.
+      KNOWN_VULNERABLE_CRATE: 'wasmtime'
+      KNOWN_VULN_COUNT: '16'
+      # The deferral's expiry. Past this date the job fails until the exposure
+      # is re-decided. Chosen to land after the next scheduled maintenance run
+      # (~2026-09-04), which is where `.cargo/audit.toml` is re-evaluated
+      # anyway. Moving it out is a legitimate decision — it just has to be a
+      # decision, recorded in this file.
+      KNOWN_REVIEW_BY: '2026-10-01'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      # Floating stable, matching clippy.yml and tests.yml. Nothing is compiled
+      # from this repo here — the toolchain exists to build cargo-audit.
+      - name: Setup Rust (floating stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07-15
+        with:
+          toolchain: stable
+
+      # Deliberately unpinned and uncached. The advisory DATABASE is fetched at
+      # run time regardless, so a stale tool buys nothing, and a cold
+      # `cargo install` of one small binary is a few minutes on a weekly job.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+
+          # `cargo audit` exits non-zero whenever it finds anything, which is
+          # the normal state here — so its exit code is not the signal. The
+          # JSON is, and the gate below fails loudly if that JSON is missing or
+          # malformed rather than reading absence as "clean".
+          cargo audit --json > "$RUNNER_TEMP/audit.json" || true
+
+          cat > "$RUNNER_TEMP/gate.mjs" <<'GATE'
+          import { readFileSync, appendFileSync } from "node:fs";
+
+          const KNOWN_CRATE = process.env.KNOWN_VULNERABLE_CRATE || "";
+          const KNOWN_COUNT = Number(process.env.KNOWN_VULN_COUNT);
+          const REVIEW_BY = process.env.KNOWN_REVIEW_BY || "";
+          const SUMMARY = process.env.GITHUB_STEP_SUMMARY;
+
+          const md = [];
+          function say(line) { md.push(line); console.log(line); }
+          function flush() {
+            if (SUMMARY) { try { appendFileSync(SUMMARY, md.join("\n") + "\n"); } catch { /* summary is best-effort */ } }
+          }
+          function die(msg) {
+            console.log(`::error::${msg}`);
+            md.push("", `**FAILED:** ${msg}`);
+            flush();
+            process.exit(1);
+          }
+
+          let doc;
+          try {
+            doc = JSON.parse(readFileSync(process.argv[2], "utf8"));
+          } catch (e) {
+            die(`cargo audit produced no parseable JSON (${e.message}) — the DETECTOR failed, which is not the same as "no advisories found".`);
+          }
+
+          const v = doc.vulnerabilities;
+          if (!v || typeof v.count !== "number" || !Array.isArray(v.list)) {
+            die("unexpected cargo-audit JSON shape: no numeric .vulnerabilities.count alongside a .list array. Re-check this gate against the installed cargo-audit rather than trusting a green run.");
+          }
+
+          const rows = v.list.map((x) => ({
+            crate: x.package.name,
+            version: x.package.version,
+            id: x.advisory.id,
+            title: x.advisory.title,
+          }));
+          const crates = [...new Set(rows.map((r) => r.crate))].sort();
+          const warn = Object.entries(doc.warnings || {}).map(([k, l]) => `${k}: ${l.length}`).join(", ") || "none";
+
+          say("## cargo audit");
+          say("");
+          say("| | |");
+          say("|---|---|");
+          say(`| vulnerabilities | **${v.count}** (recorded known-open: ${KNOWN_COUNT}) |`);
+          say(`| affected crates | ${crates.join(", ") || "none"} |`);
+          say(`| informational warnings | ${warn} |`);
+          say(`| advisory db | ${doc.database?.["last-commit"] ?? "?"} @ ${doc.database?.["last-updated"] ?? "?"} |`);
+          say(`| ignored by \`.cargo/audit.toml\` | ${(doc.settings?.ignore || []).join(", ") || "none"} |`);
+          say("");
+          if (rows.length) {
+            say("| crate | version | advisory | title |");
+            say("|---|---|---|---|");
+            for (const r of rows) say(`| ${r.crate} | ${r.version} | ${r.id} | ${r.title.replace(/\|/g, "\\|")} |`);
+            say("");
+          }
+
+          const unexpected = crates.filter((c) => c !== KNOWN_CRATE);
+          if (unexpected.length) {
+            die(`advisories against crates outside the recorded known-open set: ${unexpected.join(", ")}. The only deferred exposure is \`${KNOWN_CRATE}\` (code review 2026-08-08, finding S-1). Triage these.`);
+          }
+          if (v.count > KNOWN_COUNT) {
+            die(`the \`${KNOWN_CRATE}\` advisory count rose ${KNOWN_COUNT} -> ${v.count}. A NEW advisory against the known-open crate is not covered by the S-1 deferral — read it and re-decide.`);
+          }
+
+          const today = new Date().toISOString().slice(0, 10);
+          if (REVIEW_BY && today > REVIEW_BY) {
+            die(`the S-1 deferral expired on ${REVIEW_BY} (today is ${today}). Re-decide it: accept with a dated rationale + revisit trigger in \`src-tauri/.cargo/audit.toml\`, move off the yara-x -> wasmtime pin, or push KNOWN_REVIEW_BY out with a reason. This job stays red until somebody does one of the three.`);
+          }
+
+          if (v.count < KNOWN_COUNT) {
+            console.log(`::notice::known-open advisories dropped ${KNOWN_COUNT} -> ${v.count}; lower KNOWN_VULN_COUNT in this workflow so the floor keeps its meaning.`);
+          }
+          if (v.count > 0) {
+            console.log(`::warning::${v.count} known-open advisories, all in \`${KNOWN_CRATE}\` (finding S-1, deferred until ${REVIEW_BY}). Not a regression — and not fixed either.`);
+          }
+          flush();
+          GATE
+
+          node "$RUNNER_TEMP/gate.mjs" "$RUNNER_TEMP/audit.json"

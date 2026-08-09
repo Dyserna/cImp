@@ -15,11 +15,24 @@
   //      conversation, so re-opening both sides recreates the trifecta with a
   //      model that may already be steered.
   //
-  // The restart line is static and always shown, because it is the only truly
-  // clean exit — every override leaves the contamination bit set. Since H-2
-  // (2026-08-08) it names an APP restart, not a tab restart: a new harness
-  // session no longer clears the bit, because "the session rotated" is read from
-  // a transcript file the model's own shell can create.
+  // Step 4 adds the contamination section, and it is here — in the popover the
+  // badge opens — rather than only in the Workbench Timeline, because the
+  // Timeline is gated on `settings.workbench.checkpoints` and a containment
+  // control must not be unreachable in a configuration the user is allowed to
+  // choose. Step 5's Timeline entry point calls the same action.
+  //
+  // The two clears differ in what they promise, and the copy has to carry that:
+  //   • "Not injected — clear the flag" clears NOW, behind a second click,
+  //     because if the judgement is wrong a steered model gets its persistence
+  //     channel back.
+  //   • "I restored a checkpoint" clears NOTHING now. Restoring rolls back files
+  //     and cannot remove injected text from the conversation, so the flag is
+  //     kept and lifts when cImp sees the tab start a new session. That is why
+  //     this one is a single click: it releases nothing.
+  //
+  // The old static line said restarting cImp was the only clean reset. It was
+  // true under H-2 and is not any more, so it is gone — a security surface that
+  // tells the user the wrong escape hatch is worse than one that says nothing.
   //
   // Positioning / dismissal mirror TabContextMenu: fixed at the click coords,
   // clamped into the viewport, dismissed by Escape or a mousedown outside.
@@ -65,6 +78,9 @@
 
   let menuEl: HTMLDivElement | undefined = $state();
   let confirmingUnlatch = $state(false);
+  /// Step 4: the same two-click shape as `confirmingUnlatch`, for the same
+  /// reason — this one releases containment on the user's judgement alone.
+  let confirmingClear = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
 
@@ -171,6 +187,17 @@
       This conversation has read external content. Memory writes stay
       quarantined and external results stay wrapped — whatever the latch says.
     </div>
+    {#if row.awaiting_session_clear}
+      <!-- Step 4: the arm is set. Say what will lift it, and what will not —
+           a user who restored and then waits without knowing that a NEW session
+           is the trigger has no way to guess it. -->
+      <div class="state">
+        A checkpoint was restored. The flag stays until this tab starts a new
+        session — run <code>/clear</code> here, or restart the tab, and it lifts
+        on its own. Restoring files cannot remove injected text from the
+        conversation, which is why it was kept.
+      </div>
+    {/if}
   {/if}
 
   {#if reduced.length > 0}
@@ -232,8 +259,53 @@
     </button>
   {/if}
 
-  <div class="separator"></div>
-  <div class="state">Restarting cImp is the only clean reset.</div>
+  {#if row.can_clear}
+    <div class="separator"></div>
+    <div class="head">Contamination flag</div>
+
+    {#if confirmingClear}
+      <div class="state warn">
+        Clearing says the flagged content was harmless. If it was not, this tab's
+        memory writes stop being held for review while a model that read it is
+        still running. The conversation is not changed — nothing is restarted and
+        nothing is rolled back. Continue?
+      </div>
+      <div class="row">
+        <button
+          type="button"
+          class="entry danger"
+          disabled={busy}
+          onclick={() => void run('clear_contamination')}
+        >
+          Yes, clear the flag
+        </button>
+        <button type="button" class="entry" onclick={() => (confirmingClear = false)}>
+          Cancel
+        </button>
+      </div>
+    {:else}
+      <button
+        type="button"
+        class="entry"
+        disabled={busy}
+        onclick={() => (confirmingClear = true)}
+      >
+        Not injected — clear the flag now…
+      </button>
+    {/if}
+
+    <!-- Single click, deliberately: this releases nothing. It records that a
+         restore happened and defers the clear to an observed new session. -->
+    <button
+      type="button"
+      class="entry"
+      disabled={row.awaiting_session_clear || busy}
+      onclick={() => void run('await_session_clear')}
+    >
+      I restored a checkpoint — clear after I start a new session
+    </button>
+  {/if}
+
   {#if error}
     <div class="state err">{error}</div>
   {/if}
@@ -274,6 +346,10 @@
   }
   .why {
     color: var(--text-tertiary);
+  }
+  .state code {
+    font-family: var(--font-mono, monospace);
+    color: var(--text-primary);
   }
   /* A row whose state could not be read is not a confident claim — the same
      dashed treatment the status chip uses for its unknown state. */

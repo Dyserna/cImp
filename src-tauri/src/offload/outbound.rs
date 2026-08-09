@@ -1344,6 +1344,27 @@ pub enum Screen {
     /// and writes a beacon row, while the tab's contamination never lapsed and
     /// so has nothing new to report.
     Contamination => "contamination",
+    /// Step 4 of the user-driven clear: the moment a tab's contamination bit
+    /// went **true → false**. The exact counterpart of [`Screen::Contamination`]
+    /// above, and its own lane for that reason — a reviewer filtering the two
+    /// wire values gets one tab's whole taint lifecycle, and neither half can be
+    /// evicted by the other's volume.
+    ///
+    /// Two paths write it, and the row's [`Origin`] is what tells them apart:
+    ///
+    /// * `ipc` — the user judged the flagged content harmless and cleared the
+    ///   bit immediately from the taint popover ("false-positive resume").
+    /// * `internal` — the user had earlier armed a one-shot clear (they restored
+    ///   a checkpoint, which cannot un-read a page), and cImp has now *observed*
+    ///   the tab start a new harness session. The authority is the earlier click;
+    ///   the trigger is cImp's own observation, so the origin is not `ipc`. The
+    ///   arming click has its own [`Screen::LatchOverride`] row.
+    ///
+    /// Not a denial: nothing was refused. It is the most consequential *grant*
+    /// in this enum — from here on the tab's `context_note` writes are stored
+    /// clean again — which is precisely why it is recorded rather than inferred
+    /// from the absence of later rows.
+    ContaminationCleared => "contamination_cleared",
 }
 }
 
@@ -1444,7 +1465,9 @@ impl Screen {
     /// full pass over a result it nonetheless delivered, nor
     /// [`Screen::Contamination`], which records a call that was **admitted**
     /// (a refused call never contaminates — that is the whole point of setting
-    /// the bit on the far side of the gate).
+    /// the bit on the far side of the gate), nor
+    /// [`Screen::ContaminationCleared`], which records the bit being **released**
+    /// on the user's authority.
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
@@ -1456,6 +1479,7 @@ impl Screen {
                 | Screen::LatchOverride
                 | Screen::LatchBeacon
                 | Screen::Contamination
+                | Screen::ContaminationCleared
         )
     }
 }
@@ -2416,7 +2440,8 @@ mod tests {
                 "updater",
                 "latch_override",
                 "latch_beacon",
-                "contamination"
+                "contamination",
+                "contamination_cleared"
             ]
         );
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
@@ -2444,6 +2469,11 @@ mod tests {
         // #45: a beacon ENGAGES containment; nothing has been refused yet, and
         // the refusals that follow get their own `latch_refusal` rows.
         assert!(!Screen::LatchBeacon.is_denial());
+        // Step 4: the contamination bit going true→false is a GRANT on the
+        // user's authority — the pair with `contamination` below, and neither
+        // half of that pair is a denial.
+        assert!(!Screen::Contamination.is_denial());
+        assert!(!Screen::ContaminationCleared.is_denial());
         assert!(Screen::LatchRefusal.is_denial());
         assert!(Screen::Ssrf.is_denial());
     }

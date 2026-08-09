@@ -1308,11 +1308,23 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
 /// to draw. The Tauri backend owns the registry in-process, so this reads it
 /// directly.
 ///
-/// Cheap by construction — one mutex, a handful of `(agent, tab)` entries, no
-/// I/O — which is what makes the UI's short poll interval acceptable.
+/// Cheap by construction — a couple of mutexes, a handful of `(agent, tab)`
+/// entries, no I/O — which is what makes the UI's short poll interval
+/// acceptable.
+///
+/// Step 4 gives it one side effect, deliberately: it folds each tab's current
+/// live session into the latch registry before reading it, so a session rotation
+/// the harness has already proved is *observed* on this poll rather than
+/// whenever the model next calls a cImp tool. That matters only for a tab whose
+/// user armed the one-shot contamination clear by restoring a checkpoint — see
+/// `loopback::TabLatch::awaiting_session_clear`. It grants nothing the next
+/// gated call would not have granted anyway; it only decides when the same fact
+/// becomes visible.
 #[tauri::command]
-pub async fn latch_status() -> AppResult<Vec<crate::offload::loopback::LatchStatus>> {
-    Ok(crate::offload::loopback::latch_snapshot())
+pub async fn latch_status(
+    app: tauri::AppHandle,
+) -> AppResult<Vec<crate::offload::loopback::LatchStatus>> {
+    Ok(crate::offload::loopback::latch_snapshot(&app))
 }
 
 /// V32 Phase G (locked decision 16): the RESOLVED state of every injection

@@ -1303,17 +1303,74 @@ struct TabLatch {
     /// boundary is attacker-controlled and the tab id is not (it is
     /// config-derived, and [`is_configured_tab`] bounds the key space).
     ///
-    /// **The accepted cost.** A genuine `/clear` in the same tab keeps the bit:
-    /// that conversation's `context_note` writes stay quarantined (they are
-    /// stored and held for review, not dropped) and the badge keeps saying
-    /// "contaminated". `/latch/override` deliberately cannot clear it either.
-    /// The only escape is dropping the registry entry — and note that the
-    /// registry ([`latches`]) is a process-global map with no eviction, so
-    /// **today that means an app restart**, not a tab restart. Adding a
-    /// tab-teardown hook that removes the entry is the open follow-up; it is
-    /// deliberately not invented here, because a new clear path is a new attack
-    /// surface and needs its own decision.
+    /// # Step 4 (2026-08-09): the clear path H-2 left open, and its trust root
+    ///
+    /// H-2 removed the last automatic reset and left "restart cImp" as the only
+    /// escape — which is why the field doc used to end there. What it did not
+    /// settle is what *may* clear the bit, and the answer is not a better piece
+    /// of evidence: it is **authority**. A human acting in cImp's own UI is a
+    /// fact no shell can fabricate (the webview holds no bearer token, and
+    /// [`apply_latch_override`] is reachable only from the capability-scoped
+    /// `latch_override` IPC command), and it is the same trust root every other
+    /// consent surface in this app already uses.
+    ///
+    /// So exactly two things clear it, both rooted in that click:
+    ///
+    /// 1. [`LatchOverride::ClearContamination`] — the user judged the flagged
+    ///    content harmless. Cleared immediately; nothing else about the tab or
+    ///    its session changes.
+    /// 2. [`LatchOverride::AwaitSessionClear`] +
+    ///    [`awaiting_session_clear`](Self::awaiting_session_clear) — the user
+    ///    restored a checkpoint. The bit **stays set** and lifts only when a
+    ///    proved session rotation is observed. See that field for why a forgeable
+    ///    rotation signal is acceptable *there* and nowhere else.
+    ///
+    /// **The accepted cost is unchanged for everything else.** A genuine
+    /// `/clear` in a tab nobody armed keeps the bit: that conversation's
+    /// `context_note` writes stay quarantined (they are stored and held for
+    /// review, not dropped) and the badge keeps saying "contaminated". The two
+    /// latch overrides that existed before this step still cannot clear it, and
+    /// neither can any HTTP route.
     contaminated: bool,
+    /// Step 4: the **one-shot arm** — the only thing that lets a session
+    /// rotation clear [`contaminated`](Self::contaminated).
+    ///
+    /// Set by [`LatchOverride::AwaitSessionClear`], i.e. by a user who restored
+    /// a checkpoint. Consumed by [`observe`](Self::observe) the next time a
+    /// changed session id arrives, which clears the contamination bit and
+    /// disarms in the same move. Also cleared by an immediate
+    /// [`LatchOverride::ClearContamination`], which supersedes it (there is
+    /// nothing left to wait for).
+    ///
+    /// # Why restore does not simply clear, and why the arm is safe
+    ///
+    /// **Restore is the case where clearing is *least* justified.** Rolling back
+    /// files cannot remove injected text from the model's context window, so the
+    /// conversation the user is worried about is still running. The UI therefore
+    /// tells them to `/clear`, and cImp waits until it sees that happen.
+    ///
+    /// **And this is the one place a filesystem-derived rotation signal may be
+    /// trusted.** H-2's argument is intact: a Claude tab's session id comes from
+    /// a directory the model's own Bash can write, so the signal is forgeable.
+    /// What changes here is what the signal *decides*. It is not carrying the
+    /// decision — the click is. An attacker cannot click restore, so a forged
+    /// rotation only helps in the case where the user has **already decided** the
+    /// bit should go; the worst outcome is that it lifts slightly earlier than
+    /// their actual `/clear`. The signal answers "has the authorised thing
+    /// happened yet?", never "should it happen?". H-2's decode proof still gates
+    /// it: `observe` only ever sees session ids the live-session registry
+    /// published, and that registry takes Claude ids from
+    /// `oob::claude::LiveSessionGate` (a decoded record naming the session) and
+    /// OpenCode ids from a `session.created` on the harness's own event stream.
+    ///
+    /// # Lifetime
+    ///
+    /// It lives in the registry entry, so it has the entry's lifetime: it
+    /// survives a tab restart (which is itself a rotation, and therefore fires
+    /// it) and dies with the process. An app restart drops the whole entry —
+    /// contamination included — so an arm outliving one is meaningless by
+    /// construction.
+    awaiting_session_clear: bool,
 }
 
 impl TabLatch {
@@ -1328,6 +1385,7 @@ impl TabLatch {
             latch_flagged: false,
             beacon_flagged: false,
             contaminated: false,
+            awaiting_session_clear: false,
         }
     }
 
@@ -1342,7 +1400,68 @@ impl TabLatch {
             // from the label, or the rule would live in two places and drift.
             can_flip_local: self.latch == Latch::External,
             can_unlatch: self.latch != Latch::Open,
+            // Step 4's two, published on the same principle. `can_clear` is
+            // deliberately not `contaminated` spelled twice in TypeScript: the
+            // legality rule for a move belongs to the backend even when it is
+            // currently one field wide.
+            can_clear: self.contaminated,
+            awaiting_session_clear: self.awaiting_session_clear,
         }
+    }
+
+    /// Step 4: **the one place [`contaminated`](Self::contaminated) is
+    /// cleared.** Returns what the tab looked like immediately before, or `None`
+    /// when it was not contaminated at all.
+    ///
+    /// Both authorised paths funnel through here — the user's immediate resume
+    /// and the armed rotation — so a field that has to be reset alongside the bit
+    /// cannot be reset on one path and forgotten on the other.
+    ///
+    /// # What it resets, and why the two report bits are not optional
+    ///
+    /// `latch_flagged` and `beacon_flagged` are one-row-per-scope claim bits:
+    /// once set, the refusal and beacon rows they gate are never written again
+    /// for this tab-session. Leaving them set across a clear would make a
+    /// **re-contamination silent** — the tab would take external content again
+    /// and the feed would show nothing new, which is exactly the class of bug
+    /// #48 fixed for the `Local`-latched beacon. Clearing the bit means this tab
+    /// gets to report its containment events afresh.
+    ///
+    /// (The `contamination` row itself is self-limiting through
+    /// [`note_contamination`]'s `mem::replace`, so clearing the bit re-arms that
+    /// one automatically — which is what the re-contamination test asserts,
+    /// rather than asserting these two booleans directly.)
+    ///
+    /// # What it deliberately does NOT touch
+    ///
+    /// * **The latch.** Resume "changes nothing else"; the latch has its own two
+    ///   buttons and its own rules. Leaving it where it is can only be the
+    ///   tighter choice.
+    /// * **The budget.** Spend is not a report flag — the same reason
+    ///   [`LatchRegistry::apply_override`] does not refill it.
+    /// * **Quarantined notes.** Locked decision 10 keeps promote-or-discard
+    ///   behind the Memory view's own review, which is a separate consent
+    ///   surface. Clearing the tab bit stops *future* writes being quarantined;
+    ///   notes already held stay held. Nothing in this module can reach them, and
+    ///   that is the point.
+    fn clear_contamination(&mut self) -> Option<PriorTaint> {
+        if !self.contaminated {
+            // An arm can only be set on a contaminated tab, but if one ever
+            // outlived its bit it would be a trap waiting to fire on the next
+            // rotation. Drop it.
+            self.awaiting_session_clear = false;
+            return None;
+        }
+        let prior = PriorTaint {
+            latch: self.latch.label(),
+            armed: self.awaiting_session_clear,
+            session: self.session.clone(),
+        };
+        self.contaminated = false;
+        self.awaiting_session_clear = false;
+        self.latch_flagged = false;
+        self.beacon_flagged = false;
+        Some(prior)
     }
 
     /// Fold the currently-observed session id into this entry, resetting the
@@ -1362,6 +1481,15 @@ impl TabLatch {
     /// signal is derived from a file that attacker can create. See the field's
     /// doc for the full argument and its accepted cost.
     ///
+    /// **The one exception, and it is not an exception to that argument (step
+    /// 4).** If — and only if — the user has armed
+    /// [`awaiting_session_clear`](Self::awaiting_session_clear) by restoring a
+    /// checkpoint, this rotation is the awaited event and the bit is cleared
+    /// here. H-2 is untouched: an unarmed tab is unchanged by any rotation,
+    /// forged or genuine, which is what
+    /// `a_session_rotation_resets_the_latch_but_never_the_contamination_bit`
+    /// still asserts. The arm is the authority; the rotation only says "yet".
+    ///
     /// The three cases, and why `None` is not one of them:
     /// - a *different* session id ⇒ new scope, latch back to [`Latch::Open`];
     /// - the *same* id ⇒ unchanged;
@@ -1371,11 +1499,17 @@ impl TabLatch {
     ///   emitted a session-bearing event). Treating that silence as a restart
     ///   would hand an injected model a trivial latch reset: keep calling until
     ///   the registry blinks.
-    fn observe(&mut self, session: Option<&str>) {
-        let Some(s) = session else { return };
+    #[must_use = "an armed tab clears its contamination bit here and the clear owes the feed a \
+                  row — call ContaminationCleared::record() after dropping the registry lock"]
+    fn observe(&mut self, session: Option<&str>) -> Option<ClearedOnRotation> {
+        let s = session?;
         match self.session.as_deref() {
-            Some(prev) if prev == s => {}
-            Some(_) => {
+            Some(prev) if prev == s => None,
+            Some(prev) => {
+                let prior_session = prev.to_string();
+                // Captured before the resets below, because it is what the audit
+                // row means by "prior state".
+                let prior_latch = self.latch.label();
                 self.session = Some(s.to_string());
                 self.latch = Latch::Open;
                 // V32 Phase C: the new conversation gets a fresh budget and a
@@ -1389,13 +1523,74 @@ impl TabLatch {
                 // latch and refill the budget (both merely permissive, and both
                 // re-earned by the next real call), but it may not un-taint a
                 // context window.
+                //
+                // Step 4: unless the USER armed this exact wait. The guard is
+                // the whole design — it is checked before anything is cleared,
+                // so a rotation into an unarmed tab takes the H-2 path above and
+                // nothing else. Deliberately not `if let Some(..) = ..` over
+                // `clear_contamination`: that call must not run at all on an
+                // unarmed tab, or a later refactor of it could start reaching
+                // the bit through this door.
+                if !self.awaiting_session_clear {
+                    return None;
+                }
+                let prior = self.clear_contamination()?;
+                Some(ClearedOnRotation {
+                    prior_latch,
+                    prior_session,
+                    session: s.to_string(),
+                    armed: prior.armed,
+                })
             }
             // First sighting: the same scope, only now identified. The latch
             // carries over — calls made before the registry knew the session
             // still happened in this conversation.
-            None => self.session = Some(s.to_string()),
+            //
+            // Not a rotation, so it cannot fire the arm either: "we did not know
+            // the id before" is not evidence that the conversation changed. This
+            // is the same reading `None` gets above.
+            None => {
+                self.session = Some(s.to_string());
+                None
+            }
         }
     }
+}
+
+/// What a tab looked like immediately before [`TabLatch::clear_contamination`]
+/// released it — the "prior state" every clear's audit row records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorTaint {
+    /// [`Latch::label`] at the moment of the clear. Unchanged by it.
+    latch: &'static str,
+    /// Whether the one-shot arm was set. False for a false-positive resume of an
+    /// un-armed tab; true when the clear is a restore's arm firing.
+    armed: bool,
+    /// The conversation the tab was in. For the rotation path this is the
+    /// *outgoing* session — the contaminated one.
+    session: Option<String>,
+}
+
+/// A contamination bit cleared inside [`TabLatch::observe`] — the armed
+/// one-shot firing on a proved session rotation.
+///
+/// Returned rather than recorded in place for the reason [`Contamination`] is:
+/// the transition happens under the registry mutex and `record_flag` does file
+/// I/O. Every caller of `observe` turns this into a
+/// [`ContaminationCleared`] with its own [`LatchScope`] — which is also why the
+/// scope is not carried here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a contamination clear that is not recorded is an unaudited release of containment"]
+struct ClearedOnRotation {
+    /// [`Latch::label`] before the rotation reopened it.
+    prior_latch: &'static str,
+    /// The contaminated conversation that just ended.
+    prior_session: String,
+    /// The conversation the tab is now in.
+    session: String,
+    /// Always true — the arm is the only way to reach this type. Carried so the
+    /// row builder takes the same `armed` input on both paths.
+    armed: bool,
 }
 
 /// V32 Phase F: the containment state of one tab, as the badge and the
@@ -1415,6 +1610,18 @@ pub struct LatchView {
     pub can_flip_local: bool,
     /// Whether "restore full access" applies right now (anything but open).
     pub can_unlatch: bool,
+    /// Step 4: whether either contamination clear applies right now — i.e.
+    /// whether the tab is contaminated at all.
+    pub can_clear: bool,
+    /// Step 4: whether the user has armed the one-shot clear (they restored a
+    /// checkpoint) and cImp is waiting for this tab to start a new harness
+    /// session. See [`TabLatch::awaiting_session_clear`].
+    ///
+    /// Published because the UI has to say *why* a contaminated tab is showing
+    /// no "clear now" affordance after a restore, and because step 5's
+    /// restore-linked entry point must be able to tell an already-armed tab from
+    /// a fresh one without re-deriving the rule.
+    pub awaiting_session_clear: bool,
 }
 
 impl Default for LatchView {
@@ -1426,16 +1633,21 @@ impl Default for LatchView {
             contaminated: false,
             can_flip_local: false,
             can_unlatch: false,
+            can_clear: false,
+            awaiting_session_clear: false,
         }
     }
 }
 
-/// V32 Phase F (locked decision 15): the two USER-initiated latch moves.
+/// The USER-initiated containment moves — V32 Phase F's two latch moves
+/// (locked decision 15), plus step 4's two contamination moves.
 ///
-/// Deliberately only two, and both narrowing or explicit: there is no
-/// "latch external" (the system does that) and no "clear contamination"
-/// (nothing in this process may — H-2 removed the session-rotation reset that
-/// used to be the one exception; see [`TabLatch::contaminated`]).
+/// There is still no "latch external": the system does that, and an action that
+/// only ever tightens needs no consent surface. What step 4 adds is the *clear*
+/// this enum's doc used to say could not exist. H-2's conclusion was that no
+/// filesystem-derived **evidence** may un-taint a context window, and that
+/// stands; the trust root here is not evidence but **authority** — a human
+/// acting in cImp's own UI (see [`TabLatch::contaminated`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatchOverride {
     /// EXTERNAL → Local. Restores the proxied local-capability tools and closes
@@ -1445,18 +1657,34 @@ pub enum LatchOverride {
     /// front of it because it recreates the trifecta with injected content
     /// still in the context window.
     Unlatch,
+    /// Step 4 — **false-positive resume.** The user has looked at what was
+    /// flagged and judged it harmless. Clears the contamination bit now; the
+    /// session, the tab and the working tree are untouched (no restart, no
+    /// `/clear`, no file written). The UI puts a confirmation in front of it for
+    /// the same reason it does for [`Unlatch`](Self::Unlatch): if the judgement
+    /// is wrong, a steered model gets its persistence channel back.
+    ClearContamination,
+    /// Step 4 — **restore.** The user rolled files back to a checkpoint. That
+    /// cannot remove injected text from the model's context window, so this
+    /// clears **nothing**: it arms
+    /// [`TabLatch::awaiting_session_clear`], and the bit lifts only once cImp
+    /// observes the tab start a new harness session.
+    AwaitSessionClear,
 }
 
 impl LatchOverride {
     /// Parse a wire value. An unrecognized action is an **error**, never a
-    /// benign default: the two actions differ in exactly how much capability
-    /// they hand back, so a typo must not pick one.
+    /// benign default: the actions differ in exactly how much capability they
+    /// hand back, so a typo must not pick one.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
             "flip_local" => Ok(LatchOverride::FlipLocal),
             "unlatch" => Ok(LatchOverride::Unlatch),
+            "clear_contamination" => Ok(LatchOverride::ClearContamination),
+            "await_session_clear" => Ok(LatchOverride::AwaitSessionClear),
             other => Err(format!(
-                "invalid latch override `{other}` — expected \"flip_local\" or \"unlatch\""
+                "invalid latch override `{other}` — expected one of \"flip_local\", \"unlatch\", \
+                 \"clear_contamination\", \"await_session_clear\""
             )),
         }
     }
@@ -1466,6 +1694,8 @@ impl LatchOverride {
         match self {
             LatchOverride::FlipLocal => "flip_local",
             LatchOverride::Unlatch => "unlatch",
+            LatchOverride::ClearContamination => "clear_contamination",
+            LatchOverride::AwaitSessionClear => "await_session_clear",
         }
     }
 }
@@ -1474,8 +1704,13 @@ impl LatchOverride {
 /// looks like now. The prior state is carried because it is the fact the
 /// activity row exists to record — "restored full access" means something very
 /// different from `external` than from `local`.
+#[derive(Debug)]
 struct OverrideOutcome {
     prior: Latch,
+    /// Step 4: the taint state before the move, for the same reason `prior`
+    /// exists — "cleared the contamination flag" is only legible beside what was
+    /// there. `None` for a move on an uncontaminated tab.
+    prior_taint: Option<PriorTaint>,
     view: LatchView,
 }
 
@@ -1767,6 +2002,167 @@ impl Contamination {
     }
 }
 
+/// Step 4: on whose reasoning a contamination bit was released. The row's
+/// `basis`, and the word that makes the audit trail legible — "the user said it
+/// was a false positive" and "the user restored and then started a new session"
+/// are very different claims about what is in the model's context window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClearBasis {
+    /// [`LatchOverride::ClearContamination`] — the user judged the flagged
+    /// content harmless. Nothing else changed.
+    Resume,
+    /// [`LatchOverride::AwaitSessionClear`] armed the tab after a restore, and
+    /// cImp has now observed a new harness session.
+    Restore,
+}
+
+impl ClearBasis {
+    /// The row's at-a-glance `tool` column. These rows have no tool call behind
+    /// them; what happened is the fact worth reading.
+    fn tool(self) -> &'static str {
+        match self {
+            ClearBasis::Resume => LatchOverride::ClearContamination.as_str(),
+            ClearBasis::Restore => "session_clear_observed",
+        }
+    }
+}
+
+/// One clearing of [`TabLatch::contaminated`], ready to record — the exact
+/// counterpart of [`Contamination`], down to being owned rather than borrowed so
+/// the row is written after the registry lock is dropped.
+///
+/// **Both authorised paths build one**, which is what stops the two from
+/// describing the same state change differently: the immediate resume in
+/// [`LatchRegistry::apply_override`], and the armed rotation firing inside
+/// [`TabLatch::observe`] (via [`ClearedOnRotation::into_row`]).
+struct ContaminationCleared {
+    /// Who acted *now*. [`outbound::Origin::Ipc`] for the resume — a human in
+    /// the app's own UI. [`outbound::Origin::Internal`] for the armed rotation:
+    /// the authority was the earlier click (which has its own
+    /// [`outbound::Screen::LatchOverride`] row), but the act recorded here is
+    /// cImp's own observation, and `Ipc` means "a human did *this*".
+    origin: outbound::Origin,
+    basis: ClearBasis,
+    consumer: &'static str,
+    /// `agent:tab` — [`LatchScope::label`].
+    scope: String,
+    /// The conversation the row is filed under: the one contamination was
+    /// cleared *for*. For the rotation path that is the OUTGOING session, not
+    /// the new one — the new one was never contaminated, and filing it there
+    /// would break a join against the `contamination` row that opened the
+    /// lifecycle.
+    session: Option<String>,
+    root: String,
+    detail: String,
+}
+
+impl ContaminationCleared {
+    /// Write the row. Fire-and-forget, like every other `record_flag` call on
+    /// these paths.
+    fn record(self) {
+        warn!(
+            target: "offload",
+            consumer = self.consumer,
+            scope = %self.scope,
+            basis = self.basis.tool(),
+            origin = self.origin.as_str(),
+            root = %self.root,
+            "loopback: V32 contamination flag cleared on the user's authority"
+        );
+        outbound::record_flag(outbound::Flag {
+            screen: outbound::Screen::ContaminationCleared,
+            origin: self.origin,
+            consumer: self.consumer,
+            scope: &self.scope,
+            session: self.session.as_deref(),
+            tool: self.basis.tool(),
+            host: None,
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: self.root.clone(),
+            detail: &self.detail,
+        });
+    }
+
+    /// Record a clear that may not have happened. Every `observe` call site
+    /// funnels through this, so "the arm fired here" needs no branch of its own
+    /// at five sites.
+    fn record_from(cleared: Option<ClearedOnRotation>, scope: &LatchScope) {
+        if let Some(ev) = cleared {
+            ev.into_row(scope).record();
+        }
+    }
+}
+
+/// The sentence an incident reviewer reads when the bit was released —
+/// composed **once**, for both paths.
+///
+/// Written as one function rather than two format strings because the whole
+/// point of the pair is that they say the same things about different bases: the
+/// prior state, what was and was not restored by the clear, and — the part a
+/// reviewer most needs — that quarantined notes are untouched by it.
+fn clear_detail(
+    basis: ClearBasis,
+    origin: outbound::Origin,
+    prior_latch: &str,
+    prior_session: Option<&str>,
+    new_session: Option<&str>,
+) -> String {
+    let how = match basis {
+        ClearBasis::Resume => "the user judged the flagged content harmless and cleared the flag \
+                               from the taint popover. The session, the tab and the working tree \
+                               were not touched"
+            .to_string(),
+        ClearBasis::Restore => format!(
+            "the user restored a checkpoint, which armed a ONE-SHOT clear (a restore rolls back \
+             files and cannot remove injected text from a context window, so the flag was kept), \
+             and cImp has now observed this tab start a new harness session{}. The arm is the \
+             authority here; the rotation only answers \"has it happened yet\", which is why a \
+             forgeable rotation signal is acceptable for it and for nothing else",
+            match new_session {
+                Some(s) => format!(" ({s})"),
+                None => String::new(),
+            }
+        ),
+    };
+    format!(
+        "CONTAMINATION CLEARED (basis: {}, origin: {}): {how}. Prior state: contaminated=true, \
+         latch={prior_latch}, session={}. The latch itself is unchanged by this and keeps its own \
+         controls. Memory notes already quarantined STAY quarantined — promoting or discarding \
+         them is the Memory view's own review (locked decision 10), a separate consent surface. \
+         What changes is that this tab's future persistent writes are stored clean again, and that \
+         a fresh contamination will report itself as a new transition.",
+        basis.tool(),
+        origin.as_str(),
+        prior_session.unwrap_or("unknown"),
+    )
+}
+
+impl ClearedOnRotation {
+    /// Turn a lock-side clear into the row its caller's scope can file.
+    fn into_row(self, scope: &LatchScope) -> ContaminationCleared {
+        debug_assert!(self.armed, "only an armed tab can clear on a rotation");
+        ContaminationCleared {
+            // NOT `Ipc`: see the field's doc. The click that authorised this
+            // happened earlier and was recorded then.
+            origin: outbound::Origin::Internal,
+            basis: ClearBasis::Restore,
+            consumer: scope.agent,
+            scope: scope.label(),
+            session: Some(self.prior_session.clone()),
+            root: scope.root.clone(),
+            detail: clear_detail(
+                ClearBasis::Restore,
+                outbound::Origin::Internal,
+                self.prior_latch,
+                Some(&self.prior_session),
+                Some(&self.session),
+            ),
+        }
+    }
+}
+
 /// **The one place a conversation is marked contaminated** (#48, finding F-3).
 ///
 /// Both paths that can set the bit — an admitted proxied EXTERNAL call in
@@ -1833,10 +2229,13 @@ fn note_contamination(
             "CONTAMINATED: external content entered this conversation via {tool}{}. Nothing was \
              refused — the call was admitted, and this row records the state change it caused. \
              From here on every persistent memory write from this tab is quarantined for review \
-             and every external result keeps its spotlighting envelope (latch={}). The bit is \
-             sticky and no filesystem-derived signal clears it (H-2: a new harness session is not \
-             proof of a new context window, because the model's own shell can forge one), so \
-             until a user-driven clear exists a cImp restart is the only reset.",
+             and every external result keeps its spotlighting envelope (latch={}). No \
+             filesystem-derived signal clears the bit (H-2: a new harness session is not proof of \
+             a new context window, because the model's own shell can forge one) and no HTTP route \
+             can. It is cleared only by the USER, from the taint popover — either immediately \
+             (`clear_contamination`, \"that content was harmless\") or after a checkpoint restore \
+             (`await_session_clear`, effective once cImp observes a new harness session). Whichever \
+             happens, it writes its own `contamination_cleared` row.",
             match prov.host {
                 Some(h) => format!(" from {h}"),
                 None => String::new(),
@@ -1893,7 +2292,11 @@ impl LatchRegistry {
         }
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = tabs.entry(scope.key()).or_insert_with(TabLatch::fresh);
-        entry.observe(scope.session.as_deref());
+        // Step 4: for a Claude tab this is the usual place an armed one-shot
+        // fires — the first cImp tool call of the conversation that followed the
+        // user's `/clear`. Recorded on every exit below, before this call's own
+        // rows, so the feed reads in the order the state actually moved.
+        let rotated = entry.observe(scope.session.as_deref());
         // V32 Phase F: quarantine keys on CONTAMINATION, not on the latch
         // position. `Latch::External` always implies `contaminated` (both are
         // set by the same admitted call, a few lines below), so this only ever
@@ -1947,6 +2350,7 @@ impl LatchRegistry {
                 // queue, and a feed that reported only the first would leave
                 // later ones discoverable solely by opening the Memory view.
                 drop(tabs);
+                ContaminationCleared::record_from(rotated, scope);
                 outbound::record_flag(outbound::Flag {
                     screen: outbound::Screen::MemoryQuarantine,
                     origin: outbound::Origin::Internal,
@@ -1980,6 +2384,7 @@ impl LatchRegistry {
             // working. One row per scope (see `TabLatch::latch_flagged`).
             let first = !std::mem::replace(&mut entry.latch_flagged, true);
             drop(tabs);
+            ContaminationCleared::record_from(rotated, scope);
             if first {
                 outbound::record_flag(outbound::Flag {
                     screen: outbound::Screen::LatchRefusal,
@@ -2037,7 +2442,10 @@ impl LatchRegistry {
         let latch = entry.latch.label();
         // Both the log line and the row are written with the lock released —
         // `record_flag` reaches the activity store, which does file I/O.
+        // (Step 4's clear row is written first, below, for the same ordering
+        // reason the beacon states.)
         drop(tabs);
+        ContaminationCleared::record_from(rotated, scope);
         if engaged {
             info!(
                 target: "offload",
@@ -2111,9 +2519,11 @@ impl LatchRegistry {
         };
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = tabs.entry(scope.key()).or_insert_with(TabLatch::fresh);
-        entry.observe(scope.session.as_deref());
-        // Unchanged, deliberately: contamination is set on every beacon and
-        // nothing here or elsewhere clears it (locked decision 15). What #48
+        let cleared = entry.observe(scope.session.as_deref());
+        // Unchanged, deliberately: contamination is set on every beacon, and
+        // nothing on THIS route can ever clear it (locked decision 15 — step 4's
+        // two clears are user actions over IPC, and `observe` above releases the
+        // bit only for a tab the user armed). What #48
         // adds is only that the TRANSITION is observable, so it can be recorded
         // — through the SAME function the proxied gate flips the bit with, so
         // the two paths cannot disagree about what a transition is or produce
@@ -2130,6 +2540,11 @@ impl LatchRegistry {
             (moved || contaminated_now) && !std::mem::replace(&mut entry.beacon_flagged, true);
         let view = entry.view();
         drop(tabs);
+        // Step 4: recorded BEFORE the contamination row this beacon may also
+        // produce. A beacon arriving on the first call after an armed rotation
+        // clears the bit and immediately re-sets it, and the feed has to read in
+        // that order to make sense.
+        ContaminationCleared::record_from(cleared, scope);
         if moved {
             info!(
                 target: "offload",
@@ -2179,15 +2594,23 @@ impl LatchRegistry {
     ///   read-only purity of not touching the entry. `observe` is the same
     ///   rotation rule `gate` and `beacon` apply, so the three cannot disagree
     ///   about when a conversation ended.
+    ///
+    /// Step 4: which also means this is one of the places an armed one-shot
+    /// fires. For an OpenCode tab it is the *usual* one — the plugin polls
+    /// `/latch/state` around the harness's own turns, so a `/clear` after a
+    /// restore lifts the bit without waiting for a proxied tool call.
     fn view_for(&self, scope: &LatchScope) -> LatchView {
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
-        match tabs.get_mut(&scope.key()) {
+        let (view, cleared) = match tabs.get_mut(&scope.key()) {
             Some(entry) => {
-                entry.observe(scope.session.as_deref());
-                entry.view()
+                let cleared = entry.observe(scope.session.as_deref());
+                (entry.view(), cleared)
             }
-            None => LatchView::default(),
-        }
+            None => (LatchView::default(), None),
+        };
+        drop(tabs);
+        ContaminationCleared::record_from(cleared, scope);
+        view
     }
 
     /// V32 Phase F (locked decision 15): apply a USER-initiated latch move.
@@ -2213,14 +2636,25 @@ impl LatchRegistry {
     ///   which only ever tightens (Open → External) and only for a configured
     ///   tab id ([`is_configured_tab`]) — it cannot flip to Local, cannot
     ///   unlatch, and cannot clear contamination.
-    /// - **Nothing here clears `contaminated`** regardless of caller. Decision
-    ///   15: contamination is a property of the conversation, not of the latch
-    ///   position.
+    /// - **What clears `contaminated` (step 4)** is two of the four actions, and
+    ///   nothing else — no automatic path, no HTTP path. See
+    ///   [`TabLatch::contaminated`] for why a click is a legitimate trust root
+    ///   where a transcript file is not.
     ///
     /// This is not an integrity boundary against native code, and never was —
     /// decision 3 says plainly that a model with a shell already has the
     /// capabilities the latch withholds. It is the difference between an audit
     /// trail that records a user's decision and one that records a POST.
+    ///
+    /// **The feature switches are deliberately not consulted.** `gate` creates
+    /// no entry while [`GatePolicy::inert`], so with both controls off there is
+    /// usually nothing here to move and the caller gets the "nothing to
+    /// override" error. But an entry created while the controls were ON survives
+    /// the user switching them off, and its contamination bit is still what the
+    /// badge renders — so refusing to clear it would leave a stale flag the user
+    /// cannot reach *because* they disabled the feature. Every action here is
+    /// user-initiated and only ever loosens cImp's own bookkeeping; none of them
+    /// needs the feature to be armed to be meaningful.
     ///
     /// Errors (rather than silently no-op'ing) when the move does not apply, so
     /// the UI can say why instead of appearing to have worked.
@@ -2236,9 +2670,17 @@ impl LatchRegistry {
                 scope.label()
             ));
         };
-        entry.observe(scope.session.as_deref());
+        // An armed one-shot can fire right here: the user restored, ran
+        // `/clear`, and the first thing to look at the entry afterwards is their
+        // next click. Captured rather than dropped, and recorded below on BOTH
+        // exits — a refused action must not swallow a clear that already
+        // happened.
+        let rotated = entry.observe(scope.session.as_deref());
         let prior = entry.latch;
-        match action {
+        let mut prior_taint = None;
+        // The action's own verdict, computed before the lock is released so an
+        // error path can still record `rotated`.
+        let applied = match action {
             // The workflow button: research finished, now apply it. EXTERNAL
             // only — from `Open` there is nothing to flip and from `Local` this
             // would be a no-op that reads like an action. At no instant does the
@@ -2246,33 +2688,82 @@ impl LatchRegistry {
             // external side in the same assignment that opens the local one.
             LatchOverride::FlipLocal => {
                 if prior != Latch::External {
-                    return Err(format!(
+                    Err(format!(
                         "\"switch to local\" applies only to an EXTERNAL-latched tab ({} is {})",
                         scope.label(),
                         prior.label()
-                    ));
+                    ))
+                } else {
+                    entry.latch = Latch::Local;
+                    Ok(())
                 }
-                entry.latch = Latch::Local;
             }
             // The at-own-risk button: both sides open again. Valid from any
             // state except a latch that is already open, which would be a
             // no-op.
             LatchOverride::Unlatch => {
                 if prior == Latch::Open {
-                    return Err(format!(
+                    Err(format!(
                         "{} is not latched — nothing to unlatch",
                         scope.label()
-                    ));
+                    ))
+                } else {
+                    entry.latch = Latch::Open;
+                    Ok(())
                 }
-                entry.latch = Latch::Open;
             }
-        }
-        // Deliberately NOT touched: `contaminated`, and the session's spent
-        // budget. The override changes what the session may reach next; it
-        // cannot un-read what the model has already read, and letting a click
-        // refill the fetch budget would make the budget advisory.
+            // Step 4, the false-positive resume. Clears the bit and NOTHING
+            // else: the latch stays where it is (it has its own buttons), the
+            // budget keeps its spend, the session and the tab are not touched,
+            // and quarantined notes stay quarantined.
+            //
+            // It supersedes an arm, which `clear_contamination` drops — there is
+            // nothing left to wait for once the bit is gone.
+            LatchOverride::ClearContamination => match entry.clear_contamination() {
+                Some(p) => {
+                    prior_taint = Some(p);
+                    Ok(())
+                }
+                None => Err(format!(
+                    "{} is not flagged as contaminated — nothing to clear",
+                    scope.label()
+                )),
+            },
+            // Step 4, the restore arm. Clears nothing now, by user decision: a
+            // restore rolls back FILES and cannot remove injected text from the
+            // model's context window, so this is the case where clearing
+            // immediately is least justified.
+            LatchOverride::AwaitSessionClear => {
+                if !entry.contaminated {
+                    Err(format!(
+                        "{} is not flagged as contaminated — there is nothing waiting to clear",
+                        scope.label()
+                    ))
+                } else if entry.awaiting_session_clear {
+                    // Not a failure so much as an answer, and the popover shows
+                    // it verbatim. Still an error rather than a silent success:
+                    // a second click that reported "done" would imply something
+                    // new happened.
+                    Err(format!(
+                        "{} is already waiting for a new session — the contamination flag clears \
+                         when one is observed",
+                        scope.label()
+                    ))
+                } else {
+                    entry.awaiting_session_clear = true;
+                    Ok(())
+                }
+            }
+        };
+        // Deliberately NOT touched by the two LATCH moves: `contaminated`, and
+        // the session's spent budget. A latch override changes what the session
+        // may reach next; it cannot un-read what the model has already read, and
+        // letting a click refill the fetch budget would make the budget
+        // advisory.
         let view = entry.view();
         drop(tabs);
+        ContaminationCleared::record_from(rotated, scope);
+        applied?;
         warn!(
             target: "offload",
             agent = scope.agent,
@@ -2281,9 +2772,55 @@ impl LatchRegistry {
             prior = prior.label(),
             latch = view.latch,
             contaminated = view.contaminated,
-            "loopback: V32 taint latch moved by explicit user override"
+            awaiting_session_clear = view.awaiting_session_clear,
+            "loopback: V32 containment state moved by explicit user override"
         );
-        Ok(OverrideOutcome { prior, view })
+        Ok(OverrideOutcome {
+            prior,
+            prior_taint,
+            view,
+        })
+    }
+
+    /// Step 4: fold each known tab's CURRENT live session into its entry, so a
+    /// rotation the harness has already proved reaches [`TabLatch::observe`]
+    /// even when the tab has made no gated call since.
+    ///
+    /// **Why the read path needs this.** Before step 4, `observe` ran only from
+    /// `gate`, `beacon` and `view_for` — i.e. only when the harness did
+    /// something. That was fine when a rotation had no user-visible consequence
+    /// worth waiting for. It is not fine now: the whole promise of the restore
+    /// arm is "run `/clear` and the flag lifts", and a Claude tab has no
+    /// `/latch/state` poll, so without this the flag would sit set until the
+    /// model happened to call a cImp tool. This is the read the UI already makes
+    /// every 4 s ([`latch_snapshot`]) — no second timer, no new schedule.
+    ///
+    /// **It grants nothing a call would not have granted anyway.** Everything
+    /// `observe` resets is permissive state that the very next gated call would
+    /// have reset before deciding anything, so doing it at read time is strictly
+    /// a matter of *when* the same fact becomes visible.
+    ///
+    /// Takes resolved scopes rather than an `AppHandle` so the session lookup
+    /// (which locks the graph service) happens outside this lock.
+    fn observe_all(&self, scopes: &[LatchScope]) -> Vec<ContaminationCleared> {
+        let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cleared = Vec::new();
+        for scope in scopes {
+            if let Some(entry) = tabs.get_mut(&scope.key()) {
+                if let Some(ev) = entry.observe(scope.session.as_deref()) {
+                    cleared.push(ev.into_row(scope));
+                }
+            }
+        }
+        cleared
+    }
+
+    /// Every `(agent, tab)` the registry holds an entry for. Cloned out under
+    /// the lock so [`latch_snapshot`] can resolve live sessions without holding
+    /// it.
+    fn keys(&self) -> Vec<(&'static str, String)> {
+        let tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
+        tabs.keys().cloned().collect()
     }
 
     /// V32 Phase C (locked decision 11): whether this tab's session may make
@@ -2493,7 +3030,26 @@ impl outbound::ScopeAudit for TabAudit<'_> {
 /// Tauri backend already owns the registry, so the UI goes through an IPC
 /// command ([`crate::ipc::commands::latch_status`]) that calls this, and the
 /// token never leaves the processes that need it.
-pub fn latch_snapshot() -> Vec<LatchStatus> {
+///
+/// **Step 4: it folds each tab's current live session in first.** See
+/// [`LatchRegistry::observe_all`] for why the read path has to — a Claude tab
+/// polls no `/latch/state`, so without this an armed one-shot would wait for the
+/// model to call a cImp tool rather than for the user's `/clear`. This is the
+/// same 4 s read the badge already makes; no second timer is introduced.
+pub fn latch_snapshot(app: &AppHandle) -> Vec<LatchStatus> {
+    // Resolve scopes with the registry lock NOT held: `latch_scope` locks the
+    // graph service for the live-session lookup.
+    let settings = live_settings(app);
+    let scopes: Vec<LatchScope> = latches()
+        .keys()
+        .iter()
+        .filter_map(|(agent, tab)| {
+            latch_scope(app, &settings, agent, Some(tab.as_str())).into_scope()
+        })
+        .collect();
+    for cleared in latches().observe_all(&scopes) {
+        cleared.record();
+    }
     latches().snapshot()
 }
 
@@ -2509,6 +3065,13 @@ pub fn latch_snapshot() -> Vec<LatchStatus> {
 /// `origin` key would say `http` while its text went on asserting that a human
 /// clicked, with nothing to catch it. One struct, one origin, both consumers.
 struct FlagRow {
+    /// Which feed lane the row belongs in. Carried here since step 4, because
+    /// one of the four override actions is not a latch move at all — it releases
+    /// the contamination bit, and that belongs in
+    /// [`outbound::Screen::ContaminationCleared`] beside the row that SET the
+    /// bit rather than among the latch moves. Deciding it here keeps the choice
+    /// beside the sentence that describes it.
+    screen: outbound::Screen,
     /// Copied verbatim into [`outbound::Flag::origin`], and interpolated into
     /// [`detail`](Self::detail) by the same function that received it.
     origin: outbound::Origin,
@@ -2531,24 +3094,67 @@ fn override_row(
     action: LatchOverride,
     outcome: &OverrideOutcome,
 ) -> FlagRow {
-    FlagRow {
-        origin,
-        // The action is the row's at-a-glance "tool": these rows have no tool
-        // call behind them, and what the user DID is the fact worth reading.
-        tool: action.as_str().to_string(),
-        detail: format!(
+    // The action is the row's at-a-glance "tool" for the three latch-shaped
+    // moves: these rows have no tool call behind them, and what the user DID is
+    // the fact worth reading. The clear names its own basis instead.
+    let (screen, tool) = match action {
+        LatchOverride::ClearContamination => (
+            outbound::Screen::ContaminationCleared,
+            ClearBasis::Resume.tool().to_string(),
+        ),
+        _ => (outbound::Screen::LatchOverride, action.as_str().to_string()),
+    };
+    let detail = match action {
+        // Step 4: composed by the SAME function the armed-rotation clear uses,
+        // so the two paths cannot describe one state change two ways.
+        LatchOverride::ClearContamination => clear_detail(
+            ClearBasis::Resume,
+            origin,
+            outcome
+                .prior_taint
+                .as_ref()
+                .map_or(outcome.prior.label(), |p| p.latch),
+            outcome
+                .prior_taint
+                .as_ref()
+                .and_then(|p| p.session.as_deref()),
+            None,
+        ),
+        // Step 4: the arm. It clears nothing, and the row has to say so — a
+        // reader who sees "restore" in the feed and no `contamination_cleared`
+        // row afterwards must be able to tell "still waiting" from "lost".
+        LatchOverride::AwaitSessionClear => format!(
+            "USER OVERRIDE (await_session_clear, origin: {}): a checkpoint was restored for this \
+             tab, and the contamination flag is deliberately NOT cleared (contaminated={}). \
+             Restoring rolls back FILES; it cannot remove injected text from the model's context \
+             window, so this is the case where clearing immediately would be least justified. cImp \
+             will clear the flag when it observes this tab start a new harness session — run \
+             `/clear` in the tab, or restart it. Until then memory writes stay quarantined and \
+             external results keep their envelope. Latch unchanged ({}).",
+            origin.as_str(),
+            outcome.view.contaminated,
+            outcome.view.latch,
+        ),
+        LatchOverride::FlipLocal | LatchOverride::Unlatch => format!(
             "USER OVERRIDE ({}, origin: {}): taint latch {} → {}. Contamination is NOT cleared by \
-             an override (contaminated={}): memory writes stay quarantined and external results \
-             keep their envelope, because the injected content is still in the conversation. \
-             Nothing in a running cImp clears it (H-2: not even a new harness session — that \
-             signal comes from a file the model's own shell can write); restarting cImp is the \
-             only clean reset.",
+             a latch override (contaminated={}): memory writes stay quarantined and external \
+             results keep their envelope, because the injected content is still in the \
+             conversation. Clearing it is its own decision with its own two actions — \
+             `clear_contamination` (the user judges the content harmless) and `await_session_clear` \
+             (after a restore, effective once a new harness session is observed). No automatic \
+             path and no HTTP route can reach either.",
             action.as_str(),
             origin.as_str(),
             outcome.prior.label(),
             outcome.view.latch,
             outcome.view.contaminated,
         ),
+    };
+    FlagRow {
+        screen,
+        origin,
+        tool,
+        detail,
     }
 }
 
@@ -2598,7 +3204,10 @@ pub fn apply_latch_override(
     // has to change.
     let row = override_row(outbound::Origin::Ipc, action, &outcome);
     outbound::record_flag(outbound::Flag {
-        screen: outbound::Screen::LatchOverride,
+        // Step 4: the row's own screen, not a constant here — a contamination
+        // clear is filed beside the row that set the bit, not among the latch
+        // moves. See `FlagRow::screen`.
+        screen: row.screen,
         origin: row.origin,
         consumer: agent,
         scope: &scope.label(),
@@ -4573,7 +5182,7 @@ fn report_beacon(
     let Some(scope) = scope else { return };
     let row = beacon_row(origin, tool, out);
     outbound::record_flag(outbound::Flag {
-        screen: outbound::Screen::LatchBeacon,
+        screen: row.screen,
         origin: row.origin,
         consumer: scope.agent,
         scope: &scope.label(),
@@ -4638,6 +5247,7 @@ fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> Flag
          here on is quarantined and every external result keeps its envelope"
     };
     FlagRow {
+        screen: outbound::Screen::LatchBeacon,
         origin,
         tool: tool.to_string(),
         detail: format!(
@@ -4645,8 +5255,9 @@ fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> Flag
              {what} (latch={}, contaminated={}). This row records an authenticated POST to \
              /latch/beacon from a local process — the cImp beacon shim is the expected sender, \
              but the launch token is readable by anything running as this user, so this is NOT \
-             evidence of a user action. Restarting cImp is the only clean reset (H-2: the \
-             contamination bit no longer clears on a new harness session).",
+             evidence of a user action. This route only ever TIGHTENS: it cannot unlatch and it \
+             cannot clear the contamination flag. Clearing that is a user action in cImp's own UI \
+             (step 4), and no HTTP route reaches it.",
             origin.as_str(),
             out.view.latch,
             out.view.contaminated,
@@ -4794,7 +5405,9 @@ async fn handle_status(stream: &mut TcpStream, app: &AppHandle) -> AppResult<()>
         stream,
         200,
         &serde_json::json!({
-            "latches": latches().snapshot(),
+            // Step 4: through `latch_snapshot`, so a hand-run `/status` and the
+            // UI's badge poll see the same freshness rule rather than two.
+            "latches": latch_snapshot(app),
             "injection": injection_status(&live_settings(app)),
         }),
     )
@@ -7549,23 +8162,42 @@ mod tests {
     }
 
     /// The wire vocabulary. An unrecognized action is an ERROR, never resolved
-    /// to a default — the two moves differ in exactly how much capability they
-    /// hand back, so a typo must not pick one.
+    /// to a default — the moves differ in exactly how much capability they hand
+    /// back, so a typo must not pick one.
+    ///
+    /// The literal list below is the *assertion*, not the input (the same shape
+    /// `screen_labels_are_the_distinct_wire_values` takes): a fifth action fails
+    /// here until someone gives it a wire value and names it, because the
+    /// frontend's `LatchAction` union is a hand-kept mirror of exactly this set.
     #[test]
-    fn latch_override_parses_exactly_two_actions() {
-        assert_eq!(
-            LatchOverride::parse("flip_local"),
-            Ok(LatchOverride::FlipLocal)
-        );
-        assert_eq!(
-            LatchOverride::parse(" unlatch "),
-            Ok(LatchOverride::Unlatch)
-        );
-        for junk in ["", "unlatch_all", "flip", "FLIP_LOCAL", "open"] {
+    fn latch_override_parses_exactly_the_declared_actions() {
+        const ACTIONS: [(LatchOverride, &str); 4] = [
+            (LatchOverride::FlipLocal, "flip_local"),
+            (LatchOverride::Unlatch, "unlatch"),
+            (LatchOverride::ClearContamination, "clear_contamination"),
+            (LatchOverride::AwaitSessionClear, "await_session_clear"),
+        ];
+        for (action, wire) in ACTIONS {
+            assert_eq!(action.as_str(), wire);
+            assert_eq!(LatchOverride::parse(wire), Ok(action), "{wire}");
+            // Trimmed, exactly as `unlatch` always was.
+            assert_eq!(LatchOverride::parse(&format!(" {wire} ")), Ok(action));
+        }
+        for junk in [
+            "",
+            "unlatch_all",
+            "flip",
+            "FLIP_LOCAL",
+            "open",
+            // Near-misses of the two new ones. An action that CLEARS containment
+            // is the last place a lenient parse belongs.
+            "clear",
+            "clear_contamination_now",
+            "await_session",
+            "session_clear_observed",
+        ] {
             assert!(LatchOverride::parse(junk).is_err(), "{junk}");
         }
-        assert_eq!(LatchOverride::FlipLocal.as_str(), "flip_local");
-        assert_eq!(LatchOverride::Unlatch.as_str(), "unlatch");
     }
 
     // ── #45 — the registry's bound, and the audit row's provenance ──────────
@@ -7760,7 +8392,8 @@ mod tests {
     /// `real-session`.
     fn contaminated_tab() -> TabLatch {
         let mut t = TabLatch::fresh();
-        t.observe(Some("real-session"));
+        // A first sighting is not a rotation, so it can never clear anything.
+        assert_eq!(t.observe(Some("real-session")), None);
         let scope = LatchScope {
             agent: "claude",
             tab: "claude".to_string(),
@@ -7810,7 +8443,16 @@ mod tests {
         assert!(t.contaminated && t.latch == Latch::External);
         assert!(t.budget.exhausted(ONE_CALL), "the spend is on the books");
 
-        t.observe(Some("aaaa"));
+        // Step 4: the return value IS the "did this clear anything" answer, so
+        // an unarmed tab must answer `None` — asserted here rather than only
+        // through `t.contaminated` below, because a future `observe` that
+        // cleared the bit and forgot the row would still leave `contaminated`
+        // false and could not be caught by reading the field alone.
+        assert_eq!(
+            t.observe(Some("aaaa")),
+            None,
+            "an UNARMED tab clears nothing on a rotation, and reports nothing"
+        );
         assert_eq!(t.session.as_deref(), Some("aaaa"), "the id itself rotates");
         assert_eq!(t.latch, Latch::Open, "a rotation reopens the latch");
         assert!(
@@ -7825,15 +8467,19 @@ mod tests {
         assert!(
             t.contaminated,
             "H-2: a rotation is a claim about an attacker-writable file, so it may \
-             not un-taint the context window — only dropping the tab's registry entry does"
+             not un-taint the context window — only a user's own click does (step 4)"
+        );
+        assert!(
+            !t.awaiting_session_clear,
+            "and nothing about a rotation may ARM the one-shot either"
         );
 
         // …and the same call with NO id, or the same id, changes nothing. This
         // is the "keep calling until the registry blinks" attack `observe`
         // already defended against; C-2 and H-2 are its harder siblings.
         let mut t = contaminated_tab();
-        t.observe(None);
-        t.observe(Some("real-session"));
+        assert_eq!(t.observe(None), None);
+        assert_eq!(t.observe(Some("real-session")), None);
         assert!(t.contaminated && t.latch == Latch::External);
     }
 
@@ -7882,7 +8528,7 @@ mod tests {
         // So no rotation ever reaches the registry, and the latch keeps the
         // session it was engaged for.
         if live {
-            tab.observe(Some("aaaa"));
+            assert_eq!(tab.observe(Some("aaaa")), None);
         }
         assert_eq!(tab.session.as_deref(), Some("real-session"));
         assert_eq!(tab.latch, Latch::External);
@@ -7897,7 +8543,12 @@ mod tests {
         let mut gate = LiveSessionGate::default();
         gate.rotated();
         assert!(gate.observed(true), "a decoded record confirms the session");
-        tab.observe(Some("aaaa"));
+        assert_eq!(
+            tab.observe(Some("aaaa")),
+            None,
+            "step 4 must not have widened this: the rotation is admitted, and on an \
+             UNARMED tab it still clears nothing"
+        );
         assert_eq!(tab.latch, Latch::Open, "the permissive state does reset");
         assert!(
             tab.contaminated,
@@ -7932,9 +8583,13 @@ mod tests {
         // not un-confirm a session the tap already proved.
         assert!(gate.observed(false));
 
-        tab.observe(Some("new-session"));
+        assert_eq!(tab.observe(Some("new-session")), None);
         assert_eq!(tab.latch, Latch::Open);
         assert_eq!(tab.session.as_deref(), Some("new-session"));
+        assert!(
+            tab.contaminated,
+            "a GENUINE rotation into an unarmed tab clears no more than a forged one"
+        );
     }
 
     /// **C-2, token variant.** `/memory/event`'s three `mark_live_session`
@@ -8020,15 +8675,25 @@ mod tests {
         assert!(detail.contains("USER OVERRIDE (flip_local"), "{detail}");
         assert!(detail.contains("external → local"), "{detail}");
         assert!(detail.contains("contaminated=true"), "{detail}");
-        // H-2: the row must name the reset that actually works. A tab restart
-        // does not clear the bit any more — the registry entry outlives the
-        // harness session — so a row still saying so would misdirect an
-        // incident review.
-        assert!(detail.contains("restarting cImp"), "{detail}");
+        // The row must name the reset that actually works, and step 4 changed
+        // what that is. H-2 left "restart cImp" as the only one and the row said
+        // so; there are now two user actions, and a row still sending an
+        // incident reviewer to a restart would misdirect them.
+        assert!(detail.contains("clear_contamination"), "{detail}");
+        assert!(detail.contains("await_session_clear"), "{detail}");
+        assert!(
+            !detail.to_lowercase().contains("restarting cimp"),
+            "the restart is no longer the only clean reset: {detail}"
+        );
         assert!(!detail.contains("Restarting the tab"), "{detail}");
         assert_eq!(
             row.tool, "flip_local",
             "the action is the row's tool column"
+        );
+        assert_eq!(
+            row.screen,
+            outbound::Screen::LatchOverride,
+            "a latch move is filed as a latch move"
         );
 
         // A row that granted capability back must not be painted as a denial.
@@ -8204,6 +8869,11 @@ mod tests {
                 "contaminated": true,
                 "can_flip_local": true,
                 "can_unlatch": true,
+                // Step 4: both contamination moves are on offer, and nothing is
+                // waiting. Asserted as an exact object rather than by key, so a
+                // field added to the wire without a decision fails here.
+                "can_clear": true,
+                "awaiting_session_clear": false,
             }])
         );
         // After the flip: still contaminated, no further flip on offer.
@@ -8219,6 +8889,26 @@ mod tests {
                 "contaminated": true,
                 "can_flip_local": false,
                 "can_unlatch": true,
+                "can_clear": true,
+                "awaiting_session_clear": false,
+            }])
+        );
+        // After the restore arm: the bit is still set (that is the whole
+        // decision) and the tab now says what it is waiting for.
+        reg.apply_override(&s, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+        assert_eq!(
+            serde_json::to_value(reg.snapshot()).unwrap(),
+            serde_json::json!([{
+                "consumer": "claude",
+                "tab": "claude-1",
+                "session": "sess-a",
+                "latch": "local",
+                "contaminated": true,
+                "can_flip_local": false,
+                "can_unlatch": true,
+                "can_clear": true,
+                "awaiting_session_clear": true,
             }])
         );
     }
@@ -8703,5 +9393,719 @@ mod tests {
             assert!(!row.entry.root.is_empty(), "an empty root defeats the row");
             assert!(row.entry.ok);
         }
+    }
+
+    // ── Step 4 — the two user-driven contamination clears ──────────────────
+    //
+    // The governing risk in this area, three findings running: the code is
+    // right against the proof-of-concept and wrong against the invariant, and
+    // the test pins the PoC's shape. So the cases below are written against the
+    // *observable consequence* wherever one exists — a re-contamination row
+    // rather than a boolean, a `WriteTaint` rather than a bit — and the two
+    // that guard H-2 assert what must NOT happen on a tab nobody armed.
+
+    /// A contaminated, EXTERNAL-latched tab in session `sess-a`, with a page
+    /// already fetched (so its budget carries real spend) and both
+    /// one-row-per-scope report bits used up.
+    fn contaminated_registry() -> (LatchRegistry, LatchScope) {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(Some("https://evil.example/p"), Some("evil.example")),
+            )
+            .is_ok());
+        assert!(reg.snapshot()[0].view.contaminated);
+        (reg, s)
+    }
+
+    /// A contaminated tab whose latch is **LOCAL** — the #48 beacon case: the
+    /// tab used a local tool first, then the harness's own `WebFetch` reported
+    /// in, which contaminates the conversation without moving the latch.
+    ///
+    /// It exists because of a seam that is easy to test past. Under an EXTERNAL
+    /// latch a `context_note` is quarantined by the **latch**
+    /// (`Latch::proxy_gate`), whatever the contamination bit says — so a test
+    /// that cleared the bit on an EXTERNAL-latched tab and asserted the write
+    /// was still held would be asserting the latch's behaviour and calling it
+    /// the bit's. On a LOCAL-latched tab the bit is the only thing deciding, so
+    /// every assertion about what clearing changes is made here.
+    fn contaminated_local_registry() -> (LatchRegistry, LatchScope) {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
+        assert!(!out.engaged, "the latch stays LOCAL");
+        assert_eq!(out.view.latch, "local");
+        assert!(out.view.contaminated);
+        (reg, s)
+    }
+
+    /// The rows the clear wrote, in order.
+    fn cleared_rows(
+        rows: &[crate::activity::ActivityRecord],
+    ) -> Vec<&crate::activity::ActivityRecord> {
+        outbound::test_rows::of_screen(rows, outbound::Screen::ContaminationCleared)
+    }
+
+    /// **A: false-positive resume.** The user judged the flagged content
+    /// harmless, so the bit goes now — and *nothing else moves*. The latch keeps
+    /// its position, the session keeps its id, the budget keeps its spend.
+    ///
+    /// Asserting those three is the point rather than padding: "clear the
+    /// contamination flag" is a one-line change to a boolean, and the tempting
+    /// wrong version of it is `*entry = TabLatch::fresh()`, which would pass any
+    /// test that only looked at `contaminated`.
+    #[test]
+    fn a_false_positive_resume_clears_the_bit_and_touches_nothing_else() {
+        let (reg, s) = contaminated_registry();
+        // Spend the budget down to its limit so a reset would be visible.
+        reg.charge(Some(&s), 100_000);
+        assert_eq!(
+            reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__search"),
+            Err(outbound::REFUSAL_BUDGET)
+        );
+
+        let out = reg
+            .apply_override(&s, LatchOverride::ClearContamination)
+            .expect("a contaminated tab can be resumed");
+        assert!(!out.view.contaminated, "the bit is gone");
+        assert!(!out.view.can_clear, "and there is nothing left to clear");
+        assert!(!out.view.awaiting_session_clear);
+
+        let row = &reg.snapshot()[0];
+        assert_eq!(
+            row.session.as_deref(),
+            Some("sess-a"),
+            "the SESSION is untouched — a resume is not a restart"
+        );
+        assert_eq!(
+            row.latch(),
+            "external",
+            "and so is the latch: it has its own two buttons"
+        );
+        assert_eq!(
+            reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__search"),
+            Err(outbound::REFUSAL_BUDGET),
+            "and the fetch budget keeps its spend — a click that refilled it \
+             would make the budget advisory"
+        );
+        // The consequence of leaving the latch alone, stated so nobody reads
+        // this feature as more than it is: an EXTERNAL latch quarantines memory
+        // writes on its OWN authority (`Latch::proxy_gate`), so clearing the bit
+        // does not reopen persistence while the tab is still latched. Reopening
+        // it is `unlatch`, which is a separate decision with a separate button.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Quarantined),
+            "the LATCH still holds writes; clearing the bit is not an unlatch"
+        );
+        reg.apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Clean),
+            "…and with both released, writes are clean again"
+        );
+    }
+
+    /// **B: restore.** The user rolled files back. That cannot un-read a page,
+    /// so the bit **stays set** — this action only arms the wait.
+    ///
+    /// The locked decision is the assertion: a build that "helpfully" cleared on
+    /// restore is the exact regression this test exists to catch, and it would
+    /// pass any test that merely checked the command succeeded.
+    #[test]
+    fn a_restore_arms_the_wait_and_clears_nothing_now() {
+        // LOCAL-latched, so the quarantine assertion below is about the
+        // contamination bit rather than about the latch — see
+        // `contaminated_local_registry`.
+        let (reg, s) = contaminated_local_registry();
+        let out = reg
+            .apply_override(&s, LatchOverride::AwaitSessionClear)
+            .expect("a contaminated tab can be armed");
+        assert!(
+            out.view.contaminated,
+            "restoring FILES cannot remove injected text from a context window"
+        );
+        assert!(out.view.awaiting_session_clear, "it arms the one-shot");
+        // And the quarantine it gates is still in force for this conversation.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Quarantined),
+            "a note written after the restore is still held for review"
+        );
+
+        // Arming twice is answered, not silently repeated: a second click that
+        // reported success would imply something new happened.
+        let again = reg
+            .apply_override(&s, LatchOverride::AwaitSessionClear)
+            .expect_err("a second arm is refused");
+        assert!(again.contains("already waiting"), "{again}");
+        // …and neither refusal nor repetition may clear anything.
+        assert!(reg.snapshot()[0].view.contaminated);
+    }
+
+    /// **The critical case: the arm is what decides, not the rotation.**
+    ///
+    /// Same registry, same decode-proven rotation, two tabs — one armed by a
+    /// user, one not. The armed tab clears; the unarmed one does not. If step 4
+    /// silently reverted H-2, the second half fails.
+    ///
+    /// The rotation is driven **through** `oob::claude::LiveSessionGate` rather
+    /// than beside it, so a build that weakened the decode proof (H-2's own
+    /// guard) fails here too rather than quietly clearing on a forged file.
+    #[test]
+    fn only_an_armed_tab_clears_on_a_proved_rotation() {
+        use crate::oob::claude::LiveSessionGate;
+
+        for armed in [true, false] {
+            outbound::test_rows::reset();
+            let (reg, s) = contaminated_registry();
+            if armed {
+                reg.apply_override(&s, LatchOverride::AwaitSessionClear)
+                    .expect("arm");
+            }
+            let _ = outbound::test_rows::drain();
+
+            // The tap proves the new transcript really is this tab's session:
+            // a decoded record naming it, which is the ONLY thing that lets a
+            // new id reach the live-session registry (H-2).
+            let mut live = LiveSessionGate::default();
+            live.rotated();
+            assert!(!live.observed(false), "no evidence yet, no rotation");
+            assert!(live.observed(true), "a decoded record IS the proof");
+
+            // …and only now does a rotated scope reach the registry.
+            let rotated = scope("claude-1", Some("sess-b"));
+            let view = reg.view_for(&rotated);
+
+            assert_eq!(
+                view.contaminated, !armed,
+                "armed={armed}: the ARM decides, not the rotation"
+            );
+            assert!(
+                !view.awaiting_session_clear,
+                "armed={armed}: a one-shot fires once"
+            );
+            let rows = outbound::test_rows::drain();
+            assert_eq!(
+                cleared_rows(&rows).len(),
+                usize::from(armed),
+                "armed={armed}: a clear writes exactly one row, a non-clear none"
+            );
+
+            // The consequence, not the boolean: whether the next memory write is
+            // held for review.
+            assert_eq!(
+                reg.gate(
+                    Some(&rotated),
+                    LatchRoute::Native,
+                    "context_note",
+                    ON,
+                    NO_CONTENT
+                ),
+                if armed {
+                    Ok(WriteTaint::Clean)
+                } else {
+                    Ok(WriteTaint::Quarantined)
+                },
+                "armed={armed}"
+            );
+        }
+    }
+
+    /// **A forged rotation on an unarmed tab still clears nothing** — H-2's own
+    /// case, re-run against step 4's code rather than against the code H-2 left.
+    ///
+    /// Two forgeries, because they fail at two different bars:
+    ///
+    /// 1. `type nul` / `echo {}` — the transcript yields no record naming the
+    ///    session, so `LiveSessionGate` never confirms and no new id ever
+    ///    reaches the registry at all.
+    /// 2. `echo '{"sessionId":"…"}'` — the decode bar is cleared (decision 3
+    ///    puts the model's Bash outside every cImp latch, so it always can be),
+    ///    the rotation DOES reach `observe`… and the unarmed tab is still
+    ///    contaminated afterwards.
+    ///
+    /// The deliberate counter-case is in the test above: on an **armed** tab a
+    /// forged rotation does clear, and that is the design. The arm is the
+    /// authority — an attacker cannot click restore — so a forgery only helps in
+    /// the case where the user has already decided the bit should go, and its
+    /// worst effect is lifting it slightly earlier than their own `/clear`.
+    #[test]
+    fn a_forged_rotation_cannot_clear_an_unarmed_tab() {
+        use crate::oob::claude::LiveSessionGate;
+        let (reg, _s) = contaminated_registry();
+
+        // Forgery 1: bytes, but no record naming this session.
+        let mut live = LiveSessionGate::default();
+        live.rotated();
+        for _ in 0..10 {
+            assert!(
+                !live.observed(false),
+                "newline-terminated bytes are not evidence of a harness"
+            );
+        }
+        // So the registry is never told about `sess-forged`, and the tab keeps
+        // the session it was contaminated in.
+        assert_eq!(reg.snapshot()[0].session.as_deref(), Some("sess-a"));
+
+        // Forgery 2: the attacker writes a record naming the session, clearing
+        // the decode bar. The rotation reaches `observe`.
+        let forged = scope("claude-1", Some("sess-forged"));
+        let view = reg.view_for(&forged);
+        assert_eq!(
+            view.latch, "open",
+            "the permissive state does reset — the fix must not freeze latches"
+        );
+        assert!(
+            view.contaminated,
+            "…and the contamination bit does not: no rotation clears an unarmed tab"
+        );
+        assert_eq!(
+            reg.gate(
+                Some(&forged),
+                LatchRoute::Native,
+                "context_note",
+                ON,
+                NO_CONTENT
+            ),
+            Ok(WriteTaint::Quarantined),
+            "the persistence channel stays closed"
+        );
+        // Nor can a rotation ARM one — the only writer of the arm is a click.
+        assert!(!reg.snapshot()[0].view.awaiting_session_clear);
+    }
+
+    /// **Clearing re-arms the transition report — proved by the consequence.**
+    ///
+    /// `latch_flagged` / `beacon_flagged` are one-row-per-scope claim bits, and
+    /// the `contamination` row is self-limiting through `note_contamination`'s
+    /// `mem::replace`. Leave any of them set across a clear and a tab that gets
+    /// re-contaminated writes **no new row**: the feed says the tab is clean, the
+    /// registry says it is not, and the only trace is the quarantine rows of
+    /// later writes. That is the same class of bug #48 fixed for the
+    /// `Local`-latched beacon.
+    ///
+    /// Asserted as "a re-contamination writes a new row", not as
+    /// `assert!(!entry.beacon_flagged)`: the boolean is the mechanism, the row is
+    /// the invariant, and a mechanism swapped for another one must not fail this
+    /// test while a lost row must.
+    ///
+    /// **And both claim bits are actually SPENT first.** The obvious version of
+    /// this test starts from a proxied fetch, which sets neither bit — so the
+    /// clear's resets are no-ops and deleting them leaves the test green. (That
+    /// was the first draft, and reverting the resets did not turn it red. It is
+    /// exactly the failure mode this whole area keeps producing: a test that
+    /// pins the happy path's shape rather than the invariant.) So the tab here
+    /// is LOCAL-latched and it spends both: a beacon that contaminates without
+    /// moving the latch, and a refused proxied call.
+    #[test]
+    fn a_re_contamination_after_a_clear_writes_a_new_row() {
+        outbound::test_rows::reset();
+        let (reg, s) = contaminated_local_registry();
+        let rows = outbound::test_rows::drain();
+        assert_eq!(
+            contamination_rows(&rows).len(),
+            1,
+            "the first contamination is recorded"
+        );
+        // Spend `beacon_flagged`: this beacon reported, so the next one in the
+        // same tab-session must not.
+        for _ in 0..3 {
+            assert!(!reg.beacon(Some(&s), "WebSearch", ON, BEACON_PROV).report);
+        }
+        // Spend `latch_flagged`: the first refusal writes a row, later ones do
+        // not — that bound is what makes leaving the bit set invisible.
+        for i in 0..3 {
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
+                Err(REFUSAL_EXTERNAL_BLOCKED)
+            );
+            let rows = outbound::test_rows::drain();
+            let refusals = outbound::test_rows::of_screen(&rows, outbound::Screen::LatchRefusal);
+            assert_eq!(refusals.len(), usize::from(i == 0), "refusal {i}");
+        }
+
+        reg.apply_override(&s, LatchOverride::ClearContamination)
+            .expect("resume");
+        // (No `contamination_cleared` row is expected from the registry here:
+        // the resume's row is composed by `override_row` and written by
+        // `apply_latch_override`, the IPC entry point, exactly as the two latch
+        // moves' rows always have been. It is asserted in
+        // `every_clear_records_its_basis_and_the_state_it_replaced`.)
+        assert!(cleared_rows(&outbound::test_rows::drain()).is_empty());
+
+        // 1. The harness reads a page again. The conversation was clean a moment
+        //    ago, so this is a NEW transition and must be reported as one — both
+        //    as a contamination row and as the beacon's own row.
+        let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
+        assert!(out.contaminated_now, "the tab is contaminated again");
+        assert!(
+            out.report,
+            "a beacon after a clear is a new fact — a stale `beacon_flagged` makes \
+             the whole event silent, which is the #48 bug one clear later"
+        );
+        report_beacon(Some(&s), outbound::Origin::Http, "WebFetch", &out);
+        let rows = outbound::test_rows::drain();
+        assert_eq!(
+            contamination_rows(&rows).len(),
+            1,
+            "the re-contamination writes its own transition row"
+        );
+        assert_eq!(
+            outbound::test_rows::of_screen(&rows, outbound::Screen::LatchBeacon).len(),
+            1,
+            "…and the beacon row beside it"
+        );
+
+        // 2. The next refusal in the re-contaminated tab is likewise a fact the
+        //    feed has not carried since the clear.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
+            Err(REFUSAL_EXTERNAL_BLOCKED)
+        );
+        let rows = outbound::test_rows::drain();
+        assert_eq!(
+            outbound::test_rows::of_screen(&rows, outbound::Screen::LatchRefusal).len(),
+            1,
+            "a refusal after a clear must be reportable again"
+        );
+
+        // 3. And the proxied intake path, which flips the bit through a
+        //    different door, reports its own re-contamination too.
+        reg.apply_override(&s, LatchOverride::ClearContamination)
+            .expect("resume again");
+        let _ = outbound::test_rows::drain();
+        assert_eq!(
+            reg.gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(Some("https://evil2.example/p"), Some("evil2.example")),
+            ),
+            Err(REFUSAL_EXTERNAL_BLOCKED),
+            "the LOCAL latch still refuses it — the clear is not an unlatch"
+        );
+        reg.apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
+        let _ = outbound::test_rows::drain();
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                CallProvenance::intake(Some("https://evil2.example/p"), Some("evil2.example")),
+            )
+            .is_ok());
+        let rows = outbound::test_rows::drain();
+        let hits = contamination_rows(&rows);
+        assert_eq!(hits.len(), 1, "the proxied path reports it too");
+        assert_eq!(payload(hits[0])["host"], "evil2.example");
+    }
+
+    /// **Decision 10 is not touched by any of this.** Clearing the tab bit stops
+    /// FUTURE writes being held; notes already quarantined stay quarantined, and
+    /// promote-or-discard remains the Memory view's own review — a separate
+    /// consent surface with a separate click.
+    ///
+    /// Two halves, because the interesting failure is a well-meaning one:
+    /// someone wiring "and release this tab's held notes" into the clear.
+    #[test]
+    fn clearing_the_bit_does_not_promote_anything_already_quarantined() {
+        // LOCAL-latched: the bit is what decides here, not the latch.
+        let (reg, s) = contaminated_local_registry();
+        // A note written while contaminated is held for review.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Quarantined)
+        );
+        reg.apply_override(&s, LatchOverride::ClearContamination)
+            .expect("resume");
+        // Only the NEXT write changes.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Clean),
+            "future writes are stored clean again — that is the whole effect"
+        );
+
+        // And the structural half: nothing on the clear path can reach a stored
+        // note. The note store's release/delete API is named here so that wiring
+        // it into this module fails the build's own test rather than a review.
+        // `concat!` throughout: a needle written whole would match its own text
+        // in the file it scans.
+        let src = include_str!("loopback.rs");
+        for promotion in [
+            concat!("mem_", "promote_note"),
+            concat!("mem_", "delete_note"),
+            concat!("mem_", "quarantined_notes"),
+        ] {
+            assert!(
+                !src.contains(promotion),
+                "`{promotion}` appeared in loopback.rs — promoting a quarantined note is \
+                 the Memory view's own review (locked decision 10), not a side effect of \
+                 clearing a tab's contamination flag"
+            );
+        }
+    }
+
+    /// **The audit row: basis, prior state, and who acted** — for both clears,
+    /// because they are the same state change reached two ways and a reviewer
+    /// must be able to tell them apart.
+    #[test]
+    fn every_clear_records_its_basis_and_the_state_it_replaced() {
+        // Half 1: the immediate resume. Origin `ipc` — a human, right now.
+        outbound::test_rows::reset();
+        let (reg, s) = contaminated_registry();
+        let out = reg
+            .apply_override(&s, LatchOverride::ClearContamination)
+            .expect("resume");
+        let row = override_row(
+            outbound::Origin::Ipc,
+            LatchOverride::ClearContamination,
+            &out,
+        );
+        assert_eq!(
+            row.screen,
+            outbound::Screen::ContaminationCleared,
+            "a clear is filed beside the row that SET the bit, not among latch moves"
+        );
+        assert_eq!(row.tool, "clear_contamination");
+        assert_eq!(row.origin, outbound::Origin::Ipc);
+        let d = &row.detail;
+        assert!(d.contains("basis: clear_contamination"), "{d}");
+        assert!(d.contains("origin: ipc"), "{d}");
+        assert!(d.contains("contaminated=true"), "the PRIOR state: {d}");
+        assert!(d.contains("latch=external"), "the PRIOR latch: {d}");
+        assert!(d.contains("session=sess-a"), "the PRIOR session: {d}");
+        assert!(d.contains("STAY quarantined"), "decision 10 stated: {d}");
+
+        // Half 2: the armed rotation. The row is written by the registry itself
+        // (nothing else observes the rotation), so it is asserted through the
+        // feed rather than through a builder.
+        outbound::test_rows::reset();
+        let (reg, s) = contaminated_registry();
+        reg.apply_override(&s, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+        let armrows = outbound::test_rows::drain();
+        let arm = outbound::test_rows::of_screen(&armrows, outbound::Screen::LatchOverride);
+        assert_eq!(
+            arm.len(),
+            0,
+            "the arm row is written by the IPC entry point"
+        );
+        assert!(
+            cleared_rows(&armrows).is_empty(),
+            "arming clears nothing, so it writes no clear row"
+        );
+
+        let rotated = scope("claude-1", Some("sess-b"));
+        assert!(!reg.view_for(&rotated).contaminated);
+        let rows = outbound::test_rows::drain();
+        let hits = cleared_rows(&rows);
+        assert_eq!(hits.len(), 1, "the armed clear writes exactly one row");
+        let hit = hits[0];
+        assert_eq!(hit.entry.tool, "session_clear_observed");
+        assert_eq!(hit.entry.root, TEST_ROOT, "an empty root defeats the row");
+        assert!(hit.entry.ok, "nothing was denied");
+        let req = payload(hit);
+        assert_eq!(req["screen"], "contamination_cleared");
+        assert_eq!(
+            req["origin"], "internal",
+            "the trigger is cImp's own observation; `ipc` means a human acted NOW"
+        );
+        assert_eq!(req["scope"], "claude:claude-1");
+        assert_eq!(
+            req["session"], "sess-a",
+            "filed under the CONTAMINATED conversation, so it joins the row that opened it"
+        );
+        let d = &hit.response;
+        assert!(d.contains("basis: session_clear_observed"), "{d}");
+        assert!(d.contains("ONE-SHOT"), "{d}");
+        assert!(d.contains("session=sess-a"), "the PRIOR session: {d}");
+        assert!(d.contains("(sess-b)"), "and the one that replaced it: {d}");
+        assert!(d.contains("latch=external"), "the PRIOR latch: {d}");
+    }
+
+    /// **The arm's own row.** It is not a clear, so it is filed as a latch
+    /// override — and it has to say, in words, that the flag is still set, or a
+    /// reader who sees "restore" and no later `contamination_cleared` row cannot
+    /// tell "still waiting" from "lost".
+    #[test]
+    fn the_restore_arm_writes_a_row_that_says_the_flag_is_still_set() {
+        let (reg, s) = contaminated_registry();
+        let out = reg
+            .apply_override(&s, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+        let row = override_row(
+            outbound::Origin::Ipc,
+            LatchOverride::AwaitSessionClear,
+            &out,
+        );
+        assert_eq!(row.screen, outbound::Screen::LatchOverride);
+        assert_eq!(row.tool, "await_session_clear");
+        let d = &row.detail;
+        assert!(d.contains("NOT cleared"), "{d}");
+        assert!(d.contains("contaminated=true"), "{d}");
+        assert!(d.contains("`/clear`"), "the user is told what to do: {d}");
+    }
+
+    /// **Neither clear is reachable over HTTP**, which is the invariant the whole
+    /// design rests on: a model with a shell that could POST its way to a clear
+    /// would defeat every part of this.
+    ///
+    /// Three independent halves, because each closes a different door.
+    #[test]
+    fn no_http_route_can_reach_a_contamination_clear() {
+        // 1. The HTTP surface, pinned. Every route this listener serves is
+        //    listed here; a new one fails this test until someone names it, and
+        //    the point of naming it is to notice if it is an override door.
+        //    (#45 removed `POST /latch/override` for exactly this reason.)
+        let src = include_str!("loopback.rs");
+        let mut routes: Vec<&str> = Vec::new();
+        for marker in ["(\"POST\", \"", "(\"GET\", \""] {
+            for part in src.split(marker).skip(1) {
+                routes.push(part.split('"').next().expect("a closing quote"));
+            }
+        }
+        routes.sort_unstable();
+        routes.dedup();
+        assert_eq!(
+            routes,
+            [
+                "/activity/contract_drift",
+                "/audit/run",
+                "/context/compaction",
+                "/context/post_edit",
+                "/context/retrieve",
+                "/context/should_read",
+                "/describe",
+                "/events",
+                "/graph_run",
+                "/health",
+                "/latch/beacon",
+                "/latch/state",
+                "/mcp/call",
+                "/mcp/list",
+                "/memory/event",
+                "/permission/event",
+                "/run",
+                "/status",
+            ],
+            "the loopback's HTTP surface changed — is the new route a door onto the \
+             latch override or the contamination clear?"
+        );
+
+        // 2. The only entry point that can clear is not an HTTP handler. Its
+        //    doc says so; this asserts the shape the doc describes — the two
+        //    clearing actions exist solely as `LatchOverride` values, and the
+        //    only function that turns a string into one is called from the IPC
+        //    command.
+        let ipc = include_str!("../ipc/commands.rs");
+        assert!(
+            ipc.contains("apply_latch_override(&app, &consumer, &tab, &action)"),
+            "the IPC command is the caller of record"
+        );
+        // `concat!` so this needle does not match itself in the source it
+        // scans — the first version of this assertion counted 2 and was
+        // "failing" on nothing but its own text.
+        assert_eq!(
+            src.matches(concat!("pub fn ", "apply_latch_override"))
+                .count(),
+            1,
+            "one entry point, or the doc's claim is unverifiable"
+        );
+        assert!(
+            !src.contains(concat!("LatchOverride::", "parse(&body"))
+                && !src.contains(concat!("LatchOverride::", "parse(body")),
+            "an override action parsed from a request body is an HTTP door"
+        );
+
+        // 3. Behaviourally: the two registry entry points that ARE HTTP-reachable
+        //    (`/latch/beacon` → `beacon`, `/latch/state` → `view_for`) can
+        //    neither clear an unarmed tab nor arm one. The beacon only ever
+        //    tightens, and that must not have widened.
+        let (reg, s) = contaminated_registry();
+        for _ in 0..5 {
+            let out = reg.beacon(Some(&s), "WebFetch", ON, BEACON_PROV);
+            assert!(out.view.contaminated, "a beacon cannot clear");
+            assert!(!out.view.awaiting_session_clear, "a beacon cannot arm");
+        }
+        // …including across a rotation, which is the one moment an arm would
+        // matter. Nothing an HTTP caller can send sets it.
+        let rotated = scope("claude-1", Some("sess-b"));
+        assert!(reg.view_for(&rotated).contaminated);
+        assert!(
+            reg.beacon(Some(&rotated), "WebFetch", ON, BEACON_PROV)
+                .view
+                .contaminated
+        );
+    }
+
+    /// The registry's read path folds live sessions in, so an armed one-shot
+    /// fires on the UI's existing 4 s poll rather than waiting for the model to
+    /// call a cImp tool.
+    ///
+    /// `latch_snapshot` itself needs an `AppHandle` (it resolves the live-session
+    /// registry), which this crate cannot mock — so what is asserted here is the
+    /// half that has the logic: given resolved scopes, `observe_all` applies the
+    /// same rotation rule to every entry and hands back the rows to record.
+    #[test]
+    fn the_read_path_observes_rotations_for_every_tab_it_reports() {
+        let (reg, s) = contaminated_registry();
+        reg.apply_override(&s, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+
+        // A second, unarmed tab in the same registry: it must be observed too
+        // (its latch reopens) and cleared not at all.
+        let other = scope("claude-2", Some("sess-x"));
+        assert!(reg
+            .gate(
+                Some(&other),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+
+        let keys = reg.keys();
+        assert_eq!(keys.len(), 2, "both tabs are in the registry");
+        let rotated = [
+            scope("claude-1", Some("sess-b")),
+            scope("claude-2", Some("sess-y")),
+        ];
+        let cleared = reg.observe_all(&rotated);
+        assert_eq!(cleared.len(), 1, "exactly the armed tab clears");
+
+        let rows = reg.snapshot();
+        let armed = rows.iter().find(|r| r.tab == "claude-1").expect("claude-1");
+        let unarmed = rows.iter().find(|r| r.tab == "claude-2").expect("claude-2");
+        assert!(!armed.view.contaminated);
+        assert!(
+            unarmed.view.contaminated,
+            "the read path must not have become a second way to un-taint a tab"
+        );
+        assert_eq!(unarmed.latch(), "open", "…while still resetting the latch");
+        assert_eq!(unarmed.session.as_deref(), Some("sess-y"));
+
+        // An entry the caller resolved no scope for is simply skipped; it is not
+        // an error and it changes nothing.
+        assert!(reg.observe_all(&[]).is_empty());
     }
 }

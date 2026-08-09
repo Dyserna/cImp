@@ -24,20 +24,47 @@ export interface LatchRow {
   /// `open` | `external` | `local`.
   latch: string;
   /// Whether external content has entered this conversation at all. Survives
-  /// every override — and, since H-2 (2026-08-08), every session rotation too:
-  /// the rotation signal is the newest `*.jsonl` in a directory the model's own
-  /// Bash can write, so it cannot be the trust root for un-tainting a context
-  /// window. Nothing in a running cImp clears this bit; see
+  /// every latch override — and, since H-2 (2026-08-08), every session rotation
+  /// too: the rotation signal is the newest `*.jsonl` in a directory the model's
+  /// own Bash can write, so it cannot be the trust root for un-tainting a
+  /// context window.
+  ///
+  /// What DOES clear it (step 4) is the user, in this app's own UI — the same
+  /// trust root every consent surface here uses, and one no shell can fabricate.
+  /// Two ways, `clear_contamination` and `await_session_clear`; see
   /// `offload/loopback.rs`'s `TabLatch::contaminated`.
   contaminated: boolean;
   /// Whether "switch to local" applies right now (EXTERNAL-latched only).
   can_flip_local: boolean;
   /// Whether "restore full access" applies right now (anything but open).
   can_unlatch: boolean;
+  /// Step 4: whether either contamination clear applies right now. Published by
+  /// the backend rather than read off `contaminated` here, for the reason
+  /// `can_unlatch` is: the legality rule for a move belongs to the side that
+  /// enforces it, even when it is currently one field wide.
+  can_clear: boolean;
+  /// Step 4: whether the user restored a checkpoint and cImp is waiting to see
+  /// this tab start a new harness session before lifting `contaminated`.
+  ///
+  /// The UI needs it to explain why a contaminated tab is showing no "clear now"
+  /// button after a restore — and to tell the user what will lift it.
+  awaiting_session_clear: boolean;
 }
 
-/// The two user-initiated moves. Mirror of Rust `LatchOverride`.
-export type LatchAction = 'flip_local' | 'unlatch';
+/// The user-initiated containment moves. Mirror of Rust `LatchOverride`, which
+/// rejects anything not in this set — so the two ends have to move together.
+///
+/// - `flip_local` / `unlatch` — the two latch moves (V32 Phase F).
+/// - `clear_contamination` — step 4's false-positive resume: the user judged the
+///   flagged content harmless, so the flag goes now and nothing else changes.
+/// - `await_session_clear` — step 4's restore: the flag stays set (rolling back
+///   files cannot un-read a page) and lifts only once cImp observes a new
+///   harness session.
+export type LatchAction =
+  | 'flip_local'
+  | 'unlatch'
+  | 'clear_contamination'
+  | 'await_session_clear';
 
 // ── V32 Phase G — the enable hierarchy, introspected ───────────────────────
 

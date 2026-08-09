@@ -7,14 +7,19 @@
 //! in is load-bearing:
 //!
 //! ```text
-//!   raw EXTERNAL result
+//!   raw untrusted result
 //!        │
 //!        ├─ 1. DETECT  (this module, on the RAW text)
 //!        │
-//!        ├─ 2. ENVELOPE (spotlight::envelope — untrusted-data markers)
+//!        ├─ 2. ENVELOPE (spotlight — untrusted-data markers)
 //!        │
 //!        └─ 3. HEADER  (prepended OUTSIDE the envelope, only if flagged)
 //! ```
+//!
+//! Two populations travel this path, differing only in which standing
+//! instruction the markers carry: proxied EXTERNAL results
+//! ([`wrap_external_result`]) and, since #48's M-6, local scanner reports whose
+//! findings quote third-party source ([`wrap_local_report`]).
 //!
 //! - **Detect on raw text**, before wrapping, so the detectors never see (and
 //!   can never be confused by) cImp's own preamble and nonced markers.
@@ -547,16 +552,42 @@ pub async fn wrap_external_result(name: &str, text: String, ctx: ResultCtx<'_>) 
     if !spotlight::is_external(name) {
         return text;
     }
+    compose(name, text, ctx, spotlight::envelope).await
+}
+
+/// V32 review finding M-6 (#48) — the same composition for a **local scanner
+/// report**: a LOCAL-CAPABILITY result that is cImp-composed structure wrapped
+/// around text a scanner quoted out of files nobody here authored.
+///
+/// It is a sibling of [`wrap_external_result`] rather than a branch inside it
+/// because the two differ in exactly one thing — which standing instruction the
+/// markers carry ([`spotlight::scanner_envelope`] vs
+/// [`spotlight::envelope`]) — and in nothing else. Detection runs on the raw
+/// text, the header composes outside the markers, the unscreened notice is
+/// claimed once per scope: all of that is [`compose`], shared, so the order can
+/// never drift between the two.
+///
+/// **There is deliberately no `is_local_report(name)` gate here.** The EXTERNAL
+/// rule is a property of the *class* and so belongs in `toolclass`; this one is
+/// a property of the individual **surface** — `security_audit` quotes matched
+/// source, `graph_outline` returns symbol names cImp derived itself — and a
+/// class-wide predicate would either over-wrap the whole LOCAL-CAPABILITY class
+/// or become a second hand-maintained name list. The caller is the boundary
+/// that knows what it is delivering.
+pub async fn wrap_local_report(name: &str, text: String, ctx: ResultCtx<'_>) -> String {
+    compose(name, text, ctx, spotlight::scanner_envelope).await
+}
+
+/// Detect → envelope → header, in the one order that is correct. `wrap` is the
+/// envelope vocabulary the calling boundary delivers under; everything else is
+/// identical for every population of untrusted text.
+async fn compose(name: &str, text: String, ctx: ResultCtx<'_>, wrap: fn(&str) -> String) -> String {
     // 1. Detect on the RAW text, before any cImp-composed bytes are added.
     let verdict = screen(&text, ctx.cfg).await;
     // 2. Envelope — unless V32 Phase G's spotlighting switch is off for this
     //    scope, in which case the raw text is the body and the header (if any)
     //    describes it as such.
-    let wrapped = if ctx.spotlight {
-        spotlight::envelope(&text)
-    } else {
-        text
-    };
+    let wrapped = if ctx.spotlight { wrap(&text) } else { text };
     // 3. Headers, outside the markers and in front of the preamble. The
     //    unscreened notice (#48, D-1) is composed first so it can sit BELOW the
     //    warning when both apply: the warning is the sharper statement and must
@@ -575,7 +606,7 @@ pub async fn wrap_external_result(name: &str, text: String, ctx: ResultCtx<'_>) 
         host = ctx.host.as_deref().unwrap_or("-"),
         layers = %verdict.layers.join("+"),
         rules = %verdict.rules.join(","),
-        "detection: external tool result flagged as possible prompt injection"
+        "detection: tool result flagged as possible prompt injection"
     );
     // One row per flagged result, and the screen column names the *cheapest*
     // layer that fired, so the feed can be read at a glance; the full layer
@@ -636,7 +667,7 @@ fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Opti
         bounded = verdict.bounded,
         incomplete = verdict.incomplete,
         why = %verdict.unscreened_detail.join("; "),
-        "detection: part of an external result was NOT screened"
+        "detection: part of a tool result was NOT screened"
     );
     // One row per scope: large pages are ordinary, and a row per page would
     // evict the audit window this feed exists to keep.
@@ -926,6 +957,43 @@ mod tests {
                 wrap_external_result(trusted, HOSTILE.to_string(), ctx(signature_only())).await;
             assert_eq!(out, HOSTILE, "{trusted}");
         }
+    }
+
+    /// #48 M-6: the local-report sibling. It must screen and envelope a name
+    /// `wrap_external_result` deliberately passes through — that difference is
+    /// the whole finding, so a refactor that collapsed the two into one
+    /// `is_external`-gated function has to fail here.
+    #[tokio::test]
+    async fn wrap_local_report_screens_and_envelopes_a_name_the_external_path_skips() {
+        let name = "security_audit";
+        // Precondition, restated so this test cannot silently start passing
+        // because the tool got reclassified EXTERNAL.
+        assert!(!spotlight::is_external(name));
+        assert_eq!(
+            wrap_external_result(name, HOSTILE.to_string(), ctx(signature_only())).await,
+            HOSTILE,
+            "the external path is (correctly) blind to this surface"
+        );
+
+        let out = wrap_local_report(name, HOSTILE.to_string(), ctx(signature_only())).await;
+        assert!(out.starts_with(WARNING_HEADER_PREFIX), "screened: {out}");
+        let body = strip_warning_header(&out);
+        assert!(
+            body.starts_with(spotlight::SCANNER_PREAMBLE),
+            "the SCANNER standing instruction, not the external one: {body}"
+        );
+        assert!(!body.starts_with(spotlight::SPOTLIGHT_PREAMBLE), "{body}");
+        // Locked decision 5 holds here too: strip our additions and the bytes
+        // are the scanner's, unchanged.
+        let inner = body
+            .strip_prefix(spotlight::SCANNER_PREAMBLE)
+            .and_then(|r| r.strip_prefix('\n'))
+            .and_then(|r| r.split_once('\n'))
+            .map(|(_, rest)| rest)
+            .and_then(|r| r.rsplit_once('\n'))
+            .map(|(body, _)| body)
+            .expect("the enveloped region");
+        assert_eq!(inner, HOSTILE);
     }
 
     /// A new/unknown MCP server rides the unknown-⇒-EXTERNAL invariant into

@@ -3787,9 +3787,30 @@ async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     };
 
     let r = match result {
-        Ok(text) => RunResult {
+        // #48 M-6: the report crosses the delivery boundary here — screened,
+        // enveloped under the scanner preamble, headered if a layer fired. It is
+        // a `RawReport`, not a `String`, so this call cannot be dropped by
+        // omission (see `audit::mcp::RawReport`).
+        //
+        // Settings are re-read rather than reusing the `settings` snapshot
+        // `audit_admit` gated on: a scan can run for minutes, and the envelope is
+        // resolved **once per delivery** for exactly the reason
+        // `spotlight::recall_envelope` is — the posture that applies is the one
+        // in force when the text enters the conversation, not the one in force
+        // when the scan was admitted.
+        Ok(report) => RunResult {
             ok: true,
-            text: Some(text),
+            text: Some(
+                report
+                    .deliver(crate::audit::mcp::Delivery {
+                        settings: &live_settings(app),
+                        scope: crate::settings::injection::Scope::for_tab(
+                            crate::graph::source_for_consumer(consumer),
+                            body.tab.as_deref(),
+                        ),
+                    })
+                    .await,
+            ),
             error: None,
         },
         // Busy / disabled / no-tools errors intentionally arrive here as

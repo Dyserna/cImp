@@ -331,6 +331,18 @@ impl AuditState {
         self.inner.lock().unwrap().snapshot(None)
     }
 
+    /// A fresh snapshot of the app's live settings.
+    ///
+    /// #48 M-6: the offload worker's audit path reaches the runner through the
+    /// process-global handle ([`crate::audit::global`]) and has no `AppHandle`
+    /// of its own, so this is how it resolves the injection hierarchy for the
+    /// report it is about to deliver. Same store the loopback route reads
+    /// through `live_settings`; a snapshot, so nothing downstream can observe a
+    /// half-applied edit.
+    pub fn settings_now(&self) -> crate::settings::Settings {
+        self.settings.current()
+    }
+
     /// The launch project root every scan runs against — the loopback
     /// `/audit/run` route compares it against the requesting child's cwd to
     /// reject misrouted requests (multi-instance wrong-instance guard).

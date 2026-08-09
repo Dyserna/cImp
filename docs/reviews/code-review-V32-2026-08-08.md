@@ -540,7 +540,7 @@ signature layer"*; this is *"a failed status read silently renders it armed."* A
 | # | Finding | Status | Location |
 |---|---|---|---|
 | M-1 | Worker budget/latch is per-**attempt**, not per-task — `run_on` is called up to 4× (fail-over, thinking retry, tier escalation), each with a fresh `Budget::default()`. The 4 MiB/40-call cap is really 8 MiB/80 on a default install, 16 MiB/160 with fail-over configured. A loop that resets its own cap is not stopped. | OPEN | `agent.rs:1502-1505`, `service.rs:1147-1252` |
-| M-2 | The A-1 fix **inverted a fail-closed default**: a native name missing from `TABLE` used to classify EXTERNAL and be refused/latched; now it "neither latches nor is refused" and falls through to dispatch. Load-bearing in both directions, with no test and no tripwire. | OPEN | `agent.rs:1258-1268`, `loopback.rs:1586-1589` |
+| M-2 | The A-1 fix **inverted a fail-closed default**: a native name missing from `TABLE` used to classify EXTERNAL and be refused/latched; now it "neither latches nor is refused" and falls through to dispatch. Load-bearing in both directions, with no test and no tripwire. | **FIXED (invariant made mechanical, both directions; the A-1 fix kept)** `f895e74` — see the M-2 note below; carries F-10's fix | `toolclass.rs` (`ClassRow::dispatchable`, `dispatchable`), `loopback.rs` (`LatchRoute::can_execute`, `LatchRegistry::gate`), `agent.rs::latch_gate`, `backend_gate.rs` |
 | M-3 | Spotlighting is spawn-baked in practice (`fact_promotion_block` → `--append-system-prompt` / OpenCode instructions) but declared live: absent from `spawn_inject_sig`, no restart hint. Toggling it on mid-session leaves the running tab injecting **unenveloped pre-V32 memory into the system prompt**. Test pins the defect. | OPEN | `config.rs:1082-1089`, `injection.rs:330-337,1736` |
 | M-4 | A classifier that runs and fails is indistinguishable from Clean, and a failing window **discards windows that already scored over threshold**. `Scored` has no field to express it. The spec names exactly two exclusions; the code implements three. | **FIXED** `5920c92` | `classifier.rs:391-399`, `mod.rs:404-409` |
 | M-5 | At the worker, the "unscreened" notice is **false every time it fires**: `cap_result` truncates to 32 KB, unconditionally below both screening caps, so every byte the model sees was scanned. Trains the reader to discount a notice that is true at the proxy. | OPEN | `mod.rs:387-394`, `agent.rs:1910/1928` |
@@ -717,6 +717,78 @@ carries exported signatures — the same content H-1 demoted `graph_repo_map` fo
    but it is exactly M-2's subject: **M-2's tripwire must assert `TABLE` ↔
    dispatchable-name correspondence, with the three `hook_*` names as a documented
    exception.**
+   **Closed by M-2** (`f895e74`), with one correction to this paragraph: they
+   were **not** the first such rows — `Edit`/`Write`/`Bash` have been classified and
+   unroutable since Phase A, and `Bash` is the likelier hallucination of the six. The
+   exception is now a declared field (`ClassRow::dispatchable`) checked against the
+   real dispatch surface, and the gate leaves the latch alone for all six rather than
+   only documenting them.
+
+### M-2 — what was closed
+
+**The A-1 fix stayed.** A hallucinated bare name still neither latches nor is
+refused; `a_hallucinated_bare_tool_name_does_not_latch_the_task` and
+`an_unserveable_name_on_the_native_route_does_not_latch_the_tab` are untouched
+and still green. What was missing was the invariant that fix started depending
+on, which nothing stated and nothing checked:
+
+> **Every native tool name a dispatcher can serve has a `toolclass::TABLE` row,
+> and every `TABLE` row no dispatcher serves says so.**
+
+**It is now mechanical, in both directions, from ONE assertion.** `ClassRow`
+grew a `dispatchable` flag (`row(…)` sets it, `unrouted(…)` clears it — the
+default is the safe one) and
+`table_matches_the_native_dispatch_surface` compares `TABLE`'s dispatchable rows
+against a set **derived by scanning the dispatchers' own source**: the match arms
+of `offload::tools::dispatch` and `graph::mcp::run_tool`, the `name == "…"`
+chains in `dispatch_recorded` / `handle_call` / `run_graph_tool`, and the
+literals of `loopback::offload_tool_name`. A hand-written list compared against
+itself is the tripwire shape this finding is about, so there is not one.
+
+**The scanner is itself hand-written, so it fails loudly rather than quietly.**
+Every line at match-arm indentation must be a string-literal arm, a declared
+`NON_NAME_ARMS` entry (the unknown-tool catch-all; the `graph_` prefix
+*delegation*), or a comment/closing delimiter — anything else panics with the
+line. A site that yields **no** names panics too, so a scan that has drifted
+from its source cannot pass vacuously. And
+`every_advertised_tool_is_classified_and_dispatchable` cross-checks the same
+property at *runtime* against the real spec builders (`graph::tool_specs`, the
+two semantic specs, `audit_tools::defs`, `tools::enabled_defs`), which is what
+catches a dispatch arm the scanner stopped recognizing.
+
+**Item 2 — the latching half — was fixed, not just documented.** The three
+`hook_*` rows M-7 added were *not* the first classified-but-unroutable rows:
+`Edit`/`Write`/`Bash` have been there since Phase A, and `Bash` is the live
+case, because a local code model reaches for it out of habit. All six
+classified LOCAL-CAPABILITY or TRUSTED, so A-1's rule never saw them: they
+**engaged the latch and only then met "unknown native tool"** — A-1's harm in
+the direction A-1 did not cover. `LatchRoute::can_execute(name, class)` now
+carries both rules for both gates, and the argument for widening the
+wave-through set is that it is the *same* principle, not a new one: on a native
+route an EXTERNAL classification already means "no dispatcher will serve this",
+and these six are the rows where that default does not apply. The risk — a
+wrong `dispatchable: false` waving a real capability past the latch — is
+exactly what the tripwire above measures, and the constructor makes the safe
+value the one you get by default.
+
+**What it deliberately does not touch.** `can_execute`'s second rule is confined
+to `LatchRoute::Native`. `Hook`'s name is composed by cImp and *is* the route,
+so applying it there would wave through the gate M-7 built —
+`can_execute_covers_the_unroutable_names_without_reaching_the_hook_routes`
+asserts a contaminated tab is still refused `/context/post_edit`, next to the
+same name arriving as a model's tool call and being ignored. `Proxied` is
+untouched: every id there contains `__` by construction, so unknown-⇒-EXTERNAL
+still governs every name that can carry external content.
+
+**One M-7-era test was pinning the defect.**
+`a_hook_route_reads_the_latch_and_never_engages_it` used the *same name on
+`LatchRoute::Native`* as its control and asserted it latched — the behaviour
+M-7's own residual note called out as M-2's subject. The control is now a name
+that really is elective and really dispatches (`graph_snippet`), and the old
+case is asserted the other way round beside it.
+
+**F-10 came in with it, as a shared function *and* a compile error.** See the
+F-10 entry.
 
 ### M-8 — what was closed, and on what discriminator
 
@@ -823,7 +895,7 @@ consumer. Two have consumer-quality gaps (M-21, H-10).
 | G-4 `/mcp/call` double snapshot | MEDIUM | Docs **CLOSED**, TOCTOU open by decision and honestly recorded |
 | H-1 gate cache clobber race | MEDIUM | **PARTIAL** (M-15) — original interleaving closed, second one open |
 | H-2 per-tab plugin flags | MEDIUM | **CLOSED**, with migration (not forward-only) |
-| A-1 hallucinated name latches | MEDIUM | **CLOSED** functionally; introduced M-2 |
+| A-1 hallucinated name latches | MEDIUM | **CLOSED** functionally; introduced M-2, now also closed (the fix stands, and its invariant is mechanical) |
 
 ---
 
@@ -944,7 +1016,9 @@ lockfile bump.
 - Deleting the gate call from `handle_audit_run` or `handle_run` leaves the suite
   green — decision 18's own enforcement has no test at its enforcement point, which
   is the shape #48 explicitly rewrote another test to avoid.
-- No test binds `TABLE` to the dispatchable tool set (M-2's backstop).
+- ~~No test binds `TABLE` to the dispatchable tool set (M-2's backstop).~~
+  **Closed** by `table_matches_the_native_dispatch_surface`, which derives the
+  set from the dispatchers' own source (M-2's note above).
 - No test asserts `/latch/override` stays absent from the router.
 
 ---
@@ -1351,6 +1425,42 @@ matching — which is why `HostRouter` uses `starts_with("graph_")`. **Fix shape
 both re-gates into one function both routers call.** Folded into M-2's task, which is
 already about names that classify as capability and reach dispatch anyway.
 
+**FIXED** `f895e74` — `offload/backend_gate.rs`.
+
+All three checks (tool scope, `graph_*`, the two audit names) live in
+`BackendGate::admit`, which both routers call and neither may re-implement:
+`neither_router_reimplements_the_admission_rules` scans `agent.rs` for
+`allows_namespaced`, `allow_audit` and `starts_with("graph_")` and fails if any
+comes back. The `allow_graph`/`allow_audit` bools are no longer router fields.
+
+**And skipping the gate is a compile error, not a test.** `tools::dispatch` now
+takes a `GatePass<'_>` and reads the tool name *out of it*; only
+`BackendGate::admit` can mint one, and it mints it for the name it admitted. So a
+native dispatch that never gated has nothing to pass (`E0308`, verified by
+reverting), and a pass minted for `read_file` cannot be spent on `graph_snippet`.
+The same spirit as M-6's `RawReport`.
+
+Two consequences worth recording rather than discovering:
+
+- **The policy moved with it.** `BackendGate::for_worker(scope, is_remote,
+  settings)` is the one place the two opt-ins are resolved, and all three worker
+  entry points use it: `OffloadService::run_on`, the headless child
+  (`offload/mcp.rs::run_on_backend`) and the supervisor self-test.
+  `ResolvedBackend` gained `is_remote` for that — `is_cloud` alone would have let
+  a LAN worker reach the index on the headless path while the in-app path denies
+  it. What is *advertised* is now derived from the same value
+  (`gate.graph_allowed()` / `gate.audit_allowed()`), so a tool cannot be offered
+  by one rule and refused by another.
+- **The headless child's behaviour changes for unadvertised names only.** It
+  never advertised `graph_*` or the audit tools, so the only calls the new gate
+  can refuse are the hallucinated ones — which is precisely F-10's threat model.
+  A user with `graph.enabled = false` now gets a clean refusal there instead of a
+  silent local index read.
+
+**Adjacent, reported not fixed:** `run_check`'s equivalent exposure. Promoted to
+its own finding — see **F-12** below, because folding it into F-10's entry would
+have let a wider hole inherit a closed finding's disposition.
+
 ### F-11 — `select_discovery` is a tamper surface, not just a lookup
 
 **Found by the M-8 fix run. Severity: MEDIUM, but it is a primitive rather than a single
@@ -1374,3 +1484,39 @@ Related, not fixed: `HttpStatus`/`Unparseable` fall back at all, so a call the a
 answered and **declined** is silently re-run headless, hiding the app's own verdict.
 Under the `tab` rule the containment consequence is gone; the diagnostic dishonesty
 remains.
+
+---
+
+### F-12 — a cloud backend is *advertised* `run_check`, which executes the project's configured commands
+
+**Found by the M-2/F-10 fix run. Severity: HIGH. Predates this milestone. NEEDS A USER
+DECISION — this is a policy call, not a missing copy of an existing gate.**
+
+`run_check` appears in **neither** `LOCAL_DATA_TOOLS` (`schema.rs:2810-2817`) nor either
+re-gate, and both routers dispatch it. Unlike F-10, it does not need a hallucinated
+name: whenever the offload toggle is on and `checks` are configured, `run_check` is
+**advertised** in the tool specs a cloud backend receives. It then executes the
+project's configured build/test/lint commands and returns their output — which quotes
+source — to a remote model.
+
+So this is strictly wider than F-10, which is why it is numbered separately rather than
+left inside F-10's entry: F-10 is now FIXED, and an unfixed wider hole must not inherit
+that disposition.
+
+It is not fixed here because the question it raises is a product decision, not a bug:
+**does a cloud backend get the project's checks at all?** The three defensible answers
+are (a) add `run_check` to `LOCAL_DATA_TOOLS`, denying it to cloud backends by default
+and letting the user opt in — consistent with how `read_file`/`run_command` are treated,
+and `run_check` is arguably closer to `run_command` than to anything on the allowed
+side; (b) re-gate it behind its own opt-in the way `graph_*` and the audit tools are,
+now cheap since `BackendGate` exists; (c) accept it deliberately and write down why.
+
+Note (a) and (b) differ in an important way: `LOCAL_DATA_TOOLS` only removes it from the
+*scope*, and the V8-02 default is applied by the Settings UI when a backend's cloud flag
+is toggled — so it would not retroactively fix an existing configured backend. (b) is
+enforced at call time and would. **Recommendation: (b), plus (a) for new backends.**
+
+Note also that this is the third member of a family this review keeps meeting —
+`run_check` also drove **M-8** (headless latch bypass) and the un-enveloped check output
+behind **M-7's residual #1**. Any decision taken here should be checked against those
+two rather than made in isolation.

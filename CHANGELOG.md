@@ -5,6 +5,55 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0-rc.1] — 2026-08-09
+
+**Pre-release, for testing.** The V32/V33 injection-hardening milestone below is
+not signed off: 10 MEDIUM review findings are still open and none of its 22
+live-verification recipes have been run. The per-tab session identity work is
+likewise unverified against a live two-tab session. Settings schema is unchanged
+at 29.
+
+### Added
+
+- **Injection containment (V32/V33, issues #31–#36, #40, #42–#47).** A
+  tool-class taxonomy and a bidirectional worker taint latch; a per-tab proxy
+  latch with a spotlighting envelope; a detection surface (yara-x signatures +
+  Prompt Guard 2) with an auto-updater that validates and rolls back; outbound
+  screens (SSRF guard, per-fetch budgets, canary tokens); memory-write
+  quarantine with spotlighted recall; consumer hygiene for OpenCode (pinned
+  permissions, guidance, tripwire, escape stripping); native-web visibility
+  modes with a manual latch override; and a three-level enable hierarchy for
+  every injection control.
+- **Per-tab session identity (V34).** Each Claude tab is launched with a
+  cImp-generated `--session-id`, so its transcript binding is provable instead
+  of inferred from "newest file under the project root". This retires, for
+  pinned tabs, the V28 decision-4a degradation that silently disabled `context_*`
+  memory scoping and permission-hook attribution whenever two Claude tabs shared
+  a project. The Code Intelligence Overview now follows the focused tab rather
+  than the most-recently-active session. Tabs that select their own session
+  (`--resume`, `--continue`, …), and any tab after a `/clear`, keep the previous
+  behaviour.
+- **Contamination in the Workbench.** Checkpoints record the session and tab
+  that took them, throttle per `(root, tab)`, and the Timeline shows
+  contamination beside them; a user can clear contamination by resume or
+  restore.
+- **Proxied MCP tool calls** are recorded in the Tool Activity feed.
+
+### Fixed
+
+- **Dashboard and UI responsiveness.** The graph usage IPC commands ran their
+  multi-second store passes directly on runtime workers, starving every other
+  IPC behind them; both dashboards re-applied identical payloads on every 2 s
+  poll, re-rendering the whole Overview chart and the ~1.4k-row activity feed
+  for nothing; and the Graph view's history poll ran even while off-screen.
+- **Embedder token budget.** Auto-detected via `/props`, with fit-guaranteed
+  inputs and poison-chunk isolation.
+- **Recurring failed tool calls.** Project-scoped `run_check` schema, argument
+  aliases, canary rows.
+- Cost surfaces re-price live on LLM pricing edits; a settings typo no longer
+  resets the settings file; a screen's row volume can no longer evict another
+  screen's rows from the activity store.
+
 ## [0.50.1] — 2026-08-06
 
 ### Fixed

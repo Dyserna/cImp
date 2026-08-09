@@ -466,14 +466,28 @@ jobs:
           zip_full="${{ steps.zip.outputs.zip_full }}"
           zip_slim="${{ steps.zip.outputs.zip_slim }}"
 
+          # A semver PRE-RELEASE tag (anything with a `-` suffix: v1.2.3-rc.1,
+          # -beta.2, ...) publishes as a pre-release, so it is downloadable for
+          # testing but never becomes the repo's "Latest release". Passed on the
+          # edit path too — a re-run of an existing tag must not silently
+          # promote it.
+          # Empty for a normal release, so that path is byte-for-byte what it
+          # was — this must not change how real releases publish.
+          prerelease=()
+          if [[ "$tag" == *-* ]]; then
+            prerelease=(--prerelease)
+            echo "tag $tag is a pre-release"
+          fi
+
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag exists — refreshing notes and uploading both assets"
-            gh release edit "$tag" --notes-file release-notes.md
+            gh release edit "$tag" --notes-file release-notes.md "${prerelease[@]}"
             gh release upload "$tag" "$zip_full" "$zip_slim" --clobber
           else
             gh release create "$tag" "$zip_full" "$zip_slim" \
               --title "$tag" \
-              --notes-file release-notes.md
+              --notes-file release-notes.md \
+              "${prerelease[@]}"
           fi
 
   # Portable Linux x86-64 tarball. Runs AFTER build-windows (which creates the

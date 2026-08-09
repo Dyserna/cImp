@@ -57,6 +57,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | F-7 | Auto-injection still pushes signatures into a contaminated tab | **OPEN** | raised by the fix run; bounds what H-1 claims |
 | F-8 | A denied URL still leaks its hostname to DNS | **OPEN** | raised by the fix run; bounds what "denied" means |
 | F-9 | The signature scan's 1 s budget is wall clock spanning both passes | **OPEN** | pre-existing (H-4); fails honestly, but thins under load |
+| F-18 | Every pointer to the V32 controls names a Settings section that does not exist | **OPEN** | found live 2026-08-10 on v0.51.0-rc.1 — the first defect found by *running* the build |
 
 Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
 
@@ -1883,3 +1884,56 @@ manual `Stop-Process`. Plausibly the same child-process leak behind the known
 `audit::runner::tests::{cancel_kills_child, timeout_kills_child_and_reports_timed_out}`
 flakes — which spawn real children and assert kill timing. If so, one fix closes both,
 and it would also make CI reruns less flaky.
+
+### F-18 — every pointer to the V32 controls names a Settings section that does not exist
+
+**Found live 2026-08-10 on `v0.51.0-rc.1`, by a user who went looking for the injection
+settings and concluded the build did not have any. Severity: MEDIUM. Predates the
+milestone in part (the section label does), but V32 is what made it load-bearing.**
+
+The controls are all present, under `SectionId 'offload'` — labelled **"Offload task
+tools"** (`SettingsApp.svelte:1075`) — as *Injection protection* (the master switch,
+`:4414`), *Native web tools* (`:4573`), *Injection detection* (`:4610`) and *Detection
+updates* (`:4783`), below *Backend pool* and *Limits*.
+
+Three things compound, and the third is why the first two are not merely cosmetic:
+
+1. **`TaintMenu.svelte:226` instructs the user to "Change it in Settings → Tools →
+   Injection protection."** There is no Tools section. The seventeen-entry list is
+   Appearance … Tabs, **Offload task tools**, MCP servers, Code Intelligence, Checks,
+   Code Audit, LLM pricing, Workbench, Advanced, About. This string is reached exactly
+   when a user has been told their protection is reduced — i.e. at the one moment the
+   navigation has to work.
+2. **The spec's own recipes 11b and 14 say "Settings → Tools → Detection."** A verifier
+   following the live-verify section cannot find the surface those recipes test. This is
+   the *Documentation truthfulness* class again: the third time this milestone's prose
+   has described a surface that does not exist as written.
+3. **The ⛨ chip promises a deep link it does not perform.** Four `latch.ts` strings
+   (`:364`, `:374`, `:389`, `:391-392`) end "Click to open Settings", and
+   `InjectionBadge.svelte:44` calls `openSettingsWindow()` with **no argument**, so the
+   window opens on whatever section was last active — Appearance on a fresh profile. The
+   mechanism exists and is used elsewhere: a `settings-deep-link` event with
+   `{kind:'section', section}` is handled at `SettingsApp.svelte:1274`. Nothing needed
+   building; the call site simply does not send it.
+
+**Why this outranks the other UI-honesty MEDIUMs.** M-21 lies about one layer, M-22 about
+one popover, M-24 blurs four states into one chip. F-18 makes the **entire** V32 control
+surface — including the master switch, the detection health rows and the updater buttons
+recipes 11/11b drive — unreachable for a user who follows the app's own instructions. A
+containment control that cannot be found is off in the way that matters.
+
+**Fix, cheapest first:** correct the strings to "Offload task tools"; have
+`InjectionBadge` emit `settings-deep-link {kind:'section', section:'offload'}`; correct
+recipes 11b and 14. The better fix renames the section — "Offload task tools" stopped
+describing the block when V32 put every tab's latch under it — but a rename carries its
+own drift surface and would want a sweep of the twenty-odd "Settings → X" strings across
+`src/lib/`, several of which are already shorthand that matches no label ("Settings →
+Offload", "Settings → Code graph").
+
+**Process note, worth more than the finding.** This is the first V32 defect found by
+running the build rather than reading it. It was invisible to every source-level pass
+because each half is locally correct: the section renders, the string is well-formed, the
+click opens Settings. Only the composition is wrong, and no test asserts that a
+user-facing navigation string names a section that exists — which is itself the tripwire
+gap to close (a test over the "Settings → …" literals against `SECTIONS` would be cheap
+and would have caught all three).

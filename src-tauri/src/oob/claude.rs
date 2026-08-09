@@ -372,19 +372,17 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
     // are still honouring it. Taken by value so `pin_step`'s `GiveUp` can clear
     // it permanently for this tap. `pin_since` dates the grace window from the
     // tap's start, not from the tab's.
-    let mut pin = pinned_session;
-    let pin_since = std::time::Instant::now();
-    // A pinned tab is provable from the moment it launches: cImp chose the id
-    // and passed it to the child, so — unlike the newest-wins path, which must
-    // wait for a decoded record to prove a file is ours ([`LiveSessionGate`]) —
-    // there is nothing to confirm. Publishing it here rather than on first
-    // transcript write is what makes per-tab scoping correct during the minutes
-    // a fresh tab may sit idle before it writes anything.
-    if let Some(sid) = pin.as_deref() {
-        hb.note_pinned(true);
-        hb.note_session(sid);
-        ctx.mark_live_session(sid, "claude");
-    }
+    // The session id cImp REQUESTED for this tab. Held for the tap's lifetime
+    // (never cleared) because a conversation can start writing at any point, so
+    // a pin unverified now may verify later. Nothing is published from it until
+    // its transcript exists — see [`PinStep`].
+    let pin = pinned_session;
+    // Latched once the pinned transcript is seen: this tab's identity is
+    // PROVEN, and it is that fact — not the presence of a `--session-id` on the
+    // argv — that the registry's ambiguity exemption keys off.
+    let mut pin_verified = false;
+    // One-shot so the "pin not honoured" note doesn't repeat every 200ms tick.
+    let mut pin_unhonoured_logged = false;
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -401,34 +399,56 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
         // `newest_jsonl` so a tab is a known co-tenant from its tap's first
         // instruction, not from its first confirmed session — that is what
         // closes the launch-order window. Cleared by `_live_guard` on exit.
-        ctx.mark_live_tab_root("claude", &root, pin.is_some());
-
-        // V34: a pinned tab follows exactly one file — the transcript named by
-        // the `--session-id` cImp put on this child's command line — so the
-        // "newest wins" race above simply does not apply to it. An unpinned tab
-        // (the user's own `--resume`/`--continue`, or a pin the harness
-        // ignored) keeps the historical behaviour.
+        // V34: a VERIFIED pinned tab follows exactly one file — the transcript
+        // named by the `--session-id` cImp put on this child's argv — so the
+        // "newest wins" race above does not apply to it. A tab whose pin the
+        // harness did not honour (a restored conversation keeps its original
+        // session id) is indistinguishable from an unpinned one, and is treated
+        // as such: same file choice, same ambiguity rules, no identity claim.
         let target = match pin.as_deref() {
             Some(sid) => {
                 let path = root.join(format!("{sid}.jsonl"));
-                match pin_step(path.is_file(), pin_since.elapsed().as_millis() as u64) {
-                    PinStep::Follow => Some(path),
-                    PinStep::Wait => None,
-                    PinStep::GiveUp => {
-                        warn!(
-                            tab = ?ctx.tab,
-                            session = %sid,
-                            "Claude OOB: pinned transcript never appeared; \
-                             falling back to newest-wins (harness ignored --session-id?)"
-                        );
-                        pin = None;
+                match pin_step(path.is_file()) {
+                    PinStep::Follow => {
+                        // Verified: the harness wrote the transcript we asked
+                        // for. Claim the identity — and because WE chose the id,
+                        // this claim needs no further proof from the file's
+                        // contents (the `LiveSessionGate` bar exists for the
+                        // newest-wins path, where the file's ownership is the
+                        // very thing in doubt).
+                        if !pin_verified {
+                            pin_verified = true;
+                            debug!(tab = ?ctx.tab, session = %sid, "Claude OOB: pin verified");
+                        }
+                        hb.note_pinned(true);
+                        hb.note_session(sid);
+                        ctx.mark_live_session(sid, "claude");
+                        Some(path)
+                    }
+                    PinStep::Fallback => {
+                        // Log ONCE, not per tick: for a restored conversation
+                        // this is the steady state, not an error.
+                        if !pin_unhonoured_logged {
+                            pin_unhonoured_logged = true;
+                            debug!(
+                                tab = ?ctx.tab,
+                                session = %sid,
+                                "Claude OOB: no transcript for the pinned session yet — \
+                                 running unpinned (a restored conversation keeps its own id)"
+                            );
+                        }
                         hb.note_pinned(false);
                         newest_jsonl(&root)
                     }
                 }
             }
-            None => newest_jsonl(&root),
+            None => {
+                hb.note_pinned(false);
+                newest_jsonl(&root)
+            }
         };
+        // Reported from the VERIFIED state, never from "we passed the flag".
+        ctx.mark_live_tab_root("claude", &root, pin_verified);
 
         match target {
             Some(path) if Some(&path) != cur.as_ref() => {
@@ -1714,45 +1734,48 @@ fn slug_for(dir: &Path) -> String {
 
 /// Newest `*.jsonl` (by mtime) under `root`, or `None` if the dir is missing
 /// or empty.
-/// How long a pinned tap waits for its own `<session-id>.jsonl` to appear
-/// before giving up the pin and reverting to newest-wins.
+/// What a tap holding a `--session-id` pin should do this tick. Pure so the
+/// decision is unit-testable without a filesystem or a clock.
 ///
-/// Generous on purpose. The file appears when Claude Code first writes the
-/// conversation, which can be minutes after launch if the user doesn't type —
-/// and while we wait, this tab reports no session at all. The deadline exists
-/// only for the case the pin genuinely did not take (a `--session-id` the
-/// harness ignored, i.e. contract drift), where waiting forever would silently
-/// cost the tab its TTS, usage and memory.
+/// **Passing `--session-id` is a request, not a guarantee** (2026-08-09, found
+/// in the field). Observed on three live tabs: each carried a DISTINCT
+/// `--session-id` UUID on its argv and none carried a `--resume`/`--continue`,
+/// yet two of them were actively writing transcripts under different,
+/// pre-existing session ids — only the tab starting a fresh conversation had a
+/// `*.jsonl` matching its pin.
 ///
-/// **Expiring is safe even when it fires wrongly**: the fallback is exactly the
-/// pre-V34 behaviour, so a false trigger costs the tab nothing it had before.
-/// That asymmetry is what lets the value be a plain timeout instead of a
-/// cleverer predicate that would have to guess about co-tenants.
-const PIN_GRACE_MS: u64 = 120_000;
-
-/// What a pinned tap should do this tick. Pure so the pin/fallback decision is
-/// unit-testable without a filesystem or a clock.
+/// The mechanism is not established (restoring a prior conversation overriding
+/// the flag is the obvious candidate, but it was not proven); what IS
+/// established is that the flag's effect must be verified rather than assumed.
+///
+/// So the pin is treated as a CLAIM TO BE VERIFIED, and the transcript's
+/// existence is the verification. Everything downstream — the live-session
+/// registry entry, the registry's `pinned` flag, and therefore the ambiguity
+/// exemption — waits on that, because a session id we merely asked for names a
+/// conversation that may not exist.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PinStep {
-    /// The pinned transcript exists — follow it, and nothing else.
+    /// The pinned transcript exists ⇒ the harness honoured it. Follow that file
+    /// and nothing else, and claim the identity.
     Follow,
-    /// Not there yet, still inside the grace window: attach to NOTHING. A
-    /// pinned tap must never fall back to "newest" opportunistically — the
-    /// newest file under a shared root is very likely another tab's, which is
-    /// the exact mis-binding the pin exists to prevent.
-    Wait,
-    /// Grace exhausted with no pinned transcript: the pin did not take. Drop it
-    /// and degrade to newest-wins (and to ambiguous, if co-tenants exist).
-    GiveUp,
+    /// No pinned transcript. Behave exactly as an unpinned tap does —
+    /// newest-wins, no identity claim, ambiguity rules re-applied — while
+    /// CONTINUING to watch for the file, so a conversation that starts writing
+    /// later still upgrades to `Follow`.
+    ///
+    /// Deliberately not a blocking wait. An earlier design parked the tap until
+    /// the file appeared, which cost every restored tab its TTS, usage and
+    /// memory for the whole window — a regression against not pinning at all.
+    /// Falling back immediately is never worse than pre-V34, and costs only the
+    /// isolation a restored tab was never going to get.
+    Fallback,
 }
 
-pub(crate) fn pin_step(pinned_present: bool, waited_ms: u64) -> PinStep {
+pub(crate) fn pin_step(pinned_present: bool) -> PinStep {
     if pinned_present {
         PinStep::Follow
-    } else if waited_ms < PIN_GRACE_MS {
-        PinStep::Wait
     } else {
-        PinStep::GiveUp
+        PinStep::Fallback
     }
 }
 
@@ -1861,31 +1884,22 @@ mod tests {
     // ── V34: the `--session-id` pin ──────────────────────────────────────
 
     #[test]
-    fn a_present_pinned_transcript_is_followed_immediately() {
-        assert_eq!(pin_step(true, 0), PinStep::Follow);
-        // Presence wins even past the grace window — the deadline only governs
-        // the absent case.
-        assert_eq!(pin_step(true, PIN_GRACE_MS * 10), PinStep::Follow);
+    fn the_pinned_transcript_existing_is_what_verifies_the_pin() {
+        assert_eq!(pin_step(true), PinStep::Follow);
     }
 
     #[test]
-    fn an_absent_pinned_transcript_waits_rather_than_grabbing_the_newest() {
-        // The load-bearing case: a co-tenant tab's transcript is very likely
-        // the newest file under a shared root, so a pinned tap that fell back
-        // opportunistically would bind to the WRONG session — the precise
-        // defect the pin exists to remove.
-        assert_eq!(pin_step(false, 0), PinStep::Wait);
-        assert_eq!(pin_step(false, PIN_GRACE_MS - 1), PinStep::Wait);
-    }
-
-    #[test]
-    fn the_pin_is_abandoned_once_the_grace_window_lapses() {
-        // Fail-open: if the harness ignored `--session-id`, waiting forever
-        // would cost this tab its TTS, usage and memory. Reverting to
-        // newest-wins is exactly the pre-V34 behaviour, so giving up is never
-        // worse than not having pinned at all.
-        assert_eq!(pin_step(false, PIN_GRACE_MS), PinStep::GiveUp);
-        assert_eq!(pin_step(false, PIN_GRACE_MS + 1), PinStep::GiveUp);
+    fn an_absent_pinned_transcript_runs_unpinned_rather_than_stalling() {
+        // Found in the field (2026-08-09): a tab can run under a session id
+        // that is NOT the one cImp pinned — three live tabs each carried a
+        // distinct `--session-id`, and two were writing transcripts under
+        // different, pre-existing ids. So the pinned file may never appear.
+        //
+        // The tap must therefore degrade to exactly the pre-V34 behaviour
+        // immediately. An earlier design parked the tap waiting for the file,
+        // which cost every restored tab its TTS, usage and memory for two
+        // minutes — strictly worse than never pinning.
+        assert_eq!(pin_step(false), PinStep::Fallback);
     }
 
     #[test]

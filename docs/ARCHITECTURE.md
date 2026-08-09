@@ -272,14 +272,18 @@ for each Claude tab and passes it as `--session-id`, so the tap follows exactly
 `<root>/<uuid>.jsonl` instead of racing for the newest file, and the tab's
 binding is provable no matter how many tabs share a project. Generated in
 `tabs::config::resolve_oob_source` beside the `OobSpec` that carries it, so the
-argv flag and the file the tap follows cannot drift; `oob/claude.rs::pin_step`
-governs the wait-vs-give-up decision, and `graph_tab_session` exposes tab →
-session so the Code Intelligence Overview can follow the focused tab rather than
-the most-recently-active session. A tab whose own args already select a
-conversation (`--resume`/`--continue`/…, see `args_select_session`) is left
-unpinned, as is one whose pinned transcript never appears within
-`PIN_GRACE_MS` — both fall back to the behaviour described next, which is also
-what a pinned tab reverts to after a `/clear` rolls its session over.
+argv flag and the file the tap follows cannot drift; and `graph_tab_session`
+exposes tab → session so the Code Intelligence Overview can follow the focused
+tab rather than the most-recently-active session.
+
+**The pin is a claim, verified against the transcript's existence**
+(`oob/claude.rs::pin_step`) — passing the flag does not mean the tab runs under
+it, which was observed in the field on tabs carrying no `--resume`/`--continue`.
+Until `<root>/<pinned>.jsonl` exists, the tab publishes no identity and behaves
+exactly as described next; the tap keeps watching and upgrades if the file
+appears. A tab whose own args already select a conversation (see
+`args_select_session`) is never pinned at all, and a `/clear` rolls a verified
+tab's session over and returns it to the same fallback.
 
 **The unpinned case is not isolatable, and degrades to unscoped rather than
 guessing (H1, 2026-08-05 review).** Without a pin Claude's tap has no

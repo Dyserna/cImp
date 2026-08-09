@@ -126,10 +126,26 @@ reads and writes tab B's working set whenever B was active more recently.
      stops growing, and the tab degrades to newest-wins — i.e. back to 4a — for
      the rest of its life. Re-pinning would need a rotation signal we do not
      have; not attempted.
-   * *A harness that ignores `--session-id`.* The tap waits `PIN_GRACE_MS`
-     (120 s) for its transcript, then drops the pin and reverts to newest-wins,
-     re-marking the tab unpinned so ambiguity re-applies. Expiring is safe even
-     when it fires wrongly, because the fallback *is* the pre-V34 behaviour.
+   * *A tab that does not run under its pin.* **Observed in the field
+     (2026-08-09), not hypothetical.** Three live tabs each carried a distinct
+     `--session-id` and no `--resume`/`--continue`, yet two were actively
+     writing transcripts under different, pre-existing session ids. The
+     mechanism was not established; the lesson is that **the flag's effect must
+     be verified, never assumed**.
+
+     So the pin is a claim and the transcript's existence is its verification.
+     Until `<root>/<pinned>.jsonl` exists the tab runs exactly as pre-V34 —
+     newest-wins, no registry identity claim, ambiguity rules in force — and the
+     tap keeps watching, upgrading the moment the file appears. Nothing is
+     published from a pin alone.
+
+     *Superseded design, recorded so it is not re-attempted:* the first cut
+     published the pinned id immediately ("we chose it, so it is proven") and
+     parked the tap for a 120 s grace window waiting for the file. Both were
+     wrong. Publishing advertised a session that had no transcript and no rows,
+     so `context_*` writes would have been filed under a fiction — confidently
+     wrong, the very thing 4a exists to prevent. Parking cost every such tab its
+     TTS, usage and memory for two minutes: strictly worse than not pinning.
    * *OpenCode.* Unchanged — it binds per-tab off its own SSE stream (decision
      5) and was never degraded.
 
@@ -335,11 +351,18 @@ fallback). Three lines; noted here rather than left as a silent inconsistency.
       degrades to unscoped exactly as in the pre-V34 recipe — succeeds, never
       errors, may see the other's note. This is the asymmetry in decision 4b;
       if BOTH degrade, the pinned tab is wrongly being treated as ambiguous.
-   b3. *Pin fallback (contract drift).* Hardest to stage — needs a `claude` that
-      ignores `--session-id`. If it ever happens in the field the symptom is a
-      tab with no TTS/usage/memory for two minutes, then a
-      `"pinned transcript never appeared"` warning and a silent return to
-      pre-V34 behaviour. Grep that string first when per-tab scoping misbehaves.
+   b3. *A tab not running under its pin (**common — verify this one**).* Cheap
+      and decisive, no staging required:
+      ```powershell
+      Get-CimInstance Win32_Process -Filter "Name='claude.exe'" | ForEach-Object {
+        if ($_.CommandLine -match '--session-id\s+(\S+)') { $matches[1] } else { 'NO-PIN' } }
+      ```
+      Every tab must print a distinct UUID. Then check
+      `~/.claude/projects/<slug>/` : a tab that has written anything must have a
+      `*.jsonl` whose stem is ITS pin. A tab writing under a different stem is
+      running unpinned — expected for a restored conversation, and it must
+      degrade gracefully (TTS, usage and memory all still work, scoping falls
+      back to 4a) rather than going quiet. **Going quiet is the regression.**
    b4. *`/clear` rollover (known residual).* In a pinned tab, `/clear`, then
       `context_note` + `context_recall`. The tab reverts to newest-wins for the
       rest of its life, so with a co-tenant open it degrades to (b2)'s

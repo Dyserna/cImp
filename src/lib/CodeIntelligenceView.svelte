@@ -89,8 +89,9 @@
   import { computeChip } from './settings/checksEditor';
   import { workbenchSessionCommitCounts, openSessionCommits } from './workbench';
   import { revealTab } from './tabs/visibility';
-  import { get } from 'svelte/store';
+
   import { activeTab } from './tabs/state';
+  import { tabMeta } from './tabs/store';
   import { GRAPH_MONITOR_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import {
@@ -518,7 +519,7 @@
     // V34: re-attempt the focus follow now that rows may have landed. The
     // subscription only fires on a tab CHANGE, so without this a tab focused
     // before its session had any rows would never be picked up.
-    void followActiveTab(get(activeTab));
+    if (lastAgentTab) void followActiveTab(lastAgentTab);
     // Unawaited on purpose: commitCounts is independent $state that renders
     // when it lands — the poll's critical path shouldn't wait on a git
     // subprocess round trip.
@@ -625,12 +626,25 @@
     await selectSession(row, { auto: true });
   }
 
-  // Re-resolve on every focus change. The store subscription (rather than an
-  // `$effect` over `$activeTab`) keeps this working while the view is detached:
-  // the app-view registry keeps this component mounted, so a tab switch that
-  // happens while Code Intelligence is off-screen must still be reflected when
-  // it comes back.
-  const unsubActiveTab = activeTab.subscribe((t) => void followActiveTab(t));
+  // The last AGENT tab to hold focus — the follow target.
+  //
+  // NOT `activeTab` itself: looking at this dashboard makes IT the active tab,
+  // and a dashboard has no session, so keying on `activeTab` resolved nothing
+  // the moment the user actually looked at the card and left the selection
+  // stuck on whatever was focused first. Only `ai-tool` tabs move the target;
+  // focusing a dashboard, a shell or a preview leaves it where it was, which is
+  // what "the session of the tab I was last working in" means.
+  let lastAgentTab: string | null = null;
+
+  // Subscribing to the store (rather than an `$effect` over `$activeTab`) keeps
+  // this working while the view is detached: the app-view registry keeps this
+  // component mounted, so a tab switch that happens while Code Intelligence is
+  // off-screen must still be reflected when it comes back.
+  const unsubActiveTab = activeTab.subscribe((t) => {
+    if (tabMeta(t)?.kind !== 'ai-tool') return;
+    lastAgentTab = t;
+    void followActiveTab(t);
+  });
 
   async function selectSession(
     s: SessionUsageRow,

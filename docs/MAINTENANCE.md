@@ -832,16 +832,20 @@ load-bearing.
 
 **What to re-check instead** (the seam this design leaves):
 
-- **`--session-id` must keep working (V34, 2026-08-09).** Per-tab identity for
-  two Claude tabs on ONE project now rests on cImp pinning each tab's session at
-  spawn (`claude --session-id <uuid>`) and the transcript being named
-  `<session-id>.jsonl`. If either changes upstream, the tap waits
-  `PIN_GRACE_MS` (120 s) and then silently reverts to the pre-V34 newest-wins
-  binding — degraded, never broken. **The tell is a
-  `"pinned transcript never appeared"` warning**; grep it first whenever per-tab
-  scoping, permission attribution, or the Overview's focused-tab card look
-  wrong. Check `--session-id` is still in `claude --help` on each harness
-  upgrade (see the V28 doc, decision 4b).
+- **`--session-id` is a request, not a guarantee (V34, 2026-08-09).** Per-tab
+  identity for two Claude tabs on ONE project rests on cImp pinning each tab's
+  session at spawn (`claude --session-id <uuid>`) and the transcript being named
+  `<session-id>.jsonl`. **A tab does not always run under its pin** — observed
+  in the field on tabs carrying no `--resume`/`--continue` at all — so the pin
+  is verified against the transcript's existence before anything is published
+  from it, and a tab that never gets its pinned file simply runs as it did
+  pre-V34. Degraded, never broken, and never a false identity claim.
+
+  Nothing to watch for as a failure here: unpinned IS a supported state. What
+  would be a real regression is a pinned-but-unwritten tab going QUIET (no TTS,
+  no usage, no memory) — that means the verification turned back into a wait.
+  Check `--session-id` is still in `claude --help` on each harness upgrade, and
+  run the V28 live-verify recipe b3 (a one-liner over `Win32_Process`).
 - **The tab→session registry must stay fed.** Claude stamps it from the
   transcript drain tick (`oob/claude.rs`), OpenCode from the `/event` SSE tap
   (`oob/opencode.rs::Tracker::track_live_session`, keyed off

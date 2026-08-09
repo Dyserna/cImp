@@ -2321,6 +2321,79 @@ fn note_contamination(
     })
 }
 
+/// #48 (2026-08-08 re-review), finding M-19 — what [`LatchRegistry::gate`]
+/// hands back to a caller it could not attribute to a tab.
+///
+/// # The asymmetry this closes
+///
+/// The identity-less fail-open is locked (F-5/H-8) and load-bearing: a child
+/// spawned before `--tab` existed, and the documented headless consumers, must
+/// keep their TOOL-SERVING routes. Nothing here touches that — every class
+/// except one still leaves this function `Clean`, and no latch row is created
+/// for any of them.
+///
+/// PERSISTENT-WRITE is the exception, and the precedent for treating it as one
+/// is already in this codebase, one module over: on the **headless** path a
+/// write with no identity is refused outright (`graph::mcp::headless_refusal`,
+/// `HEADLESS_WRITE_UNAVAILABLE`), on exactly this reasoning — that path has
+/// neither a session identity nor a taint verdict, and a note written blind
+/// with neither is *"project-wide, permanent, unattributable AND unquarantined,
+/// which is the highest-privilege write the memory surface offers"*. The
+/// loopback path reached the identical state and stored the note clean. Two
+/// paths, the same two missing facts, opposite answers.
+///
+/// # Why quarantine and not the headless path's refusal
+///
+/// Locked decision 10. A refusal on this path throws away the legitimate
+/// research conclusion the session existed to produce; the quarantine keeps it,
+/// flags it, hides it from `context_recall` / `context_notes` / compaction
+/// carry-over / the fact distiller, and hands the user promote-or-discard. (The
+/// headless path refuses because there is no running app to review a queue in,
+/// not because refusal is the better answer.)
+///
+/// It is [`WriteTaint::Unattributed`] rather than `Quarantined` so the model is
+/// told the actual reason — see that variant.
+///
+/// # Deliberately not gated on `policy.latch`
+///
+/// Only on `policy.quarantine`, matching the scoped path: locked decision 16
+/// keeps the two switches independent, and this is a quarantine decision, not a
+/// latch decision. Nothing here reads or moves a latch — there is no scope to
+/// move one for, which is the whole point.
+fn unattributed_write(policy: GatePolicy, route: LatchRoute, name: &str) -> WriteTaint {
+    let class = toolclass::classify(name);
+    if !policy.quarantine || class != ToolClass::PersistentWrite || !route.can_execute(name, class)
+    {
+        return WriteTaint::Clean;
+    }
+    warn!(
+        target: "offload",
+        tool = %name,
+        "loopback: persistent memory write held — the caller carries no resolvable tab identity"
+    );
+    // One row per held note, for the same reason the scoped quarantine writes
+    // one: each is a separate item in the user's review queue, and a feed that
+    // reported only the first would leave later ones discoverable solely by
+    // opening the Memory view. There is no scope, so the columns that name one
+    // say so rather than guessing — the `consumer` a request body could have
+    // supplied is exactly the field M-19 showed is caller-chosen.
+    outbound::record_flag(outbound::Flag {
+        screen: outbound::Screen::MemoryQuarantine,
+        origin: outbound::Origin::Internal,
+        consumer: "unattributed",
+        scope: "unattributed",
+        session: None,
+        tool: name,
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: false,
+        root: String::new(),
+        detail: toolclass::UNATTRIBUTED_WRITE_NOTICE,
+    });
+    WriteTaint::Unattributed
+}
+
 impl LatchRegistry {
     /// Decide one call, and engage the latch when it may proceed.
     ///
@@ -2358,9 +2431,11 @@ impl LatchRegistry {
         if policy.inert() {
             return Ok(WriteTaint::Clean);
         }
-        // Fail-open: no tab identity ⇒ no latch (see [`latch_scope`]).
+        // Fail-open: no tab identity ⇒ no latch (see [`latch_scope`]) — except
+        // for the one class where "we do not know who this is" is itself the
+        // hazard. See [`unattributed_write`].
         let Some(scope) = scope else {
-            return Ok(WriteTaint::Clean);
+            return Ok(unattributed_write(policy, route, name));
         };
         let class = toolclass::classify(name);
         // #48, findings A-1 and M-2: a call that cannot execute on this route
@@ -2407,13 +2482,21 @@ impl LatchRegistry {
             {
                 ProxyGate::Proceed(WriteTaint::Quarantined)
             }
-            ProxyGate::Proceed(WriteTaint::Quarantined) if !policy.quarantine => {
+            ProxyGate::Proceed(WriteTaint::Quarantined | WriteTaint::Unattributed)
+                if !policy.quarantine =>
+            {
                 ProxyGate::Proceed(WriteTaint::Clean)
             }
             other => other,
         };
         let refusal = match decision {
-            ProxyGate::Proceed(WriteTaint::Quarantined) => {
+            // `Unattributed` cannot arrive here — it is [`unattributed_write`]'s
+            // answer, returned above this frame's `scope` binding, and
+            // `proxy_gate` never produces it. It is bound rather than excluded
+            // so that a future path which does route one through holds the note
+            // (and explains it correctly) instead of falling into the `Clean`
+            // arm below.
+            ProxyGate::Proceed(held @ (WriteTaint::Quarantined | WriteTaint::Unattributed)) => {
                 // Locked decision 10: store it, flag it, hold it for the user.
                 // The write itself never latches (PERSISTENT-WRITE is not a
                 // latching class), so nothing about the scope changes here.
@@ -2443,9 +2526,11 @@ impl LatchRegistry {
                     resolved_ip: None,
                     canary: false,
                     root: scope.root.clone(),
-                    detail: toolclass::QUARANTINE_WRITE_NOTICE,
+                    detail: held
+                        .write_notice()
+                        .unwrap_or(toolclass::QUARANTINE_WRITE_NOTICE),
                 });
-                return Ok(WriteTaint::Quarantined);
+                return Ok(held);
             }
             ProxyGate::Proceed(WriteTaint::Clean) => None,
             ProxyGate::Refuse(r) => Some(r),
@@ -7324,10 +7409,9 @@ mod tests {
     }
 
     /// The other direction of the same rule: a LOCAL-CAPABILITY latch never
-    /// taints a write (only external content can contaminate persistence), and
-    /// an identityless call fails open exactly as it does for the latch itself.
+    /// taints a write — only external content can contaminate persistence.
     #[test]
-    fn a_local_latch_and_a_tabless_call_both_write_clean() {
+    fn a_local_latch_writes_clean() {
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
@@ -7344,10 +7428,71 @@ mod tests {
             reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
             Ok(WriteTaint::Clean)
         );
-        // No tab identity ⇒ no scope to latch and none to taint.
+    }
+
+    /// #48 (2026-08-08 re-review), M-19 — the identity-less PERSISTENT-WRITE.
+    ///
+    /// This case used to be the tail of the test above, asserting
+    /// `Ok(WriteTaint::Clean)` under the comment *"no tab identity ⇒ no scope to
+    /// latch and none to taint"*. The first half of that is locked (F-5/H-8) and
+    /// still holds; the second half was the defect — a note nobody could
+    /// attribute, stored as ordinary auto-injecting memory, while the headless
+    /// path refuses the very same call for the very same missing facts.
+    ///
+    /// Three properties, and dropping any one of them re-opens something:
+    /// the write is HELD (not clean, and not refused — locked decision 10);
+    /// it is held as `Unattributed`, so the model gets the true reason rather
+    /// than a claim about external content; and it still creates no latch row,
+    /// so the fail-open the fix is *not* touching stays untouched.
+    #[test]
+    fn an_identityless_persistent_write_is_held_not_stored_clean() {
+        let reg = LatchRegistry::default();
         assert_eq!(
             reg.gate(None, LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Unattributed)
+        );
+        assert!(WriteTaint::Unattributed.is_quarantined());
+        assert_eq!(
+            WriteTaint::Unattributed.write_notice(),
+            Some(toolclass::UNATTRIBUTED_WRITE_NOTICE),
+            "and it is explained as itself, not as an external-content quarantine"
+        );
+        assert!(
+            reg.snapshot().is_empty(),
+            "an identityless call still creates no latch row"
+        );
+
+        // Locked decision 16: this is a QUARANTINE decision, so the quarantine
+        // switch turns it off — and the latch switch does not. Without the
+        // second assertion the feature switch could be wired to the wrong half
+        // and nothing would notice.
+        let latch_only = GatePolicy {
+            latch: true,
+            quarantine: false,
+        };
+        assert_eq!(
+            reg.gate(
+                None,
+                LatchRoute::Native,
+                "context_note",
+                latch_only,
+                NO_CONTENT
+            ),
             Ok(WriteTaint::Clean)
+        );
+        let quarantine_only = GatePolicy {
+            latch: false,
+            quarantine: true,
+        };
+        assert_eq!(
+            reg.gate(
+                None,
+                LatchRoute::Native,
+                "context_note",
+                quarantine_only,
+                NO_CONTENT
+            ),
+            Ok(WriteTaint::Unattributed)
         );
     }
 
@@ -7745,17 +7890,25 @@ mod tests {
     /// global latch — one identityless call would then latch every consumer.
     /// Its EXTERNAL results are still spotlight-wrapped (that needs no
     /// identity; see `handle_mcp_call`).
+    ///
+    /// #48 M-19 narrows this to what it always meant: never *refused*, and
+    /// never latching. The one PERSISTENT-WRITE is admitted too — and held, see
+    /// `an_identityless_persistent_write_is_held_not_stored_clean`. Asserted
+    /// per name rather than with `.is_ok()`, because `.is_ok()` is true of
+    /// every verdict this function can return and so says nothing about which
+    /// one each name got.
     #[test]
     fn an_identityless_call_is_never_gated() {
         let reg = LatchRegistry::default();
-        for (route, name) in [
-            (LatchRoute::Proxied, "ddg__fetch_content"),
-            (LatchRoute::Native, "graph_snippet"),
-            (LatchRoute::Proxied, "ddg__search"),
-            (LatchRoute::Native, "context_note"),
+        for (route, name, taint) in [
+            (LatchRoute::Proxied, "ddg__fetch_content", WriteTaint::Clean),
+            (LatchRoute::Native, "graph_snippet", WriteTaint::Clean),
+            (LatchRoute::Proxied, "ddg__search", WriteTaint::Clean),
+            (LatchRoute::Native, "context_note", WriteTaint::Unattributed),
         ] {
-            assert!(
-                reg.gate(None, route, name, ON, NO_CONTENT).is_ok(),
+            assert_eq!(
+                reg.gate(None, route, name, ON, NO_CONTENT),
+                Ok(taint),
                 "{name}"
             );
         }

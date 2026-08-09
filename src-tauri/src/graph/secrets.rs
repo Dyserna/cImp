@@ -72,6 +72,82 @@ use crate::offload::detection::signature;
 /// curation rules that apply to anything added to it.
 const SOURCE: &str = include_str!("secrets.yar");
 
+/// #48 (2026-08-08 re-review), finding M-20 — the largest note this screen may
+/// be handed, and therefore the largest note `context_note` will store.
+///
+/// The screen scans a *prefix* ([`signature::SCAN_PREFIX_BYTES`]); it always
+/// did. What M-20 found is that nothing stopped a caller handing it more than
+/// that prefix, so 256 KiB of filler followed by an AWS key screened Clean and
+/// was stored as ordinary — auto-injecting — project memory. The comment on
+/// [`screen`] asserted the input "cannot reach either bound"; that was an
+/// assertion about a caller, not a property of the code.
+///
+/// It is a property of the code now: the only way to obtain the [`NoteText`]
+/// `screen` accepts is [`NoteText::parse`], which rejects anything larger, and
+/// the static assert below ties this constant to the scanner's own prefix so
+/// the two cannot drift apart silently.
+///
+/// **64 KiB, not 256.** The value is deliberately well *under* the prefix cap
+/// rather than equal to it, so the scanner's second (normalized) pass — which
+/// can grow the buffer it works on — keeps a wide margin against
+/// [`signature::SCAN_TIMEOUT`] too. It is the same figure the classifier bounds
+/// its own input at (`classifier::MAX_INPUT_BYTES`), and ~16k words is already
+/// far past what a memory note is for.
+pub const MAX_NOTE_BYTES: usize = 64 * 1024;
+
+/// The bound above is only real while it is *below* what the scanner reads.
+/// A compile-time check rather than a test, because the failure mode it guards
+/// — someone raising `MAX_NOTE_BYTES`, or the detection layer lowering its
+/// prefix — is exactly the kind that ships quietly and re-opens M-20.
+const _: () = assert!(MAX_NOTE_BYTES <= signature::SCAN_PREFIX_BYTES);
+
+/// A `context_note` payload that is **small enough for [`screen`] to read all
+/// of**, and the only thing `screen` accepts.
+///
+/// The field is private and [`parse`](Self::parse) is the sole constructor, so
+/// "the screen saw the whole note" is enforced by the type checker rather than
+/// by a comment — the same shape as `RawReport`'s audit envelope and
+/// `GatePass`'s backend gate. It takes the `String` by value on purpose: at the
+/// one call site (`mcp::run_tool`'s `context_note` arm) that moves the raw text
+/// out of scope, so the note that gets *stored* is necessarily the note that
+/// was screened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteText(String);
+
+impl NoteText {
+    /// The parse boundary. `Err` is the model-facing message — nothing is
+    /// stored, and the caller surfaces it as a tool error.
+    pub fn parse(text: String) -> Result<Self, String> {
+        if text.len() > MAX_NOTE_BYTES {
+            return Err(too_long_notice());
+        }
+        Ok(NoteText(text))
+    }
+
+    /// The note itself, for storage. Reading it is unrestricted; *constructing*
+    /// it is the boundary.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The model-facing message for a note past [`MAX_NOTE_BYTES`].
+///
+/// Composed from the constant rather than spelled out, so the number in the
+/// message cannot drift from the number in the check. Content-free about the
+/// note, like every other boundary string here: it states what happened, that
+/// nothing was stored, and the one thing that changes the outcome.
+pub fn too_long_notice() -> String {
+    format!(
+        "NOT SAVED: this note is larger than {} KiB. cImp screens a note for credentials in \
+         FULL before storing it, and text past that size could not be screened — so nothing was \
+         stored rather than storing something unscreened. A memory note is a conclusion, not a \
+         document: re-record the conclusion within the limit and point at the long material \
+         (file path, URL, symbol) instead of pasting it.",
+        MAX_NOTE_BYTES / 1024
+    )
+}
+
 /// The display name this file carries into [`signature::compile_sources`]'s
 /// failure list. It never reaches a user (a compile failure here is a build-time
 /// mistake, caught by [`tests::the_baked_ruleset_compiles`]), but the compiler
@@ -112,25 +188,42 @@ fn compile(source: &str) -> Option<Arc<yara_x::Rules>> {
     rules
 }
 
-/// The identifiers of every secret rule matching `text`, or an empty vec for a
+/// The identifiers of every secret rule matching `note`, or an empty vec for a
 /// clean note (and for a screen that could not run — see [`rules`]).
 ///
 /// Sorted, so the model-facing message and the activity row are stable for the
 /// same input rather than dependent on yara-x's match order.
 ///
-/// This deliberately uses [`signature::scan_with`]'s hits-only shape rather than
-/// `scan_outcome_with`'s three-way one. The distinction that shape exists for —
-/// *"unscreened is not clean"* (#48, D-1) — is about a multi-megabyte fetched
-/// page against a 256 KiB prefix cap and a 750 ms deadline. The input here is
-/// one `context_note` string; it cannot reach either bound, so the only way to
-/// get `DidNotComplete` is a scanner fault, and for that the honest answer is
-/// the same fail-open every other screen takes: a screen that cannot run must
-/// not become a refusal path.
-pub fn screen(text: &str) -> Vec<String> {
+/// # Why the hits-only shape is honest here (#48, M-20)
+///
+/// This uses [`signature::scan_with`]'s hits-only shape rather than
+/// `scan_outcome_with`'s three-way one, which means it cannot say *"I did not
+/// finish"*. The distinction that shape exists for — *"unscreened is not
+/// clean"* (#48, D-1) — is about a multi-megabyte fetched page against a
+/// 256 KiB prefix cap and a one-second deadline.
+///
+/// The **prefix** bound is unreachable from here, and that is now a fact about
+/// the code rather than a claim about callers: the argument is a [`NoteText`],
+/// whose only constructor caps it at [`MAX_NOTE_BYTES`], which a static assert
+/// pins at or below [`signature::SCAN_PREFIX_BYTES`]. That is what M-20 found
+/// missing — the previous version of this comment asserted the same conclusion
+/// with nothing enforcing it, and 256 KiB of filler followed by an AWS key
+/// stored Clean.
+///
+/// The **timeout** bound is not proven unreachable, only made implausible: a
+/// bounded ≤64 KiB buffer against a 1 s ceiling, where the detection path scans
+/// four times that within the same budget. If it is ever hit, the outcome is
+/// the deliberate fail-open every screen in this codebase takes when it cannot
+/// run — the note stores clean — for the reason [`rules`] gives: a screen that
+/// cannot run must not become a refusal path. That residual is stated, not
+/// designed away, and it is no longer attacker-*selectable* the way the prefix
+/// bound was: padding buys the writer nothing, because padding past
+/// [`MAX_NOTE_BYTES`] means the note is not stored at all.
+pub fn screen(note: &NoteText) -> Vec<String> {
     let Some(rules) = rules() else {
         return Vec::new();
     };
-    let mut hits = signature::scan_with(&rules, text);
+    let mut hits = signature::scan_with(&rules, note.as_str());
     hits.sort();
     hits.dedup();
     hits
@@ -165,6 +258,13 @@ pub fn write_notice(hits: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Screen a `&str` sample. Every sample below is far under
+    /// [`MAX_NOTE_BYTES`]; the size boundary itself is tested separately, by
+    /// `the_screen_reads_every_byte_it_can_be_handed`.
+    fn screen_str(text: &str) -> Vec<String> {
+        screen(&NoteText::parse(text.to_string()).expect("sample is under the cap"))
+    }
 
     /// The baked source must compile — the whole screen is silently absent
     /// otherwise (`rules()` degrades to `None` on purpose, so nothing else in
@@ -255,7 +355,7 @@ mod tests {
                 "the dsn is postgres://svc:s3cr3tpw@db.internal:5432/app",
             ),
         ] {
-            let hits = screen(sample);
+            let hits = screen_str(sample);
             assert!(
                 hits.iter().any(|h| h == rule),
                 "`{rule}` did not match its own sample; hits were {hits:?}"
@@ -281,9 +381,9 @@ mod tests {
             "postgres://localhost:5432/app is the dev dsn (no password, trust auth)",
         ] {
             assert!(
-                screen(note).is_empty(),
+                screen_str(note).is_empty(),
                 "benign note flagged by the secret screen: {note:?} → {:?}",
-                screen(note)
+                screen_str(note)
             );
         }
     }
@@ -304,6 +404,44 @@ mod tests {
     /// this is asserted rather than assumed.
     #[test]
     fn an_empty_note_is_clean() {
-        assert!(screen("").is_empty());
+        assert!(screen_str("").is_empty());
+    }
+
+    /// #48 (2026-08-08 re-review), M-20 — the invariant that closes the
+    /// bound-bypass-by-padding hole, at the seam where it lives.
+    ///
+    /// Two halves, and both are needed. The first is the property the type
+    /// exists for: whatever [`NoteText::parse`] admits, [`screen`] reads to its
+    /// LAST byte — so a credential cannot be pushed out of the screen's reach
+    /// by padding in front of it. The second is the boundary itself: one byte
+    /// past the cap is not screened-and-stored, it is not stored at all.
+    ///
+    /// Asserting only the first half would stay green with the cap raised to
+    /// 4 MiB (M-20 exactly); asserting only the second would stay green with
+    /// the cap at one byte.
+    #[test]
+    fn the_screen_reads_every_byte_it_can_be_handed() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        // Exactly at the limit, with the credential in the final bytes.
+        let mut at_limit = "filler. ".repeat(MAX_NOTE_BYTES / 8);
+        at_limit.truncate(MAX_NOTE_BYTES - KEY.len());
+        at_limit.push_str(KEY);
+        assert_eq!(
+            at_limit.len(),
+            MAX_NOTE_BYTES,
+            "the sample must sit ON the cap"
+        );
+        let note = NoteText::parse(at_limit).expect("a note AT the cap is accepted");
+        assert!(
+            screen(&note).contains(&"secret_aws_access_key_id".to_string()),
+            "a credential in the last bytes of the largest admissible note must still be found"
+        );
+
+        // And one byte past it is refused, with nothing stored.
+        let over = "x".repeat(MAX_NOTE_BYTES + 1);
+        let err = NoteText::parse(over).expect_err("one byte past the cap must not parse");
+        assert!(err.starts_with("NOT SAVED"), "{err}");
+        assert!(err.contains("nothing was stored"), "{err}");
+        assert!(!err.contains('{'), "no format placeholder survived: {err}");
     }
 }

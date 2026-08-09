@@ -743,6 +743,24 @@ pub const QUARANTINE_WRITE_NOTICE: &str = " ⚠ QUARANTINED (security boundary):
     user promotes it in cImp's Memory view. Nothing further can be done from here; do not rewrite \
     or re-save it, and include anything the user must act on now in your answer as well.";
 
+/// #48 (2026-08-08 re-review), finding M-19 — the model-facing suffix for a
+/// note held because cImp could not tell **whose** it was.
+///
+/// Shaped like [`QUARANTINE_WRITE_NOTICE`] (fixed, content-free, states what
+/// happened, that retrying will not change it, and what does) and different in
+/// the one respect that matters: it does not claim the conversation touched
+/// external content. It claims only what this path actually knows — that the
+/// call arrived without an identity cImp could resolve, and a note that cannot
+/// be attributed cannot be allowed to auto-inject into a session that never
+/// wrote it.
+pub const UNATTRIBUTED_WRITE_NOTICE: &str = " ⚠ HELD FOR REVIEW (unattributed write): this call \
+    reached cImp without a resolvable tab identity, so neither the writing conversation's taint \
+    state nor the session this note belongs to could be established. It was saved and held for \
+    review rather than entering project memory, because an unattributable note that auto-injects \
+    would inject into sessions that never wrote it. It will NOT be recalled or auto-injected \
+    until the user releases it in cImp's Memory view. Nothing further can be done from here; do \
+    not rewrite or re-save it, and include anything the user must act on now in your answer.";
+
 /// V32 Phase C2 — whether a PERSISTENT-WRITE that the gate let through must be
 /// stored quarantined. Threaded from [`Latch::proxy_gate`] through the loopback
 /// `/graph_run` route into the memory write (`GraphIndex::mem_add_note`).
@@ -758,12 +776,39 @@ pub enum WriteTaint {
     /// Written under an EXTERNAL latch: store it, flag it, hide it from every
     /// read path until the user promotes it.
     Quarantined,
+    /// #48 (2026-08-08 re-review), finding M-19 — written by a caller with **no
+    /// resolvable tab identity**, so cImp cannot say whether the writing
+    /// conversation is contaminated *or* which session the note belongs to.
+    ///
+    /// Same storage outcome as [`Quarantined`](Self::Quarantined) — stored,
+    /// flagged, held for promote-or-discard — and a separate variant for one
+    /// reason: the model must be told the truth about WHY. Collapsing this into
+    /// `Quarantined` would serve [`QUARANTINE_WRITE_NOTICE`], which states as
+    /// fact that "this session has used an external tool (web/MCP-server)" —
+    /// something this path has no evidence for and which is usually false. A
+    /// boundary message that invents a reason teaches the model to discount
+    /// boundary messages.
+    Unattributed,
 }
 
 impl WriteTaint {
     /// The stored `mem_note.tainted` column value.
     pub fn is_quarantined(self) -> bool {
-        matches!(self, WriteTaint::Quarantined)
+        matches!(self, WriteTaint::Quarantined | WriteTaint::Unattributed)
+    }
+
+    /// The fixed suffix the model is given for this verdict, or `None` when the
+    /// write was ordinary.
+    ///
+    /// A method rather than an `if tainted { … }` at the call site so that
+    /// adding a fourth verdict is a non-exhaustive-match error here — the same
+    /// reason this is an enum and not a `bool`.
+    pub fn write_notice(self) -> Option<&'static str> {
+        match self {
+            WriteTaint::Clean => None,
+            WriteTaint::Quarantined => Some(QUARANTINE_WRITE_NOTICE),
+            WriteTaint::Unattributed => Some(UNATTRIBUTED_WRITE_NOTICE),
+        }
     }
 }
 

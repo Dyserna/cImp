@@ -19,9 +19,7 @@ use serde_json::{json, Value};
 use super::index::{ArchReport, DocHit, GraphIndex, PathHit, RefHit, SymbolHit};
 use super::memory::{MemNote, ProjectFact, WorkingSetEntry};
 use super::model::EdgeKind;
-use crate::offload::toolclass::{
-    classify, CallGuards, ToolClass, WriteTaint, QUARANTINE_WRITE_NOTICE,
-};
+use crate::offload::toolclass::{classify, CallGuards, ToolClass, WriteTaint};
 
 /// One graph tool's identity, description, and JSON-Schema parameters — the
 /// shared definition both surfaces render into their own shape.
@@ -985,6 +983,41 @@ fn scoped_session(
         .map_err(|e| e.to_string())
 }
 
+/// #48 (2026-08-08 re-review), finding M-19 — the session a **PERSISTENT-WRITE**
+/// may be attributed to: the one the caller PROVED, or none.
+///
+/// Deliberately not [`scoped_session`]. That function's most-recently-active
+/// fallback is the right answer for a READ — a caller with no identity showing
+/// itself the project's latest working set costs nothing and is V28's
+/// documented pre-upgrade behaviour. It is the wrong answer for a write, and
+/// wrong in a specific way M-19 names: the fallback keys on `agent`, and
+/// `agent` on the loopback path comes from the request body's `consumer`
+/// field. So a caller with no tab identity chose which tab's session its note
+/// landed in, by naming that tab's agent — a `context_note` written by one
+/// party, filed inside another conversation's memory, and (before the gate
+/// change that accompanies this) not even flagged.
+///
+/// "Empty is not absent" (locked decision 21) is the rule being applied:
+/// `session: None` does not mean *"scope me to whatever is most recent"*, it
+/// means *"the live-session registry could not prove a session for this
+/// caller"*. A write does not get to guess. The pinned/unpinned split at the
+/// call site is unchanged — a pinned note is global and needs no session; an
+/// unpinned one is refused honestly rather than silently orphaned (F21) or, as
+/// here, silently misfiled.
+///
+/// The cost, stated: a caller with a real tab whose session the registry cannot
+/// currently resolve (TTL-stale, or a tab that has not yet produced transcript
+/// activity) also loses the fallback, and is told to retry or pin. That is the
+/// same answer F21 already gives when there is no session at all, and it is the
+/// only one available to a frame that cannot tell the two cases apart —
+/// `session: None` is exactly as unproven in both.
+fn write_session(session: Option<&str>) -> Option<String> {
+    session
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// V32 Phase C2, #48 — the Tool Activity row for a note the secret screen held.
 ///
 /// Reuses [`Screen::MemoryQuarantine`](crate::offload::outbound::Screen), which
@@ -1192,21 +1225,27 @@ pub fn run_tool(
             Ok(maybe_recall_envelope(out, guards))
         }
         "context_note" => {
-            let text = req("text")?;
+            // #48 (2026-08-08 re-review), finding M-20: the parse boundary, and
+            // the reason it is the FIRST thing this arm does. `NoteText` is the
+            // only thing `secrets::screen` accepts and its cap is statically
+            // tied to what the scanner reads, so a note cannot be stored with a
+            // tail nobody screened. Taking the `String` by value leaves no raw
+            // `text` in scope for the storage call below to reach for.
+            let text = super::secrets::NoteText::parse(req("text")?)?;
             let pin = args.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
             // F21: an UNPINNED note needs a real session to attach to — with none,
             // it would be stored under a sentinel "" id and never resurface in the
             // working set the model reloads, yet the old code still said "Noted."
             // A PINNED note is global (surfaces regardless of session), so accept
             // it; otherwise refuse honestly instead of silently orphaning it.
-            let sid = match scoped_session(idx, agent, session)? {
+            let sid = match write_session(session) {
                 Some(s) => s,
                 None if pin => String::new(),
                 None => {
                     return Ok(
-                        "No active session to attach this note to yet — retry once the \
-                               session has activity, or pass `pin: true` to save it as a durable \
-                               pinned note."
+                        "No session could be resolved for this call, so there is nothing to \
+                               attach this note to — retry once the session has activity, or pass \
+                               `pin: true` to save it as a durable pinned note."
                             .to_string(),
                     )
                 }
@@ -1233,7 +1272,7 @@ pub fn run_tool(
             // forget.
             let secrets = super::secrets::screen(&text);
             let quarantined = tainted || !secrets.is_empty();
-            idx.mem_add_note(&note_id, &sid, &text, ts, pin, quarantined)
+            idx.mem_add_note(&note_id, &sid, text.as_str(), ts, pin, quarantined)
                 .map(|_| {
                     if !secrets.is_empty() {
                         record_secret_screen_flag(agent, &secrets);
@@ -1247,8 +1286,13 @@ pub fn run_tool(
                     // Both notices when both fired: they are different facts
                     // about the same held note, and collapsing them would tell
                     // the user's review queue only half of why the row is there.
-                    if tainted {
-                        out.push_str(QUARANTINE_WRITE_NOTICE);
+                    //
+                    // #48 M-19: the taint's OWN notice, not a fixed string — an
+                    // unattributed hold and an external-content hold are both
+                    // `is_quarantined()` and must not be explained with each
+                    // other's reason.
+                    if let Some(notice) = guards.taint.write_notice() {
+                        out.push_str(notice);
                     }
                     if !secrets.is_empty() {
                         out.push_str(&super::secrets::write_notice(&secrets));
@@ -3740,12 +3784,16 @@ mod session_scope_tests {
         assert!(!b.contains("alpha.rs"), "{b}");
     }
 
+    /// The fail-open contract, **as it applies to reads**: a child with no
+    /// `--tab`, an unknown tab key, or a TTL-stale registry entry all arrive
+    /// here as `None`, and the memory READS must behave byte-identically to
+    /// pre-V28 — most-recent session for the agent.
     #[test]
-    fn no_explicit_session_reproduces_the_pre_v28_fallback() {
-        // The fail-open contract: a child with no `--tab`, an unknown tab key,
-        // or a TTL-stale registry entry all arrive here as `None`, and must
-        // behave byte-identically to today — most-recent session for the agent.
+    fn no_explicit_session_reproduces_the_pre_v28_fallback_for_reads() {
         let (_tmp, idx) = two_session_index("fallback");
+        // `ses_b` is the more recent session, so a sessionless read resolves
+        // there. Seeded through the write path with `ses_b` proven, because the
+        // sessionless WRITE no longer resolves anywhere (see the test below).
         run_tool(
             &idx,
             "context_note",
@@ -3753,17 +3801,12 @@ mod session_scope_tests {
             50,
             200,
             Some("claude"),
-            None,
+            Some("ses_b"),
             CallGuards::clean(),
         )
         .expect("context_note");
 
-        // `ses_b` is the most recent session, so that is where it landed.
-        assert!(notes(&idx, Some("ses_b")).contains("fallback note"));
-        assert!(!notes(&idx, Some("ses_a")).contains("fallback note"));
-        // ...and reading with no session resolves the same way.
         assert!(notes(&idx, None).contains("fallback note"));
-
         let recall = run_tool(
             &idx,
             "context_recall",
@@ -3777,6 +3820,78 @@ mod session_scope_tests {
         .expect("recall");
         assert!(recall.contains("beta.rs"), "{recall}");
         assert!(!recall.contains("alpha.rs"), "{recall}");
+    }
+
+    /// #48 (2026-08-08 re-review), M-19 — the WRITE half of that same contract,
+    /// which is where the fallback was wrong.
+    ///
+    /// This test previously asserted the opposite: that a `context_note` with
+    /// no resolvable session landed in `ses_b`, "the most recent session for the
+    /// agent". `agent` on the loopback path is the request body's `consumer`
+    /// field, so that contract let an unattributable caller file a note inside a
+    /// *named* tab's conversation. The defect was pinned as correct.
+    ///
+    /// Both halves are asserted, because closing only one leaves the hole: the
+    /// note must not land in `ses_b` (the misfiling), and it must not land in
+    /// `ses_a` or the sentinel `""` scope either (which would be the same bug
+    /// aimed elsewhere, or a silent orphan).
+    #[test]
+    fn a_write_with_no_resolvable_session_is_not_filed_under_another_session() {
+        let (_tmp, idx) = two_session_index("write-fallback");
+        let out = run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "unattributable note" }),
+            50,
+            200,
+            Some("claude"),
+            None,
+            CallGuards::clean(),
+        )
+        .expect("the tool answers, rather than erroring");
+        assert!(
+            out.starts_with("No session could be resolved"),
+            "the model is told why nothing was stored: {out}"
+        );
+
+        for sid in [Some("ses_a"), Some("ses_b"), Some(""), None] {
+            assert!(
+                !notes(&idx, sid).contains("unattributable note"),
+                "the note must not have been filed under {sid:?}"
+            );
+        }
+        assert_eq!(
+            idx.mem_quarantined_count().expect("count"),
+            0,
+            "nothing was stored at all — this path stores nothing, it does not hold it"
+        );
+        // The sentinel scope, read DIRECTLY: `notes(_, Some(""))` above cannot
+        // see it, because a blank explicit session is treated as absent and
+        // falls back to `ses_b`. Without this line the test would stay green
+        // with the note silently orphaned under `sid = ""` — F21's failure mode
+        // wearing M-19's clothes.
+        assert!(
+            idx.mem_notes("").expect("read").is_empty(),
+            "and not orphaned into the sentinel scope either"
+        );
+
+        // A PINNED write is still accepted with no session: it is global by
+        // definition, so there is no session to get wrong. Locked decision 10
+        // (quarantine over refusal) is what keeps this from being a refusal —
+        // the loopback gate marks it `Unattributed`, which the boundary test
+        // module covers end to end.
+        let out = run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "durable conclusion", "pin": true }),
+            50,
+            200,
+            Some("claude"),
+            None,
+            CallGuards::clean(),
+        )
+        .expect("context_note");
+        assert!(out.starts_with("Noted (pinned"), "{out}");
     }
 
     #[test]
@@ -4228,6 +4343,115 @@ mod memory_write_boundary_tests {
         assert!(out.contains("QUARANTINED (security boundary)"), "{out}");
         assert!(out.contains("HELD FOR REVIEW (secret screen)"), "{out}");
         assert_eq!(idx.mem_quarantined_count().expect("count"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #48 (2026-08-08 re-review), M-19 — the write the loopback gate marks
+    /// `Unattributed` is held exactly like a tainted one, **and is explained
+    /// with its own reason**.
+    ///
+    /// The last assertion is the one that would otherwise rot: `is_quarantined()`
+    /// covers both verdicts, so a call site that reached for the fixed
+    /// `QUARANTINE_WRITE_NOTICE` would still store the note correctly while
+    /// telling the model that "this session has used an external tool" — a
+    /// statement this path has no evidence for. A boundary message that invents
+    /// a reason is how a model learns to discount boundary messages.
+    #[test]
+    fn an_unattributed_write_is_held_and_told_the_real_reason() {
+        let (dir, idx) = temp_index("unattributed");
+        let out = run_tool(
+            &idx,
+            "context_note",
+            &json!({ "text": "a conclusion from a caller with no tab", "pin": true }),
+            50,
+            200,
+            Some("claude"),
+            Some("s1"),
+            CallGuards {
+                taint: WriteTaint::Unattributed,
+                spotlight_recall: true,
+            },
+        )
+        .expect("stored, not refused");
+        assert!(out.starts_with("Noted"), "{out}");
+        assert!(
+            out.contains("HELD FOR REVIEW (unattributed write)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("QUARANTINED (security boundary)"),
+            "the external-content reason must not be claimed here: {out}"
+        );
+
+        // Held, on the same shelf, recoverable the same way.
+        assert!(idx.mem_notes("s1").expect("read").is_empty());
+        assert_eq!(idx.mem_quarantined_count().expect("count"), 1);
+        let held = idx.mem_quarantined_notes().expect("queue");
+        assert_eq!(held.len(), 1);
+        idx.mem_promote_note(&held[0].note_id).expect("promote");
+        assert_eq!(idx.mem_notes("s1").expect("read").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #48 (2026-08-08 re-review), M-20 — the reported PoC, end to end through
+    /// the tool: 256 KiB of filler followed by an AWS key.
+    ///
+    /// Before the fix this returned `Noted (pinned, kept across sessions).` and
+    /// the credential entered ordinary, auto-injecting project memory, because
+    /// the secret screen reads a 256 KiB prefix and nothing bounded what it
+    /// could be handed.
+    ///
+    /// The second half is what stops this test from being satisfiable by a tiny
+    /// cap: the same payload trimmed to the largest admissible size is still
+    /// CAUGHT, so the bound is doing its job (bounding the screen's input)
+    /// rather than the screen's job (cutting the credential off).
+    #[test]
+    fn a_padded_credential_cannot_outrun_the_secret_screen() {
+        use crate::graph::secrets::MAX_NOTE_BYTES;
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let (dir, idx) = temp_index("secret-padding");
+
+        let note = |text: String| {
+            run_tool(
+                &idx,
+                "context_note",
+                &json!({ "text": text, "pin": true }),
+                50,
+                200,
+                Some("claude"),
+                Some("s1"),
+                CallGuards::clean(),
+            )
+        };
+
+        // The PoC, verbatim: past the screen's prefix, then the credential.
+        let mut padded =
+            "filler. ".repeat(crate::offload::detection::signature::SCAN_PREFIX_BYTES / 8);
+        padded.push_str(KEY);
+        let err = note(padded).expect_err("a note the screen cannot read in full is not stored");
+        assert!(err.starts_with("NOT SAVED"), "{err}");
+        assert_eq!(
+            idx.mem_notes("s1").expect("read").len(),
+            0,
+            "not stored clean"
+        );
+        assert_eq!(
+            idx.mem_quarantined_count().expect("count"),
+            0,
+            "and not stored held either — nothing reached the store"
+        );
+
+        // The largest note that IS admissible, with the credential in its last
+        // bytes: held for review, not stored clean.
+        let mut at_limit = "filler. ".repeat(MAX_NOTE_BYTES / 8);
+        at_limit.truncate(MAX_NOTE_BYTES - KEY.len());
+        at_limit.push_str(KEY);
+        let out = note(at_limit).expect("a note at the cap is accepted");
+        assert!(out.contains("HELD FOR REVIEW (secret screen)"), "{out}");
+        assert!(out.contains("secret_aws_access_key_id"), "{out}");
+        assert_eq!(idx.mem_notes("s1").expect("read").len(), 0);
+        assert_eq!(idx.mem_quarantined_count().expect("count"), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

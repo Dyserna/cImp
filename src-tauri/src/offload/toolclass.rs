@@ -36,6 +36,34 @@
 //! explicit allowlist edit here, reviewed like code — never an inference from
 //! the name.
 //!
+//! # The second cross-module invariant: TABLE ↔ the dispatch surface (M-2)
+//!
+//! Review finding A-1 stopped a bare name that classifies EXTERNAL from
+//! engaging a latch on a native route: such a name is a typo, not a fetched
+//! page. That fix is right, and it **moved where the safety lives**. Before it,
+//! a capability-bearing native tool that nobody added here failed closed
+//! (EXTERNAL ⇒ refused/latched); after it, it is waved through to dispatch. The
+//! only thing keeping that safe is the invariant the fix left unstated, which
+//! #48's finding M-2 makes mechanical:
+//!
+//! > **Every native tool name a dispatcher can serve has a row in [`TABLE`],
+//! > and every [`TABLE`] row a dispatcher cannot serve says so
+//! > ([`ClassRow::dispatchable`]).**
+//!
+//! Both directions are load-bearing and both are checked by
+//! `table_matches_the_native_dispatch_surface`, which derives the served set
+//! from the dispatchers' **own source** rather than from a second list someone
+//! has to remember to update:
+//!
+//! - *dispatcher ⇒ row.* A capability tool added to `offload::tools::dispatch`
+//!   or `graph::mcp` with no row here classifies EXTERNAL, and on
+//!   `LatchRoute::Native` an EXTERNAL classification is waved straight past the
+//!   latch. Missing rows are the hole A-1's fix opened; this is its backstop.
+//! - *row ⇒ dispatcher.* A classified name that no dispatcher serves used to
+//!   **engage** the latch and only then be rejected as unknown — the A-1 harm
+//!   in the direction A-1 did not cover. `dispatchable: false` is how a row
+//!   declares it, and `LatchRoute::can_execute` is the one consumer.
+//!
 //! # Class rationale
 //!
 //! - **EXTERNAL** — proxied MCP-server tools. Their results are untrusted
@@ -124,8 +152,9 @@ pub enum ToolClass {
     PersistentWrite,
 }
 
-/// One row of the class table: a tool name, its class, and whether calling it
-/// can mutate the filesystem.
+/// One row of the class table: a tool name, its class, whether calling it can
+/// mutate the filesystem, and whether a model-supplied occurrence of the name
+/// can reach an executor at all.
 pub struct ClassRow {
     pub name: &'static str,
     pub class: ToolClass,
@@ -136,13 +165,43 @@ pub struct ClassRow {
     /// tests until that consumer lands.
     #[cfg_attr(not(test), allow(dead_code))]
     pub mutates_fs: bool,
+    /// **#48, finding M-2 — whether a MODEL-SUPPLIED occurrence of this name
+    /// reaches an executor.** `true` for every row a name-keyed native
+    /// dispatcher serves; `false` for the rows that are classified for some
+    /// other reason (see [`unrouted`]).
+    ///
+    /// Read by [`dispatchable`], whose one consumer is
+    /// `LatchRoute::can_execute` — the gate rule that a call which cannot
+    /// execute must not move the latch. Asserted against the real dispatch
+    /// surface by `table_matches_the_native_dispatch_surface`, which scans the
+    /// dispatchers' own source: a row that lies here fails the build.
+    pub dispatchable: bool,
 }
 
+/// A row for a name a native dispatcher serves — the normal case, and the safe
+/// default: a wrong `true` costs a hallucinated call its scope's other half
+/// (the A-1 nuisance), where a wrong `false` would wave a real capability past
+/// the latch.
 const fn row(name: &'static str, class: ToolClass, mutates_fs: bool) -> ClassRow {
     ClassRow {
         name,
         class,
         mutates_fs,
+        dispatchable: true,
+    }
+}
+
+/// A row for a name that is classified but that **no name-keyed dispatcher
+/// serves** — the deliberate exceptions to "everything in this table is a tool
+/// you can call". Using this constructor is the reviewed act; see
+/// `classified_but_unrouted_rows_are_the_documented_six` for the membership
+/// rationale and the tripwire that checks each claim against the source.
+const fn unrouted(name: &'static str, class: ToolClass, mutates_fs: bool) -> ClassRow {
+    ClassRow {
+        name,
+        class,
+        mutates_fs,
+        dispatchable: false,
     }
 }
 
@@ -245,7 +304,7 @@ pub const TABLE: &[ClassRow] = &[
     // LOCAL-CAPABILITY under decision 1 — the same sentence that put
     // `run_check` in this class — and `mutates_fs` mirrors `run_check`'s row
     // for the same locked reason.
-    row("hook_post_edit", ToolClass::LocalCapability, false),
+    unrouted("hook_post_edit", ToolClass::LocalCapability, false),
     // `hook_should_read` — `POST /context/should_read` answers a `Read` with
     // the file's outline, its symbol BODY (substitute mode), or a unified DIFF
     // against what the agent last read. That is repo source text, which is the
@@ -259,7 +318,7 @@ pub const TABLE: &[ClassRow] = &[
     // because "the framing is app-composed" is precisely the reasoning the C-1
     // and H-1 amendments reversed. If that trade is ever judged the wrong way
     // round, this row — not a route-local exception — is the place to change.
-    row("hook_should_read", ToolClass::LocalCapability, false),
+    unrouted("hook_should_read", ToolClass::LocalCapability, false),
     // ── TRUSTED — structural graph + app-composed reads ────────────────────
     row("graph_find_symbol", ToolClass::Trusted, false),
     row("graph_callers", ToolClass::Trusted, false),
@@ -299,7 +358,7 @@ pub const TABLE: &[ClassRow] = &[
     // still gated, so that demoting this row is all it takes to close the
     // route — but note that a refusal there also skips the route's dedup-clear
     // side effects, so a demotion must split those out first.
-    row("hook_compaction", ToolClass::Trusted, false),
+    unrouted("hook_compaction", ToolClass::Trusted, false),
     // ── PERSISTENT-WRITE ───────────────────────────────────────────────────
     row("context_note", ToolClass::PersistentWrite, false),
     // ── Harness-native tools — classified, NOT enforced ─────────────────────
@@ -309,9 +368,9 @@ pub const TABLE: &[ClassRow] = &[
     // Phase E. These rows exist because (a) V33 Phase F reads `mutates_fs`
     // from this table for tool-sourced checkpoints, and (b) a Phase E hook
     // that does gate them needs their class from the same reviewed place.
-    row("Edit", ToolClass::LocalCapability, true),
-    row("Write", ToolClass::LocalCapability, true),
-    row("Bash", ToolClass::LocalCapability, true),
+    unrouted("Edit", ToolClass::LocalCapability, true),
+    unrouted("Write", ToolClass::LocalCapability, true),
+    unrouted("Bash", ToolClass::LocalCapability, true),
 ];
 
 // ── V32 Phase H — OpenCode's OWN native tool names ─────────────────────────
@@ -410,6 +469,27 @@ pub fn classify(name: &str) -> ToolClass {
         .find(|r| r.name == name)
         .map(|r| r.class)
         .unwrap_or(ToolClass::External)
+}
+
+/// **#48, finding M-2** — whether a model-supplied `name` can reach a native
+/// executor at all.
+///
+/// Unknown ⇒ `false`, for the same reason [`classify`] answers `External`
+/// there: a bare name with no row is a name no dispatcher matches, and
+/// `offload::tools::dispatch` / `graph::mcp::run_tool` answer it with their own
+/// unknown-tool error. The two defaults agree, and together they say "this call
+/// is not a call" — which is exactly what `LatchRoute::can_execute` needs in
+/// order to leave the latch alone.
+///
+/// It is **not** a permission check and must never be used as one: it says
+/// whether a name can execute, not whether it may. Refusal is
+/// [`Latch::refusal`]'s business, and a name that answers `true` here still has
+/// to get past it.
+pub fn dispatchable(name: &str) -> bool {
+    TABLE
+        .iter()
+        .find(|r| r.name == name)
+        .is_some_and(|r| r.dispatchable)
 }
 
 /// Whether `name` can mutate the filesystem. Unknown names are `false`: an MCP
@@ -1257,5 +1337,425 @@ mod tests {
         }
         assert!(REFUSAL_NATIVE_LOCAL_BLOCKED.contains("already used an external tool"));
         assert!(REFUSAL_NATIVE_WEB_BLOCKED.contains("already used a local-capability tool"));
+    }
+
+    // ── #48, finding M-2 — TABLE ↔ the native dispatch surface ─────────────
+    //
+    // A-1's fix made an unclassified native name fall through the latch to
+    // dispatch. That is safe if and only if every name a dispatcher can serve
+    // is classified here — an invariant nothing checked, in either direction.
+    //
+    // The served set below is derived by scanning the dispatchers' OWN SOURCE.
+    // A second hand-written list compared against the table would pass forever
+    // on the day someone adds a tool and forgets both, which is precisely the
+    // tripwire shape this finding is about.
+
+    /// How one dispatcher spells the names it routes.
+    ///
+    /// The scanner understands exactly these forms and **panics on anything
+    /// else it meets in a scanned body**: an arm written in an unrecognized
+    /// style is a loud failure rather than a silent miss, which is the only
+    /// honest way to build a scanner that is itself hand-written.
+    enum Form {
+        /// `match name { "x" => …, "y" | "z" => …, other => … }`.
+        MatchOnName,
+        /// An `if` / `else if` chain over `name == "x"`.
+        NameEquals,
+        /// A function small enough that every string literal in it is a tool
+        /// name.
+        EveryLiteral,
+    }
+
+    /// One function that routes a **model-supplied** tool name to an executor.
+    struct DispatchSite {
+        /// For failure messages.
+        file: &'static str,
+        src: &'static str,
+        /// The item, verbatim from `fn`'s visibility up to the open paren.
+        func: &'static str,
+        forms: &'static [Form],
+        /// Which gate protects this surface — the reason a missing row here is
+        /// a containment defect and not a typo.
+        gated_by: &'static str,
+    }
+
+    /// **Every native dispatch surface the taint latch sits in front of.**
+    ///
+    /// A route whose tool name is *fixed by cImp* is deliberately absent:
+    /// `/audit/run` derives its name from an enum
+    /// (`audit::mcp::tool_name_for`) and the three `/context/*` hooks are their
+    /// own identity, so neither can be handed a name a model chose. `/run` IS
+    /// here, because `offload_tool_name` maps the request's `tool` field.
+    const DISPATCH_SITES: &[DispatchSite] = &[
+        DispatchSite {
+            file: "offload/tools/mod.rs",
+            src: include_str!("tools/mod.rs"),
+            func: "pub async fn dispatch(",
+            forms: &[Form::MatchOnName],
+            gated_by: "offload/agent.rs::latch_gate on LatchRoute::Native",
+        },
+        DispatchSite {
+            file: "graph/mcp.rs",
+            src: include_str!("../graph/mcp.rs"),
+            func: "pub fn run_tool(",
+            forms: &[Form::MatchOnName],
+            gated_by: "loopback /graph_run's gate on LatchRoute::Native",
+        },
+        DispatchSite {
+            file: "graph/mcp.rs",
+            src: include_str!("../graph/mcp.rs"),
+            func: "pub(crate) async fn dispatch_recorded(",
+            forms: &[Form::NameEquals],
+            gated_by: "loopback /graph_run's gate on LatchRoute::Native",
+        },
+        DispatchSite {
+            file: "graph/mcp.rs",
+            src: include_str!("../graph/mcp.rs"),
+            func: "pub async fn handle_call(",
+            forms: &[Form::NameEquals],
+            gated_by: "graph/mcp.rs::headless_refusal (the headless MCP child)",
+        },
+        DispatchSite {
+            file: "graph/service.rs",
+            src: include_str!("../graph/service.rs"),
+            func: "pub async fn run_graph_tool(",
+            forms: &[Form::NameEquals],
+            gated_by: "loopback /graph_run's gate on LatchRoute::Native",
+        },
+        DispatchSite {
+            file: "offload/loopback.rs",
+            src: include_str!("loopback.rs"),
+            func: "fn offload_tool_name(",
+            forms: &[Form::EveryLiteral],
+            gated_by: "loopback /run's gate on LatchRoute::Native",
+        },
+    ];
+
+    /// Arm patterns that introduce no tool name. Each is either the
+    /// unknown-tool catch-all or a **delegation** to another site in
+    /// [`DISPATCH_SITES`]; an arm matching neither fails the scan, so a new
+    /// routing shape cannot be added without being declared here.
+    const NON_NAME_ARMS: &[(&str, &str)] = &[
+        (
+            "other",
+            "the unknown-tool error — the arm A-1 relies on existing",
+        ),
+        (
+            "n if n.starts_with(\"graph_\")",
+            "delegates to graph_tools::dispatch → graph::offload_query → \
+             dispatch_recorded, both scanned here",
+        ),
+    ];
+
+    /// The body of `site.func`, from its signature to the `}` at its own
+    /// indentation. Starting at the SIGNATURE is deliberate: a doc comment must
+    /// not be able to contribute a tool name.
+    fn fn_body(site: &DispatchSite) -> String {
+        let mut out = String::new();
+        let mut close = String::new();
+        let mut inside = false;
+        for line in site.src.lines() {
+            if !inside {
+                if !line.trim_start().starts_with(site.func) {
+                    continue;
+                }
+                close = format!("{}}}", " ".repeat(line.len() - line.trim_start().len()));
+                inside = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            if line == close {
+                return out;
+            }
+        }
+        panic!(
+            "`{}` was not found in {}, or was not terminated — the scan would read past it",
+            site.func, site.file
+        );
+    }
+
+    /// Every tool name a `match name { … }` block routes on.
+    fn match_on_name_arms(body: &str, site: &DispatchSite) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut arm_indent = None;
+        for line in body.lines() {
+            let lead = line.len() - line.trim_start().len();
+            let t = line.trim();
+            let Some(indent) = arm_indent else {
+                if t == "match name {" {
+                    arm_indent = Some(lead + 4);
+                }
+                continue;
+            };
+            // The match's own closing brace sits one level in from its arms.
+            if lead + 4 == indent && t == "}" {
+                return out;
+            }
+            if lead != indent
+                || t.is_empty()
+                || t.starts_with("//")
+                // A closing delimiter of a multi-line arm body, never an arm.
+                || t.chars().all(|c| "}),;]".contains(c))
+            {
+                continue;
+            }
+            assert!(
+                t.contains("=>"),
+                "{}: unrecognized line at match-arm indentation in `{}` — the scanner \
+                 would silently skip whatever it introduces:\n    {t}",
+                site.file,
+                site.func
+            );
+            let pat = t.split("=>").next().unwrap().trim();
+            if !pat.starts_with('"') {
+                assert!(
+                    NON_NAME_ARMS.iter().any(|(p, _)| *p == pat),
+                    "{}: undeclared non-literal arm `{pat}` in `{}` — if it routes a tool \
+                     name the scan is missing it; if it does not, add it to NON_NAME_ARMS \
+                     with the reason",
+                    site.file,
+                    site.func
+                );
+                continue;
+            }
+            for lit in pat.split('|') {
+                let lit = lit.trim();
+                assert!(
+                    lit.len() >= 2 && lit.starts_with('"') && lit.ends_with('"'),
+                    "{}: `{lit}` in `{}` is not a plain string-literal pattern",
+                    site.file,
+                    site.func
+                );
+                out.push(lit[1..lit.len() - 1].to_string());
+            }
+        }
+        panic!("{}: no `match name {{` in `{}`", site.file, site.func);
+    }
+
+    /// Every literal compared against `name` with `==`.
+    fn name_equals_literals(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in body.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find("name == \"") {
+                rest = &rest[at + "name == \"".len()..];
+                let end = rest.find('"').expect("unterminated tool-name literal");
+                out.push(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            }
+        }
+        out
+    }
+
+    /// Every string literal in a body, for functions small enough that all of
+    /// them are tool names.
+    fn string_literals(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in body.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] != '"' {
+                    i += 1;
+                    continue;
+                }
+                let mut lit = String::new();
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != '"' {
+                    if chars[j] == '\\' {
+                        j += 1;
+                    }
+                    if j < chars.len() {
+                        lit.push(chars[j]);
+                    }
+                    j += 1;
+                }
+                out.push(lit);
+                i = j + 1;
+            }
+        }
+        out
+    }
+
+    /// The union of every model-supplied tool name cImp's native dispatchers
+    /// can serve, read off their own source.
+    fn served_names() -> Vec<String> {
+        let mut served: Vec<String> = Vec::new();
+        for site in DISPATCH_SITES {
+            let body = fn_body(site);
+            let mut here: Vec<String> = Vec::new();
+            for form in site.forms {
+                here.extend(match form {
+                    Form::MatchOnName => match_on_name_arms(&body, site),
+                    Form::NameEquals => name_equals_literals(&body),
+                    Form::EveryLiteral => string_literals(&body),
+                });
+            }
+            assert!(
+                !here.is_empty(),
+                "the scan read `{}` in {} and found no tool name — the scanner has drifted \
+                 from the source it reads, which would make every assertion below vacuous \
+                 ({} is the gate that depends on it)",
+                site.func,
+                site.file,
+                site.gated_by
+            );
+            served.extend(here);
+        }
+        served.sort_unstable();
+        served.dedup();
+        served
+    }
+
+    /// **The M-2 tripwire: the class table and the dispatch surface are the
+    /// same set of names, in both directions.**
+    ///
+    /// Direction 1 (*served ⇒ classified*) is the fail-closed default A-1's fix
+    /// spent. A capability tool added to a dispatcher with no row here
+    /// classifies EXTERNAL, and on `LatchRoute::Native` an EXTERNAL
+    /// classification is waved past the latch straight into dispatch.
+    ///
+    /// Direction 2 (*classified ⇒ served, or declared `unrouted`*) is what the
+    /// `hook_*` rows made live: a classified name no dispatcher serves used to
+    /// engage the latch and only then be rejected as unknown.
+    #[test]
+    fn table_matches_the_native_dispatch_surface() {
+        let served = served_names();
+        let mut classified: Vec<String> = TABLE
+            .iter()
+            .filter(|r| r.dispatchable)
+            .map(|r| r.name.to_string())
+            .collect();
+        classified.sort_unstable();
+        assert_eq!(
+            served, classified,
+            "\nTABLE and the native dispatch surface have drifted (#48, finding M-2).\n\
+             LEFT  = names the dispatchers' own source shows they serve.\n\
+             RIGHT = TABLE rows marked `dispatchable`.\n\
+             In LEFT only  ⇒ a tool that EXECUTES with no class: it classifies EXTERNAL, and \
+             on a native route that means the latch waves it through. Add a `row(…)`.\n\
+             In RIGHT only ⇒ a classified name nothing serves: it would engage the latch and \
+             only then be rejected as unknown. Use `unrouted(…)` and say why."
+        );
+    }
+
+    /// **The documented exceptions, named rather than counted.**
+    ///
+    /// Six rows are classified for a reason other than being callable. The
+    /// membership is pinned like `TRUSTED`'s count is: adding a seventh is a
+    /// reviewed act, and swapping one for another keeps the count but changes
+    /// the meaning.
+    #[test]
+    fn classified_but_unrouted_rows_are_the_documented_six() {
+        let unrouted: Vec<&str> = TABLE
+            .iter()
+            .filter(|r| !r.dispatchable)
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            unrouted,
+            [
+                // The three `/context/*` hook identities (#48, M-7). They are
+                // gated on `LatchRoute::Hook`, whose name is composed by cImp
+                // and is the route itself — never a name a model supplied.
+                "hook_post_edit",
+                "hook_should_read",
+                "hook_compaction",
+                // Claude's own natives. Decision 3's honest limit: they never
+                // route through a cImp router, so no cImp latch can block them.
+                // They are here for V33 Phase F's `mutates_fs` consumer and for
+                // a future Phase E hook.
+                "Edit",
+                "Write",
+                "Bash",
+            ],
+            "the classified-but-unroutable set changed — each member needs a stated reason \
+             (see the rows' own comments), because `unrouted` is what tells the gate not to \
+             latch on the name"
+        );
+        // Every one of them really is absent from the dispatch surface. This is
+        // implied by `table_matches_the_native_dispatch_surface`, and it is
+        // asserted separately because that test compares whole sets: naming
+        // these six is what stops a future edit "fixing" a drift by flipping
+        // the wrong row's flag.
+        let served = served_names();
+        for name in &unrouted {
+            assert!(
+                !served.contains(&name.to_string()),
+                "`{name}` IS dispatchable — marking it `unrouted` tells the taint latch to \
+                 ignore a call that really executes"
+            );
+        }
+        // …and the three hook names are still classified, because the hook
+        // routes gate on exactly these rows (M-7). `unrouted` must never be
+        // read as "unclassified".
+        assert_eq!(classify("hook_post_edit"), ToolClass::LocalCapability);
+        assert_eq!(classify("hook_should_read"), ToolClass::LocalCapability);
+        assert_eq!(classify("hook_compaction"), ToolClass::Trusted);
+    }
+
+    /// **Nothing may be ADVERTISED that the table does not classify and a
+    /// dispatcher does not serve.**
+    ///
+    /// The complement of the source scan, and its cross-check: this one runs
+    /// the real spec builders, so a tool added with a descriptor whose dispatch
+    /// arm the scanner failed to recognize is caught here even though the scan
+    /// missed it.
+    #[test]
+    fn every_advertised_tool_is_classified_and_dispatchable() {
+        let served = served_names();
+        let mut advertised: Vec<String> = crate::graph::tool_specs()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        advertised.push(crate::graph::semantic_spec().name.to_string());
+        advertised.push(crate::graph::semantic_code_spec().name.to_string());
+        advertised.extend(
+            crate::offload::tools::audit_tools::defs()
+                .iter()
+                .map(|d| d.function.name.clone()),
+        );
+        // The worker's native defs, with every toggle on. `enabled_defs` reads
+        // live settings for `run_check`'s extra gate, so this contributes a
+        // SUBSET on a machine with no configured checks — which is fine for a
+        // "⊆" assertion and keeps the test independent of ambient settings.
+        advertised.extend(
+            crate::offload::tools::enabled_defs(&crate::settings::OffloadToolToggles {
+                read_file: true,
+                list_dir: true,
+                code_search: true,
+                run_command: true,
+                run_check: true,
+            })
+            .iter()
+            .map(|d| d.function.name.clone()),
+        );
+        advertised.sort_unstable();
+        advertised.dedup();
+        assert!(
+            advertised.len() >= 20,
+            "the advertised surface collapsed to {advertised:?} — this test would assert \
+             nothing"
+        );
+        for name in &advertised {
+            assert!(
+                TABLE.iter().any(|r| r.name == name),
+                "`{name}` is advertised to a model but has no class-table row: it classifies \
+                 EXTERNAL, and on a native route an EXTERNAL classification is waved past \
+                 the latch (#48, M-2)"
+            );
+            assert!(
+                served.contains(name),
+                "`{name}` is advertised but no dispatcher in DISPATCH_SITES serves it — \
+                 either it is dead, or the source scan has stopped recognizing its arm"
+            );
+            assert!(dispatchable(name), "`{name}`");
+        }
     }
 }

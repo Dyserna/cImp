@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::offload::backend_gate::GatePass;
 use crate::offload::openai::ToolDef;
 use crate::settings::{CommandPolicy, OffloadToolToggles};
 
@@ -151,11 +152,30 @@ fn enabled_defs_inner(toggles: &OffloadToolToggles, checks_configured: bool) -> 
 /// Route a native `tool_call` to its executor. `args` is the parsed
 /// arguments object. Returns the tool result (or an error string the
 /// loop surfaces to the model as a `role: tool` message — never a panic).
+///
+/// # The name comes from a [`GatePass`], not from the caller (#48, F-10)
+///
+/// A tool name reaching this function has been admitted by
+/// [`BackendGate::admit`](crate::offload::backend_gate::BackendGate::admit) —
+/// the backend's tool scope plus the code-graph and code-audit opt-ins. Taking
+/// the name *out of the pass* rather than beside it is what makes that
+/// structural: a router that skipped the gate has nothing to pass here and does
+/// not compile, and a pass minted for one name cannot be spent on another.
+///
+/// # Every arm here needs a `toolclass::TABLE` row (#48, M-2)
+///
+/// This match is one of the two native dispatch surfaces the taint latch gates.
+/// A capability tool added below with no row in
+/// [`TABLE`](crate::offload::toolclass::TABLE) classifies EXTERNAL, and on a
+/// native route an EXTERNAL classification is waved past the latch — so
+/// `table_matches_the_native_dispatch_surface` scans this function's own source
+/// and fails the build for a missing row.
 pub async fn dispatch(
-    name: &str,
+    pass: GatePass<'_>,
     args: serde_json::Value,
     ctx: &ToolCtx,
 ) -> Result<String, String> {
+    let name = pass.name();
     match name {
         "read_file" => read_file::execute(args, ctx).await,
         "list_dir" => list_dir::execute(args, ctx).await,
@@ -198,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_routes_the_audit_tools() {
         for name in ["security_audit", "quality_audit"] {
-            let err = dispatch(name, serde_json::json!({}), &test_ctx())
+            let err = dispatch(GatePass::for_test(name), serde_json::json!({}), &test_ctx())
                 .await
                 .expect_err("no audit global in a unit test → error");
             assert!(

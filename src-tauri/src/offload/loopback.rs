@@ -1846,6 +1846,47 @@ impl LatchRoute {
     pub(super) fn external_is_content(self) -> bool {
         self == LatchRoute::Proxied
     }
+
+    /// **Whether a gated call could actually EXECUTE on this route** — i.e.
+    /// whether there is anything for the latch to be about. `false` means the
+    /// gate must return without refusing and without moving the latch, and let
+    /// the dispatcher answer with its own unknown-tool error.
+    ///
+    /// Two rules, one predicate, because they are the same principle applied to
+    /// the two ways a name can fail to name a tool on a native route (#48,
+    /// findings A-1 and M-2):
+    ///
+    /// 1. **Not in the table** — `class == External` on a route that cannot
+    ///    carry a proxied server's content
+    ///    ([`external_is_content`](Self::external_is_content)). A misspelled
+    ///    `graph_symbols` is a hallucination, not a page.
+    /// 2. **In the table but not dispatchable**
+    ///    ([`toolclass::dispatchable`]). Six names are classified for reasons
+    ///    other than being callable — the three `/context/*` hook routes' fixed
+    ///    identities and Claude's own `Edit`/`Write`/`Bash`. Before this, a
+    ///    model emitting the bare name `hook_post_edit` or `Bash` on
+    ///    [`LatchRoute::Native`] classified LOCAL-CAPABILITY and latched the
+    ///    scope to `Local` **before** dispatch rejected the name: the A-1 harm
+    ///    (one bad tool name costs a scope the other half of its tools) in the
+    ///    direction A-1's fix did not cover.
+    ///
+    /// Rule 2 is deliberately confined to [`LatchRoute::Native`], the only
+    /// route whose name is model-supplied. [`LatchRoute::Hook`]'s name is
+    /// composed by cImp and *is* the route's identity — applying rule 2 there
+    /// would wave through the three hook routes M-7 exists to gate — and
+    /// [`LatchRoute::Proxied`]'s names are the MCP host's to reject.
+    ///
+    /// This is not a weakening of unknown-⇒-EXTERNAL: it never admits a name
+    /// into a *less* restrictive class, it only declines to record taint for a
+    /// call that never runs. The containment question — may this class run at
+    /// all — is still [`Latch::refusal`]'s, and every name that answers `true`
+    /// here still faces it.
+    pub(super) fn can_execute(self, name: &str, class: ToolClass) -> bool {
+        if class == ToolClass::External && !self.external_is_content() {
+            return false;
+        }
+        self != LatchRoute::Native || toolclass::dispatchable(name)
+    }
 }
 
 /// What the calling ROUTE knows about a gated call that the registry cannot see
@@ -2322,7 +2363,11 @@ impl LatchRegistry {
             return Ok(WriteTaint::Clean);
         };
         let class = toolclass::classify(name);
-        if class == ToolClass::External && !route.external_is_content() {
+        // #48, findings A-1 and M-2: a call that cannot execute on this route
+        // is not evidence of anything, so it neither latches nor is refused —
+        // see [`LatchRoute::can_execute`] for both rules and why this does not
+        // weaken unknown-⇒-EXTERNAL.
+        if !route.can_execute(name, class) {
             return Ok(WriteTaint::Clean);
         }
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
@@ -8053,6 +8098,95 @@ mod tests {
         assert!(!LatchRoute::Native.external_is_content());
     }
 
+    /// **#48 (finding M-2) — `can_execute`, the rule A-1 and M-2 share, and the
+    /// two ways it must NOT over-reach.**
+    ///
+    /// The whole risk of widening the wave-through set is that it stops being
+    /// about names that cannot run. All three variants are asserted here, and
+    /// the `Hook` row is the one that matters most: the three hook names are
+    /// exactly the `unrouted` rows, and applying M-2's rule to their own route
+    /// would wave through the gate M-7 built.
+    #[test]
+    fn can_execute_covers_the_unroutable_names_without_reaching_the_hook_routes() {
+        let cls = toolclass::classify;
+        // Native: a real tool executes; a typo and an unroutable classified
+        // name do not.
+        for real in [
+            "read_file",
+            "graph_snippet",
+            "context_note",
+            "graph_outline",
+        ] {
+            assert!(
+                LatchRoute::Native.can_execute(real, cls(real)),
+                "{real} must still be gated"
+            );
+        }
+        for dead in ["graph_symbols", "definitely_not_a_tool", ""] {
+            assert!(!LatchRoute::Native.can_execute(dead, cls(dead)), "{dead}");
+        }
+        for unrouted in ["Bash", "Edit", "Write", "hook_post_edit", "hook_compaction"] {
+            assert!(
+                !LatchRoute::Native.can_execute(unrouted, cls(unrouted)),
+                "{unrouted} reaches no native dispatcher, so it must not move a latch"
+            );
+        }
+        // Hook: the name is cImp's own and IS the route, so M-2's rule must not
+        // apply — otherwise `/context/post_edit` stops being refusable and
+        // M-7's fix silently unwinds.
+        for hook in [
+            HOOK_TOOL_POST_EDIT,
+            HOOK_TOOL_SHOULD_READ,
+            HOOK_TOOL_COMPACTION,
+        ] {
+            assert!(
+                LatchRoute::Hook.can_execute(hook, cls(hook)),
+                "{hook} must still be gated on its own route (M-7)"
+            );
+        }
+        // …asserted end-to-end and not just on the predicate: a contaminated
+        // tab is still refused `/context/post_edit`.
+        let reg = LatchRegistry::default();
+        let s = scope("claude-hook", Some("ses"));
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
+            .is_ok());
+        assert_eq!(
+            reg.gate(
+                Some(&s),
+                LatchRoute::Hook,
+                HOOK_TOOL_POST_EDIT,
+                ON,
+                NO_CONTENT
+            ),
+            Err(toolclass::REFUSAL_LOCAL_BLOCKED),
+            "M-7: a contaminated conversation must not run the project's checks"
+        );
+        // …while the same name arriving as a model's tool call is simply not a
+        // tool: neither refused nor latching.
+        let reg = LatchRegistry::default();
+        let s = scope("claude-native", Some("ses"));
+        assert_eq!(
+            reg.gate(
+                Some(&s),
+                LatchRoute::Native,
+                HOOK_TOOL_POST_EDIT,
+                ON,
+                NO_CONTENT
+            ),
+            Ok(WriteTaint::Clean)
+        );
+        assert!(
+            reg.snapshot().is_empty(),
+            "a name no dispatcher serves must leave the tab unlatched"
+        );
+        // Proxied: every id here is a real proxied id, so the rule never
+        // applies — an unknown one is untrusted content, not a typo.
+        for id in ["ddg__search", "somenewserver__anything"] {
+            assert!(LatchRoute::Proxied.can_execute(id, cls(id)), "{id}");
+        }
+    }
+
     /// Budgets are scoped exactly like the latch: per tab, and reset when the
     /// tab's SESSION rotates (a tab restart). A withheld session id is not a
     /// rotation — otherwise a model could reset its budget by waiting for the
@@ -10655,9 +10789,15 @@ mod tests {
     /// read or edit — silently refusing every proxied web/MCP tool for the rest
     /// of the session, for a choice the model never made.
     ///
-    /// The `Native` half of the assertion is the control: the same registry,
-    /// the same scope, the same tool name, and it DOES latch — so this test
-    /// cannot pass by the gate having done nothing at all.
+    /// The `Native` half of the assertion is the control, so this test cannot
+    /// pass by the gate having done nothing at all. **It changed with #48's
+    /// M-2 fix and the change is the finding**: the control used to be the SAME
+    /// NAME on `LatchRoute::Native`, which latched — and M-7's own review
+    /// recorded that as a residual, because `hook_post_edit` is not a tool a
+    /// model can call, so a model that emits it has hallucinated and used to
+    /// cost its tab every proxied tool for the session. The control is now a
+    /// name that really is elective and really dispatches, and the old case is
+    /// asserted the other way round beside it.
     #[test]
     fn a_hook_route_reads_the_latch_and_never_engages_it() {
         let reg = LatchRegistry::default();
@@ -10691,18 +10831,39 @@ mod tests {
             )
             .is_ok());
 
-        // The control: the SAME name on the elective route does latch.
+        // The control: a name that IS elective and IS dispatchable latches on
+        // the same route, with the same registry and scope shape.
         let elective = LatchRegistry::default();
         assert!(elective
             .gate(
                 Some(&scope("claude-2", Some("sess-b"))),
                 LatchRoute::Native,
-                HOOK_TOOL_POST_EDIT,
+                "graph_snippet",
                 ON,
                 NO_CONTENT
             )
             .is_ok());
         assert_eq!(elective.snapshot()[0].latch(), "local");
+
+        // …and the case that used to be the control, now asserted the other way
+        // round (#48, M-2): `hook_post_edit` arriving as a MODEL's tool call is
+        // a hallucination — no dispatcher serves that name — so it neither
+        // latches nor is refused, and the tab keeps its tools.
+        let hallucinated = LatchRegistry::default();
+        assert_eq!(
+            hallucinated.gate(
+                Some(&scope("claude-3", Some("sess-c"))),
+                LatchRoute::Native,
+                HOOK_TOOL_POST_EDIT,
+                ON,
+                NO_CONTENT
+            ),
+            Ok(WriteTaint::Clean)
+        );
+        assert!(
+            hallucinated.snapshot().is_empty(),
+            "one hallucinated name must not cost a tab its web tools (A-1's harm, M-2's half)"
+        );
     }
 
     /// The residual, pinned so it is a decision and not an accident: a hook POST

@@ -457,10 +457,13 @@ mod tests {
         let root = temp_root("dispatch");
         write(&root, "hello.txt", "");
         let ctx = ctx_for(&root);
-        let out =
-            super::super::dispatch("list_dir", json!({ "path": root.to_string_lossy() }), &ctx)
-                .await
-                .unwrap();
+        let out = super::super::dispatch(
+            crate::offload::backend_gate::GatePass::for_test("list_dir"),
+            json!({ "path": root.to_string_lossy() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("hello.txt"), "dispatch did not route: {out}");
         std::fs::remove_dir_all(&root).ok();
     }

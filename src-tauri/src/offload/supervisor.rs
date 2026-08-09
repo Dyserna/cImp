@@ -562,10 +562,18 @@ impl OffloadSupervisor {
             snap.command_policies.clone(),
             &cwd,
         );
+        // #48, finding F-10: the self-test's backend is by construction a LOCAL
+        // one, but the policy is resolved through the shared constructor rather
+        // than hardcoded — so `graph.enabled = false` denies a hallucinated
+        // `graph_*` here exactly as it does on the other two worker paths.
         let router = super::agent::NativeRouter::new(
             super::tools::enabled_defs(&snap.tools),
             ctx,
-            server.tool_scope().clone(),
+            super::backend_gate::BackendGate::for_worker(
+                server.tool_scope().clone(),
+                false,
+                &settings,
+            ),
         );
         let cfg = super::agent::AgentConfig {
             base_url: server.base_url(),

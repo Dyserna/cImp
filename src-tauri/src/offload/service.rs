@@ -1449,16 +1449,22 @@ impl OffloadService {
         let mut native_defs = tools::enabled_defs(&snap.tools);
         // One settings snapshot for both feature gates below.
         let cur = self.settings.current();
+        // #48, finding F-10: the backend's whole admission policy — tool scope
+        // plus the V9-01 graph and V26 audit opt-ins — resolved once, in the
+        // one constructor the headless child and the self-test also use, and
+        // handed to the router as the thing it re-checks per call. What is
+        // ADVERTISED below is derived from the same value, so a tool can no
+        // longer be offered by one rule and refused by another.
+        let gate = super::backend_gate::BackendGate::for_worker(
+            entry.tool_scope.clone(),
+            entry.is_remote,
+            &cur,
+        );
         // V9-01: offer the graph tools to the worker when the feature is on AND
         // either this backend is local or the user opted a remote backend in
         // (a remote — LAN or cloud — would receive the project's code
-        // structure). `allow_graph` re-gates dispatch as defense-in-depth.
-        let allow_graph = worker_graph_allowed(
-            cur.graph.enabled,
-            entry.is_remote,
-            cur.graph.allow_remote_worker_access,
-        );
-        if allow_graph {
+        // structure). The gate re-gates dispatch as defense-in-depth.
+        if gate.graph_allowed() {
             native_defs.extend(tools::graph_tools::defs());
         }
         // V26: offer the code-audit tools to the worker when the feature is
@@ -1468,12 +1474,10 @@ impl OffloadService {
         // *report* — repo file:line paths plus scanner messages that can quote
         // the offending code — is local data, so it must not cross to a
         // remote/LAN/cloud backend: the same boundary `worker_graph_allowed`
-        // enforces for the graph tools. `allow_audit` re-gates dispatch in the
-        // router as defense-in-depth (advertisement alone doesn't stop a
-        // hallucinated call), and `begin_scan` re-enforces the master switch.
-        let allow_audit =
-            cur.code_audit.enabled && cur.code_audit.expose_offload && !entry.is_remote;
-        if allow_audit {
+        // enforces for the graph tools. The gate re-gates dispatch as
+        // defense-in-depth (advertisement alone doesn't stop a hallucinated
+        // call), and `begin_scan` re-enforces the master switch.
+        if gate.audit_allowed() {
             native_defs.extend(tools::audit_tools::defs());
         }
         let mcp_defs = self.host.tool_defs_for_offload().await;
@@ -1488,9 +1492,7 @@ impl OffloadService {
             mcp_defs,
             ctx,
             self.host.clone(),
-            entry.tool_scope.clone(),
-            allow_graph,
-            allow_audit,
+            gate,
             task_scope.clone(),
             outbound::Policy::from_settings(&cur, WORKER),
             super::detection::Config::from_settings(&cur, WORKER),
@@ -2114,7 +2116,11 @@ fn compute_global_cap(snap: &OffloadSettings) -> u32 {
 /// user opted remote workers in. A remote backend (LAN *or* cloud) would
 /// receive the project's code structure, so it's denied by default — the cloud
 /// Opus session and a local worker are unaffected.
-fn worker_graph_allowed(graph_enabled: bool, is_remote: bool, allow_remote: bool) -> bool {
+pub(super) fn worker_graph_allowed(
+    graph_enabled: bool,
+    is_remote: bool,
+    allow_remote: bool,
+) -> bool {
     graph_enabled && (!is_remote || allow_remote)
 }
 

@@ -28,10 +28,9 @@ use tracing::{debug, warn};
 
 use crate::error::{AppError, AppResult};
 
-use crate::settings::ToolScope;
-
 use tokio_util::sync::CancellationToken;
 
+use super::backend_gate::BackendGate;
 use super::loopback::LatchRoute;
 use super::metrics::CallRecord;
 use super::openai::{
@@ -114,23 +113,27 @@ pub trait ToolRouter: Send + Sync {
 
 /// Native-only router: the `read_file`/`code_search`/`run_command`
 /// baseline, **scoped to the chosen backend's allow-list** (V8-02). Only
-/// tools the backend's [`ToolScope`] permits are advertised to the model,
+/// tools the backend's [`BackendGate`] permits are advertised to the model,
 /// and a disallowed call is refused even if the model asks for it — the
 /// defense-in-depth half of the cloud-privacy guarantee (the router half
 /// is in [`super::router`]).
+///
+/// #48, finding F-10: the admission rules live in [`BackendGate`] rather than
+/// in this `call`, because this router used to implement only the *scope* third
+/// of them while `HostRouter` implemented all three.
 pub struct NativeRouter {
     pub defs: Vec<ToolDef>,
     pub ctx: ToolCtx,
-    /// The chosen backend's tool scope. `All` for local/LAN; a cloud
-    /// backend's scope denies the local-data tools.
-    pub scope: ToolScope,
+    /// Everything the chosen backend is allowed to reach: its tool scope plus
+    /// the graph and audit opt-ins.
+    pub gate: BackendGate,
 }
 
 impl NativeRouter {
     /// Build a native router whose advertised tools are filtered through
-    /// `scope`. (Construct the `defs` from `tools::enabled_defs` first.)
-    pub fn new(defs: Vec<ToolDef>, ctx: ToolCtx, scope: ToolScope) -> Self {
-        Self { defs, ctx, scope }
+    /// `gate`. (Construct the `defs` from `tools::enabled_defs` first.)
+    pub fn new(defs: Vec<ToolDef>, ctx: ToolCtx, gate: BackendGate) -> Self {
+        Self { defs, ctx, gate }
     }
 }
 
@@ -139,20 +142,16 @@ impl ToolRouter for NativeRouter {
     fn tool_defs(&self) -> Vec<ToolDef> {
         self.defs
             .iter()
-            .filter(|d| self.scope.allows_namespaced(&d.function.name))
+            .filter(|d| self.gate.admits(&d.function.name))
             .cloned()
             .collect()
     }
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
-        // Refuse a disallowed tool even if the model requests it (e.g. a
-        // cloud backend that hallucinates a `read_file` call) — the local
-        // file is never read for an out-of-scope backend.
-        if !self.scope.allows_namespaced(name) {
-            return Err(format!(
-                "tool `{name}` is not available on this backend (denied by its tool scope)"
-            ));
-        }
-        tools::dispatch(name, args, &self.ctx).await
+        // Refuse a disallowed tool even if the model requests it (e.g. a cloud
+        // backend that hallucinates a `read_file` — or, before F-10, a
+        // `graph_snippet` the scope set cannot express). One gate, both
+        // routers.
+        tools::dispatch(self.gate.admit(name)?, args, &self.ctx).await
     }
     fn tool_ctx(&self) -> Option<&ToolCtx> {
         Some(&self.ctx)
@@ -171,19 +170,12 @@ pub struct HostRouter {
     defs: Vec<ToolDef>,
     ctx: ToolCtx,
     host: std::sync::Arc<super::mcp_host::McpHost>,
-    scope: ToolScope,
-    /// V9-01: whether the code-graph (`graph_*`) tools may run here. The caller
-    /// computes this from the feature flag + the local/remote opt-in; we re-gate
-    /// dispatch on it as defense-in-depth so a hallucinated `graph_*` call on a
-    /// non-opted-in remote backend can't reach the local index.
-    allow_graph: bool,
-    /// V26: whether the code-audit tools (`security_audit`/`quality_audit`) may
-    /// run here — feature flag AND `expose_offload` AND a local backend (the
-    /// audit report carries repo paths + scanner messages, local data like the
-    /// graph). Re-gated at dispatch exactly like `allow_graph`, so a
-    /// hallucinated audit call on an opted-out or remote backend can't trigger
-    /// a scan or receive its report.
-    allow_audit: bool,
+    /// Everything this backend may reach: its [`ToolScope`] plus the V9-01
+    /// code-graph and V26 code-audit opt-ins. Re-checked on every call as the
+    /// defense-in-depth half of the cloud-privacy guarantee — advertisement
+    /// alone does not stop a hallucinated call, which is the whole reason the
+    /// re-gates exist (#48, finding F-10).
+    gate: BackendGate,
     /// V32 Phase C: the contaminated scope this router serves (one worker
     /// task), for the `injection_flag` rows the shared chokepoint writes.
     task_scope: String,
@@ -207,10 +199,10 @@ pub struct HostRouter {
 }
 
 impl HostRouter {
-    /// Build the merged, scope-filtered router. `native_defs` are the enabled
+    /// Build the merged, gate-filtered router. `native_defs` are the enabled
     /// native tool defs; `mcp_defs` are the host's namespaced read-class
-    /// tools (`McpHost::tool_defs().await`). `allow_graph` gates the `graph_*`
-    /// tools and `allow_audit` the audit tools (both already reflected in
+    /// tools (`McpHost::tool_defs().await`). `gate` carries the backend's tool
+    /// scope plus the `graph_*` and audit opt-ins (both already reflected in
     /// `native_defs` by the caller). `task_scope` names this run for V32
     /// `injection_flag` rows and `policy` is the SSRF screen's carve-out set.
     #[allow(clippy::too_many_arguments)]
@@ -219,9 +211,7 @@ impl HostRouter {
         mcp_defs: Vec<ToolDef>,
         ctx: ToolCtx,
         host: std::sync::Arc<super::mcp_host::McpHost>,
-        scope: ToolScope,
-        allow_graph: bool,
-        allow_audit: bool,
+        gate: BackendGate,
         task_scope: String,
         policy: super::outbound::Policy,
         detection: super::detection::Config,
@@ -230,15 +220,13 @@ impl HostRouter {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
             .chain(mcp_defs)
-            .filter(|d| scope.allows_namespaced(&d.function.name))
+            .filter(|d| gate.admits(&d.function.name))
             .collect();
         Self {
             defs,
             ctx,
             host,
-            scope,
-            allow_graph,
-            allow_audit,
+            gate,
             task_scope,
             policy,
             detection,
@@ -254,28 +242,12 @@ impl ToolRouter for HostRouter {
         self.defs.clone()
     }
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
-        if !self.scope.allows_namespaced(name) {
-            return Err(format!(
-                "tool `{name}` is not available on this backend (denied by its tool scope)"
-            ));
-        }
-        // V9-01: re-gate the code-graph tools (defense-in-depth) — a remote
-        // backend the user didn't opt in must never reach the local index.
-        if name.starts_with("graph_") && !self.allow_graph {
-            return Err(format!(
-                "tool `{name}` is not available on this backend (code-graph access for a remote \
-                 offload worker is off — enable it in cImp Settings → Code Graph)"
-            ));
-        }
-        // V26: re-gate the code-audit tools the same way — an unadvertised tool
-        // name can still be *called* by the model, and the audit report is
-        // local data that must not reach an opted-out or remote backend.
-        if matches!(name, "security_audit" | "quality_audit") && !self.allow_audit {
-            return Err(format!(
-                "tool `{name}` is not available on this backend (code audit is not exposed to \
-                 the offload worker, or this backend is remote — see cImp Settings → Code Audit)"
-            ));
-        }
+        // #48, F-10: the scope check AND the two V9-01/V26 re-gates, from the
+        // one definition `NativeRouter` also calls. An unadvertised tool name
+        // can still be *called* by the model, and the graph/audit results are
+        // local data that must not reach an opted-out or remote backend — which
+        // the tool scope cannot express (it keys on the segment before `__`).
+        let pass = self.gate.admit(name)?;
         // Namespaced ids (`<server>__<tool>`) belong to an MCP server; bare
         // names are the native baseline. Routed through the recorded,
         // consumer-guarded entry point: the row lands in the Tool Activity
@@ -283,6 +255,11 @@ impl ToolRouter for HostRouter {
         // and a hallucinated call to a server without `offload_access` is
         // refused instead of silently reaching it.
         if name.contains("__") {
+            // Spend the pass here: this branch hands the call to the MCP host,
+            // which owns the name from now on. The native branch below spends
+            // it into `tools::dispatch` instead — and cannot be reached without
+            // one, which is what makes skipping the gate a compile error.
+            let name = pass.name();
             // V32 Phase B/C: this is the worker's EXTERNAL tool-result boundary
             // — the one place a proxied server's bytes enter the worker's
             // conversation — so detection, the spotlighting envelope and the
@@ -326,7 +303,7 @@ impl ToolRouter for HostRouter {
             )
             .await)
         } else {
-            tools::dispatch(name, args, &self.ctx).await
+            tools::dispatch(pass, args, &self.ctx).await
         }
     }
     fn tool_ctx(&self) -> Option<&ToolCtx> {
@@ -1253,16 +1230,26 @@ impl CallCache {
 /// down why: *"letting it engage the latch would let one bad tool name poison a
 /// tab for its whole session."* The worker knew the route
 /// (`name.contains("__")`) and did not feed it to the gate. It does now,
-/// through the proxy's own rule — see [`LatchRoute::external_is_content`] for
-/// why this does not weaken unknown-⇒-EXTERNAL.
+/// through the proxy's own rule — see [`LatchRoute::can_execute`] for why this
+/// does not weaken unknown-⇒-EXTERNAL.
+///
+/// # …and neither is a name no dispatcher serves (#48, finding M-2)
+///
+/// A-1's fix covered the name that is *absent* from `TABLE`. Six names are
+/// *present* and still unservable — the three `/context/*` hook identities and
+/// Claude's `Edit`/`Write`/`Bash` — and until M-2 they classified
+/// LOCAL-CAPABILITY, engaged the latch, and only then met
+/// `tools::dispatch`'s "unknown native tool". `Bash` is the live one here: a
+/// local code model has every reason to reach for it and none of them make it a
+/// tool this worker has. [`LatchRoute::can_execute`] now covers both.
 fn latch_gate(latch: &mut Latch, route: LatchRoute, name: &str) -> Result<(), &'static str> {
     let class = toolclass::classify(name);
-    if class == ToolClass::External && !route.external_is_content() {
+    if !route.can_execute(name, class) {
         debug!(
             target: "offload",
             tool = %name,
-            "offload: a bare tool name that classifies EXTERNAL is a hallucination, not external \
-             content — the latch is left where it is and dispatch will reject the name"
+            "offload: a bare tool name that no native dispatcher serves is a hallucination, not \
+             external content — the latch is left where it is and dispatch will reject the name"
         );
         return Ok(());
     }
@@ -3528,6 +3515,72 @@ mod tests {
         assert_eq!(n.as_deref(), Some("a.rs, b.rs"));
     }
 
+    // ── #48, finding F-10 — one admission gate, both routers ───────────────
+
+    /// **F-10 as a live call.** A cloud backend's default scope
+    /// (`AllExcept { LOCAL_DATA_TOOLS }`) names `read_file, list_dir,
+    /// code_search, run_command, filesystem, git` — and neither `graph_*` nor
+    /// the audit tools. `NativeRouter` used to implement only that scope check,
+    /// so `security_audit` and `graph_snippet` were admitted and dispatched: a
+    /// local scan's repo paths and quoted source, to a remote model, from names
+    /// the model was never offered.
+    ///
+    /// Asserted through `ToolRouter::call` — the seam the loop actually uses —
+    /// rather than through the gate's own unit tests, because "the helper is
+    /// right and the call site is missing" is exactly how this finding existed.
+    #[tokio::test]
+    async fn a_cloud_backend_is_refused_the_graph_and_audit_tools_by_the_native_router() {
+        let cwd = std::env::current_dir().unwrap();
+        let router = NativeRouter::new(
+            Vec::new(),
+            ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd),
+            BackendGate::for_worker(
+                crate::settings::ToolScope::default_for(true),
+                true,
+                &crate::settings::Settings::default(),
+            ),
+        );
+        for name in [
+            "graph_snippet",
+            "graph_repo_map",
+            "graph_find_symbol",
+            "security_audit",
+            "quality_audit",
+        ] {
+            let err = router
+                .call(name, json!({}))
+                .await
+                .expect_err("a cloud backend must not reach local data");
+            assert!(
+                err.contains("not available on this backend"),
+                "`{name}` reached dispatch on a cloud backend: {err}"
+            );
+        }
+        // The scope half is unchanged: it still denies the local-data set.
+        for name in crate::settings::LOCAL_DATA_TOOLS {
+            assert!(router.call(name, json!({})).await.is_err(), "{name}");
+        }
+    }
+
+    /// The rules live in `backend_gate`, not in a router body. A copy here is
+    /// how F-10 happened — one router grew the two re-gates and the other did
+    /// not — so the file that holds both routers must not name them.
+    #[test]
+    fn neither_router_reimplements_the_admission_rules() {
+        let src = include_str!("agent.rs");
+        for needle in [
+            concat!("allows_", "namespaced"),
+            concat!("allow_", "audit"),
+            concat!("starts_with(\"", "graph_\")"),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "`{needle}` is back in agent.rs — the admission rules belong in \
+                 `backend_gate::BackendGate::admit`, which both routers call (#48, F-10)"
+            );
+        }
+    }
+
     // ── V32 Phase A — the per-task taint latch ─────────────────────────────
 
     use crate::offload::toolclass::{
@@ -3564,7 +3617,9 @@ mod tests {
         NativeRouter::new(
             defs,
             ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd),
-            ToolScope::All,
+            // A fully-permitted backend: these tests are about the taint latch,
+            // and a backend gate that denied anything would confound the two.
+            BackendGate::new(crate::settings::ToolScope::All, true, true),
         )
     }
 
@@ -3742,6 +3797,46 @@ mod tests {
             for local in ["read_file", "code_search", "run_command", "graph_snippet"] {
                 assert!(gate(&mut latch, local).is_ok(), "{typo} then {local}");
             }
+            assert_eq!(latch, Latch::Local, "the first REAL call is what latches");
+        }
+    }
+
+    /// **#48 (finding M-2) — A-1's blind spot: a name that IS in `TABLE` and
+    /// that no dispatcher serves.**
+    ///
+    /// These six classify LOCAL-CAPABILITY or TRUSTED rather than EXTERNAL, so
+    /// A-1's rule never saw them: they engaged the latch and *then* met
+    /// `tools::dispatch`'s "unknown native tool". `Bash` is the live one — a
+    /// local code model reaches for it out of habit, and one such hallucination
+    /// used to cost an undeclared task its web tools for good.
+    #[test]
+    fn a_classified_name_no_dispatcher_serves_does_not_latch_the_task() {
+        for name in [
+            "Bash",
+            "Edit",
+            "Write",
+            "hook_post_edit",
+            "hook_should_read",
+            "hook_compaction",
+        ] {
+            // It is still CLASSIFIED — `unrouted` is not `unclassified`, and
+            // the hook routes gate on exactly these rows (M-7).
+            assert_ne!(
+                toolclass::classify(name),
+                ToolClass::External,
+                "{name} must stay classified"
+            );
+            let mut latch = Latch::default();
+            assert!(gate(&mut latch, name).is_ok(), "{name} must not be refused");
+            assert_eq!(latch, Latch::Open, "{name} must not move the latch");
+            // Both directions of the harm: from an ALREADY-latched task the
+            // same call must not be refused either — a refusal would tell the
+            // model a security boundary blocked a tool that does not exist.
+            let mut ext = Latch::External;
+            assert!(gate(&mut ext, name).is_ok(), "{name} under EXTERNAL");
+            assert_eq!(ext, Latch::External);
+            // …and the task's real tools are untouched.
+            assert!(gate(&mut latch, "read_file").is_ok());
             assert_eq!(latch, Latch::Local, "the first REAL call is what latches");
         }
     }

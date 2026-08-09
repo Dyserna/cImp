@@ -38,6 +38,7 @@
 //! routing without re-architecting the loop.
 
 pub mod agent;
+pub mod backend_gate;
 pub mod detection;
 pub mod loopback;
 pub mod mcp;

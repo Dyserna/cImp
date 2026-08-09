@@ -106,9 +106,13 @@ mod tests {
         // (rather than "unknown native tool") proves `dispatch` routes the name.
         let root = std::env::temp_dir();
         let ctx = ToolCtx::new(vec![root.clone()], vec![], vec![], &root);
-        let out = super::super::dispatch("run_check", serde_json::json!({}), &ctx)
-            .await
-            .expect("run_check dispatch should not error");
+        let out = super::super::dispatch(
+            crate::offload::backend_gate::GatePass::for_test("run_check"),
+            serde_json::json!({}),
+            &ctx,
+        )
+        .await
+        .expect("run_check dispatch should not error");
         assert!(
             !out.contains("unknown native tool"),
             "dispatch did not route run_check: {out}"

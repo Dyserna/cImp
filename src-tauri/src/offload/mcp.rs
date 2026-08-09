@@ -1648,6 +1648,12 @@ struct ResolvedBackend {
     auth_token: Option<String>,
     cloud_blocked: bool,
     is_cloud: bool,
+    /// Off this machine — LAN *or* cloud. The same bit `OffloadService`'s pool
+    /// entries carry, and the one the graph/audit data boundaries key on
+    /// (#48, finding F-10): `is_cloud` alone would let a LAN worker reach the
+    /// local index and the audit report on the headless path while the in-app
+    /// path denies it.
+    is_remote: bool,
     tier: BackendTier,
     tool_scope: ToolScope,
     slots: u32,
@@ -1676,6 +1682,7 @@ impl ResolvedBackend {
                     auth_token: None,
                     cloud_blocked: false,
                     is_cloud: false,
+                    is_remote: false,
                     tier: b.tier,
                     tool_scope: b.tool_scope.clone(),
                     slots: cmd.parallel.max(1),
@@ -1702,6 +1709,7 @@ impl ResolvedBackend {
                     },
                     cloud_blocked: b.cloud_blocked(),
                     is_cloud: *is_cloud,
+                    is_remote: true,
                     tier: b.tier,
                     tool_scope: b.tool_scope.clone(),
                     // A remote endpoint doesn't report `-np`; assume one
@@ -1851,6 +1859,10 @@ async fn run_offload(
                 auth_token: auth,
                 cloud_blocked: false,
                 is_cloud,
+                // Probe-only shim: `probe` reads `is_cloud`, `base_url` and
+                // `auth_token` and nothing else, so this field is not a policy
+                // decision here.
+                is_remote: is_cloud,
                 tier: BackendTier::Quality,
                 tool_scope: ToolScope::All,
                 slots,
@@ -2018,10 +2030,18 @@ async fn run_on_backend(
         settings.command_policies.clone(),
         cwd,
     );
+    // #48, finding F-10: the headless child's router used to carry only the
+    // tool scope, which does not cover `graph_*` or the audit tools — so a
+    // cloud backend that emitted an unadvertised `graph_snippet` got repo
+    // source text. Same policy, same constructor, as the in-app path.
     let router = NativeRouter::new(
         tools::enabled_defs(&settings.tools),
         ctx,
-        backend.tool_scope.clone(),
+        crate::offload::backend_gate::BackendGate::for_worker(
+            backend.tool_scope.clone(),
+            backend.is_remote,
+            all,
+        ),
     );
     let cfg = AgentConfig {
         base_url: backend.base_url.clone(),

@@ -1664,6 +1664,122 @@ pub fn flag_request(flag: &Flag<'_>) -> serde_json::Value {
     })
 }
 
+// ── Step 5: reading the contamination lifecycle back out ───────────────────
+
+/// One contamination-lifecycle event, parsed back out of the activity store —
+/// the Workbench Timeline's evidence rows.
+///
+/// **The reader lives beside the writer** ([`flag_request`]) deliberately. The
+/// join keys the Timeline needs (`scope`, `session`) are not columns on
+/// [`ActivityEntry`]; they exist only inside the request payload this module
+/// composes. A parser in another file would be a second, silent copy of that
+/// payload's shape — the class of drift the V32 surfaces have already been bitten
+/// by twice (#48 G-2, H-10). Here, changing a key breaks compilation-adjacent
+/// tests in the same file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContaminationEvent {
+    /// The activity row's id — stable across restarts, and the Timeline's row key.
+    pub id: u64,
+    /// Epoch **millis**. Checkpoints carry epoch *seconds*; the consumer owns
+    /// that conversion and must not be handed a pre-converted value here, or the
+    /// two units would silently mix at a boundary nobody can see.
+    pub ts_ms: u64,
+    /// [`crate::activity::root_key`] form — what a per-project surface filters on.
+    pub root: String,
+    /// `false` for [`Screen::Contamination`] (the bit was SET), `true` for
+    /// [`Screen::ContaminationCleared`].
+    pub cleared: bool,
+    /// `agent:tab`, verbatim, even when it does not split (see [`Self::agent`]).
+    pub scope: String,
+    /// The `agent` half of `scope`, or `None` when the label did not split —
+    /// which is not something today's writers can produce, and is therefore
+    /// reported rather than guessed at.
+    pub agent: Option<String>,
+    /// The `tab` half of `scope`. `None` on the same terms as [`Self::agent`];
+    /// a consumer with no tab cannot attribute the row to a tab and must say so.
+    pub tab: Option<String>,
+    /// The conversation the row was filed under. **Not a join key for the tab**:
+    /// contamination is one row per TAB (H-2 made the bit sticky), so this names
+    /// the conversation contamination started in, not every conversation it
+    /// covers.
+    pub session: Option<String>,
+    /// The tool that carried the content in (`contamination`), or the basis the
+    /// bit was released on (`contamination_cleared`).
+    pub tool: String,
+    pub host: Option<String>,
+    pub url: Option<String>,
+    /// `internal` / `ipc` / `http` — `ipc` is the only one that means a human
+    /// acted (#45).
+    pub origin: Option<String>,
+    /// The row's response payload: the full sentence written when it happened.
+    pub detail: String,
+}
+
+/// Every retained contamination / contamination-cleared row, newest first.
+///
+/// Retention is per screen ([`crate::activity`]'s lanes), so these two lanes
+/// cannot be flooded out by any other screen — but they are still finite, and a
+/// caller must treat "no row for a tab cImp currently reports as contaminated"
+/// as *not retained*, never as *never contaminated*.
+pub fn contamination_events() -> Vec<ContaminationEvent> {
+    crate::activity::records_of_source(&[
+        Screen::Contamination.as_str(),
+        Screen::ContaminationCleared.as_str(),
+    ])
+    .into_iter()
+    .map(contamination_event)
+    .collect()
+}
+
+/// One stored record → one [`ContaminationEvent`].
+///
+/// **A row whose payload will not parse is still emitted**, with `agent`/`tab`
+/// `None`. Dropping it would turn "cImp cannot read this evidence" into "there is
+/// no evidence", which is the one rendering a containment surface must never
+/// produce; an unattributable row makes the consumer say it cannot place the
+/// event, which is true.
+fn contamination_event(rec: ActivityRecord) -> ContaminationEvent {
+    let req: Value = serde_json::from_str(&rec.request).unwrap_or(Value::Null);
+    let text = |key: &str| -> Option<String> {
+        req.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    // Fall back to the entry's own display column when the payload is
+    // unreadable, so the event still has something to show — but split ONLY the
+    // payload's scope. `target` is `"{host} ({scope})"`, which splits at the
+    // first `:` into two plausible-looking halves that are not an agent and not
+    // a tab; a surface that acts on those would attribute an event to a tab that
+    // never existed, which is worse than saying it cannot place it.
+    let from_payload = text("scope");
+    let scope = from_payload
+        .clone()
+        .unwrap_or_else(|| rec.entry.target.clone());
+    let (agent, tab) = from_payload
+        .as_deref()
+        .and_then(|s| s.split_once(':'))
+        .filter(|(a, t)| !a.is_empty() && !t.is_empty())
+        .map_or((None, None), |(a, t)| {
+            (Some(a.to_string()), Some(t.to_string()))
+        });
+    ContaminationEvent {
+        id: rec.entry.id,
+        ts_ms: rec.entry.ts_ms,
+        root: rec.entry.root.clone(),
+        cleared: rec.entry.source == Screen::ContaminationCleared.as_str(),
+        scope,
+        agent,
+        tab,
+        session: text("session"),
+        tool: rec.entry.tool.clone(),
+        host: text("host"),
+        url: text("url"),
+        origin: text("origin"),
+        detail: rec.response,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2476,6 +2592,120 @@ mod tests {
         assert!(!Screen::ContaminationCleared.is_denial());
         assert!(Screen::LatchRefusal.is_denial());
         assert!(Screen::Ssrf.is_denial());
+    }
+
+    /// Step 5: the Timeline's evidence rows survive the round trip through the
+    /// activity store's shape.
+    ///
+    /// The point is that it goes through the real WRITER: `flag_record` composes
+    /// the payload, `contamination_event` reads it back. A test that hand-built
+    /// the JSON would keep passing after `flag_request` renamed `scope` to
+    /// `label` — and the Timeline would then silently attribute nothing to any
+    /// tab while still rendering rows, which is the failure mode this whole step
+    /// exists to prevent.
+    #[test]
+    fn a_contamination_row_round_trips_into_a_joinable_event() {
+        let rec = flag_record(Flag {
+            screen: Screen::Contamination,
+            origin: Origin::Internal,
+            consumer: "claude",
+            scope: "claude:claude-2",
+            session: Some("sess-a"),
+            tool: "ddg__fetch_content",
+            host: Some("evil.example"),
+            url: Some("https://evil.example/p"),
+            resolved_ip: None,
+            canary: false,
+            root: "P:\\proj".to_string(),
+            detail: "CONTAMINATED: external content entered this conversation",
+        });
+        let ev = contamination_event(rec);
+        assert!(!ev.cleared);
+        assert_eq!(ev.scope, "claude:claude-2");
+        assert_eq!(ev.agent.as_deref(), Some("claude"));
+        assert_eq!(ev.tab.as_deref(), Some("claude-2"));
+        assert_eq!(ev.session.as_deref(), Some("sess-a"));
+        assert_eq!(ev.tool, "ddg__fetch_content");
+        assert_eq!(ev.host.as_deref(), Some("evil.example"));
+        assert_eq!(ev.url.as_deref(), Some("https://evil.example/p"));
+        assert_eq!(ev.origin.as_deref(), Some("internal"));
+        assert_eq!(ev.root, "P:\\proj");
+        assert!(ev.detail.starts_with("CONTAMINATED:"));
+
+        // The clearing half is the same row shape with the other screen — a
+        // consumer pairs the two by scope, so `cleared` is the only thing that
+        // may differ structurally.
+        let cleared = contamination_event(flag_record(Flag {
+            screen: Screen::ContaminationCleared,
+            origin: Origin::Ipc,
+            consumer: "claude",
+            scope: "claude:claude-2",
+            session: Some("sess-a"),
+            tool: "clear_contamination",
+            host: None,
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: "P:\\proj".to_string(),
+            detail: "cleared on the user's authority",
+        }));
+        assert!(cleared.cleared);
+        assert_eq!(cleared.scope, "claude:claude-2");
+        assert_eq!(cleared.origin.as_deref(), Some("ipc"));
+        assert_eq!(cleared.host, None);
+    }
+
+    /// An unreadable payload must still produce a row — see
+    /// [`contamination_event`]'s doc comment. "cImp cannot place this event" and
+    /// "there is no such event" are different claims, and only the second one is
+    /// reassuring, so the second must never be produced by accident.
+    #[test]
+    fn an_unparseable_contamination_payload_still_yields_an_unattributed_event() {
+        let mut rec = flag_record(Flag {
+            screen: Screen::Contamination,
+            origin: Origin::Internal,
+            consumer: "claude",
+            scope: "claude:claude-2",
+            session: None,
+            tool: "ddg__search",
+            host: None,
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: "P:\\proj".to_string(),
+            detail: "d",
+        });
+        rec.request = "{ truncated".to_string();
+        let ev = contamination_event(rec);
+        // The display column happens to be scope-shaped for a host-less row, so
+        // there is something to show — but it is still not a join key, and the
+        // event says so rather than looking joinable.
+        assert_eq!(ev.scope, "claude:claude-2");
+        assert_eq!(ev.tab, None);
+        assert_eq!(ev.agent, None);
+        assert_eq!(ev.session, None);
+
+        // And when the fallback is NOT scope-shaped, splitting it would invent a
+        // tab out of a rendered host — the case that makes the rule matter.
+        let mut rec = flag_record(Flag {
+            screen: Screen::Contamination,
+            origin: Origin::Internal,
+            consumer: "claude",
+            scope: "claude:claude-2",
+            session: None,
+            tool: "ddg__search",
+            host: Some("evil.example"),
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: "P:\\proj".to_string(),
+            detail: "d",
+        });
+        rec.request = String::new();
+        let ev = contamination_event(rec);
+        assert_eq!(ev.scope, "evil.example (claude:claude-2)");
+        assert_eq!(ev.tab, None, "a display string is not a join key");
+        assert_eq!(ev.agent, None);
     }
 
     /// #45: the provenance column. Its whole value is that the cases are

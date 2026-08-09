@@ -2809,6 +2809,32 @@ pub async fn workbench_restore(
     service.restore(&root, &id, delete_new).await
 }
 
+/// V33 step 5: the contamination lifecycle the Workbench Timeline renders
+/// beside its checkpoints, plus the root those checkpoints belong to.
+///
+/// **A command of its own rather than `activity_list` + N × `activity_detail`.**
+/// The Timeline joins a contamination row to a checkpoint on `(agent, tab)`,
+/// and neither half is a column on `ActivityEntry` — the `agent:tab` scope
+/// lives only inside the row's request payload, so the list command cannot
+/// answer the question at all. The two ways to get there from `activity_list`
+/// are a `activity_detail` call per row (up to 128 locked reads of a store that
+/// does file I/O, to render a section that is usually empty) or parsing the
+/// scope back out of the entry's `target`, which is a *display* string. This
+/// resolves and parses once, backend-side, next to the writer.
+///
+/// It also returns `root`, which the frontend has no other way to learn: the
+/// rows are keyed by [`crate::activity::root_key`] and the Timeline's own root
+/// is resolved here from the launch cwd. Events for OTHER roots are returned
+/// too, deliberately — a tab running in a worktree writes its checkpoints and
+/// its contamination against that worktree, and the caller has to be able to
+/// say "there is history you are not seeing" rather than show nothing.
+#[tauri::command]
+pub async fn contamination_events(root: Option<String>) -> AppResult<serde_json::Value> {
+    let root = crate::activity::root_key(&resolve_workbench_root(root)?);
+    let events = run_on_blocking_pool(crate::offload::outbound::contamination_events).await?;
+    Ok(serde_json::json!({ "root": root, "events": events }))
+}
+
 /// V13 Phase D: every cImp-managed worktree of `root`'s repo — slug, branch,
 /// base branch, ahead/behind vs that base, and whether an AI tab is
 /// currently pointed at it. `root` defaults to the launch directory.

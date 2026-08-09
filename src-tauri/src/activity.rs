@@ -433,6 +433,35 @@ impl ActivityStore {
             .collect()
     }
 
+    /// Full records (with payloads) whose `source` is one of `sources`,
+    /// newest first.
+    ///
+    /// **Why this exists rather than `snapshot_since` + N × [`detail`]** (step
+    /// 5). A row's `source` is on the light entry, but everything that makes a
+    /// V32 flag row *joinable* — the `agent:tab` scope, the session, the host —
+    /// lives only in its request payload. A consumer that needs those for a
+    /// whole class of rows would otherwise take the full feed and then one
+    /// locked `detail` call per row, which is O(rows) lock acquisitions and
+    /// O(feed) serialization to answer a question about a handful of rows. The
+    /// alternative — parsing the scope back out of the entry's `target`, which
+    /// is a display string (`"{host} ({scope})"`) — makes a rendering decision
+    /// load-bearing for a security surface.
+    ///
+    /// `sources` is small and compared linearly; every caller passes one or two.
+    pub fn records_of_source(&self, sources: &[&str]) -> Vec<ActivityRecord> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        self.load_locked(&mut inner);
+        inner
+            .ring
+            .iter()
+            .rev()
+            .filter(|r| sources.contains(&r.entry.source.as_str()))
+            .cloned()
+            .collect()
+    }
+
     /// The full record (with payloads) for one entry, if it still exists.
     pub fn detail(&self, id: u64) -> Option<ActivityRecord> {
         let mut inner = self.inner.lock().ok()?;
@@ -718,6 +747,12 @@ pub fn snapshot_since(since: u64) -> Vec<ActivityEntry> {
 /// The full record (with request/response payloads) for one entry.
 pub fn detail(id: u64) -> Option<ActivityRecord> {
     store().detail(id)
+}
+
+/// Full records (with payloads) for every row written by one of `sources`,
+/// newest first — see [`ActivityStore::records_of_source`].
+pub fn records_of_source(sources: &[&str]) -> Vec<ActivityRecord> {
+    store().records_of_source(sources)
 }
 
 /// Remove one entry by id.

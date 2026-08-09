@@ -50,6 +50,7 @@
     type LatchAction,
     type LatchRow,
   } from './latch';
+  import { latchAlsoHoldsMemory } from './timeline';
 
   let {
     x,
@@ -101,6 +102,10 @@
     posX = Math.max(margin, Math.min(wantX, window.innerWidth - rect.width - margin));
     posY = Math.max(margin, Math.min(wantY, window.innerHeight - rect.height - margin));
   });
+
+  /// Step 5d: null unless the latch is holding memory writes independently of
+  /// the flag — see `latchAlsoHoldsMemory`.
+  const memoryNote = $derived(latchAlsoHoldsMemory(row.latch));
 
   const latchLine = $derived(
     row.latch === 'external'
@@ -262,6 +267,17 @@
   {#if row.can_clear}
     <div class="separator"></div>
     <div class="head">Contamination flag</div>
+
+    {#if memoryNote}
+      <!-- Step 5d: the gap step 4 shipped with. `Latch::proxy_gate` quarantines
+           a memory write whenever the latch is EXTERNAL, on the LATCH's own
+           authority — the contamination bit only ever widens that verdict. So a
+           user who marks a false positive here finds their notes still held and
+           nothing on screen explaining it. The sentence comes from `timeline.ts`
+           so this popover and the Workbench Timeline cannot phrase it
+           differently. -->
+      <div class="state warn">{memoryNote}</div>
+    {/if}
 
     {#if confirmingClear}
       <div class="state warn">

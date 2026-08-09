@@ -20,6 +20,8 @@
   import WorktreesView from './WorktreesView.svelte';
   import SessionCommitsView from './SessionCommitsView.svelte';
   import GitGraphView from './GitGraphView.svelte';
+  import { latchByTab } from './latch';
+  import { evidenceOffNotice } from './timeline';
 
   type Section = 'diff' | 'timeline' | 'worktrees' | 'session-commits' | 'git-graph';
   const SECTIONS: { id: Section; label: string }[] = [
@@ -85,6 +87,18 @@
   });
 
   const checkpointsOff = $derived(section === 'timeline' && !$settings.workbench.checkpoints);
+
+  // V33 step 5: with checkpoints off there is no Timeline, and therefore no
+  // contamination evidence surface. That is a configuration the user is allowed
+  // to choose, so the off-state banner has to say what is missing AND name a
+  // control that still works — a silent Timeline reads as "nothing is wrong",
+  // which is exactly the claim this feature exists to stop making.
+  const contaminatedScopes = $derived(
+    Object.values($latchByTab)
+      .filter((r) => r?.contaminated)
+      .map((r) => `${r!.consumer}:${r!.tab}`),
+  );
+  const evidenceOff = $derived(evidenceOffNotice(contaminatedScopes));
 </script>
 
 <div class="workbench">
@@ -114,6 +128,7 @@
       shadow git repo (<code>.cimp/shadow.git</code>); your own
       <code>.git</code> is never touched.
     </p>
+    <p class="banner" class:warn={contaminatedScopes.length > 0}>{evidenceOff}</p>
   {/if}
 
   {#if section === 'diff'}
@@ -214,5 +229,12 @@
     background: var(--surface-danger, rgba(179, 38, 30, 0.18));
     border-color: var(--border-danger, #b3261e);
     color: var(--text-danger-soft, #ffb4ab);
+  }
+  /* Step 5: a live contamination the Timeline cannot show is not a neutral
+     configuration note. */
+  .banner.warn {
+    border-color: var(--awaiting, #d0a24c);
+    color: var(--awaiting, #d0a24c);
+    opacity: 1;
   }
 </style>

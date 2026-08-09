@@ -5,6 +5,21 @@
   // banner explains the toggle otherwise) — this component assumes the
   // feature is enabled and just deals with fetching/rendering/acting on
   // whatever checkpoints already exist.
+  //
+  // V33 step 5 — the evidence surface. The list is no longer homogeneous: a
+  // contamination event (the moment a tab's conversation stopped being clean)
+  // is merged into it by time, so the user can see WHICH checkpoint was live
+  // when it happened and act from there. Everything that decides what those
+  // rows claim lives in `timeline.ts`, which has a test harness; this file
+  // renders what that module returns and adds no rules of its own.
+  //
+  // Three things this view is careful about, all of them "do not overstate":
+  //   • the nearest preceding checkpoint often belongs to a DIFFERENT tab (per
+  //     tab throttling is not per tab guaranteeing), so every row says whose it
+  //     is rather than offering it as this tab's restore point;
+  //   • a contamination row can age out of the activity feed, so a tab flagged
+  //     with no row is announced, not rendered as an empty list;
+  //   • the flag and the latch are separate holds — see `latchAlsoHoldsMemory`.
   import {
     workbenchCheckpoints,
     workbenchCheckpointDiff,
@@ -14,18 +29,40 @@
     type Checkpoint,
     type FileDiff,
   } from './workbench';
-  import { onMount } from 'svelte';
-  import { openRestoreCheckpointDialog } from './dialog/store';
+  import { onMount, untrack } from 'svelte';
+  import { openRestoreCheckpointDialog, dialogState } from './dialog/store';
   import { errorMessage } from './errors';
   import CheckpointDiffView from './CheckpointDiffView.svelte';
-  import { WORKBENCH_TAB_ID } from './tabs/types';
-  import { onAppViewShown } from './appViewVisibility';
+  import { WORKBENCH_TAB_ID, type TabId } from './tabs/types';
+  import { onAppViewShown, isAppViewVisible } from './appViewVisibility';
   import { loadViewString, saveViewString } from './viewSection';
+  import { latchByTab, applyLatchOverride, type LatchRow } from './latch';
+  import {
+    fetchContaminationEvents,
+    buildTimelineRows,
+    evidenceNotices,
+    linkLine,
+    restoreTarget,
+    clearedLine,
+    rowIcon,
+    rowTitle,
+    latchAlsoHoldsMemory,
+    type ContaminationEvent,
+    type TimelineRow,
+  } from './timeline';
 
   let checkpoints = $state<Checkpoint[]>([]);
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let creatingNow = $state(false);
+
+  // Step 5a: the contamination lifecycle, from its own command. Its failure is
+  // tracked SEPARATELY from `loadError` — a failed evidence read must not blank
+  // the checkpoint list, and an intact checkpoint list must not imply the
+  // evidence was read.
+  let events = $state<ContaminationEvent[]>([]);
+  let evidenceRoot = $state('');
+  let eventsError = $state<string | null>(null);
 
   // The open "Diff vs now" persists (viewSection.ts) like the sibling
   // sections' expansions — a stale id matches no row and renders nothing;
@@ -52,6 +89,21 @@
     } finally {
       loading = false;
     }
+    await refreshEvidence();
+  }
+
+  /// Step 5a. Keeps the last known events on failure — a read that failed is
+  /// not evidence that nothing happened — and reports the failure as its own
+  /// notice (`evidenceNotices`) so the view never goes quiet about it.
+  async function refreshEvidence(): Promise<void> {
+    try {
+      const feed = await fetchContaminationEvents();
+      evidenceRoot = feed.root;
+      events = feed.events;
+      eventsError = null;
+    } catch (e) {
+      eventsError = errorMessage(e);
+    }
   }
 
   // Refetch after a restore (or a future "checkpoint now" from elsewhere)
@@ -68,6 +120,117 @@
   // off-screen don't bump the version store — refetch when the tab returns
   // (the pre-keep-alive remount used to cover this).
   onMount(() => onAppViewShown(WORKBENCH_TAB_ID, () => void refresh()));
+
+  const latchRows = $derived(
+    Object.values($latchByTab).filter((r): r is LatchRow => r !== undefined),
+  );
+
+  // Step 5a: contamination happens between refreshes, and this view is not
+  // allowed a timer of its own (appViews.ts cost rule). It rides the latch
+  // poll that already runs app-wide instead: when the SET of contaminated tabs
+  // changes, the evidence is refetched once. Not a poll — a change signal — and
+  // skipped while the view is detached, because `onAppViewShown` above already
+  // refreshes on return.
+  let lastContaminationSig = '';
+  $effect(() => {
+    const sig = latchRows
+      .filter((r) => r.contaminated)
+      .map((r) => r.tab)
+      .sort()
+      .join(',');
+    untrack(() => {
+      if (sig === lastContaminationSig) return;
+      lastContaminationSig = sig;
+      if (isAppViewVisible(WORKBENCH_TAB_ID)) void refreshEvidence();
+    });
+  });
+
+  const rows = $derived(buildTimelineRows(checkpoints, events, evidenceRoot));
+  const notices = $derived(
+    evidenceNotices({ events, root: evidenceRoot, latch: latchRows, error: eventsError }),
+  );
+
+  // ── Step 5c: the two actions on a contamination row ──────────────────────
+
+  /// The tab's live latch row — the backend owns which moves are legal and
+  /// publishes them (`can_clear`), exactly as `TaintMenu` reads them. Absent
+  /// means the tab has had no gated call this run, so there is nothing to act on.
+  function latchFor(tab: string | null): LatchRow | undefined {
+    return tab === null ? undefined : $latchByTab[tab as TabId];
+  }
+
+  /// Two clicks, like `TaintMenu`'s: this one releases containment on the
+  /// user's judgement alone.
+  let confirmingClear = $state<string | null>(null);
+  let actionBusy = $state(false);
+  let actionError = $state<string | null>(null);
+
+  async function run(row: LatchRow, action: 'clear_contamination' | 'await_session_clear') {
+    if (actionBusy) return;
+    actionBusy = true;
+    actionError = null;
+    try {
+      await applyLatchOverride(row.tab, row.consumer, action);
+      confirmingClear = null;
+      await refreshEvidence();
+    } catch (e) {
+      // The backend's own message, verbatim — a control that appears to do
+      // nothing when clicked is worse than one that explains why it declined.
+      actionError = errorMessage(e);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  /// Step 5c's restore, in two halves.
+  ///
+  /// `RestoreCheckpointDialog` is opened through the global dialog store and
+  /// has no completion callback — but it bumps `workbenchCheckpointsVersion`
+  /// on success, and only on success, and this view already subscribes to that
+  /// bus. So the `await_session_clear` arm rides the bump rather than a fourth
+  /// dispatch mechanism. Arming BEFORE the restore was the alternative and is
+  /// wrong: a cancelled dialog would leave the audit trail claiming a restore
+  /// that never happened.
+  let pendingArm = $state<LatchRow | null>(null);
+  let armNote = $state<string | null>(null);
+  let lastVersion = -1;
+
+  function restoreFrom(id: string, latch: LatchRow | undefined): void {
+    pendingArm = latch ?? null;
+    armNote = null;
+    openRestoreCheckpointDialog(id);
+  }
+
+  $effect(() => {
+    const v = $workbenchCheckpointsVersion;
+    untrack(() => {
+      const bumped = lastVersion >= 0 && v !== lastVersion;
+      lastVersion = v;
+      const arm = pendingArm;
+      if (!bumped || !arm) return;
+      pendingArm = null;
+      void armSessionClear(arm);
+    });
+  });
+
+  // The dialog closing without a bump means the user cancelled — drop the arm
+  // rather than letting it fire on some later, unrelated restore.
+  $effect(() => {
+    const open = $dialogState.kind === 'restore-checkpoint';
+    untrack(() => {
+      if (!open && pendingArm) pendingArm = null;
+    });
+  });
+
+  async function armSessionClear(row: LatchRow): Promise<void> {
+    try {
+      await applyLatchOverride(row.tab, row.consumer, 'await_session_clear');
+      armNote = `Restored. ${row.consumer}:${row.tab} stays flagged until it starts a new session — run /clear in that tab, or restart it, and the flag lifts on its own. Restoring files cannot remove injected text from the conversation, which is why it was kept.`;
+      await refreshEvidence();
+    } catch (e) {
+      armNote = `Restored, but the contamination flag could not be armed to clear: ${errorMessage(e)} — clear it from the tab's containment badge instead.`;
+    }
+  }
 
   async function checkpointNow(): Promise<void> {
     creatingNow = true;
@@ -108,27 +271,21 @@
     }
   }
 
-  function triggerIcon(trigger: Checkpoint['trigger']): string {
-    switch (trigger) {
-      case 'prompt': return '💬';
-      case 'burst': return '⚡';
-      case 'manual': return '📌';
-      case 'pre-restore': return '⏮';
-    }
-  }
-
-  function triggerTitle(trigger: Checkpoint['trigger']): string {
-    switch (trigger) {
-      case 'prompt': return 'Automatic — fired by a prompt';
-      case 'burst': return 'Automatic — fired by a burst of file activity';
-      case 'manual': return 'Manual — "Checkpoint now"';
-      case 'pre-restore': return 'Automatic safety net taken right before a restore';
-    }
-  }
-
   function formatTime(iso: string): string {
     const d = new Date(iso);
     return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  }
+
+  function formatMs(ms: number): string {
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? String(ms) : d.toLocaleString();
+  }
+
+  /// The one-line summary of a contamination row.
+  function headline(row: Extract<TimelineRow, { kind: 'contamination' }>): string {
+    if (!row.opened) return 'Contamination flag cleared';
+    const where = row.opened.host ? ` · ${row.opened.host}` : '';
+    return `External content entered this tab — ${row.opened.tool}${where}`;
   }
 </script>
 
@@ -140,50 +297,165 @@
     <button type="button" class="refresh" onclick={refresh} disabled={loading}>Refresh</button>
   </div>
 
+  <!-- Step 5a: what this view cannot show, said out loud. Rendered above the
+       rows and independently of them — an empty list with a suppressed notice
+       is the exact failure these exist to prevent. -->
+  {#each notices as n (n.kind)}
+    <p class="msg notice" class:err={n.kind === 'error'} class:unknown={n.kind === 'not-retained'}>
+      {n.text}
+    </p>
+  {/each}
+  {#if armNote}
+    <p class="msg notice">{armNote}</p>
+  {/if}
+  {#if actionError}
+    <p class="msg err">{actionError}</p>
+  {/if}
+
   {#if loadError}
     <p class="msg err">Couldn't load checkpoints: {loadError}</p>
-  {:else if loading && checkpoints.length === 0}
+  {:else if loading && rows.length === 0}
     <p class="msg">Loading…</p>
-  {:else if checkpoints.length === 0}
+  {:else if rows.length === 0}
     <p class="msg">
       No checkpoints yet. They're created automatically (per prompt, or after a
       burst of file activity) or on demand with "Checkpoint now" above.
     </p>
   {:else}
     <div class="rows">
-      {#each checkpoints as cp (cp.id)}
-        <div class="row">
-          <div class="row-main">
-            <span class="trigger" title={triggerTitle(cp.trigger)}>{triggerIcon(cp.trigger)}</span>
-            <span class="time">{formatTime(cp.ts)}</span>
-            <span class="label" title={cp.label}>{cp.label}</span>
-            <span class="files">{cp.files_changed} file{cp.files_changed === 1 ? '' : 's'}</span>
-            <span class="agent">{cp.agent ?? '—'}</span>
-            <span class="actions">
-              <button type="button" onclick={() => void toggleDiff(cp.id)}>
-                {openDiffFor === cp.id ? 'Hide diff' : 'Diff vs now'}
-              </button>
-              <button type="button" class="restore" onclick={() => openRestoreCheckpointDialog(cp.id)}>
-                Restore
-              </button>
-            </span>
+      {#each rows as row (row.key)}
+        {#if row.kind === 'checkpoint'}
+          {@const cp = row.checkpoint}
+          <div class="row">
+            <div class="row-main">
+              <span class="trigger" title={rowTitle(row)}>{rowIcon(row)}</span>
+              <span class="time">{formatTime(cp.ts)}</span>
+              <span class="label" title={cp.label}>{cp.label}</span>
+              <span class="files">{cp.files_changed} file{cp.files_changed === 1 ? '' : 's'}</span>
+              <span class="agent">{cp.agent ?? '—'}</span>
+              <span class="actions">
+                <button type="button" onclick={() => void toggleDiff(cp.id)}>
+                  {openDiffFor === cp.id ? 'Hide diff' : 'Diff vs now'}
+                </button>
+                <button type="button" class="restore" onclick={() => openRestoreCheckpointDialog(cp.id)}>
+                  Restore
+                </button>
+              </span>
+            </div>
+            {#if openDiffFor === cp.id}
+              <div class="row-diff">
+                {#if diffLoading.has(cp.id)}
+                  <p class="msg">Loading diff…</p>
+                {:else if diffErrors.get(cp.id)}
+                  <p class="msg err">{diffErrors.get(cp.id)}</p>
+                {:else}
+                  <CheckpointDiffView
+                    files={diffFiles.get(cp.id) ?? []}
+                    fetchFull={() => workbenchCheckpointDiff(cp.id, FULL_FILE_CONTEXT)}
+                    stateKey={`timeline:${cp.id}`}
+                  />
+                {/if}
+              </div>
+            {/if}
           </div>
-          {#if openDiffFor === cp.id}
-            <div class="row-diff">
-              {#if diffLoading.has(cp.id)}
-                <p class="msg">Loading diff…</p>
-              {:else if diffErrors.get(cp.id)}
-                <p class="msg err">{diffErrors.get(cp.id)}</p>
-              {:else}
-                <CheckpointDiffView
-                  files={diffFiles.get(cp.id) ?? []}
-                  fetchFull={() => workbenchCheckpointDiff(cp.id, FULL_FILE_CONTEXT)}
-                  stateKey={`timeline:${cp.id}`}
-                />
+        {:else}
+          {@const latch = latchFor(row.tab)}
+          {@const memoryNote = latchAlsoHoldsMemory(latch?.latch)}
+          {@const target = restoreTarget(row.link)}
+          <div class="row contam" class:resolved={row.cleared !== null}>
+            <div class="row-main">
+              <span class="trigger" title={rowTitle(row)}>{rowIcon(row)}</span>
+              <span class="time">{formatMs(row.tsMs)}</span>
+              <span class="label">{headline(row)}</span>
+              <span class="agent">{row.scope}</span>
+            </div>
+            <div class="row-detail">
+              <!-- The join's limits, on the row they apply to. `linkLine` names
+                   whose checkpoint this is; it is never presented as "this
+                   tab's restore point" unless it is one. -->
+              <p class="line">{linkLine(row.link)}</p>
+              {#if row.opened?.session}
+                <p class="line dim">
+                  Started in session <code>{row.opened.session}</code>. The flag belongs to the
+                  tab, not to that conversation — it survives a <code>/clear</code>, so a later
+                  session on this tab is covered by this same row and writes no second one.
+                </p>
+              {/if}
+              {#if row.opened === null}
+                <p class="line dim">
+                  The event that set the flag is no longer retained, so there is nothing to
+                  correlate this to.
+                </p>
+              {/if}
+              {#if row.cleared}
+                <p class="line ok">{clearedLine(row.cleared)} · {formatMs(row.cleared.ts_ms)}</p>
+              {/if}
+
+              {#if row.cleared === null}
+                {#if memoryNote}
+                  <!-- Step 5d. Same sentence as the popover's, from
+                       `timeline.ts` — two surfaces phrasing one rule in their
+                       own words is how they come to disagree. -->
+                  <p class="line warn">{memoryNote}</p>
+                {/if}
+                {#if latch?.can_clear}
+                  <div class="row-actions">
+                    {#if target}
+                      <button
+                        type="button"
+                        class="restore"
+                        disabled={actionBusy}
+                        onclick={() => restoreFrom(target.id, latch)}
+                      >
+                        Restore to before this…
+                      </button>
+                    {/if}
+                    {#if confirmingClear === row.key}
+                      <button
+                        type="button"
+                        class="danger"
+                        disabled={actionBusy}
+                        onclick={() => void run(latch, 'clear_contamination')}
+                      >
+                        Yes, clear the flag
+                      </button>
+                      <button type="button" onclick={() => (confirmingClear = null)}>Cancel</button>
+                    {:else}
+                      <button type="button" onclick={() => (confirmingClear = row.key)}>
+                        Mark false positive…
+                      </button>
+                    {/if}
+                  </div>
+                  {#if confirmingClear === row.key}
+                    <p class="line warn">
+                      Clearing says the flagged content was harmless. If it was not, this tab's
+                      memory writes stop being held for review while a model that read it is
+                      still running. The conversation is not changed — nothing is restarted and
+                      nothing is rolled back.
+                    </p>
+                  {/if}
+                  {#if latch.awaiting_session_clear}
+                    <p class="line dim">
+                      A restore was recorded for this tab: the flag lifts once cImp sees it start
+                      a new session.
+                    </p>
+                  {/if}
+                {:else if row.tab === null}
+                  <p class="line dim">
+                    cImp could not read which tab this event belongs to, so it cannot offer the
+                    flag actions here. They are on the tab's own containment badge.
+                  </p>
+                {:else}
+                  <p class="line dim">
+                    cImp holds no live containment state for {row.scope} — the tab has made no
+                    gated call this run, so there is no flag here to act on. If it is open, its
+                    containment badge is the place to check.
+                  </p>
+                {/if}
               {/if}
             </div>
-          {/if}
-        </div>
+          </div>
+        {/if}
       {/each}
     </div>
   {/if}
@@ -230,6 +502,19 @@
     color: var(--text-danger-soft, #ff8a80);
     font-style: normal;
   }
+  .msg.notice {
+    opacity: 1;
+    font-style: normal;
+    color: var(--text-secondary, #bbb);
+    line-height: 1.45;
+    margin: 0;
+  }
+  /* A claim we cannot verify wears the dashed treatment `latch.ts` established
+     for its unknown states — this is "we cannot see it", not "it is fine". */
+  .msg.unknown {
+    color: var(--awaiting, #d0a24c);
+    border-bottom: 1px dashed var(--border-default, #555);
+  }
   .rows {
     display: flex;
     flex-direction: column;
@@ -240,6 +525,13 @@
     border-radius: var(--radius-md, 6px);
     overflow: hidden;
   }
+  /* An event, not a restore point — it must not read as another checkpoint. */
+  .row.contam {
+    border-color: var(--border-danger, #a33);
+  }
+  .row.contam.resolved {
+    border-color: var(--border-subtle, #444);
+  }
   .row-main {
     display: flex;
     align-items: center;
@@ -247,6 +539,12 @@
     padding: 6px 10px;
     background: var(--surface-2, #232323);
     flex-wrap: wrap;
+  }
+  .row.contam .row-main {
+    background: var(--surface-danger-soft, #2b1f1f);
+  }
+  .row.contam.resolved .row-main {
+    background: var(--surface-2, #232323);
   }
   .trigger {
     flex: 0 0 auto;
@@ -281,7 +579,8 @@
     display: inline-flex;
     gap: 4px;
   }
-  .actions button {
+  .actions button,
+  .row-actions button {
     appearance: none;
     background: transparent;
     border: 1px solid var(--border-subtle, #444);
@@ -291,13 +590,47 @@
     font-size: var(--font-size-xs, 11px);
     cursor: pointer;
   }
-  .actions button:hover {
+  .actions button:hover,
+  .row-actions button:hover {
     background: var(--surface-3, #2a2a2a);
     color: var(--text-primary, #ddd);
   }
-  .actions button.restore {
+  .actions button.restore,
+  .row-actions button.restore,
+  .row-actions button.danger {
     border-color: var(--border-danger, #a33);
     color: var(--text-danger-soft, #ff8a80);
+  }
+  .row-detail {
+    padding: 6px 10px 8px;
+    background: var(--surface-sunken, #1a1a1a);
+    border-top: 1px solid var(--border-faint, #333);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .row-detail .line {
+    margin: 0;
+    line-height: 1.45;
+    color: var(--text-secondary, #bbb);
+  }
+  .row-detail .line.dim {
+    color: var(--text-tertiary, #999);
+  }
+  .row-detail .line.warn {
+    color: var(--awaiting, #d0a24c);
+  }
+  .row-detail .line.ok {
+    color: var(--text-success, #7ec699);
+  }
+  .row-detail code {
+    font-family: var(--font-mono, monospace);
+    color: var(--text-primary, #ddd);
+  }
+  .row-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
   }
   .row-diff {
     padding: 8px 10px;

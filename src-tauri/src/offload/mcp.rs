@@ -397,9 +397,18 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 // cross-process DB open; lets the app record it for the monitor
                 // and scope memory to this consumer). Fall back to a direct
                 // read-only open when the app isn't up.
+                //
+                // #48 finding M-8: the fallback is handed this child's TAB
+                // identity, because that is what decides whether it may still
+                // serve LOCAL-CAPABILITY there — a tab has a latch in the app
+                // that this path cannot read, a hand-run/cron child has no latch
+                // anywhere. See `graph::mcp::headless_refusal`. It is NOT handed
+                // the `ProxyMiss` reason: every reason is reachable with one
+                // `Write` to `.cimp-discovery/`, so the reason is the
+                // attacker's to choose (same doc comment).
                 match proxy_graph(&params).await {
                     Some(r) => r,
-                    None => crate::graph::handle_mcp_call(&params, consumer()).await,
+                    None => crate::graph::handle_mcp_call(&params, consumer(), tab()).await,
                 }
             } else if name == "offload_batch" {
                 handle_batch_tool(params).await

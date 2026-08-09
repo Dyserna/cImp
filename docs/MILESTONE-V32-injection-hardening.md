@@ -1242,6 +1242,35 @@ declares its class AND its mutation capability in one reviewed place.
     that is the fail-open half, recorded in Accepted residuals.
     Recorded as built in the Phase C2 amendment 2026-08-08 (M-2 + N-1);
     live-verification recipe 17. Extends decision 10.
+    **Amendment (#48 finding M-8, _hash pending_) — the same path also refuses
+    LOCAL-CAPABILITY, but only for a child that serves a cImp TAB.** "Reads stay
+    fail-open" was true of the tool *kind* and false of the *class*: past the
+    write gate sat `run_check` (executes the project's configured build/test/lint
+    commands) and six graph tools that return repo source text — the exact class
+    an EXTERNAL latch exists to withdraw, served with the latch unconsulted. The
+    gate is now one class-driven decision (`graph::mcp::headless_refusal`)
+    consulted as the FIRST thing `handle_call` does, above the `run_check`
+    dispatch and above the index open.
+    *Rejected:* key the decision on the `ProxyMiss` reason (allow under
+    `Transport`, refuse under the attacker-manufacturable ones). Every reason is
+    reachable with a single `Write` — truncating the discovery file gives
+    `NoInstance`, **adding** a well-formed entry with a deeper `root` and a dead
+    `port` gives `Transport`, since `select_discovery` prefers the deepest
+    matching root — so the attacker picks the key. *Rejected:* refuse `run_check`
+    headless unconditionally — `ARCHITECTURE.md` § *Warm pool vs. fallback child*
+    makes headless `claude -p` / cron a first-class supported flow, so that is a
+    product regression, not a fix.
+    The discriminator is the child's `--tab` argv, baked in by cImp at spawn on
+    both consumers' paths and unreachable from any request body: `Some` ⇒ a latch
+    for this tab exists in the app and this frame cannot read it; `None` ⇒ the
+    child was not spawned by cImp, has no latch scope anywhere, and would be
+    ungated on the app path too (`latch_scope`'s locked fail-open, F-5/H-8). The
+    invariant restored is **the headless path is never more permissive than the
+    app path would be for the same caller identity**.
+    **Accepted consequence:** a tab whose latch is `Open` also loses these tools
+    while the app is unreachable — the only direction available to a frame that
+    cannot read the latch, in an already-anomalous window (an AI tab is a cImp
+    webview, so cImp being down normally means the tab is gone too).
 22. **Credentials are screened at `context_note` WRITE time, and a hit is
     stored-and-quarantined (user decision 2026-08-08, #48; `b63ebfb`).**
     `context_recall`/`context_notes` are TRUSTED — never latched, never blocked

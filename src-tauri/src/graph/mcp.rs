@@ -499,7 +499,16 @@ fn mem_agent(source: &str) -> Option<&str> {
 /// (`"claude"` / `"opencode"`). Returns a JSON-RPC `tools/call` result; a
 /// missing index or bad args come back as a (non-protocol) tool error so the
 /// agent can read and adapt. Unknown tool names are a protocol error.
-pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, String)> {
+///
+/// `tab` is the cImp tab id the calling MCP child was spawned for
+/// (`--tab <id>`), or `None` for a child cImp did not spawn — the fact
+/// [`headless_refusal`] gates on. It is argv, fixed at spawn, and reaches this
+/// frame without passing through any request body.
+pub async fn handle_call(
+    params: &Value,
+    consumer: &str,
+    tab: Option<&str>,
+) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
@@ -507,6 +516,15 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
     let sub = db_subdir(&settings);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let source = source_for_consumer(consumer);
+
+    // #48, findings M-2 and M-8 — the headless path's ONE class gate, and it is
+    // deliberately the first thing in this function: it must sit above the
+    // `run_check` dispatch below (which was M-8: the one tool that EXECUTES
+    // processes was dispatched before any gate ran) and above the index open.
+    // See [`headless_refusal`] for the argument in both directions.
+    if let Some(refusal) = headless_refusal(name, tab) {
+        return Ok(refuse_headless(&cwd, &sub, source, name, &args, refusal));
+    }
 
     // `run_check` needs a project root but NOT a built code graph (V12 Phase
     // A: checks are independent of the graph feature). Resolve root the same
@@ -519,15 +537,6 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
             Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
             Err(msg) => Ok(tool_error(&msg)),
         };
-    }
-
-    // V32 Phase C2, #48 finding M-2 (user decision 2026-08-07): a PERSISTENT
-    // WRITE is REFUSED on this path, before the index is even opened. Reads stay
-    // fail-open below. See [`HEADLESS_WRITE_UNAVAILABLE`] for the whole
-    // argument; the check is `classify`, not a name, so a future
-    // PERSISTENT-WRITE tool inherits it without anyone remembering to.
-    if headless_write_refused(name) {
-        return Ok(refuse_headless_write(&cwd, &sub, source, name, &args));
     }
 
     let (root, idx) = match open_project_index(&cwd, &sub) {
@@ -543,8 +552,16 @@ pub async fn handle_call(params: &Value, consumer: &str) -> Result<Value, (i64, 
     // process this path exists precisely because it could not reach. `Clean` is
     // what reaches the tools below, and it is now safe for the reason it was
     // NOT safe before: the one tool that consumed it, `context_note`, no longer
-    // reaches this line (the refusal above). Everything past here is a read,
-    // for which fail-open is the documented and intended posture.
+    // reaches this line (the refusal above).
+    //
+    // #48 finding M-8 amends the sentence that used to follow — "everything past
+    // here is a read, for which fail-open is the documented posture". True of
+    // the tool KIND and false of the CLASS: `run_check` executes processes and
+    // six graph tools return source text, all LOCAL-CAPABILITY, all of them
+    // reaching this line unlatched. They no longer do for a child that serves a
+    // cImp tab; see [`headless_refusal`]. What is left past this line is TRUSTED
+    // plus, for a child with no tab identity, the LOCAL-CAPABILITY tools that
+    // would be ungated on the app path too.
     //
     // V32 Phase G: the recall envelope, unlike the latch, needs no registry —
     // only settings, which this path already read. It therefore resolves for
@@ -615,32 +632,102 @@ pub const HEADLESS_WRITE_UNAVAILABLE: &str = "NOT SAVED: cImp is not running, so
     Include the finding in your answer now, and re-save it with `context_note` once cImp is \
     running — this is a transient condition, not a permanent boundary.";
 
-/// The headless path's write gate, as a predicate over the tool name.
+/// #48, finding M-8 — served when a LOCAL-CAPABILITY tool is called on the
+/// **headless** path by a child that belongs to a cImp TAB.
+///
+/// Same shape and same three facts as [`HEADLESS_WRITE_UNAVAILABLE`] (what
+/// happened, that nothing ran, the one action that changes it), and transient
+/// for the same reason. It names no tool, no path and no latch state: like every
+/// other boundary string it must not be shapeable or probeable by the model.
+pub const HEADLESS_CAPABILITY_UNAVAILABLE: &str = "NOT RUN: cImp is not reachable, so this tab's \
+    contamination state cannot be checked, and cImp does not run local-capability tools for one of \
+    its own tabs without that check. Nothing ran and nothing was read. Say so in your answer and \
+    retry once cImp is running — this is a transient condition, not a permanent boundary.";
+
+/// The headless path's ONE gate: what a child that could not reach the app may
+/// still serve, given whether it belongs to a cImp tab.
 ///
 /// Split out of [`handle_call`] so the property that matters — *which* tools
-/// this refuses — is assertable without a process cwd, a global settings
-/// snapshot and an on-disk index. It reads the class table rather than naming
-/// `context_note`, so a future PERSISTENT-WRITE tool is covered the day it is
+/// this refuses, under which identity — is assertable without a process cwd, a
+/// global settings snapshot and an on-disk index. It reads the class table
+/// rather than naming tools, so a newly classified tool is covered the day it is
 /// classified, not the day someone remembers this line.
-fn headless_write_refused(name: &str) -> bool {
-    classify(name) == ToolClass::PersistentWrite
+///
+/// # PERSISTENT-WRITE — refused always (M-2, user decision 2026-08-07)
+///
+/// See [`HEADLESS_WRITE_UNAVAILABLE`]. Unchanged by M-8.
+///
+/// # LOCAL-CAPABILITY — refused when, and only when, `tab` is `Some`
+///
+/// This path has no latch: the registry lives in the app process this path
+/// exists precisely because it could not reach. That was argued safe for reads
+/// on the grounds that the only tool which consumed the latch no longer reached
+/// the dispatch. It is not safe for LOCAL-CAPABILITY, which is `run_check`
+/// (executes the project's configured build/test/lint commands),
+/// `graph_snippet`/`graph_struct_search`/`graph_repo_map` and the semantic/doc
+/// searches (return repo source text) — exactly the class an EXTERNAL latch
+/// exists to withdraw, served here with the latch unconsulted.
+///
+/// **Why the fallback REASON is not the discriminator.** It is tempting to allow
+/// LOCAL-CAPABILITY under `ProxyMiss::Transport` ("the app is genuinely
+/// unreachable — the case the fallback was designed for") and refuse it under
+/// the attacker-manufacturable ones. That buys nothing here: every reason is
+/// reachable with a single `Write`, the one tool cImp has decided it cannot gate
+/// (see the harness-native rows in `toolclass::TABLE`). Truncating
+/// `<portable_root>/.cimp-discovery/<pid>.json` yields `NoInstance`; *adding* a
+/// well-formed entry whose `root` is a deeper ancestor of the child's cwd and
+/// whose `port` is dead yields `Transport`, because
+/// `loopback::select_discovery` prefers the deepest matching root. A gate keyed
+/// on the reason is a gate the attacker picks the key for.
+///
+/// **Why `tab` IS the discriminator.** `--tab <id>` is argv, composed entirely
+/// by cImp at spawn on both consumers' paths (`tabs/config.rs` — pinned by
+/// `claude_mcp_child_carries_its_own_tab_id` and its OpenCode mirror) and
+/// nothing in a request body can reach it. `Some` therefore means *this child
+/// serves a cImp tab, so a latch for it exists in the app* — and going headless
+/// is bypassing a latch, whatever made the app unreachable. `None` means the
+/// child was not spawned by cImp at all: the documented first-class headless
+/// consumers (`claude -p`, cron — `docs/ARCHITECTURE.md` § Warm pool vs.
+/// fallback) have no tab, no latch scope anywhere, and would be UNGATED on the
+/// app path too (`latch_scope`'s locked fail-open, F-5/H-8). So the invariant
+/// this restores is: **the headless path is never more permissive than the app
+/// path would be for the same caller identity.**
+///
+/// The cost is stated rather than hidden: a tab whose latch is `Open` also loses
+/// these tools while the app is unreachable. That window is already anomalous —
+/// an AI tab is a cImp webview, so cImp being down normally means the tab is
+/// gone too — and it fails closed, which is the only direction available to a
+/// frame that cannot read the latch.
+fn headless_refusal(name: &str, tab: Option<&str>) -> Option<&'static str> {
+    match classify(name) {
+        ToolClass::PersistentWrite => Some(HEADLESS_WRITE_UNAVAILABLE),
+        ToolClass::LocalCapability if tab.is_some() => Some(HEADLESS_CAPABILITY_UNAVAILABLE),
+        _ => None,
+    }
 }
 
-/// Refuse a headless PERSISTENT-WRITE and record it, so the fallback is visible
-/// in Tool Activity instead of being indistinguishable from a normal write.
+/// Refuse a headless call and record it, so the fallback is visible in Tool
+/// Activity instead of being indistinguishable from a served call.
 ///
 /// The row is written directly rather than through [`dispatch_recorded`]:
 /// that function requires an open [`GraphIndex`], and the refusal must hold even
 /// when the index cannot be opened at all. `ok: false` is honest — the caller
-/// asked for a write and did not get one, which is exactly the shape
+/// asked for work and did not get it, which is exactly the shape
 /// `dispatch_recorded` would have recorded for an error result.
-fn refuse_headless_write(cwd: &Path, sub: &str, source: &str, name: &str, args: &Value) -> Value {
+fn refuse_headless(
+    cwd: &Path,
+    sub: &str,
+    source: &str,
+    name: &str,
+    args: &Value,
+    message: &'static str,
+) -> Value {
     let started = crate::activity::now_ms();
     let root = find_graph_root(cwd, sub).unwrap_or_else(|| cwd.to_path_buf());
     tracing::warn!(
         target: "graph",
         tool = %name,
-        "graph: refused a persistent memory write on the headless path (cImp is not running)"
+        "graph: refused a call on the headless path (cImp is not reachable)"
     );
     crate::activity::record_bg(crate::activity::ActivityRecord {
         entry: crate::activity::ActivityEntry::new(
@@ -650,14 +737,14 @@ fn refuse_headless_write(cwd: &Path, sub: &str, source: &str, name: &str, args: 
             source.to_string(),
             name.to_string(),
             arg_summary(name, args),
-            HEADLESS_WRITE_UNAVAILABLE.chars().count(),
+            message.chars().count(),
             0,
             false,
         ),
         request: serde_json::to_string_pretty(args).unwrap_or_default(),
-        response: HEADLESS_WRITE_UNAVAILABLE.to_string(),
+        response: message.to_string(),
     });
-    json!({ "content": [{ "type": "text", "text": HEADLESS_WRITE_UNAVAILABLE }] })
+    json!({ "content": [{ "type": "text", "text": message }] })
 }
 
 /// Execute one resolved `graph_*` / `context_*` tool against an open index —
@@ -3971,9 +4058,13 @@ mod memory_write_boundary_tests {
         // Exactly the PERSISTENT-WRITE tools are refused — no read is caught in
         // the blast radius, which is the half of the user's decision that
         // preserves locked decision 10's rationale for reads.
+        // `tab: None` — a child cImp did not spawn, which is the identity M-8's
+        // LOCAL-CAPABILITY gate deliberately leaves untouched, so this stays the
+        // statement M-2 made: with nothing but the class table to go on, the
+        // writes and only the writes are refused.
         let mut refused: Vec<&str> = Vec::new();
         for spec in tool_specs() {
-            if headless_write_refused(spec.name) {
+            if headless_refusal(spec.name, None).is_some() {
                 refused.push(spec.name);
             }
         }
@@ -4035,8 +4126,9 @@ mod memory_write_boundary_tests {
             );
             assert_eq!(notes[0].session_id, "", "and carries no attribution");
         }
-        assert!(
-            headless_write_refused("context_note"),
+        assert_eq!(
+            headless_refusal("context_note", None),
+            Some(HEADLESS_WRITE_UNAVAILABLE),
             "which is why the headless path must not be able to make one"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4137,5 +4229,159 @@ mod memory_write_boundary_tests {
         assert!(out.contains("HELD FOR REVIEW (secret screen)"), "{out}");
         assert_eq!(idx.mem_quarantined_count().expect("count"), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #48, finding M-8 — the headless path's LOCAL-CAPABILITY boundary: the class
+/// that EXECUTES and the class that returns source text, served with no latch
+/// because the latch lives in the process this path could not reach.
+#[cfg(test)]
+mod headless_capability_boundary_tests {
+    use super::*;
+    use crate::offload::toolclass::TABLE;
+
+    /// The LOCAL-CAPABILITY tools this dispatch can serve, written out by hand.
+    ///
+    /// By hand on purpose. A list recomputed from `classify` would agree with
+    /// [`headless_refusal`] no matter what either of them said — the two would
+    /// be the same expression twice. This one is checked *against* the table
+    /// below, in both directions, so a demotion, a promotion or a new tool all
+    /// have to come past this test.
+    const HEADLESS_LOCAL_CAPABILITY: &[&str] = &[
+        // Executes the project's configured build/test/lint commands. The one
+        // M-8 names, and the sharpest: it is process execution.
+        "run_check",
+        // Return repo SOURCE TEXT (the H-1 demotions and their neighbours).
+        "graph_snippet",
+        "graph_search_docs",
+        "graph_semantic_docs",
+        "graph_semantic_code",
+        "graph_struct_search",
+        "graph_repo_map",
+    ];
+
+    /// The hand-written list and the class table agree, in both directions.
+    #[test]
+    fn the_named_tools_are_exactly_this_surface_s_local_capability_rows() {
+        for n in HEADLESS_LOCAL_CAPABILITY {
+            assert_eq!(classify(n), ToolClass::LocalCapability, "{n}");
+        }
+        // …and nothing this dispatch serves is missing from the list: every
+        // LOCAL-CAPABILITY row that is a `graph_*` tool or `run_check` (i.e.
+        // reachable through `handle_call`) must be named above. `hook_*` rows
+        // are route gates, not tools, and are excluded by the same predicate.
+        let mut from_table: Vec<&str> = TABLE
+            .iter()
+            .filter(|r| r.class == ToolClass::LocalCapability)
+            .map(|r| r.name)
+            .filter(|n| n.starts_with("graph_") || *n == "run_check")
+            .collect();
+        from_table.sort_unstable();
+        let mut named = HEADLESS_LOCAL_CAPABILITY.to_vec();
+        named.sort_unstable();
+        assert_eq!(
+            from_table, named,
+            "a LOCAL-CAPABILITY tool reachable on the headless path is not in this test's list"
+        );
+    }
+
+    /// The gate itself, on the axis that decides it.
+    ///
+    /// A cImp-spawned tab child has a latch in the app that this path cannot
+    /// read, so LOCAL-CAPABILITY is refused. A child cImp did not spawn (the
+    /// documented `claude -p` / cron consumer) has no latch scope anywhere and
+    /// would be ungated on the app path too, so it keeps them.
+    #[test]
+    fn local_capability_is_refused_for_a_tab_child_and_kept_for_a_hand_run_one() {
+        for n in HEADLESS_LOCAL_CAPABILITY {
+            assert_eq!(
+                headless_refusal(n, Some("claude")),
+                Some(HEADLESS_CAPABILITY_UNAVAILABLE),
+                "{n} must not run unlatched for a tab child"
+            );
+            assert_eq!(
+                headless_refusal(n, None),
+                None,
+                "{n} must still serve the headless/cron consumer"
+            );
+        }
+
+        // The other three classes are unmoved by the tab axis: TRUSTED is
+        // available under every latch by definition, a write is refused under
+        // both identities, and an unknown name (⇒ EXTERNAL) is not this path's
+        // to gate — it never reaches this dispatch at all.
+        for tab in [None, Some("claude")] {
+            assert_eq!(headless_refusal("graph_outline", tab), None);
+            assert_eq!(headless_refusal("context_notes", tab), None);
+            assert_eq!(headless_refusal("context_recall", tab), None);
+            assert_eq!(
+                headless_refusal("context_note", tab),
+                Some(HEADLESS_WRITE_UNAVAILABLE)
+            );
+            assert_eq!(headless_refusal("ddg__search", tab), None);
+        }
+    }
+
+    /// The refusal string states the same three facts as the write one and
+    /// carries no dynamic content — it is a security boundary the model must
+    /// not be able to shape or probe.
+    #[test]
+    fn the_capability_refusal_is_a_fixed_content_free_string() {
+        assert!(HEADLESS_CAPABILITY_UNAVAILABLE.starts_with("NOT RUN"));
+        assert!(HEADLESS_CAPABILITY_UNAVAILABLE.contains("cImp is not reachable"));
+        assert!(HEADLESS_CAPABILITY_UNAVAILABLE.contains("transient"));
+        assert!(!HEADLESS_CAPABILITY_UNAVAILABLE.contains('{'));
+        assert_ne!(HEADLESS_CAPABILITY_UNAVAILABLE, HEADLESS_WRITE_UNAVAILABLE);
+    }
+
+    /// **The PoC.** Drive the REAL entry point, not the predicate: an
+    /// EXTERNAL-latched tab whose `.cimp-discovery` entry no longer resolves
+    /// falls to this dispatch and asks for `run_check`.
+    ///
+    /// This is the test the finding is about. `run_check` was dispatched at the
+    /// TOP of `handle_call`, above every gate, so before the fix this call
+    /// reached `run_check_tool` and executed the project's configured commands.
+    /// Asserting `headless_refusal` alone would have stayed green through
+    /// exactly that defect, which is why the call goes through `handle_call`.
+    #[tokio::test]
+    async fn a_tab_child_that_falls_headless_cannot_run_the_project_s_checks() {
+        let out = handle_call(
+            &json!({ "name": "run_check", "arguments": {} }),
+            "claude",
+            Some("claude"),
+        )
+        .await
+        .expect("a refusal is a tool result, not a protocol error");
+        assert_eq!(
+            out["content"][0]["text"].as_str(),
+            Some(HEADLESS_CAPABILITY_UNAVAILABLE),
+            "run_check ran (or errored) instead of being refused: {out}"
+        );
+    }
+
+    /// The other half at the same entry point: with no tab identity the call is
+    /// NOT refused — it goes on to the ordinary dispatch. Pinned through
+    /// `handle_call` so that a fix which hard-codes the gate on (rather than
+    /// threading the child's identity) fails here.
+    ///
+    /// `graph_snippet` rather than `run_check` deliberately: this assertion
+    /// requires the call to proceed, and the only LOCAL-CAPABILITY tool whose
+    /// proceeding starts a process is the one it must therefore avoid. What it
+    /// proceeds *to* is unasserted — with no index under the test's cwd it is a
+    /// tool error — because the property under test is "not the refusal".
+    #[tokio::test]
+    async fn a_hand_run_child_is_not_refused_at_the_same_entry_point() {
+        let out = handle_call(
+            &json!({ "name": "graph_snippet", "arguments": {} }),
+            "claude",
+            None,
+        )
+        .await
+        .expect("tool result");
+        assert_ne!(
+            out["content"][0]["text"].as_str(),
+            Some(HEADLESS_CAPABILITY_UNAVAILABLE),
+            "the documented headless/cron consumer must keep its tools: {out}"
+        );
     }
 }

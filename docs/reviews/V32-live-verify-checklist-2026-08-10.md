@@ -12,7 +12,7 @@ recipe 7 passed while describing the wrong behaviour.
 closed by code review plus unit tests. This is the release gate.
 
 Record per recipe: PASS / FAIL / BLOCKED + the finding id if it raises one.
-New findings continue the F-series (next free: **F-18**).
+New findings continue the F-series (next free: **F-20**).
 
 ---
 
@@ -27,6 +27,24 @@ New findings continue the F-series (next free: **F-18**).
 > "Click to open Settings" opens no section at all
 > (`InjectionBadge.svelte:44` calls `openSettingsWindow()` with no argument,
 > though `settings-deep-link` handling exists at `SettingsApp.svelte:1274`).
+
+> **Cost, found live 2026-08-10 against rc.2 (F-19).** `default_llm_pricing()`
+> (`src-tauri/src/settings/schema.rs:548-605`) has no `claude-opus-5` row —
+> Fable 5, Opus 4.8/4.7/4.6, Sonnet 5/4.6 and Haiku 4.5 are all seeded, Opus 5
+> is not. A session on the current default model therefore auto-matches no
+> `model_prefix`, so the Usage view's cost mode falls back to manual-pick and
+> reads $0 until the row is added by hand (which is what the live run did).
+>
+> Adding the row fixes **fresh installs only.** `read_global_llm_pricing`
+> (`settings/persistence.rs:386-402`) seeds defaults *only when the global file
+> is absent*; a file that carries `llm_pricing` — even as `[]` — keeps exactly
+> what it has, by design, because the table is user-editable and a merge would
+> fight the user's own edits. So every existing install stays wrong after a
+> code fix. Closing F-19 properly needs **both**: the seed row, and a one-time
+> migration that appends built-in rows whose `model_prefix` is absent from the
+> stored table (append-only — it must never touch a price the user has edited).
+>
+> Not a V32 finding; recorded here because rc.2 is what surfaced it.
 
 - [ ] **Where does the seeded injection page live?** Recipes 1, 3, 9, 10 and 14
       need a page containing a visible injection payload, fetched through
@@ -477,5 +495,7 @@ Seeing them live is useful (note it against the id); filing them again is not.
 | A denied URL still leaks its hostname to DNS | F-8 |
 | `MemoryQuarantine` rows with an empty `root` vanish from a root-filtered view | F-16 |
 | A stale `cimp-<hash>.exe` wedges the next link with `LNK1104` (`Stop-Process`) | F-17 |
+| Every V32 switch is under "Offload task tools"; every pointer says "Tools" | F-18 |
+| No `claude-opus-5` row in the seeded price table — cost reads $0 until added by hand | F-19 |
 | `run_check` advertised to a cloud backend | **F-12 — open, HIGH, needs your decision** |
 | A cloned repo's `opencode.json` is executed configuration | **H-7 — open, largely V33** |

@@ -86,15 +86,36 @@ Recipes 11/11b stage the manifest on a local server that answers 200 and
 **structurally cannot** catch this. Do both legs **before** the first real
 publish (decision 24 / deploy step 3).
 
-- [ ] `offload.detection_update_manifest_url` → a **throwaway ref on the real
+- [x] `offload.detection_update_manifest_url` → a **throwaway ref on the real
       host** (`https://raw.githubusercontent.com/<owner>/<repo>/<ref>/manifest.json`)
       with one valid bundle behind it → one live run reports **`applied`**.
+      **PASS 2026-08-10** against `detection-v1-rehearsal` (bundle
+      `2026.08.09.1`): "activated rules `2026.08.09.1`: 3 file(s), 19 rule(s)
+      live. Validated against 3 benign + 4 hostile control document(s) (compile
+      43 ms, slowest scan 0 ms). The previous bundle is retained and can be
+      reverted from Settings; `rules.d/local/` was not touched." So the whole
+      gauntlet ran, not just the download — smoke corpus, coverage floor,
+      archive-for-revert and the `local/` non-recursion all confirmed live.
 - [ ] Negative control: point it at a **release-asset** URL
       (`https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json`)
       → run ends **`Unavailable`** with the redirect named in the logged reason.
-      (Deliberately reproducing H-5.)
+      (Deliberately reproducing H-5.) **Still to run.** No throwaway release
+      needed — any existing asset reproduces it; confirmed 2026-08-10 that
+      `.../releases/download/v0.50.1/cimp-portable-win-x64-v0.50.1-no-models.zip`
+      still answers **302 → release-assets.githubusercontent.com**. The fetcher
+      should refuse the redirect before it ever notices the body is a zip, so a
+      non-manifest asset is a valid probe.
 
-**Result:** ____________
+**Result:** positive leg PASS 2026-08-10; negative leg outstanding.
+
+> **The channel is PUBLISHED as of 2026-08-10.** Orphan branch `detection-v1`:
+> `13a9c36` (artifacts) then `b165cea` (manifest, pushed second on purpose).
+> Bundle `2026.08.10`, byte-identical to the `rules.d/` seed in rc.2. The pinned
+> `DEFAULT_MANIFEST_URL` now answers **200, no redirect** — recipes 11/11b/11c no
+> longer need a staged bundle to have something to talk to.
+> **Housekeeping still owed:** delete `detection-v1-rehearsal` once the negative
+> leg is done, and clear any `detection_update_manifest_url` override so installs
+> fall back to the pin.
 
 ---
 

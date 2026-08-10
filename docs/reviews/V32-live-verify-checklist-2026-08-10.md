@@ -453,7 +453,18 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then: — **PASS 2026-0
       `context_recall`. Verified from a different scope: the probe note is
       absent while **other** pinned notes are returned normally, so it is
       discriminating, not blanket-hiding.
-- [ ] After explicit promote, it **does**. _(needs the Memory view — IPC-only.)_
+- [x] After explicit promote, it **does**. **PASS 2026-08-11** — promoted from
+      the Memory view, and the note then appeared in another scope's
+      `context_notes`. **Promotion is per-note, not a blanket unlock:** the three
+      other held notes stayed absent from the same call. Full lifecycle verified
+      in one run — written under an EXTERNAL latch → held → withheld from recall
+      → promoted → recalled.
+
+> **The review queue held exactly 4 notes, and that is the correct number.**
+> Five `V32 …` probe notes were written; the fifth (`recipe 16 control`, the
+> benign prose containing "key"/"token"/"password") was stored **clean** and so
+> never entered the queue — it sits in ordinary pinned memory. The queue count
+> *is* recipe 16's false-positive control passing, viewed from the other side.
 
 ### 16 — the memory secret screen (`graph::secrets`, decision 22)
 Run in an **UNLATCHED, clean** tab — independence from taint is the point.

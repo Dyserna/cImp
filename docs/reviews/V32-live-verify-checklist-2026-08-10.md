@@ -8,10 +8,11 @@ is a *pair* (one refused, one allowed), both boxes are kept adjacent, because
 running only the refusal half proves nothing — that is exactly how the old
 recipe 7 passed while describing the wrong behaviour.
 
-**Status 2026-08-10 (rc.3): 9 recipes have now run.** PASS: **1**, **2** (both
-legs), **3**, **7** (2 boxes partial), **10**, **11c** (positive leg), **13b**
-(both negative legs). PARTIAL: **22**. BLOCKED: **9** — the canary is worker-only
-and needs a compliant worker to attempt exfiltration. The rest are still unrun —
+**Status 2026-08-10 (rc.3): 12 recipes have now run.** PASS: **1**, **2** (both
+legs), **3**, **6**, **7** (2 boxes partial), **10**, **11c** (positive leg),
+**13b** (both negative legs), **16** (one box FAILS — the row count).
+PARTIAL: **9**, **13**, **22**. One box FAILED so far, and it reproduced **F-16**
+live. The rest are still unrun —
 every V32 finding before this was closed by code review plus unit tests, and this
 remains the release gate.
 
@@ -325,26 +326,57 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then:
 
 ## C. Persistence and memory containment
 
-### 6 — memory quarantine
-- [ ] Under an EXTERNAL-latched task, `context_note` with `pin=true` → note
-      appears in the Memory UI **flagged tainted**.
-- [ ] It does **not** appear in a fresh session's auto-injection or
-      `context_recall`.
-- [ ] After explicit promote, it **does**.
+### 6 — memory quarantine — **PASS 2026-08-10** (promote leg needs the UI)
+- [x] Under an EXTERNAL-latched task, `context_note` with `pin=true` → note
+      appears in the Memory UI **flagged tainted**. Served:
+      *"Noted (pinned, kept across sessions). ⚠ QUARANTINED (security boundary):
+      this session has used an external tool (web/MCP-server), so the note was
+      saved but held for review instead of entering project memory…"* plus an
+      `injection_flag / memory_quarantine / ok:true` row. **Saved, not refused** —
+      the distinction M-20 turns on.
+- [x] It does **not** appear in a fresh session's auto-injection or
+      `context_recall`. Verified from a different scope: the probe note is
+      absent while **other** pinned notes are returned normally, so it is
+      discriminating, not blanket-hiding.
+- [ ] After explicit promote, it **does**. _(needs the Memory view — IPC-only.)_
 
 ### 16 — the memory secret screen (`graph::secrets`, decision 22)
 Run in an **UNLATCHED, clean** tab — independence from taint is the point.
-- [ ] A note carrying a credential-shaped value (fake, matching a vendor-prefix
-      rule) is **stored — not refused, not redacted**.
-- [ ] It appears in the Memory view's review queue.
-- [ ] Absent from `context_recall`, `context_notes` and a fresh session's
-      auto-injection until promoted.
-- [ ] A `Screen::MemoryQuarantine` row appears with `ok: true`.
-- [ ] The notice names the matched **rules**, never the matched text.
-- [ ] **Control that matters most:** ordinary research prose containing "key",
-      "token", "password" unquoted is stored **clean**.
-- [ ] Second control: a note tripping **both** taint and the secret screen under
-      an EXTERNAL latch → both notices appended, **one** row.
+**PASS 2026-08-10 on every box except the row-count one.** Probe value was
+`AKIAIOSFODNN7EXAMPLE` — AWS's own published documentation example, so no real
+credential was used. Run on `claude:claude`, which `/status` confirmed
+`latch:"open", contaminated:false`.
+- [x] A note carrying a credential-shaped value (fake, matching a vendor-prefix
+      rule) is **stored — not refused, not redacted**. *"Noted (pinned, kept
+      across sessions). ⚠ HELD FOR REVIEW (secret screen)…"*
+- [ ] It appears in the Memory view's review queue. _(needs the UI.)_
+- [x] Absent from `context_recall`, `context_notes` and a fresh session's
+      auto-injection until promoted. Checked from a second scope: the
+      credential note absent, the benign control from the same batch present.
+- [x] A `Screen::MemoryQuarantine` row appears with `ok: true`.
+- [x] The notice names the matched **rules**, never the matched text — it says
+      `(secret_aws_access_key_id)` and the `AKIA…` value appears nowhere in it.
+- [x] **Control that matters most:** ordinary research prose containing "key",
+      "token", "password" unquoted is stored **clean**. A note reading *"the auth
+      key rotation runs weekly, the token refresh is automatic, and the password
+      reset flow emails a link"* returned a bare *"Noted (pinned, kept across
+      sessions)."* — no notice, no flag row. **No false positive.**
+- [ ] **FAIL (row count):** a note tripping **both** taint and the secret screen
+      under an EXTERNAL latch → both notices appended, **one** row.
+      **Both notices appended correctly** — QUARANTINED then HELD FOR REVIEW, in
+      one result — but **two** `memory_quarantine` rows were written, not one:
+      | row | `target` | `root` |
+      |---|---|---|
+      | taint | `opencode:ai-b8c20b42-…` | the project root |
+      | secret | `memory secret screen` | **`""`** |
+      Two producers fire independently. Whether one row or two is *right* is a
+      spec question — two are arguably more informative — but the recipe says one
+      and the surfaces show a held note twice.
+      **This is also F-16 reproduced live, and it is worse than the finding's
+      LOW suggests:** the row with the empty `root` is the **secret-screen** one,
+      so in a root-filtered Events/Tool Activity view the row recording that a
+      *credential* was held is exactly the row that disappears. Recommend
+      re-rating F-16 and fixing it with the row-count decision.
 
 ### 17 — the headless persistent-write refusal (M-2, decision 21)
 - [ ] cImp **stopped**; a tab calls `context_note` through the MCP child →
@@ -370,7 +402,14 @@ Run in an **UNLATCHED, clean** tab — independence from taint is the point.
 - [ ] Positive control: a genuinely new session in that tab → latch and budget
       **do** reset once its first line lands.
 
-**Results:** 6 ____ 16 ____ 17 ____ 21 ____
+**Results:** 6 **PASS** (promote leg needs UI) 16 **PASS except the row-count
+box — see F-16 live** 17 ____ 21 ____
+
+> **Cleanup owed from these two recipes:** four probe notes were written to the
+> project's memory store and are all prefixed `V32 recipe …(safe to delete)` —
+> two quarantined (taint, secret), one held by the secret screen, one benign
+> control that is **live pinned memory** and will be recalled by future
+> sessions until removed. Delete them in the Memory view.
 
 ---
 
@@ -787,7 +826,7 @@ Seeing them live is useful (note it against the id); filing them again is not.
 | `/graph_run` + `/mcp/call` share H-8's tab half (a decision, not a bug) | F-5 |
 | Auto-injection still pushes signatures into a contaminated tab | F-7 |
 | A denied URL still leaks its hostname to DNS | F-8 |
-| `MemoryQuarantine` rows with an empty `root` vanish from a root-filtered view | F-16 |
+| `MemoryQuarantine` rows with an empty `root` vanish from a root-filtered view | F-16 — **reproduced live 2026-08-10; the empty-`root` row is the SECRET-screen one, so the credential record is the one that vanishes. Re-rate.** |
 | A stale `cimp-<hash>.exe` wedges the next link with `LNK1104` (`Stop-Process`) | F-17 — **reproduced live 2026-08-10**; kill ONLY the `cimp-<hash>.exe` test binary, never the `bin\cimp.exe` the user is verifying |
 | Every V32 switch is under "Offload task tools"; every pointer says "Tools" | F-18 |
 | No `claude-opus-5` row in the seeded price table — cost reads $0 until added by hand | F-19 |

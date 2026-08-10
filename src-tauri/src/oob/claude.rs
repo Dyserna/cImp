@@ -1615,6 +1615,10 @@ fn report_subagent_drift(project_dir: &Path, session_id: &str, summary: &str) {
             summary.chars().count(),
             0,
             false, // a drift report is never "ok" — it flags the entry in the feed
+            // Same shape as the shim's `contract_drift`: about the harness
+            // rather than a tab, but the session is known.
+            crate::activity::Attribution::Unattributed,
+            Some(session_id.to_string()),
         ),
         request: format!("sub-agent transcript contract drift (session {session_id})"),
         response: summary.to_string(),

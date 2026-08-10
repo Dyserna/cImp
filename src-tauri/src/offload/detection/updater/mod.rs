@@ -815,6 +815,9 @@ fn record_row(c: Component, outcome: Outcome, version: &str, detail: &str) {
             0,
             0,
             outcome.ok(),
+            // The C3 updater is cImp's own scheduled work — no tab.
+            crate::activity::Attribution::Headless,
+            None,
         ),
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
         response: detail.to_string(),

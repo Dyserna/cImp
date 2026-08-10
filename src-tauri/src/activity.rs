@@ -257,6 +257,68 @@ impl Lane {
     }
 }
 
+/// Who a row is attributed to — the "which tab is doing what" column (#51).
+///
+/// Four states, and **collapsing any two of them is a bug**:
+///
+/// * [`Tab`](Self::Tab) — a configured AI tab. The only state that may render
+///   as a tab.
+/// * [`Unrecognized`](Self::Unrecognized) — a non-empty id naming no configured
+///   tab. `loopback::tab_identity`'s `Unknown`: it "creates no row and gates
+///   nothing". Rendering it as a tab would attribute activity to a tab that
+///   does not exist, inside the view whose job is attribution.
+/// * [`Headless`](Self::Headless) — positively no tab. Covers the documented
+///   first-class headless consumers (`claude -p`, cron), worker tasks, and
+///   cImp's own internal work (the read advisor, auto-check, the C3 updater).
+///   This is a fact about the caller, not missing data — which is exactly why
+///   it must stay distinct from `Unattributed` below.
+/// * [`Unattributed`](Self::Unattributed) — this writer does not know. Also
+///   what a row written before #51 deserializes to, which is why it is
+///   `Default`: an old row must not claim to be `Headless`, because "nobody was
+///   asking on a tab" and "we weren't recording it yet" are different facts and
+///   only one of them is evidence.
+///
+/// Wire form is a plain externally-tagged enum, so `Tab`/`Unrecognized` cost one
+/// short string and the two unit variants cost a word — [`ActivityEntry`] is
+/// polled every couple of seconds and has to stay light.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Attribution {
+    /// The writer does not know, or the row predates the column.
+    #[default]
+    Unattributed,
+    /// Positively no tab: a headless consumer.
+    Headless,
+    /// A configured AI tab id, or an id that reached the recorder as
+    /// cImp-authored argv (`--tab`), which a request body cannot forge.
+    Tab(String),
+    /// A non-empty id that names no configured tab.
+    Unrecognized(String),
+}
+
+// Both accessors exist for the feed UI, which lands in the next #51 commit
+// (columns + filters). They are unit-tested now rather than written later
+// against a live view, because `is_tab`'s exclusion of `Unrecognized` is the
+// property a filter must not get wrong.
+#[allow(dead_code)]
+impl Attribution {
+    /// The id to display, for the two states that carry one.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Attribution::Tab(t) | Attribution::Unrecognized(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether this row is attributable to a REAL tab — the predicate a
+    /// "filter by tab" must use. Deliberately false for
+    /// [`Unrecognized`](Self::Unrecognized): filtering by a tab id must never
+    /// surface a row that merely quoted that id.
+    pub fn is_tab(&self) -> bool {
+        matches!(self, Attribution::Tab(_))
+    }
+}
+
 /// One recorded tool activity, WITHOUT payloads — the shape list consumers
 /// (the Tool Activity feed poll, the Graph View pulse feed) receive every
 /// couple of seconds, so it must stay light.
@@ -296,11 +358,36 @@ pub struct ActivityEntry {
     pub ms: u64,
     /// Whether the call succeeded.
     pub ok: bool,
+    /// #51: which tab this row belongs to. See [`Attribution`] — an absent
+    /// field (every row written before #51) reads as
+    /// [`Attribution::Unattributed`], never as `Headless`.
+    #[serde(default)]
+    pub tab: Attribution,
+    /// #51: the harness conversation the caller was in, when the writer knows
+    /// it.
+    ///
+    /// **A separate field from `tab` on purpose** (#48 F-3): a tab outlives its
+    /// conversations, so `tab` alone cannot answer "which conversation was
+    /// this?", and a consumer joining a row to something conversation-shaped —
+    /// a checkpoint, a transcript — needs an exact key rather than a guess by
+    /// nearest wall clock. `None` for a worker task (no harness session), for a
+    /// tab whose session the registry withholds, and for every pre-#51 row.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 impl ActivityEntry {
     /// The one way recorders build an entry: `kind` is the closed enum (no
     /// free-form strings at call sites) and `id` is always store-assigned.
+    ///
+    /// **`tab` is a required argument, not a defaulted one** (#51). The
+    /// alternative — a defaulting constructor plus an opt-in `with_tab` — is
+    /// the exact shape #47 removed from `record_flag`: a new call site would
+    /// inherit "unattributed" by writing nothing, and the column whose entire
+    /// purpose is telling you which tab did something would quietly stop
+    /// answering as new recorders were added. Passing
+    /// [`Attribution::Unattributed`] explicitly is fine; passing it by omission
+    /// is not.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: ActivityKind,
@@ -312,6 +399,8 @@ impl ActivityEntry {
         chars: usize,
         ms: u64,
         ok: bool,
+        tab: Attribution,
+        session: Option<String>,
     ) -> Self {
         Self {
             id: 0,
@@ -324,6 +413,8 @@ impl ActivityEntry {
             chars,
             ms,
             ok,
+            tab,
+            session,
         }
     }
 }
@@ -867,9 +958,73 @@ mod tests {
                 0,
                 0,
                 true,
+                Attribution::Unattributed,
+                None,
             ),
             request: format!("{{\"file\": \"{target}\"}}"),
             response: format!("outline of {target}"),
+        }
+    }
+
+    // ── #51: row attribution ─────────────────────────────────────────────
+
+    /// **The backward-compatibility guarantee.** Every row in an existing
+    /// `tool-activity.jsonl` was written without these fields, and must come
+    /// back as "we weren't recording it yet" — never as `Headless`, which is a
+    /// positive claim that nobody was on a tab.
+    ///
+    /// Both facts are load-bearing and only one of them is evidence: a
+    /// containment row that reads `Headless` says the caller had no tab, which
+    /// a reviewer would take as a finding. An old row must not be able to
+    /// manufacture that.
+    #[test]
+    fn a_row_written_before_the_columns_existed_is_unattributed_not_headless() {
+        let legacy = r#"{"id":7,"ts_ms":1,"kind":"graph","root":"r","source":"claude",
+            "tool":"graph_outline","target":"x","chars":3,"ms":4,"ok":true}"#;
+        let e: ActivityEntry = serde_json::from_str(legacy).expect("legacy row parses");
+
+        assert_eq!(e.tab, Attribution::Unattributed);
+        assert_ne!(
+            e.tab,
+            Attribution::Headless,
+            "an unrecorded tab must never read as a positive `no tab` claim"
+        );
+        assert_eq!(e.session, None);
+        // …and the rest of the row is untouched.
+        assert_eq!(e.tool, "graph_outline");
+        assert!(e.ok);
+    }
+
+    /// `Unrecognized` is an id the caller quoted, not a tab that exists —
+    /// `loopback::tab_identity`'s `Unknown` "creates no row and gates nothing".
+    /// A filter-by-tab that matched it would attribute activity to a tab that
+    /// does not exist, inside the view whose whole job is attribution.
+    #[test]
+    fn only_a_configured_tab_counts_as_a_tab() {
+        assert!(Attribution::Tab("claude".into()).is_tab());
+        assert!(!Attribution::Unrecognized("claude".into()).is_tab());
+        assert!(!Attribution::Headless.is_tab());
+        assert!(!Attribution::Unattributed.is_tab());
+
+        // Both id-carrying states still surface the id — the UI has to be able
+        // to say *which* id was unrecognized.
+        assert_eq!(Attribution::Tab("a".into()).id(), Some("a"));
+        assert_eq!(Attribution::Unrecognized("b".into()).id(), Some("b"));
+        assert_eq!(Attribution::Headless.id(), None);
+        assert_eq!(Attribution::Unattributed.id(), None);
+    }
+
+    #[test]
+    fn attribution_round_trips_through_the_wire() {
+        for a in [
+            Attribution::Unattributed,
+            Attribution::Headless,
+            Attribution::Tab("claude".into()),
+            Attribution::Unrecognized("nope".into()),
+        ] {
+            let j = serde_json::to_string(&a).expect("serialize");
+            let back: Attribution = serde_json::from_str(&j).expect("deserialize");
+            assert_eq!(a, back, "round trip via {j}");
         }
     }
 

@@ -939,6 +939,10 @@ impl McpHost {
                 result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
                 crate::activity::now_ms().saturating_sub(started),
                 result.is_ok(),
+                // #51 follow-up: the proxied MCP route knows its consumer but
+                // the tab is not threaded to this frame yet.
+                crate::activity::Attribution::Unattributed,
+                None,
             ),
             request,
             response: match &result {

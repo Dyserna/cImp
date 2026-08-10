@@ -4443,6 +4443,10 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
                 missing.chars().count(),
                 0,
                 false, // a drift report is never "ok" — it flags the entry in the feed
+                // The report is about the harness shim, not a tab's call — but
+                // the session it drifted in is known and is the join key.
+                crate::activity::Attribution::Unattributed,
+                Some(session.clone()),
             ),
             request: format!(
                 "shim {} payload missing required fields (session {session})",

@@ -1172,6 +1172,9 @@ fn record_audit_run(id: AuditToolId, root: &Path, findings: usize, ms: u64, ok: 
             findings,
             ms,
             ok,
+            // cImp runs the scanner itself — no calling tab.
+            activity::Attribution::Headless,
+            None,
         ),
         request: format!("audit scan: {}", id.command_name()),
         response: format!("{findings} findings"),

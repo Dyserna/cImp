@@ -65,7 +65,7 @@ use serde_json::Value;
 use tracing::warn;
 use url::{Host, Url};
 
-use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord};
+use crate::activity::{ActivityEntry, ActivityKind, ActivityRecord, Attribution};
 use crate::settings::{OffloadBackendKind, Settings};
 
 // ── Fixed-string refusals ──────────────────────────────────────────────────
@@ -1591,6 +1591,13 @@ pub fn flag_record(flag: Flag<'_>) -> ActivityRecord {
             // `ok: true` and read as "flagged", which is exactly what locked
             // decision 5 says happened.
             !flag.screen.is_denial(),
+            // #51: the scope IS the attribution for a flag row, and it is
+            // already trustworthy — every scope this module sees was resolved
+            // by `latch_scope` from cImp-authored argv, never from a request
+            // body. `agent:tab` names a real tab; a worker task id does not,
+            // and saying so is the honest reading rather than inventing one.
+            scope_attribution(flag.scope),
+            flag.session.map(str::to_string),
         ),
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
         response: flag.detail.to_string(),
@@ -1645,6 +1652,26 @@ pub mod test_rows {
 /// depends on after an incident (the screen, the scope, and since #45 the
 /// [`Origin`]) are assertable in a unit test. The write itself needs the
 /// activity store, which is process-global file I/O; this does not.
+/// A latch scope, read as a row attribution (#51).
+///
+/// [`Flag::scope`] is either `agent:tab` or a worker task id, and the two are
+/// not interchangeable: only the first names something the user can point at in
+/// the UI. A worker task is real work with a real scope but **no tab**, so it
+/// reports [`Attribution::Headless`] rather than borrowing the task id into a
+/// column the reader will interpret as a tab.
+///
+/// No `Unrecognized` case: every scope reaching this module was resolved by
+/// `loopback::latch_scope`, which creates no scope for an id that names no
+/// configured tab. An unrecognized id therefore never becomes a flag row in the
+/// first place — the state exists in [`Attribution`] for the recorders that
+/// *can* see one, not for this one.
+fn scope_attribution(scope: &str) -> Attribution {
+    match scope.split_once(':') {
+        Some((_agent, tab)) if !tab.is_empty() => Attribution::Tab(tab.to_string()),
+        _ => Attribution::Headless,
+    }
+}
+
 pub fn flag_request(flag: &Flag<'_>) -> serde_json::Value {
     serde_json::json!({
         "screen": flag.screen.as_str(),

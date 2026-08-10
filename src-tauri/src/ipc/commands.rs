@@ -3570,6 +3570,8 @@ mod tests {
             0,
             0,
             true,
+            crate::activity::Attribution::Unattributed,
+            None,
         )
     }
 

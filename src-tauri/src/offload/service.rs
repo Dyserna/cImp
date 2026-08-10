@@ -1324,6 +1324,9 @@ impl OffloadService {
                 result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
                 now_ms().saturating_sub(run_started),
                 result.is_ok(),
+                // A worker run is real work with no tab behind it.
+                crate::activity::Attribution::Headless,
+                None,
             ),
             request,
             response,

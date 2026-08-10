@@ -2925,6 +2925,9 @@ impl GraphService {
                 text.chars().count(),
                 0,
                 true,
+                // cImp's own read advisor — positively no calling tab.
+                crate::activity::Attribution::Headless,
+                None,
             ),
         });
         Some(text)
@@ -3028,6 +3031,8 @@ impl GraphService {
                     chars as usize,
                     0,
                     false, // a bypass is a miss for the advisor — flag it
+                    crate::activity::Attribution::Headless,
+                    None,
                 ),
             });
         }
@@ -3327,6 +3332,9 @@ impl GraphService {
                 block.chars().count(),
                 0,
                 true,
+                // cImp's own auto-check — positively no calling tab.
+                crate::activity::Attribution::Headless,
+                None,
             ),
             request: format!("agent edit of `{file_path}` (the trigger — no explicit request)"),
             response: block.clone(),

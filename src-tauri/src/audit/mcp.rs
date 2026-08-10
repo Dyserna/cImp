@@ -489,6 +489,10 @@ pub async fn run_audit(
             findings,
             now_ms().saturating_sub(started),
             result.is_ok(),
+            // #51 follow-up: this child carries `--tab` on argv; not yet
+            // threaded to this frame.
+            crate::activity::Attribution::Unattributed,
+            None,
         ),
         request: format!("{tool} ({source})"),
         // The RAW report, deliberately: this row is read by a human in the Tool

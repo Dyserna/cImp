@@ -738,6 +738,12 @@ fn refuse_headless(
             message.chars().count(),
             0,
             false,
+            // #51 follow-up: `--tab` is argv on this child but is not threaded
+            // to this frame yet. `Unattributed` is the honest reading — this
+            // writer does not know — not `Headless`, which would assert there
+            // was no tab.
+            crate::activity::Attribution::Unattributed,
+            None,
         ),
         request: serde_json::to_string_pretty(args).unwrap_or_default(),
         response: message.to_string(),
@@ -848,6 +854,10 @@ pub(crate) async fn dispatch_recorded(
             result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
             crate::activity::now_ms().saturating_sub(started),
             result.is_ok(),
+            // #51 follow-up: see `refuse_headless` — `--tab` is argv on this
+            // child but not yet threaded to this frame.
+            crate::activity::Attribution::Unattributed,
+            None,
         ),
         request: serde_json::to_string_pretty(raw_args).unwrap_or_default(),
         response: activity_response(&result),
@@ -1455,6 +1465,9 @@ pub(crate) async fn run_check_tool(
             result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
             crate::activity::now_ms().saturating_sub(started),
             result.is_ok(),
+            // #51 follow-up: as above.
+            crate::activity::Attribution::Unattributed,
+            None,
         ),
         request: serde_json::to_string_pretty(args).unwrap_or_default(),
         response: activity_response(&result),

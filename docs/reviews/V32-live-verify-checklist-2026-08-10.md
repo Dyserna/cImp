@@ -1021,7 +1021,25 @@ With a tab EXTERNAL-latched, click the ⛨ badge:
       refill it**, so a fetch there returns the budget refusal regardless.
 - [x] Both actions show as `latch_override` rows whose payload reads
       `"origin": "ipc"`. **PASS 2026-08-10** — three rows, all `"origin":"ipc"`.
-- [ ] A tab restart still resets everything.
+- [x] A tab restart still resets everything. **PASS in effect 2026-08-10, but
+      read the mechanism — the box overstates what was proven.**
+      Closing and reopening the tab produced a **new tab id**
+      (`ai-b8c20b42…` → `ai-7aef716d…` → `ai-a7821548…`, a fresh one each time),
+      and the new tab has **no `/status` row at all** — unlatched, uncontaminated.
+      So the *user-visible* promise holds.
+      **What it does NOT prove:** that re-spawning the **same** tab id clears its
+      latch. It cannot, because the id never repeats. And the registry has **no
+      remove/eviction/TTL** (H-2), so the old row survives: `ai-7aef716d…` still
+      reads `latch:"local", contaminated:true` for a tab that no longer exists.
+      Ghost rows accumulate one per tab restart for the app's lifetime.
+      **This matters for backlog #50** (automating the spawn-baked tab restart).
+      If that work respawns a tab **preserving its id** — the natural
+      implementation, and what `--session-id` pinning enables — the tab comes
+      back **still latched and still contaminated**, because only an app restart
+      or the explicit clear resets the bit. Today the id churn hides that. H-2
+      already forced six user-facing strings off "restarting the tab is the only
+      clean reset"; this box is the same stale expectation, and #50 must not
+      reintroduce it.
 
 > **Contamination correctly survived the override, and the UI could not say so
 > (live sighting of M-24, 2026-08-10).** After the unlatch the user reported the
@@ -1142,7 +1160,7 @@ The one thing no source assertion can show.
       _Note F-14 (open, LOW): the spec's "most hardened combination" phrasing
       overstates this — expect the narrower behaviour, don't file it twice._
 
-**Results:** 13 **PARTIAL** 13b **PASS** (all three legs) 14 ____ 15 ____
+**Results:** 13 **PASS** (all legs) 13b **PASS** (all three legs) 14 ____ 15 ____
 18 ____ 19 **harness box PASS**, two live legs owed
 
 ---

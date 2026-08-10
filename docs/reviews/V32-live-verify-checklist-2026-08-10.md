@@ -109,6 +109,21 @@ below — F-22 is the one to read first).
       and lets one operator run a tab's recipes without that tab's conversation.
       Used for 3, 7 and 10 below. It also sidesteps the trap that a *model* asked
       to "fetch this and report" may simply decline or summarize.
+- [x] **⚠ READ THE PROJECT OVERLAY BEFORE ANY SETTINGS CLAIM.** Settings resolve
+      from **two** files: global `<exe-dir>/settings.json` **and** the sparse
+      per-project `<project>/.cimp/config.json`. The overlay carries only
+      overridden keys, and **dropping a key is how a value returns to the global
+      one** — so a setting can change with the global file untouched. It is also
+      where `offload.enabled`, `backends`, `mcp_servers`,
+      `detection_update_manifest_url`, `offload.injection` and much of `graph`
+      actually live on this install. Comparing the app against the global file
+      alone produced a full false finding (F-22, withdrawn).
+- [ ] **⚠ `detection_update_manifest_url` is NOT cleared** — the global reads
+      `""` but the **project overlay still points at
+      `…/detection-v1-rehearsal/manifest.json`**, the throwaway ref. So the app
+      is checking the rehearsal channel, not the pinned `detection-v1` default.
+      Clear it in the overlay before recipes 11 / 11b / 11c, or they verify the
+      wrong channel — and delete the rehearsal branch only after.
 - [ ] **Throwaway project root**, not a real one. Recipes 11/11c write to
       `<exe-dir>/detection-updates/`, 17 corrupts `.cimp-discovery/<pid>.json`,
       18 writes `.opencode/plugin/`, 21 writes into
@@ -644,7 +659,38 @@ process. The updater's redirect policy is `none()`, covered by recipe 11._
 **Results:** 7 **PASS** (all boxes) 8 **PARTIAL** (TTS leg owed)
 9 **PARTIAL** (control PASS; enforcement leg structurally unreachable)
 
-### F-22 — raised 2026-08-10 → **GitHub issue [#52](https://github.com/Dyserna/cImp/issues/52)**: live settings and persisted settings diverge, and it is NOT one field
+### F-22 — **WITHDRAWN 2026-08-10. NOT A BUG.** Issue [#52](https://github.com/Dyserna/cImp/issues/52) closed as invalid.
+
+> **cImp resolves settings from TWO levels** — the global `<exe-dir>/settings.json`
+> and a **sparse per-project overlay** at `<project>/.cimp/config.json`. Every
+> "divergence" below was me comparing the app's *resolved* value against the
+> global file alone. The overlay was doing its job.
+>
+> - `graph.read_advisor`: global `false`, **project `true`**, live `true`. Correct.
+> - `native_web_visibility`: the **project** overlay carried the `deny` the tabs
+>   baked. Setting the select back to `Sensor` made it equal the global value, so
+>   the sparse overlay **dropped the key** — `.cimp/config.json` was rewritten at
+>   20:35:45 (exactly the save) and the next tab spawned with the `--taint-beacon`
+>   hook and no `permissions` block. Correct end to end.
+> - "the save never reached disk": it did — into `.cimp/config.json`. The global
+>   file's mtime was rightly untouched because the global value never changed.
+>
+> **The lesson, and it is the same one recipe 7's harness taught earlier today:
+> a reproducible, self-consistent story is not proof.** Every check I ran agreed
+> with the wrong model because every check asked the same wrong question. What
+> broke it was the user saying "there is a global config and a local project
+> config" — one fact no amount of re-running would have produced.
+>
+> **Read `<project>/.cimp/config.json` FIRST from now on**; it also explains why
+> the global file shows `offload.enabled:false`, `backends:[]`, `mcp_servers:[]`
+> on an install with a working backend and ddg server.
+>
+> Residual worth keeping, much smaller than what was filed: nothing in the
+> Settings UI or the global file says **which level decided a value**. `/status`
+> carries `decided_by` for injection features, so the provenance exists
+> internally. Its own small issue if wanted, not this one.
+
+### F-22 (original text, retained for the record — superseded by the retraction above)
 
 > **It generalizes — confirmed 2026-08-10 after the finding was first written.**
 > `graph.read_advisor` diverges the same way: the spawn overlay carries the

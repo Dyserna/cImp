@@ -3197,17 +3197,20 @@ mod tests {
             "a file predating the watermark must look like generation 0, or the \
              top-up never runs on the installs that need it"
         );
-        assert!(
-            PRICING_GENERATION > 0,
-            "generation 0 must mean `nothing topped up yet`"
-        );
     }
+
+    /// Generation 0 has to mean "nothing topped up yet", or the serde default
+    /// above is indistinguishable from a current install. Compile-time because
+    /// it is a property of the constant, not of any run.
+    const _: () = assert!(PRICING_GENERATION > 0);
 
     #[test]
     fn top_up_appends_new_built_in_rows_to_an_existing_table() {
         // An install carrying the pre-Opus-5 table.
-        let mut s = Settings::default();
-        s.pricing_seeded_generation = 0;
+        let mut s = Settings {
+            pricing_seeded_generation: 0,
+            ..Settings::default()
+        };
         s.llm_pricing
             .retain(|r| r.model_prefix != "claude-opus-5");
         let before = s.llm_pricing.len();
@@ -3232,8 +3235,10 @@ mod tests {
     /// one-time top-up, not a reconciliation against `default_llm_pricing`.
     #[test]
     fn top_up_does_not_resurrect_a_row_the_user_deleted() {
-        let mut s = Settings::default();
-        s.pricing_seeded_generation = 0;
+        let mut s = Settings {
+            pricing_seeded_generation: 0,
+            ..Settings::default()
+        };
         assert!(top_up_llm_pricing_if_needed(&mut s));
 
         // User deletes it afterwards. It must stay gone.
@@ -3249,8 +3254,10 @@ mod tests {
     /// the missing row by adding it by hand, at their own price.
     #[test]
     fn top_up_neither_duplicates_nor_overwrites_a_hand_added_row() {
-        let mut s = Settings::default();
-        s.pricing_seeded_generation = 0;
+        let mut s = Settings {
+            pricing_seeded_generation: 0,
+            ..Settings::default()
+        };
         s.llm_pricing
             .retain(|r| r.model_prefix != "claude-opus-5");
         s.llm_pricing.push(LlmPricingModel {
@@ -3282,8 +3289,10 @@ mod tests {
     /// them collide with each other or suppress a prefixed row.
     #[test]
     fn empty_prefix_rows_never_suppress_a_top_up() {
-        let mut s = Settings::default();
-        s.pricing_seeded_generation = 0;
+        let mut s = Settings {
+            pricing_seeded_generation: 0,
+            ..Settings::default()
+        };
         s.llm_pricing.retain(|r| r.model_prefix.is_empty());
         let before = s.llm_pricing.len();
         assert!(before > 0, "the Copilot rows are the empty-prefix ones");

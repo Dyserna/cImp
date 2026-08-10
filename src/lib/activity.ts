@@ -132,34 +132,18 @@ export interface ActivityRecord extends ActivityEntry {
   response: string;
 }
 
-/// Server-side narrowing of the feed. Mirror of Rust
-/// `activity::ActivityFilter`: every field is optional and an unset field
-/// means "don't constrain this axis".
-///
-/// Note what it CANNOT express: `tab` is a real tab id (matched with
-/// `Attribution::is_tab_named` semantics, so an `unrecognized` row never
-/// matches), and there is no way to ask for the headless / unattributed /
-/// unrecognized states. See `FeedFilter` below for why the Events tab
-/// therefore narrows on the client.
-export interface ActivityFilter {
-  kind?: string | null;
-  source?: string | null;
-  tab?: string | null;
-}
-
 /// The feed (graph + offload), newest first, payload-free. Pass `sinceTs` to
 /// fetch only entries newer than a high-water mark; omit it for the full
-/// list (the Tool Activity tab polls the full list — it needs an
-/// authoritative snapshot to reflect deletions). Pass `filter` to have the
-/// backend narrow the snapshot before serializing it.
-export function activityList(
-  sinceTs?: number,
-  filter?: ActivityFilter,
-): Promise<ActivityEntry[]> {
-  return invoke<ActivityEntry[]>('activity_list', {
-    sinceTs: sinceTs ?? null,
-    filter: filter ?? null,
-  });
+/// list (both feeds poll the full list — they need an authoritative snapshot
+/// to reflect deletions).
+///
+/// There is no server-side filter, by design: the store is capped per lane at
+/// ~1,570 payload-free rows, so the read this would shrink cannot grow; the
+/// filter bar's option lists have to come from an unfiltered read anyway; and
+/// a backend filter would mean a second copy of the four-state rule below,
+/// with only one copy exercised. `FeedFilter` narrows here instead.
+export function activityList(sinceTs?: number): Promise<ActivityEntry[]> {
+  return invoke<ActivityEntry[]>('activity_list', { sinceTs: sinceTs ?? null });
 }
 
 /// One activity's full record for the detail popup. Resolves null when the
@@ -180,25 +164,27 @@ export function activityClear(): Promise<void> {
 
 // ── Feed filtering (Events tab, #51) ──────────────────────────────────────
 //
-// CLIENT-SIDE, deliberately — even though `activity_list` now takes an
-// `ActivityFilter`. Two reasons, both of which have to be fixed backend-side
-// before the switch is worth making:
+// CLIENT-SIDE, and this is the only implementation — a server-side filter was
+// written and then deliberately removed. Three reasons:
 //
-//  1. The wire filter's `tab` is a real tab id only. Three of the four
-//     attribution states (headless / unattributed / unrecognized) have no wire
-//     representation, and those are precisely the selections this view exists
-//     to offer — "which rows had no tab at all" is the question, not a corner
-//     case.
+//  1. A wire filter can only name a real tab. Three of the four attribution
+//     states (headless / unattributed / unrecognized) have no wire form, and
+//     those are precisely the selections this view exists to offer — "which
+//     rows had no tab at all" is the question, not a corner case.
 //  2. The kind / source / tab OPTION lists are derived from the feed, so they
-//     must come from an UNFILTERED read. A pre-narrowed poll can only ever
-//     offer back the option already selected, which silently strands the user
-//     on one filter.
+//     must come from an UNFILTERED read. A pre-narrowed poll can only offer
+//     back the option already selected, stranding the user on one filter — so
+//     a backend filter would have been a SECOND request beside the full one,
+//     not a replacement for it.
+//  3. There is nothing to shrink. The store is capped per lane at ~1,570
+//     payload-free rows by construction, and the Tool Activity tab has
+//     full-polled this same store every couple of seconds since v0.41.0.
 //
-// So the poll fetches everything and narrows here. All of the filter logic is
-// in the pure functions below, so the switch stays local once (1) and (2) are
-// solved: map a `FeedFilter` to an `ActivityFilter`, pass it to `activityList`,
-// and drop the `filterEntries` call in the view — the predicates stay for the
-// tests and for whatever still has to be narrowed on this side.
+// What settled it was the duplication rather than the dead code: filtering on
+// both sides means two copies of the rule in `matchesTabFilter` below, only
+// one of them exercised. That rule — whether an `unrecognized` id counts as
+// its tab — is what the whole view rests on, and it fails by showing MORE than
+// was asked. One implementation, in the layer that runs it.
 
 /// The "no constraint" value for every filter axis. A sentinel rather than
 /// `null` because these are bound straight to `<select>` values, which are
@@ -242,7 +228,7 @@ export function matchesTabFilter(a: Attribution | null | undefined, value: TabFi
 }
 
 /// The three filter axes the Events tab exposes — the UI-level selection,
-/// distinct from the wire-level `ActivityFilter` above: every axis is always
+/// distinct from a wire-level filter: every axis is always
 /// set (a `<select>` always has a value) and `FILTER_ANY` is how "don't
 /// constrain it" is spelled.
 export interface FeedFilter {

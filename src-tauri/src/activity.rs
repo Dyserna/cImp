@@ -296,6 +296,15 @@ pub enum Attribution {
     Unrecognized(String),
 }
 
+// Rust has no caller for these: the Events tab narrows client-side, so the
+// filter-by-tab rule lives in `src/lib/activity.ts` (see `activity_list` in
+// `ipc::commands` for why the server-side filter was removed). They stay,
+// unit-tested, because this enum is where the four states are DEFINED and
+// `is_tab`'s exclusion of `Unrecognized` is the one thing a reader of that
+// definition must not have to infer. Unlike the filter that was removed, a
+// one-line `matches!` over the variants is not a second matching pipeline that
+// can drift out of step — it is the definition restating itself.
+#[allow(dead_code)]
 impl Attribution {
     /// The id to display, for the two states that carry one.
     pub fn id(&self) -> Option<&str> {
@@ -313,79 +322,6 @@ impl Attribution {
         matches!(self, Attribution::Tab(_))
     }
 
-    /// Whether this row belongs to the tab `id` — the ONE predicate a
-    /// filter-by-tab may use.
-    ///
-    /// It is [`is_tab`](Self::is_tab) **and then** the id, in that order and
-    /// never the id alone: [`Unrecognized`](Self::Unrecognized) carries an id
-    /// too, so a comparison against [`id`](Self::id) would match
-    /// `Unrecognized("claude")` for the filter `claude`. That row named a tab
-    /// that does not exist — it created no scope and gated nothing — and
-    /// surfacing it under a real tab's filter would attribute activity to that
-    /// tab inside the view whose entire job is attribution.
-    pub fn is_tab_named(&self, id: &str) -> bool {
-        self.is_tab() && self.id() == Some(id)
-    }
-}
-
-/// Optional narrowing for a feed read (#51, the Events tab's filter bar).
-///
-/// Every field is a separate, independent `Option`: `None` means "do not
-/// filter on this at all", and the set fields are ANDed. That shape is what
-/// keeps the endpoint additive — a caller that sends no filter (every caller
-/// that predates it) reads exactly the feed it read before, and a new filter
-/// dimension is one more `None`-by-default field rather than a new endpoint.
-///
-/// Filtering deliberately happens **here, over the snapshot** rather than in
-/// the store's retention structures: retention lanes are a write-path
-/// contract (a row is evicted only by newer rows of its own lane) and a read
-/// filter must not be able to influence what is kept.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(default)]
-pub struct ActivityFilter {
-    /// Serialized [`ActivityKind`] (`"graph"` / `"offload"` / `"audit"` /
-    /// `"mcp"` / `"injection_flag"`). Compared as the wire string so a row
-    /// written by a newer build under a kind this one does not know is still
-    /// selectable rather than silently unmatchable.
-    pub kind: Option<String>,
-    /// The row's `source`. For `injection_flag` rows that is the [`Screen`]
-    /// wire value, which is what "filter by screen" means on this feed; for
-    /// every other kind it is the issuing consumer. One field for both because
-    /// it is one column — splitting it would force the caller to know a row's
-    /// kind before it could ask about its source.
-    pub source: Option<String>,
-    /// A tab id, matched with [`Attribution::is_tab_named`] semantics — see
-    /// there for why `Unrecognized` must not match.
-    pub tab: Option<String>,
-}
-
-impl ActivityFilter {
-    /// True when nothing is set, i.e. the filter is a no-op. Lets the store
-    /// skip the per-row predicate on the unfiltered polls, which are the
-    /// common case (the Tool Activity tab polls every 1.5–2s).
-    pub fn is_empty(&self) -> bool {
-        self.kind.is_none() && self.source.is_none() && self.tab.is_none()
-    }
-
-    /// Whether `entry` survives every set field.
-    pub fn matches(&self, entry: &ActivityEntry) -> bool {
-        if let Some(kind) = &self.kind {
-            if &entry.kind != kind {
-                return false;
-            }
-        }
-        if let Some(source) = &self.source {
-            if &entry.source != source {
-                return false;
-            }
-        }
-        if let Some(tab) = &self.tab {
-            if !entry.tab.is_tab_named(tab) {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 /// One recorded tool activity, WITHOUT payloads — the shape list consumers
@@ -579,28 +515,19 @@ impl ActivityStore {
 
     /// A newest-first, payload-free snapshot of the entries with
     /// `ts_ms > since` (pass 0 for everything).
-    pub fn snapshot_since(&self, since: u64) -> Vec<ActivityEntry> {
-        self.snapshot_filtered(since, &ActivityFilter::default())
-    }
-
-    /// [`snapshot_since`](Self::snapshot_since) additionally narrowed by
-    /// `filter` — an empty [`ActivityFilter`] is exactly the unfiltered read,
-    /// which is why the two share one body instead of drifting.
     ///
-    /// The filter runs on the read side only; retention is untouched (see
-    /// [`ActivityFilter`]).
-    pub fn snapshot_filtered(&self, since: u64, filter: &ActivityFilter) -> Vec<ActivityEntry> {
+    /// Deliberately has no filtering counterpart — see `activity_list` in
+    /// `ipc::commands` for why the Events tab narrows client-side instead.
+    pub fn snapshot_since(&self, since: u64) -> Vec<ActivityEntry> {
         let Ok(mut inner) = self.inner.lock() else {
             return Vec::new();
         };
         self.load_locked(&mut inner);
-        let unfiltered = filter.is_empty();
         inner
             .ring
             .iter()
             .rev()
             .filter(|r| r.entry.ts_ms > since)
-            .filter(|r| unfiltered || filter.matches(&r.entry))
             .map(|r| r.entry.clone())
             .collect()
     }
@@ -916,12 +843,6 @@ pub fn snapshot_since(since: u64) -> Vec<ActivityEntry> {
     store().snapshot_since(since)
 }
 
-/// [`snapshot_since`] narrowed by `filter` — see [`ActivityFilter`]. An empty
-/// filter is byte-for-byte the unfiltered snapshot.
-pub fn snapshot_filtered(since: u64, filter: &ActivityFilter) -> Vec<ActivityEntry> {
-    store().snapshot_filtered(since, filter)
-}
-
 /// The full record (with request/response payloads) for one entry.
 pub fn detail(id: u64) -> Option<ActivityRecord> {
     store().detail(id)
@@ -1192,186 +1113,6 @@ mod tests {
             .snapshot_since(0)
             .is_empty());
         let _ = fs::remove_file(&store.path);
-    }
-
-    // ── #51: feed filters ────────────────────────────────────────────────
-
-    /// A record with an explicit attribution — the filter tests need rows that
-    /// disagree about `tab`, which `rec_kind` (always `Unattributed`) cannot
-    /// produce.
-    fn rec_tab(kind: ActivityKind, target: &str, tab: Attribution) -> ActivityRecord {
-        let mut r = rec_kind(kind, target);
-        r.entry.tab = tab;
-        r
-    }
-
-    fn targets(snap: &[ActivityEntry]) -> Vec<String> {
-        snap.iter().map(|e| e.target.clone()).collect()
-    }
-
-    /// **The correctness property this whole endpoint exists to get right.**
-    ///
-    /// `Unrecognized("claude")` is a row that *named* the tab `claude` and was
-    /// found to name no configured tab — it created no scope and gated
-    /// nothing. Matching it for the filter `claude` would put activity that
-    /// belongs to no tab under a real tab's name, inside the view whose entire
-    /// job is attribution. Asserted through the store, not just
-    /// `Attribution::is_tab`, because the store's predicate is what a UI can
-    /// actually get wrong.
-    #[test]
-    fn a_tab_filter_never_matches_a_row_that_merely_quoted_the_id() {
-        let store = temp_store("filter-tab");
-        store.record(rec_tab(
-            ActivityKind::Graph,
-            "real",
-            Attribution::Tab("claude".into()),
-        ));
-        store.record(rec_tab(
-            ActivityKind::Graph,
-            "quoted",
-            Attribution::Unrecognized("claude".into()),
-        ));
-        store.record(rec_tab(ActivityKind::Graph, "headless", Attribution::Headless));
-        store.record(rec_tab(
-            ActivityKind::Graph,
-            "unknown",
-            Attribution::Unattributed,
-        ));
-
-        let filter = ActivityFilter {
-            tab: Some("claude".into()),
-            ..Default::default()
-        };
-        assert_eq!(targets(&store.snapshot_filtered(0, &filter)), ["real"]);
-
-        // The other three states are not "some other tab" either — no tab
-        // filter may claim them.
-        for other in ["quoted", "headless", "unknown"] {
-            assert!(
-                !targets(&store.snapshot_filtered(0, &filter)).contains(&other.to_string()),
-                "{other} must not answer to a tab filter"
-            );
-        }
-        let _ = fs::remove_file(&store.path);
-    }
-
-    /// Each filter dimension alone, the two together (ANDed), and — the
-    /// additive guarantee — the absent filter returning the same feed the
-    /// pre-#51 `snapshot_since` returns.
-    #[test]
-    fn each_filter_narrows_and_an_absent_filter_does_not() {
-        let store = temp_store("filter-dims");
-        store.record(rec_tab(
-            ActivityKind::Graph,
-            "g",
-            Attribution::Tab("claude".into()),
-        ));
-        store.record(rec_tab(
-            ActivityKind::Offload,
-            "o",
-            Attribution::Tab("claude".into()),
-        ));
-        store.record(rec_tab(
-            ActivityKind::Offload,
-            "o-other-tab",
-            Attribution::Tab("opencode".into()),
-        ));
-        let mut flag = rec_flag(Screen::Canary, "c");
-        flag.entry.tab = Attribution::Tab("claude".into());
-        store.record(flag);
-
-        let all = store.snapshot_since(0);
-        assert_eq!(
-            targets(&store.snapshot_filtered(0, &ActivityFilter::default())),
-            targets(&all),
-            "an empty filter is the historical unfiltered feed"
-        );
-
-        let by_kind = ActivityFilter {
-            kind: Some(ActivityKind::Offload.as_str().into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            targets(&store.snapshot_filtered(0, &by_kind)),
-            ["o-other-tab", "o"]
-        );
-
-        // `source` on an injection_flag row IS the screen — one column, so one
-        // filter field.
-        let by_screen = ActivityFilter {
-            source: Some(Screen::Canary.as_str().into()),
-            ..Default::default()
-        };
-        assert_eq!(targets(&store.snapshot_filtered(0, &by_screen)), ["c"]);
-
-        let by_tab = ActivityFilter {
-            tab: Some("opencode".into()),
-            ..Default::default()
-        };
-        assert_eq!(targets(&store.snapshot_filtered(0, &by_tab)), ["o-other-tab"]);
-
-        // Set fields are ANDed, not ORed.
-        let both = ActivityFilter {
-            kind: Some(ActivityKind::Offload.as_str().into()),
-            tab: Some("claude".into()),
-            ..Default::default()
-        };
-        assert_eq!(targets(&store.snapshot_filtered(0, &both)), ["o"]);
-
-        // A filter no row satisfies is empty, not everything.
-        let none = ActivityFilter {
-            kind: Some(ActivityKind::Audit.as_str().into()),
-            ..Default::default()
-        };
-        assert!(store.snapshot_filtered(0, &none).is_empty());
-        let _ = fs::remove_file(&store.path);
-    }
-
-    /// Filtering is a read; retention is a write-path contract. A filtered
-    /// poll must not change what the next unfiltered poll sees — otherwise the
-    /// view could quietly delete the evidence the per-screen lanes exist to
-    /// keep.
-    #[test]
-    fn filtering_does_not_disturb_retention() {
-        let store = temp_store("filter-retention");
-        store.record(rec_kind(ActivityKind::Graph, "g"));
-        store.record(rec_flag(Screen::Canary, "c"));
-        let before = targets(&store.snapshot_since(0));
-
-        for f in [
-            ActivityFilter {
-                kind: Some(ActivityKind::Graph.as_str().into()),
-                ..Default::default()
-            },
-            ActivityFilter {
-                tab: Some("claude".into()),
-                ..Default::default()
-            },
-        ] {
-            let _ = store.snapshot_filtered(0, &f);
-        }
-
-        assert_eq!(targets(&store.snapshot_since(0)), before);
-        assert_eq!(
-            targets(&ActivityStore::new(store.path.clone()).snapshot_since(0)),
-            before,
-            "and nothing was rewritten on disk either"
-        );
-        let _ = fs::remove_file(&store.path);
-    }
-
-    /// The wire shape the frontend sends. Every field is independently
-    /// optional and `{}` is a no-op — that is what lets an existing caller
-    /// keep sending nothing.
-    #[test]
-    fn a_partial_filter_deserializes_with_the_rest_unset() {
-        let f: ActivityFilter = serde_json::from_str(r#"{"tab":"claude"}"#).expect("partial");
-        assert_eq!(f.tab.as_deref(), Some("claude"));
-        assert!(f.kind.is_none() && f.source.is_none());
-        assert!(!f.is_empty());
-
-        let empty: ActivityFilter = serde_json::from_str("{}").expect("empty object");
-        assert!(empty.is_empty());
     }
 
     #[test]

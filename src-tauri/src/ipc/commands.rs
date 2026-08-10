@@ -1715,21 +1715,23 @@ pub async fn graph_history(
 /// The unified tool-activity feed (graph calls + offload runs), newest first,
 /// without payloads — the Tool Activity tab's poll and the #51 Events tab's.
 ///
-/// `filter` is optional and every field inside it is optional again
-/// ([`ActivityFilter`](crate::activity::ActivityFilter)): omitting the argument
-/// is the historical unfiltered feed, byte for byte, so the Tool Activity poll
-/// keeps working unchanged. It narrows only what this response carries —
-/// retention is a write-path contract and no read may influence it.
+/// **Deliberately unfiltered, and the Events tab narrows client-side** (#51).
+/// A server-side filter shipped here briefly and was removed: the store is
+/// capped per lane at ~1,570 light rows *by construction*, so the payload this
+/// avoids cannot grow; the Tool Activity tab has full-polled this same store
+/// every couple of seconds since v0.41.0; and the filter bar's option lists
+/// have to be derived from an UNFILTERED read anyway, so a narrowed poll would
+/// have been a second request beside the full one rather than a replacement.
+///
+/// What settled it was not the dead code but the duplication: filtering
+/// server-side means a second copy of the four-state attribution rule, and only
+/// one copy can be the exercised one. That rule — whether an `Unrecognized` id
+/// counts as its tab — is the property the whole Events view rests on, and it
+/// fails by showing MORE than was asked. One implementation, in the layer that
+/// actually runs it.
 #[tauri::command]
-pub async fn activity_list(
-    since_ts: Option<u64>,
-    filter: Option<crate::activity::ActivityFilter>,
-) -> AppResult<Vec<crate::activity::ActivityEntry>> {
-    let filter = filter.unwrap_or_default();
-    run_on_blocking_pool(move || {
-        crate::activity::snapshot_filtered(since_ts.unwrap_or(0), &filter)
-    })
-    .await
+pub async fn activity_list(since_ts: Option<u64>) -> AppResult<Vec<crate::activity::ActivityEntry>> {
+    run_on_blocking_pool(move || crate::activity::snapshot_since(since_ts.unwrap_or(0))).await
 }
 
 /// One activity's full record — including the captured request/response

@@ -58,6 +58,7 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | F-8 | A denied URL still leaks its hostname to DNS | **OPEN** | raised by the fix run; bounds what "denied" means |
 | F-9 | The signature scan's 1 s budget is wall clock spanning both passes | **OPEN** | pre-existing (H-4); fails honestly, but thins under load |
 | F-18 | Every pointer to the V32 controls names a Settings section that does not exist | **OPEN** | found live 2026-08-10 on v0.51.0-rc.1 — the first defect found by *running* the build |
+| F-19 | No `claude-opus-5` row in the seeded price table — session cost reads $0 | **OPEN** | found live 2026-08-10 on v0.51.0-rc.2; not a V32 defect, filed here to keep the F-series in one ledger |
 
 Everything in the MEDIUM table below is **OPEN** unless its row says otherwise.
 
@@ -1937,3 +1938,43 @@ click opens Settings. Only the composition is wrong, and no test asserts that a
 user-facing navigation string names a section that exists — which is itself the tripwire
 gap to close (a test over the "Settings → …" literals against `SECTIONS` would be cheap
 and would have caught all three).
+
+### F-19 — the seeded price table has no `claude-opus-5` row, so session cost reads $0
+
+**Found live 2026-08-10 on `v0.51.0-rc.2`. Severity: MEDIUM. Not a V32 defect** — it has
+nothing to do with injection hardening — **filed here so the F-series stays in one
+ledger** rather than starting a second one for the same testing run.
+
+`default_llm_pricing()` (`src-tauri/src/settings/schema.rs:548-605`) seeds Claude Fable 5,
+Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 5, Sonnet 4.6 and Haiku 4.5, plus the Copilot rows.
+There is no `claude-opus-5`. The Anthropic rows are the ones that carry a `model_prefix`,
+which is what the Usage view's cost mode matches transcript model ids against (longest
+prefix wins, `usageMath.ts:100`). A session on the current default model therefore matches
+**no** row, falls back to manual-pick, and shows $0 until the user adds the row by hand —
+which is what the live run did before anything else in this session worked.
+
+**The part that makes it more than a one-line fix.** Adding the row corrects **fresh
+installs only**. `read_global_llm_pricing` (`settings/persistence.rs:386-402`) returns the
+seeded defaults *only when the global settings file does not exist*; a file that carries
+`llm_pricing` — even as `[]` — keeps exactly what it has. That is deliberate and correct:
+the table is user-editable, and a deep-merge against defaults would fight a user who has
+edited a price or deleted a row they do not use. The consequence is that every install
+that already exists stays wrong after a code fix lands, silently, because the symptom is a
+$0 reading rather than an error.
+
+**Fix.** Both halves, or it is not closed:
+
+1. the seed row in `default_llm_pricing()`; and
+2. a one-time, **append-only** migration that adds built-in rows whose `model_prefix` is
+   absent from the stored table. It must never overwrite a price the user has edited, and
+   it must not resurrect a row the user deliberately deleted — which argues for keying the
+   migration on a stored "seeded through version N" marker rather than on row absence
+   alone.
+
+**Class, and why it is worth recording next to the V32 findings.** This is the same shape
+as M-5 and M-21: a computed value that is *presented as authoritative* while being
+silently unpopulated. A cost readout of $0 is not visibly "unknown" — it reads as free.
+Global principle 3 applies: the signal has a consumer, so it has to be either right or
+visibly absent. A model id that matches no pricing row should arguably render as "—" or
+"unpriced" rather than $0.00, independently of whether the Opus 5 row is present, and that
+would have surfaced this on day one instead of on a user's manual edit.

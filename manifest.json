@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "generated": "2026-08-10T00:00:00Z",
+  "components": [
+    {
+      "component": "rules",
+      "version": "2026.08.10",
+      "notes": "First published bundle. Byte-identical to the rules.d/ seed shipped in v0.51.0-rc.2: 19 cImp-authored rules across the instruction-override, role-forgery, guardrail-removal, prompt-extraction, exfiltration, tool-steering, hidden-text and encoded-payload families.",
+      "files": [
+        {
+          "name": "injection_core.yar",
+          "sha256": "b74dea798ce12fe973cc78cf088ff77a6285e0bd4d3ec19d7ec901e62cbee9ee",
+          "size": 8353,
+          "url": "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/2026.08.10-injection_core.yar"
+        },
+        {
+          "name": "exfiltration.yar",
+          "sha256": "2d0024f15cb7fac0abc8adcdbbff9ea575500c198157321eb87bd761cb6ccd85",
+          "size": 6212,
+          "url": "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/2026.08.10-exfiltration.yar"
+        },
+        {
+          "name": "obfuscation.yar",
+          "sha256": "f4c33aef79f5f34d4e6912a3e2eed55872b2e5411b1d1cf3bcd37d902c7444ce",
+          "size": 4712,
+          "url": "https://raw.githubusercontent.com/Dyserna/cImp/detection-v1/2026.08.10-obfuscation.yar"
+        }
+      ]
+    }
+  ]
+}

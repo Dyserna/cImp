@@ -98,7 +98,7 @@ pub async fn execute(
         .ok_or_else(|| "code audit is unavailable in this process".to_string())?;
     // "offload" = the worker's source label in the tool-activity feed (the
     // same label the graph tools use for worker-issued calls).
-    let report = crate::audit::mcp::run_audit(&state, category, "offload").await?;
+    let report = crate::audit::mcp::run_audit(&state, category, "offload", None).await?;
     // #48 M-6: the worker's delivery boundary for the audit report. It resolves
     // at `Scope::OffloadWorker` — the same pseudo-scope every other worker-side
     // V32 control resolves at (`HostRouter`'s `spotlight`/`detection`, the

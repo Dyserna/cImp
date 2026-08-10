@@ -521,7 +521,7 @@ pub async fn handle_call(
     // processes was dispatched before any gate ran) and above the index open.
     // See [`headless_refusal`] for the argument in both directions.
     if let Some(refusal) = headless_refusal(name, tab) {
-        return Ok(refuse_headless(&cwd, &sub, source, name, &args, refusal));
+        return Ok(refuse_headless(&cwd, &sub, source, name, &args, refusal, tab));
     }
 
     // `run_check` needs a project root but NOT a built code graph (V12 Phase
@@ -531,7 +531,7 @@ pub async fn handle_call(
     // working directory itself — never require opening an index for this tool.
     if name == "run_check" {
         let root = find_graph_root(&cwd, &sub).unwrap_or(cwd);
-        return match run_check_tool(&root, &settings, source, &args).await {
+        return match run_check_tool(&root, &settings, source, &args, tab).await {
             Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
             Err(msg) => Ok(tool_error(&msg)),
         };
@@ -581,6 +581,7 @@ pub async fn handle_call(
                 &settings,
             ),
         },
+        tab,
     )
     .await;
 
@@ -719,6 +720,7 @@ fn refuse_headless(
     name: &str,
     args: &Value,
     message: &'static str,
+    tab: Option<&str>,
 ) -> Value {
     let started = crate::activity::now_ms();
     let root = find_graph_root(cwd, sub).unwrap_or_else(|| cwd.to_path_buf());
@@ -738,11 +740,11 @@ fn refuse_headless(
             message.chars().count(),
             0,
             false,
-            // #51 follow-up: `--tab` is argv on this child but is not threaded
-            // to this frame yet. `Unattributed` is the honest reading — this
-            // writer does not know — not `Headless`, which would assert there
-            // was no tab.
-            crate::activity::Attribution::Unattributed,
+            // This row IS the headless refusal, so `tab` is almost always None
+            // here — but not necessarily: `headless_refusal` also fires for a
+            // tab whose latch cannot be read because cImp is unreachable, and
+            // that row should still name the tab it refused.
+            crate::activity::Attribution::from_child_argv(tab),
             None,
         ),
         request: serde_json::to_string_pretty(args).unwrap_or_default(),
@@ -770,6 +772,10 @@ fn refuse_headless(
 /// [`WriteTaint::Clean`] — see the call sites for why that is fail-open by
 /// design rather than an oversight.
 #[allow(clippy::too_many_arguments)]
+/// `tab` is the caller's own `--tab` argv, for the activity row's attribution
+/// (#51) — `None` from the offload worker, which has no tab by construction.
+/// See [`crate::activity::Attribution::from_child_argv`] for why an argv tab
+/// needs no configured-tab check.
 pub(crate) async fn dispatch_recorded(
     root: &Path,
     idx: &GraphIndex,
@@ -779,6 +785,7 @@ pub(crate) async fn dispatch_recorded(
     args: &Value,
     session: Option<&str>,
     guards: CallGuards,
+    tab: Option<&str>,
 ) -> Result<String, String> {
     let (max_rows, max_snippet) = limits(settings);
     let started = crate::activity::now_ms();
@@ -854,10 +861,8 @@ pub(crate) async fn dispatch_recorded(
             result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
             crate::activity::now_ms().saturating_sub(started),
             result.is_ok(),
-            // #51 follow-up: see `refuse_headless` — `--tab` is argv on this
-            // child but not yet threaded to this frame.
-            crate::activity::Attribution::Unattributed,
-            None,
+            crate::activity::Attribution::from_child_argv(tab),
+            session.map(str::to_string),
         ),
         request: serde_json::to_string_pretty(raw_args).unwrap_or_default(),
         response: activity_response(&result),
@@ -1448,6 +1453,9 @@ pub(crate) async fn run_check_tool(
     settings: &crate::settings::Settings,
     source: &str,
     args: &Value,
+    // The caller's own `--tab` argv, for the activity row's attribution (#51);
+    // `None` from the worker, which has no tab.
+    tab: Option<&str>,
 ) -> Result<String, String> {
     let started = crate::activity::now_ms();
     let result = run_check_inner(root, settings, args).await;
@@ -1465,8 +1473,7 @@ pub(crate) async fn run_check_tool(
             result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
             crate::activity::now_ms().saturating_sub(started),
             result.is_ok(),
-            // #51 follow-up: as above.
-            crate::activity::Attribution::Unattributed,
+            crate::activity::Attribution::from_child_argv(tab),
             None,
         ),
         request: serde_json::to_string_pretty(args).unwrap_or_default(),
@@ -1774,6 +1781,9 @@ pub async fn offload_query(roots: &[PathBuf], name: &str, args: &Value) -> Resul
                     args,
                     None,
                     guards,
+                    // The worker is not a tab; `from_child_argv(None)` reads it
+                    // as headless, which is what it is.
+                    None,
                 )
                 .await;
             }
@@ -1802,7 +1812,7 @@ pub async fn offload_run_check(roots: &[PathBuf], args: &Value) -> Result<String
         .find_map(|r| find_graph_root(r, &sub))
         .or_else(|| roots.first().cloned())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    run_check_tool(&root, &settings, "offload", args).await
+    run_check_tool(&root, &settings, "offload", args, None).await
 }
 
 // ── result formatting (compact, token-bounded text for the model) ────────

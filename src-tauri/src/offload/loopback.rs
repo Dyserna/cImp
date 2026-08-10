@@ -3892,7 +3892,7 @@ async fn handle_audit_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
 
     // Run the scan concurrently with the heartbeat interval: whichever branch
     // fires, `run_audit` still owns clearing `scanning`.
-    let run_fut = crate::audit::mcp::run_audit(&state, category, consumer);
+    let run_fut = crate::audit::mcp::run_audit(&state, category, consumer, body.tab.as_deref());
     tokio::pin!(run_fut);
 
     let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);

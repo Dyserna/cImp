@@ -456,10 +456,17 @@ impl RawReport {
 /// must call [`RawReport::deliver`] with the scope it serves before it has text
 /// to hand a model — see that type for why this is enforced by the type system
 /// rather than by a comment.
+/// `tab` is the cImp tab this scan was requested for, for the activity row's
+/// attribution (#51). Unlike the graph child's recorders this runs in the APP,
+/// reached from the `/audit/run` route, so the id arrived over the wire — but
+/// `audit_admit` has already refused any body whose tab resolves to no
+/// configured tab, so what survives to here is a real tab. `None` from the
+/// offload worker, which has no tab.
 pub async fn run_audit(
     state: &Arc<AuditState>,
     category: Category,
     source: &str,
+    tab: Option<&str>,
 ) -> Result<RawReport, String> {
     use crate::activity::{self, now_ms, ActivityEntry, ActivityKind, ActivityRecord};
 
@@ -489,9 +496,10 @@ pub async fn run_audit(
             findings,
             now_ms().saturating_sub(started),
             result.is_ok(),
-            // #51 follow-up: this child carries `--tab` on argv; not yet
-            // threaded to this frame.
-            crate::activity::Attribution::Unattributed,
+            // Admission already proved this names a configured tab (see the fn
+            // doc), so the `from_child_argv` reading holds: present ⇒ a real
+            // tab, absent ⇒ the worker, which has none.
+            crate::activity::Attribution::from_child_argv(tab),
             None,
         ),
         request: format!("{tool} ({source})"),

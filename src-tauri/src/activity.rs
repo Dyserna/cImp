@@ -296,7 +296,7 @@ pub enum Attribution {
     Unrecognized(String),
 }
 
-// Rust has no caller for these: the Events tab narrows client-side, so the
+// `id`/`is_tab` have no Rust caller: the Events tab narrows client-side, so the
 // filter-by-tab rule lives in `src/lib/activity.ts` (see `activity_list` in
 // `ipc::commands` for why the server-side filter was removed). They stay,
 // unit-tested, because this enum is where the four states are DEFINED and
@@ -306,6 +306,34 @@ pub enum Attribution {
 // can drift out of step — it is the definition restating itself.
 #[allow(dead_code)]
 impl Attribution {
+    /// Attribution for a recorder running **inside a cImp-spawned child**,
+    /// from that child's own `--tab` argv.
+    ///
+    /// `Some` ⇒ [`Tab`](Self::Tab), with no configured-tab check, and that is
+    /// correct rather than lax: `--tab <id>` is "composed entirely by cImp at
+    /// spawn on both consumers' paths and nothing in a request body can reach
+    /// it" (`graph::mcp`, test-pinned on both consumers). If cImp spawned this
+    /// child for that tab, the tab is real; there is no forgeable path into
+    /// this value, so there is nothing for a registry lookup to catch.
+    ///
+    /// `None` ⇒ [`Headless`](Self::Headless), not `Unattributed`: a child with
+    /// no `--tab` was not spawned by cImp at all — the documented first-class
+    /// headless consumers (`claude -p`, cron) — so "no tab" is a fact here, not
+    /// an absence of information.
+    ///
+    /// **Not for app-side recorders.** A tab id that arrived over the loopback
+    /// route came from a request body, which a caller can invent; those must
+    /// classify through `loopback::tab_identity` so an id naming no configured
+    /// tab becomes [`Unrecognized`](Self::Unrecognized). Same field, different
+    /// provenance — this constructor exists so the two cannot be confused at a
+    /// call site.
+    pub fn from_child_argv(tab: Option<&str>) -> Self {
+        match tab.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => Attribution::Tab(t.to_string()),
+            None => Attribution::Headless,
+        }
+    }
+
     /// The id to display, for the two states that carry one.
     pub fn id(&self) -> Option<&str> {
         match self {
@@ -1020,6 +1048,28 @@ mod tests {
         assert_eq!(Attribution::Unrecognized("b".into()).id(), Some("b"));
         assert_eq!(Attribution::Headless.id(), None);
         assert_eq!(Attribution::Unattributed.id(), None);
+    }
+
+    /// An argv tab is trusted; its ABSENCE is a fact, not a gap.
+    ///
+    /// The `None` case is the one worth pinning: it must be `Headless`, because
+    /// a child with no `--tab` was not spawned by cImp at all. Returning
+    /// `Unattributed` there would say "we don't know" about something we do
+    /// know, and would make a headless `claude -p` call indistinguishable from
+    /// a row written before the column existed.
+    #[test]
+    fn an_argv_tab_is_a_real_tab_and_its_absence_is_headless() {
+        assert_eq!(
+            Attribution::from_child_argv(Some("claude")),
+            Attribution::Tab("claude".into())
+        );
+        assert_eq!(Attribution::from_child_argv(None), Attribution::Headless);
+        // Whitespace-only is absence, matching `loopback::tab_identity`.
+        assert_eq!(Attribution::from_child_argv(Some("   ")), Attribution::Headless);
+        assert_eq!(
+            Attribution::from_child_argv(Some(" claude ")),
+            Attribution::Tab("claude".into())
+        );
     }
 
     #[test]

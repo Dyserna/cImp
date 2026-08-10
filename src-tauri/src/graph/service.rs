@@ -1157,13 +1157,16 @@ impl GraphService {
         // entirely (same rationale as `mcp::handle_call`'s special case).
         if name == "run_check" {
             let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
-            return super::mcp::run_check_tool(&root, &settings, source, args).await;
+            return super::mcp::run_check_tool(&root, &settings, source, args, None).await;
         }
 
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        super::mcp::dispatch_recorded(&root, &idx, &settings, source, name, args, session, guards)
+        // No tab: this is the offload worker's in-process route.
+        super::mcp::dispatch_recorded(
+            &root, &idx, &settings, source, name, args, session, guards, None,
+        )
             .await
     }
 

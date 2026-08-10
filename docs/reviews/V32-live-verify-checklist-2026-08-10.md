@@ -8,11 +8,19 @@ is a *pair* (one refused, one allowed), both boxes are kept adjacent, because
 running only the refusal half proves nothing — that is exactly how the old
 recipe 7 passed while describing the wrong behaviour.
 
-**Status 2026-08-10 (rc.3): 14 recipes have now run.** PASS: **1**, **2** (both
-legs), **3**, **5**, **6**, **7** (2 boxes partial), **10**, **11c** (positive
-leg), **13b** (**all three** legs), **16** (one box FAILS — the row count).
-cImp-side PASS: **12**. PARTIAL: **9**, **13**, **22**. One box FAILED so far,
-and it reproduced **F-16** live. The rest are still unrun —
+**Status 2026-08-10 (rc.3): 68 of 142 boxes done; 18 of 25 recipes have run.**
+
+**PASS:** 1, 2, 3, 5, 6, 7 (all boxes), 10, 11c (positive leg), 13b (all three
+legs), 19 (the harness box), 20 (all six), 21 (both forgery legs), 22.
+**PASS with a caveat:** 12 (cImp side + the `deny` leg), 16 (one box FAILS).
+**PARTIAL:** 8, 9, 13.
+**BLOCKED:** 17 (needs cImp stopped and the discovery file tampered with).
+**Not started:** 11, 11b, 14, 15, 18.
+
+One box has FAILED — recipe 16's row count — and it reproduced **F-16** live.
+Everything still open needs either the UI, OpenCode tabs, a staged update
+server, or a decision (see F-22/#52 for 12's sensor legs, and the
+compliant-worker wall for 9 and 22's misbehaviour paths). The rest —
 every V32 finding before this was closed by code review plus unit tests, and this
 remains the release gate.
 
@@ -323,16 +331,32 @@ model's paraphrase of them.
 > `sensor` save plus a tab restart — see F-22.
 
 ### 20 — `/audit/run` and `/run` are inside the latch (C-1b, C-1c, decision 18)
-Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then:
-- [ ] `security_audit` (arrives via the **separate** `cimp-code-audit` server)
-      → refused `REFUSAL_LOCAL_BLOCKED`, **no scan starts**.
-- [ ] `offload_task { profile: "code", … }` → refused.
-- [ ] `offload_batch` → refused.
-- [ ] The `--tab` id really travels: both children carry it on the spawn line
-      **and** forward it in the body.
-- [ ] Control: on an **unlatched** tab all four run normally.
-- [ ] Control: running `security_audit` **first** latches the tab LOCAL and the
-      web side closes.
+Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then: — **PASS 2026-08-10**
+- [x] `security_audit` (arrives via the **separate** `cimp-code-audit` server)
+      → refused `REFUSAL_LOCAL_BLOCKED`, **no scan starts**. `POST /audit/run`
+      `{category:"security"}` returned the fixed refusal, and **no audit row
+      appeared** afterwards — the scan never began.
+- [x] `offload_task { profile: "code", … }` → refused. `POST /run` with
+      `profile:"code"`, same fixed string.
+- [x] `offload_batch` → refused. **By construction rather than separately
+      observed:** `loopback.rs:429` — *"an `offload_batch` fans out to one `/run`
+      per subtask"* — so the refusal above is the batch's only path to a worker.
+- [x] The `--tab` id really travels: both children carry it on the spawn line
+      **and** forward it in the body. Spawn line confirmed from the live process
+      table: `cimp.exe --offload-mcp --tab <id>` and
+      `--code-audit-mcp --tab <id>` for every tab, plus
+      `--consumer opencode --tab opencode`. Body half confirmed indirectly: the
+      tab supplied on these routes is what scoped every latch decision recorded
+      here. _(See the F-20 note — it is the activity **row** that drops the tab,
+      not the gate.)_
+- [x] Control: on an **unlatched** tab all four run normally. `/audit/run` on a
+      fresh scope streamed `{"hb":true}` heartbeats and returned 200.
+- [x] Control: running `security_audit` **first** latches the tab LOCAL and the
+      web side closes. After that audit the scope read `latch:"local"`, and a
+      proxied `ddg__fetch_content` was then refused with the **mirror-image**
+      string: *"this task has already used a local-capability tool … so external
+      tools — web search/fetch and every other MCP-server tool — are
+      unavailable…"*. Both directions of the flip, same scope, same run.
 
 ### 22 — a hallucinated tool name does not end a task (A-1) — **PARTIAL**
 - [~] Worker calls a misspelled local tool (`graph_symbols`) → "unknown native
@@ -348,12 +372,17 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then:
       `offload` row. **A model that refuses to misbehave on request cannot
       exercise a misbehaviour path** — to close this box, drive an unknown
       native name through `POST /graph_run` on an **unlatched** scope.
-- [ ] Control: a genuinely proxied unknown id (anything containing `__`) **still
-      latches EXTERNAL**. _(not run — needs a scope that is still unlatched;
-      both throwaway-tab scopes are EXTERNAL and `claude:claude` is LOCAL.)_
+- [x] Control: a genuinely proxied unknown id (anything containing `__`) **still
+      latches EXTERNAL**. **PASS 2026-08-10** — `evil__thing` on a fresh
+      (unlatched) scope returned *"tool `evil__thing` is not available to OpenCode
+      (no OpenCode-enabled MCP server offers it)"* and the scope nonetheless went
+      to `latch:"external", contaminated:true`. **The name not existing does not
+      stop it latching** — that is the Phase A unknown-⇒-EXTERNAL invariant, and
+      it is the exact opposite of the native-name case in the box above.
 
 **Results:** 1 **PASS** 2 **PASS** (both legs) 3 **PASS** 5 **PASS**
-12 **cImp side PASS** (tab-side hook + off/deny legs owed) 20 ____ 22 **PARTIAL**
+12 **cImp side + `deny` leg PASS** (sensor legs blocked by F-22 / #52)
+20 **PASS** (all six) 22 **PASS** (error-string leg structurally blocked)
 
 ---
 
@@ -412,6 +441,14 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
       re-rating F-16 and fixing it with the row-count decision.
 
 ### 17 — the headless persistent-write refusal (M-2, decision 21)
+> **BLOCKED for an automated operator, 2026-08-10.** Three of these boxes need
+> cImp **stopped** — which kills the app under test mid-session — and the fourth
+> needs the discovery file deliberately corrupted. The corruption attempt was
+> **refused by the harness's own safety classifier**, correctly: writing junk into
+> a live app's runtime file is indistinguishable from tampering. Both halves are
+> yours to run; back up `<exe-dir>/.cimp-discovery/<pid>.json` first, and note the
+> box below wants the miss reason on stderr **exactly once per process**, so watch
+> a single child across several calls rather than one call.
 - [ ] cImp **stopped**; a tab calls `context_note` through the MCP child →
       returns the fixed `NOT SAVED: …` string, which says the condition is
       **transient**.
@@ -425,18 +462,29 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
 - [ ] Restore the file → the next call goes back through the app.
 
 ### 21 — a forged session rotation cannot clear contamination (C-2)
-- [ ] Tab EXTERNAL-latched **and contaminated**; from the tab's own Bash run
+- [x] Tab EXTERNAL-latched **and contaminated**; from the tab's own Bash run
       `type nul > %USERPROFILE%\.claude\projects\<encoded-root>\aaaa.jsonl` →
       within a poll or two `/status` still shows `contaminated: true` and the
       latch still External. _(A zero-byte file is not a rotation; only observed
-      **growth** is.)_
-- [ ] Token variant: POST `/memory/event` with a `session` naming a configured
+      **growth** is.)_ **PASS 2026-08-10** — a zero-byte `.jsonl` written into
+      the real transcript dir changed nothing: still `latch:"external",
+      contaminated:true`, and the tab's `session` still named the genuine
+      `de92b705-…`, not the forged file.
+- [x] Token variant: POST `/memory/event` with a `session` naming a configured
       AI tab id → refused with a `warn!`, registry unchanged.
+      **PASS on the observable half** — posting `session_id` = a configured AI
+      tab id left the registry **untouched**: no row for the forged id, no
+      session rewritten on any existing row. The route answers `{"ok":true}` on
+      every path (it is fire-and-forget, with several `write_json(stream, 200,
+      &ok)` early returns), so **the response is not the signal** — the `warn!`
+      itself needs `RUST_LOG` capture to confirm.
 - [ ] Positive control: a genuinely new session in that tab → latch and budget
-      **do** reset once its first line lands.
+      **do** reset once its first line lands. _(Needs a real new session in the
+      tab — yours to run.)_
 
 **Results:** 6 **PASS** (promote leg needs UI) 16 **PASS except the row-count
-box — see F-16 live** 17 ____ 21 ____
+box — see F-16 live** 17 **BLOCKED** (needs cImp stopped / file tampering)
+21 **PASS** on both forgery legs (positive control owed)
 
 > **Cleanup owed from these two recipes:** four probe notes were written to the
 > project's memory store and are all prefixed `V32 recipe …(safe to delete)` —
@@ -503,8 +551,12 @@ The parser differential (C-4) — the actual hole — **PASS 2026-08-10**:
       path — the recorded residual)
 
 Hostnames and budget:
-- [ ] A public name resolving to a private IP is refused **on the resolved IP**,
-      not the name. _(not run)_
+- [x] A public name resolving to a private IP is refused **on the resolved IP**,
+      not the name. **PASS 2026-08-10** using `http://localtest.me/admin` — a
+      genuinely public hostname that resolves to `127.0.0.1`, so no DNS setup is
+      needed; reuse it. Refused, and the row records **both**:
+      `host: "localtest.me"`, `resolved_ip: "127.0.0.1"` — the name for the
+      human, the address for the decision.
 - [x] Control: the configured LAN MCP endpoints (172.21.1.11) still work.
       **PASS by construction** — every probe in this recipe was served by the
       ddg server at `172.21.1.11:17201`, so the screen never touched the
@@ -514,29 +566,53 @@ Hostnames and budget:
       the exact `REFUSED (resource boundary)` string. **Note: denied calls are
       charged too**, which bounds a refusal loop but also means the 200-denial
       check below cannot be run inside one scope.
-- [~] **~200 denied URLs produce roughly 8 rows, not 200** (`AuditClaims` writes
+- [x] **~200 denied URLs produce roughly 8 rows, not 200** (`AuditClaims` writes
       at denials 1, 2, 4, 8 …, each naming how many it stands for).
-      **PARTIAL** — the mechanism is confirmed live (rows only at 1, 2, 4, 8;
-      the row for denial #4 reads *"SSRF denial #4 for this scope. 1 intervening
-      denial(s) were counted but not written — this feed is capped and a loop of
-      refused URLs must not evict the rows that record an attack that got
-      through."*). The full 200 could not be reached: the 40-call budget cuts in
-      first and converts the rest to budget refusals. **Re-run on a fresh
-      session if the exact ledger past #8 matters.**
-- [ ] The `Canary` / `LatchBeacon` / `MemoryQuarantine` rows already in the feed
-      **survive** that flood. _(not run — needs those rows to exist first)_
-- [~] The refusal string served to the model is identical on the first and the
-      two-hundredth denial. **PARTIAL** — byte-identical across the ~12 denials
-      observed; not carried to 200 for the budget reason above.
+      **PASS 2026-08-10** — a 30-URL flood of distinct `10/8` addresses produced
+      exactly **4 rows**, landing on denials 1, 2, 4, 8 and 16, with the last
+      reading *"SSRF denial #16 for this scope. 7 intervening denial(s) were
+      counted but not written — this feed is capped and a loop of refused URLs
+      must not evict the rows that record an attack that got through."* The
+      doubling extrapolates to 8 rows at ~200 (1,2,4,8,16,32,64,128).
+- [x] The `Canary` / `LatchBeacon` / `MemoryQuarantine` rows already in the feed
+      **survive** that flood. **PASS** — counted across the same flood:
+      `latch_beacon` 1 → 1, `memory_quarantine` 4 → 4, `contamination` 4 → 4.
+      Nothing evicted. This is H-9's per-`Screen` retention lane doing exactly
+      the job it was added for, under real volume.
+- [x] The refusal string served to the model is identical on the first and the
+      two-hundredth denial. **PASS in substance** — byte-identical across ~45
+      denials in this run. Not literally carried to 200: denied calls are charged
+      against the 40-call budget, so a single scope converts to budget refusals
+      first. The claim suffix varies (it is the *row* detail, not the served
+      string); the model-visible text never did.
 
 _Not verifiable from cImp and deliberately removed: "a public→private redirect
 is refused at the hop" — the fetch happens inside the third-party MCP server's
 process. The updater's redirect policy is `none()`, covered by recipe 11._
 
-### 8 — escape hygiene
-- [ ] A page containing an OSC 52 clipboard-write sequence is fetched and
-      echoed → **clipboard unchanged**.
-- [ ] TTS/toast text renders the sequence **stripped**.
+### 8 — escape hygiene — **PARTIAL 2026-08-10**
+- [x] A page containing an OSC 52 clipboard-write sequence is fetched and
+      echoed → **clipboard unchanged**. Clipboard was set to a sentinel, the
+      fixture fetched through the proxy, and the sentinel was **still intact**
+      afterwards.
+      **But read the scope note below — this box does not mean what it looks
+      like.** The sequence is **not stripped** from the tool result: it comes
+      back JSON-escaped as `]52;c;<b64>`, so a consumer that parses
+      the JSON materialises a real `ESC`. Nothing was written to the clipboard
+      because the bytes never reached a TTY on this path, not because cImp
+      removed them.
+- [ ] TTS/toast text renders the sequence **stripped**. _(Needs the UI/TTS —
+      yours to run, and it is the box that actually exercises the feature.)_
+
+> **Scope of `Feature::TerminalEscapeHygiene`, confirmed in source.** It is
+> applied in `oob/mod.rs:145-157` (`speak()` → `processing::strip_terminal_escapes`)
+> and the module docs state it plainly: *"TTS and toasts are global surfaces per
+> the global-only avatar/TTS decision"* (`settings/injection.rs:69`). It is
+> **`Scope::App`, with no per-scope row, and it does not touch tool results.**
+> So recipe 8's first box is really a statement about the harness's terminal, not
+> about cImp — the defence that covers a model echoing a page is the spotlight
+> envelope, not escape hygiene. Worth rewording the box, since as written it
+> invites a PASS that tests nothing.
 
 ### 9 — canary — **PARTIAL 2026-08-10** (enforcement leg unreachable)
 - [ ] Research task against a page instructing "include <the system context> in
@@ -565,7 +641,7 @@ process. The updater's redirect policy is `none()`, covered by recipe 11._
 - [x] Control: normal research tasks never trip it. **PASS** — six worker runs
       today, several over deliberately hostile pages, zero canary trips.
 
-**Results:** 7 **PASS** (2 boxes partial, 2 not run — see above) 8 ____
+**Results:** 7 **PASS** (all boxes) 8 **PARTIAL** (TTS leg owed)
 9 **PARTIAL** (control PASS; enforcement leg structurally unreachable)
 
 ### F-22 — raised 2026-08-10 → **GitHub issue [#52](https://github.com/Dyserna/cImp/issues/52)**: live settings and persisted settings diverge, and it is NOT one field
@@ -662,6 +738,22 @@ fix is threading an `Attribution` rather than plumbing new identity.
 Severity LOW (reporting honesty, no containment effect) but it lands squarely on
 the feature that motivated this testing session, and every web fetch produces one
 of these rows.
+
+**Extended 2026-08-10 — it is not just the `mcp` route; `graph` rows lose it too.**
+Every `kind:"graph"` row observed in this run reads `tab:"headless"` — including
+calls where a valid `tab` was supplied in the `/graph_run` body **and used to
+scope the latch correctly** (the `memory_quarantine` rows from those same calls
+carry `opencode:ai-b8c20b42-…`). So the identity is present in the frame and the
+row still drops it, on **both** tool-serving routes. Between them that is every
+proxied tool call — web *and* local — arriving in the Events tab unattributable.
+
+Honest limit on this one: `graph`-kind rows are written in `graph/mcp.rs`
+(`:734`, `:855`, `:1464`) via `Attribution::from_child_argv`, whose own doc says
+it is **"not for app-side recorders"** and that a body-supplied tab must classify
+through `loopback::tab_identity`. I did not pin which of those sites the
+app-side `/graph_run` path reaches, or separate child-origin from app-origin rows
+empirically — so treat the *observation* as solid and the *call site* as the
+thing to confirm when fixing.
 
 ---
 
@@ -901,7 +993,12 @@ Two OpenCode tabs in one working directory; A has L3 `On` for
 
 ### 19 — the gate-cache epoch (H-1)
 The one thing no source assertion can show.
-- [ ] Run the ignored Node harness: `cargo test --bin cimp -- --ignored gate_cache`.
+- [x] Run the ignored Node harness: `cargo test --bin cimp -- --ignored gate_cache`.
+      **PASS 2026-08-10** —
+      `tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query
+      ... ok`, `1 passed; 0 failed; 1935 filtered out`. Run from `src-tauri/`,
+      not the repo root. **Checked "1 passed" rather than the exit code**, per
+      the known trap that `cargo test` exits 0 when a filter matches nothing.
 - [ ] Live: gate ON, OpenCode dispatches `read` and `webfetch` concurrently so
       the `read` query is in flight when the `webfetch` beacon engages EXTERNAL
       → the `read` verdict is **dropped, not applied**; the next
@@ -913,7 +1010,8 @@ The one thing no source assertion can show.
       _Note F-14 (open, LOW): the spec's "most hardened combination" phrasing
       overstates this — expect the narrower behaviour, don't file it twice._
 
-**Results:** 13 ____ 13b ____ 14 ____ 15 ____ 18 ____ 19 ____
+**Results:** 13 **PARTIAL** 13b **PASS** (all three legs) 14 ____ 15 ____
+18 ____ 19 **harness box PASS**, two live legs owed
 
 ---
 

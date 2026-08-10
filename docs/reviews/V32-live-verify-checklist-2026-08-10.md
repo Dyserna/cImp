@@ -203,9 +203,19 @@ blocked the `detection-v1` publish is fully verified.
 > Bundle `2026.08.10`, byte-identical to the `rules.d/` seed in rc.2. The pinned
 > `DEFAULT_MANIFEST_URL` now answers **200, no redirect** — recipes 11/11b/11c no
 > longer need a staged bundle to have something to talk to.
-> **Housekeeping still owed:** delete `detection-v1-rehearsal` once the negative
-> leg is done, and clear any `detection_update_manifest_url` override so installs
-> fall back to the pin.
+> **Housekeeping COMPLETE 2026-08-10.** `detection-v1-rehearsal` **deleted**
+> (via `gh api -X DELETE repos/…/git/refs/heads/…`, never a local checkout);
+> only `detection-v1` at `b165cea` remains. The
+> `detection_update_manifest_url` override was **cleared from the project
+> overlay** — note it was never in the global file, which is why it looked
+> cleared already; setting it empty made it equal the global value and the sparse
+> overlay dropped the key (overlay rewritten 21:12:56). The pinned
+> `DEFAULT_MANIFEST_URL` now answers **200 with zero redirects**, verified, so
+> recipes 11 / 11b run against the real channel rather than the throwaway.
+>
+> **In Git Bash, `gh api` paths must omit the leading slash** — otherwise the
+> shell rewrites `/repos/...` into `C:/Program Files/Git/repos/...` and the call
+> fails with "invalid API endpoint".
 
 ---
 

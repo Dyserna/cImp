@@ -25,7 +25,7 @@ every V32 finding before this was closed by code review plus unit tests, and thi
 remains the release gate.
 
 Record per recipe: PASS / FAIL / BLOCKED + the finding id if it raises one.
-New findings continue the F-series (next free: **F-24**; F-20, F-21, F-22 (withdrawn), **F-23**
+New findings continue the F-series (next free: **F-25**; F-20, F-21, F-22 (withdrawn), **F-23**
 below — F-22 is the one to read first).
 
 ---
@@ -475,13 +475,19 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
 - [x] A note carrying a credential-shaped value (fake, matching a vendor-prefix
       rule) is **stored — not refused, not redacted**. *"Noted (pinned, kept
       across sessions). ⚠ HELD FOR REVIEW (secret screen)…"*
-- [ ] It appears in the Memory view's review queue. _(needs the UI.)_
+- [x] It appears in the Memory view's review queue. **PASS 2026-08-11** — present
+      in the *Quarantined notes* card alongside the other three held notes.
 - [x] Absent from `context_recall`, `context_notes` and a fresh session's
       auto-injection until promoted. Checked from a second scope: the
       credential note absent, the benign control from the same batch present.
 - [x] A `Screen::MemoryQuarantine` row appears with `ok: true`.
 - [x] The notice names the matched **rules**, never the matched text — it says
       `(secret_aws_access_key_id)` and the `AKIA…` value appears nowhere in it.
+      **PASS at the tool-result layer, FAILS at the UI — see F-24.** The Memory
+      view's card shows the note text (secret value included), a timestamp,
+      Promote/Discard and a session id on hover, and **no rule, screen or reason
+      of any kind**. The contract holds where the model reads it and not where
+      the human decides.
 - [x] **Control that matters most:** ordinary research prose containing "key",
       "token", "password" unquoted is stored **clean**. A note reading *"the auth
       key rotation runs weekly, the token refresh is automatic, and the password
@@ -814,6 +820,43 @@ path. That is the thread to pull.
 **Recipe 12's `deny` leg is verified as a side effect** — native web tools refused
 by the harness itself, while proxied `ddg__fetch_content` kept working and
 latching all session (recipes 3, 7, 10). Both halves of that pair, unplanned.
+
+### F-24 — raised 2026-08-11, MEDIUM: the quarantine review card shows **no reason at all**
+
+The Memory view's *Quarantined notes* card contains, in full: **the note text,
+a timestamp, Promote and Discard buttons, and a session id on hover.** Nothing
+says *why* the note was held — no screen, no rule, no distinction between a
+taint hold and a secret hold.
+
+Observed live on four held notes covering three distinct causes: two held by the
+**taint** latch, one by the **secret screen**, one that tripped **both**. The
+card renders them identically.
+
+**The information exists and is already computed.** The tool result for the same
+note read *"⚠ HELD FOR REVIEW (secret screen): this note matched cImp's
+credential patterns (**secret_aws_access_key_id**)…"*, and the activity row
+carries the screen. So the reason reaches the **model**, which cannot act on it,
+and not the **human**, who is the only one who can. That is global principle 3
+inverted — a signal with a consumer that has no authority, and no consumer where
+the authority sits.
+
+**Sharpest way to put it:** the card displays the **matched secret value**
+(`AKIAIOSFODNN7EXAMPLE`) and withholds the **rule name** — precisely the
+inversion of decision 22's stated contract, *"the notice names the matched rules,
+never the matched text"*. Showing the body is right; a review queue must be
+readable, and decision 22 deliberately stores the value unredacted. Showing it
+*without* the reason is what makes the decision unmakeable.
+
+**Compounds two open findings rather than duplicating them:** M-23 (Promote is
+one unconfirmed click while Discard is behind a modal — inverted friction) and
+M-24 (every cause collapses into one red chip). With no reason on the card, the
+one unconfirmed click is also an **uninformed** click. A user cannot tell
+"my own note about an API key" from "attacker-authored text that arrived through
+a fetched page", and those warrant opposite actions.
+
+**Fix is small:** the hold already knows its screen(s) — pass them to the card
+and render the same rule list the tool result gets. Take it with M-23/M-24 as one
+piece of work on this surface.
 
 ### F-23 — raised 2026-08-10: after a USER flip, the refusal states a cause that did not happen
 

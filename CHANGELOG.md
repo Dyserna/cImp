@@ -5,6 +5,57 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0-rc.3] — 2026-08-10
+
+**Pre-release, for testing.** The first RC with live-verification results in it:
+two recipes have now actually been run and passed, and the V32 detection update
+channel is published, so the updater has something to talk to. The milestone is
+still **unsigned-off** — 11 open MEDIUMs, and 23 of the 25 recipes remain unrun.
+Settings schema is unchanged at 29.
+
+### Added
+
+- **An Events tab** — one place to see what each tab is doing, including
+  containment. Every activity row now carries the tab it belongs to and the
+  harness session it ran in, with filters by kind, screen and tab. Additive:
+  Tool Activity and the Workbench Timeline are untouched.
+- **Session cost is priced again on the current default model.** The seeded
+  price table had no `claude-opus-5` row, so sessions on it read $0 until the
+  row was added by hand (F-19). Existing installs are topped up once on load —
+  append-only, so an edited price is never reset and a row you deleted stays
+  deleted.
+
+### Fixed
+
+- **A containment row could name a tab that does not exist.** A scope with no
+  tab identity is labelled `agent:(no tab identity)`, which is shaped like a
+  real scope; read naively it became a *tab* of that name in the feed. Now
+  reported as headless. Reachable in normal use — the SSRF screen runs without
+  needing identity.
+
+### Verified live (new — previous RCs verified nothing)
+
+- **The taint latch refuses, and says so.** After local file reads, a proxied
+  external fetch is refused for the whole MCP surface, with a matching
+  `latch_refusal` row in the activity feed.
+- **The detection update channel works end to end.** Bundle `2026.08.10` is
+  published on the `detection-v1` branch and validated against the smoke corpus
+  before activation; a live run applied 19 rules across 3 files and retained the
+  previous bundle for revert.
+
+### Known issues
+
+- **F-18 is still open** — the injection controls remain under Settings →
+  *Offload task tools* while the taint popover points at a "Settings → Tools"
+  section that does not exist.
+- **Native web tools are not blocked by default.** `native_web_visibility`
+  ships as `sensor`, which reports and engages the latch but never denies; only
+  `deny` refuses them. That is the locked design, not a regression — but it
+  means a contained tab can still use the harness's own web tools. The setting
+  is spawn-baked, so changing it needs a new tab.
+- **The tab column is blank for proxied MCP calls.** That recorder has the
+  information but does not yet pass it through.
+
 ## [0.51.0-rc.2] — 2026-08-10
 
 **Pre-release, for testing.** A small delta over rc.1: one behavioural fix and

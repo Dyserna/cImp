@@ -174,17 +174,29 @@ publish (decision 24 / deploy step 3).
       reverted from Settings; `rules.d/local/` was not touched." So the whole
       gauntlet ran, not just the download — smoke corpus, coverage floor,
       archive-for-revert and the `local/` non-recursion all confirmed live.
-- [ ] Negative control: point it at a **release-asset** URL
+- [x] Negative control: point it at a **release-asset** URL
       (`https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json`)
       → run ends **`Unavailable`** with the redirect named in the logged reason.
-      (Deliberately reproducing H-5.) **Still to run.** No throwaway release
-      needed — any existing asset reproduces it; confirmed 2026-08-10 that
-      `.../releases/download/v0.50.1/cimp-portable-win-x64-v0.50.1-no-models.zip`
-      still answers **302 → release-assets.githubusercontent.com**. The fetcher
-      should refuse the redirect before it ever notices the body is a zip, so a
-      non-manifest asset is a valid probe.
+      (Deliberately reproducing H-5.) **PASS 2026-08-10.** Pointed at
+      `.../releases/download/v0.50.1/cimp-portable-win-x64-v0.50.1-no-models.zip`;
+      Settings line, verbatim:
+      > *Could not reach the update channel: GET
+      > https://github.com/Dyserna/cImp/releases/download/v0.50.1/cimp-portable-win-x64-v0.50.1-no-models.zip:
+      > **HTTP 302 Found**. Nothing was checked and nothing changed; the current
+      > detection data is still live.*
+      Activity row: `injection_flag / source: updater / tool: rules /
+      target: **unavailable** / ok: **true**` — the neutral outcome, not a
+      failure, exactly as #46's split requires.
+      **This is H-5 reproduced cleanly:** the fetcher stopped **at** the 302 and
+      never followed it to `release-assets.githubusercontent.com`, so it never
+      reached the body — which is why a release-asset channel could not have
+      worked at all, and why the redirect policy is `none()`. The probe URL is a
+      zip and that never even became relevant.
 
-**Result:** positive leg PASS 2026-08-10; negative leg outstanding.
+**Result: recipe 11c COMPLETE — both legs PASS.** The transport gate that
+blocked the `detection-v1` publish is fully verified.
+
+**Result:** BOTH legs PASS 2026-08-10 — recipe 11c is complete.
 
 > **The channel is PUBLISHED as of 2026-08-10.** Orphan branch `detection-v1`:
 > `13a9c36` (artifacts) then `b165cea` (manifest, pushed second on purpose).

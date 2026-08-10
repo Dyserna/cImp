@@ -295,6 +295,18 @@ model's paraphrase of them.
 > beacon POST). That half needs a human typing in the tab, and is still owed.
 - [x] Claude tab, **native** WebFetch → tab badge appears, `/status` shows the
       latch engaged, a proxied `graph_snippet` is refused.
+      **FULL PASS 2026-08-10 via the REAL native route** (tab
+      `ai-7aef716d-…`, freshly spawned under `sensor` so it started unlatched):
+      `WebFetch` was present in the tab's tools again, the fetch **succeeded**
+      (sensor never denies), **the user saw the badge turn red**, `/status` then
+      read `latch:"external", contaminated:true`, one `latch_beacon` row plus one
+      `contamination` row both carrying `"origin":"http"`, and a proxied
+      `graph_snippet` was refused with the fixed string.
+      **This is the half no synthetic beacon could establish** — that the
+      `PreToolUse` shim is actually injected and actually fires on a real native
+      web call. The chain hook → beacon POST → latch → refusal is now verified
+      end to end.
+      _(Earlier, weaker evidence via `POST /latch/beacon` retained below.)_
       **cImp side PASS:** the beacon returned
       `{"ok":true,"latch":{"latch":"external","contaminated":true,…}}`, `/status`
       then showed that tab `latch:"external", contaminated:true`, and a proxied

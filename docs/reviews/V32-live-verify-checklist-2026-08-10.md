@@ -642,10 +642,32 @@ With a tab EXTERNAL-latched, click the ⛨ badge:
       refused (a flip, not an unlatch).
 - [ ] A `context_note pin=true` written **after** the flip still lands
       **quarantined** (contamination survives the override).
-- [ ] "Full unlatch" (after its confirmation) restores both sides.
-- [ ] Both actions show as `latch_override` rows whose payload reads
-      `"origin": "ipc"`.
+- [x] "Full unlatch" (after its confirmation) restores both sides.
+      **PASS 2026-08-10 (local side)** — after the user's unlatch the tab reads
+      `latch:"open"` and `graph_snippet` answers again. Web side not re-probed:
+      that scope's 40-call budget was already spent, and **an unlatch does not
+      refill it**, so a fetch there returns the budget refusal regardless.
+- [x] Both actions show as `latch_override` rows whose payload reads
+      `"origin": "ipc"`. **PASS 2026-08-10** — three rows, all `"origin":"ipc"`.
 - [ ] A tab restart still resets everything.
+
+> **Contamination correctly survived the override, and the UI could not say so
+> (live sighting of M-24, 2026-08-10).** After the unlatch the user reported the
+> yellow icon gone but "the red icon still visible" and read it as stuck. It was
+> right: `/status` showed `latch:"open", contaminated:true, can_clear:true` —
+> H-2 removed the only reset, so the bit clears only via the explicit clear
+> action or an app restart. Because M-24 collapses latch state, detector flags,
+> `MemoryQuarantine` and `LatchOverride` into **one** red chip, the chip cannot
+> distinguish "still latched" from "unlatched but still contaminated", which is
+> exactly the confusion it produced. **This is the first live evidence for M-24
+> and it argues for raising its priority alongside F-18.**
+>
+> **Operator trap, hit live:** a tab can hold **more than one scope**. Driving
+> recipes with `?consumer=opencode` (to get a fresh fetch budget / SSRF ledger)
+> creates a second `opencode:<tab>` scope on the same tab, and the popover's
+> override clears only the scope it acts on — `claude:<tab>` stayed open while
+> `opencode:<tab>` remained EXTERNAL and contaminated. Check every row of
+> `/status`'s `latches` array before trusting a tab's state.
 
 ### 13b — #45's two negative checks (shell, launch token + port)
 **Precondition: at least one AI tab configured** — with zero AI tabs the forged

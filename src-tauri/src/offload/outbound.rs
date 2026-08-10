@@ -1652,6 +1652,15 @@ pub mod test_rows {
 /// depends on after an incident (the screen, the scope, and since #45 the
 /// [`Origin`]) are assertable in a unit test. The write itself needs the
 /// activity store, which is process-global file I/O; this does not.
+/// The tab half of a scope label when the caller had **no tab identity** —
+/// `loopback` builds `"{agent}:(no tab identity)"` rather than inventing a
+/// scope, and that label reaches flag rows.
+///
+/// Shared so [`scope_attribution`] and the formatter cannot drift: a literal in
+/// two files is how this string would quietly become a tab named
+/// `(no tab identity)` in the Events feed.
+pub const NO_TAB_IDENTITY: &str = "(no tab identity)";
+
 /// A latch scope, read as a row attribution (#51).
 ///
 /// [`Flag::scope`] is either `agent:tab` or a worker task id, and the two are
@@ -1665,9 +1674,19 @@ pub mod test_rows {
 /// configured tab. An unrecognized id therefore never becomes a flag row in the
 /// first place — the state exists in [`Attribution`] for the recorders that
 /// *can* see one, not for this one.
+///
+/// [`NO_TAB_IDENTITY`] is the case that makes this more than a string split.
+/// A caller with no tab identity still produces flag rows (the SSRF screen
+/// needs no identity to run), and `loopback` labels those
+/// `"{agent}:(no tab identity)"` — an honest label, but one shaped exactly like
+/// a real `agent:tab`. Splitting naively turns it into a **tab named
+/// `(no tab identity)`**: a phantom row in the one view whose job is saying
+/// which tab did something. It is `Headless`, which is the truth.
 fn scope_attribution(scope: &str) -> Attribution {
     match scope.split_once(':') {
-        Some((_agent, tab)) if !tab.is_empty() => Attribution::Tab(tab.to_string()),
+        Some((_agent, tab)) if !tab.is_empty() && tab != NO_TAB_IDENTITY => {
+            Attribution::Tab(tab.to_string())
+        }
         _ => Attribution::Headless,
     }
 }
@@ -1814,6 +1833,43 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("test address parses")
+    }
+
+    /// A scope is only a tab when it names one (#51).
+    ///
+    /// The `(no tab identity)` case is the one this exists for. That label is
+    /// what `loopback` writes when the caller has no tab identity at all, and
+    /// it is deliberately shaped like a real `agent:tab` — so a naive split
+    /// yields a **tab named `(no tab identity)`**, a row attributed to a tab
+    /// that cannot exist, in the view whose entire job is attribution. It is
+    /// the exact defect the four-state `Attribution` exists to prevent, and it
+    /// is reachable: the SSRF screen needs no identity, so it flags on this
+    /// path routinely.
+    #[test]
+    fn a_scope_without_tab_identity_is_headless_not_a_tab_of_that_name() {
+        assert_eq!(
+            scope_attribution("claude:tab-1"),
+            Attribution::Tab("tab-1".into())
+        );
+        assert_eq!(
+            scope_attribution(&format!("claude:{NO_TAB_IDENTITY}")),
+            Attribution::Headless,
+            "the no-identity label must never read as a tab"
+        );
+        // A worker task scope has no `agent:tab` shape at all.
+        assert_eq!(scope_attribution("task-abc123"), Attribution::Headless);
+        assert_eq!(scope_attribution("claude:"), Attribution::Headless);
+        assert_eq!(scope_attribution(""), Attribution::Headless);
+    }
+
+    /// The label `loopback` builds and the label `scope_attribution` recognizes
+    /// have to be the same string, or the phantom-tab defect comes back
+    /// silently. One constant, asserted from the shape the formatter produces.
+    #[test]
+    fn the_no_identity_label_matches_what_loopback_formats() {
+        let formatted = format!("claude:{NO_TAB_IDENTITY}");
+        assert!(formatted.ends_with(NO_TAB_IDENTITY));
+        assert_eq!(scope_attribution(&formatted), Attribution::Headless);
     }
 
     /// Every range in the locked deny set, plus the neighbours that must stay

@@ -5332,7 +5332,7 @@ async fn handle_mcp_call(
     let scope_label = scope
         .as_ref()
         .map(LatchScope::label)
-        .unwrap_or_else(|| format!("{agent}:(no tab identity)"));
+        .unwrap_or_else(|| format!("{agent}:{}", outbound::NO_TAB_IDENTITY));
     let detection_cfg = detection::Config::from_settings(&settings, inj_scope);
     let spotlight_on = crate::settings::injection::effective(
         crate::settings::injection::Feature::Spotlighting,

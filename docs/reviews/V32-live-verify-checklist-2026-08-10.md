@@ -8,11 +8,11 @@ is a *pair* (one refused, one allowed), both boxes are kept adjacent, because
 running only the refusal half proves nothing — that is exactly how the old
 recipe 7 passed while describing the wrong behaviour.
 
-**Status 2026-08-10 (rc.3): 12 recipes have now run.** PASS: **1**, **2** (both
-legs), **3**, **6**, **7** (2 boxes partial), **10**, **11c** (positive leg),
-**13b** (both negative legs), **16** (one box FAILS — the row count).
-PARTIAL: **9**, **13**, **22**. One box FAILED so far, and it reproduced **F-16**
-live. The rest are still unrun —
+**Status 2026-08-10 (rc.3): 14 recipes have now run.** PASS: **1**, **2** (both
+legs), **3**, **5**, **6**, **7** (2 boxes partial), **10**, **11c** (positive
+leg), **13b** (**all three** legs), **16** (one box FAILS — the row count).
+cImp-side PASS: **12**. PARTIAL: **9**, **13**, **22**. One box FAILED so far,
+and it reproduced **F-16** live. The rest are still unrun —
 every V32 finding before this was closed by code review plus unit tests, and this
 remains the release gate.
 
@@ -252,13 +252,32 @@ model's paraphrase of them.
       tool *returns* — `graph_snippet` yields source text, `graph_outline` only
       structure — which is the distinction the pair exists to prove.
 
-### 5 — latch reset
-- [ ] A new offload task starts **unlatched**.
-- [ ] A tab restart starts **unlatched**.
+### 5 — latch reset — **PASS 2026-08-10**
+- [x] A new offload task starts **unlatched**. Shown across recipes 1 → 2: the
+      recipe 1 task ended EXTERNAL-latched (its `read_file` was refused), and the
+      very next task came up with the **full local tool list** and no residue.
+- [x] A tab restart starts **unlatched**. **Verified on the app restart:**
+      `/status`'s `latches` array came back **empty** — every latch and every
+      contamination bit gone, including the stray `opencode:<tab>` scope. The
+      registry is a process-global `OnceLock`, so this is the clean exit the six
+      user-facing strings promise.
 
-### 12 — sensor mode (default), native web tools
-- [ ] Claude tab, **native** WebFetch → tab badge appears, `/status` shows the
+### 12 — sensor mode (default), native web tools — **cImp side PASS 2026-08-10**
+> **What was covered and what was not.** The checks below were driven by
+> `POST /latch/beacon` with a real tab id — the same route and the same payload
+> the injected beacon shim sends, so everything on **cImp's** side of the line is
+> genuinely exercised. What it does **not** cover is whether a real native
+> `WebFetch` in a live tab causes the shim to fire at all (hook injection →
+> beacon POST). That half needs a human typing in the tab, and is still owed.
+- [x] Claude tab, **native** WebFetch → tab badge appears, `/status` shows the
       latch engaged, a proxied `graph_snippet` is refused.
+      **cImp side PASS:** the beacon returned
+      `{"ok":true,"latch":{"latch":"external","contaminated":true,…}}`, `/status`
+      then showed that tab `latch:"external", contaminated:true`, and a proxied
+      `graph_snippet` came back with the fixed `REFUSED (security boundary)`
+      string. **Badge not visually confirmed** — that is the tab-side half.
+      Note sensor mode **engages the latch** while never denying the native tool:
+      report-only refers to the *native* route, not to the latch.
 
 > **Confirmed default on the live install 2026-08-10:**
 > `P:\WorkSync\Software\ccimp\bin\settings.json` carries
@@ -282,8 +301,11 @@ model's paraphrase of them.
 > on, so it should be blocking" is the natural and wrong reading — observed
 > live. Whatever rework closes F-18 should make the on-state state its posture.
 - [ ] Same via OpenCode's native webfetch.
-- [ ] A `latch_beacon` row appears whose payload reads `"origin": "http"` (#45).
-- [ ] **Exactly one** row for the whole session (the latch is sticky).
+- [x] A `latch_beacon` row appears whose payload reads `"origin": "http"` (#45).
+      **PASS** — plus a `contamination` row, also `"origin":"http"`.
+- [x] **Exactly one** row for the whole session (the latch is sticky).
+      **PASS** — a second identical beacon returned the same latch state and
+      wrote **zero** further rows.
 - [ ] `native_web_visibility: off` + tab restart → no badge, no latch, no row,
       **no hook injected at all**.
 - [ ] `deny` mode → native web tools refused by the harness itself; a proxied
@@ -319,8 +341,8 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then:
       latches EXTERNAL**. _(not run — needs a scope that is still unlatched;
       both throwaway-tab scopes are EXTERNAL and `claude:claude` is LOCAL.)_
 
-**Results:** 1 **PASS** 2 **PASS** (both legs) 3 **PASS**
-5 ____ 12 ____ 20 ____ 22 **PARTIAL**
+**Results:** 1 **PASS** 2 **PASS** (both legs) 3 **PASS** 5 **PASS**
+12 **cImp side PASS** (tab-side hook + off/deny legs owed) 20 ____ 22 **PARTIAL**
 
 ---
 
@@ -723,10 +745,13 @@ beacon is *accepted* and the second check passes for the wrong reason.
       `grep -c not-a-tab` over `/status` = **0**; no row written.
       Precondition satisfied: `claude` was a configured AI tab, so this did not
       pass for the empty-tab-list reason.
-- [ ] Repeat with a **real** tab id → 200 and the sensor-mode behaviour of (12).
-      **Deliberately deferred** — this leg *engages* the named tab's EXTERNAL
-      latch, and contamination is sticky for that tab's life. Run it against the
-      throwaway `v32-test` tab, not a working one.
+- [x] Repeat with a **real** tab id → 200 and the sensor-mode behaviour of (12).
+      **PASS 2026-08-10**, run after the app restart against the throwaway tab:
+      `HTTP 200`, latch `external`, `contaminated:true`, one `latch_beacon` row
+      with `"origin":"http"`, and a proxied `graph_snippet` refused afterwards.
+      So all three of 13b's legs now pass. _(Deferred earlier on purpose: this
+      leg engages the named tab's latch and contamination is sticky for that
+      tab's life.)_
 
 **Result:** both negative legs PASS 2026-08-10 (auth is `Authorization: Bearer
 <token>` from `<exe-dir>/.cimp-offload.json`; port 49344, pid 62216 that run).

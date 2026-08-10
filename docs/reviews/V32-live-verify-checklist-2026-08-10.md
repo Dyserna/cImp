@@ -568,7 +568,28 @@ process. The updater's redirect policy is `none()`, covered by recipe 11._
 **Results:** 7 **PASS** (2 boxes partial, 2 not run — see above) 8 ____
 9 **PARTIAL** (control PASS; enforcement leg structurally unreachable)
 
-### F-22 — raised 2026-08-10, HIGH-ish: live settings and persisted settings disagree for a spawn-baked security control
+### F-22 — raised 2026-08-10 → **GitHub issue [#52](https://github.com/Dyserna/cImp/issues/52)**: live settings and persisted settings diverge, and it is NOT one field
+
+> **It generalizes — confirmed 2026-08-10 after the finding was first written.**
+> `graph.read_advisor` diverges the same way: the spawn overlay carries the
+> `PreToolUse` **Read** hook, which is gated on
+> `graph.enabled && graph.read_advisor && !e1_blocked()`
+> (`tabs/config.rs:709-711`), while disk says `read_advisor: false`. And **all
+> seven `read_advisor*` fields on disk are byte-identical to the frontend default
+> block** (`src/lib/settings/types.ts:1851-1857`), exactly as
+> `native_web_visibility` matches its default at `:1790`.
+>
+> Meanwhile `tabs`, `layout` and `llm_pricing` on disk still hold real data — so
+> this is not a wholesale defaults overwrite. **The fields that survived are
+> largely the ones `apply_incoming_settings` copies from `cur`**
+> (`ipc/commands.rs:832-856`), which makes "a save whose `incoming` was
+> default-derived" the leading hypothesis and puts the blast radius at *every
+> field not on the out-of-band preserve list*.
+>
+> Still unexplained, and the thread to pull: `apply_incoming_settings` ends with
+> `*cur = incoming` (`:857`), so that path alone would have moved the **live**
+> value to `sensor` too. It did not. **Some writer is reaching `settings.json`
+> outside that path.** No repro yet — the user never edited the affected fields.
 
 **Symptom that surfaced it.** The v32-test tab reported that `WebFetch` was not
 in its tool list at all — and it was right; so is the `claude` tab. It correctly

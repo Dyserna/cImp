@@ -825,8 +825,9 @@ pub async fn ai_tool_tab_defaults(tab: TabId) -> AppResult<AiToolTabConfig> {
 ///
 /// `incoming` is the Settings-window's full snapshot; `cur` is the live
 /// in-memory state. See the call site in `settings_update` for why
-/// `layout`/`session`/`prompt_templates`/`templates_seeded` are preserved
-/// from `cur` rather than taken from `incoming`.
+/// `layout`/`session`/`prompt_templates`/`templates_seeded`/
+/// `pricing_seeded_generation` are preserved from `cur` rather than taken from
+/// `incoming`.
 fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     incoming.layout = cur.layout.clone();
     incoming.session = cur.session.clone();
@@ -837,6 +838,13 @@ fn apply_incoming_settings(cur: &mut Settings, mut incoming: Settings) {
     // the physical global file. Preserve it so a stale Settings-window
     // snapshot can't stomp a price edit made through the dedicated IPC.
     incoming.llm_pricing = cur.llm_pricing.clone();
+    // F-19: the watermark travels with `llm_pricing` and must be preserved for
+    // a sharper reason than the table itself. A Settings-window snapshot that
+    // omits the field deserializes it as 0 (its serde default), so taking it
+    // from `incoming` would reset the watermark on every settings save — and
+    // the next launch would then re-run the top-up and resurrect a built-in
+    // row the user had deliberately deleted.
+    incoming.pricing_seeded_generation = cur.pricing_seeded_generation;
     // `harness_versions` is likewise out-of-band (V16): written by the OOB
     // transcript tap / tab spawn / `harness_mark_verified`, straight to the
     // physical global file. A stale Settings-window snapshot must not revert

@@ -156,6 +156,12 @@ fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
 }
 
+/// Serde default for `Settings::pricing_seeded_generation` — see that field's
+/// doc comment for why it must be 0 rather than the container default.
+fn pricing_generation_none() -> u32 {
+    0
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -315,6 +321,24 @@ pub struct Settings {
     /// `CURRENT_SCHEMA_VERSION` — a user who deletes all 4 starters must not
     /// have them reappear on a future migration.
     pub templates_seeded: bool,
+    /// F-19: which [`PRICING_GENERATION`] this install's `llm_pricing` has
+    /// been topped up to. Newer built-in rows are appended once, on the next
+    /// load, by `persistence::top_up_llm_pricing_if_needed`.
+    ///
+    /// A watermark rather than a `templates_seeded`-style bool because the
+    /// built-in set keeps growing: a one-shot flag would flip on the first
+    /// launch and never carry a later model in.
+    ///
+    /// **The explicit `default` is load-bearing.** `Settings` carries a
+    /// container-level `#[serde(default)]`, which fills a missing field from
+    /// `Settings::default()` — i.e. `PRICING_GENERATION`, marking every
+    /// pre-existing install as already current and permanently suppressing the
+    /// top-up it exists to perform. The field-level attribute overrides that
+    /// with 0, so an install that predates this field is correctly seen as
+    /// generation 0. Fresh installs get the current generation from `Default`,
+    /// since `default_llm_pricing` already includes every row.
+    #[serde(default = "pricing_generation_none")]
+    pub pricing_seeded_generation: u32,
     /// V14 Phase D2: budget-tuning advisor proposals the user has dismissed.
     /// Each entry suppresses ONE rule at ONE coarse (10%-bucketed) rate —
     /// see `advisor::Proposal::signature`'s doc comment — so a materially
@@ -411,6 +435,9 @@ impl Default for Settings {
             logging: LoggingSettings::default(),
             prompt_templates: Vec::new(),
             templates_seeded: false,
+            // A fresh install takes the whole current table from
+            // `default_llm_pricing`, so it starts already topped up.
+            pricing_seeded_generation: PRICING_GENERATION,
             advisor_dismissed: Vec::new(),
             advisor_applied: Vec::new(),
             preview_last_url: None,
@@ -534,23 +561,20 @@ pub struct LlmPricingModel {
 /// wins); Copilot rows are manual-pick only (Copilot sessions never appear
 /// in the Claude transcript tap).
 pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
-    fn row(provider: &str, model: &str, prefix: &str, prices: [f64; 4]) -> LlmPricingModel {
-        LlmPricingModel {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            model_prefix: prefix.to_string(),
-            input: prices[0],
-            cache_write: prices[1],
-            cache_read: prices[2],
-            output: prices[3],
-        }
-    }
     vec![
         row(
             "Anthropic",
             "Claude Fable 5",
             "claude-fable-5",
             [10.0, 20.0, 1.0, 50.0],
+        ),
+        // F-19 (2026-08-10): absent until rc.2, which is why a session on the
+        // default model priced at $0. Same list rates as the Opus 4.x rows.
+        row(
+            "Anthropic",
+            "Claude Opus 5",
+            "claude-opus-5",
+            [5.0, 10.0, 0.5, 25.0],
         ),
         row(
             "Anthropic",
@@ -603,6 +627,49 @@ pub fn default_llm_pricing() -> Vec<LlmPricingModel> {
         row("Copilot", "Gemini 2.5 Pro", "", [1.25, 1.25, 0.31, 10.0]),
         row("Copilot", "Gemini 3.5 Flash", "", [1.5, 1.5, 0.38, 9.0]),
     ]
+}
+
+fn row(provider: &str, model: &str, prefix: &str, prices: [f64; 4]) -> LlmPricingModel {
+    LlmPricingModel {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        model_prefix: prefix.to_string(),
+        input: prices[0],
+        cache_write: prices[1],
+        cache_read: prices[2],
+        output: prices[3],
+    }
+}
+
+/// Which batch of built-in price rows this build knows about. **Bump this by
+/// one, and extend [`pricing_rows_since`], every time a model is added to
+/// [`default_llm_pricing`]** — otherwise the new row reaches fresh installs
+/// only and every existing install silently prices that model at $0 (F-19).
+///
+/// Generation 0 is the pre-2026-08-10 table (no `claude-opus-5`); generation 1
+/// adds it.
+pub const PRICING_GENERATION: u32 = 1;
+
+/// The built-in rows introduced *after* generation `since` — the top-up set
+/// for an install whose stored table predates this build.
+///
+/// Deliberately NOT "every built-in row the stored table is missing". The
+/// price table is user-owned: a row the user deleted must stay deleted, and
+/// only the watermark can tell "deleted" apart from "never shipped". Callers
+/// additionally skip any row whose `model_prefix` the stored table already
+/// carries, so a hand-added row is topped up to a no-op rather than a
+/// duplicate — which is exactly the state the user who reported F-19 is in.
+pub fn pricing_rows_since(since: u32) -> Vec<LlmPricingModel> {
+    let mut out = Vec::new();
+    if since < 1 {
+        out.push(row(
+            "Anthropic",
+            "Claude Opus 5",
+            "claude-opus-5",
+            [5.0, 10.0, 0.5, 25.0],
+        ));
+    }
+    out
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. `rule_id` mirrors
@@ -4596,6 +4663,100 @@ mod tests {
                 "{group}.{field}"
             );
         }
+    }
+
+    /// **F-19 tripwire. If you added a model to [`default_llm_pricing`] and
+    /// landed here, that is this test working:** bump [`PRICING_GENERATION`],
+    /// add the row to [`pricing_rows_since`] under the new generation, and add
+    /// its prefix to `GEN_0` below only if it shipped before 2026-08-10.
+    ///
+    /// A row added to `default_llm_pricing` alone reaches **fresh installs
+    /// only** — every existing install keeps its stored table and prices that
+    /// model at $0, with no error anywhere. That is exactly how the missing
+    /// `claude-opus-5` row survived into a release candidate, and nothing about
+    /// adding the next model makes it more noticeable.
+    #[test]
+    fn every_built_in_priced_model_is_reachable_by_existing_installs() {
+        /// Prefixed rows that shipped before the watermark existed. Installs
+        /// that predate F-19 already have these, so they are NOT in
+        /// `pricing_rows_since` — adding one here retroactively would mean
+        /// resurrecting it for users who deleted it.
+        const GEN_0: &[&str] = &[
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ];
+
+        let shipped: Vec<String> = default_llm_pricing()
+            .into_iter()
+            .map(|r| r.model_prefix)
+            .filter(|p| !p.is_empty())
+            .collect();
+
+        // Every prefix reaches an existing install via exactly one route.
+        let migrated: Vec<String> = pricing_rows_since(0)
+            .into_iter()
+            .map(|r| r.model_prefix)
+            .collect();
+        for prefix in &shipped {
+            let in_gen_0 = GEN_0.contains(&prefix.as_str());
+            let in_migration = migrated.iter().any(|p| p == prefix);
+            assert!(
+                in_gen_0 || in_migration,
+                "`{prefix}` is seeded into fresh installs by default_llm_pricing but is \
+                 neither a pre-watermark row nor returned by pricing_rows_since(0) — every \
+                 EXISTING install will price it at $0. Bump PRICING_GENERATION and add it \
+                 to pricing_rows_since."
+            );
+            assert!(
+                !(in_gen_0 && in_migration),
+                "`{prefix}` is both a pre-watermark row and a migration row; the migration \
+                 would re-add a row those installs may have deleted"
+            );
+        }
+
+        // …and the migration never offers a row fresh installs don't get, or
+        // the two populations end up with different tables.
+        for prefix in &migrated {
+            assert!(
+                shipped.contains(prefix),
+                "pricing_rows_since offers `{prefix}` to existing installs but \
+                 default_llm_pricing doesn't give it to fresh ones"
+            );
+        }
+
+        // Prices must agree between the two routes, for the same reason.
+        for row in pricing_rows_since(0) {
+            let shipped_row = default_llm_pricing()
+                .into_iter()
+                .find(|r| r.model_prefix == row.model_prefix)
+                .expect("checked above");
+            assert_eq!(
+                (
+                    shipped_row.input,
+                    shipped_row.cache_write,
+                    shipped_row.cache_read,
+                    shipped_row.output
+                ),
+                (row.input, row.cache_write, row.cache_read, row.output),
+                "`{}` is priced differently for fresh vs migrated installs",
+                row.model_prefix
+            );
+        }
+    }
+
+    /// The default model has to be priced, or the Usage view's cost mode reads
+    /// $0 for the sessions the user actually runs — the F-19 symptom.
+    #[test]
+    fn the_current_default_model_has_a_price_row() {
+        let priced = default_llm_pricing()
+            .into_iter()
+            .any(|r| r.model_prefix == "claude-opus-5");
+        assert!(priced, "no claude-opus-5 row in the seeded price table");
     }
 
     fn local_backend(cmd: &str) -> OffloadBackend {

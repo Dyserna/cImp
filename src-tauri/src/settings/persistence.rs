@@ -43,12 +43,12 @@ use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
     default_ai_tab, default_audit_tools, default_graph_monitor_tab, default_shell_1_tab,
-    default_tool_activity_tab, default_workbench_tab, starter_prompt_templates, AiTabId,
-    HarnessVersions, LayoutNodePersisted, LlmPricingModel, PromptTemplate, RemoteBackendTemplate,
-    ServerCommandTemplate, Settings, TabConfig, CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID,
-    CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID,
-    OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID,
-    WORKBENCH_TAB_ID,
+    default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
+    starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
+    PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate, Settings, TabConfig,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID,
+    GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
+    PRICING_GENERATION, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
 use crate::settings::write_atomic;
 use crate::shell::ShellSpec;
@@ -604,8 +604,12 @@ fn load_global(default_shell: &ShellSpec) -> Settings {
     // seed to disk when a project overlay is active; see the function's
     // own doc comment).
     let seeded = seed_prompt_templates_if_needed(&mut typed);
+    // F-19: same reasoning — the physical global file is the only place the
+    // price table lives, so the top-up has to run here rather than against the
+    // merged per-project `Settings`.
+    let priced = top_up_llm_pricing_if_needed(&mut typed);
 
-    if migrated || seeded {
+    if migrated || seeded || priced {
         // Persist the migrated/seeded shape back to disk so future launches
         // don't re-migrate or re-seed. Atomic write inside save_to keeps
         // this safe under crash.
@@ -1142,6 +1146,58 @@ fn seed_prompt_templates_if_needed(s: &mut Settings) -> bool {
     }
     s.prompt_templates = starter_prompt_templates();
     s.templates_seeded = true;
+    true
+}
+
+/// F-19: append built-in price rows added since this install's
+/// `pricing_seeded_generation`, then advance the watermark. Returns `true`
+/// when anything changed (including a watermark-only advance), so the caller
+/// knows to rewrite the physical global file.
+///
+/// Why this exists at all: `read_global_llm_pricing` seeds
+/// `default_llm_pricing` **only when the global file is absent**, so shipping a
+/// new built-in row reaches fresh installs and nobody else — every existing
+/// install goes on pricing that model at $0 with no error, which is how the
+/// missing `claude-opus-5` row survived to a release candidate.
+///
+/// Three properties, each load-bearing:
+///
+/// * **Append-only.** Existing entries are never touched, so a price the user
+///   edited stays edited. That is also why this can't just overwrite the table
+///   with `default_llm_pricing`.
+/// * **Deleted rows stay deleted.** The watermark — not "is this built-in row
+///   missing?" — decides what to add, so a row the user removed is not
+///   resurrected on the next launch. This is the same reasoning as
+///   `templates_seeded`, generalized from a bool to a counter because the
+///   built-in set keeps growing.
+/// * **Hand-added rows aren't duplicated.** A user who worked around the
+///   missing row by adding it themselves already has the prefix, so the
+///   top-up skips it and only advances the watermark. Matching is on
+///   `model_prefix` because that is the field cost mode actually resolves
+///   against; a row with an empty prefix (the Copilot rows) can never
+///   suppress anything, since every such row would otherwise collide.
+fn top_up_llm_pricing_if_needed(s: &mut Settings) -> bool {
+    if s.pricing_seeded_generation >= PRICING_GENERATION {
+        return false;
+    }
+    let have: std::collections::HashSet<&str> = s
+        .llm_pricing
+        .iter()
+        .map(|r| r.model_prefix.as_str())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let missing: Vec<_> = pricing_rows_since(s.pricing_seeded_generation)
+        .into_iter()
+        .filter(|r| !have.contains(r.model_prefix.as_str()))
+        .collect();
+    let added = missing.len();
+    s.llm_pricing.extend(missing);
+    s.pricing_seeded_generation = PRICING_GENERATION;
+    tracing::info!(
+        added,
+        generation = PRICING_GENERATION,
+        "settings: llm pricing topped up"
+    );
     true
 }
 
@@ -2982,6 +3038,131 @@ mod tests {
             s.prompt_templates.is_empty(),
             "deleted starters must stay deleted"
         );
+    }
+
+    // --- F-19: built-in price rows reach EXISTING installs ---------------
+
+    /// A settings file written before this field existed must read back as
+    /// generation 0, not as `PRICING_GENERATION`.
+    ///
+    /// This is the whole fix in one assertion. `Settings` carries a
+    /// container-level `#[serde(default)]`, which fills missing fields from
+    /// `Settings::default()` — and that returns the CURRENT generation. Drop
+    /// the field-level `#[serde(default = "pricing_generation_none")]` and this
+    /// test fails while everything else stays green: every pre-existing install
+    /// would read as already-topped-up and silently never receive another
+    /// built-in row.
+    #[test]
+    fn a_settings_file_without_the_watermark_reads_as_generation_zero() {
+        let s: Settings = serde_json::from_str(r#"{"schema_version": 29}"#).unwrap();
+        assert_eq!(
+            s.pricing_seeded_generation, 0,
+            "a file predating the watermark must look like generation 0, or the \
+             top-up never runs on the installs that need it"
+        );
+        assert!(
+            PRICING_GENERATION > 0,
+            "generation 0 must mean `nothing topped up yet`"
+        );
+    }
+
+    #[test]
+    fn top_up_appends_new_built_in_rows_to_an_existing_table() {
+        // An install carrying the pre-Opus-5 table.
+        let mut s = Settings::default();
+        s.pricing_seeded_generation = 0;
+        s.llm_pricing
+            .retain(|r| r.model_prefix != "claude-opus-5");
+        let before = s.llm_pricing.len();
+
+        assert!(top_up_llm_pricing_if_needed(&mut s));
+        assert_eq!(s.pricing_seeded_generation, PRICING_GENERATION);
+        assert_eq!(s.llm_pricing.len(), before + 1);
+
+        let added = s
+            .llm_pricing
+            .iter()
+            .find(|r| r.model_prefix == "claude-opus-5")
+            .expect("claude-opus-5 row appended");
+        assert_eq!((added.input, added.output), (5.0, 25.0));
+
+        // Idempotent: the watermark stops a second pass.
+        assert!(!top_up_llm_pricing_if_needed(&mut s));
+        assert_eq!(s.llm_pricing.len(), before + 1);
+    }
+
+    /// The property that makes this safe to run on every launch: it is a
+    /// one-time top-up, not a reconciliation against `default_llm_pricing`.
+    #[test]
+    fn top_up_does_not_resurrect_a_row_the_user_deleted() {
+        let mut s = Settings::default();
+        s.pricing_seeded_generation = 0;
+        assert!(top_up_llm_pricing_if_needed(&mut s));
+
+        // User deletes it afterwards. It must stay gone.
+        s.llm_pricing.retain(|r| r.model_prefix != "claude-opus-5");
+        assert!(!top_up_llm_pricing_if_needed(&mut s));
+        assert!(
+            !s.llm_pricing.iter().any(|r| r.model_prefix == "claude-opus-5"),
+            "a deleted price row must stay deleted"
+        );
+    }
+
+    /// The state the user who reported F-19 is actually in: they worked around
+    /// the missing row by adding it by hand, at their own price.
+    #[test]
+    fn top_up_neither_duplicates_nor_overwrites_a_hand_added_row() {
+        let mut s = Settings::default();
+        s.pricing_seeded_generation = 0;
+        s.llm_pricing
+            .retain(|r| r.model_prefix != "claude-opus-5");
+        s.llm_pricing.push(LlmPricingModel {
+            provider: "Anthropic".to_string(),
+            model: "Opus 5 (mine)".to_string(),
+            model_prefix: "claude-opus-5".to_string(),
+            input: 4.0,
+            cache_write: 8.0,
+            cache_read: 0.4,
+            output: 20.0,
+        });
+        let before = s.llm_pricing.len();
+
+        // Still returns true — the watermark advances — but adds nothing.
+        assert!(top_up_llm_pricing_if_needed(&mut s));
+        assert_eq!(s.llm_pricing.len(), before, "no duplicate row");
+
+        let rows: Vec<_> = s
+            .llm_pricing
+            .iter()
+            .filter(|r| r.model_prefix == "claude-opus-5")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input, 4.0, "a hand-edited price must not be reset");
+        assert_eq!(rows[0].model, "Opus 5 (mine)");
+    }
+
+    /// The Copilot rows all carry an empty `model_prefix`; that must not make
+    /// them collide with each other or suppress a prefixed row.
+    #[test]
+    fn empty_prefix_rows_never_suppress_a_top_up() {
+        let mut s = Settings::default();
+        s.pricing_seeded_generation = 0;
+        s.llm_pricing.retain(|r| r.model_prefix.is_empty());
+        let before = s.llm_pricing.len();
+        assert!(before > 0, "the Copilot rows are the empty-prefix ones");
+
+        assert!(top_up_llm_pricing_if_needed(&mut s));
+        assert_eq!(s.llm_pricing.len(), before + 1);
+    }
+
+    /// A fresh install already has every row, so it starts topped up and the
+    /// migration is a no-op for it.
+    #[test]
+    fn a_fresh_install_starts_at_the_current_generation() {
+        let mut s = Settings::default();
+        assert_eq!(s.pricing_seeded_generation, PRICING_GENERATION);
+        assert!(s.llm_pricing.iter().any(|r| r.model_prefix == "claude-opus-5"));
+        assert!(!top_up_llm_pricing_if_needed(&mut s));
     }
 
     #[test]

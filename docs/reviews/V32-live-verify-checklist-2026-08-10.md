@@ -25,7 +25,7 @@ every V32 finding before this was closed by code review plus unit tests, and thi
 remains the release gate.
 
 Record per recipe: PASS / FAIL / BLOCKED + the finding id if it raises one.
-New findings continue the F-series (next free: **F-23**; F-20, F-21, **F-22**
+New findings continue the F-series (next free: **F-24**; F-20, F-21, F-22 (withdrawn), **F-23**
 below — F-22 is the one to read first).
 
 ---
@@ -804,6 +804,37 @@ path. That is the thread to pull.
 by the harness itself, while proxied `ddg__fetch_content` kept working and
 latching all session (recipes 3, 7, 10). Both halves of that pair, unplanned.
 
+### F-23 — raised 2026-08-10: after a USER flip, the refusal states a cause that did not happen
+
+Recipe 13a, on a tab latched EXTERNAL by a native `WebFetch`. The user clicked
+**"Switch to local"** in the ⛨ popover. The next `ddg__fetch_content` was
+correctly refused — with the generic LOCAL-latch string:
+
+> *"REFUSED (security boundary): **this task has already used a local-capability
+> tool** … so external tools — web search/fetch and every other MCP-server tool —
+> are unavailable for the remainder of this task."*
+
+That is false here. The task had used a local tool only *after* the flip, and the
+flip is what closed the external side. **The enforcement was right; the stated
+reason was invented.**
+
+**Why it matters more than a wording nit:** the model in the tab believed it and
+passed it on, telling the user *"the `graph_snippet` lookup for `new_canary`
+latched this task to the local side"* — a specific, confident, wrong causal
+claim, offered unprompted. A user debugging "why did my web tools vanish" is
+told a tool they ran is responsible, when the real answer is a button they
+pressed. That is the failure mode locked decision 15 exists to make legible.
+
+Both override actions have the same problem (`flip_local` closes the web side,
+`unlatch` reopens both), and the fix is cheap: the latch already knows it moved
+by `LatchOverride` rather than by tool use — it writes a `latch_override` row
+saying exactly that, with `origin:"ipc"`. The refusal just doesn't consult it.
+
+Severity LOW-MEDIUM, reporting honesty; same family as M-5, M-21, M-22 and M-24,
+and it strengthens the case for taking that group as one piece of work.
+**Found only by running the recipe** — no source read would have flagged a
+correct-looking constant.
+
 ### F-20 — raised 2026-08-10, first defect found in rc.3's own headline feature
 
 Every `kind:"mcp"` row — the row recording the actual proxied tool call — is
@@ -962,8 +993,14 @@ and Limits: Injection protection (`SettingsApp.svelte:4414`), Native web tools
 
 ### 13 — override (UI only; no HTTP route since #45)
 With a tab EXTERNAL-latched, click the ⛨ badge:
-- [ ] "Switch to local" → `graph_snippet` answers again **and** `ddg__*` is
-      refused (a flip, not an unlatch).
+- [x] "Switch to local" → `graph_snippet` answers again **and** `ddg__*` is
+      refused (a flip, not an unlatch). **PASS 2026-08-10** on a tab latched
+      EXTERNAL by a real native `WebFetch`: after the flip `graph_snippet`
+      returned the body of `new_canary`, and `ddg__fetch_content` was refused
+      with the mirror-image string. `/status`: `latch:"local"`,
+      **`contaminated:true`** (the bit survives the flip, as decision 15 says).
+      `latch_override` row: `tool: flip_local, ok:true, origin:"ipc"`.
+      **Raises F-23 — see below.**
 - [ ] A `context_note pin=true` written **after** the flip still lands
       **quarantined** (contamination survives the override).
 - [x] "Full unlatch" (after its confirmation) restores both sides.

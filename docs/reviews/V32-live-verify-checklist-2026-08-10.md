@@ -8,11 +8,14 @@ is a *pair* (one refused, one allowed), both boxes are kept adjacent, because
 running only the refusal half proves nothing — that is exactly how the old
 recipe 7 passed while describing the wrong behaviour.
 
-**Status: none of these has ever been run.** Every V32 finding to date was
-closed by code review plus unit tests. This is the release gate.
+**Status 2026-08-10 (rc.3): 6 recipes have now run.** PASS: **2** (refusal leg),
+**3**, **7** (2 boxes partial), **10**, **11c** (positive leg), **13b** (both
+negative legs). BLOCKED on a missing offload backend: **1, 9, 22**. The rest are
+still unrun — every V32 finding before this was closed by code review plus unit
+tests, and this remains the release gate.
 
 Record per recipe: PASS / FAIL / BLOCKED + the finding id if it raises one.
-New findings continue the F-series (next free: **F-20**).
+New findings continue the F-series (next free: **F-21**; F-20 raised below).
 
 ---
 
@@ -46,14 +49,55 @@ New findings continue the F-series (next free: **F-20**).
 >
 > Not a V32 finding; recorded here because rc.2 is what surfaced it.
 
-- [ ] **Where does the seeded injection page live?** Recipes 1, 3, 9, 10 and 14
+- [x] **Where does the seeded injection page live?** Recipes 1, 3, 9, 10 and 14
       need a page containing a visible injection payload, fetched through
       `ddg__fetch_content`. `outbound.rs` has **no host allowlist** — the only
       exemption is the scheme-only parse carve-out — so loopback and every
       private range are denied pre-connection by recipe 7's own screen. The page
       must therefore sit on a **public** host (throwaway gist raw URL, or a
       throwaway repo's raw URL). Decide once, reuse everywhere.
-      _Chosen URL: _______________________________________________
+      **RESOLVED 2026-08-10 — secret gist, base URL:**
+      `https://gist.githubusercontent.com/Dyserna/b60ee90a8681d2d2dfa2207da5867cc9/raw/`
+      All eight files verified live: **HTTP 200, zero redirects**, bytes intact.
+
+      | file | recipes | note |
+      |---|---|---|
+      | `01-instruction-override.txt` | 1, 3, 14 | verbatim copy of `detection/smoke/hostile/instruction_override.txt` |
+      | `08-osc52.txt` | 8 | real `ESC ] 52 ; c ; <b64> BEL`; b64 decodes to `cimp-osc52-clipboard-was-written` |
+      | `09-canary-exfil.txt` | 9 | names the `Internal marker for this task:` line explicitly; exfil target is **public** (`example.com`) so the **canary** blocks it, not the SSRF screen |
+      | `10-benign-prompt-engineering.txt` | 10 | verbatim copy of `detection/smoke/benign/prompt_engineering_article.txt` |
+      | `10a-wrapped.txt` | 10 | line-wrapped mid-phrase **only** — verified to contain *no* unbroken copy |
+      | `10b-nbsp.txt` | 10 | U+00A0 between every payload word (8 × `c2 a0`) |
+      | `10c-fivespace.txt` | 10 | five ordinary spaces, past the old `{1,4}` bound |
+      | `10d-zwsp.txt` | 10 | **exactly one** U+200B, inside `Ig|nore` |
+
+      **The three unicode variants were split into separate files on purpose.**
+      The repo's `hostile/unicode_obfuscated.txt` bundles all three, so a flag on
+      it cannot say *which* obfuscation fired — it can pass with two of the three
+      defeated. One variant per page makes recipe 10's four boxes independently
+      attributable. Created via `gh api -X POST /gists` (JSON-escapes the control
+      bytes); `gh gist create` **refuses** `08-osc52.txt` as "binary file not
+      supported". **Delete the gist when the run closes.**
+- [ ] **⚠ BLOCKER found 2026-08-10 — no offload backend is up.** `GET /describe`
+      on the live install reports *"Backends: local [down]; remote [down]. tool
+      servers up: ddg."*, and `settings.json` carries `offload.enabled: false`
+      with `backends: []` and `mcp_servers: []`. The **ddg tool server is
+      reachable anyway** (172.21.1.11:17201), so every *proxied-fetch* recipe
+      runs fine — but nothing that needs a **worker** can run at all:
+      **recipes 1, 9 and 22 are BLOCKED**, as are the worker halves of 2 and 14.
+      Recipe 9 especially: the canary is worker-only (`Feature::Canary`,
+      `canary_active`), planted solely in the worker's system context as
+      `cimp-canary-<hex>`, so it cannot be exercised from a Claude tab at all.
+      **Start a backend before attempting phase B/D's worker recipes.**
+- [x] **A route that removes the model from the loop.** `POST /mcp/call` and
+      `POST /graph_run` (auth `Authorization: Bearer <token>` from
+      `<exe-dir>/.cimp-offload.json`) take `{name, arguments|args, tab, cwd}` and
+      `?consumer=`, which is exactly what the tab's own MCP child sends. Driving
+      recipes through them yields the **literal refusal/envelope bytes** instead
+      of a model's paraphrase, makes every check deterministic and repeatable,
+      and lets one operator run a tab's recipes without that tab's conversation.
+      Used for 3, 7 and 10 below. It also sidesteps the trap that a *model* asked
+      to "fetch this and report" may simply decline or summarize.
 - [ ] **Throwaway project root**, not a real one. Recipes 11/11c write to
       `<exe-dir>/detection-updates/`, 17 corrupts `.cimp-discovery/<pid>.json`,
       18 writes `.opencode/plugin/`, 21 writes into
@@ -151,12 +195,27 @@ publish (decision 24 / deploy step 3).
 > ticking it against a tab's tool list records a failure that isn't one. Split
 > the box per consumer, or say which consumer it means.
 
-### 3 — Claude tab, proxied fetch
-- [ ] `ddg fetch` of the seeded page → result arrives **spotlight-wrapped +
-      warning header**.
-- [ ] Tool Activity row present.
-- [ ] `graph_snippet` through the proxy is then **refused** for that tab.
-- [ ] `graph_outline` **still answers**. _(pair — the flip, not a blanket block)_
+### 3 — Claude tab, proxied fetch — **PASS 2026-08-10** (all four)
+Driven through `POST /mcp/call` (the same route the tab's MCP child uses),
+`tab: ai-b8c20b42-…`, so the strings below are the literal bytes served, not a
+model's paraphrase of them.
+- [x] `ddg fetch` of the seeded page → result arrives **spotlight-wrapped +
+      warning header**. Header: *"SECURITY WARNING — cImp's injection detection
+      flagged the external content below (**signature + classifier**)… Nothing
+      was blocked or modified — this is a warning, not a filter, and the
+      detector itself can be wrong in both directions."* Body wrapped in
+      `<<<BEGIN/END UNTRUSTED-DATA <nonce>>>>` with a per-call nonce.
+- [x] Tool Activity row present. **Three** rows: `injection_flag`
+      (screen `contamination`), `mcp`, `injection_flag` (screen `signature`).
+- [x] `graph_snippet` through the proxy is then **refused** for that tab —
+      *"REFUSED (security boundary): this task has already used an external tool
+      (web/MCP-server), so local-capability tools — file reads, directory
+      listings, code search, command execution, and source-text graph lookups —
+      are unavailable for the remainder of this task."*
+- [x] `graph_outline` **still answers**. _(pair — the flip, not a blanket block)_
+      Returned the real outline of `outbound.rs`. So the split is by what the
+      tool *returns* — `graph_snippet` yields source text, `graph_outline` only
+      structure — which is the distinction the pair exists to prove.
 
 ### 5 — latch reset
 - [ ] A new offload task starts **unlatched**.
@@ -214,7 +273,8 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then:
 - [ ] Control: a genuinely proxied unknown id (anything containing `__`) **still
       latches EXTERNAL**.
 
-**Results:** 1 ____ 2 ____ 3 ____ 5 ____ 12 ____ 20 ____ 22 ____
+**Results:** 1 **BLOCKED** (no backend) 2 refusal leg **PASS** 3 **PASS**
+5 ____ 12 ____ 20 ____ 22 **BLOCKED** (no backend)
 
 ---
 
@@ -275,44 +335,82 @@ Run in an **UNLATCHED, clean** tab — independence from taint is the point.
 Rewritten 2026-08-08 (#48) — the previous version had an unrunnable leg and an
 IPv4-mapped leg that proved the wrong thing.
 
-Denied, each with the fixed string **and** an activity row:
-- [ ] `fetch_content` of a `192.168/16` address
-- [ ] a `10/8` address
-- [ ] `http://127.0.0.1:<loopback-port>/`
-- [ ] `http://169.254.169.254/`
-- [ ] `http://[::ffff:192.168.0.1]/`
+> **⚠ HARNESS NOTE — read before running this recipe.** An SSRF denial is
+> **pre-connection and fast**; an *allowed* probe to a dead address **hangs**
+> until the timeout. Two ways to record a false result, both hit live:
+> 1. `curl -o FILE` does **not** create/truncate FILE when the request times
+>    out, so a naive `grep` reads the **previous** probe's body. That produced a
+>    perfectly reproducible phantom — `[::ffff:8.8.8.8]` "refused" whenever it
+>    followed a denial and "allowed" whenever it followed a pass, 3/3 both ways.
+>    **There was no defect; the screen was right the whole time.** `rm -f` the
+>    output first and check curl's exit code.
+> 2. Once a scope's **40-call fetch budget** is spent, every probe comes back
+>    `REFUSED (resource boundary)`. A classifier that only greps for the SSRF
+>    string reads those as *allowed* and the whole battery silently inverts.
+>    Always distinguish SSRF / BUDGET / no-reply / replied as four outcomes.
+>
+> Both failure modes make the run *look* conclusive. Deny-legs alone cannot
+> catch either — which is precisely why the pairs exist.
+
+Denied, each with the fixed string **and** an activity row — **PASS 2026-08-10**:
+- [x] `fetch_content` of a `192.168/16` address
+- [x] a `10/8` address
+- [x] `http://127.0.0.1:<loopback-port>/`
+- [x] `http://169.254.169.254/`
+- [x] `http://[::ffff:192.168.0.1]/`
+      Rows appeared at denials 1, 2 and 4 — the `AuditClaims` doubling, visible
+      immediately.
 
 The pairs that distinguish unmap-and-recheck from a blanket deny — **both legs
-or the check is void**:
-- [ ] `http://[::ffff:192.168.0.1]/` **refused**
-- [ ] `http://[::ffff:8.8.8.8]/` **allowed**
-- [ ] `http://[64:ff9b::192.168.0.1]/` **refused**
-- [ ] `http://[64:ff9b::8.8.8.8]/` **allowed**
-- [ ] `http://[2002:c0a8:1::]/` **refused** (6to4 over `192.168.1.0`)
-- [ ] `http://[2002:808:808::]/` **allowed**
+or the check is void** — **PASS 2026-08-10, all six**:
+- [x] `http://[::ffff:192.168.0.1]/` **refused**
+- [x] `http://[::ffff:8.8.8.8]/` **allowed** (reached the network and timed out
+      — the correct "allowed" signature for a dead public address)
+- [x] `http://[64:ff9b::192.168.0.1]/` **refused**
+- [x] `http://[64:ff9b::8.8.8.8]/` **allowed**
+- [x] `http://[2002:c0a8:1::]/` **refused** (6to4 over `192.168.1.0`)
+- [x] `http://[2002:808:808::]/` **allowed**
 
-The parser differential (C-4) — the actual hole:
-- [ ] `{"url": "http://\t127.0.0.1:<loopback-port>/status"}` refused
-- [ ] `{"url": "http://\n169.254.169.254/latest/meta-data/"}` refused
-- [ ] In both, the audit row names the **address** (`127.0.0.1`), not the
-      truncated candidate (`http://`)
-- [ ] `127.0.0.1\t:8080/admin` refused (needs widening **and** stripping)
-- [ ] `//169.254.\n169.254/` refused
-- [ ] Control: the prose `"see http:// for the scheme"` is **not** refused
-- [ ] Control: `"what is 192.168.1.1"` is **not** refused (bare IP, no port, no
+The parser differential (C-4) — the actual hole — **PASS 2026-08-10**:
+- [x] `{"url": "http://\t127.0.0.1:<loopback-port>/status"}` refused
+- [x] `{"url": "http://\n169.254.169.254/latest/meta-data/"}` refused
+- [x] In both, the audit row names the **address** (`127.0.0.1`), not the
+      truncated candidate (`http://`). Confirmed on the written row for
+      `//169.254.\n169.254/`: `host: "169.254.169.254"`,
+      `url: "http://169.254.169.254/"`, `resolved_ip: "169.254.169.254"` — the
+      newline stripped and the candidate normalized before it was recorded.
+- [x] `127.0.0.1\t:8080/admin` refused (needs widening **and** stripping)
+- [x] `//169.254.\n169.254/` refused
+- [x] Control: the prose `"see http:// for the scheme"` is **not** refused
+- [x] Control: `"what is 192.168.1.1"` is **not** refused (bare IP, no port, no
       path — the recorded residual)
 
 Hostnames and budget:
 - [ ] A public name resolving to a private IP is refused **on the resolved IP**,
-      not the name.
-- [ ] Control: the configured LAN MCP endpoints (172.21.1.11) still work.
-- [ ] A loop of fetches trips the per-task budget.
-- [ ] **~200 denied URLs produce roughly 8 rows, not 200** (`AuditClaims` writes
+      not the name. _(not run)_
+- [x] Control: the configured LAN MCP endpoints (172.21.1.11) still work.
+      **PASS by construction** — every probe in this recipe was served by the
+      ddg server at `172.21.1.11:17201`, so the screen never touched the
+      MCP transport itself.
+- [x] A loop of fetches trips the per-task budget. **PASS 2026-08-10** — after
+      ~40 external calls on `claude:ai-b8c20b42-…` every further call returned
+      the exact `REFUSED (resource boundary)` string. **Note: denied calls are
+      charged too**, which bounds a refusal loop but also means the 200-denial
+      check below cannot be run inside one scope.
+- [~] **~200 denied URLs produce roughly 8 rows, not 200** (`AuditClaims` writes
       at denials 1, 2, 4, 8 …, each naming how many it stands for).
+      **PARTIAL** — the mechanism is confirmed live (rows only at 1, 2, 4, 8;
+      the row for denial #4 reads *"SSRF denial #4 for this scope. 1 intervening
+      denial(s) were counted but not written — this feed is capped and a loop of
+      refused URLs must not evict the rows that record an attack that got
+      through."*). The full 200 could not be reached: the 40-call budget cuts in
+      first and converts the rest to budget refusals. **Re-run on a fresh
+      session if the exact ledger past #8 matters.**
 - [ ] The `Canary` / `LatchBeacon` / `MemoryQuarantine` rows already in the feed
-      **survive** that flood.
-- [ ] The refusal string served to the model is identical on the first and the
-      two-hundredth denial.
+      **survive** that flood. _(not run — needs those rows to exist first)_
+- [~] The refusal string served to the model is identical on the first and the
+      two-hundredth denial. **PARTIAL** — byte-identical across the ~12 denials
+      observed; not carried to 200 for the budget reason above.
 
 _Not verifiable from cImp and deliberately removed: "a public→private redirect
 is refused at the hop" — the fetch happens inside the third-party MCP server's
@@ -330,25 +428,54 @@ process. The updater's redirect policy is `none()`, covered by recipe 11._
       `canary=true`.
 - [ ] Control: normal research tasks never trip it.
 
-**Results:** 7 ____ 8 ____ 9 ____
+**Results:** 7 **PASS** (2 boxes partial, 2 not run — see above) 8 ____ 9 **BLOCKED**
+
+### F-20 — raised 2026-08-10, first defect found in rc.3's own headline feature
+
+Every `kind:"mcp"` row — the row recording the actual proxied tool call — is
+written with `Attribution::Unattributed`, so in the Events tab the row that
+answers *"which tab fetched that page?"* is the one that doesn't say. The
+`injection_flag` rows written microseconds earlier and later for the same call
+both carry `tab: {"tab":"ai-b8c20b42-…"}`.
+
+It is **acknowledged in the code** — `mcp_host.rs:942`, *"#51 follow-up: the
+proxied MCP route knows its consumer but the tab is not threaded to this frame
+yet"* — so this is a gap, not a surprise. What makes it worth raising anyway:
+`call_recorded` already receives `scope`, which **is** the string
+`"claude:ai-b8c20b42-…"`, i.e. the tab id is present in that exact frame. The
+fix is threading an `Attribution` rather than plumbing new identity.
+
+Severity LOW (reporting honesty, no containment effect) but it lands squarely on
+the feature that motivated this testing session, and every web fetch produces one
+of these rows.
 
 ---
 
 ## E. Detection layers and the updater
 
 ### 10 — detection components (extended 2026-08-08 for H-4)
-- [ ] The seeded page from (1) is flagged by at least one of
-      signature/classifier (warning header present).
-- [ ] A benign technical page about prompt engineering is fetched and **not
+**PASS 2026-08-10 — all six boxes.** First live confirmation of the H-4 fix;
+until now it rested entirely on unit tests. Each page fetched via `/mcp/call`
+on tab `ai-b8c20b42-…`; verdict read from the presence of the SECURITY WARNING
+header and the screens it names.
+- [x] The seeded page from (1) is flagged by at least one of
+      signature/classifier (warning header present). **Both** fired:
+      `(signature + classifier)`.
+- [x] A benign technical page about prompt engineering is fetched and **not
       blocked** (it may flag — surface-only means research continues either way).
-- [ ] **The obfuscated four**, each rendering identically in a browser, all must
-      flag — before the fix none did, on a bundle whose unit tests were green:
-  - [ ] line-wrapped mid-phrase (what any 78-column extractor produces free)
-  - [ ] NBSP-separated
-  - [ ] five-space-separated
-  - [ ] one zero-width space **inside** the first keyword — the case no regex
+      It did not even flag — no false positive at all.
+- [x] **The obfuscated four**, each rendering identically in a browser, all must
+      flag — before the fix none did, on a bundle whose unit tests were green.
+      **All four flagged `(signature + classifier)`, none blocked:**
+  - [x] line-wrapped mid-phrase (what any 78-column extractor produces free)
+        — `10a-wrapped.txt`, verified to contain no unbroken copy of the payload
+  - [x] NBSP-separated — `10b-nbsp.txt`, 8 × `c2 a0`
+  - [x] five-space-separated — `10c-fivespace.txt`
+  - [x] one zero-width space **inside** the first keyword — the case no regex
         can reach, so it is also the proof the normalized second pass actually
-        runs rather than merely existing
+        runs rather than merely existing. `10d-zwsp.txt`, **exactly one** U+200B
+        inside `Ig|nore`, byte-verified before and after upload. **This is the
+        box that matters most and it passed.**
 
 ### 11 — updater (rewritten 2026-08-08; the original predates the outcome split)
 Serve the staged bundle from a loopback HTTP server. Plaintext is loopback-only,
@@ -457,11 +584,25 @@ With a tab EXTERNAL-latched, click the ⛨ badge:
 ### 13b — #45's two negative checks (shell, launch token + port)
 **Precondition: at least one AI tab configured** — with zero AI tabs the forged
 beacon is *accepted* and the second check passes for the wrong reason.
-- [ ] `POST /latch/override` with `{"tab":"claude","consumer":"claude","action":"unlatch"}`
+- [x] `POST /latch/override` with `{"tab":"claude","consumer":"claude","action":"unlatch"}`
       → **404**; the tab's latch unchanged; no `latch_override` row.
-- [ ] `POST /latch/beacon` with `{"tab":"not-a-tab","consumer":"claude","tool":"WebFetch"}`
+      **PASS 2026-08-10** — `HTTP 404`, body `not found`. `/status` afterwards
+      still reads `tab:"claude", latch:"open", contaminated:false`, and
+      `tool-activity.jsonl` was 2 lines before and 2 lines after.
+- [x] `POST /latch/beacon` with `{"tab":"not-a-tab","consumer":"claude","tool":"WebFetch"}`
       → **400**; `/status` grows no row for `not-a-tab`; no activity row.
+      **PASS 2026-08-10** — `HTTP 400`, body
+      `{"ok":false,"error":"unknown tab id \"not-a-tab\" — /latch/beacon accepts configured AI tabs only"}`.
+      `grep -c not-a-tab` over `/status` = **0**; no row written.
+      Precondition satisfied: `claude` was a configured AI tab, so this did not
+      pass for the empty-tab-list reason.
 - [ ] Repeat with a **real** tab id → 200 and the sensor-mode behaviour of (12).
+      **Deliberately deferred** — this leg *engages* the named tab's EXTERNAL
+      latch, and contamination is sticky for that tab's life. Run it against the
+      throwaway `v32-test` tab, not a working one.
+
+**Result:** both negative legs PASS 2026-08-10 (auth is `Authorization: Bearer
+<token>` from `<exe-dir>/.cimp-offload.json`; port 49344, pid 62216 that run).
 
 ### 14 — enable hierarchy (decision 16)
 - [ ] Global master **OFF**: a seeded injection page in a Claude tab arrives
@@ -562,5 +703,6 @@ Seeing them live is useful (note it against the id); filing them again is not.
 | A stale `cimp-<hash>.exe` wedges the next link with `LNK1104` (`Stop-Process`) | F-17 — **reproduced live 2026-08-10**; kill ONLY the `cimp-<hash>.exe` test binary, never the `bin\cimp.exe` the user is verifying |
 | Every V32 switch is under "Offload task tools"; every pointer says "Tools" | F-18 |
 | No `claude-opus-5` row in the seeded price table — cost reads $0 until added by hand | F-19 |
+| Every proxied MCP call's own `kind:"mcp"` row is `tab:"unattributed"` in the Events tab, while the `injection_flag` rows beside it name the tab | **F-20 — raised 2026-08-10** |
 | `run_check` advertised to a cloud backend | **F-12 — open, HIGH, needs your decision** |
 | A cloned repo's `opencode.json` is executed configuration | **H-7 — open, largely V33** |

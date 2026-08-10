@@ -340,8 +340,12 @@ model's paraphrase of them.
 - [x] A `latch_beacon` row appears whose payload reads `"origin": "http"` (#45).
       **PASS** — plus a `contamination` row, also `"origin":"http"`.
 - [x] **Exactly one** row for the whole session (the latch is sticky).
-      **PASS** — a second identical beacon returned the same latch state and
-      wrote **zero** further rows.
+      **PASS 2026-08-10 via the real native route** — after **two** native
+      `WebFetch` calls to different hosts in the same session, the tab still has
+      exactly **1** `latch_beacon` row and **1** `contamination` row, and the
+      latch is unchanged. The second fetch succeeded and the badge stayed red,
+      so stickiness costs the tab nothing further and reports nothing twice.
+      _(Also confirmed earlier against a repeated synthetic beacon.)_
 - [ ] `native_web_visibility: off` + tab restart → no badge, no latch, no row,
       **no hook injected at all**.
 - [x] `deny` mode → native web tools refused by the harness itself; a proxied

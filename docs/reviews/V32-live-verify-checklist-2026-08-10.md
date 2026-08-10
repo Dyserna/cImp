@@ -178,6 +178,8 @@ publish (decision 24 / deploy step 3).
 > `Feature::spawn_baked`, riding `spawn_inject_sig`), so flipping the select
 > does **not** affect an open tab — recipes 12/13 need a **fresh tab** after
 > the change. A fresh tab is the right vehicle anyway: it starts unlatched.
+> (**#50** would make that restart one click and restore the conversation;
+> until it lands, this is a manual restart plus a manual session restore.)
 >
 > **Reading trap worth a UI note (same class as F-18/M-24, not filed
 > separately).** The switch above the select is driven by

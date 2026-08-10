@@ -1009,6 +1009,51 @@ declares its class AND its mutation capability in one reviewed place.
     from the `latch_override` Tauri IPC command **only**. The authenticated
     `POST /latch/override` route this decision originally also specified has
     been removed — see the Phase F amendment below.
+
+    **Amended 2026-08-10 (user decision, live-verify session) — "Full unlatch"
+    now CLEARS contamination.** User: *"if the user restores full access then the
+    tab should be cleared, it's the user's decision."*
+
+    This narrows the "contamination outlives the override" paragraph above to
+    **"Switch to local" only**. `LatchOverride::Unlatch` clears the
+    `contaminated` bit as part of restoring full access;
+    `LatchOverride::FlipLocal` still leaves it set.
+
+    - **Why it is consistent rather than a weakening.** The trust root of this
+      whole path is **authority, not evidence** (the argument that closed H-2): a
+      human acting in cImp's own UI is a fact no steered model can fabricate, and
+      an attacker cannot click "Full unlatch". The action already carries an
+      at-own-risk confirmation and already hands back the strictly more dangerous
+      capability — the read+web trifecta with injected content still in context.
+      Leaving the *memory* half quarantined after the user has explicitly taken
+      that larger risk was an inconsistency, not a defence: it made the product
+      overrule a judgement it had just asked the user to make.
+    - **Why "Switch to local" keeps the bit.** The flip is a workflow step
+      ("research done, now apply it"), not a verdict that the content was
+      harmless. Only `ClearContamination` and now `Unlatch` are verdicts.
+    - **`ClearContamination` survives as its own action** — the false-positive
+      resume where the user wants the bit gone *without* handing back the
+      external side.
+    - **Checkpoint restore is untouched.** `AwaitSessionClear` still clears
+      nothing and still waits for an observed session rotation: a restore rolls
+      files back but cannot remove injected text from the context window, so it
+      remains the case where clearing is least justified. That earlier user
+      decision stands.
+    - **The confirmation text must state the widened effect.** It currently warns
+      only about recreating the trifecta; it must also say that contamination is
+      cleared and persistent memory writes stop being quarantined, or the dialog
+      under-states what the click does — the same reporting-honesty class as
+      M-21/M-22/M-24.
+    - **Evidence is not erased.** Clearing the *state* must leave every
+      contamination `injection_flag` row and Timeline entry in place; the feed
+      still records what happened and when it was cleared, by whom.
+
+    **Reverses a tested behaviour — implementation owed:**
+    `loopback.rs::contamination_survives_every_override_and_every_session_rotation`
+    (`:8629`) pins the old rule by name and must be split so it still guards
+    `FlipLocal` and every session rotation while asserting the new `Unlatch`
+    semantics. Live-verify recipe 13's quarantine box is unaffected: it is
+    written "after **the flip**".
 16. **Three-level enable hierarchy (user decision 2026-08-07).** Until now
     roughly half of V32 was structurally always-on (the latch itself, the
     envelope, the SSRF guard, the canary, memory quarantine, consumer

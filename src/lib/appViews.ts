@@ -17,6 +17,7 @@
 
 import { mount, unmount, type Component } from 'svelte';
 import {
+  EVENTS_TAB_ID,
   GRAPH_MONITOR_TAB_ID,
   NOTE_TAB_ID,
   TOOL_ACTIVITY_TAB_ID,
@@ -28,12 +29,16 @@ import CodeIntelligenceView from './CodeIntelligenceView.svelte';
 import NoteView from './NoteView.svelte';
 import WorkbenchView from './WorkbenchView.svelte';
 import ToolActivityView from './ToolActivityView.svelte';
+import EventsView from './EventsView.svelte';
 
 const COMPONENTS = new Map<TabId, Component>([
   [GRAPH_MONITOR_TAB_ID, CodeIntelligenceView as Component],
   [NOTE_TAB_ID, NoteView as Component],
   [WORKBENCH_TAB_ID, WorkbenchView as Component],
   [TOOL_ACTIVITY_TAB_ID, ToolActivityView as Component],
+  // #51: additive — the Events tab is its own view; Tool Activity above is
+  // untouched and keeps its own Activities feed.
+  [EVENTS_TAB_ID, EventsView as Component],
 ]);
 
 interface Host {

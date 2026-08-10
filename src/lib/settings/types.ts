@@ -460,6 +460,10 @@ export interface UiSettings {
   /// Show the reserved Tool Activity tab (unified graph-call + offload
   /// request feed, plus the tool reference lists). Default true.
   tool_activity_tab: boolean;
+  /// #51: show the reserved Events tab (the same activity store, read as
+  /// events — attributed per tab/session and filterable). Default true.
+  /// Additive: independent of `tool_activity_tab`, and both tabs coexist.
+  events_tab: boolean;
 }
 
 /// A display panel in the status bar's movable left cluster.
@@ -1686,6 +1690,7 @@ export function defaultSettings(): Settings {
         ],
       },
       tool_activity_tab: true,
+      events_tab: true,
     },
     // Default terminal palette is paired with the default UI theme
     // (tui → OpenCode Grey); the pairing comes from each theme's

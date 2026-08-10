@@ -122,6 +122,16 @@ pub const GRAPH_VIEW_TAB_ID: &str = "graph-view";
 /// reconciled by the integrity check, exactly like the Code Graph monitor
 /// tab). App-rendered like the monitor — no PTY.
 pub const TOOL_ACTIVITY_TAB_ID: &str = "tool-activity";
+/// #51: reserved id of the read-only, app-rendered Events tab — the activity
+/// feed read as *events*, attributed per tab/session and filterable by kind,
+/// source/screen and tab (see `activity::Attribution`). Materialized iff
+/// `ui.events_tab` (default true, reconciled by the integrity check, exactly
+/// like the Tool Activity tab). App-rendered — no PTY.
+///
+/// **Strictly additive**: the Tool Activity tab keeps its feed and its
+/// sections, and the Workbench Timeline stays its own tab. Nothing is retired,
+/// so this id must never appear in `RETIRED_TAB_IDS`.
+pub const EVENTS_TAB_ID: &str = "events";
 /// Legacy id of the V23 reserved Code Audit tab. Retired in schema v27: the
 /// Security | Quality audit panels moved INSIDE the Tool Activity tab as the
 /// "Code audit" section (ToolActivityView.svelte), so there is no separate
@@ -3475,6 +3485,24 @@ pub fn default_tool_activity_tab() -> TabConfig {
     })
 }
 
+/// #51: the reserved, non-closable Events tab. Same shape as the Tool Activity
+/// tab — Shell-kind with no command (app-rendered, no PTY).
+/// Materialized/removed by the integrity check per `ui.events_tab`.
+pub fn default_events_tab() -> TabConfig {
+    TabConfig::Shell(ShellTabConfig {
+        id: EVENTS_TAB_ID.to_string(),
+        builtin: true,
+        name: "Events".to_string(),
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        env: HashMap::new(),
+        notifications: ShellNotificationConfig::default(),
+        theme_override: None,
+        background_override: None,
+    })
+}
+
 /// Default Shell-1 entry. Takes the resolved platform default shell so the
 /// `command` and `args` fields land on the right binary for the host. The
 /// reserved id is just the seed value for the first shell tab on a fresh
@@ -4026,6 +4054,13 @@ pub struct UiSettings {
     /// lacking the key deserialize to true via the struct-level
     /// `#[serde(default)]`. Reconciled like the other reserved feature tabs.
     pub tool_activity_tab: bool,
+    /// #51: show the reserved Events tab (the per-tab-attributed, filterable
+    /// activity feed). Default true; an existing settings file lacking the key
+    /// deserializes to true via the struct-level `#[serde(default)]` and the
+    /// integrity check materializes the tab on the next load — which is why
+    /// this needs no schema-version migration. Additive: `tool_activity_tab`
+    /// is untouched and both tabs coexist.
+    pub events_tab: bool,
 }
 
 impl Default for UiSettings {
@@ -4035,6 +4070,7 @@ impl Default for UiSettings {
             tui_accent: DEFAULT_TUI_ACCENT.to_string(),
             status_bar: StatusBarLayout::default(),
             tool_activity_tab: true,
+            events_tab: true,
         }
     }
 }

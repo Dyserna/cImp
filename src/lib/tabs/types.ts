@@ -65,6 +65,22 @@ export function isToolActivityTab(id: TabId): boolean {
   return id === TOOL_ACTIVITY_TAB_ID;
 }
 
+/// #51: the reserved id of the read-only, app-rendered Events tab — the same
+/// persistent activity feed the Tool Activity tab shows, but with the #51
+/// attribution columns (which tab / which session) visible and filterable.
+/// Shell-kind on the backend — no PTY — same pattern as the Code Graph monitor
+/// tab.
+///
+/// ADDITIVE: the Tool Activity tab and its Activities section stay exactly as
+/// they were. The two overlap on purpose for now — the consolidation is a
+/// later, separate decision.
+export const EVENTS_TAB_ID = 'events';
+
+/// True for the Events tab.
+export function isEventsTab(id: TabId): boolean {
+  return id === EVENTS_TAB_ID;
+}
+
 // The V23 "code-audit" reserved tab is retired (schema v27) — the Security |
 // Quality audit panels live inside the Tool Activity tab as the "Code audit"
 // section now (ToolActivityView.svelte); the v26 → v27 migration drops old
@@ -80,7 +96,7 @@ export function isPreviewTabId(id: TabId): boolean {
 }
 
 /// THE single source of truth for "app-rendered, no-PTY" tabs: the reserved
-/// dashboards (Code Graph monitor, Note, Workbench, Tool Activity) plus
+/// dashboards (Code Graph monitor, Note, Workbench, Tool Activity, Events) plus
 /// Preview tabs (an embedded webview). Every guard
 /// that used to hand-enumerate these must call this instead — a new
 /// app-rendered tab is added HERE (plus its own isXTab predicate above) and
@@ -91,6 +107,7 @@ export function isAppRenderedTab(id: TabId): boolean {
     isNoteTab(id) ||
     isWorkbenchTab(id) ||
     isToolActivityTab(id) ||
+    isEventsTab(id) ||
     isPreviewTabId(id)
   );
 }

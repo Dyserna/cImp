@@ -64,6 +64,12 @@ pub enum TabId {
     /// [`Self::GraphMonitor`] — Shell-kind, reserved identity, no PTY,
     /// app-rendered.
     ToolActivity,
+    /// #51: the read-only, non-closable Events tab (the activity feed
+    /// attributed per tab/session, with kind/source/tab filters). Same shape
+    /// as [`Self::GraphMonitor`] — Shell-kind, reserved identity, no PTY,
+    /// app-rendered. Additive to [`Self::ToolActivity`], which keeps its own
+    /// feed.
+    Events,
     /// V14 Phase F: a user-created Preview tab (embedded localhost browser).
     /// Unlike the reserved app-rendered tabs above, this is a genuinely new
     /// [`TabKind`] (not a Shell-kind reserved id) because it's repeatable —
@@ -84,6 +90,7 @@ impl TabId {
             TabId::GraphMonitor => "graph-monitor",
             TabId::Workbench => "workbench-1",
             TabId::ToolActivity => "tool-activity",
+            TabId::Events => "events",
             TabId::Ai(s) => s.as_str(),
             TabId::Shell(s) => s.as_str(),
             TabId::Preview(s) => s.as_str(),
@@ -98,6 +105,7 @@ impl TabId {
             "graph-monitor" => TabId::GraphMonitor,
             "workbench-1" => TabId::Workbench,
             "tool-activity" => TabId::ToolActivity,
+            "events" => TabId::Events,
             // "code-quality" (the retired V25 reserved tab — its Quality view
             // now lives inside the Code Audit surface as a sub-tab),
             // "offload-server" (the retired V8-03 reserved tab — its dashboard
@@ -137,9 +145,11 @@ impl TabId {
             // purposes (they never run a PTY, so this is inert), keeping them
             // off the per-kind match explosion. Their read-only behavior is
             // keyed off the reserved id, not the kind.
-            TabId::Shell(_) | TabId::GraphMonitor | TabId::Workbench | TabId::ToolActivity => {
-                TabKind::Shell
-            }
+            TabId::Shell(_)
+            | TabId::GraphMonitor
+            | TabId::Workbench
+            | TabId::ToolActivity
+            | TabId::Events => TabKind::Shell,
             // V14 Phase F: unlike the reserved dashboards above, Preview is a
             // real kind of its own — it's repeatable (a user may open several),
             // so the frontend needs a wire-visible discriminator rather than
@@ -150,7 +160,7 @@ impl TabId {
 
     /// THE single enumeration of the reserved app-rendered dashboard tabs:
     /// Shell-kind with a reserved identity and NO PTY (Code Graph monitor,
-    /// Workbench, Tool Activity). Every guard
+    /// Workbench, Tool Activity, Events). Every guard
     /// that needs "is this one of the reserved dashboards?" — the pty-write
     /// swallow, the close refusal, the builtin flag — derives from this
     /// predicate, so a new reserved dashboard is added HERE (plus `as_str`/
@@ -160,7 +170,7 @@ impl TabId {
     pub fn is_reserved_dashboard(&self) -> bool {
         matches!(
             self,
-            TabId::GraphMonitor | TabId::Workbench | TabId::ToolActivity
+            TabId::GraphMonitor | TabId::Workbench | TabId::ToolActivity | TabId::Events
         )
     }
 
@@ -1681,11 +1691,27 @@ mod tests {
             TabId::Shell("shell-1".to_string()),
             TabId::Shell("user-bash".to_string()),
             TabId::ToolActivity,
+            TabId::Events,
         ] {
             let s = serde_json::to_string(&id).unwrap();
             let back: TabId = serde_json::from_str(&s).unwrap();
             assert_eq!(id, back);
         }
+    }
+
+    /// #51: `events` is a reserved dashboard, not a user shell — so the close
+    /// `×` refuses it, no PTY is spawned for it, and it is `builtin`. Pinned
+    /// because the id is an ordinary-looking word: without the `from_str` arm
+    /// it would silently be a closable Shell tab that tries to launch a shell.
+    #[test]
+    fn events_id_is_a_reserved_dashboard() {
+        let id = TabId::from_str("events");
+        assert_eq!(id, TabId::Events);
+        assert!(id.is_reserved_dashboard());
+        assert!(id.is_builtin());
+        assert_eq!(id.kind(), TabKind::Shell);
+        // Additive: Tool Activity is still its own reserved dashboard.
+        assert!(TabId::from_str("tool-activity").is_reserved_dashboard());
     }
 
     #[test]

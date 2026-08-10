@@ -3275,6 +3275,21 @@
           <label class="checkbox">
             <input
               type="checkbox"
+              checked={snapshot.ui.events_tab}
+              onchange={(e) =>
+                patch((s) => (s.ui.events_tab = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>Show the <strong>Events</strong> tab</span>
+          </label>
+          <small class="hint">
+            The same recorded activity, read as events: every row says which
+            tab and which session it came from, and the feed filters by kind,
+            source/screen and tab. Independent of the Tools tab — turning one
+            off leaves the other alone.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
               checked={snapshot.preview_allow_remote}
               onchange={(e) =>
                 patch(

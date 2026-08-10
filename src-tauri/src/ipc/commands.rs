@@ -891,6 +891,7 @@ pub async fn settings_update(
         (TabId::GraphMonitor, |s| s.graph.enabled),
         (TabId::Workbench, |s| s.workbench.enabled),
         (TabId::ToolActivity, |s| s.ui.tool_activity_tab),
+        (TabId::Events, |s| s.ui.events_tab),
     ];
 
     // Snapshot the pre-update flags (reserved tabs via the table, plus the
@@ -1712,12 +1713,23 @@ pub async fn graph_history(
 }
 
 /// The unified tool-activity feed (graph calls + offload runs), newest first,
-/// without payloads — the Tool Activity tab's poll.
+/// without payloads — the Tool Activity tab's poll and the #51 Events tab's.
+///
+/// `filter` is optional and every field inside it is optional again
+/// ([`ActivityFilter`](crate::activity::ActivityFilter)): omitting the argument
+/// is the historical unfiltered feed, byte for byte, so the Tool Activity poll
+/// keeps working unchanged. It narrows only what this response carries —
+/// retention is a write-path contract and no read may influence it.
 #[tauri::command]
 pub async fn activity_list(
     since_ts: Option<u64>,
+    filter: Option<crate::activity::ActivityFilter>,
 ) -> AppResult<Vec<crate::activity::ActivityEntry>> {
-    run_on_blocking_pool(move || crate::activity::snapshot_since(since_ts.unwrap_or(0))).await
+    let filter = filter.unwrap_or_default();
+    run_on_blocking_pool(move || {
+        crate::activity::snapshot_filtered(since_ts.unwrap_or(0), &filter)
+    })
+    .await
 }
 
 /// One activity's full record — including the captured request/response

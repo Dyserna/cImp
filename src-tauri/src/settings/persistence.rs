@@ -42,11 +42,11 @@ use serde_json::{Map, Value};
 use crate::error::{AppError, AppResult};
 use crate::settings::migration;
 use crate::settings::schema::{
-    default_ai_tab, default_audit_tools, default_graph_monitor_tab, default_shell_1_tab,
-    default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
+    default_ai_tab, default_audit_tools, default_events_tab, default_graph_monitor_tab,
+    default_shell_1_tab, default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
     PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate, Settings, TabConfig,
-    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID,
+    CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     PRICING_GENERATION, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
 };
@@ -1435,6 +1435,19 @@ const RESERVED_TAB_SPECS: &[ReservedTabSpec] = &[
         default_tab: default_tool_activity_tab,
         sync_name: true,
     },
+    // #51: the Events tab is ADDITIVE — the Tools row above keeps its feed and
+    // its sections, and nothing is retired, so no `RETIRED_TAB_IDS` entry
+    // belongs to this change. Existing installs gain it through this reconcile
+    // (its `ui.events_tab` flag defaults true and an old file lacking the key
+    // deserializes to that default), which is why #51 needs no schema bump.
+    ReservedTabSpec {
+        id: EVENTS_TAB_ID,
+        log_name: "Events",
+        flag: "events_tab",
+        enabled: |s| s.ui.events_tab,
+        default_tab: default_events_tab,
+        sync_name: true,
+    },
     // The V23 "Code Audit" reserved tab is retired (schema v27) — its
     // Security | Quality panels live inside the Tool Activity tab as the
     // "Code audit" section now; the v26 → v27 migration drops old persisted
@@ -1825,7 +1838,7 @@ mod tests {
     }
 
     /// `Settings::default()` with every default-ON reserved feature tab
-    /// turned off (currently Workbench + Tool Activity), so tab-count
+    /// turned off (currently Workbench + Tool Activity + Events), so tab-count
     /// assertions only see the tabs a test explicitly sets up. A future
     /// default-on reserved tab gets disabled HERE once, not in every test
     /// body. Tests that exercise a specific reserved tab re-enable its flag.
@@ -1833,6 +1846,7 @@ mod tests {
         let mut s = Settings::default();
         s.workbench.enabled = false;
         s.ui.tool_activity_tab = false;
+        s.ui.events_tab = false;
         s
     }
 
@@ -2093,6 +2107,129 @@ mod tests {
         s.ui.tool_activity_tab = true;
         assert!(reconcile_reserved_tabs(&mut s));
         assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
+    }
+
+    // ── #51: the Events tab ──────────────────────────────────────────────
+
+    /// Fresh install. `ui.events_tab` defaults true, so the tab is there
+    /// without anyone touching a flag — and, because #51 is additive, the Tool
+    /// Activity tab is still there beside it, to its left.
+    #[test]
+    fn integrity_materializes_events_tab_by_default() {
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+
+        let entry = s
+            .tabs
+            .iter()
+            .find(|t| t.id() == EVENTS_TAB_ID)
+            .expect("fresh install has the Events tab");
+        assert!(entry.builtin(), "the Events tab is non-closable");
+
+        let tool_activity_pos = s
+            .tabs
+            .iter()
+            .position(|t| t.id() == TOOL_ACTIVITY_TAB_ID)
+            .expect("Tool Activity is untouched by #51");
+        let events_pos = s.tabs.iter().position(|t| t.id() == EVENTS_TAB_ID).unwrap();
+        assert!(tool_activity_pos < events_pos);
+    }
+
+    /// **The upgrade path, and the reason #51 needs no schema-version bump.**
+    ///
+    /// An existing install's settings file was written before `ui.events_tab`
+    /// and the `events` tab entry existed. This reconstructs exactly that —
+    /// serialize a settled install, delete the key and the tab — and pins that
+    /// the tab arrives on the next load while the user's own tabs, their
+    /// order, and their layout tree all survive. A migration would have had to
+    /// promise the same thing; the integrity check already does.
+    #[test]
+    fn an_existing_install_gains_the_events_tab_without_losing_its_layout() {
+        use crate::settings::schema::LayoutPersisted;
+
+        let mut before = Settings::default();
+        integrity_check(&mut before);
+        before.tabs.push(default_shell_1_tab(&fake_default_shell()));
+        let user_tabs: Vec<String> = before
+            .tabs
+            .iter()
+            .filter(|t| t.id() != EVENTS_TAB_ID)
+            .map(|t| t.id().to_string())
+            .collect();
+        before.layout = Some(LayoutPersisted {
+            tree: LayoutNodePersisted::Pane {
+                id: "pane-1".to_string(),
+                tab_ids: user_tabs.clone(),
+                active_tab_id: Some(CLAUDE_TAB_ID.to_string()),
+            },
+            focused_pane_id: "pane-1".to_string(),
+        });
+
+        // Roll the file back to its pre-#51 shape: no `ui.events_tab` key, no
+        // `events` entry in `tabs`.
+        let mut json = serde_json::to_value(&before).expect("serialize");
+        json["ui"]
+            .as_object_mut()
+            .unwrap()
+            .remove("events_tab")
+            .expect("the key exists to be removed");
+        let tabs = json["tabs"].as_array_mut().unwrap();
+        tabs.retain(|t| t["id"] != serde_json::json!(EVENTS_TAB_ID));
+
+        let mut s: Settings = serde_json::from_value(json).expect("a pre-#51 file still loads");
+        assert!(
+            s.ui.events_tab,
+            "a file lacking the key must read as enabled — that is what makes \
+             the integrity check, rather than a migration, the upgrade path"
+        );
+        assert!(s.tabs.iter().all(|t| t.id() != EVENTS_TAB_ID));
+
+        assert!(integrity_check(&mut s));
+
+        assert!(s.tabs.iter().any(|t| t.id() == EVENTS_TAB_ID));
+        // Nothing the user had is gone or reordered relative to itself.
+        let after: Vec<&str> = s
+            .tabs
+            .iter()
+            .map(|t| t.id())
+            .filter(|id| *id != EVENTS_TAB_ID)
+            .collect();
+        assert_eq!(after, user_tabs, "existing tabs survive, in order");
+        // …and the layout still names them all: a materialized tab must not
+        // cost the user the arrangement they had.
+        match &s.layout.as_ref().unwrap().tree {
+            LayoutNodePersisted::Pane { tab_ids, .. } => assert_eq!(*tab_ids, user_tabs),
+            other => panic!("layout tree was rewritten: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_reserved_tabs_covers_events_live_toggle() {
+        // Same shape as the Tool Activity live-toggle test: the Settings
+        // window's save path materializes/removes without a restart.
+        let mut s = Settings::default();
+        integrity_check(&mut s);
+        assert!(s.tabs.iter().any(|t| t.id() == EVENTS_TAB_ID));
+
+        s.ui.events_tab = false;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().all(|t| t.id() != EVENTS_TAB_ID));
+        // Disabling Events leaves Tool Activity alone — they are two tabs.
+        assert!(s.tabs.iter().any(|t| t.id() == TOOL_ACTIVITY_TAB_ID));
+        assert!(!reconcile_reserved_tabs(&mut s));
+
+        s.ui.events_tab = true;
+        assert!(reconcile_reserved_tabs(&mut s));
+        assert!(s.tabs.iter().any(|t| t.id() == EVENTS_TAB_ID));
+    }
+
+    /// Nothing is retired by #51, so the id must not be in the retired list —
+    /// an entry there would delete the tab on every load.
+    #[test]
+    fn the_events_tab_is_additive_not_a_replacement() {
+        assert!(!RETIRED_TAB_IDS.contains(&EVENTS_TAB_ID));
+        assert!(!RETIRED_TAB_IDS.contains(&TOOL_ACTIVITY_TAB_ID));
+        assert!(!RETIRED_TAB_IDS.contains(&WORKBENCH_TAB_ID));
     }
 
     #[test]

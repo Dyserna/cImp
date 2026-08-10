@@ -71,6 +71,14 @@ New findings continue the F-series (next free: **F-20**).
       when the tab list is empty).
 - [ ] Two OpenCode tabs in one working directory available for recipe 18; Phase H
       toggle reachable for 15.
+- [ ] **`run_check` reported cImp unreachable while three `bin\cimp.exe`
+      processes were running** (2026-08-10). Its message — "cImp is not
+      reachable, so this tab's contamination state cannot be checked" — is the
+      fail-closed path for local-capability tools, but the app was up, so
+      either discovery or the contamination lookup is the thing that failed,
+      not the app. Worth characterising before it gets blamed on the latch:
+      it fails the same way whether cImp is down or the tab is simply unknown
+      to it. `cargo test` directly is the workaround.
 - [ ] Known flakes, **not** regressions — do not chase:
       `offload::detection::signature::tests::{a_benign_page_about_prompt_engineering_does_not_flag,
       a_payload_cannot_evade_the_shipped_rules_by_changing_its_separators}`
@@ -127,7 +135,21 @@ publish (decision 24 / deploy step 3).
 
 ### 2 — code offload, the mirror image
 - [ ] After the first `read_file`, `ddg` tools are **absent from defs**.
-- [ ] An attempted fetch is refused with the fixed string.
+- [x] An attempted fetch is refused with the fixed string. **PASS 2026-08-10**,
+      on a **Claude tab** (not the worker): after a session of local file reads,
+      `ddg__fetch_content` returned `REFUSED (security boundary)`, naming not
+      just that tool but "web search/fetch and every other MCP-server tool".
+      `latch_refusal` present in Tool Activity — so the block and the forensic
+      record both fired.
+
+> **The def-removal box above is a WORKER check; do not fail it on a Claude
+> tab.** Observed 2026-08-10: with the latch already engaged, `WebFetch`,
+> `WebSearch`, `ddg__search` and `ddg__fetch_content` all still returned full
+> schemas — enforcement on a Claude tab is at **call** time, not advertisement
+> time. Both designs are defensible (the worker withholds defs; the proxy
+> refuses the call), but the recipe's wording describes only the first, so
+> ticking it against a tab's tool list records a failure that isn't one. Split
+> the box per consumer, or say which consumer it means.
 
 ### 3 — Claude tab, proxied fetch
 - [ ] `ddg fetch` of the seeded page → result arrives **spotlight-wrapped +
@@ -143,6 +165,26 @@ publish (decision 24 / deploy step 3).
 ### 12 — sensor mode (default), native web tools
 - [ ] Claude tab, **native** WebFetch → tab badge appears, `/status` shows the
       latch engaged, a proxied `graph_snippet` is refused.
+
+> **Confirmed default on the live install 2026-08-10:**
+> `P:\WorkSync\Software\ccimp\bin\settings.json` carries
+> `"native_web_visibility": "sensor"`. Per `injection.rs:788-793` sensor is
+> *report-only — "Never deny"*, so on a tab already latched to local
+> capability the **native** web tools are still not refused by cImp; only
+> `deny` ("refused by the harness itself") closes that route. Locked decision
+> 14 chose this deliberately, so it is a posture to record, not a bug.
+>
+> **`native_web_visibility` is spawn-baked** (`Feature::NativeWeb` is in
+> `Feature::spawn_baked`, riding `spawn_inject_sig`), so flipping the select
+> does **not** affect an open tab — recipes 12/13 need a **fresh tab** after
+> the change. A fresh tab is the right vehicle anyway: it starts unlatched.
+>
+> **Reading trap worth a UI note (same class as F-18/M-24, not filed
+> separately).** The switch above the select is driven by
+> `native_web_visibility !== 'off'` (`SettingsApp.svelte:577`), so the feature
+> reads "on" while the select underneath sits at the report-only value. "It's
+> on, so it should be blocking" is the natural and wrong reading — observed
+> live. Whatever rework closes F-18 should make the on-state state its posture.
 - [ ] Same via OpenCode's native webfetch.
 - [ ] A `latch_beacon` row appears whose payload reads `"origin": "http"` (#45).
 - [ ] **Exactly one** row for the whole session (the latch is sticky).
@@ -515,7 +557,7 @@ Seeing them live is useful (note it against the id); filing them again is not.
 | Auto-injection still pushes signatures into a contaminated tab | F-7 |
 | A denied URL still leaks its hostname to DNS | F-8 |
 | `MemoryQuarantine` rows with an empty `root` vanish from a root-filtered view | F-16 |
-| A stale `cimp-<hash>.exe` wedges the next link with `LNK1104` (`Stop-Process`) | F-17 |
+| A stale `cimp-<hash>.exe` wedges the next link with `LNK1104` (`Stop-Process`) | F-17 — **reproduced live 2026-08-10**; kill ONLY the `cimp-<hash>.exe` test binary, never the `bin\cimp.exe` the user is verifying |
 | Every V32 switch is under "Offload task tools"; every pointer says "Tools" | F-18 |
 | No `claude-opus-5` row in the seeded price table — cost reads $0 until added by hand | F-19 |
 | `run_check` advertised to a cloud backend | **F-12 — open, HIGH, needs your decision** |

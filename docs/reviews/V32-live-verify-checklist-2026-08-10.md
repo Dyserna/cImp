@@ -17,7 +17,8 @@ every V32 finding before this was closed by code review plus unit tests, and thi
 remains the release gate.
 
 Record per recipe: PASS / FAIL / BLOCKED + the finding id if it raises one.
-New findings continue the F-series (next free: **F-22**; F-20 and F-21 below).
+New findings continue the F-series (next free: **F-23**; F-20, F-21, **F-22**
+below — F-22 is the one to read first).
 
 ---
 
@@ -308,8 +309,18 @@ model's paraphrase of them.
       wrote **zero** further rows.
 - [ ] `native_web_visibility: off` + tab restart → no badge, no latch, no row,
       **no hook injected at all**.
-- [ ] `deny` mode → native web tools refused by the harness itself; a proxied
+- [x] `deny` mode → native web tools refused by the harness itself; a proxied
       `ddg__fetch_content` **still works and latches** as in (3).
+      **PASS 2026-08-10, unplanned** — both tabs turned out to be running `deny`
+      (see **F-22**): `WebFetch`/`WebSearch` were absent from both tabs' tool
+      lists via the overlay's `permissions.deny`, while every proxied
+      `ddg__fetch_content` in recipes 3, 7 and 10 worked and latched normally.
+      Both halves of the pair, from the same install state.
+
+> **The sensor legs above could not run for the same reason.** With the tabs
+> baked at `deny`, the `--taint-beacon` hook was never injected, so there was no
+> native web tool to fire it and nothing to observe. They need an explicit
+> `sensor` save plus a tab restart — see F-22.
 
 ### 20 — `/audit/run` and `/run` are inside the latch (C-1b, C-1c, decision 18)
 Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then:
@@ -556,6 +567,61 @@ process. The updater's redirect policy is `none()`, covered by recipe 11._
 
 **Results:** 7 **PASS** (2 boxes partial, 2 not run — see above) 8 ____
 9 **PARTIAL** (control PASS; enforcement leg structurally unreachable)
+
+### F-22 — raised 2026-08-10, HIGH-ish: live settings and persisted settings disagree for a spawn-baked security control
+
+**Symptom that surfaced it.** The v32-test tab reported that `WebFetch` was not
+in its tool list at all — and it was right; so is the `claude` tab. It correctly
+refused to substitute another tool.
+
+**Proven, in this order:**
+1. Both tabs were spawned (18:34:03) with
+   `"permissions":{"deny":["WebFetch","WebSearch"]}` and **no** `--taint-beacon`
+   hook. Those two branches are mutually exclusive in `tabs/config.rs`
+   (`if native_web == Deny` at `:887`, `if native_web == Sensor && …` at `:758`),
+   so the only input producing that pair is the literal string `"deny"`.
+   `NativeWebMode::parse` is correct — unknown values fall back to `Sensor`
+   (`injection.rs:801-807`) — and a per-tab L3 override can only force `Off`,
+   never `Deny`. So the spawn genuinely saw `deny`.
+2. `settings.json` read `"sensor"` at 16:30, and still reads `"sensor"`, written
+   **18:36:53** — after the spawn, and unchanged for the 29 minutes since.
+3. The Settings window's select reads **Deny** — `SettingsApp.svelte:4600` binds
+   it to the raw `snapshot.offload.native_web_visibility`, so that is the app's
+   own value, not a derived one. **Re-checked after fully closing and reopening
+   the Settings window**, to rule out the M-22-class stale-snapshot explanation.
+   Still Deny.
+
+**So: the app holds `deny`, the file holds `sensor`.** The user states they never
+touched this setting.
+
+**Why it matters.** `native_web_visibility` is spawn-baked, so tabs enforce the
+*live* value while the *file* decides what the next launch gets. The posture
+therefore changes across an app restart with no user action, and the UI displays
+the value that will **not** survive. Whichever side is "right", the pair is a
+defect:
+- if the live `deny` is intended, the persist path dropped it and the next launch
+  silently downgrades to `sensor`;
+- if the stored `sensor` is intended, the running app over-enforced and removed a
+  tool the user never asked to lose — which is exactly the confusion this cost.
+
+**Not a containment weakness in the direction that matters:** `deny` is the
+*stricter* posture; the native web route was closed, never opened. The cost is
+that the sensor beacon never installed, so recipe 12's sensor legs could not run,
+and on an install that lands on `sensor` a native `WebFetch` needs that hook to be
+visible to the latch at all.
+
+**Lead, not yet confirmed:** `src/lib/settings/types.ts:1790` carries a frontend
+default `native_web_visibility: 'sensor'`. A snapshot built from frontend
+defaults reaching disk is the **F-19 trap** (a default overwriting a real value on
+save) and would explain an 18:36:53 write of `sensor`. It does **not** by itself
+explain the live value being `deny`, because `apply_incoming_settings` does
+`*cur = incoming` (`ipc/commands.rs:857`) and would have moved memory to `sensor`
+too. So at least one writer is reaching the file **without** going through that
+path. That is the thread to pull.
+
+**Recipe 12's `deny` leg is verified as a side effect** — native web tools refused
+by the harness itself, while proxied `ddg__fetch_content` kept working and
+latching all session (recipes 3, 7, 10). Both halves of that pair, unplanned.
 
 ### F-20 — raised 2026-08-10, first defect found in rc.3's own headline feature
 

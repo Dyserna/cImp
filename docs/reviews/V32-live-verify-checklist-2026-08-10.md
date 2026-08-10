@@ -1001,8 +1001,19 @@ With a tab EXTERNAL-latched, click the ⛨ badge:
       **`contaminated:true`** (the bit survives the flip, as decision 15 says).
       `latch_override` row: `tool: flip_local, ok:true, origin:"ipc"`.
       **Raises F-23 — see below.**
-- [ ] A `context_note pin=true` written **after** the flip still lands
-      **quarantined** (contamination survives the override).
+- [x] A `context_note pin=true` written **after** the flip still lands
+      **quarantined** (contamination survives the override). **PASS 2026-08-10**
+      — saved and pinned, returned *"⚠ QUARANTINED (security boundary)…held for
+      review instead of entering project memory"*, wrote a
+      `memory_quarantine / ok:true` row scoped to the tab, and the note was
+      **absent** from another scope's `context_notes`.
+      **Contrast worth keeping (bears on F-23):** this notice was **true** — the
+      session really had used an external tool — so the quarantine path states a
+      cause it actually checked, while the latch refusal a few lines away does
+      not. The fix pattern for F-23 already exists next door.
+      ⚠ **This box is the tripwire for the decision-15 amendment.** The flip must
+      keep the bit; only *Full unlatch* clears it. If this box starts FAILING
+      after that change lands, the implementation went too far.
 - [x] "Full unlatch" (after its confirmation) restores both sides.
       **PASS 2026-08-10 (local side)** — after the user's unlatch the tab reads
       `latch:"open"` and `graph_snippet` answers again. Web side not re-probed:

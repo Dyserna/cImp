@@ -368,7 +368,18 @@ model's paraphrase of them.
 > reads "on" while the select underneath sits at the report-only value. "It's
 > on, so it should be blocking" is the natural and wrong reading — observed
 > live. Whatever rework closes F-18 should make the on-state state its posture.
-- [ ] Same via OpenCode's native webfetch.
+- [x] Same via OpenCode's native webfetch.
+      **PASS 2026-08-11**, driven through the REAL emitted per-tab plugin file
+      for a previously **unlatched** OpenCode tab (`ai-ac26857b…`, no registry
+      row at all beforehand). Two native `webfetch` calls, both **ADMITTED**
+      (sensor mode does not close the native route), each firing
+      `/latch/state` + `/latch/beacon`. The tab moved to
+      `latch:"external", contaminated:true`, and the activity store gained
+      **exactly two rows for the whole session** — one
+      `injection_flag/latch_beacon` and one `injection_flag/contamination`, both
+      `tool:"webfetch"`, `target:"opencode:ai-ac26857b…"`, both naming the tab.
+      **The second beacon wrote ZERO further rows**, so stickiness holds on the
+      OpenCode native route exactly as it does on Claude's.
 - [x] A `latch_beacon` row appears whose payload reads `"origin": "http"` (#45).
       **PASS** — plus a `contamination` row, also `"origin":"http"`.
 - [x] **Exactly one** row for the whole session (the latch is sticky).

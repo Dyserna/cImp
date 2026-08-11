@@ -1091,12 +1091,52 @@ declares its class AND its mutation capability in one reviewed place.
       contamination `injection_flag` row and Timeline entry in place; the feed
       still records what happened and when it was cleared, by whom.
 
-    **Reverses a tested behaviour — implementation owed:**
-    `loopback.rs::contamination_survives_every_override_and_every_session_rotation`
-    (`:8629`) pins the old rule by name and must be split so it still guards
-    `FlipLocal` and every session rotation while asserting the new `Unlatch`
-    semantics. Live-verify recipe 13's quarantine box is unaffected: it is
-    written "after **the flip**".
+    **Built 2026-08-11.** `LatchOverride::Unlatch` clears `contaminated` through
+    the one function that owns the bit (`TabLatch::clear_contamination`), *before*
+    it moves the latch, so the audit row's "prior state" names the latch the flag
+    was released from (`external`/`local`) rather than the `open` the same arm is
+    about to write. The release is filed as its own `contamination_cleared` row
+    (`ClearBasis::Unlatch`, `tool: "unlatch"`, `origin: "ipc"`, built by
+    `unlatch_clear_row`) beside the `contamination` row that set the bit — not
+    merely inside the `latch_override` prose — because `contamination_events()`
+    reads exactly those two retention lanes, and a clear invisible to that join
+    leaves a `☣` on the Workbench Timeline that never closes for a tab the
+    registry reports clean: a signal with no consumer, one amendment after #48
+    fixed the same class. `FlipLocal` is unchanged and now says so in its own row
+    (the `FlipLocal | Unlatch` arm of `override_row` shared one detail string
+    asserting *"Contamination is NOT cleared by a latch override"*, which would
+    have stated the opposite of what happened; it is split). An unlatch on an
+    **uncontaminated** tab clears nothing, writes no clear row, and its
+    `latch_override` row says "nothing to clear" — a row must not read as
+    evidence of a release that did not happen.
+    **Tests.** The named test was split into
+    `contamination_survives_the_flip_and_every_session_rotation` (the rule that
+    still holds: the flip, the arm, and every unarmed session rotation) and
+    `a_full_unlatch_clears_contamination_and_records_it` (the new rule — state,
+    the released `WriteTaint::Clean` write, the pre-move `prior_taint`, both rows'
+    words, the surviving `contamination` row, the honest `None` case, the
+    superseded arm, the same-click rotation collision, and the refusal from
+    `open`). The neighbour `full_unlatch_restores_both_sides_but_not_persistence`
+    became `full_unlatch_restores_both_sides_including_persistence`, and had to be
+    split into two registries: its old single-registry form probed the web side
+    first, which **re-latched EXTERNAL and re-contaminated the tab**, so the
+    quarantine it then observed was the new latch's and the assertion never
+    depended on the unlatch at all. `every_clear_records_its_basis_and_the_state_it_replaced`
+    gained a third half for the new basis. `a_restore_arms_the_wait_and_clears_nothing_now`
+    and `only_an_armed_tab_clears_on_a_proved_rotation` are green **unmodified** —
+    they are the tripwires for boundary 4.
+    The confirmation copy states the widened effect and, when the tab is not
+    contaminated, no longer promises a clear (nor claims injected content is
+    present). `timeline.ts`'s `clearedLine` names the third basis instead of
+    rendering the bare `Cleared (unlatch).` fallback. Live-verify recipe 13's
+    quarantine box is unaffected: it is written "after **the flip**"; its "Full
+    unlatch" box is owed a re-run.
+    **Not changed, deliberately:** `can_unlatch` is still `latch != open`, so a
+    contaminated tab whose latch a rotation reopened (the H-2 state) uses
+    `clear_contamination` — a "Restore full access" button on a tab with nothing
+    latched would name an action that does nothing. The clear is per **scope**, as
+    every override always has been: a sibling `opencode:<tab>` scope on the same
+    tab keeps its own flag.
 16. **Three-level enable hierarchy (user decision 2026-08-07).** Until now
     roughly half of V32 was structurally always-on (the latch itself, the
     envelope, the SSRF guard, the canary, memory quarantine, consumer
@@ -3209,7 +3249,8 @@ declares its class AND its mutation capability in one reviewed place.
       and the same session-rotation reset as `latch_flagged`, so a caller
       POSTing in a loop still produces one row and a mid-session policy change
       cannot produce a second. Locked decision 15 is unmoved: this records that
-      the bit was SET, and no path clears it. The row's first sentence follows
+      the bit was SET, and **no HTTP path** clears it (the 2026-08-10 amendment
+      adds a third USER action, `unlatch`). The row's first sentence follows
       the outcome instead of asserting an engagement that may not have happened.
     - **A2-3 — the row's origin has one source now.** `override_flag_detail` and
       `beacon_flag_detail` spelled `Origin::Ipc` / `Origin::Http` into their own
@@ -3299,7 +3340,9 @@ declares its class AND its mutation capability in one reviewed place.
     **What is deliberately NOT changed:** `observe` still reopens the latch and
     resets the budget on a rotation. Decision 15's line is that clearing
     `contaminated` requires proof of a genuinely new conversation — the proof is
-    what was missing, not the consequence. Cost of the fix: a genuinely new
+    what was missing, not the consequence. (The 2026-08-10 amendment changes what
+    a **click** may do, not what a rotation may prove; `observe` is untouched by
+    it.) Cost of the fix: a genuinely new
     session is reported live one 200 ms poll later, once its first line lands.
     Tests: `a_rotation_with_no_observed_growth_does_not_clear_contamination`,
     `a_rotation_with_observed_growth_does_clear_contamination` and
@@ -3783,8 +3826,9 @@ declares its class AND its mutation capability in one reviewed place.
     reset on a **proved** session rotation as `latch_flagged`), an `info!`
     covers the latch-unmoved case, and the row's first sentence follows the
     outcome rather than asserting an engagement that may not have happened.
-    Decision 15 is unmoved: this records that the bit was SET; nothing clears
-    it. The paragraph above now describes the code as it stands.
+    Decision 15 is unmoved: this records that the bit was SET; **no HTTP path**
+    clears it (the 2026-08-10 amendment adds a third USER action, `unlatch`).
+    The paragraph above now describes the code as it stands.
 
     **Closing it, re-scoped 2026-08-08 (#48).** The old text said closing this
     needs a per-tab secret "which the OpenCode plugin cannot hold while it is
@@ -3796,9 +3840,13 @@ declares its class AND its mutation capability in one reviewed place.
     shared discovery file). Left open deliberately: per decision 3 this buys
     audit-trail fidelity and cross-tab DoS resistance, not containment, and the
     containment answer is V33.
-  - **Never reachable, by either route: clearing `contaminated`.** Decision 15
-    holds — contamination is a property of the conversation, not of the latch
-    position. (The separate finding C-2 — that a forged session *rotation* did
+  - **Never reachable, by either HTTP route: clearing `contaminated`.** The
+    beacon can only ever tighten, and `POST /latch/override` is gone — so this
+    residual is still true and still valuable. (Decision 15's 2026-08-10
+    amendment changes only what a *click* may do: `unlatch`, over IPC, now
+    releases the flag. Contamination remains a property of the conversation
+    rather than of the latch position for every non-user path.) (The separate
+    finding C-2 — that a forged session *rotation* did
     clear it, by two routes neither of which is `/latch/override` — is closed;
     see the Phase F #48 C-2 amendment. A rotation must now be proved by observed
     transcript growth, and a `/memory/event` body can no longer key the

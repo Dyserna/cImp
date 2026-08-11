@@ -1364,8 +1364,16 @@ pub async fn injection_status(state: State<'_, AppState>) -> AppResult<serde_jso
 // `WorkerInjectionOverrides` carry only their own scope's fields, so the illegal
 // write does not typecheck in Rust and has no key to target in JSON.
 
-/// V32 Phase F (locked decision 15): apply a user-initiated latch move
-/// (`"flip_local"` or `"unlatch"`) to one tab and return its new view.
+/// V32 Phase F (locked decision 15): apply a user-initiated containment move to
+/// one tab and return its new view — the two latch moves (`"flip_local"`,
+/// `"unlatch"`) and step 4's two contamination moves (`"clear_contamination"`,
+/// `"await_session_clear"`).
+///
+/// **This is the only path that can release a contamination flag**, and since
+/// decision 15's 2026-08-10 amendment `"unlatch"` releases one too (restoring
+/// FULL access is the user's verdict; `"flip_local"` is a workflow step and
+/// keeps the flag). See `loopback::TabLatch::contaminated` for why a click in
+/// this app's own UI is a legitimate trust root where a transcript file is not.
 ///
 /// Errors carry a human-readable reason (unknown action, no latch to move, an
 /// illegal transition) that the popover shows verbatim — a security control

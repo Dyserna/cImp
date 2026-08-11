@@ -13,7 +13,12 @@
   //   3. "Restore full access" — at-own-risk, behind an explicit second click
   //      that spells out WHY it is risky: the injected content is still in the
   //      conversation, so re-opening both sides recreates the trifecta with a
-  //      model that may already be steered.
+  //      model that may already be steered. Since decision 15's 2026-08-10
+  //      amendment that click ALSO clears the contamination flag, so the second
+  //      click states both effects — and, on a tab that is not contaminated,
+  //      states neither (a promise to clear a flag that is not set would be
+  //      false, and the old single string made exactly that mistake about the
+  //      injected content).
   //
   // Step 4 adds the contamination section, and it is here — in the popover the
   // badge opens — rather than only in the Workbench Timeline, because the
@@ -21,7 +26,8 @@
   // control must not be unreachable in a configuration the user is allowed to
   // choose. Step 5's Timeline entry point calls the same action.
   //
-  // The two clears differ in what they promise, and the copy has to carry that:
+  // The three clears differ in what they promise, and the copy has to carry
+  // that:
   //   • "Not injected — clear the flag" clears NOW, behind a second click,
   //     because if the judgement is wrong a steered model gets its persistence
   //     channel back.
@@ -29,6 +35,11 @@
   //     and cannot remove injected text from the conversation, so the flag is
   //     kept and lifts when cImp sees the tab start a new session. That is why
   //     this one is a single click: it releases nothing.
+  //   • "Restore full access" clears it too — decision 15's 2026-08-10
+  //     amendment. A full unlatch is a VERDICT (the user takes the larger risk
+  //     knowingly), where "switch to local" is a workflow step and therefore
+  //     keeps the flag. It lives in the latch section above, not here, because
+  //     the clear is a consequence of the latch move rather than its purpose.
   //
   // The old static line said restarting cImp was the only clean reset. It was
   // true under H-2 and is not any more, so it is gone — a security surface that
@@ -238,11 +249,31 @@
   </button>
 
   {#if confirmingUnlatch}
-    <div class="state warn">
-      Restoring full access re-opens the web side while the injected content is
-      still in this conversation — the model can be steered by it and reach your
-      files at the same time. Continue?
-    </div>
+    <!-- Conditional on `row.contaminated`, because the two cases promise
+         different things and neither string is safe for the other tab: on an
+         uncontaminated tab (latched `local` by a local call that never fetched)
+         "the injected content is still in this conversation" is untrue and a
+         promise to clear the flag would be false; on a contaminated one, saying
+         only "re-opens the web side" under-states a click that also releases
+         persistence — the reporting-honesty class of M-21/M-22/M-24. -->
+    {#if row.contaminated}
+      <div class="state warn">
+        Restoring full access re-opens the web side while the injected content is
+        still in this conversation — the model can be steered by it and reach your
+        files at the same time.
+        <strong>It also clears this tab's contamination flag:</strong> new notes
+        stop being held for review and save straight into project memory again.
+        Notes already held stay held — release those from the Memory view. The
+        record of what happened, and of this clear, stays on the Timeline.
+        Continue?
+      </div>
+    {:else}
+      <div class="state warn">
+        Restoring full access re-opens both sides of the latch, so this session
+        can hold web access and local file access at the same time — the
+        combination the latch exists to prevent. Continue?
+      </div>
+    {/if}
     <div class="row">
       <button
         type="button"
@@ -250,7 +281,7 @@
         disabled={busy}
         onclick={() => void run('unlatch')}
       >
-        Yes, restore full access
+        {row.contaminated ? 'Yes, restore access and clear the flag' : 'Yes, restore full access'}
       </button>
       <button type="button" class="entry" onclick={() => (confirmingUnlatch = false)}>
         Cancel

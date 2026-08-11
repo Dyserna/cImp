@@ -301,6 +301,26 @@ describe('the cleared lifecycle', () => {
     expect(row.link.kind).toBe('none');
     expect(clearedLine(row.cleared!)).toContain('new session');
   });
+
+  /// Decision 15's 2026-08-10 amendment added a THIRD basis, and the row has to
+  /// name it: without its own arm the Timeline rendered the bare fallback
+  /// `Cleared (unlatch).`, which is a wire value where the user needs a decision.
+  /// The three sentences must also be distinguishable from each other — a shared
+  /// sentence would put "the content was harmless" and "I took the whole risk
+  /// knowingly" in the same words.
+  it('names each clear basis, and falls back rather than guessing', () => {
+    const unlatched = clearedLine(ev({ cleared: true, tool: 'unlatch', origin: 'ipc' }));
+    expect(unlatched).toContain('restored full access');
+    expect(unlatched).toContain('deliberately');
+    const resumed = clearedLine(ev({ cleared: true, tool: 'clear_contamination' }));
+    const rotated = clearedLine(ev({ cleared: true, tool: 'session_clear_observed' }));
+    expect(new Set([unlatched, resumed, rotated]).size).toBe(3);
+
+    // An unknown basis must not borrow one of the three sentences: a build that
+    // grew a fourth clear says so instead of describing the wrong one.
+    const unknown = clearedLine(ev({ cleared: true, tool: 'flip_local' }));
+    expect(unknown).toBe('Cleared (flip_local).');
+  });
 });
 
 describe('what the view says when it cannot show everything', () => {

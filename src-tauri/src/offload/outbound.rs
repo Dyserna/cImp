@@ -1350,15 +1350,26 @@ pub enum Screen {
     /// wire values gets one tab's whole taint lifecycle, and neither half can be
     /// evicted by the other's volume.
     ///
-    /// Two paths write it, and the row's [`Origin`] is what tells them apart:
+    /// Three paths write it. The row's `tool` column carries the **basis** and is
+    /// what tells them apart; the [`Origin`] only says whether a human acted
+    /// *now*:
     ///
-    /// * `ipc` — the user judged the flagged content harmless and cleared the
-    ///   bit immediately from the taint popover ("false-positive resume").
-    /// * `internal` — the user had earlier armed a one-shot clear (they restored
-    ///   a checkpoint, which cannot un-read a page), and cImp has now *observed*
-    ///   the tab start a new harness session. The authority is the earlier click;
-    ///   the trigger is cImp's own observation, so the origin is not `ipc`. The
-    ///   arming click has its own [`Screen::LatchOverride`] row.
+    /// * `clear_contamination` / `ipc` — the user judged the flagged content
+    ///   harmless and cleared the bit immediately from the taint popover
+    ///   ("false-positive resume").
+    /// * `unlatch` / `ipc` — decision 15's 2026-08-10 amendment: the user
+    ///   restored FULL access, and the flag went with it. A *different claim*
+    ///   from the resume ("I am taking the whole risk knowingly" rather than
+    ///   "that content was harmless"), which is why it is its own basis and not
+    ///   a reuse of the first. The same click also writes a
+    ///   [`Screen::LatchOverride`] row for the latch move; the two share the word
+    ///   `unlatch` and are told apart by `screen`.
+    /// * `session_clear_observed` / `internal` — the user had earlier armed a
+    ///   one-shot clear (they restored a checkpoint, which cannot un-read a
+    ///   page), and cImp has now *observed* the tab start a new harness session.
+    ///   The authority is the earlier click; the trigger is cImp's own
+    ///   observation, so the origin is not `ipc`. The arming click has its own
+    ///   [`Screen::LatchOverride`] row.
     ///
     /// Not a denial: nothing was refused. It is the most consequential *grant*
     /// in this enum — from here on the tab's `context_note` writes are stored

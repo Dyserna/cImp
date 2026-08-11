@@ -24,14 +24,16 @@ export interface LatchRow {
   /// `open` | `external` | `local`.
   latch: string;
   /// Whether external content has entered this conversation at all. Survives
-  /// every latch override — and, since H-2 (2026-08-08), every session rotation
-  /// too: the rotation signal is the newest `*.jsonl` in a directory the model's
-  /// own Bash can write, so it cannot be the trust root for un-tainting a
-  /// context window.
+  /// the `flip_local` override — and, since H-2 (2026-08-08), every *unarmed*
+  /// session rotation too: the rotation signal is the newest `*.jsonl` in a
+  /// directory the model's own Bash can write, so it cannot be the trust root
+  /// for un-tainting a context window.
   ///
-  /// What DOES clear it (step 4) is the user, in this app's own UI — the same
-  /// trust root every consent surface here uses, and one no shell can fabricate.
-  /// Two ways, `clear_contamination` and `await_session_clear`; see
+  /// What DOES clear it is the user, in this app's own UI — the same trust root
+  /// every consent surface here uses, and one no shell can fabricate. Three
+  /// ways: `clear_contamination`, `await_session_clear`, and (decision 15's
+  /// 2026-08-10 amendment) `unlatch`, because restoring FULL access is the
+  /// user's verdict while the flip is only a workflow step. See
   /// `offload/loopback.rs`'s `TabLatch::contaminated`.
   contaminated: boolean;
   /// Whether "switch to local" applies right now (EXTERNAL-latched only).
@@ -54,7 +56,10 @@ export interface LatchRow {
 /// The user-initiated containment moves. Mirror of Rust `LatchOverride`, which
 /// rejects anything not in this set — so the two ends have to move together.
 ///
-/// - `flip_local` / `unlatch` — the two latch moves (V32 Phase F).
+/// - `flip_local` / `unlatch` — the two latch moves (V32 Phase F). `unlatch`
+///   also CLEARS the contamination flag (decision 15's 2026-08-10 amendment):
+///   restoring full access is a verdict, and the click already hands back the
+///   strictly larger risk. `flip_local` keeps the flag — it is a workflow step.
 /// - `clear_contamination` — step 4's false-positive resume: the user judged the
 ///   flagged content harmless, so the flag goes now and nothing else changes.
 /// - `await_session_clear` — step 4's restore: the flag stays set (rolling back

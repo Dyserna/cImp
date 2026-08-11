@@ -327,15 +327,21 @@ export function triggerTitle(trigger: Checkpoint['trigger']): string {
 
 /// How a contamination bit was released, in the user's words.
 ///
-/// The two bases are very different claims about what is in the model's context
-/// window — "the user judged the content harmless" versus "the user restored and
-/// the tab then started a new conversation" — and the audit trail is only legible
-/// if the row says which. Falls through to the raw basis for a value this build
-/// does not know, rather than to a confident sentence about the wrong one.
+/// The three bases are very different claims about what is in the model's
+/// context window — "the user judged the content harmless" versus "the user took
+/// the whole risk knowingly" versus "the user restored and the tab then started a
+/// new conversation" — and the audit trail is only legible if the row says which.
+/// Falls through to the raw basis for a value this build does not know, rather
+/// than to a confident sentence about the wrong one.
 export function clearedLine(event: ContaminationEvent): string {
   switch (event.tool) {
     case 'clear_contamination':
       return 'Cleared — marked a false positive. Nothing was restarted and nothing was rolled back; the conversation was left as it was.';
+    case 'unlatch':
+      // Decision 15's 2026-08-10 amendment. Without this arm the row rendered
+      // the bare fallback `Cleared (unlatch).`, which names a wire value and
+      // says nothing about what the user decided.
+      return 'Cleared — the user restored full access to this tab, which releases the flag with it (the larger risk was accepted deliberately).';
     case 'session_clear_observed':
       return 'Cleared — a checkpoint was restored, and cImp then saw this tab start a new session.';
     default:
@@ -428,7 +434,7 @@ export function evidenceNotices(input: EvidenceInput): EvidenceNotice[] {
 /// is how they come to disagree (#48, G-2).
 export function latchAlsoHoldsMemory(latch: string | undefined): string | null {
   if (latch !== 'external') return null;
-  return 'Clearing the flag will not release this tab’s memory writes on its own: the tab is latched to external content, and the latch quarantines writes on its own authority, whatever the flag says. Move the latch as well — the containment badge’s "Switch to local" or "Restore full access" — before notes save normally again.';
+  return 'Clearing the flag will not release this tab’s memory writes on its own: the tab is latched to external content, and the latch quarantines writes on its own authority, whatever the flag says. Move the latch as well — the containment badge’s "Switch to local" (which keeps the flag) or "Restore full access" (which also clears it) — before notes save normally again.';
 }
 
 /// What the Workbench says when checkpoints are off, so this view does not exist.

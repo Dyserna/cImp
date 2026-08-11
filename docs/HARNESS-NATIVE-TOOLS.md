@@ -529,21 +529,30 @@ raises the hint.
   what memory quarantine keys off).
   * *Switch to local* (decision 15) flips the **latch** — external closes,
     local reopens, never both at once. The intended "research done, now apply
-    it" button. *Full unlatch* recreates the trifecta and asks for confirmation.
+    it" button; the flip **keeps** the contamination flag. *Full unlatch*
+    recreates the trifecta, asks for confirmation, and **releases the flag** as
+    part of the same click.
   * The **contamination bit** is cleared by the user, in cImp's own UI
-    (`05e613f`). *Resume* clears it now and touches nothing else; *Restore* arms
-    a one-shot wait and lifts it only when a genuine session rotation is
-    observed, because restoring a checkpoint rolls back files and cannot remove
-    injected text from the context window. The trust root is **authority, not
-    evidence** — a human clicking in cImp is a fact no shell can fabricate,
-    which is why H-2 (`2c40136`) removed the automatic reset: "the session
-    rotated" was inferred from a transcript file the model's own shell can
-    write. Neither clear path is reachable over HTTP; `/latch/beacon` can only
-    tighten.
+    (`05e613f`). *Resume* clears it now and touches nothing else; *Full unlatch*
+    clears it too (user decision 2026-08-10 — restoring FULL access is a verdict,
+    and that click already hands back the strictly larger risk, so quarantining
+    persistent memory afterwards would overrule the judgement it just asked for);
+    *Restore* arms a one-shot wait and lifts it only when a genuine session
+    rotation is observed, because restoring a checkpoint rolls back files and
+    cannot remove injected text from the context window. The trust root is
+    **authority, not evidence** — a human clicking in cImp is a fact no shell can
+    fabricate, which is why H-2 (`2c40136`) removed the automatic reset: "the
+    session rotated" was inferred from a transcript file the model's own shell can
+    write. None of the three clear paths is reachable over HTTP; `/latch/beacon`
+    can only tighten. Every release writes its own `contamination_cleared` row
+    beside the `contamination` row that set the bit — clearing the state never
+    erases the evidence.
   * **Clearing the bit does not by itself reopen persistent memory** while the
     latch is still EXTERNAL — `proxy_gate` quarantines a `context_note` on the
-    latch's own authority. A resume on an EXTERNAL-latched tab leaves notes held
-    until the user also switches to local or unlatches.
+    latch's own authority. A resume on an EXTERNAL-latched tab therefore leaves
+    notes held until the user also switches to local or unlatches — and the
+    unlatch now clears the flag as part of the same click, so it is the one
+    action that releases both holds at once.
 
 **The recommended research pattern under `deny` (revised 2026-08-09):**
 

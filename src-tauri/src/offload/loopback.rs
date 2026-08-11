@@ -1272,8 +1272,9 @@ struct TabLatch {
     beacon_flagged: bool,
     /// V32 Phase F (locked decision 15): whether external content has entered
     /// this conversation *at all* — set the moment an EXTERNAL call is admitted
-    /// (proxied, or beaconed from a harness-native web tool) and **never
-    /// cleared by an override**.
+    /// (proxied, or beaconed from a harness-native web tool) and cleared by
+    /// exactly three USER actions, none of them reachable over HTTP (see "Step
+    /// 4" and "The 2026-08-10 amendment" below).
     ///
     /// It exists because decision 15 lets the USER move the latch, and the two
     /// facts then come apart: the latch says what the session may do NEXT,
@@ -1281,6 +1282,12 @@ struct TabLatch {
     /// written after "switch to local" was still composed by a model that read
     /// an attacker's page, so persistence must stay quarantined — contamination
     /// is a property of the conversation, not of the latch position.
+    ///
+    /// That argument governs [`LatchOverride::FlipLocal`] and only it. The
+    /// 2026-08-10 amendment below draws the line where the user's own click
+    /// draws it: a *workflow step* cannot un-taint a conversation, but a
+    /// deliberate return to FULL access — the strictly larger risk — is the
+    /// verdict the flip is not.
     ///
     /// # H-2 (2026-08-08 re-review): the bit is STICKY, and why
     ///
@@ -1314,7 +1321,7 @@ struct TabLatch {
     /// `latch_override` IPC command), and it is the same trust root every other
     /// consent surface in this app already uses.
     ///
-    /// So exactly two things clear it, both rooted in that click:
+    /// So exactly three things clear it, all rooted in that click:
     ///
     /// 1. [`LatchOverride::ClearContamination`] — the user judged the flagged
     ///    content harmless. Cleared immediately; nothing else about the tab or
@@ -1324,13 +1331,34 @@ struct TabLatch {
     ///    restored a checkpoint. The bit **stays set** and lifts only when a
     ///    proved session rotation is observed. See that field for why a forgeable
     ///    rotation signal is acceptable *there* and nowhere else.
+    /// 3. [`LatchOverride::Unlatch`] — the user restored FULL access. See "The
+    ///    2026-08-10 amendment" below for the argument.
     ///
     /// **The accepted cost is unchanged for everything else.** A genuine
     /// `/clear` in a tab nobody armed keeps the bit: that conversation's
     /// `context_note` writes stay quarantined (they are stored and held for
-    /// review, not dropped) and the badge keeps saying "contaminated". The two
-    /// latch overrides that existed before this step still cannot clear it, and
-    /// neither can any HTTP route.
+    /// review, not dropped) and the badge keeps saying "contaminated".
+    /// [`LatchOverride::FlipLocal`] — the workflow flip — still cannot clear it,
+    /// and neither can any HTTP route: `/latch/beacon` only ever tightens, and
+    /// `POST /latch/override` has not existed since #45.
+    ///
+    /// # The 2026-08-10 amendment: a full unlatch IS a verdict
+    ///
+    /// **The 2026-08-10 amendment to decision 15** (user: *"if the user restores
+    /// full access then the tab should be cleared, it's the user's decision."*).
+    /// A full unlatch hands back read AND web with the injected content still in
+    /// the context window; that is the strictly larger risk, and it is taken
+    /// behind the popover's own confirmation. Leaving the *memory* half
+    /// quarantined after it made the product overrule a judgement it had just
+    /// asked the user to make. Same trust root as (1): authority, not evidence.
+    ///
+    /// **Clearing the STATE never erases the EVIDENCE.** The
+    /// [`outbound::Screen::Contamination`] row that set the bit stays in its own
+    /// retention lane, and every release writes an
+    /// [`outbound::Screen::ContaminationCleared`] row beside it — including the
+    /// unlatch's ([`unlatch_clear_row`]). "Cleared" and "never contaminated" are
+    /// therefore distinguishable in the feed even though the live view is
+    /// identical, which is the point.
     contaminated: bool,
     /// Step 4: the **one-shot arm** — the only thing that lets a session
     /// rotation clear [`contaminated`](Self::contaminated).
@@ -1413,9 +1441,10 @@ impl TabLatch {
     /// cleared.** Returns what the tab looked like immediately before, or `None`
     /// when it was not contaminated at all.
     ///
-    /// Both authorised paths funnel through here — the user's immediate resume
-    /// and the armed rotation — so a field that has to be reset alongside the bit
-    /// cannot be reset on one path and forgotten on the other.
+    /// All three authorised paths funnel through here — the user's immediate
+    /// resume, the full unlatch (2026-08-10 amendment) and the armed rotation —
+    /// so a field that has to be reset alongside the bit cannot be reset on one
+    /// path and forgotten on the other.
     ///
     /// # What it resets, and why the two report bits are not optional
     ///
@@ -1436,7 +1465,10 @@ impl TabLatch {
     ///
     /// * **The latch.** Resume "changes nothing else"; the latch has its own two
     ///   buttons and its own rules. Leaving it where it is can only be the
-    ///   tighter choice.
+    ///   tighter choice. (The unlatch path moves the latch too — but it does so
+    ///   in its own arm of [`LatchRegistry::apply_override`], *after* this
+    ///   function has run, so `PriorTaint::latch` still names the latch the bit
+    ///   was released from. This function never touches the latch on any path.)
     /// * **The budget.** Spend is not a report flag — the same reason
     ///   [`LatchRegistry::apply_override`] does not refill it.
     /// * **Quarantined notes.** Locked decision 10 keeps promote-or-discard
@@ -1561,7 +1593,11 @@ impl TabLatch {
 /// released it — the "prior state" every clear's audit row records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PriorTaint {
-    /// [`Latch::label`] at the moment of the clear. Unchanged by it.
+    /// [`Latch::label`] at the moment of the clear — i.e. the latch the bit was
+    /// released *from*. `clear_contamination` never changes it; on the unlatch
+    /// path the caller moves the latch to `Open` immediately afterwards, so this
+    /// reads `external`/`local`, which is the state an audit row means by
+    /// "prior". It therefore always equals `OverrideOutcome::prior.label()`.
     latch: &'static str,
     /// Whether the one-shot arm was set. False for a false-positive resume of an
     /// un-armed tab; true when the clear is a restore's arm firing.
@@ -1602,9 +1638,11 @@ pub struct LatchView {
     /// [`Latch::label`]: `open` / `external` / `local`.
     pub latch: &'static str,
     /// Locked decision 15: has external content entered this conversation at
-    /// all? Survives every override — and, since H-2, every session rotation
-    /// too: the bit is sticky for the tab's registry entry (see
-    /// [`TabLatch::contaminated`]).
+    /// all? Survives [`LatchOverride::FlipLocal`] and — since H-2 — every
+    /// *unarmed* session rotation: the bit is sticky for the tab's registry
+    /// entry. It is released only by the three USER actions listed on
+    /// [`TabLatch::contaminated`], one of which is
+    /// [`LatchOverride::Unlatch`] (2026-08-10 amendment).
     pub contaminated: bool,
     /// Whether "switch to local" applies right now (EXTERNAL-latched only).
     pub can_flip_local: bool,
@@ -1656,6 +1694,15 @@ pub enum LatchOverride {
     /// Anything → Open. Restores both sides; the UI puts a confirmation in
     /// front of it because it recreates the trifecta with injected content
     /// still in the context window.
+    ///
+    /// **And it clears [`TabLatch::contaminated`]** — decision 15's 2026-08-10
+    /// amendment. The click is a verdict, not a workflow step: it already hands
+    /// back the strictly more dangerous capability, so quarantining persistent
+    /// memory afterwards overruled the user's own decision. On an
+    /// uncontaminated tab it clears nothing and is still legal; the clear is a
+    /// consequence of the action, not its precondition (contrast
+    /// [`ClearContamination`](Self::ClearContamination), whose entire purpose is
+    /// the clear, so "nothing to clear" is *its* error).
     Unlatch,
     /// Step 4 — **false-positive resume.** The user has looked at what was
     /// flagged and judged it harmless. Clears the contamination bit now; the
@@ -1709,7 +1756,11 @@ struct OverrideOutcome {
     prior: Latch,
     /// Step 4: the taint state before the move, for the same reason `prior`
     /// exists — "cleared the contamination flag" is only legible beside what was
-    /// there. `None` for a move on an uncontaminated tab.
+    /// there. `Some` **only when this override actually released the bit**:
+    /// `clear_contamination`, or an `unlatch` on a contaminated tab (decision
+    /// 15's 2026-08-10 amendment). `None` for `flip_local`, for the arm, and for
+    /// any move on an uncontaminated tab — which is what
+    /// [`unlatch_clear_row`] keys its "write no row" decision on.
     prior_taint: Option<PriorTaint>,
     view: LatchView,
 }
@@ -2090,6 +2141,14 @@ enum ClearBasis {
     /// [`LatchOverride::AwaitSessionClear`] armed the tab after a restore, and
     /// cImp has now observed a new harness session.
     Restore,
+    /// [`LatchOverride::Unlatch`] — decision 15's 2026-08-10 amendment. The user
+    /// restored FULL access, and the flag went with it. A third basis rather
+    /// than a reuse of [`Resume`](Self::Resume) because the two are different
+    /// claims about what the user decided: `Resume` says *"that content was
+    /// harmless"*, this says *"I am taking the whole risk knowingly"* — and an
+    /// incident reviewer who cannot tell them apart cannot reconstruct the
+    /// decision.
+    Unlatch,
 }
 
 impl ClearBasis {
@@ -2099,6 +2158,11 @@ impl ClearBasis {
         match self {
             ClearBasis::Resume => LatchOverride::ClearContamination.as_str(),
             ClearBasis::Restore => "session_clear_observed",
+            // `"unlatch"` is also the `tool` column of the tab's
+            // `latch_override` row. The two are told apart by `screen`, and
+            // `contamination_events()` reads only the two contamination lanes,
+            // so nothing joins them by accident — the shared word is a feature.
+            ClearBasis::Unlatch => LatchOverride::Unlatch.as_str(),
         }
     }
 }
@@ -2190,6 +2254,15 @@ fn clear_detail(
                                from the taint popover. The session, the tab and the working tree \
                                were not touched"
             .to_string(),
+        ClearBasis::Unlatch => "the user restored FULL access from the taint popover (`unlatch`), \
+                                and decision 15's 2026-08-10 amendment releases the flag with it: \
+                                that click already hands back the strictly more dangerous \
+                                capability — read AND web with the injected content still in the \
+                                context window — so quarantining persistent memory afterwards \
+                                would overrule the judgement it just asked for. An attacker \
+                                cannot click it; the trust root is authority, not evidence. The \
+                                session, the tab and the working tree were not touched"
+            .to_string(),
         ClearBasis::Restore => format!(
             "the user restored a checkpoint, which armed a ONE-SHOT clear (a restore rolls back \
              files and cannot remove injected text from a context window, so the flag was kept), \
@@ -2202,13 +2275,23 @@ fn clear_detail(
             }
         ),
     };
+    // The one sentence the three bases cannot share: two of them leave the latch
+    // exactly where it was, and the third IS a latch move.
+    let latch_note = match basis {
+        ClearBasis::Unlatch => "The same click also moved the latch to `open` — that is what \
+                                released the flag, and it is recorded as its own `latch_override` \
+                                row.",
+        ClearBasis::Resume | ClearBasis::Restore => {
+            "The latch itself is unchanged by this and keeps its own controls."
+        }
+    };
     format!(
         "CONTAMINATION CLEARED (basis: {}, origin: {}): {how}. Prior state: contaminated=true, \
-         latch={prior_latch}, session={}. The latch itself is unchanged by this and keeps its own \
-         controls. Memory notes already quarantined STAY quarantined — promoting or discarding \
-         them is the Memory view's own review (locked decision 10), a separate consent surface. \
-         What changes is that this tab's future persistent writes are stored clean again, and that \
-         a fresh contamination will report itself as a new transition.",
+         latch={prior_latch}, session={}. {latch_note} Memory notes already quarantined STAY \
+         quarantined — promoting or discarding them is the Memory view's own review (locked \
+         decision 10), a separate consent surface. What changes is that this tab's future \
+         persistent writes are stored clean again, and that a fresh contamination will report \
+         itself as a new transition.",
         basis.tool(),
         origin.as_str(),
         prior_session.unwrap_or("unknown"),
@@ -2308,10 +2391,12 @@ fn note_contamination(
              and every external result keeps its spotlighting envelope (latch={}). No \
              filesystem-derived signal clears the bit (H-2: a new harness session is not proof of \
              a new context window, because the model's own shell can forge one) and no HTTP route \
-             can. It is cleared only by the USER, from the taint popover — either immediately \
-             (`clear_contamination`, \"that content was harmless\") or after a checkpoint restore \
-             (`await_session_clear`, effective once cImp observes a new harness session). Whichever \
-             happens, it writes its own `contamination_cleared` row.",
+             can. It is cleared only by the USER, from the taint popover — immediately \
+             (`clear_contamination`, \"that content was harmless\"), by restoring FULL access \
+             (`unlatch`, which accepts the larger risk deliberately), or after a checkpoint \
+             restore (`await_session_clear`, effective once cImp observes a new harness session). \
+             The workflow flip (`flip_local`) does NOT clear it. Whichever happens, it writes its \
+             own `contamination_cleared` row.",
             match prov.host {
                 Some(h) => format!(" from {h}"),
                 None => String::new(),
@@ -2808,8 +2893,10 @@ impl LatchRegistry {
     ///   which only ever tightens (Open → External) and only for a configured
     ///   tab id ([`is_configured_tab`]) — it cannot flip to Local, cannot
     ///   unlatch, and cannot clear contamination.
-    /// - **What clears `contaminated` (step 4)** is two of the four actions, and
-    ///   nothing else — no automatic path, no HTTP path. See
+    /// - **What clears `contaminated`** is three of the four actions —
+    ///   `clear_contamination`, `unlatch` (decision 15's 2026-08-10 amendment)
+    ///   and, deferred, `await_session_clear` — and nothing else: no automatic
+    ///   path, no HTTP path. `flip_local` is the one that does not. See
     ///   [`TabLatch::contaminated`] for why a click is a legitimate trust root
     ///   where a transcript file is not.
     ///
@@ -2873,6 +2960,22 @@ impl LatchRegistry {
             // The at-own-risk button: both sides open again. Valid from any
             // state except a latch that is already open, which would be a
             // no-op.
+            //
+            // Decision 15's 2026-08-10 amendment: **it also clears the
+            // contamination bit.** The trust root is the one that closed H-2 —
+            // authority, not evidence. An attacker cannot click this; the click
+            // already hands back the strictly more dangerous capability (read +
+            // web, with the injected content still in the context window) behind
+            // the popover's own confirmation; so leaving persistent memory
+            // quarantined afterwards overruled a judgement the product had just
+            // asked the user to make. `FlipLocal` above keeps the bit precisely
+            // because it is a workflow step and not a verdict.
+            //
+            // Ordering is load-bearing: the clear runs BEFORE `latch = Open`, so
+            // `PriorTaint::latch` records the latch the bit was released from
+            // (`external`/`local`) rather than the `open` this arm is about to
+            // write — which is what keeps it equal to `OverrideOutcome::prior`,
+            // the value `override_row` puts in the same sentence.
             LatchOverride::Unlatch => {
                 if prior == Latch::Open {
                     Err(format!(
@@ -2880,6 +2983,12 @@ impl LatchRegistry {
                         scope.label()
                     ))
                 } else {
+                    // `None` here is not an error: the unlatch is legal on its
+                    // own terms and the clear is a consequence of it, not its
+                    // purpose. An uncontaminated latched tab unlatches and
+                    // writes no `contamination_cleared` row — see
+                    // `unlatch_clear_row`.
+                    prior_taint = entry.clear_contamination();
                     entry.latch = Latch::Open;
                     Ok(())
                 }
@@ -2927,11 +3036,17 @@ impl LatchRegistry {
                 }
             }
         };
-        // Deliberately NOT touched by the two LATCH moves: `contaminated`, and
-        // the session's spent budget. A latch override changes what the session
-        // may reach next; it cannot un-read what the model has already read, and
-        // letting a click refill the fetch budget would make the budget
-        // advisory.
+        // Deliberately NOT touched by ANY move here: the session's spent budget.
+        // Letting a click refill the fetch budget would make the budget
+        // advisory. (Live-verified 2026-08-10: an unlatch does not refill it —
+        // recipe 13's web-side leg could not be re-probed for exactly that
+        // reason.)
+        //
+        // And `contaminated` is not touched by `FlipLocal`: the flip changes
+        // what the session may reach next and cannot un-read what the model has
+        // already read. `Unlatch` DOES release it — decision 15's 2026-08-10
+        // amendment, argued in that arm — and `Unlatch` is the only latch move
+        // that does.
         let view = entry.view();
         drop(tabs);
         ContaminationCleared::record_from(rotated, scope);
@@ -3307,19 +3422,58 @@ fn override_row(
             outcome.view.contaminated,
             outcome.view.latch,
         ),
-        LatchOverride::FlipLocal | LatchOverride::Unlatch => format!(
-            "USER OVERRIDE ({}, origin: {}): taint latch {} → {}. Contamination is NOT cleared by \
-             a latch override (contaminated={}): memory writes stay quarantined and external \
+        // The flip is a WORKFLOW step, not a verdict, which is the whole reason
+        // decision 15's 2026-08-10 amendment narrowed "contamination outlives
+        // the override" to this one action. The row is where a reviewer learns
+        // which of the two moves they are looking at.
+        LatchOverride::FlipLocal => format!(
+            "USER OVERRIDE (flip_local, origin: {}): taint latch {} → {}. Contamination is NOT \
+             cleared by the flip (contaminated={}): memory writes stay quarantined and external \
              results keep their envelope, because the injected content is still in the \
-             conversation. Clearing it is its own decision with its own two actions — \
-             `clear_contamination` (the user judges the content harmless) and `await_session_clear` \
+             conversation and \"switch to local\" says \"research done, now apply it\" — not \"that \
+             content was harmless\". Clearing the flag is its own decision with its own three \
+             actions: `clear_contamination` (the user judges the content harmless), `unlatch` (the \
+             user restores FULL access and accepts the larger risk) and `await_session_clear` \
              (after a restore, effective once a new harness session is observed). No automatic \
-             path and no HTTP route can reach either.",
-            action.as_str(),
+             path and no HTTP route can reach any of them.",
             origin.as_str(),
             outcome.prior.label(),
             outcome.view.latch,
             outcome.view.contaminated,
+        ),
+        // Decision 15's 2026-08-10 amendment. One click, two effects, and the
+        // row states both — including whether the second one actually fired: an
+        // unlatch on an uncontaminated tab clears nothing, and this sentence
+        // must not be readable as evidence that a bit was released.
+        LatchOverride::Unlatch => format!(
+            "USER OVERRIDE (unlatch, origin: {}): taint latch {} → {} — FULL access restored, \
+             which recreates the read+web trifecta with any injected content still in the \
+             conversation. {} Memory notes ALREADY quarantined STAY quarantined — promoting or \
+             discarding them is the Memory view's own review (locked decision 10), a separate \
+             consent surface.",
+            origin.as_str(),
+            outcome.prior.label(),
+            outcome.view.latch,
+            match outcome.prior_taint.as_ref() {
+                Some(p) => format!(
+                    "The contamination flag was cleared by the same click (prior state: \
+                     contaminated=true, latch={}, session={}), and it is filed as its own \
+                     `contamination_cleared` row beside the row that SET the bit. The trust root \
+                     is AUTHORITY, not evidence: an attacker cannot click this, and the click \
+                     already handed back the strictly more dangerous capability — so leaving \
+                     persistent memory writes quarantined would have overruled a judgement the \
+                     product had just asked the user to make. This tab's future `context_note` \
+                     writes are stored clean again, and a fresh contamination will report itself \
+                     as a new transition.",
+                    p.latch,
+                    p.session.as_deref().unwrap_or("unknown"),
+                ),
+                None => format!(
+                    "This tab was not flagged as contaminated, so there was nothing to clear \
+                     (contaminated={}).",
+                    outcome.view.contaminated
+                ),
+            },
         ),
     };
     FlagRow {
@@ -3328,6 +3482,61 @@ fn override_row(
         tool,
         detail,
     }
+}
+
+/// Decision 15's 2026-08-10 amendment: the `contamination_cleared` row a **full
+/// unlatch** owes, or `None` when this override released nothing.
+///
+/// # Why a second row rather than a sentence in the first one
+///
+/// [`outbound::Screen::ContaminationCleared`] is a retention lane *and* a join
+/// key: its own doc says a reviewer filtering the two contamination wire values
+/// "gets one tab's whole taint lifecycle", and [`outbound::contamination_events`]
+/// queries exactly those two lanes. A release visible only inside a
+/// [`outbound::Screen::LatchOverride`] detail string is invisible to that join —
+/// the Workbench Timeline would show a `☣` that never closes, for a tab the
+/// registry reports clean. That is the "signal with no consumer" class (#48,
+/// F-3) reintroduced one amendment later, so the clear is filed where every
+/// other clear is filed.
+///
+/// # Why it is composed here and not in [`LatchRegistry::apply_override`]
+///
+/// The origin is stated ONCE, by the caller (#48, A2-3): [`apply_latch_override`]
+/// is the only path in and it names [`outbound::Origin::Ipc`] for both rows, so
+/// the two halves of an override cannot disagree about who acted. Composing it
+/// here also makes it assertable without an `AppHandle`, which this crate has no
+/// mock for — the same seam [`override_row`] exists for.
+///
+/// `None` covers the honest case: an unlatch on a tab that was never
+/// contaminated. It is not an error, and it must not write a row saying a bit
+/// was released.
+fn unlatch_clear_row(
+    origin: outbound::Origin,
+    action: LatchOverride,
+    scope: &LatchScope,
+    outcome: &OverrideOutcome,
+) -> Option<ContaminationCleared> {
+    if action != LatchOverride::Unlatch {
+        return None;
+    }
+    let prior = outcome.prior_taint.as_ref()?;
+    Some(ContaminationCleared {
+        origin,
+        basis: ClearBasis::Unlatch,
+        consumer: scope.agent,
+        scope: scope.label(),
+        // The conversation the bit was cleared FOR, exactly as the resume path
+        // files it: the one the `contamination` row named.
+        session: prior.session.clone(),
+        root: scope.root.clone(),
+        detail: clear_detail(
+            ClearBasis::Unlatch,
+            origin,
+            prior.latch,
+            prior.session.as_deref(),
+            None,
+        ),
+    })
 }
 
 /// V32 Phase F (locked decision 15): apply a user-initiated latch move to one
@@ -3392,6 +3601,15 @@ pub fn apply_latch_override(
         root: scope.root.clone(),
         detail: &row.detail,
     });
+    // Decision 15's 2026-08-10 amendment: a full unlatch also RELEASES the
+    // contamination bit, and that release owes the `contamination_cleared` lane
+    // its own row — see `unlatch_clear_row` for why it is not folded into the
+    // latch move's prose. Written AFTER the override row, in the order the state
+    // moved: the latch reopened, and the flag went with it. Same stated origin
+    // for both, from the one constant above.
+    if let Some(cleared) = unlatch_clear_row(outbound::Origin::Ipc, action, &scope, &outcome) {
+        cleared.record();
+    }
     Ok(outcome.view)
 }
 
@@ -8615,67 +8833,309 @@ mod tests {
         );
     }
 
-    /// **The core Phase F invariant.** Contamination is a property of the
-    /// CONVERSATION, not of the latch position: a note written after any
-    /// override was still composed by a model that read an attacker's page, so
-    /// persistence stays quarantined through both moves.
+    /// **The core Phase F invariant, as decision 15's 2026-08-10 amendment
+    /// leaves it.** Contamination is a property of the CONVERSATION, not of the
+    /// latch position: a note written after the *flip* was still composed by a
+    /// model that read an attacker's page, so persistence stays quarantined
+    /// through it.
     ///
     /// H-2 extends it past the session boundary: this test used to end by
     /// rotating the session and asserting a clean scope ("a tab restart, the one
     /// clean exit the UI names"). It now asserts the opposite, because the
     /// rotation signal comes from a file the model's own Bash can create — see
     /// [`TabLatch::contaminated`]. The latch still reopens; the bit does not.
+    ///
+    /// **Why the name narrowed** (it was
+    /// `contamination_survives_every_override_and_every_session_rotation`): the
+    /// user's 2026-08-10 decision moved `unlatch` out of this rule — *"if the
+    /// user restores full access then the tab should be cleared, it's the user's
+    /// decision."* The flip is a workflow step and keeps the bit; the unlatch is
+    /// a verdict and releases it, which is
+    /// `a_full_unlatch_clears_contamination_and_records_it` next door. Of the
+    /// four actions only `clear_contamination` and `unlatch` clear; the flip
+    /// never does, and the arm defers.
     #[test]
-    fn contamination_survives_every_override_and_every_session_rotation() {
-        for action in [LatchOverride::FlipLocal, LatchOverride::Unlatch] {
-            let reg = LatchRegistry::default();
-            let s = scope("claude-1", Some("sess-a"));
-            assert!(reg
-                .gate(
-                    Some(&s),
-                    LatchRoute::Proxied,
-                    "ddg__fetch_content",
-                    ON,
-                    NO_CONTENT
-                )
-                .is_ok());
-            let out = reg.apply_override(&s, action).expect("override applies");
-            assert!(out.view.contaminated, "{action:?}");
-            // The latch moved; the quarantine did not.
-            assert_ne!(out.view.latch, "external", "{action:?}");
-            assert_eq!(
-                reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
-                Ok(WriteTaint::Quarantined),
-                "{action:?}: a post-override write must still be quarantined"
-            );
-            assert!(reg.snapshot()[0].view.contaminated, "{action:?}");
+    fn contamination_survives_the_flip_and_every_session_rotation() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        let out = reg
+            .apply_override(&s, LatchOverride::FlipLocal)
+            .expect("the flip applies from external");
+        assert!(
+            out.view.contaminated,
+            "the flip is a workflow step, not a verdict"
+        );
+        assert!(
+            out.prior_taint.is_none(),
+            "and it releases nothing, so it has no prior taint to record"
+        );
+        // The latch moved; the quarantine did not.
+        assert_ne!(out.view.latch, "external");
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Quarantined),
+            "a post-flip write must still be quarantined"
+        );
+        assert!(reg.snapshot()[0].view.contaminated);
 
-            // H-2: a new session id reopens the latch — but the write is STILL
-            // quarantined, because "the session rotated" is a claim sourced from
-            // an attacker-writable transcript directory.
-            let after = scope("claude-1", Some("sess-b"));
-            assert_eq!(
-                reg.gate(
-                    Some(&after),
-                    LatchRoute::Native,
-                    "context_note",
-                    ON,
-                    NO_CONTENT
-                ),
-                Ok(WriteTaint::Quarantined),
-                "{action:?}: a rotation must not re-open the persistence channel"
-            );
-            let rows = reg.snapshot();
-            assert!(rows[0].view.contaminated, "{action:?}");
-            assert_eq!(rows[0].latch(), "open", "{action:?}");
-        }
+        // H-2: a new session id reopens the latch — but the write is STILL
+        // quarantined, because "the session rotated" is a claim sourced from
+        // an attacker-writable transcript directory.
+        let after = scope("claude-1", Some("sess-b"));
+        assert_eq!(
+            reg.gate(
+                Some(&after),
+                LatchRoute::Native,
+                "context_note",
+                ON,
+                NO_CONTENT
+            ),
+            Ok(WriteTaint::Quarantined),
+            "a rotation must not re-open the persistence channel"
+        );
+        let rows = reg.snapshot();
+        assert!(rows[0].view.contaminated);
+        assert_eq!(rows[0].latch(), "open");
+
+        // And the fourth action likewise leaves the bit alone — one assertion,
+        // because the full behaviour is `a_restore_arms_the_wait_and_clears_
+        // nothing_now` and duplicating it here would give the rule two homes.
+        let (armed_reg, armed_scope) = contaminated_registry();
+        let armed = armed_reg
+            .apply_override(&armed_scope, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+        assert!(
+            armed.view.contaminated,
+            "the restore arm defers the clear; it does not perform one"
+        );
     }
 
-    /// Full unlatch restores both sides — the at-own-risk move — while the
-    /// contamination bit keeps persistence closed. Both facts matter: the
-    /// button must actually work, and it must not silently undo the quarantine.
+    /// **Decision 15's 2026-08-10 amendment** (user: *"if the user restores full
+    /// access then the tab should be cleared, it's the user's decision."*). One
+    /// invariant with several faces, so one test: the state, the payload the user
+    /// is buying, the prior state the audit rows quote, the two rows themselves,
+    /// and the two cases where nothing is released.
+    ///
+    /// The trust root is the one that closed H-2 — **authority, not evidence**.
+    /// An attacker cannot click this; the click already hands back the strictly
+    /// more dangerous capability, so leaving persistent memory quarantined
+    /// afterwards overruled a judgement the product had just asked for.
     #[test]
-    fn full_unlatch_restores_both_sides_but_not_persistence() {
+    fn a_full_unlatch_clears_contamination_and_records_it() {
+        outbound::test_rows::reset();
+        let (reg, s) = contaminated_registry();
+
+        // 1. The state. `can_clear` goes with the bit — there is nothing left to
+        //    clear, so the popover must stop offering it.
+        let out = reg
+            .apply_override(&s, LatchOverride::Unlatch)
+            .expect("a contaminated latched tab can be unlatched");
+        assert!(!out.view.contaminated, "the flag went with the access");
+        assert!(!out.view.can_clear, "and nothing is left to clear");
+        assert!(!out.view.awaiting_session_clear);
+        assert_eq!(out.view.latch, "open");
+        assert!(!reg.snapshot()[0].view.contaminated);
+
+        // 2. Prior state, captured BEFORE the latch moved. `external`, not
+        //    `open`: this is the assertion that goes red if someone moves the
+        //    clear after `entry.latch = Latch::Open`, which would make the audit
+        //    row quote the state the click produced instead of the one it
+        //    replaced.
+        let prior = out.prior_taint.as_ref().expect("the clear happened here");
+        assert_eq!(prior.latch, "external");
+        assert_eq!(prior.session.as_deref(), Some("sess-a"));
+
+        // 3. Two rows, right lanes, right words. Neither is written by the
+        //    registry — both are composed here and filed by
+        //    `apply_latch_override`, the IPC entry point, from one stated origin.
+        let orow = override_row(outbound::Origin::Ipc, LatchOverride::Unlatch, &out);
+        assert_eq!(orow.screen, outbound::Screen::LatchOverride);
+        assert_eq!(orow.tool, "unlatch");
+        let d = &orow.detail;
+        assert!(d.contains("FULL access restored"), "{d}");
+        assert!(d.contains("contaminated=true"), "the PRIOR state: {d}");
+        assert!(d.contains("latch=external"), "the PRIOR latch: {d}");
+        assert!(d.contains("STAY quarantined"), "decision 10 stated: {d}");
+
+        let cleared = unlatch_clear_row(outbound::Origin::Ipc, LatchOverride::Unlatch, &s, &out)
+            .expect("a release owes the contamination_cleared lane a row");
+        assert_eq!(cleared.basis.tool(), "unlatch");
+        assert_eq!(
+            cleared.session.as_deref(),
+            Some("sess-a"),
+            "filed under the CONTAMINATED conversation, so it joins the row that opened it"
+        );
+        assert_eq!(cleared.root, TEST_ROOT, "an empty root defeats the row");
+        let cd = &cleared.detail;
+        assert!(cd.contains("basis: unlatch"), "{cd}");
+        assert!(cd.contains("origin: ipc"), "{cd}");
+        assert!(cd.contains("contaminated=true"), "the PRIOR state: {cd}");
+        assert!(cd.contains("STAY quarantined"), "decision 10 stated: {cd}");
+
+        // 4. Empty is not absent: the clear releases STATE, never EVIDENCE. The
+        //    `contamination` row that set the bit is untouched by the override —
+        //    what makes "cleared" distinguishable from "never contaminated" is
+        //    that pair of rows, not the live view, which is now identical.
+        let rows = outbound::test_rows::drain();
+        assert_eq!(
+            contamination_rows(&rows).len(),
+            1,
+            "the row that SET the bit is still in the feed after the release"
+        );
+        assert!(
+            cleared_rows(&rows).is_empty(),
+            "the release's own row is the IPC entry point's to write, exactly as the \
+             resume's is — see `unlatch_clear_row`"
+        );
+
+        // 5. The payload the user is actually buying, and the reason this action
+        //    and not the flip: BOTH holds are released, so the next memory write
+        //    is stored clean.
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            Ok(WriteTaint::Clean),
+            "decision 15's 2026-08-10 amendment: restoring full access releases the \
+             flag too — the user's decision"
+        );
+
+        // 6. The honest `None`: an unlatch on a tab that was never contaminated
+        //    is still legal, releases nothing, and must not write a row claiming
+        //    a bit was released.
+        let clean = LatchRegistry::default();
+        let cs = scope("claude-2", Some("sess-c"));
+        assert!(clean
+            .gate(
+                Some(&cs),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        let cout = clean
+            .apply_override(&cs, LatchOverride::Unlatch)
+            .expect("an uncontaminated latched tab unlatches too");
+        assert_eq!(cout.prior, Latch::Local);
+        assert!(cout.prior_taint.is_none(), "there was nothing to release");
+        assert!(
+            unlatch_clear_row(outbound::Origin::Ipc, LatchOverride::Unlatch, &cs, &cout).is_none(),
+            "a `contamination_cleared` row here would claim a release that never happened"
+        );
+        let cleanrow = override_row(outbound::Origin::Ipc, LatchOverride::Unlatch, &cout);
+        assert!(
+            cleanrow.detail.contains("nothing to clear"),
+            "{}",
+            cleanrow.detail
+        );
+
+        // 7. An arm is superseded, not stranded: `clear_contamination` drops it,
+        //    because once the bit is gone there is nothing left to wait for.
+        outbound::test_rows::reset();
+        let (armed, arm_s) = contaminated_registry();
+        armed
+            .apply_override(&arm_s, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+        let _ = outbound::test_rows::drain();
+        let aout = armed
+            .apply_override(&arm_s, LatchOverride::Unlatch)
+            .expect("unlatch supersedes the arm");
+        assert!(!aout.view.contaminated);
+        assert!(
+            !aout.view.awaiting_session_clear,
+            "an arm outliving its bit is a trap waiting for the next rotation"
+        );
+        assert!(
+            aout.prior_taint.as_ref().is_some_and(|p| p.armed),
+            "and the row records that the tab had been armed"
+        );
+        assert!(
+            cleared_rows(&outbound::test_rows::drain()).is_empty(),
+            "still exactly one release row, and it is the builder's"
+        );
+        assert!(unlatch_clear_row(
+            outbound::Origin::Ipc,
+            LatchOverride::Unlatch,
+            &arm_s,
+            &aout
+        )
+        .is_some());
+
+        // 8. And the collision case the ordering inside `apply_override` decides:
+        //    an armed one-shot that fires on the SAME click (the user restored,
+        //    ran `/clear`, then clicked). `observe` runs first, so it clears the
+        //    bit and writes the rotation's row; the unlatch then finds a latch
+        //    the rotation already reopened and is refused — while the clear that
+        //    really happened is still recorded. Exactly one release row.
+        outbound::test_rows::reset();
+        let (raced, rs) = contaminated_registry();
+        raced
+            .apply_override(&rs, LatchOverride::AwaitSessionClear)
+            .expect("arm");
+        let _ = outbound::test_rows::drain();
+        let rotated = scope("claude-1", Some("sess-b"));
+        let err = raced
+            .apply_override(&rotated, LatchOverride::Unlatch)
+            .expect_err("the rotation reopened the latch, so there is nothing to unlatch");
+        assert!(err.contains("not latched"), "{err}");
+        assert_eq!(
+            cleared_rows(&outbound::test_rows::drain()).len(),
+            1,
+            "a refused action must not swallow a clear that already happened"
+        );
+        assert!(!raced.snapshot()[0].view.contaminated);
+
+        // 9. And from `Open`, contaminated: the H-2 state (a rotation reopened
+        //    the latch and kept the bit). `unlatch` does not apply there and
+        //    clears nothing — `clear_contamination` is that state's action, which
+        //    is why `can_unlatch` is deliberately not widened.
+        let (open_reg, _os) = contaminated_registry();
+        let orotated = scope("claude-1", Some("sess-b"));
+        let v = open_reg.view_for(&orotated);
+        assert_eq!(v.latch, "open");
+        assert!(v.contaminated, "unarmed: the bit is sticky (H-2)");
+        let oerr = open_reg
+            .apply_override(&orotated, LatchOverride::Unlatch)
+            .expect_err("nothing to unlatch");
+        assert!(oerr.contains("not latched"), "{oerr}");
+        assert!(
+            open_reg.snapshot()[0].view.contaminated,
+            "a refused unlatch releases nothing"
+        );
+    }
+
+    /// Full unlatch restores both sides — the at-own-risk move — **and, since
+    /// decision 15's 2026-08-10 amendment, persistence with them**: the user
+    /// restored full access, and the flag goes with it. Both facts matter: the
+    /// button must actually work, and it must release exactly what the
+    /// confirmation says it releases.
+    ///
+    /// This test asserted the inverse until 2026-08-11 (it was
+    /// `full_unlatch_restores_both_sides_but_not_persistence`, ending in
+    /// *"unlatching must not un-contaminate the conversation"*). The flip keeps
+    /// that rule — see
+    /// `contamination_survives_the_flip_and_every_session_rotation`.
+    ///
+    /// **It also needed splitting into two legs, and that is a finding of its
+    /// own.** The old single-registry version probed the external side first
+    /// (`ddg__search`) and *then* asserted the write was quarantined — but that
+    /// probe is an admitted EXTERNAL call: it re-latches the tab EXTERNAL and
+    /// re-contaminates the conversation. The quarantine it observed was the NEW
+    /// latch's, on `Latch::proxy_gate`'s own authority, so the assertion never
+    /// depended on the unlatch's treatment of the flag at all. Two registries,
+    /// because one call cannot both exercise the web side and leave the tab in
+    /// the state the other half is about.
+    #[test]
+    fn full_unlatch_restores_both_sides_including_persistence() {
+        // Leg 1: the web side answers again — the button does what it says.
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
@@ -8689,16 +9149,43 @@ mod tests {
             .is_ok());
         reg.apply_override(&s, LatchOverride::Unlatch)
             .expect("unlatch");
-        // Both sides answer again... (the local call re-latches Local, so probe
-        // the external side first).
         assert!(reg
             .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
             .is_ok());
+        // …and that call has re-latched EXTERNAL and re-contaminated the tab,
+        // which is correct: a new page really was read.
+        assert!(reg.snapshot()[0].view.contaminated);
+
+        // Leg 2: and so does persistence, which is what the amendment added.
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        reg.apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
         assert_eq!(
             reg.gate(Some(&s), LatchRoute::Native, "context_note", ON, NO_CONTENT),
-            Ok(WriteTaint::Quarantined),
-            "unlatching must not un-contaminate the conversation"
+            Ok(WriteTaint::Clean),
+            "decision 15's 2026-08-10 amendment: restoring full access also releases \
+             the flag — the user's decision"
         );
+        // The local-capability side answers too (that write re-latched Local).
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
     }
 
     /// The wire vocabulary. An unrecognized action is an ERROR, never resolved
@@ -10285,7 +10772,10 @@ mod tests {
         // (No `contamination_cleared` row is expected from the registry here:
         // the resume's row is composed by `override_row` and written by
         // `apply_latch_override`, the IPC entry point, exactly as the two latch
-        // moves' rows always have been. It is asserted in
+        // moves' rows always have been. The same is true of the unlatch's
+        // release row (decision 15's 2026-08-10 amendment), which `unlatch_clear_row`
+        // composes for that same entry point — so the `Unlatch` below likewise
+        // adds nothing to this feed. Both are asserted in
         // `every_clear_records_its_basis_and_the_state_it_replaced`.)
         assert!(cleared_rows(&outbound::test_rows::drain()).is_empty());
 
@@ -10480,6 +10970,36 @@ mod tests {
         assert!(d.contains("session=sess-a"), "the PRIOR session: {d}");
         assert!(d.contains("(sess-b)"), "and the one that replaced it: {d}");
         assert!(d.contains("latch=external"), "the PRIOR latch: {d}");
+
+        // Half 3: the full unlatch (decision 15's 2026-08-10 amendment). Same
+        // shape as half 1 — asserted through the builder, because this row is
+        // likewise composed for `apply_latch_override` to file — and it must be
+        // a DIFFERENT basis from the resume: "that content was harmless" and "I
+        // am taking the whole risk knowingly" are different claims, and a
+        // reviewer who cannot tell them apart cannot reconstruct the decision.
+        outbound::test_rows::reset();
+        let (reg, s) = contaminated_registry();
+        let out = reg
+            .apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
+        let row = unlatch_clear_row(outbound::Origin::Ipc, LatchOverride::Unlatch, &s, &out)
+            .expect("the release owes its own row");
+        assert_eq!(row.origin, outbound::Origin::Ipc, "a human acted NOW");
+        assert_eq!(row.basis.tool(), "unlatch");
+        assert_ne!(row.basis, ClearBasis::Resume);
+        assert_eq!(row.scope, "claude:claude-1");
+        assert_eq!(row.session.as_deref(), Some("sess-a"));
+        let d = &row.detail;
+        assert!(d.contains("basis: unlatch"), "{d}");
+        assert!(d.contains("origin: ipc"), "{d}");
+        assert!(d.contains("contaminated=true"), "the PRIOR state: {d}");
+        assert!(d.contains("latch=external"), "the PRIOR latch: {d}");
+        assert!(d.contains("session=sess-a"), "the PRIOR session: {d}");
+        assert!(d.contains("STAY quarantined"), "decision 10 stated: {d}");
+        assert!(
+            d.contains("moved the latch to `open`"),
+            "the one sentence the three bases cannot share: {d}"
+        );
     }
 
     /// **The arm's own row.** It is not a clear, so it is filed as a latch
@@ -11152,10 +11672,11 @@ mod tests {
         );
 
         // 2. The only entry point that can clear is not an HTTP handler. Its
-        //    doc says so; this asserts the shape the doc describes — the two
-        //    clearing actions exist solely as `LatchOverride` values, and the
-        //    only function that turns a string into one is called from the IPC
-        //    command.
+        //    doc says so; this asserts the shape the doc describes — the three
+        //    clearing actions (`clear_contamination`, `unlatch` since decision
+        //    15's 2026-08-10 amendment, and the deferred `await_session_clear`)
+        //    exist solely as `LatchOverride` values, and the only function that
+        //    turns a string into one is called from the IPC command.
         let ipc = include_str!("../ipc/commands.rs");
         assert!(
             ipc.contains("apply_latch_override(&app, &consumer, &tab, &action)"),

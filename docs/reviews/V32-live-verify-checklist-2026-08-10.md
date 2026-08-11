@@ -962,6 +962,64 @@ Happy path:
 - [ ] Manifest at a staged bundle with a bumped version → Check now downloads,
       validates, swaps, reloads; installed version moves; `previous/` gains the
       old bundle; **Revert restores it**.
+      **ATTEMPTED 2026-08-11 WITHOUT CLICKS, AND IT RAISED F-25 INSTEAD — see
+      below. Not scored either way.**
+
+### F-25 — raised 2026-08-11, **LEAD (needs one `RUST_LOG` run to confirm or kill)**: the updater's scheduler did not tick for 34+ minutes with due-ness forced
+
+**What was done.** To drive recipe 11's happy path with no UI, the updater's own
+state file was edited (backed up first): `installed_version` lowered
+`2026.08.10` → `2026.08.09` so the live channel would be *newer*, and
+`last_check_ms` set to `0`. This is sound because `state()` re-reads from disk on
+every call (`updater/mod.rs:583-588`) — there is no in-memory cache — and
+`is_due` returns `true` **unconditionally** when `last_check_ms == 0`
+(`:188-190`). Re-applying was chosen deliberately as a no-op on the files: the
+three installed digests are **byte-identical** to what the manifest publishes, so
+a successful apply could not damage the install.
+
+**What happened: nothing.** Staged 10:17:51; watched continuously to 10:51:57.
+`last_check_ms` stayed `0` and no check ran. **34 minutes is more than two full
+`POLL_TICK` periods (15 min, `:163`), so this does not depend on knowing the
+tick phase** — any live 15-minute scheduler must have fired at least twice.
+
+**Every gate was verified open at the time**, which is what makes it a lead:
+- `spawn_scheduler` is called **unconditionally** (`main.rs:894`), and its own
+  comment says gating is deliberately *inside* the tick so settings take effect
+  "at the next tick with no restart".
+- `updates_enabled` = `Feature::Detection` at `Scope::App` (`:259-265`) —
+  `/status` reported `effective:true` at every scope throughout.
+- `Mode::parse("auto")` → `Mode::Auto` (`:139-143`), so `is_inert()` is false.
+- **The project overlay does not override either updater key** — checked
+  explicitly, because comparing against the global file alone is what produced
+  the withdrawn F-22.
+- The state file still held the edit afterwards, so nothing overwrote it.
+
+**The one benign explanation, and why it does not cover this.** Decoding the
+original `last_check_ms` (1786389137607) gives **2026-08-10 21:12:17** — i.e. the
+last real check was yesterday evening, and with `interval_hours: 24` the next
+natural due time was 21:12 *tonight*. That fully explains why no check ran during
+this app session **before** the edit, and it is worth knowing. It does not
+explain the 34 minutes **after** due-ness was forced to unconditional.
+
+**So the live hypothesis is that the spawned scheduler task is not alive** — a
+panic inside `tick_once` would kill the `tauri::async_runtime::spawn` task
+silently and it would never tick again, with no user-visible signal and no
+retry. If true this is more serious than a missed update: detection rules go
+stale indefinitely while Settings still shows a healthy channel, which is the
+"quality signal with no consumer" shape. The updater code path itself is known
+good — it applied `2026.08.10` successfully at that 21:12 timestamp.
+
+**How to settle it in one run, and it needs a restart so it is the user's:**
+relaunch with `RUST_LOG=offload=info` and force due-ness the same way.
+`tick_once` logs `detection updater: scheduled check` on every due tick
+(`:2588-2592`). A line within one `POLL_TICK` ⇒ the scheduler is alive and this
+was an artefact; **silence across two ⇒ confirm F-25**. There is **no log file
+anywhere on this install** (checked), so `RUST_LOG` is the only route.
+
+**The install was restored** to the exact backed-up state afterwards:
+`installed_version` `2026.08.10`, `last_check_ms` back to the original,
+`previous_version` `2026.08.09.1` intact, and all three `rules.d` digests
+unchanged.
 
 `local/` survives and cannot veto (U-4):
 - [ ] A hand-written rule in `rules.d/local/` still matches after the update.

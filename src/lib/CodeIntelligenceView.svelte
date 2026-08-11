@@ -1800,7 +1800,7 @@
           <div>
             <span
               class="num"
-              title="Serialized size of the graph tool descriptors advertised to the cloud session and the offload worker — cache-written once per session. Toggle Settings → Code Graph → lean tool surface to trim the cold-tail tools."
+              title="Serialized size of the graph tool descriptors advertised to the cloud session and the offload worker — cache-written once per session. Toggle Settings → Code Intelligence → Code graph → Lean tool surface to trim the cold-tail tools."
             >{usage.surface.mcp_tools.toLocaleString()}</span>
             <span class="lbl">tool surface: {usage.surface.mcp_chars.toLocaleString()} chars, cache-written once per session
               <span class="est-badge">est. ~{Math.round(usage.surface.mcp_chars / 4).toLocaleString()} tok</span>
@@ -2500,7 +2500,8 @@
   {:else if section === 'context'}
     <div class="context-sec">
       <p class="caveat">
-        When enabled (Settings → Code Intelligence → Context injection), cImp
+        When enabled (Settings → Code Intelligence → Token efficiency → Context
+        injection), cImp
         prepends a budget-bounded digest of the most relevant files to each
         prompt — for Claude via a <code>UserPromptSubmit</code> hook, for OpenCode
         via a generated plugin. Preview below shows what <em>would</em> be injected

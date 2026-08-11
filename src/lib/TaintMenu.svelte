@@ -234,7 +234,9 @@
         </li>
       {/each}
     </ul>
-    <div class="state">Change it in Settings → Tools → Injection protection.</div>
+    <!-- F-18: the path, not the name. "Injection protection" was always right —
+         it is now a top-level Settings category, and "Tools" never was one. -->
+    <div class="state">Change it in Settings → Injection protection.</div>
   {/if}
 
   <div class="separator"></div>

@@ -38,7 +38,7 @@
   const remote = $derived(dashboards.filter((d) => d.kind === 'lan' || d.kind === 'cloud'));
 
   // Start/Stop/Reset for the local offload server, mirroring the per-backend
-  // controls in Settings → Offload. cImp normally owns a single local
+  // controls in Settings → Offload task tools. cImp normally owns a single local
   // llama-server, so these act on the first local backend. `busy` disables the
   // row while an action is in flight so a double-click can't race two lifecycle
   // ops.
@@ -58,7 +58,8 @@
     }
   }
 
-  // "Show command on start" (Settings → Offload → Local backend): Start first
+  // "Show command on start" (Settings → Offload task tools → Pool, on the local
+  // backend's card): Start first
   // opens the configured server command in an editable confirm dialog
   // (OffloadStartCommandDialog, mounted in App.svelte); the edited command is
   // used for that launch only — never persisted. Reads the live settings
@@ -81,7 +82,7 @@
   {#if dashboards.length === 0}
     <div class="offline">
       <span class="dot off"></span>
-      <span>No offload backend configured — add one in Settings → Offload.</span>
+      <span>No offload backend configured — add one in Settings → Offload task tools.</span>
     </div>
   {:else}
     {#if local.length > 0}

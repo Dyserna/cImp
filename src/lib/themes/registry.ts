@@ -47,7 +47,7 @@ const FALLBACK_THEME: ThemeEntry = {
 };
 
 const themesStore = writable<ThemeEntry[]>([FALLBACK_THEME]);
-/// The available UI themes, for the Settings → Theme dropdown.
+/// The available UI themes, for the Settings → Appearance → Theme dropdown.
 export const themeRegistry: Readable<ThemeEntry[]> = themesStore;
 
 // The available terminal palettes, for the palette dropdowns + swatches.

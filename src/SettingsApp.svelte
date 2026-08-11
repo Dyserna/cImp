@@ -508,8 +508,16 @@
       // No boolean L2: `native_web_visibility`'s tri-mode IS this feature's
       // app-wide switch (the Phase G reconciliation), so there is no field to
       // bind and the checkbox is read-only.
+      //
+      // F-18's companion defect: a read-only checkbox can only say on/off, and
+      // `injectionL2On` ticks it for BOTH live modes — so at `sensor`, the
+      // shipped default, the row read plain "on" and a user took that to mean
+      // the harness was refusing its own web tools when it never denies one.
+      // Locked decision 14 makes `sensor` a posture, not a bug, so the fix is
+      // to name which of the three modes is in force (rendered beside the label
+      // from `nativeWebModeWord`) rather than to change the default.
       field: null,
-      hint: 'Set by the Native web tools mode below, which is this feature’s app-wide switch — its "off" IS this control off. Use the per-tab overrides here to exempt or force one tab.',
+      hint: 'Set by the Native web tools mode below, which is this feature’s app-wide switch: its "off" IS this control off, and its "sensor" — the shipped default — is this control ON but REPORT-ONLY, raising the taint badge without ever refusing a call. Only "deny" blocks anything. Use the per-tab overrides here to exempt or force one tab.',
     },
     consumer_hygiene: {
       hint: 'The pinned OpenCode permission block and the data-not-instructions paragraph in the session guidance. Off: OpenCode inherits its upstream defaults and the session is never told how to read cImp’s markers.',
@@ -565,6 +573,39 @@
     return [...seen.values()];
   });
 
+  /// The app-wide native-web mode, normalized exactly as the backend's single
+  /// reader does it (`injection::NativeWebMode::parse`): trimmed, and anything
+  /// unrecognized resolves to `sensor` rather than `off` — a typo must not blind
+  /// the latch. One normalizer here too, so the matrix checkbox and the mode
+  /// word below cannot disagree about which mode is in force.
+  const nativeWebMode = $derived.by((): 'off' | 'sensor' | 'deny' => {
+    const raw = snapshot?.offload.native_web_visibility.trim() ?? '';
+    return raw === 'off' ? 'off' : raw === 'deny' ? 'deny' : 'sensor';
+  });
+
+  /// F-18's companion defect, as a value: which of the three modes is in force,
+  /// in words that say what it DOES. The matrix row renders this beside the
+  /// feature label, because that row's checkbox is a boolean collapse of a
+  /// tri-mode switch and a ticked box at `sensor` — the shipped default — was
+  /// read as "the harness is blocking its web tools" when `sensor` never denies
+  /// a call. Wording deliberately echoes the select's own option text in "Native
+  /// web tools" below: two surfaces, one claim.
+  ///
+  /// A stored value that is not one of the three is NAMED rather than swallowed:
+  /// it resolves to `sensor`, and a hand-edited config must not read as a mode
+  /// the user chose.
+  const NATIVE_WEB_MODE_WORDS: Record<'off' | 'sensor' | 'deny', string> = {
+    off: 'off — no hook, no visibility',
+    sensor: 'sensor — reports and taints, never denies a call',
+    deny: 'deny — the harness refuses its own web tools',
+  };
+  const nativeWebModeWord = $derived.by(() => {
+    if (!snapshot) return '';
+    const raw = snapshot.offload.native_web_visibility.trim();
+    const word = NATIVE_WEB_MODE_WORDS[nativeWebMode];
+    return raw === nativeWebMode ? word : `${word} (stored as “${raw}”)`;
+  });
+
   /// A feature's app-wide L2 value, for the read-only display and for the
   /// "Inherit (on/off)" label on every override cell. One reader, because the
   /// tri-mode exception below used to be spelled out at each of them.
@@ -573,8 +614,9 @@
     if (f.field) return snapshot.offload.injection[f.field] as boolean;
     // The one feature with no boolean L2 (see the meta table). Its app-wide
     // switch is the `native_web_visibility` select below; `off` IS this control
-    // off.
-    return f.key === 'native_web' ? snapshot.offload.native_web_visibility !== 'off' : false;
+    // off, and BOTH other modes are it on — which is why the row also renders
+    // `nativeWebModeWord` (F-18's companion defect: on ≠ blocking).
+    return f.key === 'native_web' ? nativeWebMode !== 'off' : false;
   }
 
   /// One override cell, resolved for display.
@@ -1052,6 +1094,7 @@
     | 'shortcuts'
     | 'compose'
     | 'offload'
+    | 'injection'
     | 'mcp'
     | 'graph'
     | 'checks'
@@ -1071,6 +1114,14 @@
     { id: 'stt', label: 'Speech-to-text' },
     { id: 'tabs', label: 'Tabs' },
     { id: 'offload', label: 'Offload task tools' },
+    // F-18: a top-level category of its own, labelled with the phrase the UI
+    // strings and the ⛨ status chip already use ("Injection protection is
+    // reduced…"), so every pointer at it is a path correction rather than a
+    // rename. It used to be three headings at the bottom of Offload task tools
+    // → Pool, and it governs every AI tab and the MCP surface, not just the
+    // offload worker. Adjacent to `offload` deliberately: that is where anyone
+    // who remembers the old layout, or read an older pointer, starts looking.
+    { id: 'injection', label: 'Injection protection' },
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
     { id: 'checks', label: 'Checks' },
@@ -4418,13 +4469,317 @@
             </small>
           </label>
           <!--
+            F-18: the injection controls used to sit right here, at the bottom
+            of this sub-tab. This is where anyone who remembers that, or who
+            read one of the pointers that named a "Tools" section, will look.
+            A breadcrumb rather than an alias in the deep-link router: this
+            section id is live and still means the offload pool, so aliasing it
+            would hijack every legitimate link to this page.
+          -->
+          <hr class="card-divider lg" />
+          <small class="hint">
+            <strong>Injection protection moved.</strong> The master switch, the
+            per-feature matrix, the external fetch budgets, native web tools and
+            injection detection are now a top-level Settings category of their
+            own — they govern every AI tab, not just the offload worker.
+          </small>
+          <div class="button-row">
+            <button type="button" class="secondary" onclick={() => (activeSection = 'injection')}>
+              Open Injection protection
+            </button>
+          </div>
+
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.escalate_partial}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.escalate_partial = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Escalate partial fast-tier answers to the quality backend</span>
+          </label>
+          <small class="hint">
+            When a fast-tier offload comes back only partially verified, re-run it
+            once on a distinct, ready quality backend and keep the better answer.
+            Inert unless a second, quality-tier backend is configured.
+          </small>
+          {:else}
+          <h3>Native tools</h3>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.read_file}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.read_file = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>read_file — bounded file reads</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.list_dir}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.list_dir = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>list_dir — enumerate a directory (what files exist / how many)</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.code_search}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.code_search = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>code_search — literal search across the roots</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.run_command}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.run_command = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span>run_command — allowlisted, read-only commands</span>
+          </label>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.offload.tools.run_check}
+              onchange={(e) =>
+                patch((s) => (s.offload.tools.run_check = (e.currentTarget as HTMLInputElement).checked))}
+            />
+            <span
+              >run_check — run a configured project check (build/typecheck/lint/test).
+              Inert until the project's <code>checks</code> are configured.</span
+            >
+          </label>
+
+          <label>
+            <span>Allowed roots (one per line)</span>
+            <textarea
+              rows="3"
+              value={snapshot.offload.allowed_roots.join('\n')}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.allowed_roots = (e.currentTarget as HTMLTextAreaElement).value
+                      .split('\n')
+                      .map((r) => r.trim())
+                      .filter((r) => r.length > 0)),
+                )}
+              placeholder="Leave empty to confine to the launch project root"
+            ></textarea>
+            <small class="hint">
+              <code>code_search</code>/<code>read_file</code>/<code>run_command</code>
+              are confined to these. Empty = the launch project root.
+            </small>
+          </label>
+          <label>
+            <span>Command allowlist (comma-separated)</span>
+            <input
+              type="text"
+              value={snapshot.offload.command_allowlist.join(', ')}
+              oninput={(e) =>
+                patch(
+                  (s) =>
+                    (s.offload.command_allowlist = (e.currentTarget as HTMLInputElement).value
+                      .split(',')
+                      .map((c) => c.trim())
+                      .filter((c) => c.length > 0)),
+                )}
+              placeholder="git, cargo"
+            />
+            <small class="hint">
+              <code>run_command</code> runs nothing unless its program is
+              listed here (deny by default).
+            </small>
+          </label>
+
+          <div class="button-row">
+            <button type="button" class="secondary" onclick={enableReadonlyCommands}>
+              Enable safe read-only commands
+            </button>
+          </div>
+          <small class="hint">
+            Adds <code>git</code> and <code>cargo</code> to the allowlist and
+            installs a <code>cargo</code> policy that permits only
+            <code>metadata</code> / <code>tree</code> (never
+            <code>run</code>/<code>build</code>). A one-time merge — it never
+            overwrites your own entries, and you can prune anything it adds below.
+          </small>
+
+          {#if snapshot.offload.command_allowlist.length > 0}
+            <ul class="policy-status">
+              {#each snapshot.offload.command_allowlist as prog (prog)}
+                {@const pol = policyForProgram(prog)}
+                <li>
+                  <code>{prog}</code>
+                  {#if pol}
+                    <span class="hardened">✓ hardened by policy</span>
+                  {:else}
+                    <span class="unguarded">— no extra guards (allowlist + bare-name only)</span>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+
+          <h3>Command security policies</h3>
+          <small class="hint top">
+            Per-program hardening layered on top of the allowlist:
+            <code>run_command</code> refuses the listed flags/subcommands and
+            forces the listed environment variables at spawn. <code>program</code>
+            matches an allowlisted command by name (file-stem, case-insensitive).
+            The default <code>git</code> policy blocks the config-injection and
+            root-escape vectors and neutralizes the pager/ssh hooks. You can edit
+            or remove any policy — weakening one can reopen an
+            arbitrary-code-execution path, so change with care.
+          </small>
+          {#each snapshot.offload.command_policies as policy, i (i)}
+            <fieldset class="policy-card">
+              <div class="policy-head">
+                <label class="policy-program">
+                  <span>Program</span>
+                  <input
+                    type="text"
+                    value={policy.program}
+                    oninput={(e) =>
+                      updatePolicy(i, (p) => (p.program = (e.currentTarget as HTMLInputElement).value.trim()))}
+                    placeholder="git"
+                  />
+                </label>
+                <button type="button" class="secondary danger" onclick={() => removeCommandPolicy(i)}>
+                  Remove
+                </button>
+              </div>
+              <label>
+                <span>Denied flags (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.denied_flags.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.denied_flags = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="-c, --git-dir, --work-tree"
+                />
+              </label>
+              <label>
+                <span>Denied subcommands (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.denied_subcommands.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.denied_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="config"
+                />
+              </label>
+              <label>
+                <span>Allowed subcommands (comma-separated)</span>
+                <input
+                  type="text"
+                  value={policy.allowed_subcommands.join(', ')}
+                  oninput={(e) =>
+                    updatePolicy(i, (p) => (p.allowed_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
+                  placeholder="metadata, tree"
+                />
+                <small class="hint">
+                  When set, ONLY these subcommands may run — every other, and a
+                  bare invocation, is refused. Leave empty to allow all except
+                  the denied ones.
+                </small>
+              </label>
+              <div class="policy-env">
+                <span class="policy-env-label">Spawn environment (forced)</span>
+                {#each policy.env as ev, j (j)}
+                  <div class="env-row">
+                    <input
+                      type="text"
+                      value={ev.key}
+                      oninput={(e) =>
+                        updatePolicy(i, (p) => (p.env[j].key = (e.currentTarget as HTMLInputElement).value))}
+                      placeholder="GIT_PAGER"
+                    />
+                    <input
+                      type="text"
+                      value={ev.value}
+                      oninput={(e) =>
+                        updatePolicy(i, (p) => (p.env[j].value = (e.currentTarget as HTMLInputElement).value))}
+                      placeholder="cat"
+                    />
+                    <!-- `icon` opts out of the TUI themes' `[ … ]` bracket
+                         framing — brackets around a lone × wrap it tall. -->
+                    <button
+                      type="button"
+                      class="secondary icon"
+                      aria-label="Remove environment variable"
+                      onclick={() => updatePolicy(i, (p) => (p.env = p.env.filter((_, idx) => idx !== j)))}
+                    >
+                      ×
+                    </button>
+                  </div>
+                {/each}
+                <div class="button-row">
+                  <button
+                    type="button"
+                    class="secondary"
+                    onclick={() => updatePolicy(i, (p) => (p.env = [...p.env, { key: '', value: '' }]))}
+                  >
+                    Add env var
+                  </button>
+                </div>
+              </div>
+            </fieldset>
+          {/each}
+          <div class="button-row">
+            <button type="button" onclick={addCommandPolicy}>Add command policy</button>
+          </div>
+          {/if}
+
+          <hr class="card-divider lg" />
+          <label>
+            <span>Test offload</span>
+            <input
+              type="text"
+              bind:value={offloadTestInput}
+              placeholder="Leave empty for a canned reachability check, or type a task…"
+            />
+            <div class="button-row">
+              <button type="button" disabled={offloadBusy} onclick={runOffloadTest}>
+                Run test
+              </button>
+            </div>
+            {#if offloadTestResult}
+              <pre class="offload-test-result">{offloadTestResult}</pre>
+            {/if}
+          </label>
+          <small class="hint">
+            Watch the local model load + server logs live in the
+            <strong>Tools</strong> tab's <strong>Offload server</strong>
+            section.
+          </small>
+        </section>
+      {:else if activeSection === 'injection'}
+        <section>
+          <!--
             V32 Phase G (locked decision 16): the three-level enable hierarchy.
             Placed AHEAD of the individual V32 blocks below (budgets, native
             web, detection) because it governs all of them: a user who has come
             here to turn something off should meet the master switch before the
             tuning knobs.
+
+            F-18: this whole group used to be three headings at the BOTTOM of
+            "Offload task tools" → Pool, below the backend list and the limits,
+            while every pointer to it in the app and in the docs sent the user to
+            a Settings "Tools" section that has never existed. It governs every
+            AI tab and the MCP surface as much as the offload worker, so it is
+            its own top-level category now; the group heading became the
+            section heading, and nothing else about these controls moved.
+            `settingsPointers.test.ts` is the tripwire that keeps the pointers
+            and this sidebar's labels from drifting apart again.
           -->
-          <h3>Injection protection</h3>
+          <h2>Injection protection</h2>
           <small class="hint top">
             Every V32 containment control has three levels of switch: this master,
             a per-feature switch app-wide, and a per-scope override. A control is
@@ -4503,7 +4858,15 @@
                     patch((s) => ((s.offload.injection[field] as boolean) = on));
                   }}
                 />
-                <span>{f.label}{f.spawnBaked ? ' (needs a tab restart)' : ''}</span>
+                <!-- The mode word is rendered for the ONE feature whose L2 is a
+                     tri-mode rather than a boolean, because its checkbox cannot
+                     say which of the two live modes is in force and "on" was
+                     read as "denying" (F-18's companion defect). -->
+                <span
+                  >{f.label}{f.spawnBaked ? ' (needs a tab restart)' : ''}{#if f.key === 'native_web'}
+                    — <strong>{nativeWebModeWord}</strong>
+                  {/if}</span
+                >
               </label>
               {#if f.hint}<small class="hint">{f.hint}</small>{/if}
               {#if injectionScopeRows(f).length > 0}
@@ -4617,6 +4980,16 @@
               <strong>Off</strong> is the escape hatch if a hook misbehaves.
               In every mode, shell-level access (<code>curl</code> in Bash) stays
               invisible.
+            </small>
+            <!-- F-18's companion defect, at the source of it: a `<select>` whose
+                 stored value matches none of its options renders BLANK, which
+                 reads as "not set" while the backend is enforcing `sensor`
+                 regardless. The mode in force is stated rather than left to the
+                 widget — and it is the same string the matrix row above shows,
+                 so the two cannot disagree. -->
+            <small class="hint">
+              In force now: <strong>{nativeWebModeWord}</strong>. Only
+              <strong>deny</strong> refuses a call.
             </small>
           </label>
 
@@ -4985,277 +5358,6 @@
               a host of its choosing. Mainly for testing a staged bundle.
             </small>
           </label>
-
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.escalate_partial}
-              onchange={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.escalate_partial = (e.currentTarget as HTMLInputElement).checked),
-                )}
-            />
-            <span>Escalate partial fast-tier answers to the quality backend</span>
-          </label>
-          <small class="hint">
-            When a fast-tier offload comes back only partially verified, re-run it
-            once on a distinct, ready quality backend and keep the better answer.
-            Inert unless a second, quality-tier backend is configured.
-          </small>
-          {:else}
-          <h3>Native tools</h3>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.read_file}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.read_file = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>read_file — bounded file reads</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.list_dir}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.list_dir = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>list_dir — enumerate a directory (what files exist / how many)</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.code_search}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.code_search = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>code_search — literal search across the roots</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.run_command}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.run_command = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>run_command — allowlisted, read-only commands</span>
-          </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.offload.tools.run_check}
-              onchange={(e) =>
-                patch((s) => (s.offload.tools.run_check = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span
-              >run_check — run a configured project check (build/typecheck/lint/test).
-              Inert until the project's <code>checks</code> are configured.</span
-            >
-          </label>
-
-          <label>
-            <span>Allowed roots (one per line)</span>
-            <textarea
-              rows="3"
-              value={snapshot.offload.allowed_roots.join('\n')}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.allowed_roots = (e.currentTarget as HTMLTextAreaElement).value
-                      .split('\n')
-                      .map((r) => r.trim())
-                      .filter((r) => r.length > 0)),
-                )}
-              placeholder="Leave empty to confine to the launch project root"
-            ></textarea>
-            <small class="hint">
-              <code>code_search</code>/<code>read_file</code>/<code>run_command</code>
-              are confined to these. Empty = the launch project root.
-            </small>
-          </label>
-          <label>
-            <span>Command allowlist (comma-separated)</span>
-            <input
-              type="text"
-              value={snapshot.offload.command_allowlist.join(', ')}
-              oninput={(e) =>
-                patch(
-                  (s) =>
-                    (s.offload.command_allowlist = (e.currentTarget as HTMLInputElement).value
-                      .split(',')
-                      .map((c) => c.trim())
-                      .filter((c) => c.length > 0)),
-                )}
-              placeholder="git, cargo"
-            />
-            <small class="hint">
-              <code>run_command</code> runs nothing unless its program is
-              listed here (deny by default).
-            </small>
-          </label>
-
-          <div class="button-row">
-            <button type="button" class="secondary" onclick={enableReadonlyCommands}>
-              Enable safe read-only commands
-            </button>
-          </div>
-          <small class="hint">
-            Adds <code>git</code> and <code>cargo</code> to the allowlist and
-            installs a <code>cargo</code> policy that permits only
-            <code>metadata</code> / <code>tree</code> (never
-            <code>run</code>/<code>build</code>). A one-time merge — it never
-            overwrites your own entries, and you can prune anything it adds below.
-          </small>
-
-          {#if snapshot.offload.command_allowlist.length > 0}
-            <ul class="policy-status">
-              {#each snapshot.offload.command_allowlist as prog (prog)}
-                {@const pol = policyForProgram(prog)}
-                <li>
-                  <code>{prog}</code>
-                  {#if pol}
-                    <span class="hardened">✓ hardened by policy</span>
-                  {:else}
-                    <span class="unguarded">— no extra guards (allowlist + bare-name only)</span>
-                  {/if}
-                </li>
-              {/each}
-            </ul>
-          {/if}
-
-          <h3>Command security policies</h3>
-          <small class="hint top">
-            Per-program hardening layered on top of the allowlist:
-            <code>run_command</code> refuses the listed flags/subcommands and
-            forces the listed environment variables at spawn. <code>program</code>
-            matches an allowlisted command by name (file-stem, case-insensitive).
-            The default <code>git</code> policy blocks the config-injection and
-            root-escape vectors and neutralizes the pager/ssh hooks. You can edit
-            or remove any policy — weakening one can reopen an
-            arbitrary-code-execution path, so change with care.
-          </small>
-          {#each snapshot.offload.command_policies as policy, i (i)}
-            <fieldset class="policy-card">
-              <div class="policy-head">
-                <label class="policy-program">
-                  <span>Program</span>
-                  <input
-                    type="text"
-                    value={policy.program}
-                    oninput={(e) =>
-                      updatePolicy(i, (p) => (p.program = (e.currentTarget as HTMLInputElement).value.trim()))}
-                    placeholder="git"
-                  />
-                </label>
-                <button type="button" class="secondary danger" onclick={() => removeCommandPolicy(i)}>
-                  Remove
-                </button>
-              </div>
-              <label>
-                <span>Denied flags (comma-separated)</span>
-                <input
-                  type="text"
-                  value={policy.denied_flags.join(', ')}
-                  oninput={(e) =>
-                    updatePolicy(i, (p) => (p.denied_flags = csvToList((e.currentTarget as HTMLInputElement).value)))}
-                  placeholder="-c, --git-dir, --work-tree"
-                />
-              </label>
-              <label>
-                <span>Denied subcommands (comma-separated)</span>
-                <input
-                  type="text"
-                  value={policy.denied_subcommands.join(', ')}
-                  oninput={(e) =>
-                    updatePolicy(i, (p) => (p.denied_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
-                  placeholder="config"
-                />
-              </label>
-              <label>
-                <span>Allowed subcommands (comma-separated)</span>
-                <input
-                  type="text"
-                  value={policy.allowed_subcommands.join(', ')}
-                  oninput={(e) =>
-                    updatePolicy(i, (p) => (p.allowed_subcommands = csvToList((e.currentTarget as HTMLInputElement).value)))}
-                  placeholder="metadata, tree"
-                />
-                <small class="hint">
-                  When set, ONLY these subcommands may run — every other, and a
-                  bare invocation, is refused. Leave empty to allow all except
-                  the denied ones.
-                </small>
-              </label>
-              <div class="policy-env">
-                <span class="policy-env-label">Spawn environment (forced)</span>
-                {#each policy.env as ev, j (j)}
-                  <div class="env-row">
-                    <input
-                      type="text"
-                      value={ev.key}
-                      oninput={(e) =>
-                        updatePolicy(i, (p) => (p.env[j].key = (e.currentTarget as HTMLInputElement).value))}
-                      placeholder="GIT_PAGER"
-                    />
-                    <input
-                      type="text"
-                      value={ev.value}
-                      oninput={(e) =>
-                        updatePolicy(i, (p) => (p.env[j].value = (e.currentTarget as HTMLInputElement).value))}
-                      placeholder="cat"
-                    />
-                    <!-- `icon` opts out of the TUI themes' `[ … ]` bracket
-                         framing — brackets around a lone × wrap it tall. -->
-                    <button
-                      type="button"
-                      class="secondary icon"
-                      aria-label="Remove environment variable"
-                      onclick={() => updatePolicy(i, (p) => (p.env = p.env.filter((_, idx) => idx !== j)))}
-                    >
-                      ×
-                    </button>
-                  </div>
-                {/each}
-                <div class="button-row">
-                  <button
-                    type="button"
-                    class="secondary"
-                    onclick={() => updatePolicy(i, (p) => (p.env = [...p.env, { key: '', value: '' }]))}
-                  >
-                    Add env var
-                  </button>
-                </div>
-              </div>
-            </fieldset>
-          {/each}
-          <div class="button-row">
-            <button type="button" onclick={addCommandPolicy}>Add command policy</button>
-          </div>
-          {/if}
-
-          <hr class="card-divider lg" />
-          <label>
-            <span>Test offload</span>
-            <input
-              type="text"
-              bind:value={offloadTestInput}
-              placeholder="Leave empty for a canned reachability check, or type a task…"
-            />
-            <div class="button-row">
-              <button type="button" disabled={offloadBusy} onclick={runOffloadTest}>
-                Run test
-              </button>
-            </div>
-            {#if offloadTestResult}
-              <pre class="offload-test-result">{offloadTestResult}</pre>
-            {/if}
-          </label>
-          <small class="hint">
-            Watch the local model load + server logs live in the
-            <strong>Tools</strong> tab's <strong>Offload server</strong>
-            section.
-          </small>
         </section>
       {:else if activeSection === 'mcp'}
         <section>
@@ -6072,7 +6174,7 @@
               backend; never leaves this machine.
               {#if !localOffloadReady}
                 <strong>No local offload backend is ready</strong> — start one in
-                Settings → Offload to enable this.
+                Settings → Offload task tools to enable this.
               {/if}
             </small>
 
@@ -6198,12 +6300,14 @@
                existed only in Rust and was reachable only by hand-editing
                `.cimp/config.json`.
 
-               NOTE for whoever fixes F-18: the Rust refusal message
-               (`offload/backend_gate.rs`) points at "Settings → Code Intelligence
-               → Checks", which does not exist — Checks is a top-level section,
-               a SIBLING of Code Intelligence. The real path is
-               "Settings → Checks → Offload worker access". Not corrected here:
-               the string is Rust-side and F-18 is pending a user decision. -->
+               OWED TO THE RUST LANE (F-18's fifth site, second half): the
+               `run_check` refusal in `offload/backend_gate.rs` sends the user to
+               a Code-Intelligence sub-tab named Checks, which has never existed
+               — Checks is a top-level section, a SIBLING of Code Intelligence.
+               The real path is "Settings → Checks → Offload worker access", i.e.
+               this heading. Unaffected by F-18's restructure and still wrong;
+               not corrected here because the string is Rust-side and this pass
+               may not edit `src-tauri/`. -->
           <h3>Offload worker access</h3>
           <label class="checkbox">
             <input

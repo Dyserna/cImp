@@ -50,7 +50,8 @@
   let waveLineWidth = 2;
   let waveGlow = 0.6;
   let waveOpacity = 0.85;
-  // Independent show/hide for the waveform (Settings → Waveform → Visible).
+  // Independent show/hide for the waveform
+  // (Settings → Avatar → Waveform → Show waveform).
   // Reactive so the container's `hidden` class updates live on toggle.
   let waveVisible = $state(true);
   const unsubWave = waveformSettings.subscribe((w) => {

@@ -73,7 +73,7 @@
   // Reference list of the tools the offload feature provides. `offload_task`
   // is the MCP tool Claude calls to delegate; read_file / code_search /
   // run_command are the native tools the local worker uses to complete the
-  // task (toggle them in Settings → Offload → Tools). Static docs (moved from
+  // task (toggle them in Settings → Offload task tools → Tools). Static docs (moved from
   // OffloadServerView).
   const OFFLOAD_TOOLS = [
     { name: 'offload_task', desc: 'Delegate a token-heavy subtask to the local model and get back only the synthesized result — conserving the main session’s context.', example: 'Offload: summarize every TODO/FIXME across the repo and group them by theme.' },

@@ -313,7 +313,7 @@ hand-authoring the obvious safe set.
   `cargo` policy allowing only the `metadata` and `tree` subcommands (both
   resolve/read; neither runs build scripts) and denying everything else, so
   an allowlisted `cargo` can never reach `cargo run`/`build`.
-- **UI:** Settings → Tools → Offload native tools gains an "Enable safe
+- **UI:** Settings → Offload task tools → Tools → Native tools gains an "Enable safe
   read-only commands" button — merges the preset into `command_allowlist`
   (no duplicates) and installs the `cargo` policy if absent. It's a
   merge-into-settings action, not a mode: users see exactly what got added

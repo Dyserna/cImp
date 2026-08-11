@@ -24,12 +24,18 @@
   //     Distinct from "reduced" on purpose: nothing was switched off, and
   //     saying so would send the user hunting Settings for a switch that is
   //     already on.
-  // Clicking opens Settings, where the matrix says exactly which and why.
+  // Clicking opens Settings AT the matrix, which says exactly which and why.
+  //
+  // F-18: it used to call `openSettingsWindow()` with no argument, landing on
+  // Appearance — so the one surface whose whole job is "protection is reduced,
+  // go look" made the user hunt for controls that were then three headings deep
+  // inside "Offload task tools". They are a top-level section now and this chip
+  // deep-links straight to it.
   //
   // The whole decision — visible, which word, which tooltip — is `latch.ts`'s
   // `injectionChipState`, because a chip that must not lie needs tests and
   // `.svelte` files have no harness in this repo.
-  import { openSettingsWindow } from '../settings/ipc';
+  import { openSettingsWindowToSection } from '../settings/ipc';
   import { injectionStatus, injectionStatusUnknown, injectionChipState } from '../latch';
 
   const chip = $derived(injectionChipState($injectionStatus, $injectionStatusUnknown));
@@ -41,7 +47,7 @@
     class="status-button injection"
     class:master-off={chip.label === 'off'}
     class:unknown={chip.degraded}
-    onclick={() => void openSettingsWindow()}
+    onclick={() => void openSettingsWindowToSection('injection')}
     title={chip.title}
     aria-label={chip.title}
   >

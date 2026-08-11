@@ -18,7 +18,8 @@ export const TUI_THEME_ID = 'tui';
 export const DEFAULT_TUI_ACCENT = '#7aa2f7';
 
 /// The four accents the legacy tui-* theme variants shipped with, offered
-/// as one-click presets next to the free color picker in Settings → Theme.
+/// as one-click presets next to the free color picker in
+/// Settings → Appearance → Theme.
 export const TUI_ACCENT_PRESETS: readonly { name: string; color: string }[] = [
   { name: 'Orange', color: '#d77757' },
   { name: 'Blue', color: '#7aa2f7' },

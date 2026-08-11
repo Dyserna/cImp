@@ -39,7 +39,7 @@
       case 'unreachable':
         return 'Unreachable — the endpoint did not answer /health.';
       case 'blocked':
-        return 'Needs cloud consent — enable it in Settings → Offload.';
+        return 'Needs cloud consent — enable it in Settings → Offload task tools.';
       case 'disabled':
         return 'Disabled.';
       default:

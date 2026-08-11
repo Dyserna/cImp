@@ -1853,7 +1853,8 @@ declares its class AND its mutation capability in one reviewed place.
     while `signature_down` is already up). The last two are **not** fed by
     `updater::advisor_signals`' per-component loop; they are facts about data on
     disk, fed by `signature::advisor_signal` and `updater::broken_local_rules`.
-    Settings → Tools → Detection grew a *Detection updates* block:
+    Settings → Injection protection → Injection detection grew a *Detection
+    updates* block:
     per-component mode select, installed/available versions, last check +
     verbatim outcome, Check now / Apply / Revert, plus Open rules folder and the
     manifest URL in force.
@@ -2309,7 +2310,8 @@ declares its class AND its mutation capability in one reviewed place.
       cards. **The Settings line landed 2026-08-08**: `DetectionStatus` now
       publishes `local_rules_broken` — the very same
       `updater::broken_local_rules` value, not a re-derivation from the `local/`
-      prefix in TypeScript — and Settings → Tools → Detection renders it as a
+      prefix in TypeScript — and Settings → Injection protection → Injection
+      detection renders it as a
       "Your rule files" health row beside the signature/classifier dots. One
       predicate, so the card and the row cannot disagree about whether the user's
       rules are live (the N-3 lesson: a dot that computes its own health
@@ -3648,7 +3650,7 @@ declares its class AND its mutation capability in one reviewed place.
     deliberately no `set_injection_override` command — the switches are ordinary
     settings and go through the one `apply_settings` write path, so the Settings
     window cannot race its own full-object save.
-  - **Surfaces.** Settings → Tools grew an *Injection protection* block ahead of
+  - **Surfaces.** Settings grew an *Injection protection* block ahead of
     the other V32 blocks (master switch with an explicit off-state warning,
     **eleven** per-feature rows — this read "ten" until 2026-08-08 (#48, review
     Part 7 item 14); Phase H's `opencode_native_gate` was the eleventh
@@ -3661,6 +3663,19 @@ declares its class AND its mutation capability in one reviewed place.
     silent while everything is on. The frontend re-uses the backend's resolution
     (one extra IPC per 4 s poll) rather than reimplementing the rule in
     TypeScript.
+    **F-18 amendment 2026-08-11.** Those blocks shipped at the bottom of the
+    *Offload task tools* sidebar entry, under its Pool sub-tab, while this spec
+    and every string in the app named a *Settings → Tools* section that has
+    never existed — so the documented path led nowhere. **Injection protection**
+    is now a top-level Settings category of its own (the label the ⛨ chip and
+    the popover already used, so the pointers were only wrong about the path),
+    holding the master switch + matrix + fetch budgets, *Native web tools* and
+    *Injection detection* with its *Detection updates* block. The ⛨ chip
+    deep-links to it; *Offload task tools* keeps a breadcrumb where the controls
+    used to be. `src/lib/settingsPointers.test.ts` now fails the build if any
+    `Settings → X` literal in `src/` names a section the sidebar does not have;
+    the Rust half of that scan (`src-tauri/src/**`, where `updates_allowed`'s
+    refusal carries the same dead path) is owed.
   **Phase G/H amendment 2026-08-08 (#48 review — G-1, G-2, G-3, N-1, F-y).**
     - **A typed override typo no longer resets the settings file (G-1).**
       `Override` carried `#[serde(from = "String")]`, so the post-hoc parse only
@@ -4114,7 +4129,8 @@ than fixed because this pass is documentation; each is small.
       someone has actually seen rather than one described in a doc.
     - Do both **before** the first real publish (decision 24 / deploy step 3).
 
-11b. #48's four checks, all in Settings → Tools → Detection:
+11b. #48's four checks, all in Settings → Injection protection → *Detection
+     updates*:
     - With the manifest URL pointing nowhere (today's shipped state), the
       component line reads *"Could not reach the update channel: GET …:
       HTTP 404. Nothing was checked…"* — the clause exactly **once**, in the

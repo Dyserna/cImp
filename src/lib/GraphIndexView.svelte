@@ -231,7 +231,7 @@
 
   {#if roots.length === 0}
     <p class="empty">
-      No project indexed yet. Enable the graph in Settings → Code graph and click
+      No project indexed yet. Enable the graph in Settings → Code Intelligence and click
       <strong>Rebuild index</strong>.
     </p>
   {:else}

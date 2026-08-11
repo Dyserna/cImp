@@ -447,7 +447,7 @@ raises the hint.
 2. `ddg` and `context7` are present in the `offload.mcp_servers` overlay
    **actually in force** for this project, and each has `claude_access` /
    `opencode_access` true for the consumer being denied. Confirm in
-   *Settings → Tools → MCP tool servers*, not from a stale settings file.
+   *Settings → MCP servers*, not from a stale settings file.
 3. Both endpoints answer: `initialize` + `tools/list` against
    `172.21.1.11:17201/mcp` and `:17202/mcp`. A crashed server drops its tools
    from the capability set silently.

@@ -354,6 +354,11 @@ export interface InjectionChipState {
 /// Lives here rather than in `InjectionBadge.svelte` for the reason given on
 /// [`reducedSummary`]: `.svelte` files have no test harness in this repo, and
 /// the chip's job is to not lie.
+///
+/// F-18: every tooltip below names its destination, because the badge now
+/// deep-links to the "Injection protection" section rather than opening Settings
+/// on whatever section it happens to land on. The path in the words and the
+/// target of the click have to agree, so changing one means changing the other.
 export function injectionChipState(
   status: InjectionStatus | null,
   pollUnknown: boolean,
@@ -366,7 +371,7 @@ export function injectionChipState(
       label: 'unknown',
       degraded: true,
       title:
-        'Injection protection state is UNKNOWN — cImp has not been able to read it for several polls, so this app cannot tell you what is switched on. Check the console. Click to open Settings.',
+        'Injection protection state is UNKNOWN — cImp has not been able to read it for several polls, so this app cannot tell you what is switched on. Check the console. Click to open Settings → Injection protection.',
     };
   }
   const visible = !!status?.reduced;
@@ -376,7 +381,7 @@ export function injectionChipState(
       label: 'off',
       degraded: false,
       title:
-        'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings.',
+        'Injection protection is OFF — every V32 control is disabled, for every tab and the offload worker. Click to open Settings → Injection protection.',
     };
   }
   const unreadable = counts.unreadable > 0;
@@ -391,10 +396,10 @@ export function injectionChipState(
     label: onlyUnreadable ? 'unverified' : 'reduced',
     degraded: unreadable,
     title: onlyUnreadable
-      ? `Injection protection cannot be verified — ${summary}. It is not switched off; cImp cannot currently tell whether it is working. Click to open Settings.`
+      ? `Injection protection cannot be verified — ${summary}. It is not switched off; cImp cannot currently tell whether it is working. Click to open Settings → Injection protection.`
       : unreadable
-        ? `Injection protection is reduced, and part of it cannot be verified — ${summary}. Click to open Settings.`
-        : `Injection protection is reduced — ${summary}. Click to open Settings.`,
+        ? `Injection protection is reduced, and part of it cannot be verified — ${summary}. Click to open Settings → Injection protection.`
+        : `Injection protection is reduced — ${summary}. Click to open Settings → Injection protection.`,
   };
 }
 

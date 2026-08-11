@@ -61,8 +61,8 @@
     return MAX_DIST_3D * Math.max(1, tune.clusterSpacing);
   }
 
-  // ── Settings-driven tuning (Settings → Code Intelligence → Graph View
-  // tuning). Multipliers on the base constants below — one size doesn't fit
+  // ── Settings-driven tuning (Settings → Code Intelligence → Graph view →
+  // Graph view tuning). Multipliers on the base constants below — one size doesn't fit
   // every repo. The numeric knobs are read at frame rate by the physics/
   // render loop, so they live in a plain object updated by the settings
   // subscription (applyTuning), NOT in $state; the two edge colors ARE

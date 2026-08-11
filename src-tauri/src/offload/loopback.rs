@@ -61,6 +61,34 @@ const DISCOVERY_FILE: &str = ".cimp-offload.json";
 /// project. Readers resolve root-aware via [`read_discovery_for`].
 const DISCOVERY_DIR: &str = ".cimp-discovery";
 
+/// Total wall-clock budget for ONE candidate's liveness probe ([`responds`]) —
+/// connect, write and read together, not per syscall.
+///
+/// Locked decision 30 (#48 F-11) put a network round trip on the resolution path
+/// every stdio child and every hook shim takes, so the bound is part of the
+/// decision rather than a tuning knob: **a probe with no timeout would turn a
+/// dead port into a hang, which is worse than the finding.** A refused loopback
+/// connect returns in microseconds, so this budget is only ever spent against
+/// something that is listening and not answering — which, per the accepted case
+/// against decision 30, means an attacker who has already paid for a listener.
+const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How many candidates one resolution will probe, across all three preference
+/// steps ([`select_verified`]).
+///
+/// The other half of the bound: without it, N planted entries cost N probes and
+/// the attacker sets N. Worst case per COLD resolution is therefore
+/// `MAX_DISCOVERY_PROBES * DISCOVERY_PROBE_TIMEOUT` = **1.2 s**, once per process
+/// per hint (the winner is memoized — see [`read_discovery_for`]).
+///
+/// Consequence, stated rather than hidden: flooding `.cimp-discovery/` with more
+/// than this many *deeper* well-formed entries pushes the real instance past the
+/// budget and the child goes headless. That is not a regression — today ONE such
+/// entry already wins and the child goes headless — and headless is governed by
+/// M-8's `--tab` rule, which does not consult the reason. Enforced by
+/// `tests::a_resolution_never_probes_more_than_its_budget`.
+const MAX_DISCOVERY_PROBES: usize = 6;
+
 /// The discovery file the child reads to find + authenticate to the app.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Discovery {
@@ -160,78 +188,326 @@ fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
     })
 }
 
-/// Pick the instance serving `hint` from the per-instance entries: the
-/// DEEPEST root that is an ancestor of the hint wins (nested checkouts
-/// resolve to the closest instance; same-root duplicates tie-break on pid —
-/// arbitrary but deterministic). With no hint or no match: a sole surviving
-/// entry is unambiguous, else fall back to the legacy last-writer-wins file.
-/// Pure — unit-tested directly.
-fn select_discovery(entries: Vec<Discovery>, hint: Option<&Path>) -> Option<Discovery> {
-    select_with_legacy(entries, hint, read_discovery)
+/// Whether the endpoint an entry names is **answering as the instance that
+/// entry claims**: a blocking `GET /health` presenting that entry's own token,
+/// 2xx only, inside [`DISCOVERY_PROBE_TIMEOUT`].
+///
+/// Locked decision 30 (#48 F-11 / F-28). Selection used to accept a candidate on
+/// the strength of the file alone, so ONE `Write` of a well-formed
+/// `.cimp-discovery/<n>.json` naming a deeper root and a dead port steered every
+/// child and every hook shim onto an endpoint that could not answer — including
+/// the native-web taint beacon, which is fail-open by design and therefore went
+/// silent (F-28, decision 14's `sensor` signal).
+///
+/// **What this does not prove, stated because the decision accepted it.**
+/// Liveness proves something is *listening*, not that it is cImp. Whoever can
+/// write the discovery file can also bind a loopback port and answer this probe
+/// with the token it just wrote. The token check raises that bar a little — the
+/// planted entry must name a port the attacker controls, so it cannot borrow the
+/// real instance's port and inherit its answer — but the honest bound is: this
+/// raises the cost from *one write* to *one write plus a listener*. It does not
+/// remove the primitive.
+///
+/// Blocking on purpose: two of the four consumers (`context_hook`,
+/// `taint_beacon`) are synchronous shims with no async runtime, and a second
+/// async copy of this for the two MCP children is a second thing to get wrong.
+/// The callers are all short-lived child processes — no in-app path reaches it
+/// (the app's own entry is read pid-keyed by [`read_own_discovery`], which is
+/// immune to this primitive and deliberately unprobed).
+///
+/// **The two MCP children run a `new_current_thread` runtime**, so a probe parks
+/// that child's whole runtime — including its `/events` relay task — for as long
+/// as it lasts. That is why the budget above is small, why the winner is
+/// memoized, and why the worst case is stated in numbers: 1.2 s once per process
+/// per hint, against a 10 s heartbeat interval. A refused loopback connect (the
+/// ordinary shape of a dead entry) costs microseconds.
+fn responds(d: &Discovery) -> bool {
+    use std::io::{Read, Write};
+
+    let deadline = std::time::Instant::now() + DISCOVERY_PROBE_TIMEOUT;
+    // Whatever is left of this candidate's budget. `None` once spent — a zero
+    // duration is an error to both `connect_timeout` and `set_*_timeout`, and
+    // "no time left" is a non-answer anyway.
+    let left = || -> Option<Duration> {
+        let now = std::time::Instant::now();
+        (deadline > now).then(|| deadline - now)
+    };
+
+    let addr = std::net::SocketAddr::from(([127u8, 0, 0, 1], d.port));
+    let Some(budget) = left() else { return false };
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, budget) else {
+        return false;
+    };
+    let req = format!(
+        "GET /health HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Authorization: Bearer {}\r\n\
+         Connection: close\r\n\r\n",
+        d.token
+    );
+    let Some(budget) = left() else { return false };
+    if stream.set_write_timeout(Some(budget)).is_err() || stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let Some(budget) = left() else { return false };
+    if stream.set_read_timeout(Some(budget)).is_err() {
+        return false;
+    }
+    // The status line is the whole answer: `HTTP/1.1 200 OK` from `write_simple`
+    // means this instance recognized this entry's token. A 401 (someone else's
+    // instance on that port, or a token this instance never issued) and a
+    // truncated read are both non-answers.
+    let mut head = [0u8; 15];
+    let mut filled = 0usize;
+    while filled < head.len() {
+        match stream.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return false,
+        }
+    }
+    let line = String::from_utf8_lossy(&head[..filled]);
+    line.strip_prefix("HTTP/1.1 ")
+        .or_else(|| line.strip_prefix("HTTP/1.0 "))
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code))
 }
 
-/// [`select_discovery`] with its **third** preference injected, so the whole
-/// three-step order is unit-testable and not just the first two.
+/// How many candidates a resolution skipped for not answering — process-local,
+/// monotonic, and **surfaced** (not merely counted) by [`proxy_base_for`].
 ///
-/// #48 F-26 is why this split exists. Two `graph/mcp.rs` comments documented a
-/// repro — "truncate `.cimp-discovery/<pid>.json` and the child goes headless" —
-/// that does not reproduce, because the entry `read_all_discoveries` silently
+/// A skipped candidate is a quality signal and needs a consumer: silently
+/// preferring the next entry is right, but a discovery directory that contains a
+/// well-formed entry for a port nothing serves is either an unclean shutdown or
+/// the F-11 primitive being exercised, and neither should be invisible.
+static SKIPPED_CANDIDATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One-shot budgeted liveness oracle, shared by all three preference steps so
+/// the probe ceiling is per RESOLUTION and not per step.
+struct Probe<F> {
+    alive: F,
+    spent: usize,
+    skipped: usize,
+}
+
+impl<F: FnMut(&Discovery) -> bool> Probe<F> {
+    /// Whether this candidate answers. Beyond [`MAX_DISCOVERY_PROBES`] every
+    /// candidate reads as a non-answer — the budget is a ceiling on latency, so
+    /// exhausting it must not be a way to get an *unverified* entry accepted.
+    fn answers(&mut self, d: &Discovery) -> bool {
+        if self.spent >= MAX_DISCOVERY_PROBES {
+            return false;
+        }
+        self.spent += 1;
+        if (self.alive)(d) {
+            true
+        } else {
+            self.skipped += 1;
+            false
+        }
+    }
+}
+
+/// Pick the instance serving `hint` from the per-instance entries: the DEEPEST
+/// root that is an ancestor of the hint **and answering** wins (nested checkouts
+/// resolve to the closest live instance; same-root duplicates tie-break on pid —
+/// arbitrary but deterministic). With no hint or no live match: a sole surviving
+/// entry is unambiguous, else fall back to the legacy last-writer-wins file —
+/// each of those, too, only if it answers.
+fn select_discovery(entries: Vec<Discovery>, hint: Option<&Path>) -> Option<Discovery> {
+    select_verified(entries, hint, responds, read_discovery)
+}
+
+/// [`select_discovery`] with its **liveness oracle** and its **third**
+/// preference injected, so the whole three-step order is unit-testable and not
+/// just the first two.
+///
+/// #48 F-26 is why `legacy` is injected. Two `graph/mcp.rs` comments documented
+/// a repro — "truncate `.cimp-discovery/<pid>.json` and the child goes headless"
+/// — that does not reproduce, because the entry `read_all_discoveries` silently
 /// drops merely takes the caller to step 3, where `.cimp-offload.json` still
 /// resolves. That step used to be an inline `read_discovery()` call reading a
 /// real file next to the executable, so the one property the wrong comment got
 /// wrong was the one property no test could state. `legacy` makes it statable.
 ///
-/// The order, in one place:
+/// #48 F-11 / F-28 is why `alive` is injected: the ordering and the liveness test
+/// are separately assertable, and a test can count probes to pin the budget.
+///
+/// The order, in one place — every step now **verified** ([`responds`]):
 /// 1. among per-instance entries with a non-empty `root` that is an ancestor of
-///    (or equal to) the hint, the DEEPEST root, higher pid breaking a tie;
-/// 2. the sole per-instance entry, when exactly one survives;
-/// 3. `legacy` — in production `.cimp-offload.json`.
-fn select_with_legacy(
-    mut entries: Vec<Discovery>,
+///    (or equal to) the hint, ranked deepest-first with a higher pid breaking a
+///    tie, the first that ANSWERS;
+/// 2. the sole per-instance entry, when exactly one survives and step 1 did not
+///    already rank (and reject) it;
+/// 3. `legacy` — in production `.cimp-offload.json` — if it answers.
+///
+/// Two deliberate non-changes. The deepest-root preference **stays**: dropping it
+/// reintroduces "project A's child talks to project B's app", the defect
+/// [`DISCOVERY_DIR`] was added to fix. And two *live* entries tying at the same
+/// depth still resolve on pid rather than refusing: a live app that legitimately
+/// serves the hint is a correct answer either way, and refusing on ambiguity
+/// breaks nested checkouts — the very case the per-instance directory exists for.
+fn select_verified(
+    entries: Vec<Discovery>,
     hint: Option<&Path>,
+    alive: impl FnMut(&Discovery) -> bool,
     legacy: impl FnOnce() -> Option<Discovery>,
 ) -> Option<Discovery> {
+    let mut probe = Probe {
+        alive,
+        spent: 0,
+        skipped: 0,
+    };
+    let picked = select_answering(entries, hint, &mut probe, legacy);
+    if probe.skipped > 0 {
+        SKIPPED_CANDIDATES.fetch_add(probe.skipped, std::sync::atomic::Ordering::Relaxed);
+    }
+    picked
+}
+
+/// The three-step order itself, with the probe budget threaded through. Split
+/// from [`select_verified`] only so the skip count is accumulated once, on every
+/// exit path, instead of at each `return`.
+fn select_answering<F: FnMut(&Discovery) -> bool>(
+    mut entries: Vec<Discovery>,
+    hint: Option<&Path>,
+    probe: &mut Probe<F>,
+    legacy: impl FnOnce() -> Option<Discovery>,
+) -> Option<Discovery> {
+    // Step 1. Rank every matching candidate rather than keeping only the best,
+    // because "best" is now "best that answers" and the runner-up has to be
+    // reachable. Ranking is unchanged: depth desc, then pid desc.
+    let mut ranked: Vec<(usize, &Discovery)> = Vec::new();
     if let Some(h) = hint {
-        let mut best: Option<(usize, &Discovery)> = None;
         for d in &entries {
             if d.root.is_empty() {
                 continue;
             }
             let root = PathBuf::from(&d.root);
             if is_ancestor_or_equal(&root, h) {
-                let depth = root.components().count();
-                let better = match &best {
-                    None => true,
-                    Some((bd, bde)) => depth > *bd || (depth == *bd && d.pid > bde.pid),
-                };
-                if better {
-                    best = Some((depth, d));
-                }
+                ranked.push((root.components().count(), d));
             }
         }
-        if let Some((_, d)) = best {
-            return Some(d.clone());
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.pid.cmp(&a.1.pid)));
+        for (_, d) in &ranked {
+            if probe.answers(d) {
+                return Some((*d).clone());
+            }
         }
     }
-    if entries.len() == 1 {
-        return entries.pop();
+    let ranked_any = !ranked.is_empty();
+
+    // Step 2. A sole entry is unambiguous — but only if it answers, and only if
+    // step 1 has not already probed it (never probe one candidate twice: the
+    // budget is small and a double charge would hide the runner-up).
+    if !ranked_any && entries.len() == 1 {
+        let sole = entries.pop().expect("len == 1");
+        if probe.answers(&sole) {
+            return Some(sole);
+        }
+        // Falling through to the legacy file is new and deliberate: a hard-killed
+        // instance leaves its `<pid>.json` behind, so the sole SURVIVING entry can
+        // be a dead one while `.cimp-offload.json` names a live instance.
     }
-    legacy()
+
+    // Step 3.
+    legacy().filter(|d| probe.answers(d))
 }
+
+/// Process-local memo of the endpoint each hint resolved to.
+///
+/// Required by locked decision 30, not an optimization: `proxy_base()` resolves
+/// on EVERY tool call, and an unmemoized probe would put a round trip on each
+/// one. It is cleared by [`forget_resolved_discovery`] on any failure of the
+/// memoized endpoint, which is what preserves the self-healing property this
+/// path has today — discovery is re-read per call, so a cImp restart under a live
+/// tab recovers instead of wedging that tab headless for life. (Baking
+/// port+token into children at spawn was rejected for losing exactly that; see
+/// locked decision 30's non-goal.)
+///
+/// Only successes are memoized. A negative memo would defeat self-healing in the
+/// other direction — a child that started before cImp would never find it — and a
+/// miss is cheap: a graceful exit removes both stores, so there is nothing to
+/// probe.
+static RESOLVED: OnceLock<Mutex<HashMap<PathBuf, Discovery>>> = OnceLock::new();
 
 /// Root-aware discovery: resolve the instance serving `hint` (a child's cwd
 /// or a hook payload's cwd). `None` hint degrades to sole-entry / legacy.
+/// Memoized per hint for the life of the process — see [`RESOLVED`].
 pub fn read_discovery_for(hint: Option<&Path>) -> Option<Discovery> {
     let hint = hint.map(canon);
-    select_discovery(read_all_discoveries(), hint.as_deref())
+    // `None` and `""` collapse onto one key, which is what they mean here: no
+    // project in view. (Empty is not absent — but for a *lookup key* the two are
+    // the same lookup, and `select_verified` treats an empty `root` on an ENTRY
+    // as unmatchable regardless.)
+    let key = hint.clone().unwrap_or_default();
+    let memo = RESOLVED.get_or_init(Default::default);
+    if let Some(d) = memo
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(d.clone());
+    }
+    let picked = select_discovery(read_all_discoveries(), hint.as_deref())?;
+    memo.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, picked.clone());
+    Some(picked)
+}
+
+/// Drop the memoized endpoints so the next [`read_discovery_for`] re-resolves.
+///
+/// Every consumer calls this when the endpoint it holds fails, and that is the
+/// whole of decision 30's re-resolution half: `offload::mcp::proxy_graph` on any
+/// [`ProxyMiss`](crate::offload::mcp), `audit::mcp` when `/audit/run` cannot be
+/// reached, `context_hook::post_loopback` on a failed post and
+/// `taint_beacon::dispatch` on a refused connect. Without it the memo could
+/// outlive the instance it names — a cImp restart rotates the token and the port,
+/// so a stale memo means a permanently headless tab, which is the precise cost
+/// that made "bake the endpoint into the child at spawn" a non-goal.
+pub fn forget_resolved_discovery() {
+    if let Some(memo) = RESOLVED.get() {
+        memo.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
 }
 
 /// Base URL + bearer token of the loopback endpoint of the instance serving
 /// `hint` — the one endpoint resolver every stdio MCP child uses
-/// (`offload/mcp.rs`, `audit/mcp.rs`). `None` ⇒ no instance is running.
+/// (`offload/mcp.rs`, `audit/mcp.rs`). `None` ⇒ no instance answered.
 pub fn proxy_base_for(hint: Option<&Path>) -> Option<(String, String)> {
-    let d = read_discovery_for(hint)?;
+    let d = read_discovery_for(hint);
+    // The consumer for [`SKIPPED_CANDIDATES`], placed here rather than in
+    // `read_discovery_for` on purpose: this resolver serves the two stdio MCP
+    // children, which already own a stderr diagnostic channel (the handshake
+    // lines and `ProxyMiss::report`). The hook shims call `read_discovery_for`
+    // directly and must stay on the silent path — `taint_beacon`'s whole safety
+    // argument is that it writes nothing to stdout or stderr and awaits nothing.
+    // Surfacing a planted entry to the USER (an activity row) needs a loopback
+    // route that does not exist yet; that is recorded as follow-up work, not
+    // solved by making a hook noisy.
+    report_skipped_candidates();
+    let d = d?;
     Some((format!("http://127.0.0.1:{}", d.port), d.token))
+}
+
+/// Say once, on this child's stderr, that discovery ignored one or more
+/// candidate endpoints. Silent when nothing was skipped.
+fn report_skipped_candidates() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let n = SKIPPED_CANDIDATES.load(std::sync::atomic::Ordering::Relaxed);
+    if n == 0 || SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "cimp: discovery skipped {n} candidate endpoint(s) that did not answer a \
+         token-authenticated `GET /health` (#48 F-11, locked decision 30). After an unclean cImp \
+         shutdown this is a leftover `.cimp-discovery/<pid>.json` and is harmless. It is ALSO what \
+         a planted entry looks like: a well-formed file naming a deeper project root and a port \
+         nothing serves is how untrusted content steers this child onto a dead endpoint. If you \
+         did not expect it, list `.cimp-discovery/` next to the cImp executable."
+    );
 }
 
 /// Delete per-instance entries whose endpoint no longer answers — hard-killed
@@ -6926,12 +7202,24 @@ mod tests {
         }
     }
 
+    /// The preference ORDER on its own: every candidate answers and there is no
+    /// legacy store.
+    ///
+    /// These four cases predate locked decision 30 and used to call
+    /// `select_discovery`, which now probes real sockets and reads the real
+    /// `.cimp-offload.json` next to the test binary. Stubbing liveness all-live
+    /// is what keeps them a statement about ORDERING — the property they were
+    /// written for — rather than about the machine they run on.
+    fn select_all_live(entries: Vec<Discovery>, hint: Option<&Path>) -> Option<Discovery> {
+        select_verified(entries, hint, |_| true, || None)
+    }
+
     #[test]
     fn select_discovery_routes_by_root() {
         // Two instances off one install: a child whose cwd is inside project
         // B must reach B's instance, never last-writer-wins.
         let entries = vec![disc(1, 1001, "P:\\proj\\a"), disc(2, 1002, "P:\\proj\\b")];
-        let picked = select_discovery(entries, Some(Path::new("P:\\proj\\b\\src"))).expect("match");
+        let picked = select_all_live(entries, Some(Path::new("P:\\proj\\b\\src"))).expect("match");
         assert_eq!(picked.pid, 2);
     }
 
@@ -6940,11 +7228,11 @@ mod tests {
         // Nested checkouts: the closest (deepest) serving instance wins.
         let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
         let picked =
-            select_discovery(entries, Some(Path::new("P:\\proj\\nested\\src"))).expect("match");
+            select_all_live(entries, Some(Path::new("P:\\proj\\nested\\src"))).expect("match");
         assert_eq!(picked.pid, 2);
         // A hint outside the nested root resolves to the outer instance.
         let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
-        let picked = select_discovery(entries, Some(Path::new("P:\\proj\\other"))).expect("match");
+        let picked = select_all_live(entries, Some(Path::new("P:\\proj\\other"))).expect("match");
         assert_eq!(picked.pid, 1);
     }
 
@@ -6953,7 +7241,7 @@ mod tests {
     fn select_discovery_is_case_insensitive_on_windows() {
         let entries = vec![disc(1, 1001, "p:\\PROJ\\A")];
         let picked =
-            select_discovery(entries, Some(Path::new("P:\\proj\\a\\deep"))).expect("match");
+            select_all_live(entries, Some(Path::new("P:\\proj\\a\\deep"))).expect("match");
         assert_eq!(picked.pid, 1);
     }
 
@@ -6962,7 +7250,7 @@ mod tests {
         // One running instance is unambiguous even when the hint doesn't
         // land inside its root (e.g. an agent launched outside any project).
         let entries = vec![disc(7, 1007, "P:\\elsewhere")];
-        let picked = select_discovery(entries, Some(Path::new("Q:\\other"))).expect("sole entry");
+        let picked = select_all_live(entries, Some(Path::new("Q:\\other"))).expect("sole entry");
         assert_eq!(picked.pid, 7);
     }
 
@@ -6981,42 +7269,244 @@ mod tests {
         let hint = PathBuf::from("P:\\proj\\src");
         let legacy = disc(99, 4444, "");
         // The corrupted `<pid>.json` is simply absent from the entry list.
-        let picked = select_with_legacy(vec![], Some(&hint), || Some(legacy.clone()))
+        let picked = select_verified(vec![], Some(&hint), |_| true, || Some(legacy.clone()))
             .expect("the legacy store still resolves");
         assert_eq!(picked.pid, 99, "step 3 was not consulted");
         assert_eq!(picked.port, 4444);
         // And only when the first two preferences produce nothing: a matching
         // per-instance entry must never be overridden by the legacy file.
-        let picked = select_with_legacy(
+        let picked = select_verified(
             vec![disc(1, 1001, "P:\\proj")],
             Some(&hint),
+            |_| true,
             || panic!("the legacy store must not be read when a per-instance entry matches"),
         )
         .expect("match");
         assert_eq!(picked.pid, 1);
+        // Decision 30 added a second condition to step 3 that F-26's original
+        // wording did not have: the legacy entry must ANSWER too. A legacy file
+        // naming a dead endpoint is not a resolution — it is the last candidate,
+        // and `NoInstance` is the honest answer once it fails.
+        assert!(
+            select_verified(vec![], Some(&hint), |_| false, || Some(legacy.clone())).is_none(),
+            "a dead legacy entry must not resolve (#48 F-11)"
+        );
     }
 
-    /// …and the single-write trigger, which is F-26's other half: a well-formed
-    /// DEEPER entry outranks the real instance whatever its port, so ONE `Write`
-    /// steers a child onto a dead endpoint and the reported reason is
-    /// `ProxyMiss::Transport` rather than `NoInstance`.
+    /// The single-write trigger F-26 named, **re-pointed by locked decision 30**.
     ///
-    /// This pins F-11's primitive **on purpose**: F-11 is open, and whichever way
-    /// it is fixed the fix has to edit this test deliberately rather than by
-    /// accident. Do not read a green suite here as F-11 closed.
+    /// **This test changed meaning.** It was written as
+    /// `a_deeper_well_formed_entry_outranks_the_running_instance` and it pinned
+    /// F-11's DEFECT on purpose — a deeper well-formed entry outranked the real
+    /// instance *whatever its port*, so ONE `Write` steered a child onto a dead
+    /// endpoint (and chose `ProxyMiss::Transport` as the reason the system would
+    /// report). Its author left the defect pinned so that a green suite could not
+    /// be mistaken for F-11 being closed. Decision 30 closed it, so the assertion
+    /// is now the post-fix invariant, and the name says which half is which:
+    ///
+    /// * a deeper entry that **answers** legitimately still wins — the
+    ///   deepest-root preference is deliberately kept (dropping it reintroduces
+    ///   "project A's child talks to project B's app");
+    /// * a deeper entry that does **not** answer no longer wins, and the real
+    ///   instance below it does.
+    ///
+    /// What it still does NOT claim: that a planted entry cannot win. An attacker
+    /// who binds the port they wrote answers the probe. Decision 30's accepted
+    /// bound is "one write plus a listener", and this test is the pin on the
+    /// *write-only* half — see [`responds`].
     #[test]
-    fn a_deeper_well_formed_entry_outranks_the_running_instance() {
+    fn a_deeper_entry_outranks_the_running_instance_only_while_it_answers() {
         let real = disc(10, 4000, "P:\\proj");
         let planted = disc(11, 1, "P:\\proj\\sub");
         let hint = PathBuf::from("P:\\proj\\sub\\deeper");
-        let picked = select_with_legacy(vec![real, planted], Some(&hint), || {
-            panic!("a matching per-instance entry exists")
-        })
+        let no_legacy = || panic!("a matching per-instance entry answers");
+
+        // Half 1 — a deeper entry that answers is still preferred. Depth, not
+        // liveness, is what ranks; liveness only filters.
+        let picked = select_verified(
+            vec![real.clone(), planted.clone()],
+            Some(&hint),
+            |_| true,
+            no_legacy,
+        )
         .expect("a matching entry exists");
-        // The planted entry wins on DEPTH alone — selection never probes the
-        // port, so "dead" costs the attacker nothing.
-        assert_eq!(picked.pid, 11);
-        assert_eq!(picked.port, 1);
+        assert_eq!(picked.pid, 11, "the deepest LIVE entry must still win");
+
+        // Half 2 — the finding itself: the deeper entry is dead, so the running
+        // instance underneath it serves the call instead of the child going
+        // headless. `dead` is keyed on the port, which is the one thing the
+        // planted file cannot fake without a listener.
+        let picked = select_verified(
+            vec![real, planted],
+            Some(&hint),
+            |d| d.port != 1,
+            no_legacy,
+        )
+        .expect("the shallower live instance resolves");
+        assert_eq!(picked.pid, 10, "a dead deeper entry must not win (#48 F-11)");
+        assert_eq!(picked.port, 4000);
+    }
+
+    /// #48 F-28 — one `Write` no longer disarms decision 14's native-web sensor.
+    ///
+    /// `taint_beacon::dispatch` resolves its endpoint with `read_discovery_for`
+    /// and is **fail-open by design**: no endpoint means no beacon, silently, so a
+    /// `WebFetch` stops contaminating the tab. That fail-open is correct and is
+    /// deliberately unchanged — the defect was that the resolution it failed open
+    /// *from* was steerable by one file write.
+    ///
+    /// Driven through the beacon's own resolution shape (its cwd is the project
+    /// directory Claude spawned it in) against a REAL socket for the live
+    /// instance, so the probe itself — not a stubbed closure — is what rejects the
+    /// planted entry. F-28 keeps its own live-verification row; this is the unit
+    /// pin, not a substitute for it.
+    #[test]
+    fn a_planted_dead_entry_no_longer_disarms_the_native_web_beacon() {
+        let live = fake_instance("tok-live");
+        // The planted file: well-formed, a DEEPER root than the running
+        // instance's, and a port nothing is listening on.
+        let planted = disc(4242, dead_port(), "P:\\proj\\sub");
+        let real = Discovery {
+            port: live,
+            token: "tok-live".into(),
+            pid: 10,
+            root: "P:\\proj".into(),
+        };
+        let cwd = PathBuf::from("P:\\proj\\sub\\pkg");
+
+        let picked = select_verified(vec![real, planted], Some(&cwd), responds, || None)
+            .expect("the beacon still finds the running instance");
+        assert_eq!(
+            picked.port, live,
+            "the beacon must reach the live instance, not the planted endpoint"
+        );
+        assert_eq!(picked.token, "tok-live");
+    }
+
+    /// The probe is an authentication check as well as a liveness check: a socket
+    /// that answers but does not recognize the entry's token is somebody else's
+    /// process, and accepting it would let a planted file borrow a real port.
+    #[test]
+    fn the_probe_accepts_only_an_endpoint_that_honours_this_entrys_token() {
+        let port = fake_instance("tok-right");
+        let right = Discovery {
+            port,
+            token: "tok-right".into(),
+            pid: 1,
+            root: String::new(),
+        };
+        let wrong = Discovery {
+            token: "tok-wrong".into(),
+            ..right.clone()
+        };
+        assert!(responds(&right), "the real token must answer 200");
+        assert!(!responds(&wrong), "a 401 is not an answer");
+        assert!(
+            !responds(&Discovery {
+                port: dead_port(),
+                ..right
+            }),
+            "a dead port is not an answer"
+        );
+    }
+
+    /// The latency bound is a property, not a comment: a resolution probes at
+    /// most [`MAX_DISCOVERY_PROBES`] candidates however many entries exist, so the
+    /// worst case a hook shim can be made to pay is bounded by the constant and
+    /// not by how many files an attacker wrote.
+    #[test]
+    fn a_resolution_never_probes_more_than_its_budget() {
+        let hint = PathBuf::from("P:\\proj\\a\\b\\c\\d\\e\\f\\g\\h");
+        // Twenty matching entries, each deeper than the last, none answering.
+        let entries: Vec<Discovery> = (0..20)
+            .map(|i| disc(i, 1000 + i as u16, "P:\\proj"))
+            .collect();
+        let probes = std::cell::Cell::new(0usize);
+        let picked = select_verified(
+            entries,
+            Some(&hint),
+            |_| {
+                probes.set(probes.get() + 1);
+                false
+            },
+            || Some(disc(99, 4444, "")),
+        );
+        assert!(picked.is_none(), "nothing answered, so nothing resolves");
+        assert!(
+            probes.get() <= MAX_DISCOVERY_PROBES,
+            "probed {} candidates, budget is {MAX_DISCOVERY_PROBES}",
+            probes.get()
+        );
+        // And the ceiling is a non-answer, never a free pass: exhausting the
+        // budget must not let an UNVERIFIED entry through.
+        assert!(probes.get() > 0, "the budget must actually be spent");
+    }
+
+    /// A sole per-instance entry that is dead now falls through to the legacy
+    /// file. New with decision 30 and deliberate: a hard-killed instance leaves
+    /// its `<pid>.json` behind (removal is graceful-exit only), so "the sole
+    /// surviving entry" can be a corpse while `.cimp-offload.json` names a live
+    /// instance. Previously that child went headless.
+    #[test]
+    fn a_dead_sole_entry_falls_through_to_the_legacy_store() {
+        let hint = PathBuf::from("Q:\\other");
+        let picked = select_verified(
+            vec![disc(7, 1007, "P:\\elsewhere")],
+            Some(&hint),
+            |d| d.pid == 99,
+            || Some(disc(99, 4444, "")),
+        )
+        .expect("the legacy store names a live instance");
+        assert_eq!(picked.pid, 99);
+    }
+
+    /// A port on the loopback interface that nothing is listening on: bound,
+    /// read, and released before the test uses the number. A `connect` to it is
+    /// refused immediately, which is also why a dead planted entry costs the
+    /// probe budget almost nothing in practice.
+    fn dead_port() -> u16 {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        drop(l);
+        port
+    }
+
+    /// A minimal stand-in for a running cImp instance: answers `GET /health`
+    /// with 200 when the bearer token matches and 401 when it does not, exactly
+    /// like `handle_conn` + `write_simple` do. Returns the port it bound.
+    ///
+    /// A real socket rather than a stubbed closure because the property under
+    /// test is what [`responds`] puts on the wire — a stub would pass even if the
+    /// probe sent no `Authorization` header at all.
+    ///
+    /// The accept loop runs on a **detached** thread and lives until the test
+    /// binary exits. Deliberate: a joinable guard would have to interrupt a thread
+    /// parked in `accept`, and a test that can hang waiting on its own diagnostic
+    /// helper is worse than one leaked thread per test.
+    fn fake_instance(token: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 512];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let ok = req.contains(&format!("Authorization: Bearer {token}\r\n"));
+                let body: &[u8] = if ok { b"ok" } else { b"unauthorized" };
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    if ok { 200 } else { 401 },
+                    if ok { "OK" } else { "Unauthorized" },
+                    body.len()
+                );
+                let _ = conn.write_all(head.as_bytes());
+                let _ = conn.write_all(body);
+            }
+        });
+        port
     }
 
     #[test]

@@ -40,7 +40,7 @@ use super::adapters::Category;
 use super::runner::{AuditSnapshot, AuditState, ToolStatus};
 use crate::checks::Severity;
 use crate::mcp_stdio::tool_error;
-use crate::offload::loopback::{parse_result_line, proxy_base_for};
+use crate::offload::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_for};
 use crate::settings::AuditToolId;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -724,7 +724,14 @@ async fn run_via_loopback(category: Category) -> Result<String, String> {
     {
         Ok(r) => r,
         // Could not even reach the app → treat as not running.
-        Err(_) => return Err("cImp is not running — start cImp to run code audits.".into()),
+        Err(_) => {
+            // Locked decision 30 (#48 F-11): the endpoint was memoized after
+            // answering a `GET /health` probe and has now stopped answering, so
+            // drop it — the next audit in this child re-resolves instead of
+            // inheriting a dead endpoint for the rest of the tab's life.
+            forget_resolved_discovery();
+            return Err("cImp is not running — start cImp to run code audits.".into());
+        }
     };
     if !resp.status().is_success() {
         let status = resp.status();

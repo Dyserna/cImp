@@ -637,14 +637,18 @@ pub async fn handle_call(
 /// So corrupting `<pid>.json` with a single byte — which
 /// `read_all_discoveries`'s `filter_map(… .ok())` does drop silently — falls
 /// through to (3) and the app is still reached: `NoInstance` needs BOTH stores
-/// unusable. The single-write trigger is a different one — ADD a well-formed
-/// entry naming a deeper root and a dead port, which yields `Transport`
-/// (`offload::mcp::ProxyMiss::Transport`, and
-/// `loopback::tests::a_deeper_well_formed_entry_outranks_the_running_instance`
-/// pins the preference). Nothing in M-2's argument rests on which reason it is
-/// (see [`headless_refusal`]: the discriminator is `--tab`, never the reason).
-/// The wording is corrected because the wrong repro produces a **false PASS** in
-/// live verification — the tester truncates one file, observes a served call, and
+/// unusable. The single-write trigger used to be a different one — ADD a
+/// well-formed entry naming a deeper root and a dead port, which yielded
+/// `Transport` — and **locked decision 30 (#48 F-11) closed it**: each step above
+/// now requires the candidate to answer a token-authenticated `GET /health`
+/// (`loopback::responds`), so a dead planted entry is skipped and the real
+/// instance serves the call
+/// (`loopback::tests::a_deeper_entry_outranks_the_running_instance_only_while_it_answers`).
+/// The remaining cost is one write **plus a listener**, which is a cost increase
+/// and not a guarantee. Nothing in M-2's argument rests on which reason it is (see
+/// [`headless_refusal`]: the discriminator is `--tab`, never the reason). The
+/// wording is corrected because the wrong repro produces a **false PASS** in live
+/// verification — the tester truncates one file, observes a served call, and
 /// records "no fallback reachable".
 ///
 /// So the write is refused and the reads stay fail-open. That split is what
@@ -715,15 +719,20 @@ pub const HEADLESS_CAPABILITY_UNAVAILABLE: &str = "NOT RUN: cImp is not reachabl
 ///   `<portable_root>/.cimp-discovery/<pid>.json` leaves
 ///   `<portable_root>/.cimp-offload.json` resolving through `select_discovery`'s
 ///   legacy fallback, so that call is still SERVED. Two writes, not one.
-/// * `Transport` needs exactly one write, and it is the cheap one: ADD a
+/// * `Transport` needed exactly one write, and it was the cheap one: ADD a
 ///   well-formed `.cimp-discovery/<n>.json` whose `root` is a deeper ancestor of
-///   the child's cwd and whose `port` is dead. It parses, so it is preferred
+///   the child's cwd and whose `port` is dead. It parses, so it was preferred
 ///   (`select_discovery` takes the deepest matching root), and the dead port
-///   yields `Transport` — the reason whose own doc comment used to read as a
-///   safety property. See `offload::mcp::ProxyMiss::Transport`, and #48 F-11 for
-///   the primitive itself, which is untouched by this correction.
+///   yielded `Transport` — the reason whose own doc comment used to read as a
+///   safety property. See `offload::mcp::ProxyMiss::Transport`.
 ///
-/// A gate keyed on the reason is a gate the attacker picks the key for.
+/// **Locked decision 30 (#48 F-11 / F-28) raised that price and did not remove
+/// it.** Discovery is now liveness-verified: a candidate must answer a
+/// token-authenticated `GET /health`, so the second bullet costs one write **plus
+/// a listener on the port it names**. That is a cost increase, not a guarantee —
+/// whoever can write the file can bind a port — so this section's conclusion is
+/// unchanged and load-bearing: a gate keyed on the reason is a gate the attacker
+/// picks the key for.
 ///
 /// **Why `tab` IS the discriminator.** `--tab <id>` is argv, composed entirely
 /// by cImp at spawn on both consumers' paths (`tabs/config.rs` — pinned by

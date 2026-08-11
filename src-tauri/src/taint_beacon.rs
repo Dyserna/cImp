@@ -177,6 +177,19 @@ pub fn run() {
 /// `post_loopback`: Claude spawns hook shims in the project directory, so with
 /// several cImp instances off one install the beacon reaches the instance
 /// serving ITS project rather than the last one launched.
+///
+/// **#48 F-28, closed by locked decision 30.** That resolution was the beacon's
+/// soft spot: `select_discovery` preferred the deepest matching `root` on the
+/// strength of the file alone, so ONE `Write` of a well-formed
+/// `.cimp-discovery/<n>.json` naming a deeper root and a dead port sent this
+/// beacon nowhere — and because every failure here is swallowed (correctly), a
+/// `WebFetch` stopped contaminating the tab **silently**, disarming locked
+/// decision 14's `sensor` signal. Discovery now requires a candidate to answer a
+/// token-authenticated `GET /health`, so a planted dead entry is skipped and the
+/// running instance still receives the beacon
+/// (`loopback::tests::a_planted_dead_entry_no_longer_disarms_the_native_web_beacon`).
+/// The fail-open behaviour below is unchanged and must stay: a lost beacon
+/// understates taint for one call; a blocked `WebFetch` breaks the tab.
 fn dispatch(path: &str, body: &str) {
     let cwd = std::env::current_dir().ok();
     let Some(disc) = crate::offload::loopback::read_discovery_for(cwd.as_deref()) else {
@@ -184,6 +197,10 @@ fn dispatch(path: &str, body: &str) {
     };
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), disc.port);
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, DISPATCH_TIMEOUT) else {
+        // The memoized endpoint passed a probe and is now refusing connections.
+        // Drop it so this process's second dispatch (a contract-drift report is
+        // followed by the beacon itself) re-resolves instead of inheriting it.
+        crate::offload::loopback::forget_resolved_discovery();
         return;
     };
     if stream.set_write_timeout(Some(DISPATCH_TIMEOUT)).is_err() {

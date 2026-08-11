@@ -93,10 +93,25 @@ pub fn run() {
 /// in the project directory (the same fact `resolve_cwd` leans on), so with
 /// several cImp instances off one install the hook reaches the instance
 /// serving ITS project rather than the last one launched.
+///
+/// Since locked decision 30 (#48 F-11) that resolution is liveness-verified: a
+/// discovery entry naming a port nothing answers on is skipped, so one planted
+/// file can no longer make this shim deliver nowhere. It stays **fail-open** —
+/// `None` here means no context is injected, never that the hook blocks — which is
+/// deliberately unchanged: the fix is about *which* instance is chosen, not about
+/// whether a shim refuses work.
 pub(crate) fn post_loopback(path: &str, body: &str) -> Option<String> {
     let cwd = std::env::current_dir().ok();
     let disc = crate::offload::loopback::read_discovery_for(cwd.as_deref())?;
-    post_context(disc.port, &disc.token, path, body)
+    let answer = post_context(disc.port, &disc.token, path, body);
+    if answer.is_none() {
+        // The memoized endpoint answered a probe and has now failed a real post
+        // (the app exited between the two, or rotated its token). Drop it so the
+        // shim's SECOND post — every shim may report contract drift and then do its
+        // own work — re-resolves rather than inheriting a dead endpoint.
+        crate::offload::loopback::forget_resolved_discovery();
+    }
+    answer
 }
 
 /// The working directory a hook payload names, falling back to the shim's

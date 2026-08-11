@@ -33,12 +33,18 @@ use tokio::sync::Semaphore;
 use crate::error::AppError;
 use crate::mcp_stdio::tool_error;
 
-use super::loopback::{parse_result_line, proxy_base_for};
+use super::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_for};
 
 /// Root-aware endpoint resolution for this child: its cwd is the agent's
 /// project directory (inherited at spawn — the injected mcp-config sets no
 /// cwd), so with several cImp instances off one install the child connects
 /// to the instance actually serving ITS project, not the last one launched.
+///
+/// Since locked decision 30 (#48 F-11) the resolution is also **liveness
+/// verified** — a candidate has to answer a token-authenticated `GET /health` —
+/// and memoized per process, so this stays a cheap call on the per-tool-call path
+/// it sits on. [`forget_resolved_discovery`] is what keeps the memo from
+/// outliving the instance; see [`proxy_graph`].
 fn proxy_base() -> Option<(String, String)> {
     proxy_base_for(std::env::current_dir().ok().as_deref())
 }
@@ -403,9 +409,16 @@ async fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 // serve LOCAL-CAPABILITY there — a tab has a latch in the app
                 // that this path cannot read, a hand-run/cron child has no latch
                 // anywhere. See `graph::mcp::headless_refusal`. It is NOT handed
-                // the `ProxyMiss` reason: every reason is reachable with one
-                // `Write` to `.cimp-discovery/`, so the reason is the
-                // attacker's to choose (same doc comment).
+                // the `ProxyMiss` reason: the reason remains the attacker's to
+                // influence — locked decision 30 raised `Transport` from "one
+                // `Write` to `.cimp-discovery/`" to "one write plus a listener",
+                // which is a cost increase and not a guarantee (same doc comment).
+                //
+                // Note also that not every reason reaches this fallback any more:
+                // `ProxyMiss::declined` returns the app's own verdict for the two
+                // reasons that mean it answered, so `None` here now means "no
+                // instance answered at all", which is what the fallback was
+                // always documented to be for.
                 match proxy_graph(&params).await {
                     Some(r) => r,
                     None => crate::graph::handle_mcp_call(&params, consumer(), tab()).await,
@@ -1044,8 +1057,20 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
     match proxy_graph_outcome(params).await {
         Ok(v) => Some(v),
         Err(miss) => {
+            // Locked decision 30, the re-resolution half: whatever went wrong, the
+            // endpoint this child is holding is now suspect (a rotated token reads
+            // as `HttpStatus(401)`, a restarted app as `Transport`), so the memo is
+            // dropped and the NEXT call re-resolves. Without this the memo could
+            // wedge a live tab headless for the rest of its life — the precise cost
+            // that made "bake the endpoint in at spawn" a non-goal.
+            forget_resolved_discovery();
             miss.report();
-            None
+            // `Some` = the app ANSWERED: report its verdict as a tool error rather
+            // than silently re-running the call on the weaker path. `None` = fall
+            // back, which is what the caller's `None` arm does.
+            miss.declined().map(|text| {
+                Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": true }))
+            })
         }
     }
 }
@@ -1066,11 +1091,21 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
 ///
 /// It is not. A corrupted `<portable_root>/.cimp-discovery/<pid>.json` does not
 /// by itself produce [`NoInstance`](Self::NoInstance) — the legacy
-/// `.cimp-offload.json` still resolves (#48 F-26) — but a well-formed entry with
-/// a dead port produces [`Transport`](Self::Transport) in ONE write, and Claude's
-/// own `Write` tool reaches it. `HttpStatus(500)` means the app answered and
-/// refused, which is a completely different fact about the system and used to be
-/// indistinguishable from "cImp is not running".
+/// `.cimp-offload.json` still resolves (#48 F-26) — and a well-formed entry with
+/// a dead port used to produce [`Transport`](Self::Transport) in ONE write, which
+/// Claude's own `Write` tool reaches. **Locked decision 30 (#48 F-11) closed that
+/// one write:** `loopback::select_verified` now requires a candidate to answer a
+/// token-authenticated `GET /health`, so a planted entry naming a dead port is
+/// skipped and the real instance serves the call. What remains, accepted
+/// knowingly, is one write **plus a listener** — see `loopback::responds`.
+/// `HttpStatus(500)` means the app answered and refused, which is a completely
+/// different fact about the system and used to be indistinguishable from "cImp is
+/// not running".
+///
+/// **Not every reason falls back.** [`declined`](Self::declined) splits the set:
+/// the two that mean the app ANSWERED are surfaced as tool errors, because
+/// re-running such a call headless discards a live instance's verdict and
+/// substitutes a weaker path's (decision 30, part two).
 ///
 /// Each is reported once per process (see [`report`](Self::report)): the
 /// condition is stable — a corrupt discovery file stays corrupt for the child's
@@ -1098,19 +1133,30 @@ enum ProxyMiss {
     /// is genuinely unreachable, the case the fallback was designed for" — reads
     /// as a safety guarantee and is not one (#48 F-11, sharpened by F-26). One
     /// `Write` of a *well-formed* `.cimp-discovery/<n>.json` naming a deeper root
-    /// than the running instance and a dead `port` makes
-    /// `loopback::select_discovery` prefer that entry, and the dead port lands
-    /// here. So `Transport` means "the endpoint this child resolved did not
-    /// answer" — and which endpoint it resolved is steerable by anything that can
-    /// write one file. It is the CHEAPEST reason to manufacture, not the most
-    /// trustworthy one. Nothing may gate on it; see
-    /// `graph::mcp::headless_refusal`, which gates on `--tab` instead.
+    /// than the running instance and a dead `port` used to make
+    /// `loopback::select_discovery` prefer that entry, and the dead port landed
+    /// here.
+    ///
+    /// Locked decision 30 removed the write-only form of that steer — a candidate
+    /// must now answer a token-authenticated `GET /health` — but the honest
+    /// reading of this variant is still **"the endpoint this child resolved did
+    /// not answer"**, and which endpoint it resolved remains steerable by anything
+    /// that can write one file *and* bind the port it names. So it stays the
+    /// cheapest reason to manufacture rather than the most trustworthy one, and
+    /// nothing may gate on it: see `graph::mcp::headless_refusal`, which gates on
+    /// `--tab` instead.
     Transport,
     /// The app answered with a non-2xx status. It is RUNNING and it declined:
     /// 401 is a stale bearer token, 5xx is a fault inside the warm path.
+    ///
+    /// Since locked decision 30 this does **not** fall back — see
+    /// [`declined`](Self::declined).
     HttpStatus(u16),
     /// A 2xx answer whose body was not JSON. The app is running and something
     /// between it and here is rewriting the response.
+    ///
+    /// Since locked decision 30 this does **not** fall back — see
+    /// [`declined`](Self::declined).
     Unparseable,
 }
 
@@ -1124,6 +1170,44 @@ impl ProxyMiss {
             ProxyMiss::Transport => "transport",
             ProxyMiss::HttpStatus(_) => "http-status",
             ProxyMiss::Unparseable => "unparseable-response",
+        }
+    }
+
+    /// The message this reason is reported to the CALLER with, or `None` when the
+    /// call may be re-run on the headless fallback.
+    ///
+    /// Locked decision 30, part two (#48 F-11): `HttpStatus` and `Unparseable`
+    /// both mean **the app answered**. `HttpStatus` is a running instance
+    /// declining (401 on a rotated token, 5xx inside the warm path) and
+    /// `Unparseable` is a 2xx whose body something rewrote. Re-running such a call
+    /// headless silently discards a live instance's verdict and substitutes a
+    /// weaker path's — a different and arguably worse bug than the steering
+    /// primitive F-11 filed, because there the app never spoke at all. Under the
+    /// `--tab` rule M-8 settled the containment consequence is already gone; this
+    /// closes the diagnostic dishonesty.
+    ///
+    /// Exhaustive on purpose: a sixth reason cannot join the set without a
+    /// deliberate answer to "does the app's own verdict exist for this one".
+    fn declined(&self) -> Option<String> {
+        match self {
+            ProxyMiss::HttpStatus(code) => Some(format!(
+                "NOT RUN: cImp is running and answered this call with HTTP {code}, so the call was \
+                 not re-run without it — an answer from the app, even a refusal, is the app's \
+                 verdict, and running the call on the fallback path instead would hide it. \
+                 Nothing ran and nothing was read. If this is a 401 the tab is holding a token \
+                 from a previous cImp launch and restarting the tab fixes it; a 5xx is a fault \
+                 inside cImp's own warm path. Say so in your answer and retry — this is a \
+                 transient condition, not a permanent boundary."
+            )),
+            ProxyMiss::Unparseable => Some(
+                "NOT RUN: cImp answered this call with a success status but a body that was not \
+                 JSON, so something between cImp and this tool is rewriting responses. The call \
+                 was not re-run without cImp: a rewritten answer is a reason to stop, not a \
+                 reason to run the same call on a weaker path. Nothing ran and nothing was read. \
+                 Report this verbatim — it is not a normal condition."
+                    .to_string(),
+            ),
+            ProxyMiss::NoInstance | ProxyMiss::ClientBuild | ProxyMiss::Transport => None,
         }
     }
 
@@ -1144,13 +1228,24 @@ impl ProxyMiss {
         if !seen.insert(key.clone()) {
             return;
         }
+        if self.declined().is_some() {
+            eprintln!(
+                "cimp-offload: cImp ANSWERED a graph/context call and declined it ({key}) — the \
+                 call was surfaced to the caller as a tool error, NOT re-run on the headless \
+                 fallback (locked decision 30). `http-status:401` means this tab's MCP child holds \
+                 a token from an earlier cImp launch — restart the tab. A 5xx is a fault inside \
+                 cImp's warm path."
+            );
+            return;
+        }
         eprintln!(
             "cimp-offload: graph/context calls are taking the HEADLESS fallback ({key}) — the \
              app's warm index is not serving them. Reads still work; persistent memory writes are \
-             refused until cImp is reachable. If cImp IS running, discovery resolved to the wrong \
-             or a dead endpoint: check BOTH `.cimp-discovery/<pid>.json` (preferred, deepest \
-             matching root wins) and `.cimp-offload.json` (the legacy fallback) next to the \
-             executable."
+             refused until cImp is reachable. If cImp IS running, no discovery candidate answered \
+             a token-authenticated `GET /health`: check BOTH `.cimp-discovery/<pid>.json` \
+             (preferred, deepest matching root wins, and since locked decision 30 an entry that \
+             does not answer is skipped) and `.cimp-offload.json` (the legacy fallback) next to \
+             the executable."
         );
     }
 }
@@ -1194,6 +1289,47 @@ mod proxy_miss_tests {
         assert_ne!(ProxyMiss::NoInstance, ProxyMiss::HttpStatus(500));
         assert_ne!(ProxyMiss::HttpStatus(401), ProxyMiss::HttpStatus(500));
         assert_ne!(ProxyMiss::Transport, ProxyMiss::NoInstance);
+    }
+
+    /// Locked decision 30, part two (#48 F-11): the app's own verdict is never
+    /// re-run headless.
+    ///
+    /// The split is asserted in BOTH directions on purpose. Widening it would
+    /// start refusing work the fallback exists to do (`NoInstance` is the app
+    /// being closed, which is the ordinary case); narrowing it puts the silent
+    /// re-run back.
+    #[test]
+    fn only_the_reasons_that_mean_the_app_answered_refuse_to_fall_back() {
+        for answered in [
+            ProxyMiss::HttpStatus(401),
+            ProxyMiss::HttpStatus(500),
+            ProxyMiss::Unparseable,
+        ] {
+            let text = answered
+                .declined()
+                .unwrap_or_else(|| panic!("{answered:?} must not fall back"));
+            // The message has to say what happened, that nothing ran, and that it
+            // is transient — the same three facts every other boundary string
+            // carries (`graph::mcp::HEADLESS_WRITE_UNAVAILABLE` and friends).
+            assert!(text.starts_with("NOT RUN:"), "{text}");
+            assert!(text.contains("Nothing ran and nothing was read."), "{text}");
+        }
+        for falls_back in [
+            ProxyMiss::NoInstance,
+            ProxyMiss::ClientBuild,
+            ProxyMiss::Transport,
+        ] {
+            assert!(
+                falls_back.declined().is_none(),
+                "{falls_back:?} must still reach the headless fallback"
+            );
+        }
+        // A 401 names the one action that fixes it, because a rotated token is by
+        // far the likeliest way a running app declines: the memo is dropped on
+        // every miss, so a child that keeps seeing 401 is holding a stale token in
+        // its own `--tab` MCP config, not a stale endpoint.
+        let four_oh_one = ProxyMiss::HttpStatus(401).declined().expect("declined");
+        assert!(four_oh_one.contains("restarting the tab"), "{four_oh_one}");
     }
 }
 

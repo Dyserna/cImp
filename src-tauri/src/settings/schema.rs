@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 29;
+pub const CURRENT_SCHEMA_VERSION: u8 = 30;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -301,6 +301,32 @@ pub struct Settings {
     /// every index. Per-project via the overlay (a fresh project re-offers the
     /// nudge). Written by the `checks_dismiss_suggestion` IPC. Additive.
     pub checks_suggestion_dismissed: bool,
+    /// #48, finding **F-12**: let the **offload worker** run this project's
+    /// configured checks (`run_check`) when it is working on a **remote**
+    /// backend. The exact shape of `graph.allow_remote_worker_access`, for the
+    /// same reason: a remote backend (LAN *or* cloud) receives the check
+    /// command's output, which quotes source — and `run_check` executes local
+    /// build/test/lint commands, so advertising it off-machine hands a third
+    /// party arbitrary local command execution against the user's repo.
+    ///
+    /// **Off by default, and `false` is the safe value.** `Settings` carries a
+    /// container-level `#[serde(default)]`, so a config file that predates this
+    /// field — and a Settings-window snapshot that omits it — deserializes to
+    /// `false`, i.e. *denied*. That is the direction the F-19 trap has to fail
+    /// in: the worst case is an opt-in that has to be re-ticked, never a silent
+    /// re-opening of the hole.
+    ///
+    /// Lives at the root beside [`Self::checks`] (project tooling, independent
+    /// of the code graph) and rides the per-project `.cimp/config.json` overlay
+    /// like `checks` itself, so the decision is made per repo — which is the
+    /// granularity that matters, since the commands are per repo.
+    ///
+    /// **Not spawn-baked**: nothing in a Claude/OpenCode tab's argv or injected
+    /// config depends on it. It is resolved per offload run by
+    /// `BackendGate::for_worker`, so it needs no `tabs::config::spawn_inject_sig`
+    /// entry and must not acquire one (that would nag every tab to restart for a
+    /// setting that takes effect on the next worker call).
+    pub checks_allow_remote_worker: bool,
     /// Which AI-tool tabs are enabled. Each id in this list corresponds
     /// to one of the four reserved AI builtins (`claude`, `claude-local`,
     /// `aider`, `aider-local`). Adding an id opens that tab; removing
@@ -441,6 +467,9 @@ impl Default for Settings {
             checks: Vec::new(),
             checks_auto_configure: false,
             checks_suggestion_dismissed: false,
+            // F-12: denied by default — the remote worker does not get to run
+            // this project's commands until the user says so.
+            checks_allow_remote_worker: false,
             enabled_ai_tabs: vec![AiTabId::Claude],
             logging: LoggingSettings::default(),
             prompt_templates: Vec::new(),
@@ -2884,11 +2913,27 @@ impl Default for McpServerConfig {
 /// task needing any of these to a cloud backend, and a cloud backend's
 /// default [`ToolScope`] denies them. (MCP servers are matched by their
 /// configured `name`; native tools by their fixed name.)
+///
+/// #48, finding **F-12**: `run_check` joined this set. It executes the project's
+/// **configured** build/test/lint commands and returns their output — which
+/// quotes source — so it is closer to `run_command` than to anything on the
+/// cloud-allowed side. Membership here only fixes a **new** backend (it is what
+/// [`ToolScope::default_for`] excludes, and what the v29 → v30 migration
+/// backfills into an existing "web/docs only" exclusion list). An already
+/// configured backend whose scope does *not* name it — `ToolScope::All`, or a
+/// hand-picked `AllExcept` — is fixed by the **call-time** half instead:
+/// `BackendGate::admit`'s `run_check` rule plus the
+/// [`Settings::checks_allow_remote_worker`] opt-in. Neither half is sufficient
+/// alone; see `offload::backend_gate`.
+///
+/// Mirrored by hand in `src/lib/settings/types.ts` (`LOCAL_DATA_TOOLS`), which
+/// is what the Settings window writes when a backend's cloud flag is toggled.
 pub const LOCAL_DATA_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
     "code_search",
     "run_command",
+    "run_check",
     "filesystem",
     "git",
 ];

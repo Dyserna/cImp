@@ -3076,6 +3076,61 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #48, finding **F-12**: the `run_check`-on-a-remote-worker opt-in must
+    /// round-trip through the REAL two-file path — global `settings.json` plus
+    /// the *sparse* `<project>/.cimp/config.json` overlay — because that is where
+    /// a per-project security decision actually lives. Three claims:
+    ///
+    /// 1. flipping it on in a project writes exactly that one key to the overlay;
+    /// 2. merging the overlay back onto the global baseline resolves it `true`;
+    /// 3. **dropping the key returns the value to the global** — i.e. to *denied*,
+    ///    which is the direction a missing override has to fail in.
+    #[test]
+    fn run_check_remote_opt_in_persists_through_the_sparse_project_overlay() {
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+        assert!(
+            !global.checks_allow_remote_worker,
+            "the global baseline must be denied"
+        );
+
+        let dir = std::env::temp_dir().join(format!("cimp_f12_optin_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let overlay = custom_path(&dir);
+
+        let mut customized = global.clone();
+        customized.checks_allow_remote_worker = true;
+        save(&customized, &dir, &global).unwrap();
+
+        // (1) The sparse overlay carries only the overridden key.
+        let text = fs::read_to_string(&overlay).unwrap();
+        let overlay_val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            overlay_val,
+            serde_json::json!({ "checks_allow_remote_worker": true }),
+            "overlay: {text}"
+        );
+
+        // (2) Merged back onto the global baseline it resolves to the opt-in.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        deep_merge(&mut merged, overlay_val);
+        let loaded: Settings = serde_json::from_value(merged).unwrap();
+        assert!(loaded.checks_allow_remote_worker);
+
+        // (3) Drop the override ⇒ back to the global value (denied). Saving the
+        //     baseline removes the overlay entirely, which is the same thing.
+        save(&global, &dir, &global).unwrap();
+        assert!(!overlay.exists());
+        let bare: Settings = serde_json::from_value(serde_json::to_value(&global).unwrap()).unwrap();
+        assert!(
+            !bare.checks_allow_remote_worker,
+            "a project with no override must fall back to DENIED"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn save_writes_overlay_inside_cimp_dir() {
         // The per-folder overlay must land at `<cwd>/.cimp/config.json`, not

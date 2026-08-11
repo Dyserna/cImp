@@ -3562,6 +3562,93 @@ mod tests {
         }
     }
 
+    // ── #48, finding F-12 — `run_check` on a remote backend ────────────────
+
+    /// **F-12 as a live call, on the backend an EXISTING install actually has.**
+    /// The fixture is deliberately *not* a fresh cloud backend: `ToolScope::All`
+    /// is the default every non-cloud backend carries, and a LAN box marked
+    /// remote keeps it. That scope admits `run_check`, and neither adding the
+    /// name to `LOCAL_DATA_TOOLS` nor migrating an `AllExcept` list can reach it —
+    /// so if the gate were consulted only when a backend is *configured*, this
+    /// call would still execute the project's build/test/lint commands for a
+    /// remote model. Asserted through `ToolRouter::call`, the seam the loop uses,
+    /// because "the helper is right and the call site is missing" is exactly how
+    /// F-10 (and F-12) existed.
+    #[tokio::test]
+    async fn an_existing_remote_backend_is_refused_run_check_at_call_time() {
+        let cwd = std::env::current_dir().unwrap();
+        // A settings file written before the opt-in existed — the pre-existing
+        // install this half of the fix is for.
+        let legacy: crate::settings::Settings = serde_json::from_str(r#"{"schema_version": 29}"#)
+            .expect("a pre-F-12 settings file deserializes");
+        let router = NativeRouter::new(
+            vec![ToolDef::function(
+                "run_check",
+                "",
+                json!({ "type": "object" }),
+            )],
+            ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd),
+            BackendGate::for_worker(crate::settings::ToolScope::All, true, &legacy),
+        );
+        let err = router
+            .call("run_check", json!({}))
+            .await
+            .expect_err("a remote backend must not run the project's checks");
+        assert!(
+            err.contains("configured build/test/lint commands"),
+            "the refusal must name the cause it checked: {err}"
+        );
+        // …and it is not merely refused on call: it is not advertised either, so
+        // the model is never offered a tool it would be refused (the invariant
+        // F-10's fix established for `graph_*`/audit).
+        assert!(
+            router.tool_defs().is_empty(),
+            "run_check must not be advertised to a backend that would refuse it"
+        );
+    }
+
+    /// The other half of the same claim: the opt-in **actually permits** it, on
+    /// that same already-configured remote backend, with no scope edit. Without
+    /// this assertion the fix could be a permanent denial wearing an opt-in's
+    /// clothes.
+    #[tokio::test]
+    async fn the_opt_in_permits_run_check_on_that_same_remote_backend() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut opted: crate::settings::Settings =
+            serde_json::from_str(r#"{"schema_version": 29}"#).unwrap();
+        opted.checks_allow_remote_worker = true;
+        let router = NativeRouter::new(
+            vec![ToolDef::function(
+                "run_check",
+                "",
+                json!({ "type": "object" }),
+            )],
+            ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd),
+            BackendGate::for_worker(crate::settings::ToolScope::All, true, &opted),
+        );
+        assert_eq!(
+            router
+                .tool_defs()
+                .iter()
+                .map(|d| d.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_check"],
+            "the opt-in must restore the advertisement too"
+        );
+        // The call reaches dispatch rather than the gate's refusal. In this test
+        // environment no `checks` are configured, so the shared entry point
+        // answers with its own "not configured" guidance — reaching THAT is the
+        // proof the gate admitted the name.
+        let out = router
+            .call("run_check", json!({}))
+            .await
+            .expect("the opt-in must let the call through the gate");
+        assert!(
+            !out.contains("not available on this backend"),
+            "the gate still refused an opted-in call: {out}"
+        );
+    }
+
     /// The rules live in `backend_gate`, not in a router body. A copy here is
     /// how F-10 happened — one router grew the two re-gates and the other did
     /// not — so the file that holds both routers must not name them.
@@ -3571,6 +3658,7 @@ mod tests {
         for needle in [
             concat!("allows_", "namespaced"),
             concat!("allow_", "audit"),
+            concat!("allow_", "run_check"),
             concat!("starts_with(\"", "graph_\")"),
         ] {
             assert!(
@@ -3619,7 +3707,7 @@ mod tests {
             ToolCtx::new(vec![cwd.clone()], vec![], vec![], &cwd),
             // A fully-permitted backend: these tests are about the taint latch,
             // and a backend gate that denied anything would confound the two.
-            BackendGate::new(crate::settings::ToolScope::All, true, true),
+            BackendGate::new(crate::settings::ToolScope::All, true, true, true),
         )
     }
 

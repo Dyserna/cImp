@@ -27,6 +27,34 @@
 //! prefix matching it does not have), so the rules have to live somewhere; the
 //! defect was that "somewhere" was a router body.
 //!
+//! # Rule 4 — `run_check` (finding F-12)
+//!
+//! `run_check` executes the project's **configured** build/test/lint commands
+//! and returns their output, which quotes source. It was in neither
+//! `LOCAL_DATA_TOOLS` nor any re-gate, and — unlike F-10 — it did not need a
+//! hallucinated name: with the offload toggle on and `checks` configured it was
+//! **advertised** in the tool specs a cloud backend received. That hands a third
+//! party arbitrary local command execution against the user's repo.
+//!
+//! The fix has two halves and **neither is sufficient alone**:
+//!
+//! - `run_check` joined [`crate::settings::LOCAL_DATA_TOOLS`], so a **new** cloud
+//!   backend's default scope denies it (rule 1 catches it), and the v29 → v30
+//!   migration backfills it into an existing recognizable "web/docs only"
+//!   exclusion list.
+//! - …but an **already configured** backend can carry `ToolScope::All` (every
+//!   LAN backend, by default) or a hand-picked `AllExcept` that does not name it,
+//!   and no scope edit reaches those. So rule 4 below is enforced **at call
+//!   time**, keyed on the same `is_remote` bit rules 2 and 3 use, with
+//!   [`crate::settings::Settings::checks_allow_remote_worker`] as the opt-in.
+//!   This is F-10's shape restated — *the helper is right, the call site is
+//!   missing* — and a gate consulted only when a backend is **configured** would
+//!   not have closed it.
+//!
+//! Advertisement is derived from the same verdict (both routers filter their
+//! defs through [`BackendGate::admits`]), so `run_check` cannot be offered by one
+//! rule and refused by another.
+//!
 //! # Why a [`GatePass`] and not a `Result<(), String>`
 //!
 //! A shared function still has to be *called*. [`super::tools::dispatch`] takes
@@ -79,6 +107,28 @@ pub struct BackendGate {
     /// way, but its report is repo paths plus scanner messages that quote the
     /// offending source — local data, like the graph.
     allow_audit: bool,
+    /// F-12: whether `run_check` may run for this backend (local, OR the user
+    /// opted this project's checks in to a remote worker). It executes the
+    /// project's configured commands and returns output that quotes source.
+    allow_run_check: bool,
+}
+
+/// F-12: whether the offload worker may run the project's configured checks on
+/// the chosen backend — local always, remote only on the user's explicit opt-in.
+///
+/// `is_remote` is *LAN or cloud*, the same bit
+/// [`super::service::worker_graph_allowed`] takes, because both are "off this
+/// machine" for the boundary this guards. Named and separate so the rule is
+/// stated once and testable without a `Settings`.
+///
+/// Deliberately **not** conditioned on `checks` being non-empty or on
+/// `offload.tools.run_check`: those are *advertisement* conditions applied
+/// upstream in `tools::enabled_defs`, and folding them in here would turn a
+/// local project with no checks configured into a security-flavoured refusal
+/// instead of the "no checks configured" guidance the shared entry point already
+/// returns. Advertisement stays a subset of admission either way.
+pub(super) fn worker_run_check_allowed(is_remote: bool, allow_remote: bool) -> bool {
+    !is_remote || allow_remote
 }
 
 impl BackendGate {
@@ -86,18 +136,29 @@ impl BackendGate {
     /// [`for_worker`](Self::for_worker), which resolves them from settings so
     /// the three worker entry points cannot disagree; this constructor exists
     /// for callers that already hold the verdicts (and for tests).
-    pub fn new(scope: ToolScope, allow_graph: bool, allow_audit: bool) -> Self {
+    ///
+    /// Every verdict is a **positional required argument** on purpose: adding a
+    /// rule to [`admit`](Self::admit) breaks every existing call site, so a new
+    /// admission decision cannot be added with a silently permissive default
+    /// anywhere (F-12 grew rule 4 this way).
+    pub fn new(
+        scope: ToolScope,
+        allow_graph: bool,
+        allow_audit: bool,
+        allow_run_check: bool,
+    ) -> Self {
         Self {
             scope,
             allow_graph,
             allow_audit,
+            allow_run_check,
         }
     }
 
     /// The worker's policy, resolved from one settings snapshot.
     ///
     /// `is_remote` is *LAN or cloud* — the same bit `OffloadService`'s pool
-    /// entries carry — because both are "off this machine" for the two data
+    /// entries carry — because both are "off this machine" for the three data
     /// boundaries below.
     pub fn for_worker(scope: ToolScope, is_remote: bool, settings: &Settings) -> Self {
         Self::new(
@@ -108,6 +169,12 @@ impl BackendGate {
                 settings.graph.allow_remote_worker_access,
             ),
             settings.code_audit.enabled && settings.code_audit.expose_offload && !is_remote,
+            // F-12. Resolved HERE — the one place all three worker entry points
+            // (`OffloadService::run_on`, the headless child's `run_on_backend`,
+            // the supervisor self-test) build their gate — so the opt-in reaches
+            // an **already configured** backend on its very next call, with no
+            // settings edit and no re-save of the backend.
+            worker_run_check_allowed(is_remote, settings.checks_allow_remote_worker),
         )
     }
 
@@ -164,6 +231,23 @@ impl BackendGate {
                  the offload worker, or this backend is remote — see cImp Settings → Code Audit)"
             ));
         }
+        // 4. F-12 — the `run_check` opt-in. Rule 1 already denies it for a
+        //    backend whose scope names it, but a backend configured before this
+        //    rule existed carries a scope that does not (`All`, or an
+        //    `AllExcept` picked by hand), so this is the half that reaches
+        //    those — and it must be here, at call time, not at the moment a
+        //    backend is configured.
+        //
+        //    The refusal names the cause it actually checked (global principle
+        //    3): this backend is off-machine and the project has not opted in.
+        if name == "run_check" && !self.allow_run_check {
+            return Err(format!(
+                "tool `{name}` is not available on this backend (it executes this project's \
+                 configured build/test/lint commands, and running the project's checks on a \
+                 remote offload backend is off — enable it for this project in cImp Settings → \
+                 Code Intelligence → Checks)"
+            ));
+        }
         Ok(GatePass { name })
     }
 }
@@ -197,7 +281,7 @@ mod tests {
             );
         }
         // …and the gate denies every one of them for an opted-out backend.
-        let gate = BackendGate::new(scope, false, false);
+        let gate = BackendGate::new(scope, false, false, false);
         for name in [
             "graph_snippet",
             "graph_repo_map",
@@ -225,11 +309,12 @@ mod tests {
     /// because the name comes out of the pass, not out of the call site.
     #[test]
     fn an_opted_in_backend_admits_and_the_pass_carries_its_name() {
-        let gate = BackendGate::new(ToolScope::All, true, true);
+        let gate = BackendGate::new(ToolScope::All, true, true, true);
         for name in [
             "graph_snippet",
             "security_audit",
             "read_file",
+            "run_check",
             "ddg__search",
         ] {
             let pass = gate.admit(name).expect("admitted");
@@ -237,18 +322,122 @@ mod tests {
         }
     }
 
-    /// The two opt-ins are independent axes: graph off must not deny the audit
-    /// tools, and audit off must not deny the graph tools.
+    /// The opt-ins are independent axes: graph off must not deny the audit
+    /// tools, audit off must not deny the graph tools, and neither may deny (or
+    /// admit) `run_check`.
     #[test]
     fn the_two_opt_ins_are_independent() {
-        let graph_only = BackendGate::new(ToolScope::All, true, false);
+        let graph_only = BackendGate::new(ToolScope::All, true, false, false);
         assert!(graph_only.admits("graph_snippet"));
         assert!(!graph_only.admits("security_audit"));
+        assert!(!graph_only.admits("run_check"));
         assert!(graph_only.graph_allowed() && !graph_only.audit_allowed());
 
-        let audit_only = BackendGate::new(ToolScope::All, false, true);
+        let audit_only = BackendGate::new(ToolScope::All, false, true, false);
         assert!(!audit_only.admits("graph_snippet"));
         assert!(audit_only.admits("quality_audit"));
+        assert!(!audit_only.admits("run_check"));
         assert!(!audit_only.graph_allowed() && audit_only.audit_allowed());
+
+        let check_only = BackendGate::new(ToolScope::All, false, false, true);
+        assert!(!check_only.admits("graph_snippet"));
+        assert!(!check_only.admits("quality_audit"));
+        assert!(check_only.admits("run_check"));
+    }
+
+    // ── #48, finding F-12 — `run_check` on a remote backend ────────────────
+
+    /// **F-12's `LOCAL_DATA_TOOLS` half, restated as an executable claim.** A
+    /// *newly* configured cloud backend takes `ToolScope::default_for(true)`,
+    /// which is `AllExcept { LOCAL_DATA_TOOLS }` — so rule 1 alone must now deny
+    /// `run_check`, and this fails if anyone removes it from that set.
+    #[test]
+    fn a_new_cloud_backends_default_scope_denies_run_check_on_rule_one_alone() {
+        assert!(
+            LOCAL_DATA_TOOLS.contains(&"run_check"),
+            "F-12: `run_check` executes the project's configured commands — it belongs in \
+             LOCAL_DATA_TOOLS ({LOCAL_DATA_TOOLS:?})"
+        );
+        let scope = cloud_scope();
+        assert!(!scope.allows_namespaced("run_check"));
+        // Rule 1 fires even with the opt-in ON: the user opted the *project* in,
+        // not this backend's scope, and the scope is the narrower statement.
+        let opted_in = BackendGate::new(scope, true, true, true);
+        let err = opted_in
+            .admit("run_check")
+            .err()
+            .expect("denied by the scope");
+        assert!(err.contains("denied by its tool scope"), "{err}");
+    }
+
+    /// **F-12's call-time half, and why the scope half is not enough.** The
+    /// backend an existing install actually has is `ToolScope::All` (the default
+    /// for every non-cloud backend, and what a LAN box keeps) — a scope that
+    /// admits `run_check` and that no edit to `LOCAL_DATA_TOOLS` and no migration
+    /// of an `AllExcept` list will ever touch. Rule 4 is the only thing standing
+    /// there, which is why it is enforced on every call rather than when the
+    /// backend is configured.
+    #[test]
+    fn an_existing_remote_backend_with_an_untouched_scope_is_denied_at_call_time() {
+        let legacy_scope = ToolScope::All;
+        assert!(
+            legacy_scope.allows_namespaced("run_check"),
+            "the scope half cannot reach a ToolScope::All backend — that is the point"
+        );
+        let gate = BackendGate::new(legacy_scope, true, true, false);
+        let err = gate
+            .admit("run_check")
+            .err()
+            .expect("F-12 must refuse this");
+        assert!(
+            err.contains("configured build/test/lint commands"),
+            "the refusal must name the cause it checked: {err}"
+        );
+        assert!(!gate.admits("run_check"));
+        // Nothing else regressed: the same gate still admits the rest.
+        assert!(gate.admits("read_file") && gate.admits("graph_snippet"));
+    }
+
+    /// `worker_run_check_allowed` — local always, remote only on the opt-in.
+    /// The truth table `for_worker` resolves, stated where it can be read.
+    #[test]
+    fn worker_run_check_allowed_is_local_always_remote_on_opt_in() {
+        assert!(worker_run_check_allowed(false, false));
+        assert!(worker_run_check_allowed(false, true));
+        assert!(!worker_run_check_allowed(true, false));
+        assert!(worker_run_check_allowed(true, true));
+    }
+
+    /// `for_worker` resolves rule 4 from the real `Settings` field, in the one
+    /// constructor all three worker entry points use — including the F-19 check
+    /// that a config file predating the field lands on the *denied* side.
+    #[test]
+    fn for_worker_resolves_run_check_from_settings_and_defaults_to_denied() {
+        // A settings file that predates the field (container-level
+        // `#[serde(default)]` fills it) — the pre-existing-install case.
+        let legacy: Settings = serde_json::from_str(r#"{"schema_version": 29}"#)
+            .expect("a pre-F-12 settings file deserializes");
+        assert!(
+            !legacy.checks_allow_remote_worker,
+            "F-19 trap: the additive field's default must be the SAFE value"
+        );
+
+        // Remote + not opted in ⇒ denied. `ToolScope::All` so only rule 4 can
+        // be doing the work.
+        let remote = BackendGate::for_worker(ToolScope::All, true, &legacy);
+        assert!(!remote.admits("run_check"));
+        // Local ⇒ allowed regardless of the opt-in.
+        let local = BackendGate::for_worker(ToolScope::All, false, &legacy);
+        assert!(local.admits("run_check"));
+
+        // Remote + opted in ⇒ the opt-in actually permits it, on a backend that
+        // was configured long before the flag existed.
+        let mut opted = legacy.clone();
+        opted.checks_allow_remote_worker = true;
+        let remote_opted = BackendGate::for_worker(ToolScope::All, true, &opted);
+        let pass = remote_opted
+            .admit("run_check")
+            .expect("the opt-in must actually permit it");
+        assert_eq!(pass.name(), "run_check");
     }
 }

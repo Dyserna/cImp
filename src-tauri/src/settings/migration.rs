@@ -311,6 +311,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v28,
         transform: migrate_v28_to_v29_step,
     },
+    MigrationStep {
+        from_version: "v29",
+        detect: looks_v29,
+        transform: migrate_v29_to_v30_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2316,21 +2321,109 @@ fn migrate_v28_to_v29(value: &mut Value) {
     let Some(root) = value.as_object_mut() else {
         return;
     };
-    // Final cascade step ⇒ stamp CURRENT (29).
+    // Stamps a *literal* 29 (not `CURRENT_SCHEMA_VERSION`): the v29 → v30 step
+    // runs next in the same cascade pass and gates on `schema_version == 29`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(29u8)),
     );
 }
 
+/// The local-data tool set as of schema v30 — the v22 six plus `run_check`
+/// (added by the #48 F-12 fix). Frozen literal for the same reason as
+/// [`LOCAL_DATA_TOOLS_PRE_V22`] and [`LOCAL_DATA_TOOLS_V22`]: this is the target
+/// of ONE migration step, and a future addition to `schema::LOCAL_DATA_TOOLS`
+/// needs its own step rather than a silent retroactive edit to this one (a user
+/// already at v30 never re-runs this step, so widening it here would fix the
+/// tripwire and nobody's install).
+const LOCAL_DATA_TOOLS_V30: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "code_search",
+    "run_command",
+    "run_check",
+    "filesystem",
+    "git",
+];
+
+fn looks_v29(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 29)
+}
+
+fn migrate_v29_to_v30_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v29_to_v30(value)
+}
+
+/// V29 → V30 (#48, finding **F-12**): backfill `run_check` into any offload
+/// backend scoped "web/docs only", and stamp the new additive
+/// `checks_allow_remote_worker` opt-in's absence as the safe default.
+///
+/// `run_check` executes the project's configured build/test/lint commands and
+/// returns output that quotes source, so it joined `schema::LOCAL_DATA_TOOLS`.
+/// Exactly as with `list_dir` in v21 → v22, a user who had scoped a cloud backend
+/// to web/docs-only on an earlier build persisted `AllExcept { the v22 six }` —
+/// so after upgrading, `run_check` (absent from that list) would become *allowed*
+/// on a backend the user had explicitly restricted. This step closes that for
+/// every backend whose exclusion list is recognizably the local-data preset.
+///
+/// It is **not** the whole fix, and must not be mistaken for it: a backend on
+/// `ToolScope::All` (the default for every non-cloud backend, including a LAN box
+/// the user marks remote) or on a hand-picked `AllExcept` has no exclusion list
+/// this step may widen. Those are covered at **call time** by
+/// `offload::backend_gate::BackendGate`'s rule 4 plus the
+/// `checks_allow_remote_worker` opt-in. Two halves, neither sufficient alone.
+///
+/// The new `Settings::checks_allow_remote_worker` field needs no data transform:
+/// its absence deserializes to `false` (denied) through the container-level
+/// `#[serde(default)]`, which is the safe direction — see the field's doc comment
+/// on the F-19 trap.
+///
+/// Idempotent: a second pass finds `schema_version == 30` so `looks_v29` is
+/// false, and the backfill only ever adds already-absent names.
+fn migrate_v29_to_v30(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Object(offload)) = root.get_mut("offload") {
+        if let Some(Value::Array(backends)) = offload.get_mut("backends") {
+            for backend in backends.iter_mut() {
+                backfill_local_data_scope_to(backend, LOCAL_DATA_TOOLS_V30);
+            }
+        }
+    }
+
+    // Final cascade step ⇒ stamp CURRENT (30).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(30u8)),
+    );
+}
+
+/// Fail-closed backfill for one backend's `tool_scope`, to the v22 preset.
+/// Thin wrapper over [`backfill_local_data_scope_to`] kept so the v21 → v22 step
+/// still names the set it was written against (a frozen step must not drift onto
+/// a newer preset — see [`LOCAL_DATA_TOOLS_V22`]).
+fn backfill_local_data_scope(backend: &mut Value) {
+    backfill_local_data_scope_to(backend, LOCAL_DATA_TOOLS_V22)
+}
+
 /// Fail-closed backfill for one backend's `tool_scope`. If the scope is an
 /// `AllExcept` whose exclusion list already denies the *entire* pre-v22
-/// local-data preset (the "web/docs only" fingerprint), add any v22 local-data
-/// tool missing from it. Any other shape is left untouched: `all`/`only`
-/// scopes carry no privacy regression, and an `allexcept` list that denies
-/// only a subset of the preset is a deliberate custom selection we must not
-/// silently widen.
-fn backfill_local_data_scope(backend: &mut Value) {
+/// local-data preset (the "web/docs only" fingerprint), add any `target`
+/// local-data tool missing from it. Any other shape is left untouched:
+/// `all`/`only` scopes carry no privacy regression, and an `allexcept` list that
+/// denies only a subset of the preset is a deliberate custom selection we must
+/// not silently widen.
+///
+/// The fingerprint stays pinned to [`LOCAL_DATA_TOOLS_PRE_V22`] across every
+/// version of this step: it is the *intent* signal ("the user excluded the
+/// local-data tools"), and every later preset is a superset of it, so a v22-era
+/// six-item list and a v30-era seven-item list are both recognized.
+fn backfill_local_data_scope_to(backend: &mut Value, target: &[&str]) {
     let Some(scope) = backend.get_mut("tool_scope").and_then(Value::as_object_mut) else {
         return;
     };
@@ -2348,7 +2441,7 @@ fn backfill_local_data_scope(backend: &mut Value) {
     if !covers_preset {
         return;
     }
-    for name in LOCAL_DATA_TOOLS_V22 {
+    for name in target {
         if !tools.iter().any(|t| t.as_str() == Some(name)) {
             tools.push(Value::String((*name).to_string()));
         }
@@ -3176,6 +3269,101 @@ mod tests {
         migrate_v28_to_v29(&mut v);
         assert_eq!(v, once);
         assert!(!looks_v28(&v));
+    }
+
+    // ── v29 → v30 (#48, finding F-12) ──────────────────────────────────────
+
+    #[test]
+    fn looks_v29_detects_v29_and_not_others() {
+        assert!(looks_v29(&json!({ "schema_version": 29 })));
+        assert!(!looks_v29(&json!({ "schema_version": 28 })));
+        assert!(!looks_v29(&json!({ "schema_version": 30 })));
+        assert!(!looks_v29(&json!({})));
+    }
+
+    /// F-12: a v29 install whose cloud backend carries the v22 "web/docs only"
+    /// fingerprint gains `run_check` in its exclusion list. Without this, adding
+    /// `run_check` to `schema::LOCAL_DATA_TOOLS` would silently *widen* a scope
+    /// the user had deliberately narrowed — the exact v21 `list_dir` regression.
+    #[test]
+    fn v29_to_v30_backfills_run_check_into_a_web_docs_only_scope() {
+        let mut v = json!({
+            "schema_version": 29,
+            "offload": { "backends": [{
+                "name": "cloud",
+                "tool_scope": { "mode": "allexcept", "tools": [
+                    "read_file", "list_dir", "code_search", "run_command", "filesystem", "git"
+                ] }
+            }] }
+        });
+        migrate_v29_to_v30(&mut v);
+        assert_eq!(v["schema_version"], json!(30));
+        let tools = v["offload"]["backends"][0]["tool_scope"]["tools"]
+            .as_array()
+            .expect("exclusion list survives")
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&"run_check"), "{tools:?}");
+        for name in LOCAL_DATA_TOOLS_V22 {
+            assert!(tools.contains(name), "{name} was dropped: {tools:?}");
+        }
+    }
+
+    /// …and it leaves every other scope shape alone. `all`/`only` carry no
+    /// regression to fix, and a hand-picked `allexcept` subset is a deliberate
+    /// selection this step must not widen — those backends are covered at call
+    /// time by `BackendGate`'s rule 4, not here.
+    #[test]
+    fn v29_to_v30_leaves_non_preset_scopes_untouched() {
+        let mut v = json!({
+            "schema_version": 29,
+            "offload": { "backends": [
+                { "name": "all", "tool_scope": { "mode": "all" } },
+                { "name": "only", "tool_scope": { "mode": "only", "tools": ["duckduckgo"] } },
+                { "name": "partial", "tool_scope": { "mode": "allexcept", "tools": ["git"] } }
+            ] }
+        });
+        migrate_v29_to_v30(&mut v);
+        assert_eq!(v["offload"]["backends"][0]["tool_scope"]["mode"], json!("all"));
+        assert_eq!(
+            v["offload"]["backends"][1]["tool_scope"]["tools"],
+            json!(["duckduckgo"])
+        );
+        assert_eq!(
+            v["offload"]["backends"][2]["tool_scope"]["tools"],
+            json!(["git"]),
+            "a partial exclusion list is a deliberate custom selection"
+        );
+    }
+
+    /// No data transform for the opt-in itself: `checks_allow_remote_worker` is
+    /// additive and its absence means **denied**, so the step must not synthesize
+    /// the key (and must certainly not synthesize it `true`).
+    #[test]
+    fn v29_to_v30_does_not_synthesize_the_run_check_opt_in() {
+        let mut v = json!({ "schema_version": 29, "checks": [] });
+        migrate_v29_to_v30(&mut v);
+        assert!(
+            v.get("checks_allow_remote_worker").is_none(),
+            "serde's default supplies `false`; the migration must stay out of it"
+        );
+        let s: crate::settings::Settings = serde_json::from_value(v).unwrap();
+        assert!(!s.checks_allow_remote_worker);
+    }
+
+    #[test]
+    fn v29_to_v30_is_idempotent() {
+        let mut v = json!({ "schema_version": 29, "offload": { "backends": [{
+            "tool_scope": { "mode": "allexcept", "tools": [
+                "read_file", "list_dir", "code_search", "run_command", "filesystem", "git"
+            ] }
+        }] } });
+        migrate_v29_to_v30(&mut v);
+        let once = v.clone();
+        migrate_v29_to_v30(&mut v);
+        assert_eq!(v, once);
+        assert!(!looks_v29(&v));
     }
 
     /// The cascade's last step must land exactly on `CURRENT_SCHEMA_VERSION` —

@@ -554,11 +554,61 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
       `no-instance` mention, not three — so the guard is per process, not per
       call. The message also names the remedy: *"If cImp IS running, the
       discovery file under `.cimp-discovery/` is unreadable or stale."*
-- [ ] cImp **running**: corrupt one byte of
+- [x] cImp **running**: corrupt one byte of
       `<portable_root>/.cimp-discovery/<pid>.json` → same refusal, and stderr
       names the miss reason (`unparseable-response` / `no-instance` / …)
       **exactly once per process**.
-- [ ] Restore the file → the next call goes back through the app.
+      **PASS 2026-08-11 — but ONLY after corrupting a SECOND file, and that
+      correction matters (see F-26 below).** With cImp **running** and both
+      discovery paths unparseable, all three `context_note` calls returned
+      `NOT SAVED: …` and stderr named the reason **exactly once** — one
+      `no-instance`, not three.
+      **Reason nuance worth keeping:** a corrupt discovery file yields
+      **`no-instance`**, not `unparseable-response`, because
+      `read_all_discoveries`' `filter_map(… .ok())` drops the bad entry silently,
+      so the child sees *zero* instances rather than a bad reply.
+      `unparseable-response` is the different case of a live instance answering
+      unparseably. Both satisfy this box as written.
+- [x] Restore the file → the next call goes back through the app.
+      **PASS 2026-08-11.** Both files restored → `context_note` returned
+      `"Noted (pinned, kept across sessions)."` with **zero** miss-reason
+      mentions on stderr. Clean rather than quarantined is correct here: the app
+      restart had cleared every latch, so the tab was `latch:"open",
+      contaminated:false` (confirmed in `/status`).
+
+#### F-26 — raised 2026-08-11, **doc/repro accuracy**: the documented one-byte repro does not reproduce, and following it literally yields a FALSE PASS
+
+`graph/mcp.rs:609-613` states the fallback is attacker-selectable and that *"the
+cheapest needs no shell: corrupt `<portable_root>/.cimp-discovery/<pid>.json`
+with a single byte … so every later `graph_*`/`context_*` call from that child
+takes this path for the rest of the tab's life. Claude's own `Write` tool reaches
+that file."*
+
+**Run live, that is not what happens.** Corrupting only
+`.cimp-discovery/<pid>.json` (byte 5, `"port"` → `"porX"`) with cImp running left
+the child **fully connected to the app**: the note stored normally and stderr
+reported **zero** miss reasons. The fallback engaged only once
+`<exe-dir>/.cimp-offload.json` was corrupted **as well** — there are **two**
+discovery paths, `DISCOVERY_FILE` and `DISCOVERY_DIR`
+(`loopback.rs:54,62`, the former documented at `:85` as *"the legacy
+portable-root discovery path"*), and the legacy one still resolved.
+
+Two consequences, pointing opposite ways:
+- **Reassuring:** the attack surface is *narrower* than the comment claims — a
+  single `Write` to one file does not force the fallback while the legacy file
+  is present. The M-2/decision-21 justification does not depend on the count, so
+  nothing about the fix is weakened.
+- **Costly for testing:** anyone following the documented repro sees the call
+  **succeed** and can conclude the fallback path is healthy, when in fact they
+  never entered it. That is a false PASS produced by the doc itself — the same
+  class as **O-1** and **F-21** (claims that do not hold as stated). This run hit
+  it, and the only reason it was caught is that the null result was investigated
+  rather than recorded.
+
+**Fix:** correct the comment to name **both** files, and say which one
+`select_discovery` prefers. Worth checking whether the legacy path should still
+be consulted at all, since it is the one keeping the documented threat model from
+holding.
 
 ### 21 — a forged session rotation cannot clear contamination (C-2)
 - [x] Tab EXTERNAL-latched **and contaminated**; from the tab's own Bash run

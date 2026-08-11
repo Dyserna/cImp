@@ -418,6 +418,58 @@ declares its class AND its mutation capability in one reviewed place.
    notice on every result of every install without weights is worth nothing.
    The consumer was extracted to a pure `note_classifier` seam so the fix is
    testable with no weights installed, which is the state of every machine.
+
+   **Amendment 2026-08-11 (user decision, review finding M-5) — the notice is
+   derived PER REASON, from bytes that genuinely escaped screening, and the
+   worker's truncation is NOT reordered.** M-5 reported the unscreened notice as
+   *"false every time it fires"* at the worker: the worker screens the full tool
+   result and only then truncates it to `per_tool_result_token_cap` (8000 tokens
+   ⇒ ~32 KB, `offload/agent.rs:1901` and `:1919`), and ~32 KB is below **both**
+   screening caps (`signature::SCAN_PREFIX_BYTES` = 256 KiB,
+   `offload/detection/signature.rs:56`; `classifier::MAX_INPUT_BYTES` = 64 KiB,
+   `offload/detection/classifier.rs:92`). On the byte-prefix legs, therefore,
+   every byte the model was shown had in fact been scanned, and the notice told
+   it otherwise.
+
+   **The correction that decides the shape — "false every time it fires" is true
+   of the two byte-prefix legs ONLY.** The notice is already assembled from
+   `Verdict::unscreened_detail`, a *list* of reasons
+   (`offload/detection/mod.rs:658-690`), and the remaining reasons are true and
+   load-bearing at the worker exactly as they are at the proxy:
+
+   - `classifier::MAX_WINDOWS` (32, `detection/classifier.rs:98`) binds at
+     14,336 tokens — 510 content tokens plus 31 strides of 446
+     (`detection/classifier.rs:269-292`) — which for the dense tokenization the
+     cap exists to bound (CJK, base64) is on the order of 14 KB of bytes, i.e.
+     **inside** the ~32 KB the worker delivers. (The byte figure is an
+     order-of-magnitude for dense input, not a measurement: only the token
+     figure is derived from the constants.)
+   - every `incomplete` leg — a yara-x timeout, a failed inference, a screening
+     task that never ran — is a statement about the bytes that *were* delivered,
+     whatever their length.
+
+   A blanket "suppress the notice at the worker" would therefore have deleted
+   truthful signals in order to fix an untruthful one: decision 5's own D-1
+   failure, run backwards.
+
+   **So the notice is derived per reason.** The helper gains the delivered byte
+   count as an input, and a reason is reported only when the region it names
+   overlaps what was actually delivered. Accepted cost, stated because it is a
+   real one: `unscreened_notice`'s present virtue is being one pure composition
+   over a `Verdict`, and this adds a `delivered_bytes` input and a `Gap` type to
+   it. *Rejected:* deleting the notice at the worker (deletes the three truthful
+   legs with the two false ones); *rejected:* leaving it (a security notice that
+   is wrong in the common case trains its reader to discount it in the rare one —
+   global principle 3).
+
+   **Reordering the truncation above the screen was rejected outright**, not
+   traded off. `offload/agent.rs:1884-1892`'s rationale still holds — the budget
+   charges what left the network, the cap is what the *model* reads — so
+   reordering re-breaks D-3, and it would also discard forensic detection of hits
+   in bytes 32 KB–256 KB: content the model never sees but which is evidence that
+   the page was hostile.
+
+   **Status: settled 2026-08-11, not yet coded.**
 6. **Spotlighting envelope on every EXTERNAL result at the proxy.** Fetched
    content is wrapped in randomized boundary markers (per-result nonce, so
    pages cannot pre-quote the delimiter) with a one-line preamble: content
@@ -478,6 +530,98 @@ declares its class AND its mutation capability in one reviewed place.
      The same seam is shared by `graph::secrets` and the updater's gauntlet
      (both go through `scan_with`), so decision 22's credential screen picked up
      obfuscation resistance for free.
+
+     **Amendment 2026-08-11 (user decision, review findings F-9 / F-9a / F-9b) —
+     the budget is `SCAN_PASS_TIMEOUT = 2 s` PER PASS, and the reason is a
+     property of the dependency, not the volume of work.** The H-4 amendment
+     above ends by saying the second pass *"draws from the remaining
+     `SCAN_TIMEOUT`, so the per-call bound holds"*. The bound held; the
+     **defence** did not. On a loaded machine the pass that dies first is always
+     the *normalized* one — the obfuscation defence — because it runs on
+     `SCAN_TIMEOUT - elapsed` (`offload/detection/signature.rs:1073`). Anyone who
+     can make the machine busy therefore raises the odds that precisely the pass
+     which would have caught them never runs. It fails honestly
+     (`DidNotComplete`, never `Clean`), so this is detection availability rather
+     than a containment hole — but "the defence thins exactly where someone is
+     pushing on it" is a property to choose, not to inherit.
+
+     **The mechanism, recorded because it will outlive this fix.** `yara-x`
+     1.12.0 does not implement a timeout as a deadline on a clock. It `ceil()`s
+     the requested duration to whole seconds
+     (`yara-x-1.12.0/src/scanner/context.rs:552`), adds that to a **free-running,
+     process-wide 1 Hz heartbeat counter** shared by every scan in the process
+     (`:557`, thread started once at `:574-576`), and aborts when the counter
+     passes the deadline inside the Aho-Corasick match loop (`:762`). Two
+     consequences:
+
+     - a pass asked for N seconds aborts anywhere in `(N-1, N]`, because the
+       heartbeat's phase is unrelated to when the scan started;
+     - **at N = 1 the guaranteed floor is ZERO.** A scan can be aborted
+       microseconds after it starts.
+
+     This is why the sizing had to change and why "raise the total to 2 s" would
+     have been a **no-op**: a shared budget is still `ceil()`ed per pass, so the
+     second pass keeps a zero floor. The only sizing the heartbeat permits is a
+     whole-second budget **per pass**. Hence `SCAN_PASS_TIMEOUT = 2 s`, which
+     buys a guaranteed floor of 1 s per pass — about 4.8× the worst legal input
+     (256 KiB ⇒ ~210 ms per pass, derived from the ~105 ms measured for 64 KB
+     across both passes during the M-6 fix run; that datum is **inherited, not
+     re-measured here**, so the multiple is indicative rather than proved).
+
+     **Re-check this on every `yara-x` upgrade.** The fix is sized against a
+     dependency's internal clock, not against an API contract; an upstream change
+     from a heartbeat to a real deadline would make a 1 s budget correct again,
+     and a change in the other direction would break this sizing silently.
+
+     **Accepted cost:** worst-case screen wall clock goes 1 s → 4 s (two passes ×
+     2 s), typical ~210 ms. Accepted knowingly, because the alternative the
+     heartbeat leaves is not fixing F-9 at all. It does not approach any caller
+     bound in this process — the nearest in-process limits are 30 s
+     (`offload/loopback.rs:657`, `offload/mcp.rs:1191`) and 45 s
+     (`offload/mcp_host.rs:44`), and the screen runs inside the one
+     `spawn_blocking` (`detection/mod.rs:351`) on a path whose fetch already
+     dominates. The bound cImp cannot see is the *consumer's* own MCP client
+     timeout; 3 s of added worst case is stated here so that assumption is visible
+     rather than implied.
+
+     - **`SCAN_TIMEOUT` is deleted, not aliased**, and the tripwire that produces
+       is the point. Its one non-test consumer is a literal alias today —
+       `pub const SCAN_BUDGET: Duration = signature::SCAN_TIMEOUT;`
+       (`offload/detection/updater/validate.rs:70`) — so deleting the constant
+       makes the updater's activation gauntlet a **compile error**, which is the
+       tripwire discipline session 4 settled. **That consumer needs an explicit
+       decision of its own in the same implementation pass, because its
+       *meaning* changes with the constant, not only its name.** `SCAN_BUDGET` is
+       the per-document smoke budget the gauntlet enforces, and it reaches both
+       passes through `scan_with` (`validate.rs:204`, `:226`), so a per-pass 2 s
+       silently re-prices a pathological smoke document from up to 1 s to up to
+       4 s. Either the gauntlet keeps a 1 s per-document budget of its own, or its
+       worst-case runtime is re-derived and re-stated; it must not inherit the new
+       number by accident.
+     - **`DidNotComplete` must name the pass** (`raw` / `normalized`). Today both
+       passes emit the same string (`signature.rs:1103`) and `merged_with`'s
+       dedupe of equal reasons (`signature.rs:984`) hides which layer died.
+     - **Related, recorded separately as F-9a and NOT fixed here:**
+       `Hits ⊕ DidNotComplete = Hits` (`signature.rs:983`), so a truncated scan
+       that happened to match reports as a *complete* scan. Same family as M-5 —
+       an honest signal computed and then discarded. F-9's fix narrows the
+       fail-open (truncation can no longer be mistaken for clean *through*
+       `scan_outcome_with`) but does not close it: it still can be through the
+       hits-only `scan_with`, whose callers are `graph::secrets`
+       (`graph/secrets.rs:226`, by the deliberate design decision 22 records) and
+       the updater gauntlet.
+     - **The tests change as a consequence, and must re-point at the invariant:**
+       *the normalized pass ran, and the outcome is never `Clean`* — not a
+       specific match that load may legitimately defeat. *Rejected:* making the
+       two affected tests tolerant of `DidNotComplete` and calling it done — that
+       converts a real property into a silenced one, and this family already goes
+       red in CI on release commits, which is how a check stops being read.
+     - **CPU-time measurement rejected** despite being the theoretically clean
+       answer: Rust's std has no portable thread-CPU-time API, and — the real
+       objection — it removes the wall-clock latency bound the caller depends on,
+       trading a detection-availability problem for a caller-blocking one.
+
+     **Status: settled 2026-08-11, not yet coded** (F-9, F-9a and F-9b all).
    - **Classifier: Llama Prompt Guard 2 (22M) under `ort`** — Meta's
      actively maintained DeBERTa-based injection/jailbreak classifier
      (86M multilingual variant as the upgrade path). Tiny enough for CPU
@@ -564,6 +708,55 @@ declares its class AND its mutation capability in one reviewed place.
    which have shifted across versions before (SDK v2 revert precedent).
    Exact values are a Phase D decision with the user; the milestone locks
    only that they are *pinned*.
+
+   **Amendment 2026-08-11 (user decision, review finding M-16) — `read` is
+   pinned too, as an ORDERED map restating upstream's `.env` carve-out
+   verbatim.** Phase D deliberately left `read` unpinned to preserve OpenCode's
+   own `*.env` → *ask* carve-out. M-16 showed why that reasoning was incomplete:
+   **last-match-wins applies to the PROJECT config as well**, so a cloned repo
+   shipping `{"permission":{"read":"allow"}}` appends `read *: allow` after the
+   carve-out and `.env` is then read with no prompt. Verified live. An unpinned
+   key is not "open to upstream", it is *"open to whoever wrote the repo"* — and
+   the repo is the untrusted party this milestone exists for.
+
+   The pin restates OpenCode 1.18.13's effective behaviour and nothing else, the
+   same discipline as the four values Phase D already pinned, so a working tab is
+   undisturbed: `*` → allow, `*.env` → ask, `*.env.*` → ask, `*.env.example` →
+   allow.
+
+   - **Insertion order is load-bearing** — the only pinned value for which that
+     is true. Under last-match-wins the `*` wildcard must come FIRST and
+     `*.env.example` (which `*.env.*` also matches) must come LAST. `serde_json`
+     preserves insertion order in this build via a *transitive* `preserve_order`
+     → `indexmap` feature (confirmed: `serde_json 1.0.151` depends on
+     `indexmap 2.14.0` in `src-tauri/Cargo.lock`), not a declared one, which is
+     why the guard asserts the **serialized string** rather than the parsed value.
+   - **Do NOT widen past upstream's four patterns.** `*.pem`, `id_*`, `.npmrc`
+     and friends are a *behaviour* change for a tab the user works in daily, and
+     therefore a separate deliberate decision — the same line Phase D drew for
+     `webfetch: "ask"`. Accepted cost, in both directions: a secret-file pattern
+     upstream adds later will not reach the `build` agent until someone re-syncs
+     this list, and a user's own *tightening* of `read` in their project config is
+     now overridden too (identical to the cost already accepted for
+     `bash`/`edit`/`webfetch`/`websearch`; the escape hatch is switching consumer
+     hygiene off for that tab).
+   - **Do NOT ship `OPENCODE_DISABLE_PROJECT_CONFIG` as part of this.** It is not
+     this fix and does not replace it: it closes H-7's *other* vectors (`mcp`,
+     `plugin`, `instructions`), which the pin does not touch, and V19 §A.3 scopes
+     it default-on for hardened tabs only — a population that excludes the
+     default install where M-16 was actually verified, because the Phase H gate
+     ships off (decision 17). It stays **H-7's own work**.
+
+   **Built 2026-08-11** (`63d03d1`). `tabs/config.rs::opencode_pinned_read`
+   assembles the four patterns in their load-bearing order from three named
+   constants (`OPENCODE_PINNED_READ_ANY` / `_ENV` / `_ENV_EXAMPLE`), inside the
+   consumer-hygiene branch so it vanishes with the other pins when hygiene is off;
+   guarded by
+   `the_pinned_read_rule_keeps_the_env_carve_out_in_wildcard_first_order`, which
+   asserts the serialized string. **Release note:** this adds no setting but
+   changes what a **fresh** tab launches with — `OPENCODE_CONFIG_CONTENT` is
+   recomputed only at spawn, so an upgraded binary needs a tab restart before the
+   pin is live.
 9. **Channel-content invariant.** Push content must never carry text authored
    by an LLM, a scanner finding message, or fetched content — only
    app-composed templates (two producers today: the graph indexer's
@@ -610,6 +803,71 @@ declares its class AND its mutation capability in one reviewed place.
     value in the note text — screened at write time, stored under the same
     `tainted` column, withheld from the same read paths and reviewed in the
     same Memory queue. Both are stated in the Phase C2 amendments below.
+
+    **Amendment 2026-08-11 (orchestrator decision, review finding F-24) — the
+    review queue publishes WHY a note is held, and the reason is stored WITH the
+    note.** Decision 10 locks that a quarantined note is *"surfaced in the Memory
+    UI for explicit user promote-or-discard"*. It does not say what the human is
+    shown, and what they were shown was the note text, its time, and two buttons.
+    Since decision 22 there are **two different reasons** a note can be in that
+    queue — an EXTERNAL latch (injected content) and the credential screen (the
+    user's own secret) — and the card could not tell them apart, so a note held
+    because it contained an `AKIA…`-shaped literal read as an injection hold. The
+    card also **shows the secret value while withholding the rule name**, which is
+    decision 22's ordering inverted: the reason exists, reaches the *model* (which
+    cannot act on it), and not the *human* (who must).
+
+    **The reason is published with the note, NOT by joining to the activity row.**
+    Two independent reasons, both fatal to the join:
+
+    - **there is no key.** The `injection_flag` rows carry consumer, scope,
+      session, tool, host, url, root and a detail string — and **no `note_id`**
+      (`offload/loopback.rs:2601-2615`, `graph/mcp.rs:1046-1061`). A join would
+      have to be reconstructed from timestamps.
+    - **the activity store is a capped per-lane ring, and this is its highest-
+      volume lane.** Since H-9 each `Screen` has its own window of
+      `INJECTION_FLAG_SCREEN_CAP = 64` rows (`activity.rs:90`), and
+      `MemoryQuarantine` writes **one row per `context_note`** (`activity.rs:76-78`,
+      and both producers say so in place). So the rows that age out first belong
+      to the **oldest unreviewed notes** — exactly the ones whose reason a human
+      most needs. A review surface must not lose its explanation faster than the
+      thing it explains.
+
+    **Set the field at the STORE boundary, not at the callers.** `MemNote` has six
+    fields and none of them is a reason (`graph/memory.rs:45-60`); the two reasons
+    are collapsed into one `bool` at the single production write site —
+    `let quarantined = tainted || !secrets.is_empty();` (`graph/mcp.rs:1289`) — and
+    thrown away one line later at `mem_add_note(…, quarantined)`
+    (`graph/mcp.rs:1290`, signature at `graph/index/notes.rs:282-291`). The reason
+    must therefore be threaded through the storage signature the way `WriteTaint`
+    is threaded through every layer above it, replacing the bare `bool`. Setting
+    it at the callers instead reopens F-15's gap in a new place — `mem_add_note`
+    is `pub`, so a future write path would store a note with no reason and the
+    card would silently regress to its honest-but-useless line.
+
+    **"Three callers" is imprecise, and the precise shape is what picks the fix
+    site.** There is exactly **one** production call site today (`graph/mcp.rs:1290`),
+    reached by three upstream entry paths — the loopback `/graph_run` route, the
+    headless MCP child, and the offload worker's native route. One write site
+    reached three ways is precisely why the **store boundary** is the cheap place
+    to fix it: one signature change covers all three paths and cannot be forgotten
+    by a fourth.
+
+    **Named, and deliberately NOT decided here:** what a note held for **both**
+    reasons at once should report. The store must be able to say so — the current
+    `bool` cannot, and a reason field that silently prefers one cause would
+    recreate F-23's shape (a stated cause that was not the one checked). This
+    remains an **open detail owed to the backend implementation pass**; nothing in
+    this amendment chooses between "both", "first cause wins" or a set-valued
+    field.
+
+    **Status: the FRONTEND half is shipped** (`220dce6`) — the rule name is the
+    headline above the note text, so decision 22's ordering is right, and when no
+    reason is stored the card says so in words (*"this build does not store which
+    screen or rule held this note"*), with missing / `null` / blank all collapsing
+    to that one honest line and nothing inferred from the note text. **The backend
+    half — a reason on `MemNote`, set at the store — is settled and not yet
+    coded.**
 11. **SSRF guard + fetch budgets on EXTERNAL fetches.** The proxy screens
     every outbound fetch URL before forwarding: an injected model must not
     use `fetch_content` as a LAN scanner or a pivot to unauthenticated
@@ -758,6 +1016,58 @@ declares its class AND its mutation capability in one reviewed place.
     residuals amendment: not enforceable from cImp; the fetch runs in the
     third-party MCP server's process).
 
+    **Review amendment 2026-08-11 (user decision, review finding M-18) — a
+    canonical NETWORK ADDRESS on a schemeless run is not a fetch target.** The
+    widened extraction (bare `host:port` / `host/path`) reads CIDR notation as a
+    URL: `"RFC1918 (10.0.0.0/8)"` inside a **search query** produces the candidate
+    `http://10.0.0.0/8` — the `/8` satisfies the has-a-path plausibility rule
+    (`offload/outbound.rs:484-513`), the host parses, and `screen_urls` refuses
+    the whole call with a security error. Doc placeholders and prose about private
+    ranges are ordinary research content, and a screen that refuses them teaches
+    the user that the screen is broken.
+
+    **Narrow the CIDR case now, and only that:** on a **schemeless** run
+    (`Candidate::strict == false`) a run is not extracted when it is a canonical
+    network address — host bits all zero for the stated prefix, a literal `/`,
+    prefix `0..=31`, **no port**, and **no further path segment** after the
+    prefix. Anything scheme-bearing, port-bearing, or with a real path is
+    untouched.
+
+    **This is an ACCEPTED NARROWING of this decision's own "deny set
+    (complete-or-it's-the-hole)" framing, taken with eyes open.** The deny set
+    stays complete as a *range* policy — nothing is removed from it — but the
+    *extraction* that feeds it now declines to manufacture one class of candidate,
+    and the consequence is concrete: a scheme-guessing fetcher can reach
+    `http://127.0.0.0/8` on port 80. Accepted, and the reason is that the string is
+    a network address — host bits zero, portless, pathless past the prefix — and
+    therefore not the loopback *service* this decision's carve-out text protects;
+    naming a whole /8 is not how anyone reaches a listener. The alternative is a
+    screen that refuses ordinary prose about RFC1918, which is the failure mode
+    that gets a security control switched off (decision 16's argument). **H-3's
+    screen/parser-agreement invariant is untouched and survives intact** — all
+    21,120 generated corpus cases and all 30 C-4 rows are scheme-bearing,
+    relative, or port-bearing, so none of them meets the exemption's conditions;
+    and `screen_urls` denies on **any** candidate (`outbound.rs:719-732`), so
+    dropping one candidate can never flip a verdict that another candidate in the
+    same call already condemns.
+
+    **The denial-row novelty gate is a SEPARATE, LATER change, and severable.**
+    M-18's second half — one row for the first denial per distinct target, four
+    slots, then the existing power-of-two doubling — is deferred on purpose: it
+    **breaks `ssrf_denial_rows_are_bounded_per_session_and_reset_on_rotation`**
+    (`offload/loopback.rs:8382`) and **invalidates live-verification recipe 7's
+    doubling leg**, i.e. re-verification nobody has budgeted. Compounding is real
+    (each benign denial raises the threshold that would have surfaced a later real
+    one) but it is a reporting defect, not a containment one, and it is cheaper
+    once the CIDR narrowing has removed most of the benign denials that drive it.
+
+    *Rejected:* "exempt benign denials", as unimplementable — any proxy for
+    *benign* decides **whether to audit** from model-authored text, which is the
+    class C-4 and H-3 exist to close.
+
+    **Status: settled 2026-08-11, not yet coded** (both halves; the second half is
+    deliberately a later commit).
+
     **Review amendment 2026-08-07 (#48) — three corrections to how this
     decision's own signals are recorded and counted.**
 
@@ -832,6 +1142,38 @@ declares its class AND its mutation capability in one reviewed place.
       EXTERNAL fetch budget and could fire `Screen::Budget` on a task that never
       touched the network. Both now read one route, computed once, in
       `call_screens`.
+
+    **Review amendment 2026-08-11 (user decision, review finding M-1) — the fetch
+    budget is TASK-scoped, and the documented number becomes the real one.** This
+    decision says *"per-task budgets"*. The code built them per **attempt**:
+    `Budget::default()` is constructed inside the worker loop
+    (`offload/agent.rs:1493`), and `run_on` is entered up to four times for one
+    task — fail-over, the thinking retry, and tier escalation
+    (`offload/service.rs:1111`, `:1147`, `:1187`, `:1242`). With the shipped
+    defaults (`external_fetch_max_calls: 40`, `external_fetch_max_bytes: 4 MiB`,
+    `settings/schema.rs:2130-2131`) the documented 40 calls / 4 MiB was really up
+    to 160 / 16 MiB. **A loop that resets its own cap is not stopped**, and a
+    documented bound that is 4× the enforced one is worse than either number
+    alone.
+
+    **One budget is threaded through `run_on` for the whole task, and the limits
+    stay 40 calls / 4 MiB.**
+
+    **The user-visible consequence, stated rather than discovered:** on installs
+    with two or more backends the effective per-task ceiling **drops** from
+    160 → 40 calls and 16 → 4 MiB, because a tier escalation now inherits the
+    fast attempt's spend. **Some escalated answers will be less grounded than
+    they are today.** That is the trade taken knowingly: a truthful cap over
+    answer quality on the escalation ladder. The failure mode is soft — an
+    exhausted budget is a fixed-string tool-result refusal, not an aborted task
+    (`outbound::Budget::exhausted`, `offload/outbound.rs:905-912`) — so a task
+    that runs out still answers from what it already gathered.
+
+    *Rejected:* raising the defaults to today's real 160 / 16 MiB. It ratifies a
+    bound four times what this decision reasoned about, and it makes the spec's
+    number a description of an accident.
+
+    **Status: settled 2026-08-11, not yet coded.**
 12. **Canary tokens — leak detection as a tripwire, two tiers.**
     - **In-band canary (built-in, always on with the latch):** the worker
       embeds a per-task random canary string in its system context (never
@@ -1031,6 +1373,30 @@ declares its class AND its mutation capability in one reviewed place.
     gated by sensor/deny — that remains optional full Phase E gating and
     V33 OS containment; shell-level net access (`curl` in Bash) is
     invisible in every mode (V33 egress control).
+
+    **Amendment 2026-08-11 (user decision, review finding F-28) — this signal can
+    be switched off by one file write, and the fix is decision 30's.** `sensor`
+    mode's whole value is that a native web fetch is *reported*. The shim resolves
+    which cImp instance to report to through the same attacker-steerable lookup
+    F-11 describes (`taint_beacon.rs:182` → `loopback::read_discovery_for`), and
+    it is **fail-open by design** — every failure is swallowed, because a beacon
+    that throws breaks the user's `WebFetch` (`taint_beacon.rs:172-190`). Those
+    two properties together mean a single `Write` of a well-formed
+    `.cimp-discovery/<n>.json` naming a deeper root and a dead port **silently
+    disarms this decision's signal**: no beacon, no EXTERNAL latch, no badge, and
+    nothing anywhere says the sensor stopped sensing.
+
+    Fail-open is correct for a shim and is not the defect. The defect is that the
+    resolution it fails open *from* is attacker-steerable, so the fix belongs to
+    **locked decision 30** (liveness-verified instance discovery) rather than
+    here. Recorded under this decision as well because F-28 is a sharper
+    consequence than the underlying primitive's own filing: that primitive steers
+    *which instance answers and what error story is told*; F-28 turns this
+    decision's signal **off**.
+
+    **Status: settled 2026-08-11, not yet coded — fixed in decision 30's pass, and
+    kept as its own live-verification item so the beacon-disarm case is re-tested
+    by name rather than assumed covered.**
 15. **Manual latch override (user decision 2026-08-07 — amends decision
     1's stickiness for USER-initiated action only; automatic resets stay
     rejected).** Per-tab UI surfaced from `/status`: a taint badge plus:
@@ -1196,6 +1562,66 @@ declares its class AND its mutation capability in one reviewed place.
     decided it. A reduced-protection state (L1 off, or any feature off) is
     visible outside Settings too, on the existing status surface and the
     decision-15 tab badge, so protection cannot be off and forgotten.
+
+    **Amendment 2026-08-11 (user decision, review finding F-18) — the injection
+    controls get their own top-level Settings category, labelled exactly
+    `Injection protection`.** This decision's closing paragraph requires the
+    resolved state to be *introspectable* — "why is this tab not latching?"
+    answerable without reading code. That was built, and then made unreachable:
+    every control lived under the `offload` section, labelled **"Offload task
+    tools"**, while every pointer to it named a *"Tools"* section that has never
+    existed in the seventeen-entry sidebar. A user who went looking for the
+    injection settings on `v0.51.0-rc.1` concluded the build did not have any.
+    **Introspectable state that cannot be navigated to is the same defect as state
+    that is not published**, and that is why this is an amendment to *this*
+    decision rather than a UI ticket.
+
+    Three things compounded, and the third is why the first two were not merely
+    cosmetic: the taint menu instructed the user to *"Change it in Settings →
+    Tools → Injection protection"* — reached at the one moment the navigation has
+    to work, when the user has just been told their protection is reduced; the
+    spec's own live-verification recipes named the same absent section, so a
+    verifier could not find the surface the recipes test; and the ⛨ chip promised
+    *"Click to open Settings"* while calling `openSettingsWindow()` with no
+    argument, landing on whatever section was last active (Appearance, on a fresh
+    profile) — although the `settings-deep-link` mechanism it needed already
+    existed and was used elsewhere.
+
+    **The label is not a free choice.** `Injection protection` is the exact name
+    the L1 master switch, the ⛨ chip's own strings and the reduced-protection
+    notices already use; a category with any other name reintroduces the mismatch
+    in a new place.
+
+    **The tripwire must cover BOTH `src/` and the backend's user-facing strings,
+    and this is the half still owed.** A `src/`-only scan is insufficient and
+    misses real sites: the same stale pointer is compiled into Rust —
+    `ipc/commands.rs:1271-1280` (`updates_allowed`'s error, served to the user
+    when they click a disabled updater action, still reading *"Settings → Tools →
+    Injection protection"* today) and the advisor cards (`advisor.rs:908`, `:955`,
+    `:1038`, `:1077`, plus `detection/updater/mod.rs:2462`), fourteen `Settings →
+    Tools` literals across `src-tauri/src/` in total. The guard therefore has to
+    assert over both trees: **no user-facing string names a Settings section that
+    `SECTIONS` does not declare.** Two traps are recorded so the Rust scan is not
+    written naively: `backend_gate.rs:243-250`'s `run_check` refusal — shipped by
+    decision 31 the same day — wraps across lines with a `\` continuation, so a
+    line-by-line scanner sees `Settings → ` with an empty tail and skips exactly
+    that string; and that same refusal names *"Code Intelligence → Checks"* when
+    Checks is a top-level **sibling**, so the scan must check the first segment,
+    not merely that some segment exists.
+
+    **Built 2026-08-11** (`6459ac9`) — the Settings half only. `src/SettingsApp.svelte`'s
+    `SECTIONS` list gained `{ id: 'injection', label: 'Injection protection' }`
+    (`:1124`); the ⛨ chip now deep-links to that id; and
+    `src/lib/settingsPointers.test.ts` fails the build on any `Settings → X`
+    literal in `src/` whose first segment is not a real sidebar label — enforced
+    over *all* of them, so every pre-existing wrong pointer in `src/` was fixed
+    rather than grandfathered. **What the move actually consisted of, the
+    breadcrumb left behind, the deliberate refusal to alias `offload → injection`,
+    and the `sensor`-honesty fix that shipped with it are recorded once, in the
+    *Phase G/H* implementation record's `F-18 amendment 2026-08-11`** — this entry
+    is the decision, that one is the build. **Still owed under this decision:** the
+    `src-tauri/src/**` half of the tripwire and the fourteen Rust strings it will
+    fail on.
 17. **The Phase E split is resolved: E1 (Claude) is DEFERRED, E2 (OpenCode)
     ships as Phase H behind a default-off toggle, containment stays V33's job
     (user decision 2026-08-07).** *Numbered here 2026-08-08 (#48).* This
@@ -1654,6 +2080,273 @@ declares its class AND its mutation capability in one reviewed place.
     **literal redaction inside the signature**, is deferred as its own decision:
     it is per-language tree-sitter work whose failure mode (a missed node kind)
     is a silent leak.
+30. **Instance discovery is LIVENESS-VERIFIED, and a running app's own verdict is
+    never re-run headless (user decision 2026-08-11 — review findings F-11 and
+    F-28).** Every stdio child and every hook shim finds the app it belongs to by
+    reading `.cimp-discovery/<n>.json` and choosing the entry whose `root` is the
+    **deepest** ancestor of its cwd (`offload/loopback.rs:169-196`, reached
+    through `read_discovery_for` at `:200`). That lookup is a tamper surface, not
+    a neutral resolution: **one `Write` of a well-formed entry naming a deeper
+    root and a dead port** makes every child prefer a dead endpoint — and,
+    because the entry *parses*, the resulting miss is classified `Transport`
+    rather than `NoInstance` (`offload/mcp.rs:1080-1098`), so the attacker also
+    chooses the reason the failure reports. `ProxyMiss::Transport`'s own doc
+    comment — *"the app is genuinely unreachable, the case the fallback was
+    designed for"* — reads as a safety property and is not one.
+
+    This is a **primitive**, not a single hole. It steers the offload child, the
+    code-audit child, `context_hook` (`context_hook.rs:98`) and — the sharpest
+    case, filed as **F-28** and recorded under decision 14 — the native-web taint
+    beacon (`taint_beacon.rs:182`), which is fail-open by design, so steering it
+    **silently disarms decision 14's `sensor` signal**.
+
+    **The decision, in two parts:**
+
+    - **Liveness-verified selection.** Probe each candidate entry with a
+      `GET /health` using *that entry's own token*, skip entries that do not
+      answer, memoize the winner for the life of the process, and re-resolve on a
+      later failure. A dead-port entry can no longer win, which removes the
+      one-write form of the attack.
+    - **`HttpStatus` and `Unparseable` stop falling back at all.** Both mean the
+      app **answered**: `HttpStatus` is a running instance declining (401 on a
+      stale token, 5xx inside the warm path) and `Unparseable` is a 2xx whose body
+      something rewrote. Re-running such a call headless silently discards a live
+      instance's verdict and substitutes a weaker path's. Under the `--tab` rule
+      M-8 settled, the containment consequence of that is already gone; the
+      diagnostic dishonesty is what this closes.
+
+    **The case against it, accepted knowingly.** Liveness proves something is
+    **listening**, not that it is cImp: whoever can write the discovery file can
+    also bind a port and answer the probe. This raises the cost from *one write*
+    to *one write plus a listener*; it does not remove the primitive. That is the
+    honest bound on this decision and it is stated here rather than implied.
+
+    **Five shapes rejected, with the reason each fails:**
+
+    - **refuse on ambiguity** — breaks nested checkouts, which is the very case
+      the per-instance directory exists to serve;
+    - **drop the deepest-root preference** — reintroduces "project A's child talks
+      to project B's app", the defect the preference was added to fix;
+    - **own-pid file** — a **no-op**: children have no own-pid file to check;
+    - **HMAC over the entry** — barred by **locked decision 28 (H-6)** on that
+      decision's own argument: the key would have to live inside the blast radius
+      it is meant to bound, so it is ceremony rather than security;
+    - **bake port + token into children at spawn** — a deliberate **non-goal**, not
+      merely a rejection: it loses self-healing, so a cImp restart would wedge a
+      live tab headless for the rest of its life.
+
+    **Status: settled 2026-08-11, not yet coded.** F-28 keeps its own
+    live-verification item — the beacon-disarm case must be re-tested by name
+    rather than assumed covered by this pass.
+31. **`run_check` is denied to an off-machine offload backend by default, with a
+    PER-PROJECT opt-in that is global across backends (user decision 2026-08-11 —
+    review finding F-12).** `run_check` executes the project's configured
+    build/test/lint commands and returns their output, which quotes source. It
+    appeared in neither the backend allow-list nor any re-gate, and — unlike
+    F-10's class, which needs the model to invent an unadvertised name — it was
+    **advertised** in the tool specs a cloud backend receives whenever offload is
+    on and checks are configured. So a remote model was offered a local command
+    executor as a normal tool.
+
+    **The opt-in is `checks_allow_remote_worker`: one boolean, per project,
+    global across backends** (`settings/schema.rs:329`, default `false` at
+    `:472`), deliberately the **exact shape** of `graph.allow_remote_worker_access`
+    (`settings/schema.rs:2199`, default `false` at `:2489`). *The case against it,
+    accepted:* a per-backend flag would let a user trust a self-hosted LAN worker
+    while denying a cloud vendor — a real distinction. Declined because **two
+    shapes for the same question is its own defect**: the user would have to learn
+    that "may an off-machine worker see local data" is answered per project for
+    the graph and per backend for the checks.
+
+    **This switch deliberately sits OUTSIDE decision 16's three-level hierarchy,
+    and must stay there.** It is a data-boundary opt-in like V8-02's tool scope and
+    V9-01's graph access, not a protection toggle, so it is not a `Feature`, has no
+    L2/L3 row, and is not resolved through `effective()`. **Do not "fix" it into
+    that hierarchy later:** decision 16's L1/L2/L3 switches exist to turn
+    *protection off*, and a switch whose job is to turn protection off must never
+    be able to **grant** a remote backend a capability it did not otherwise have.
+    Folding this opt-in into `effective()` would make the injection master switch a
+    capability-granting control, which inverts what a master switch means.
+
+    **Both halves are required and neither is sufficient alone** — this is F-10's
+    lesson (*"the helper is right, the call site is missing"*) applied before the
+    fact:
+
+    - `run_check` joins `LOCAL_DATA_TOOLS` (`settings/schema.rs:2931-2939`), which
+      fixes **new** backends, because the V8-02 default scope for a cloud backend
+      is `AllExcept { LOCAL_DATA_TOOLS }`;
+    - and a `BackendGate` **rule 4** enforced **at call time**
+      (`offload/backend_gate.rs:243-250`), which is what fixes **already
+      configured** backends — a backend saved before this rule existed carries a
+      scope that does not name `run_check`, so rule 1 never sees it.
+
+    **Built 2026-08-11** (`00ae3cb`). The verdict is resolved in one place,
+    `BackendGate::for_worker` (`offload/backend_gate.rs:163-179`) via the named
+    predicate `worker_run_check_allowed(is_remote, allow_remote)`
+    (`backend_gate.rs:131-133`), and all three worker entry points build their gate
+    there — `OffloadService::run_on`, the headless child's `run_on_backend`, and
+    the supervisor self-test — so an already-configured backend is fixed **on its
+    next call**, with no settings edit and no re-save. `is_remote` is *LAN or
+    cloud*, the same bit the graph opt-in takes, because both are "off this
+    machine" for this boundary. The refusal names the cause it actually checked
+    (global principle 3) rather than a generic scope error. `BackendGate::new`
+    gained a **fourth required positional argument** (`backend_gate.rs:147-152`) as
+    a compile-error tripwire, so a fifth rule cannot be added with a silently
+    permissive default. The predicate is deliberately **not** conditioned on
+    `checks` being non-empty or on `offload.tools.run_check`: those are
+    *advertisement* conditions applied upstream, and folding them in would turn "no
+    checks configured" into a security-flavoured refusal.
+
+    Two facts recorded because they were discovered rather than planned:
+
+    - **a settings schema bump was unavoidable (29 → 30**,
+      `settings/schema.rs:163`). The pre-existing tripwire
+      `local_data_tools_growth_requires_a_backfilling_migration` *demands* a
+      backfilling migration for any addition to that set; the brief for this work
+      had assumed none was needed and was wrong. The v21→v22 migration literal was
+      deliberately **not** widened — a user at v29 never re-runs that step, so
+      widening it would have turned the tripwire green and fixed nobody's install.
+    - **the frontend mirror of `LOCAL_DATA_TOOLS` is hand-maintained** and was
+      stale, which is filed as **F-27**: the Settings window *writes* that list
+      into a backend's scope when its cloud flag is toggled, so until the mirror
+      was corrected the `LOCAL_DATA_TOOLS` half of this decision had **no
+      production effect**. No hole opened at any point — rule 4 refuses at call
+      time regardless — but the UI lied. The mirror is fixed (`049fb8b`,
+      `src/lib/settings/types.ts:1303-1311`, preset identity now bidirectional set
+      membership rather than array length); a Rust-side `include_str!` tripwire
+      that **parses** the array and asserts set equality in **both** directions is
+      still owed, on the pattern at `settings/schema.rs:4862` and
+      `checks/mod.rs:1010`.
+
+    **Residual, neither widened nor narrowed:** a gate refusal writes no
+    `activity` row. That is pre-existing for this whole class and is tracked by
+    F-20. **Also owed:** rule 4's refusal text points the user at *"Settings →
+    Code Intelligence → Checks"* when Checks is a top-level sibling — one of the
+    strings decision 16's F-18 amendment owes a Rust-side tripwire for.
+32. **A contaminated-but-open tab is refused the WEB direction only, through a
+    third refusal constant (user decision 2026-08-11 — review finding F-13).**
+    `contaminated` has been published beside `latch` on `/latch/state` since Phase
+    H and nothing read it, so a tab that was **contaminated but not
+    EXTERNAL-latched** admitted every native tool including the web ones — while
+    rendering a contamination badge. A published signal with no consumer (global
+    principle 3), and the steady state *after* M-15's race rather than the race
+    itself.
+
+    **The state this closes is not exotic.** A session rotation reopens the latch
+    and deliberately keeps the bit (H-2), and `bash` is pinned `allow` — so a
+    contaminated tab can run `bash`, spawn a second `opencode` that inherits
+    `CIMP_TAB_ID`, publish a fresh session id under this tab's identity, reopen the
+    latch, **and get its web tools back**. The contamination bit is the one thing
+    that survives that escalation, which is why it has to be read.
+
+    **The rule, as a table over the two published fields:**
+
+    | latch | contaminated | native local | native web |
+    |---|---|---|---|
+    | `open` | false | admit | admit |
+    | `open` | true | admit | **REFUSE** |
+    | `local` | either | admit | refuse |
+    | `external` | either | **REFUSE** | admit |
+
+    Once external content has entered a conversation, the harness's own web tools
+    are its unproxied way **out** — no beacon in `off`/`deny` mode, no latch, no
+    budget, no SSRF screen.
+
+    **Refusing local tools as well was rejected**, even though that is how F-13
+    was filed. Contamination is sticky for the tab's life (H-2 removed the only
+    reset; clearing is a human authority action under decision 15), so gating
+    local tools on it would be close to a **permanent withdrawal**: it would make
+    "Switch to local" restore only half a surface, and it would lock a **rotated,
+    clean** conversation out of native `read`/`bash`. Contamination's cost to
+    local capability is *persistence*, which the write quarantine already enforces
+    (decisions 10 and 22).
+
+    **A third refusal constant, not a reuse.** The two existing native strings
+    both name a cause — *"this session has already used a local-capability
+    tool"* — that did **not** happen in this state, and a refusal stating a cause
+    it did not check is finding F-23's defect. `REFUSAL_NATIVE_WEB_TAINTED` joins
+    `REFUSAL_NATIVE_LOCAL_BLOCKED` and `REFUSAL_NATIVE_WEB_BLOCKED`
+    (`offload/toolclass.rs:714`, `:724`, `:745`).
+
+    **Where it is read, and why there:** at the single deny site every cache path
+    funnels through, so a cached verdict, a fresh verdict and a fail-open verdict
+    all pass through the same expression; `contaminated === true` (a missing field
+    reads `false`, i.e. fails open), `latch === "open"` in the negative form that
+    keeps an *unknown* latch label from denying anything, and `contaminated`
+    deliberately **not** joined to the plugin's type guard — that would have been a
+    total gate bypass rather than a narrowing. A clear (`clear_contamination`
+    app-side) is honoured within one gate TTL and needs no invalidation: the epoch
+    exists so a **tightening** cannot be overwritten by a stale verdict, and a
+    *loosening* that lands late costs at most one TTL of over-refusal — the same
+    latency `FlipLocal` already has in the local direction. The 1500 ms abort, the
+    2000 ms TTL and the epoch's drop-not-apply semantics are untouched.
+
+    **The bound this decision does NOT close, stated plainly, because it is a
+    bound on the decision and not a defect in the fix.** The whole plugin gate,
+    including this refusal, sits inside Phase H's native gate — the refusal is
+    literally inside `if (CIMP_NATIVE_GATE_ENABLED && …)`
+    (`tabs/config.rs:1926`) — and that gate is the one V32 control **decision 17
+    ships default OFF** (`Feature::OpencodeNativeGate => false`,
+    `settings/injection.rs:269`; a test at `injection.rs:1428` asserts it is the
+    *only* default-off feature, so this is a deliberate posture and not an
+    oversight). **So on a default install this decision changes nothing:** a
+    contaminated-but-open tab still reaches its native web tools. What this fixes
+    is the configuration that asked to be protected — a user who turned the Phase H
+    gate on. **The identical bound already applied to the two pre-existing latch
+    refusals in the same plugin**, so this is the established scope of the whole
+    native-gate lane, not a new limitation introduced here. Closing it for everyone
+    is decision 17's default-on question and V33's containment work, not this row.
+
+    **Consistent with decision 15 as amended:** a *Full unlatch* clears
+    contamination, so it restores the web direction too — which is the point of an
+    at-own-risk restore; *Switch to local* keeps the bit, and a `local` latch
+    already refuses web, so nothing about the flip changes.
+
+    **Built 2026-08-11** (`63d03d1`), in `tabs/config.rs`'s generated gate with the
+    state table written out beside it. Negative control run: replacing the new
+    condition with `if (false)` makes the node-backed test fail with *"a
+    contaminated tab must not keep its native web tools"* — the test bites.
+    **Release note:** this adds no setting but changes what a **fresh** tab launches
+    with, because the plugin file is generated at spawn; an upgraded binary needs a
+    tab restart before the refusal is live.
+33. **A security row is never hidden by a project filter, and an empty `root` is a
+    STATEMENT (orchestrator decision 2026-08-11 — review finding F-16).** Two of
+    the three producers of `MemoryQuarantine` rows write `root: String::new()`:
+    the credential screen's row (`graph/mcp.rs:1060`) and the identity-less write
+    hold (`offload/loopback.rs:2476`). Only the scoped quarantine carries a real
+    one (`offload/loopback.rs:2613`). Retention is unaffected — lanes key on
+    `Screen`, not on root (H-9) — but a **root-filtered Tool Activity view shows
+    neither row under any project**, and the row that vanishes is the one
+    recording that a *credential* was held. Filed LOW; reproduced live, which is
+    what re-rated it: the review surface silently omits the rows most worth
+    reviewing.
+
+    **Both halves are required.**
+
+    - **Thread a real root wherever one is derivable.** The secret-screen row runs
+      inside `run_tool`, which knows the project it is writing memory for, so its
+      empty root is an omission rather than a fact. Producers that *can* attribute
+      must attribute.
+    - **And the view must never hide a rootless security row.** Some producers
+      genuinely cannot attribute one — `LatchRegistry::gate` has no scope to derive
+      a root from, which is why M-19's `unattributed_write` matches the older
+      row — so a filter that drops unattributed rows would still lose evidence
+      after the first half lands. A project filter narrows *attributable* rows; it
+      must not silently discard the rest.
+
+    **The sentinel's meaning is now fixed: `root: ""` means "not attributable to a
+    project"** — a positive statement, the same discipline F-20 and F-29 apply to
+    `tab`. It never means "this project", and it must not be rendered as a missing
+    value. That is what makes the second half implementable: a view can only decide
+    to keep a row it can recognize as deliberately unattributed.
+
+    *Rejected:* dropping the filter for this feed (the filter is what makes a
+    busy multi-project install readable), and inferring a root from the note or
+    the tab (a guess presented as provenance, which is the class F-20/F-29 close).
+
+    **Status: settled 2026-08-11, not yet coded.** Take with F-20 and F-29 — four
+    findings now cluster on *"containment right, reporting wrong"*, and they share
+    one seam.
 
 ## Phases
 
@@ -3676,6 +4369,12 @@ declares its class AND its mutation capability in one reviewed place.
     `Settings → X` literal in `src/` names a section the sidebar does not have;
     the Rust half of that scan (`src-tauri/src/**`, where `updates_allowed`'s
     refusal carries the same dead path) is owed.
+    *The decision behind this move — why an unreachable control is the same defect
+    as an unpublished one, why the label is fixed rather than chosen, the two traps
+    the Rust-side scan must handle, and the enumerated strings it will fail on —
+    is recorded as the **F-18 amendment 2026-08-11 under locked decision 16**.
+    This paragraph is the build record for it; the two are one record in two
+    places, not two decisions.*
   **Phase G/H amendment 2026-08-08 (#48 review — G-1, G-2, G-3, N-1, F-y).**
     - **A typed override typo no longer resets the settings file (G-1).**
       `Override` carried `#[serde(from = "String")]`, so the post-hoc parse only

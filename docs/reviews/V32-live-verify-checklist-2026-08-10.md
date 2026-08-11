@@ -25,8 +25,48 @@ every V32 finding before this was closed by code review plus unit tests, and thi
 remains the release gate.
 
 Record per recipe: PASS / FAIL / BLOCKED + the finding id if it raises one.
-New findings continue the F-series (next free: **F-25**; F-20, F-21, F-22 (withdrawn), **F-23**
+New findings continue the F-series (next free: **F-31**; F-20, F-21, F-22 (withdrawn), **F-23**
 below — F-22 is the one to read first).
+
+---
+
+## ⏸ Status 2026-08-11 — testing CLOSED, fix phase, and what this file now targets
+
+**The run was closed by user decision at 99 of 148 boxes ticked** (critical paths
+covered; the updater is split to [#53](https://github.com/Dyserna/cImp/issues/53)
+and does not count). The project is in a **fix phase**; a **new RC** follows and
+the boxes below are what it gets re-tested against. **The status lines above are
+the rc.3 record and are deliberately left as they were** — they describe a build
+that no longer exists.
+
+**Five commits landed 2026-08-11 that change what a tester should see.** Where
+that happened this file was re-written on that date and the rewrite is marked in
+place. **Nothing observed was deleted:** an observation that was true of the
+build it was made against stays true of that build, and the standing trap in this
+project is a control that asserts behaviour a fix reversed (see recipe 11's U-4
+negative control, rewritten for exactly that reason). Read the *new* assertion,
+not the retained one.
+
+| commit | what changed | where in this file |
+|---|---|---|
+| `e4513b5` | **A full unlatch now CLEARS contamination** (decision 15's amendment). `flip_local` still does **not**; `clear_contamination` and `await_session_clear` survive unchanged. The clear writes its own `contamination_cleared` row under basis `unlatch`; prior `contamination` rows and Timeline entries survive. The confirm dialog now branches on whether the tab is contaminated. | **recipe 13's Full-unlatch box RESET to `[ ]`** with the new assertions and both dialog strings; recipe 13's tripwire note, recipe 14's side observation and the M-24 sighting note all annotated |
+| `00ae3cb` + `049fb8b` | **F-12:** `run_check` is **denied to a remote/cloud offload backend by default** (`LOCAL_DATA_TOOLS` + `BackendGate` rule 4 at call time), with a new per-project opt-in **Settings → Checks → Offload worker access** (`checks_allow_remote_worker`, default false). Schema 29 → 30. `049fb8b` also fixed F-27's stale `types.ts` mirror and the `scopeMode()` length test. | setup's F-12 warning rewritten; **new block "F-12 — `run_check` on a remote offload backend" with 3 NEW boxes** after recipe 2 |
+| `220dce6` | **M-22** popover live-updates; **M-23** Promote/Discard polarity **inverted** (Promote is now the danger-coloured two-step); **M-24** one `StatusChip` with **12 statuses** replaces the single red chip; **F-24's frontend half** — the rule name is the headline above the note text. **F-24's backend half is NOT done**, so the card shows *"Reason not recorded — this build does not store which screen or rule held this note."* live. **That is the expected honest state for this RC — do not file it.** | recipe 6's promote box and recipe 16's rule-naming box annotated; the F-24 write-up carries an update block; the known-open table split in two |
+| `fdb29f1` | the release workflow now gates on the Tests workflow (raises **F-30**). | no box — noted in the known-open table |
+
+**Re-test cost this fix phase created: 1 box reset from `[x]` to `[ ]`, and 9
+boxes added** — 6 of them the reset box's own new assertions (contamination
+cleared, `can_clear`, the `contamination_cleared` row, evidence survives, a clean
+post-unlatch note, held notes stay held) and 3 the new F-12 block. **Counts:
+99 → 98 ticked, 45 → 55 unticked (`[ ]`), 3 partial (`[~]`), 1 not-runnable
+(`[!]`) — 148 → 157 boxes.** Everything else that was ticked stays ticked: the
+fixes above changed the UI's *reporting* and one *state transition*, not the
+containment those boxes recorded. Two boxes keep their tick with a changed
+expectation annotated in place (recipe 6's promote leg — the behaviour held, the
+click path did not; recipe 16's rule-naming box — ticked at the tool-result layer,
+which the fix did not touch), and one is flagged as marked `[x]` while its own note
+says a leg was never scored (recipe 14's third box, the `consumer`-in-the-body
+trap).
 
 ---
 
@@ -138,10 +178,21 @@ below — F-22 is the one to read first).
       `<exe-dir>/detection-updates/`, 17 corrupts `.cimp-discovery/<pid>.json`,
       18 writes `.opencode/plugin/`, 21 writes into
       `%USERPROFILE%\.claude\projects\<encoded-root>\`.
-- [ ] **⚠ F-12 is OPEN and HIGH.** `run_check` is *advertised* to a cloud/LAN
-      backend and executes the project's configured commands. If any recipe
-      points the worker at a non-local backend, do it from the throwaway root
-      only — or settle F-12 first.
+- [ ] ~~**⚠ F-12 is OPEN and HIGH.**~~ — **FIXED 2026-08-11 (`00ae3cb` backend,
+      `049fb8b` the UI control). Read the new behaviour before pointing a worker
+      at a non-local backend.** `run_check` is now **denied to a remote/cloud
+      offload backend by default**: it joined `LOCAL_DATA_TOOLS` (fixes newly
+      configured backends) **and** `BackendGate` rule 4 refuses it **at call
+      time** (fixes already-configured ones, on their next call, with no
+      re-save). The opt-in is per-project and global across backends:
+      **Settings → Checks → Offload worker access** →
+      *"Allow a **remote** offload worker to run these checks"*
+      (`checks_allow_remote_worker`, default **false**). **Schema 29 → 30**, so
+      this install migrates on first launch of the new RC.
+      **Still do the throwaway root** if you tick the opt-in — the refusal is the
+      only thing that changed, not what `run_check` executes.
+      **Verify it: see the new F-12 block after recipe 2** (3 boxes, never
+      live-verified — it is a HIGH that shipped this phase).
 - [ ] Launch token + port read from `<exe-dir>/.cimp-offload.json` (recipes 13b,
       17). _PORT: ________ TOK: ________________________________________
 - [ ] `RUST_LOG=offload=info` available for the "makes no request" checks
@@ -258,6 +309,14 @@ its own first tool call).
       (incl. graph_snippet), context_*, security_audit, quality_audit` and
       answered **"NO WEB TOOL IN LIST"**. Same F-21 caveat for the
       latch-on-first-use mode.
+      ⚠ **The recorded tool list is a LOCAL backend's, and F-12 (`00ae3cb`) may
+      change it on a REMOTE one — do not fail this box on a missing `run_check`.**
+      `run_check` joined `LOCAL_DATA_TOOLS`, which is the exclusion written for an
+      off-machine backend, so a remote backend configured (or re-saved) after that
+      change can legitimately enumerate **without** `run_check`; an
+      already-configured one keeps advertising it and is refused at call time
+      instead. Both are correct — see the new F-12 block below. What this box
+      asserts is the **absence of the `ddg` tools**, and that is unchanged.
 - [x] An attempted fetch is refused with the fixed string. **PASS 2026-08-10**,
       on a **Claude tab** (not the worker): after a session of local file reads,
       `ddg__fetch_content` returned `REFUSED (security boundary)`, naming not
@@ -294,6 +353,54 @@ its own first tool call).
 > predicate that makes containment identical either way. Boxes 1 and 2 of the
 > milestone's own live-verification list now name the mode too, so ticking them
 > against a refusal is no longer a recorded failure.
+
+### F-12 — `run_check` on a remote offload backend — **NEW 2026-08-11, never run**
+
+Not one of the 25 spec recipes: **a HIGH that shipped during the fix phase**
+(`00ae3cb` + `049fb8b`) and has only unit coverage. Numbered by its finding id so
+the recipe numbering is untouched. Needs a **remote** backend configured — one
+whose `cloud`/off-machine flag is set, LAN is enough — and a **throwaway project
+root**, because the whole point of the tool is that it runs this project's
+configured build/test/lint commands.
+
+Pair, and **both legs or the check is void** — a refusal alone cannot tell "the
+gate works" from "the backend was never reachable":
+- [ ] **Denied leg, the default.** Opt-in **off**; drive `run_check` at a
+      **remote** backend (the worker path — `/run` with a profile that has it, or
+      the headless child). It is refused, with the cause named. The Rust string,
+      verbatim from `backend_gate.rs:243-249`, is:
+      > *tool `run_check` is not available on this backend (it executes this
+      > project's configured build/test/lint commands, and running the project's
+      > checks on a remote offload backend is off — enable it for this project in
+      > cImp Settings → **Code Intelligence → Checks**)*
+
+      ⚠ **Do NOT record that path as correct — it does not resolve** (Checks is a
+      **top-level sibling** of Code Intelligence, not a sub-tab of it). This is a
+      **sixth site of F-18**, introduced by F-12's own fix and left deliberately
+      because F-18 is pending a user decision (`049fb8b` records the correct path
+      in a comment). Note it against **F-18**; do not file it again. The real
+      path is **Settings → Checks → Offload worker access**.
+      **Also expected, and not a defect to chase:** a gate refusal writes **no
+      `activity` row** — pre-existing for this whole class, tracked with F-20. Do
+      not hunt the feed for one.
+- [ ] **Permitted leg.** Tick *Settings → Checks → **Offload worker access*** →
+      *"Allow a **remote** offload worker to run these checks"*, then re-run the
+      same call: it **executes**. **No tab restart** — the hint says *"Applies
+      from the worker's next call"*, and `for_worker` resolves the flag per call,
+      so if this needs a restart that is the finding.
+- [ ] **Control: a LOCAL backend is never affected**, opt-in either way
+      (`worker_run_check_allowed(false, _) == true`). And the exposure line in
+      *Settings → Checks* tells the truth about which: with the opt-in **off** it
+      reads `run_check exposed: MCP ✓ / offload worker ✓ **(local worker only)**`,
+      and the suffix disappears when it is on. _(That line was unqualified before
+      `049fb8b` — same containment-right-reporting-wrong class as F-23/F-24.)_
+
+_Two things this block does **not** cover, on purpose._ The **session's own**
+`run_check` (a Claude/OpenCode tab calling it through the proxy) is out of scope —
+F-12 governs the offload worker only. And the sparse-overlay round trip
+(`checks_allow_remote_worker` set per project, then the key dropped, returning to
+the global denied value) is covered by unit tests that check the F-19 trap
+explicitly; re-run it live only if the setting appears not to stick.
 
 ### 3 — Claude tab, proxied fetch — **PASS 2026-08-10** (all four)
 Driven through `POST /mcp/call` (the same route the tab's MCP child uses),
@@ -466,6 +573,7 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then: — **PASS 2026-0
 **Results:** 1 **PASS** 2 **PASS** (both legs) 3 **PASS** 5 **PASS**
 12 **cImp side + `deny` leg PASS** (sensor legs blocked by F-22 / #52)
 20 **PASS** (all six) 22 **PASS** (error-string leg structurally blocked)
+F-12 ____ (new 2026-08-11, all three boxes unrun)
 
 ---
 
@@ -489,6 +597,20 @@ Latch a tab EXTERNAL via a proxied `ddg__fetch_content`, then: — **PASS 2026-0
       other held notes stayed absent from the same call. Full lifecycle verified
       in one run — written under an EXTERNAL latch → held → withheld from recall
       → promoted → recalled.
+      ⚠ **The CLICK PATH changed 2026-08-11 (`220dce6`, M-23) — the tick stands
+      (the promoted note really did become recallable) but a re-run will not
+      reach it the same way.** Polarity was inverted: **Promote** is now the
+      danger-coloured **two-step** (`Promote…` → *"Promoting accepts this text
+      into project memory… once promoted it is returned by recall, rides the
+      launch-time guidance into new sessions, and no longer says where it came
+      from. Read it above first. Continue?"* → **"Yes, promote into memory"**),
+      and **Discard** is now the plain-styled two-step (`Discard…` → *"Discarding
+      deletes this note permanently and cannot be undone. Nothing else changes:
+      it is already held out of every read path, so discarding releases
+      nothing."* → **"Yes, discard permanently"**). One armed confirmation at a
+      time, keyed by note id. **A one-click Promote, or a `confirm()` browser
+      dialog on Discard, is now the regression** — that is the pre-`220dce6`
+      behaviour.
 
 > **The review queue held exactly 4 notes, and that is the correct number.**
 > Five `V32 …` probe notes were written; the fifth (`recipe 16 control`, the
@@ -513,11 +635,31 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
 - [x] A `Screen::MemoryQuarantine` row appears with `ok: true`.
 - [x] The notice names the matched **rules**, never the matched text — it says
       `(secret_aws_access_key_id)` and the `AKIA…` value appears nowhere in it.
-      **PASS at the tool-result layer, FAILS at the UI — see F-24.** The Memory
-      view's card shows the note text (secret value included), a timestamp,
-      Promote/Discard and a session id on hover, and **no rule, screen or reason
-      of any kind**. The contract holds where the model reads it and not where
-      the human decides.
+      **PASS at the tool-result layer** (the tick is for that layer, and nothing
+      has changed there). **FAILED at the UI on 2026-08-10 — see F-24 — and the
+      UI half was PARTLY fixed 2026-08-11 (`220dce6`), so the assertion for the
+      new RC is different.** As observed on rc.3: the card showed the note text
+      (secret value included), a timestamp, Promote/Discard and a session id on
+      hover, and **no rule, screen or reason of any kind**.
+      **What to expect on the new RC instead:** the card now carries a **reason
+      line above the note text** — rule identifiers in monospace, the screen
+      beside them, the note body demoted below. But **F-24's BACKEND half is
+      owed** (`MemNote` does not carry the reason), so the line renders, verbatim
+      and for every held note:
+      > *Reason not recorded — this build does not store which screen or rule
+      > held this note.*
+
+      **That is the intended honest state for this RC, not a bug to file** — the
+      frontend deliberately never reconstructs a reason from the note text (a
+      test feeds a literal AWS key and asserts `null`). Note anything else against
+      **F-24**. Two things ARE assertable now: the intro paragraph must name
+      **all three** causes (session already used an external tool / write could
+      not be attributed to a tab / the write-time credential screen matched) — it
+      named only the latch before, which is why a credential hold read as an
+      injected-instruction hold — and the reason line must be rendered in the
+      app's quiet-italic "not a confident claim" treatment, not as an explanation.
+      **This box stays `[x]` because its tick was earned at the tool-result layer,
+      which the fix did not touch; the UI half was never a tick.**
 - [x] **Control that matters most:** ordinary research prose containing "key",
       "token", "password" unquoted is stored **clean**. A note reading *"the auth
       key rotation runs weekly, the token refresh is automatic, and the password
@@ -974,6 +1116,26 @@ a fetched page", and those warrant opposite actions.
 and render the same rule list the tool result gets. Take it with M-23/M-24 as one
 piece of work on this surface.
 
+> **UPDATE 2026-08-11 — the FRONTEND half is fixed (`220dce6`); the BACKEND half
+> is owed, and the honest placeholder is what a tester will see.** The finding
+> text above describes rc.3 and is kept as the record of it.
+> · **Fixed:** the rule name is now the **headline above** the note text (the
+> value is demoted, which is the way round decision 22 requires); the card's
+> intro names **all three** causes rather than only the latch; missing, `null`
+> and blank reasons all collapse to one line rather than three different silences.
+> · **Owed:** `MemNote` genuinely does not carry the reason — the three write
+> sites each hold the string already — so **every** held note renders
+> *"Reason not recorded — this build does not store which screen or rule held
+> this note."* until that lands. **Expected, not a defect.**
+> · **Decided while fixing it:** publish the reason **with the note**, not by
+> joining to the activity row — the `injection_flag` rows carry no `note_id`, so a
+> join has no key, and the activity store is a capped per-lane ring, so the oldest
+> unreviewed notes (the ones most needing a reason) would blank first.
+> · **Its two companions closed with it:** M-23 (polarity inverted — Promote is
+> the two-step now) and M-24 (one `StatusChip`, 12 statuses). So the "one
+> uninformed click" compound stated above is **half** resolved: the click is now
+> confirmed and warned, and still uninformed until the backend half lands.
+
 ### F-23 — raised 2026-08-10: after a USER flip, the refusal states a cause that did not happen
 
 Recipe 13a, on a tab latched EXTERNAL by a native `WebFetch`. The user clicked
@@ -1289,11 +1451,74 @@ With a tab EXTERNAL-latched, click the ⛨ badge:
       ⚠ **This box is the tripwire for the decision-15 amendment.** The flip must
       keep the bit; only *Full unlatch* clears it. If this box starts FAILING
       after that change lands, the implementation went too far.
-- [x] "Full unlatch" (after its confirmation) restores both sides.
-      **PASS 2026-08-10 (local side)** — after the user's unlatch the tab reads
-      `latch:"open"` and `graph_snippet` answers again. Web side not re-probed:
-      that scope's 40-call budget was already spent, and **an unlatch does not
-      refill it**, so a fetch there returns the budget refusal regardless.
+      **The amendment LANDED 2026-08-11 (`e4513b5`) and this box still stands
+      exactly as written** — `FlipLocal` deliberately keeps the bit (*"the flip is
+      a workflow step, not a verdict"*, and F-13's planned fix depends on that
+      staying true). Unit tripwire:
+      `contamination_survives_the_flip_and_every_session_rotation`. **Re-run this
+      box on the new RC before the unlatch box below**, in that order: it is the
+      only thing separating "the amendment was implemented" from "the amendment
+      was over-implemented".
+- [ ] **RESET 2026-08-11 — was `[x]`, and the behaviour it recorded is now
+      REVERSED by `e4513b5`. Re-run on the new RC.** "Full unlatch" (after its
+      confirmation) restores both sides **and, since decision 15's amendment,
+      CLEARS the contamination flag with them.** What to assert, all six:
+  - [ ] `/status` for that tab reads `latch:"open"` **and
+        `contaminated:false`** — the bit is gone, not merely the latch.
+  - [ ] **`can_clear` is `false` afterwards** (it tracks the bit:
+        `can_clear: self.contaminated`, `loopback.rs:1435`). A `true` here means
+        the clear did not happen.
+  - [ ] A **`contamination_cleared` row** is written, `tool: "unlatch"` — the
+        new `ClearBasis::Unlatch`, which exists because
+        `contamination_events()` reads only the two contamination lanes, so a
+        clear recorded merely as `latch_override` prose would leave a marker
+        that never closes. The `latch_override` row (`tool: unlatch`,
+        `origin: "ipc"`) is written **as well**; the two are told apart by
+        `screen`, and the shared word is deliberate.
+  - [ ] **The evidence survives:** the earlier `contamination` row is still in
+        the feed, and the Timeline still shows the contamination entry — plus a
+        new cleared entry reading
+        *"Cleared — the user restored full access to this tab, which releases
+        the flag with it (the larger risk was accepted deliberately)."*
+        ("Cleared" and "never contaminated" must stay distinguishable in the
+        feed even though the live view is identical.)
+  - [ ] A `context_note pin=true` written **after** the unlatch stores
+        **clean** — bare *"Noted (pinned, kept across sessions)."*, no
+        QUARANTINED notice — and is visible from another scope's
+        `context_notes`. _(This is the pair for the flip box above, which must
+        still come back quarantined.)_
+  - [ ] **Notes already held stay held** — the clear releases future writes
+        only; the four already in the review queue are still there. The dialog
+        promises exactly this, so a queue that empties itself is the finding.
+      **The confirm dialog now branches on whether the tab is contaminated, and
+      this file's style is to compare against the literal string, so both are
+      here** (`TaintMenu.svelte`). Contaminated tab:
+      > *Restoring full access re-opens the web side while the injected content
+      > is still in this conversation — the model can be steered by it and reach
+      > your files at the same time. **It also clears this tab's contamination
+      > flag:** new notes stop being held for review and save straight into
+      > project memory again. Notes already held stay held — release those from
+      > the Memory view. The record of what happened, and of this clear, stays on
+      > the Timeline. Continue?*
+
+      …with the button reading **"Yes, restore access and clear the flag"**.
+      Uncontaminated tab (latched `local` by a local call that never fetched):
+      > *Restoring full access re-opens both sides of the latch, so this session
+      > can hold web access and local file access at the same time — the
+      > combination the latch exists to prevent. Continue?*
+
+      …button **"Yes, restore full access"**, and **no `contamination_cleared`
+      row is written at all** (`unlatch_clear_row` returns `None` when nothing was
+      released). Getting the contaminated wording on an uncontaminated tab is a
+      finding: it would promise to clear a flag that is not set.
+      _**Retained, and it was true of rc.3:** **PASS 2026-08-10 (local side)** —
+      after the user's unlatch the tab read `latch:"open"` and `graph_snippet`
+      answered again. Web side not re-probed: that scope's 40-call budget was
+      already spent, and **an unlatch does not refill it** (still true — the
+      amendment deliberately left the budget alone), so a fetch there returns the
+      budget refusal regardless. **What that run also observed —
+      `contaminated:true, can_clear:true` after the unlatch — is precisely what
+      `e4513b5` changed, which is why the box is reset rather than annotated.**_
 - [x] Both actions show as `latch_override` rows whose payload reads
       `"origin": "ipc"`. **PASS 2026-08-10** — three rows, all `"origin":"ipc"`.
 - [x] A tab restart still resets everything. **PASS in effect 2026-08-10, but
@@ -1327,6 +1552,22 @@ With a tab EXTERNAL-latched, click the ⛨ badge:
 > exactly the confusion it produced. **This is the first live evidence for M-24
 > and it argues for raising its priority alongside F-18.**
 >
+> **BOTH HALVES OF THIS SIGHTING WERE ACTED ON 2026-08-11 — expect a different
+> picture on the new RC, and do not re-file either half.**
+> · The *state* that caused it is gone from this route: `e4513b5` makes the full
+> unlatch clear the bit, so `latch:"open", contaminated:true, can_clear:true`
+> **no longer follows an unlatch**. The state itself still exists by other routes
+> (an OpenCode tab was seen sitting `contaminated:true` with `latch:"open"` on
+> 2026-08-11) — that is **F-13**, still open, decided but not yet coded.
+> · The *chip* is fixed: `220dce6` replaced the single red chip with one
+> `StatusChip` shared by Tool Activity and Events, carrying **12** statuses.
+> A tester should now see `engaged` (containment came ON — a beacon, a tab
+> becoming contaminated), `granted` (a latch override **or a contamination flag
+> cleared** — a release, drawn as one), `held` (a memory write awaiting review),
+> `unscreened` (dashed, deliberately *not* an alarm), `flagged`, `denied` (the
+> only red), `rejected`/`update` for the updater, and `recorded` for a screen this
+> build has no word for. **`denied` is the only one that means "we blocked
+> something"** — if anything else is red, that is the finding.
 > **Operator trap, hit live:** a tab can hold **more than one scope**. Driving
 > recipes with `?consumer=opencode` (to get a fresh fetch budget / SSRF ledger)
 > creates a second `opencode:<tab>` scope on the same tab, and the popover's
@@ -1416,9 +1657,23 @@ beacon is *accepted* and the second check passes for the wrong reason.
       separate scopes"*). Re-run with the consumer in the **body** to score it.
       This is [F-4](#) realized live — `(consumer, tab)` is a verified pair on no
       route — not a new finding.
-      *(Side observation, expected: **Full unlatch left `contaminated:true`.**
-      Decision 15's amendment — full unlatch clears contamination — is confirmed
-      still uncoded. `can_clear` stayed `true` afterwards.)*
+      ⚠ **Flagged 2026-08-11 (not re-scored, left as the runner wrote it): this
+      box is marked `[x]` while its own trap note says the Inherit leg was not
+      scored** — `graph_snippet` answered for the wrong reason, and the note ends
+      *"Re-run with the consumer in the body to score it."* Treat the Inherit leg
+      as **unrun** until that re-run happens; the Override leg stands.
+      *(Side observation, expected **AT THE TIME**: **Full unlatch left
+      `contaminated:true`**, `can_clear` stayed `true` — decision 15's amendment
+      was confirmed still uncoded. **That observation was true when written and is
+      now obsolete: the amendment was coded 2026-08-11 in `e4513b5`**, so on the
+      new RC a full unlatch reads `contaminated:false` / `can_clear:false` and
+      writes a `contamination_cleared` row with basis `unlatch`. **It also changes
+      this box's own method:** the subject tab was reset with **Full unlatch**
+      precisely to keep per-tab overrides, and that reset now clears the
+      contamination bit as well. Harmless for what this box asserts — the latch
+      and `decided_by` legs are unaffected — but if you re-run it, do not read the
+      clean bit as a defect, and do not use Full unlatch as the reset in any box
+      whose assertion involves contamination.)*
 
 Extended 2026-08-08 — four consumers the above does not reach:
 - [~] **The updater scheduler follows `Feature::Detection`, not L1** (decisions
@@ -1518,7 +1773,21 @@ Extended 2026-08-08 — four consumers the above does not reach:
       `reducedTabLine` (`latch.ts:411`). Worth noting on its own: the **OpenCode
       tab showed a contamination badge while its latch was `open`** — the
       contaminated-but-not-EXTERNAL state, which is exactly **F-13**'s shape,
-      reached live for the first time.
+      reached live for the first time. **F-13 is now DECIDED (2026-08-11) and not
+      yet coded**: refuse the **web** direction only, on
+      `contaminated && latch === "open"`, via a **third** refusal constant — so
+      expect to meet this state again on the new RC, and note it against F-13.
+      ⚠ **The contaminated tab-badge tooltip was rewritten 2026-08-11
+      (`049fb8b`) — the fragment quoted above still opens it, but its
+      continuation changed and it now BRANCHES.** It used to promise the flag
+      lasts *"until cImp is restarted"*, false since `05e613f` and doubly so after
+      `e4513b5`. Now, contaminated + `awaiting_session_clear`: *"…memory writes
+      stay quarantined and external results stay wrapped for this tab. A
+      checkpoint was restored, so the flag lifts when this tab starts a new
+      session."*; contaminated + `open` (no restore): *"…Click this badge to clear
+      the flag once you have judged the content harmless."* The split exists
+      because `can_clear` is false after a restore, so one string would have
+      pointed at a button that is not rendered.
 - [!] Break `injection_status` (stop the backend mid-poll) → after three
       consecutive failures the chip reads `⛨ unknown` and both poll failures
       `console.warn`; it must **never** render as fully protected.
@@ -1695,7 +1964,9 @@ The one thing no source assertion can show.
       _Note F-14 (open, LOW): the spec's "most hardened combination" phrasing
       overstates this — expect the narrower behaviour, don't file it twice._
 
-**Results:** 13 **PASS** (all legs) 13b **PASS** (all three legs) 14 ____ 15 ____
+**Results:** 13 ~~**PASS** (all legs)~~ → **REOPENED 2026-08-11: the Full-unlatch
+leg was reset for `e4513b5` (decision 15's amendment) and its six assertions are
+unrun. The other four legs stand.** 13b **PASS** (all three legs) 14 ____ 15 ____
 18 ____ 19 **harness box PASS**, two live legs owed
 
 ---
@@ -1704,18 +1975,22 @@ The one thing no source assertion can show.
 
 These are already recorded in `docs/reviews/code-review-V32-2026-08-08.md`.
 Seeing them live is useful (note it against the id); filing them again is not.
+**Rebuilt 2026-08-11 for the fix phase.** Five rows moved out (M-22, M-23, M-24,
+F-12, F-19 — they are fixed, see the second table), and the findings raised or
+decided on 2026-08-11 were added,
+because a tester meeting one of those should reach for an existing id rather than
+open a new one. **The ledger is the source of truth; where a row below says FIXED
+and the ledger's own row still says OPEN, the ledger is simply not reconciled yet
+— the commit is named here so you can check for yourself.**
 
 | you'll see | id |
 |---|---|
-| The worker's "unscreened" notice is false every time it fires | M-5 |
-| A CIDR string or doc placeholder in a **search query** refuses the whole call | M-18 |
-| The override popover doesn't update while open — a tab that becomes contaminated still reads "Not latched." | M-22 |
-| Promote is one unconfirmed click; Discard is behind a modal | M-23 |
-| `Unscreened`, detector flags, `MemoryQuarantine`, `LatchOverride` all collapse into one red chip | M-24 |
-| A repo shipping `{"permission":{"read":"allow"}}` reads `.env` with no prompt | M-16 |
+| The worker's "unscreened" notice is false every time it fires | M-5 — **DECIDED 2026-08-11, not yet coded** (derive the notice per reason; do **not** delete it). ⚠ The finding's *"false every time"* is only true of the two byte-prefix legs — it is **true and load-bearing** for `classifier::MAX_WINDOWS` and every `incomplete` leg |
+| A CIDR string or doc placeholder in a **search query** refuses the whole call | M-18 — **DECIDED 2026-08-11, not yet coded** (narrow CIDR first; the denial-row novelty gate is a **separate, later** change because it would break recipe 7's live doubling leg) |
+| A repo shipping `{"permission":{"read":"allow"}}` reads `.env` with no prompt | M-16 — **DECIDED 2026-08-11, not yet coded** (pin `read` as an ordered object restating upstream's four patterns verbatim) |
 | Toggling spotlighting mid-session doesn't take (spawn-baked, declared live) | M-3 |
 | A worker-only detection override leaves the updater inert and the UI lying | M-21 |
-| Per-**attempt** budget/latch — the 4 MiB/40-call cap is really 8/80, 16/160 with fail-over | M-1 |
+| Per-**attempt** budget/latch — the 4 MiB/40-call cap is really 8/80, 16/160 with fail-over | M-1 — **DECIDED 2026-08-11, not yet coded** (one task-scoped budget threaded through `run_on`, **keeping** 40 calls / 4 MiB, so the documented number becomes the real one) |
 | Remote MCP `error.message` + 300 chars of raw body carried verbatim | M-17 |
 | `(consumer, tab)` verified on no route | F-4 |
 | `/graph_run` + `/mcp/call` share H-8's tab half (a decision, not a bug) | F-5 |
@@ -1723,9 +1998,31 @@ Seeing them live is useful (note it against the id); filing them again is not.
 | A denied URL still leaks its hostname to DNS | F-8 |
 | `MemoryQuarantine` rows with an empty `root` vanish from a root-filtered view | F-16 — **reproduced live 2026-08-10; the empty-`root` row is the SECRET-screen one, so the credential record is the one that vanishes. Re-rate.** |
 | A stale `cimp-<hash>.exe` wedges the next link with `LNK1104` (`Stop-Process`) | F-17 — **reproduced live 2026-08-10**; kill ONLY the `cimp-<hash>.exe` test binary, never the `bin\cimp.exe` the user is verifying |
-| Every V32 switch is under "Offload task tools"; every pointer says "Tools" | F-18 |
-| No `claude-opus-5` row in the seeded price table — cost reads $0 until added by hand | F-19 |
+| Every V32 switch is under "Offload task tools"; every pointer says "Tools" | F-18 — **now SIX sites, and two of them are in Rust**: `ipc/commands.rs:1276-1279` (*"Settings → Tools → Injection protection"*) and, new 2026-08-11, `offload/backend_gate.rs:243-249` (*"Settings → Code Intelligence → Checks"* — Checks is a **sibling** of Code Intelligence, not a sub-tab). Pending a user decision; the proposed `src/lib/` tripwire would catch **neither** |
 | Every proxied MCP call's own `kind:"mcp"` row is `tab:"unattributed"` in the Events tab, while the `injection_flag` rows beside it name the tab | **F-20 — raised 2026-08-10** |
-| "The worker withholds defs, the proxy refuses the call" is only half true: defs are withheld under a **declared** profile, but in latch-on-first-use mode the worker keeps the defs and is refused at the gate | **F-21 — raised 2026-08-10 (doc accuracy)** |
-| `run_check` advertised to a cloud backend | **F-12 — open, HIGH, needs your decision** |
+| An OpenCode tab sitting `contaminated:true` with `latch:"open"` admits every local tool — the plugin's gate reads only `st.latch` | **F-13 — reached live 2026-08-11. DECIDED, not yet coded:** refuse the **web** direction only, on `contaminated && latch === "open"`, via a **third** refusal constant. Its fix depends on `flip_local` continuing to keep the bit |
+| The documented "one byte into `.cimp-discovery/<pid>.json`" repro does **not** force the headless fallback — there are **two** discovery paths and the legacy one still resolves, so following the doc literally yields a **false PASS** | **F-26 — raised 2026-08-11** (recipe 17). Same class as O-1 / F-21: a claim that does not hold as stated |
+| One `Write` of a discovery file steers which instance answers **and** the error story told about it | **F-11 — DECIDED 2026-08-11, not yet coded:** liveness-verified selection, and `HttpStatus`/`Unparseable` stop falling back |
+| …and the sharper consequence of the same primitive: it **silently disarms the native-web taint beacon** (recipe 12's whole surface), fail-open by design | **F-28 — raised 2026-08-11.** Its own row on purpose, fixed in the F-11 pass, so the beacon-disarm case is re-tested by name rather than assumed covered. **If recipe 12's sensor legs mysteriously produce no beacon, check the discovery files before filing anything** |
+| `record_secret_screen_flag` / `unattributed_write` rows claim `Headless` — a **positive** "there was no tab behind this" — for rows whose tab merely was not threaded | **F-29 — raised 2026-08-11.** F-20's shape, different producer, and a *false* statement rather than a missing one. Deliberately outside the F-20/F-16 pass |
+| The signature scan's timeout is wall clock across both passes, and the dependency `ceil()`s it against a 1 Hz heartbeat so a 1 s pass has a **zero** guaranteed floor | **F-9 / F-9b — DECIDED 2026-08-11, not yet coded** (`SCAN_PASS_TIMEOUT` = 2 s **per pass**; worst case 1 s → 4 s). This is the mechanism behind the two `signature::tests` flakes listed in setup — **do not chase them as regressions** |
+| A truncated scan that happened to find something reports as a **complete** scan (`Hits ⊕ DidNotComplete = Hits`) | **F-9a — raised 2026-08-11, open.** Narrowed but not closed by F-9's fix; still reachable through the hits-only `scan_with` used by `graph::secrets` and the updater gauntlet |
+| A tag whose tree touches only `detection/`, `themes/` or `palettes/` is untested **and** runless — no `paths:` filter covers them | **F-30 — raised 2026-08-11** by the release-gate work (`fdb29f1`). The new `gate-tests` job correctly **fails** such a tag; the real fix is in `tests.yml`. Related and also correct-but-surprising: only the **head** of a push gets a Tests run, so tagging a mid-push commit fails the gate |
+| "The worker withholds defs, the proxy refuses the call" is only half true: defs are withheld under a **declared** profile, but in latch-on-first-use mode the worker keeps the defs and is refused at the gate | **F-21 — FIXED (docs) 2026-08-11**; kept here because the *spec's* older phrasing is quoted in places this file does not control |
 | A cloned repo's `opencode.json` is executed configuration | **H-7 — open, largely V33** |
+
+### Fixed during the 2026-08-11 fix phase — expect the NEW behaviour, and do not "correct" it back
+
+The other half of the same job: a tester working from the rows above would file the
+**fix** as a defect. Each of these was a known-open row until 2026-08-11.
+
+| what you'll now see | was | id / commit |
+|---|---|---|
+| The override popover **live-updates** while open — a tab that becomes contaminated updates under the cursor (it is `$derived` off the store the badge already polls, on the app-wide 4 s tick) | it rendered a click-time snapshot and kept saying "Not latched." | **M-22 — FIXED `220dce6`** |
+| **Promote** is the danger-coloured **two-step** (`Promote…` → warning → "Yes, promote into memory"); **Discard** is a plain two-step (`Discard…` → "Yes, discard permanently"). One armed confirmation at a time | Promote was one unconfirmed click; Discard sat behind a browser `confirm()` | **M-23 — FIXED `220dce6`.** A one-click Promote is now the regression |
+| One `StatusChip` in **both** feeds with **12** statuses — `denied` (the only red, the only "we blocked something"), `flagged`, `unscreened` (dashed, not an alarm), `held`, `engaged`, `granted`, `update`, `rejected`, `recorded`, `ok`, `failed`, `signal` | everything collapsed into one red chip, so "we did not look at all of it" read as "we blocked something" | **M-24 — FIXED `220dce6`.** Also fixed in passing: an `updater` row is matched on **source before `ok`**, so a rejected bundle no longer reports as a blocked tool call |
+| The quarantine card leads with the **rule/screen line above** the note text, and its intro names **all three** causes | it showed the secret **value** and withheld the **rule name** — decision 22 inverted | **F-24 — FRONTEND FIXED `220dce6`; BACKEND OWED.** So every held note currently reads *"Reason not recorded — this build does not store which screen or rule held this note."* **That is expected, not a bug** |
+| A **full unlatch clears contamination** — `contaminated:false`, `can_clear:false`, a `contamination_cleared` row with basis `unlatch`, prior rows and Timeline entries intact. `flip_local` still keeps the bit | the bit survived every override, so an unlatched tab could read `contaminated:true, can_clear:true` | **decision 15's amendment — CODED `e4513b5`.** Recipe 13's Full-unlatch box was reset for it |
+| `run_check` is **refused to a remote/cloud offload backend** unless *Settings → Checks → Offload worker access* is ticked | it was advertised to a cloud backend and executed the project's commands | **F-12 — FIXED `00ae3cb` + `049fb8b`.** New block after recipe 2. ⚠ Its refusal string names *"Settings → Code Intelligence → Checks"*, which **does not resolve** — that is **F-18**'s sixth site, left knowingly |
+| The *Settings → Checks* exposure line reads `offload worker ✓ (local worker only)` when the opt-in is off, and the *"web/docs only"* preset recognizes the **7**-entry exclusion | the line claimed `offload worker ✓` unconditionally, and `scopeMode()` matched on array **length**, so a migrated install rendered as "custom" and clicking the radio silently dropped `run_check` | **F-27 — FIXED `049fb8b`.** The Rust-side `include_str!` mirror tripwire is still owed |
+| A price row for `claude-opus-5`, and existing installs backfilled by a watermark migration | session cost read $0 | **F-19 — FIXED `1524efa`** |

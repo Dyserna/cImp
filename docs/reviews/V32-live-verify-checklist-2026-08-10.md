@@ -1140,29 +1140,163 @@ beacon is *accepted* and the second check passes for the wrong reason.
 <token>` from `<exe-dir>/.cimp-offload.json`; port 49344, pid 62216 that run).
 
 ### 14 — enable hierarchy (decision 16)
-- [ ] Global master **OFF**: a seeded injection page in a Claude tab arrives
+- [x] Global master **OFF**: a seeded injection page in a Claude tab arrives
       unwrapped and unflagged, `graph_snippet` still answers after it, and a
       `context_note` under a would-be-latched session stores **clean** —
       pre-V32 behaviour at every layer at once.
-- [ ] Master back **ON**: the same sequence latches, envelopes and quarantines
+      **PASS 2026-08-11.** Driven over `/mcp/call` + `/graph_run` against a
+      **freshly reopened** tab (`ai-861e08c3-d280-45b0-8888-f4edac24f5c6`), master
+      off confirmed by `/status` → `"protection":false,"reduced":true`. Fetch of
+      `01-instruction-override.txt` returned the page text **bare** — no
+      `SECURITY WARNING` line, no `BEGIN/END UNTRUSTED-DATA` markers, no
+      envelope. `graph_snippet symbol=compile_report` **still answered**
+      (`signature.rs:704-738`) after that external fetch. `context_note pin=true`
+      returned exactly `"Noted (pinned, kept across sessions)."` — no quarantine
+      notice. The tab acquired **no latch row at all** in `/status`.
+- [x] Master back **ON**: the same sequence latches, envelopes and quarantines
       again **with no restart** (only native-web visibility, consumer hygiene
       and the Phase H gate need the restart the hint asks for).
-- [ ] Master ON, taint latch OFF app-wide, one tab's override `On` → that tab
+      **PASS 2026-08-11.** `/status` → `"protection":true,"reduced":false`; the
+      identical three calls re-run on the **same tab, no restart, no respawn**:
+      fetch came back with the `SECURITY WARNING — … (signature + classifier)`
+      header **and** the `UNTRUSTED-DATA` envelope; `graph_snippet` returned
+      `REFUSED (security boundary)`; `context_note` returned
+      `Noted (pinned…). ⚠ QUARANTINED (security boundary)`. The registry gained
+      `tab:ai-861e08c3-… latch:external contaminated:true`. **All three layers
+      are live-reconfigurable — the master is genuinely not spawn-baked.**
+      *(Route note: `context_note` is served by `/graph_run`, not `/mcp/call` —
+      `/mcp/call` answers "tool `context_note` is not available to Claude Code".
+      Also `?consumer=` does **not** open a fresh latch row: the latch is keyed
+      per tab and `/status` reports the tab's configured consumer regardless, so
+      a fresh **unlatched** subject requires reopening the tab, not renaming the
+      consumer. `?consumer=` still gives a fresh fetch budget and SSRF ledger.)*
+- [x] Master ON, taint latch OFF app-wide, one tab's override `On` → that tab
       latches, a second does not, and `/status` names which level decided each.
+      **PASS 2026-08-11.** Setup: *Taint latch* app-wide checkbox unticked,
+      `v32ClaudeTestTab` L3 → `On`, OpenCode left at Inherit; the subject tab was
+      reset with **Full unlatch** rather than reopened, because per-tab overrides
+      are keyed to the tab id and a reopen discards them.
+      Override tab (`claude`/`ai-861e08c3-…`): fetch → `latch:"external"`,
+      `graph_snippet` → `REFUSED (security boundary)`.
+      Inherit tab (`opencode`/`opencode`): the same fetch left `latch:"open"` and
+      `graph_snippet` **answered**.
+      `/status` names the level for each: the override tab reads
+      `decided_by:"scope", override_value:"on"`; `claude`, `opencode` and
+      `offload-worker` all read `decided_by:"feature"`.
+      **⚠ HARNESS TRAP, cost one false PASS — the two gated routes learn the
+      consumer from DIFFERENT places** (`loopback.rs:966-971`): `/mcp/call` reads
+      the `?consumer=` **query**, `/graph_run` reads a `consumer` field in the
+      **body** and *"Defaults to Claude when absent"* (`GraphRunBody`,
+      `:922-926`). Passing `?consumer=opencode` to `/graph_run` is silently
+      ignored, so the fetch latched `(opencode, opencode)` while the graph read
+      asked `(claude, opencode)` — a second registry row for the same tab — and
+      `graph_snippet` answered for the wrong reason. The doc comment names this
+      exact failure (*"or its web fetches and its graph reads would latch two
+      separate scopes"*). Re-run with the consumer in the **body** to score it.
+      This is [F-4](#) realized live — `(consumer, tab)` is a verified pair on no
+      route — not a new finding.
+      *(Side observation, expected: **Full unlatch left `contaminated:true`.**
+      Decision 15's amendment — full unlatch clears contamination — is confirmed
+      still uncoded. `can_clear` stayed `true` afterwards.)*
 
 Extended 2026-08-08 — four consumers the above does not reach:
-- [ ] **The updater scheduler follows `Feature::Detection`, not L1** (decisions
+- [~] **The updater scheduler follows `Feature::Detection`, not L1** (decisions
       19–20): protection ON + *Injection detection* OFF → `tick_once` makes no
       request, and Check now / Apply / Revert are refused **by the IPC command**,
       not merely greyed out (invoke `detection_check_now` directly).
-- [ ] **An identity-less call honours a per-tab `On` (N-1):** taint latch OFF
+      **PARTIAL 2026-08-11.** Live setup: master ON, *Injection detection*
+      unticked → `/status` `"protection":true, "reduced":true` with `detection`
+      `effective:false` at every scope.
+      **What PASSED live — the switch really reaches the scanner.** The hostile
+      fixture fetched through `/mcp/call` came back with the `UNTRUSTED-DATA`
+      envelope **and no `SECURITY WARNING` header at all** (grep count 0), where
+      the identical fetch under detection ON carries
+      *"flagged the external content below (signature + classifier)"*. Detection
+      and spotlighting are independently switchable exactly as decision 16
+      requires — and this is the first run that separates the two layers recipe
+      3 verified together.
+      **What could NOT be run: the IPC-refusal leg. "Check now" is greyed out**,
+      so the refusal inside the command is unobservable from the UI, and IPC is
+      not reachable from the shell. Source-verified instead:
+      `detection_check_now` and `detection_revert` both call `updates_allowed`
+      **before any work** (`ipc/commands.rs:1225`, `:1251`), which delegates to
+      the same `updater::updates_enabled` the scheduler tick uses — *"one
+      predicate, so a button and a tick can never disagree"* (`:1263-1266`), and
+      it returns `Err`, deliberately, because *"a security control that does
+      nothing when clicked, and says nothing about it, teaches the user to
+      distrust it"*. **Still owed:** invoke `detection_check_now` directly (a
+      devtools console in the Settings window, or a test-only hook) and confirm
+      `tick_once` issues no request.
+      **⚠ F-18 HAS A FIFTH SITE, AND IT IS IN RUST.** That refusal string tells
+      the user to go to **"Settings → Tools → Injection protection"**
+      (`ipc/commands.rs:1276-1279`) — the section that does not exist. F-18's
+      recorded evidence lists `TaintMenu.svelte:226`, the spec's recipes and four
+      `latch.ts` tooltips, all frontend. **The proposed tripwire — "assert every
+      `Settings → X` literal in `src/lib/` names a real entry in `SECTIONS`" —
+      would not catch this one**, because it lives in `src-tauri/`. The tripwire
+      must cover backend user-facing strings too, or F-18 regresses through the
+      half nobody is scanning.
+- [x] **An identity-less call honours a per-tab `On` (N-1):** taint latch OFF
       app-wide, one tab's L3 `On`, a proxied call carrying **no** `--tab` →
       resolves **protected**, not fail-open. Control: with no tab stating `On`,
       the same call is unprotected.
-- [ ] **The reduced-protection count is one rule:** turn off exactly one control
+      **PASS 2026-08-11, both legs — but run against `memory_quarantine`, NOT
+      `taint_latch`, and that substitution is the point.** An identity-less call
+      resolves `LatchScoping::Anonymous`, which is *"fail-open everywhere"* and
+      creates **no latch row at all** (`loopback.rs:1194`), so the taint latch has
+      nothing to engage and N-1's elevation of it has **no observable consumer on
+      this path**. Confirmed live: with taint latch off app-wide and one tab
+      stating `On`, an anonymous fetch → anonymous `graph_snippet` pair left the
+      snippet **answering**. The elevation's real consumer is the *other* switch
+      — `unattributed_write` is *"deliberately not gated on `policy.latch`… only
+      on `policy.quarantine`"* (`loopback.rs:2356-2361`), and `GatePolicy::resolve`
+      maps a `None` scope to `Scope::App` (`:1997-2005`), which is precisely where
+      `decide` applies `any_tab_override_on` (`injection.rs:678-686`).
+      So the decisive pair, with *Memory quarantine* **off app-wide**:
+      · one tab's L3 `On` → app row `effective:true, decided_by:"scope",
+      override_value:"inherit"`; anonymous `context_note pin=true` came back
+      **`⚠ HELD FOR REVIEW (unattributed write)`**.
+      · that tab back to `Inherit` → app row `effective:false,
+      decided_by:"feature"`; the **identical** call returned exactly
+      `"Noted (pinned, kept across sessions)."` — stored **clean**.
+      Nothing else changed between the two, so the hold is attributable to the
+      single per-tab `On` and nothing else.
+      *(`/status`'s app row reading `decided_by:"scope"` while its own
+      `override_value` is `"inherit"` looks self-contradictory but is documented
+      N-1 behaviour — `DecidedBy::Scope` at `Scope::App` means "a narrower scope's
+      `On` is being honoured here", and the honest alternative `Feature` would
+      claim L2 said `on` when it said `off` (`injection.rs:648-654`). Do not
+      re-raise it.)*
+      *(Also observed, expected and separate: the anonymous fetch was still
+      **enveloped** — spotlighting resolves at `Scope::App` independently.)*
+- [x] **The reduced-protection count is one rule:** turn off exactly one control
       on one scope → the ⛨ tooltip and the tab badge agree; the count is of
       **distinct controls**, not scope×feature pairs; a default-off control at
       its default (the Phase H gate on a fresh install) is **not** counted.
+      **PASS 2026-08-11 (distinct-controls clause live; Phase-H clause
+      structural).** With *Taint latch* off app-wide and one tab overriding it
+      back on, `/status` carried the reduced row at **three** scopes
+      (`claude`, `opencode`, `offload-worker` — each
+      `effective:false, in_scope:true, default_on:true`) and the status-bar ⛨
+      chip read, verbatim:
+      **"Injection protection is reduced - 1 control switched off. click to open
+      settings"** — **1, not 3.** `reducedCounts` keys a `Set` on `f.feature`
+      across every scope (`latch.ts:285-301`), which is the rule.
+      The **default-off clause is settled by construction, not by a live toggle**:
+      `isReducedRow` is `f.in_scope && !f.effective && f.default_on`
+      (`latch.ts:235-237`), so a control with `default_on:false` can never be a
+      reduced row at any effective value. Not exercised live because this install
+      has `opencode_native_gate` switched **on** (`effective:true,
+      default_on:false`) — i.e. above its default, which is the other side of the
+      same rule and correctly also uncounted.
+      **Residual, unrun:** the "⛨ tooltip and the tab badge agree" half. Asked
+      for the tab badge and got the **latch/contamination** sentence instead
+      (`v32ClaudeTestTab` → *"this session has used web…"*; OpenCode → *"this
+      session has read external content…"*), which is a different string from
+      `reducedTabLine` (`latch.ts:411`). Worth noting on its own: the **OpenCode
+      tab showed a contamination badge while its latch was `open`** — the
+      contaminated-but-not-EXTERNAL state, which is exactly **F-13**'s shape,
+      reached live for the first time.
 - [ ] Break `injection_status` (stop the backend mid-poll) → after three
       consecutive failures the chip reads `⛨ unknown` and both poll failures
       `console.warn`; it must **never** render as fully protected.

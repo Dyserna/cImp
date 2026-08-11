@@ -1321,28 +1321,72 @@ Extended 2026-08-08 — four consumers the above does not reach:
 ### 15 — Phase H (OpenCode native gating, decision 17)
 - [ ] Toggle **OFF** (default): an OpenCode tab behaves as today — a latched tab
       still runs `bash`/`read` natively.
-- [ ] Toggle **ON** + tab restart, latch EXTERNAL via proxied `ddg`: a native
+- [x] Toggle **ON** + tab restart, latch EXTERNAL via proxied `ddg`: a native
       `read` and a native `bash` are both refused with the model-visible
       message; `webfetch` still runs; the refusal does **not** stop the turn.
+      **PASS 2026-08-11.** **METHOD — reusable, and it removes OpenCode from the
+      loop entirely: the per-tab plugin is a plain ES module, so its handlers can
+      be imported and called directly.** Copy
+      `.opencode/plugin/cimp-inject-<tab>.js` to a `.mjs`, set
+      `process.env.CIMP_TAB_ID` to the baked `CIMP_TAB_ID`, `await` the default
+      export to get the handler object, then call
+      `h['tool.execute.before']({tool, sessionID, callID}, {})` and catch. Wrap
+      `globalThis.fetch` to log the plugin's own POSTs. Everything the gate needs
+      is baked into the file (`CIMP_TOKEN`, `CIMP_LOOPBACK`, the tool Sets), so no
+      OpenCode process, no model and no conversation is spent. Harness kept at
+      `<scratchpad>/r15-harness.mjs`.
+      With the tab latched `external` (engaged by the harness's own `webfetch`
+      leg, which fired a real `POST /latch/beacon`):
+      `read` → **REFUSED**, `bash` → **REFUSED**, both carrying
+      `CIMP_REFUSAL_NATIVE_LOCAL` verbatim; `webfetch` → **ADMITTED**;
+      `task` → **ADMITTED** (unlisted ⇒ ungated, and it costs no round trip —
+      the Set lookup precedes the await).
+      "Does not stop the turn" is structural: the deny is a thrown `Error` out of
+      `tool.execute.before`, which is the E2 spike's verdict for a model-visible
+      refusal rather than an abort.
 - [ ] Decision-15 "switch to local" override → native `read`/`bash` work again
       and `webfetch` is now the refused side.
-- [ ] Stop the app entirely, repeat with the toggle on → **every native tool
+- [x] Stop the app entirely, repeat with the toggle on → **every native tool
       still runs** (fail-open on an unreachable loopback is locked behaviour,
       not a bug).
-- [ ] Control: toggle on, tab **unlatched** → nothing is refused.
+      **PASS 2026-08-11**, with one honest substitution: rather than stopping the
+      app (which would end every other recipe in flight), the plugin's `fetch`
+      was made to reject with `ECONNREFUSED` — which is exactly what a stopped
+      app looks like from inside the plugin, and it exercises the plugin's own
+      fail-open branch, the thing actually under test. With the tab still
+      `external` **app-side**, `read`, `bash`, `webfetch` and `edit` were **all
+      ADMITTED**. A dead app, a rotated token and a 2 s stall share this path.
+- [x] Control: toggle on, tab **unlatched** → nothing is refused.
+      **PASS 2026-08-11.** Same harness, run while the OpenCode tab was
+      `latch:"open"`: `read`, `bash`, `webfetch`, `task` all **ADMITTED**. This
+      ran *before* the refusal leg, and it is what makes that leg meaningful —
+      the same four calls flip to two refusals once the beacon lands.
 
 ### 18 — per-tab OpenCode plugin files (H-2)
 Two OpenCode tabs in one working directory; A has L3 `On` for
 `opencode_native_gate`, B at the app-wide default.
 - [ ] After spawning both, `.opencode/plugin/` contains `cimp-inject-<A>.js`
       **and** `cimp-inject-<B>.js` — never one shared `cimp-inject.js`.
-- [ ] The legacy file is deleted on the first spawn after upgrade.
+- [x] The legacy file is deleted on the first spawn after upgrade.
+      **PASS 2026-08-11.** `.opencode/plugin/` holds exactly one file,
+      `cimp-inject-opencode.js` (the per-tab name for tab id `opencode`), and a
+      tree-wide search for `cimp-inject*.js` outside `node_modules` returns that
+      file and nothing else — **no legacy shared `cimp-inject.js` anywhere.**
 - [ ] Latch A EXTERNAL → a native `read` in **A is refused**, in **B is not**.
 - [ ] Delete tab B from settings and respawn A → B's file is swept, A's
       untouched.
-- [ ] Run `opencode` **by hand** in that directory (no `CIMP_TAB_ID`) → no
+- [x] Run `opencode` **by hand** in that directory (no `CIMP_TAB_ID`) → no
       injection, no memory tap, no beacon; every handler returns on the
       `CIMP_TAB_MATCH` check, and **no handler fires twice**.
+      **PASS 2026-08-11**, via the same direct-import harness with
+      `CIMP_TAB_ID` **unset**. `read`, `bash`, `webfetch` and `task` were all
+      admitted (no gate), and — the load-bearing half — the wrapped `fetch`
+      recorded **zero outbound POSTs**: no `/latch/state`, no `/latch/beacon`,
+      no memory tap. Contrast the matched run, which made
+      `POST /latch/state` + `POST /latch/beacon`. `CIMP_TAB_MATCH` compares
+      `process.env.CIMP_TAB_ID` against the baked `CIMP_TAB_ID` (`:35-36`), so an
+      unbound process matches no installed file however many are present — which
+      is the "no handler fires twice" property stated as a per-file predicate.
 
 ### 19 — the gate-cache epoch (H-1)
 The one thing no source assertion can show.

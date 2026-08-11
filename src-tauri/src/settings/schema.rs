@@ -1735,6 +1735,14 @@ pub struct OffloadSettings {
     /// exfiltration staging, not to ration research. `0` disables the count
     /// half entirely.
     ///
+    /// #48/M-1: "a worker task" means the whole `offload_task` — **including** its
+    /// connection fail-over, its `thinking:on → auto` retry and its tier
+    /// escalation, which are attempts at one task and share one budget
+    /// (`agent::TaskScope`). Until that fix each attempt built its own, so this
+    /// number was really up to four times itself. The documented cap is now the
+    /// enforced cap; the cost is that a task which spent most of its allowance on
+    /// a fast-tier attempt escalates with what is left.
+    ///
     /// Additive `#[serde(default)]` — old settings files round-trip with the
     /// default cap. No schema-version bump (the V8/V16/V23 precedent for a
     /// plain additive field).

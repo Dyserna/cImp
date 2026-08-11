@@ -1117,6 +1117,15 @@ impl OffloadService {
         let run_started = now_ms();
         self.run_begin(&backend_name, run_id, &instructions, thinking);
         let mut trace = RunTrace::default();
+        // #48 (finding M-1): ONE scope for this whole `offload_task` — its
+        // EXTERNAL budget, its `injection_flag` scope id, its latch-refusal claim
+        // and its SSRF/unscreened ledger. Constructed HERE, *outside* the
+        // fail-over / thinking-retry / escalation ladder below, because each of
+        // those enters `run_on` again: a budget rebuilt per attempt was a cap the
+        // task could reset simply by failing (the documented 40 calls / 4 MiB was
+        // really up to 160 / 16 MiB), and a scope id minted per attempt scattered
+        // one task's audit rows across four uncorrelatable ids.
+        let mut task_scope = agent::TaskScope::for_task();
 
         // First attempt with the requested thinking mode.
         let first = self
@@ -1133,6 +1142,7 @@ impl OffloadService {
                 overall_deadline,
                 Some(&mut trace),
                 &cancel,
+                &mut task_scope,
             )
             .await;
 
@@ -1169,6 +1179,7 @@ impl OffloadService {
                             overall_deadline,
                             Some(&mut trace),
                             &cancel,
+                            &mut task_scope,
                         )
                         .await
                     }
@@ -1209,6 +1220,7 @@ impl OffloadService {
                     retry_deadline,
                     Some(&mut trace),
                     &cancel,
+                    &mut task_scope,
                 )
                 .await;
             recovered = result.is_ok();
@@ -1264,6 +1276,7 @@ impl OffloadService {
                         esc_deadline,
                         Some(&mut trace),
                         &cancel,
+                        &mut task_scope,
                     )
                     .await;
                 // The escalation's agent loop numbers its calls from step 0 again;
@@ -1424,6 +1437,11 @@ impl OffloadService {
 
     /// Run the agent loop against one chosen backend: acquire its slot,
     /// build the host-aware scoped router, and drive [`agent::run`].
+    ///
+    /// **This is ONE attempt at the task, not the task** (#48/M-1). [`Self::run`]
+    /// calls it up to four times — fail-over, the thinking retry, tier escalation
+    /// — which is why `scope` is borrowed from the caller and nothing per-task is
+    /// built in here.
     #[allow(clippy::too_many_arguments)]
     async fn run_on(
         &self,
@@ -1441,6 +1459,9 @@ impl OffloadService {
         deadline: Instant,
         trace: Option<&mut RunTrace>,
         cancel: &CancellationToken,
+        // #48/M-1: this task's shared budget / scope id / audit ledger, minted
+        // once by the caller outside the retry ladder. Borrowed, never built here.
+        scope: &mut agent::TaskScope,
     ) -> AppResult<String> {
         let slot_timeout = deadline.saturating_duration_since(Instant::now());
         let _slot = entry.handle.acquire_slot(slot_timeout).await?;
@@ -1496,12 +1517,16 @@ impl OffloadService {
             native_defs.extend(tools::audit_tools::defs());
         }
         let mcp_defs = self.host.tool_defs_for_offload().await;
-        // V32 Phase C: one scope id for this run, shared by the router (whose
-        // SSRF rows the shared chokepoint writes) and the loop (whose budget /
-        // canary / latch rows it writes), so every `injection_flag` row from
-        // this task correlates. The SSRF carve-out policy is snapshotted here
-        // beside the tool surface, from the same settings read.
-        let task_scope = outbound::new_task_scope();
+        // V32 Phase C: one scope id, shared by the router (whose SSRF rows the
+        // shared chokepoint writes) and the loop (whose budget / canary / latch
+        // rows it writes), so every `injection_flag` row from this task
+        // correlates. #48/M-1: it is the TASK's id and it arrives in `scope` —
+        // minting it here made it the *attempt*'s, so fail-over, the thinking
+        // retry and tier escalation each wrote under a different scope and a
+        // reader could not tell they belonged to one `offload_task`. The SSRF
+        // carve-out policy is still snapshotted here beside the tool surface,
+        // from the same settings read.
+        //
         // #48/M-5: ONE reading of the result cap for both the loop (which
         // truncates with it) and the router (which tells the detection boundary
         // how much of a result the model will actually see). Two readings of
@@ -1514,7 +1539,7 @@ impl OffloadService {
             ctx,
             self.host.clone(),
             gate,
-            task_scope.clone(),
+            scope,
             outbound::Policy::from_settings(&cur, WORKER),
             super::detection::Config::from_settings(&cur, WORKER),
             crate::settings::injection::effective(
@@ -1534,7 +1559,6 @@ impl OffloadService {
             per_tool_result_token_cap: result_cap_tokens,
             auth_token: entry.auth_token.clone(),
             per_call_timeout: Duration::from_secs(snap.offload_timeout_secs.max(30)),
-            task_scope,
             // V32 Phase G: every worker-side control resolves at the
             // `offload-worker` pseudo-scope, from the SAME settings snapshot as
             // the policy and detection config above — one task, one posture, for
@@ -1558,7 +1582,17 @@ impl OffloadService {
             schema,
             profile,
         };
-        agent::run(&self.client, &cfg, &router, task, deadline, trace, cancel).await
+        agent::run(
+            &self.client,
+            &cfg,
+            &router,
+            task,
+            deadline,
+            trace,
+            cancel,
+            scope,
+        )
+        .await
     }
 
     /// Resolve the enabled backend pool from live state: live local handles

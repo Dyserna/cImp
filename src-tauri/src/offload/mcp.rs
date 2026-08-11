@@ -2198,6 +2198,13 @@ async fn run_on_backend(
             all,
         ),
     );
+    // #48/M-1: ONE scope for both attempts of this child run. The `thinking`
+    // retry below is a second `agent::run`, so a per-call budget/scope id was
+    // exactly the reset the app path had. This router is a `NativeRouter` (no MCP
+    // host ⇒ no EXTERNAL tool is reachable) so the budget is inert here **today**
+    // — threaded anyway, because "inert today" is how finding F-10 happened, and
+    // because the app path and this one must not drift.
+    let mut task_scope = agent::TaskScope::for_task();
     let cfg = AgentConfig {
         base_url: backend.base_url.clone(),
         model: None,
@@ -2212,8 +2219,8 @@ async fn run_on_backend(
         // MCP host, so no EXTERNAL tool is reachable and the budget is inert
         // here. It is still filled from the user's settings rather than a
         // hardcoded value, so the two paths can never disagree if this one ever
-        // grows a host.
-        task_scope: crate::offload::outbound::new_task_scope(),
+        // grows a host. (#48/M-1: the scope id that used to sit on this struct is
+        // now `task_scope` above, threaded into both attempts.)
         // V32 Phase G: resolved at the `offload-worker` pseudo-scope, like the
         // in-app path, so the master switch reaches this fallback too.
         external_budget: crate::settings::injection::budget_limits(
@@ -2247,7 +2254,17 @@ async fn run_on_backend(
     // slot gate (acquire is infallible; the semaphore is never closed).
     let _permit = CHILD_GATE.acquire().await.expect("CHILD_GATE never closed");
     // The headless child path doesn't feed the dashboard run log → no trace.
-    let first = agent::run(client, &cfg, &router, task, deadline, None, &cancel).await;
+    let first = agent::run(
+        client,
+        &cfg,
+        &router,
+        task,
+        deadline,
+        None,
+        &cancel,
+        &mut task_scope,
+    )
+    .await;
     // Mirror the app's On→Auto retry: a `thinking:on` run that produced no
     // answer (the model spent its output budget thinking) gets one more shot
     // with `auto`. Without this, the degraded child path surfaces a hard error
@@ -2262,7 +2279,19 @@ async fn run_on_backend(
                 profile,
             };
             let deadline = Instant::now() + Duration::from_secs(secs);
-            agent::run(client, &cfg, &router, task, deadline, None, &cancel).await
+            // #48/M-1: the SAME `task_scope` — this retry is a second attempt at
+            // one task, not a new task.
+            agent::run(
+                client,
+                &cfg,
+                &router,
+                task,
+                deadline,
+                None,
+                &cancel,
+                &mut task_scope,
+            )
+            .await
         }
         other => other,
     };

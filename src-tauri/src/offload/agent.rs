@@ -158,6 +158,108 @@ impl ToolRouter for NativeRouter {
     }
 }
 
+/// The state whose scope is one **task**, not one attempt at it (#48, M-1).
+///
+/// `Service::run` may drive [`run`] up to **four** times for a single
+/// `offload_task` — the first attempt, one connection-failure fail-over, the
+/// `thinking:on → auto` retry, and one tier escalation — and the headless child
+/// path (`mcp.rs`) twice. Everything in here used to be a local of
+/// [`run_inner`], a field of [`AgentConfig`] or a field of the per-attempt
+/// [`HostRouter`], so every attempt started over: the documented 4 MiB /
+/// 40-call EXTERNAL cap was really 8 MiB / 80 on a default install and
+/// 16 MiB / 160 with fail-over configured, and the two "ONE row per task"
+/// claims wrote one row per *attempt*, each under a different `task_scope` id
+/// no reader could correlate.
+///
+/// Deliberately **not** `Copy` and **not** `Clone`. [`Budget`] is `Copy`, which
+/// is how the old shape could be forked at any call boundary without anyone
+/// noticing; the only thing this type permits is `&mut`, so "the cap resets
+/// itself" is a compile error rather than a review finding. For the same reason
+/// the scope id lives here and nowhere else — `AgentConfig` used to carry its
+/// own `String` copy, which is a second place a fresh id could be minted — and
+/// [`HostRouter::new`] takes a `&TaskScope` rather than an id plus a ledger, so
+/// an attempt's router cannot describe a different task than the loop it serves.
+///
+/// **What is deliberately NOT in here: the taint [`Latch`].** Each attempt
+/// builds a fresh conversation from the same clean `instructions`/`context`
+/// (`Convo::new` in [`run_inner`], from a `context.clone()` the ladder never
+/// overwrites with a previous answer), so **no contaminated byte crosses an
+/// attempt boundary** and a re-opened latch is the honest state of a genuinely
+/// new conversation. Hoisting it would refuse tools to a conversation that never
+/// touched the class. The *report* bit (`latch_flagged`) does cross, because it
+/// is a claim about the task's audit rows, not about containment.
+pub struct TaskScope {
+    /// The scope id every `injection_flag` row for this task carries. Minted
+    /// once per task so fail-over, retry and escalation rows correlate.
+    id: String,
+    /// Which attempt is running (1-based), for the run log only.
+    attempt: u32,
+    /// This task's cumulative EXTERNAL spend, charged across every attempt.
+    budget: Budget,
+    /// Whether this task's ONE taint-latch refusal row has been written.
+    latch_flagged: bool,
+    /// The SSRF-denial + unscreened-content claim ledger, shared with every
+    /// attempt's router (see [`HostRouter`]'s `audit` field).
+    audit: std::sync::Arc<super::outbound::TaskAudit>,
+}
+
+impl TaskScope {
+    /// One task's scope. Call this exactly once per `offload_task`, **outside**
+    /// the fail-over / retry / escalation ladder — that is the whole point of
+    /// the type, and `only_the_task_entry_points_mint_a_task_scope` watches the
+    /// three entry points for a second mint site.
+    pub fn for_task() -> Self {
+        Self {
+            id: super::outbound::new_task_scope(),
+            attempt: 0,
+            budget: Budget::default(),
+            latch_flagged: false,
+            audit: std::sync::Arc::new(super::outbound::TaskAudit::default()),
+        }
+    }
+
+    /// The scope id for this task's `injection_flag` rows.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// A handle to this task's claim ledger, for the attempt's router.
+    pub fn audit(&self) -> std::sync::Arc<super::outbound::TaskAudit> {
+        std::sync::Arc::clone(&self.audit)
+    }
+
+    /// Open the next attempt and return its 1-based number.
+    fn begin_attempt(&mut self) -> u32 {
+        self.attempt = self.attempt.saturating_add(1);
+        self.attempt
+    }
+
+    /// Whether a new EXTERNAL call may start under `limits`. This is the loop's
+    /// own decision, exposed as a method so a test drives the same code path
+    /// rather than a re-implementation of it.
+    fn external_allowed(&self, limits: outbound::BudgetLimits) -> bool {
+        !self.budget.exhausted(limits)
+    }
+
+    /// Charge one completed EXTERNAL call and the bytes it PULLED (pre-cap —
+    /// see #48/D-3 at the charge site). `pulled == 0` still costs a call:
+    /// "empty is not absent", and a worker looping empty-but-parseable results
+    /// must reach the cap like any other.
+    fn charge_external(&mut self, pulled: usize) {
+        self.budget.charge(pulled);
+    }
+
+    /// Claim this task's ONE budget-exhaustion row. `true` exactly once.
+    fn claim_budget_row(&mut self) -> bool {
+        self.budget.claim_flag()
+    }
+
+    /// Claim this task's ONE taint-latch refusal row. `true` exactly once.
+    fn claim_latch_row(&mut self) -> bool {
+        !std::mem::replace(&mut self.latch_flagged, true)
+    }
+}
+
 /// V8-03 host-aware router: the native baseline **plus** the warm MCP host's
 /// namespaced tools, all filtered through the chosen backend's [`ToolScope`].
 /// The merged tool surface is computed once at construction (the warm pool is
@@ -177,7 +279,10 @@ pub struct HostRouter {
     /// re-gates exist (#48, finding F-10).
     gate: BackendGate,
     /// V32 Phase C: the contaminated scope this router serves (one worker
-    /// task), for the `injection_flag` rows the shared chokepoint writes.
+    /// task), for the `injection_flag` rows the shared chokepoint writes. Copied
+    /// out of the task's [`TaskScope`] in [`HostRouter::new`] — never minted here
+    /// and never read from settings, so an attempt's rows cannot land under an id
+    /// the loop's rows do not share (#48/M-1).
     task_scope: String,
     /// V32 Phase C: the SSRF screen's carve-out set (the user's own configured
     /// endpoints), snapshotted for the run alongside the tool surface.
@@ -191,11 +296,17 @@ pub struct HostRouter {
     /// the same settings read, for the same reason: one task, one posture.
     spotlight: bool,
     /// #48: this task's audit-row claim bits — the SSRF denial counter and the
-    /// unscreened-content bit. Owned outright because the router's lifetime IS
-    /// the task's, which is the scope both rows are keyed to. (The proxy's
-    /// equivalent rides the tab's `Budget`, where a session rotation resets
-    /// it.)
-    audit: super::outbound::TaskAudit,
+    /// unscreened-content bit. **Shared** with every *other* attempt at the same
+    /// task, through [`TaskScope::audit`].
+    ///
+    /// #48/M-1: this field used to be `TaskAudit` owned outright, and the comment
+    /// here used to justify that with *"the router's lifetime IS the task's"*.
+    /// That sentence was false — the router is rebuilt per **attempt**, and
+    /// `Service::run` makes up to four attempts at one `offload_task` — which is
+    /// precisely how the SSRF doubling ledger and the once-per-scope unscreened
+    /// bit came to restart up to four times per task. (The proxy's equivalent
+    /// rides the tab's `Budget`, where a session rotation resets it.)
+    audit: std::sync::Arc<super::outbound::TaskAudit>,
     /// #48/M-5: how many bytes of an EXTERNAL result this worker will actually
     /// deliver to the model — [`cap_result`]'s cut, which is below both screening
     /// caps on the shipped default. Carried here so the detection boundary can
@@ -212,8 +323,10 @@ impl HostRouter {
     /// native tool defs; `mcp_defs` are the host's namespaced read-class
     /// tools (`McpHost::tool_defs().await`). `gate` carries the backend's tool
     /// scope plus the `graph_*` and audit opt-ins (both already reflected in
-    /// `native_defs` by the caller). `task_scope` names this run for V32
-    /// `injection_flag` rows and `policy` is the SSRF screen's carve-out set.
+    /// `native_defs` by the caller). `scope` is the **task** this attempt serves
+    /// — its `injection_flag` id and its audit ledger, both taken from the one
+    /// object the loop is also charging — and `policy` is the SSRF screen's
+    /// carve-out set.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         native_defs: Vec<ToolDef>,
@@ -221,7 +334,12 @@ impl HostRouter {
         ctx: ToolCtx,
         host: std::sync::Arc<super::mcp_host::McpHost>,
         gate: BackendGate,
-        task_scope: String,
+        // #48/M-1: the TASK, not this attempt. Taken as a whole rather than as an
+        // id plus a ledger so the two cannot be handed in from different places:
+        // a second attempt at the same task can neither restart the SSRF doubling
+        // nor re-claim the unscreened row, and cannot file its rows under an id
+        // of its own.
+        scope: &TaskScope,
         policy: super::outbound::Policy,
         detection: super::detection::Config,
         spotlight: bool,
@@ -241,11 +359,11 @@ impl HostRouter {
             ctx,
             host,
             gate,
-            task_scope,
+            task_scope: scope.id().to_string(),
             policy,
             detection,
             spotlight,
-            audit: super::outbound::TaskAudit::default(),
+            audit: scope.audit(),
             delivered_bytes: result_cap_bytes(result_cap_tokens),
         }
     }
@@ -307,7 +425,7 @@ impl ToolRouter for HostRouter {
                 host,
                 cfg: self.detection,
                 spotlight: self.spotlight,
-                audit: &self.audit,
+                audit: self.audit.as_ref(),
                 delivered_bytes: self.delivered_bytes,
             };
             match self
@@ -324,7 +442,7 @@ impl ToolRouter for HostRouter {
                     // Deliberately not `Unattributed`.
                     crate::activity::Attribution::Headless,
                     &self.policy,
-                    &self.audit,
+                    self.audit.as_ref(),
                 )
                 .await
             {
@@ -383,11 +501,11 @@ pub struct AgentConfig {
     /// `mcp.rs`) lets the proxy wait out a long-but-live job instead of
     /// abandoning + re-running it, so a fixed per-call timeout is safe.
     pub per_call_timeout: Duration,
-    /// V32 Phase C: a short id naming this run as a contaminated scope in
-    /// `injection_flag` Tool Activity rows. The caller mints it once and gives
-    /// the same value to [`HostRouter::new`], so the SSRF rows the chokepoint
-    /// writes and the budget/canary rows the loop writes correlate.
-    pub task_scope: String,
+    // #48/M-1: `task_scope: String` used to live here. It is gone — the id is a
+    // property of the TASK, and this struct is rebuilt per attempt, so a copy
+    // here was a second place a fresh id could be minted (and was, four times per
+    // task). Both the loop and the router now read it from the one [`TaskScope`]
+    // the caller threads through [`run`].
     /// V32 Phase C (locked decision 11): this task's EXTERNAL call/byte
     /// budget, from settings. V32 Phase G resolves it through
     /// [`settings::injection::budget_limits`](crate::settings::injection::budget_limits),
@@ -1445,6 +1563,7 @@ fn call_screens(
 ///
 /// Consumers (Claude/OpenCode tabs) get no canary: their system prompts are not
 /// cImp-authored, so there is nothing of ours in them to leak.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &reqwest::Client,
     cfg: &AgentConfig,
@@ -1453,6 +1572,10 @@ pub async fn run(
     deadline: Instant,
     trace: Option<&mut RunTrace>,
     cancel: &CancellationToken,
+    // #48/M-1: the caller's per-TASK state. Borrowed, never constructed here —
+    // this function is ONE ATTEMPT, and an attempt has no business minting a
+    // budget, a scope id or an audit ledger. See [`TaskScope`].
+    scope: &mut TaskScope,
 ) -> AppResult<String> {
     // V32 Phase G: the empty string is the disabled canary. Every consumer of
     // it — `system_context`, `outbound::contains_canary`, `redact_canary` —
@@ -1463,20 +1586,21 @@ pub async fn run(
     } else {
         String::new()
     };
-    let answer = run_inner(client, cfg, router, task, deadline, trace, cancel, &canary).await?;
+    let answer =
+        run_inner(client, cfg, router, task, deadline, trace, cancel, &canary, scope).await?;
     let Some(cleaned) = screen_answer_canary(&answer, &canary) else {
         return Ok(answer);
     };
     warn!(
         target: "offload",
-        scope = %cfg.task_scope,
+        scope = %scope.id(),
         "offload: the task's canary appeared in its FINAL ANSWER — redacting and flagging"
     );
     outbound::record_flag(outbound::Flag {
         screen: outbound::Screen::Canary,
         origin: outbound::Origin::Internal,
         consumer: "offload",
-        scope: &cfg.task_scope,
+        scope: scope.id(),
         session: None,
         tool: "(final answer)",
         host: None,
@@ -1520,6 +1644,8 @@ async fn run_inner(
     mut trace: Option<&mut RunTrace>,
     cancel: &CancellationToken,
     canary: &str,
+    // #48/M-1 — see [`TaskScope`]. This function is one attempt at the task.
+    scope: &mut TaskScope,
 ) -> AppResult<String> {
     let url = format!("{}/v1/chat/completions", cfg.base_url);
     // The router's full surface, snapshotted once (the warm pool is reconciled
@@ -1542,12 +1668,20 @@ async fn run_inner(
     } else {
         Latch::Open
     };
-    // V32 Phase C: this task's EXTERNAL spend, and the one-row-per-task claim
-    // for taint-latch refusals. Both are plain locals because a task IS the
-    // scope — there is no registry to key, and a new task starts fresh by
-    // construction (the reset rule locked decision 11 asks for).
-    let mut budget = Budget::default();
-    let mut latch_flagged = false;
+    // V32 Phase C, corrected in #48 (finding M-1): this task's EXTERNAL spend and
+    // its one-row-per-task latch claim live in the caller's [`TaskScope`], NOT
+    // here. The premise of the old comment — "a task IS the scope" — was wrong by
+    // one level: this function is one *attempt*, and `Service::run` makes up to
+    // four of them for one `offload_task`. A `Budget::default()` on this line
+    // meant the documented 40-call / 4 MiB cap was really 80/8 on a default
+    // install and 160/16 with fail-over configured. A loop that resets its own
+    // cap is not stopped.
+    //
+    // The latch itself (above) deliberately does NOT come from the scope: this
+    // attempt's conversation is rebuilt from the same clean inputs, so no
+    // contaminated byte crosses the boundary and a fresh latch is the honest
+    // state. Only the *reporting* claim crosses.
+    let attempt = scope.begin_attempt();
     let mut advertised = toolclass::filter_defs(&all_tools, latch);
     // The latch the current `advertised` view was built for, so the filter runs
     // only when the state actually moves (not once per step).
@@ -1836,12 +1970,18 @@ async fn run_inner(
                 // row per task: the latch is sticky, so every later refusal
                 // restates the same fact and a looping model must not be able
                 // to fill the feed with it.
-                if !std::mem::replace(&mut latch_flagged, true) {
+                //
+                // #48/M-1: "per task" is only now true. The claim bit was a local
+                // of this function, so a task that latched on all four attempts
+                // wrote four rows — under four different scope ids, which is what
+                // made the promise unverifiable by a reader rather than merely
+                // noisy.
+                if scope.claim_latch_row() {
                     outbound::record_flag(outbound::Flag {
                         screen: outbound::Screen::LatchRefusal,
                         origin: outbound::Origin::Internal,
                         consumer: "offload",
-                        scope: &cfg.task_scope,
+                        scope: scope.id(),
                         session: None,
                         tool: name,
                         host: None,
@@ -1878,14 +2018,15 @@ async fn run_inner(
                     target: "offload",
                     tool = %name,
                     class = ?toolclass::classify(name),
-                    scope = %cfg.task_scope,
+                    scope = %scope.id(),
+                    attempt,
                     "offload: ABORTING the task — its canary appeared in an outbound tool call"
                 );
                 outbound::record_flag(outbound::Flag {
                     screen: outbound::Screen::Canary,
                     origin: outbound::Origin::Internal,
                     consumer: "offload",
-                    scope: &cfg.task_scope,
+                    scope: scope.id(),
                     session: None,
                     tool: name,
                     host: None,
@@ -1902,19 +2043,30 @@ async fn run_inner(
                 // model can keep working around, so it is served as a tool
                 // result rather than aborting the run — but reported exactly
                 // once for the task.
-                if budget.exhausted(cfg.external_budget) {
-                    if budget.claim_flag() {
+                //
+                // #48/M-1: the spend is the TASK's, shared across fail-over, the
+                // thinking retry and tier escalation, so this really is the
+                // documented 40 calls / 4 MiB and not four times it. A later
+                // attempt can therefore be refused at its FIRST fetch, which is
+                // the accepted cost of the cap being true (locked decision 11's
+                // 2026-08-11 amendment): the refusal is a tool result the model
+                // keeps working from, never an aborted task.
+                if !scope.external_allowed(cfg.external_budget) {
+                    if scope.claim_budget_row() {
                         warn!(
                             target: "offload",
                             tool = %name,
-                            scope = %cfg.task_scope,
-                            "offload: external fetch budget exhausted for this task"
+                            scope = %scope.id(),
+                            attempt,
+                            "offload: external fetch budget exhausted for this TASK \
+                             (shared across fail-over, the thinking retry and tier escalation \
+                             since #48/M-1)"
                         );
                         outbound::record_flag(outbound::Flag {
                             screen: outbound::Screen::Budget,
                             origin: outbound::Origin::Internal,
                             consumer: "offload",
-                            scope: &cfg.task_scope,
+                            scope: scope.id(),
                             session: None,
                             tool: name,
                             host: None,
@@ -1990,8 +2142,14 @@ async fn run_inner(
             // actually pulled. A cache-served repeat is not charged — nothing
             // left the machine — and it cannot be used to fetch for free
             // either, since by definition it returns bytes already counted.
+            //
+            // #48/M-1: charged to the TASK. `call_cache` stays a local of this
+            // function, so a later attempt re-fetches URLs an earlier one already
+            // pulled and is charged for them again — correct, because those bytes
+            // really did leave the machine a second time, and the main reason the
+            // per-task cap feels tighter than the old per-attempt one.
             if external && executed {
-                budget.charge(pulled);
+                scope.charge_external(pulled);
             }
             // V21 F4: label each tool result with an observation id the model
             // can cite ([T1], [T2], …).
@@ -2728,7 +2886,6 @@ mod tests {
             per_tool_result_token_cap: cap,
             auth_token: None,
             per_call_timeout: Duration::from_secs(300),
-            task_scope: "task-test".into(),
             external_budget: outbound::BudgetLimits {
                 max_calls: 40,
                 max_bytes: 4 * 1024 * 1024,
@@ -4257,6 +4414,230 @@ mod tests {
             spent < limits.max_bytes,
             "the whole call budget spent only {spent} of {} bytes — the byte cap was unreachable",
             limits.max_bytes
+        );
+    }
+
+    // ── #48/M-1 — the budget is the TASK's, not the attempt's ──────────────
+
+    /// #48 (finding M-1) — **the finding, asserted.** `Service::run` drives
+    /// `run_on` up to four times for one `offload_task` (fail-over, the
+    /// `thinking:on → auto` retry, tier escalation) and the budget used to be a
+    /// local of the loop, so each attempt started at zero: the documented
+    /// 40 calls / 4 MiB was really 80 / 8 MiB on a default install and
+    /// 160 / 16 MiB with fail-over configured.
+    ///
+    /// Driven through [`TaskScope`]'s own methods — the ones `run_inner` calls —
+    /// rather than a re-implementation of the gate, so the test cannot pass while
+    /// the loop's copy of the rule diverges.
+    #[test]
+    fn a_second_attempt_at_one_task_inherits_the_first_attempts_fetch_spend() {
+        let limits = outbound::BudgetLimits {
+            max_calls: 40,
+            max_bytes: 4 * 1024 * 1024,
+        };
+
+        // Attempt 1 spends 25 of the 40 calls.
+        let mut scope = TaskScope::for_task();
+        assert_eq!(scope.begin_attempt(), 1);
+        for i in 0..25 {
+            assert!(scope.external_allowed(limits), "call {i} of attempt 1");
+            scope.charge_external(10);
+        }
+
+        // Attempt 2 — the retry — starts already-spent, and the 41st call of the
+        // TASK is refused even though it is only attempt 2's 16th.
+        assert_eq!(scope.begin_attempt(), 2);
+        for i in 0..15 {
+            assert!(
+                scope.external_allowed(limits),
+                "call {i} of attempt 2 is still inside the task's 40"
+            );
+            scope.charge_external(10);
+        }
+        assert!(
+            !scope.external_allowed(limits),
+            "the task's 41st EXTERNAL call must be refused in attempt 2 — a budget that \
+             starts over per attempt is a cap the task can reset by failing (#48/M-1)"
+        );
+
+        // The byte half, across the same boundary: two 2 MiB pulls in two
+        // different attempts exhaust one 4 MiB cap.
+        let mut scope = TaskScope::for_task();
+        scope.begin_attempt();
+        scope.charge_external(2 * 1024 * 1024);
+        assert!(scope.external_allowed(limits), "2 MiB of 4 MiB is not spent");
+        scope.begin_attempt();
+        scope.charge_external(2 * 1024 * 1024);
+        assert!(
+            !scope.external_allowed(limits),
+            "two 2 MiB fetches in two attempts must exhaust one 4 MiB task cap"
+        );
+
+        // The escalation ladder's worst case is now the documented number, not
+        // four times it.
+        let mut scope = TaskScope::for_task();
+        let mut charged = 0u32;
+        for _ in 0..4 {
+            scope.begin_attempt();
+            while scope.external_allowed(limits) {
+                scope.charge_external(1);
+                charged += 1;
+            }
+        }
+        assert_eq!(
+            charged, limits.max_calls,
+            "four attempts must together spend exactly one task budget"
+        );
+    }
+
+    /// #48/M-1 + global principle "empty is not absent" — a zero-byte tool
+    /// result is still a call that left the machine, so it is charged.
+    ///
+    /// This is the adversarial case the byte cap alone does not bound: a worker
+    /// that degrades mid-run and loops producing tiny (or empty) schema-valid
+    /// results would never approach 4 MiB, and must still hit the call cap —
+    /// once for the whole task, not once per attempt.
+    #[test]
+    fn an_empty_tool_result_is_still_charged_a_call_across_attempts() {
+        let limits = outbound::BudgetLimits {
+            max_calls: 40,
+            max_bytes: 4 * 1024 * 1024,
+        };
+        let mut scope = TaskScope::for_task();
+        let mut calls = 0u32;
+        // A model looping empty results across all four attempts.
+        for _ in 0..4 {
+            scope.begin_attempt();
+            for _ in 0..20 {
+                if !scope.external_allowed(limits) {
+                    break;
+                }
+                scope.charge_external(0);
+                calls += 1;
+            }
+        }
+        assert_eq!(
+            calls, limits.max_calls,
+            "empty-but-parseable results must be charged a call each and stop at the cap"
+        );
+        assert!(!scope.external_allowed(limits));
+    }
+
+    /// #48/M-1 — the two "ONE row per task" claims are now per task. The latch
+    /// claim bit was a local of the loop and the budget's was inside the loop's
+    /// own `Budget`, so a task that latched (or exhausted) on all four attempts
+    /// wrote up to four rows — under four different scope ids, which is what made
+    /// the promise unverifiable to a reader rather than merely noisy.
+    #[test]
+    fn the_latch_refusal_row_is_claimed_once_per_task_not_once_per_attempt() {
+        let mut scope = TaskScope::for_task();
+        scope.begin_attempt();
+        assert!(scope.claim_latch_row(), "the first refusal writes the row");
+        assert!(!scope.claim_latch_row(), "a later refusal in the same attempt");
+        // Every subsequent attempt at the SAME task is still the same claim.
+        for attempt in 2..=4 {
+            scope.begin_attempt();
+            assert!(
+                !scope.claim_latch_row(),
+                "attempt {attempt} must not re-claim the task's one latch row"
+            );
+        }
+        // Same for the budget-exhaustion row: one `Screen::Budget` row per task,
+        // where a task with fail-over + retry + escalation could write four.
+        let mut scope = TaskScope::for_task();
+        scope.begin_attempt();
+        assert!(scope.claim_budget_row());
+        for attempt in 2..=4 {
+            scope.begin_attempt();
+            assert!(
+                !scope.claim_budget_row(),
+                "attempt {attempt} must not re-claim the task's one Screen::Budget row"
+            );
+        }
+        // A genuinely new task is entitled to its own rows.
+        let mut next = TaskScope::for_task();
+        next.begin_attempt();
+        assert!(next.claim_latch_row());
+        assert!(next.claim_budget_row());
+    }
+
+    /// #48/M-1 — one `task-xxxxxxxx` id and one audit ledger for the whole task,
+    /// so fail-over / retry / escalation rows correlate in the feed instead of
+    /// scattering across four unrelated scopes.
+    #[test]
+    fn a_tasks_scope_id_and_audit_ledger_are_stable_across_attempts() {
+        let mut scope = TaskScope::for_task();
+        assert!(
+            scope.id().starts_with("task-"),
+            "the feed's scope column reads this: {}",
+            scope.id()
+        );
+        let id = scope.id().to_string();
+        let first = scope.audit();
+        for _ in 0..4 {
+            scope.begin_attempt();
+            assert_eq!(scope.id(), id, "the scope id is the TASK's");
+            assert!(
+                std::sync::Arc::ptr_eq(&first, &scope.audit()),
+                "every attempt's router must share the task's ONE ledger"
+            );
+        }
+        // …and sharing it is what makes the once-per-task rows true: a claim made
+        // through one attempt's handle is spent for every other attempt's.
+        let later = scope.audit();
+        assert!(outbound::ScopeAudit::claim_unscreened(first.as_ref()));
+        assert!(
+            !outbound::ScopeAudit::claim_unscreened(later.as_ref()),
+            "a second attempt must not re-claim the task's one unscreened row"
+        );
+        // Two different tasks are two ledgers and two ids.
+        let other = TaskScope::for_task();
+        assert_ne!(other.id(), id);
+        assert!(outbound::ScopeAudit::claim_unscreened(other.audit().as_ref()));
+    }
+
+    /// #48/M-1 tripwire — only the three **task entry points** mint a
+    /// [`TaskScope`], and none of them mints a raw scope id or a `Budget` of its
+    /// own.
+    ///
+    /// The structural half of the guard is real and is not this test:
+    /// `TaskScope` is neither `Copy` nor `Clone`, so no retry path can *fork*
+    /// one, and `run`/`run_inner`/`run_on`/`HostRouter::new` take it by reference
+    /// — forgetting to thread it is a missing-argument compile error. What no type
+    /// can catch is a future retry path *calling `for_task()` again* inside a
+    /// ladder, which is exactly the shape of the original bug, so that half is
+    /// watched here. (A source scan, and the weaker kind of guard — `Budget` must
+    /// keep `Default` for `loopback::TabLatch`, so the mint cannot be made
+    /// unreachable.)
+    #[test]
+    fn only_the_task_entry_points_mint_a_task_scope() {
+        for (file, src) in [
+            ("offload/service.rs", include_str!("service.rs")),
+            ("offload/mcp.rs", include_str!("mcp.rs")),
+            ("offload/supervisor.rs", include_str!("supervisor.rs")),
+        ] {
+            assert_eq!(
+                src.matches(concat!("TaskScope::", "for_task")).count(),
+                1,
+                "{file} must mint exactly ONE task scope, outside its retry ladder — a second \
+                 mint site is the #48/M-1 bug again (a per-attempt budget and four \
+                 uncorrelatable scope ids)"
+            );
+            assert!(
+                !src.contains(concat!("new_task", "_scope()")),
+                "{file} mints a raw scope id — every `injection_flag` id must come from the \
+                 task's `TaskScope` so the router's rows and the loop's rows agree (#48/M-1)"
+            );
+            assert!(
+                !src.contains(concat!("Budget::", "default()")),
+                "{file} builds its own EXTERNAL budget — the task's is threaded in (#48/M-1)"
+            );
+        }
+        // And the loop itself no longer owns one: this exact line WAS the finding.
+        assert!(
+            !include_str!("agent.rs").contains(concat!("let mut budget = Budget::", "default()")),
+            "the agent loop mints its own budget again — it is ONE ATTEMPT, and \
+             `Service::run` makes up to four per task (#48/M-1)"
         );
     }
 

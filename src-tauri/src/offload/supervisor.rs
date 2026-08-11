@@ -575,6 +575,12 @@ impl OffloadSupervisor {
                 &settings,
             ),
         );
+        // #48/M-1: one scope for this self-test run. It makes a single
+        // `agent::run` call, so there is no reset to fix here — it is threaded for
+        // the same reason its budget is read from settings rather than hardcoded:
+        // the self-test must not become the one worker path with a shape of its
+        // own.
+        let mut task_scope = super::agent::TaskScope::for_task();
         let cfg = super::agent::AgentConfig {
             base_url: server.base_url(),
             model: None,
@@ -587,8 +593,8 @@ impl OffloadSupervisor {
             per_call_timeout: timeout,
             // V32 Phase C: the self-test uses a NativeRouter (no MCP host), so
             // no EXTERNAL tool is reachable and the budget is inert — filled
-            // from settings anyway so the paths cannot drift.
-            task_scope: super::outbound::new_task_scope(),
+            // from settings anyway so the paths cannot drift. (#48/M-1: the scope
+            // id that used to sit here is now `task_scope` above.)
             // V32 Phase G: resolved at the `offload-worker` pseudo-scope like
             // every other worker-side control, even though this router reaches
             // no EXTERNAL tool — the self-test must not become the one path
@@ -629,6 +635,7 @@ impl OffloadSupervisor {
             deadline,
             None,
             &cancel,
+            &mut task_scope,
         )
         .await
     }

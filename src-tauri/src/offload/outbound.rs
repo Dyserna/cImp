@@ -882,11 +882,17 @@ pub struct BudgetLimits {
 /// Running EXTERNAL spend for one contaminated scope — a worker task, or a
 /// (agent, tab) session at the proxy.
 ///
-/// Lives next to whichever latch state the scope already has (the worker's
-/// per-run state in `agent.rs`, the proxy's `TabLatch` in `loopback.rs`), so it
-/// inherits that scope's lifetime and reset rule for free: a new task starts a
-/// new budget, and a tab's session rotation resets both latch and budget
-/// together.
+/// Lives inside whatever owns the scope: at the worker that is
+/// `agent::TaskScope`, built once per `offload_task` and threaded through every
+/// attempt at it; at the proxy it is the tab's `TabLatch` in `loopback.rs`. So it
+/// inherits the scope's lifetime and reset rule for free: a new task starts a new
+/// budget, and a tab's session rotation resets both latch and budget together.
+///
+/// #48/M-1: at the worker it used to be a plain local of the agent loop, which is
+/// one **attempt** — fail-over, the thinking retry and tier escalation each got a
+/// fresh one, so the documented cap was up to four times the enforced one. Being
+/// `Copy` is what let that happen silently; `agent::TaskScope` is deliberately
+/// neither `Copy` nor `Clone` for exactly that reason.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Budget {
     calls: u32,
@@ -1043,9 +1049,15 @@ pub trait ScopeAudit: Send + Sync {
     fn claim_unscreened(&self) -> bool;
 }
 
-/// A scope that owns its ledger outright — the offload worker's per-task
-/// router, whose lifetime *is* the task's. (The proxy's rides the tab's
-/// [`Budget`], which is where a session rotation resets it.)
+/// A ledger owned by a whole worker **task** — held by `agent::TaskScope` and
+/// shared (behind an `Arc`) with each attempt's router, so fail-over, the thinking
+/// retry and tier escalation claim against one ledger.
+///
+/// #48/M-1: the router used to own this outright, on the strength of a comment
+/// claiming the router's lifetime *is* the task's. It is one attempt's, so the
+/// doubling counter and the one unscreened bit restarted up to four times per
+/// task. (The proxy's equivalent rides the tab's [`Budget`], which is where a
+/// session rotation resets it.)
 #[derive(Default)]
 pub struct TaskAudit(std::sync::Mutex<AuditClaims>);
 
@@ -1091,6 +1103,11 @@ pub fn ssrf_flag_detail(row: SsrfRow) -> String {
 ///
 /// Deliberately NOT the task's canary: the canary must never be written
 /// anywhere it could be read back, and the activity store is a file on disk.
+///
+/// #48/M-1: its one legitimate caller is `agent::TaskScope::for_task`. Minting an
+/// id anywhere else re-creates the finding — four attempts at one `offload_task`
+/// filing their rows under four ids no reader can correlate — and
+/// `only_the_task_entry_points_mint_a_task_scope` fails on a second call site.
 pub fn new_task_scope() -> String {
     format!("task-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }

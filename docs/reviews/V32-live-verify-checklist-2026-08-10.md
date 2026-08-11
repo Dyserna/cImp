@@ -285,6 +285,15 @@ its own first tool call).
 > defect, and the same class as the seven false claims found in
 > `HARNESS-NATIVE-TOOLS.md` (O-1). The spec and this checklist both need the
 > mode named.
+>
+> **Recorded 2026-08-11:** the spec half is done — locked decision 2 now carries
+> an *Amended 2026-08-11 (live verification, review finding F-21)* block naming
+> both modes, citing the two enforcement points (`agent.rs:1484-1495` /
+> `filter_defs` for the declared-profile path, `agent.rs:1773-1804` /
+> `latch_gate` for the omitted-profile path) and the shared `Latch::blocks`
+> predicate that makes containment identical either way. Boxes 1 and 2 of the
+> milestone's own live-verification list now name the mode too, so ticking them
+> against a refusal is no longer a recorded failure.
 
 ### 3 — Claude tab, proxied fetch — **PASS 2026-08-10** (all four)
 Driven through `POST /mcp/call` (the same route the tab's MCP child uses),
@@ -1165,19 +1174,31 @@ unchanged.
 
 `local/` survives and cannot veto (U-4):
 - [ ] A hand-written rule in `rules.d/local/` still matches after the update.
-- [ ] Break it (syntax error, or an identifier colliding with one already
-      colliding in the bundle) → a **good** bundle still applies: outcome
-      `applied`, **not** a rollback.
+- [ ] Break it — **use a syntax error**; since M-13 a bare identifier collision
+      is renamed rather than broken, so it no longer produces a failing file
+      → a **good** bundle still applies: outcome `applied`, **not** a rollback.
 - [ ] Plus a `detection.local_rules_broken.v1` card naming the file, and a
       "Your rule files" health row beside the signature/classifier dots.
-- [ ] Negative control: a `local/` file that compiled **before** and fails
-      **after** (a collision the new bundle introduces) still fails and still
-      rolls back.
+- [ ] Negative control — **rewritten 2026-08-11, the old one asserted the
+      behaviour M-13 reversed.** It read *"a `local/` file that compiled before
+      and fails after (a collision the new bundle introduces) still fails and
+      still rolls back"*; both halves are now wrong. A collision is **renamed**,
+      not failed (`signature::rename_colliding_local_rules`), and forgiveness
+      keys on the `local/` prefix alone, not on "was failing before"
+      (`updater/mod.rs:461-471`) — so an *introduced* `local/` failure is
+      reported, not rolled back. The two controls that still hold:
+      a failure in a **bundle** file is never forgiven (rollback, red card), and
+      a set with **no rules at all** (`!Status::armed`) is a hard failure
+      whatever the baseline says.
 - [ ] **M-13 behaviour (user decision, reverses a U-4 deliverable):** on a
       shipped-vs-user identifier collision the user's rule loads as
       `custom_<Ident>` and the update proceeds; the user's file on disk is
       **byte-for-byte unmodified**. Residual to confirm visible on the card: a
-      renamed rule still matches but **hits report the NEW identifier**.
+      renamed rule still matches but **hits report the NEW identifier**. (The
+      surface exists — `broken_local_rules` fires on a non-empty `renamed` list
+      alone, `updater/mod.rs:996`, and Settings renders it as its own "Your
+      renamed rules" group, `src/SettingsApp.svelte:4672-4688`. What is unticked
+      is the live sighting, not the plumbing.)
 
 Rejected vs Unavailable (the whole of #46):
 - [ ] Bad checksum → `rejected`: `ok:false` row, `detection.update_failed.v1`

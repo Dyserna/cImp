@@ -740,11 +740,20 @@ Facts worth keeping in mind when something looks wrong:
 - **`rules.d/local/` is never touched** by the updater — structurally, not by a
   filter (`store::managed_rule_files` is non-recursive). Hand-written rules
   survive every update; report anything else as a bug, not a config issue. Nor
-  can a broken one **veto** an update any more (#48, U-4): the health check is
-  baseline-relative, forgiving only `local/` files that were already failing
-  before the swap, and it raises `detection.local_rules_broken.v1` instead of
-  rolling a good bundle back. A `local/` file that compiled before and fails
-  after — a collision the bundle introduced — still fails and still rolls back.
+  can a broken one **veto** an update any more (#48, U-4 + M-13): forgiveness
+  keys on the `local/` prefix — **any** `local/` failure is forgiven, whether or
+  not it predates the swap (`updater/mod.rs:461-471`) — and it raises
+  `detection.local_rules_broken.v1` instead of rolling a good bundle back. Only
+  a **bundle** file's failure still vetoes, and `!Status::armed` (no rules at
+  all) is still a hard failure. The baseline survives to *word* the report
+  ("already broken" vs "stopped compiling with this bundle"), not to decide it.
+  A shipped-vs-user **identifier collision** does not even reach that path: the
+  user's rule is loaded under a `custom_<Ident>` name and keeps matching
+  (`signature::rename_colliding_local_rules`, applied inside `compile_report`),
+  their file on disk is not modified, and hits then report the **new**
+  identifier — which is what the card and the Settings "Your rule files" row
+  say. *(Corrected 2026-08-11: this bullet used to end "a collision the bundle
+  introduced still fails and still rolls back" — M-13 reversed exactly that.)*
 - **Assets may only come from the manifest's own directory** — enforced by a
   **parsed** structural compare (`manifest::AssetAnchor`: scheme, `Host`, port,
   empty credentials, no query or fragment, normalized-path prefix), not a

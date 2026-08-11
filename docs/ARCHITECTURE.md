@@ -139,10 +139,21 @@ explanation of the fallback child; `MAINTENANCE.md` § Offload (V8) points here.
 - Binds `127.0.0.1:0` (ephemeral port) and requires a **per-launch bearer token**.
   Routes: `POST /run`, `GET /describe`, `GET /events` (SSE). Purpose-built for
   offload — not a general local API.
-- Advertises `{port, token, pid}` in a discovery file at
-  **`<exe-dir>/.cimp-offload.json`** (the portable root, next to `settings.json`
-  — *never* `~/.claude`), written when `offload.enabled` and **removed on graceful
-  exit**. The token rotates every launch; on Unix the file is `chmod 600`
+- Advertises `{port, token, pid, root}` in **two** places under the portable
+  root (next to `settings.json` — *never* `~/.claude`), both written at start and
+  **removed on graceful exit**: the per-instance file
+  **`<exe-dir>/.cimp-discovery/<pid>.json`**, which is the authoritative one, and
+  the legacy single file **`<exe-dir>/.cimp-offload.json`**, kept in step
+  (last-writer-wins) for anything that only knows that path. Readers resolve
+  root-aware through `read_discovery_for(hint)` → `select_discovery`: the
+  **deepest** per-instance `root` that is an ancestor of the hint wins (nested
+  checkouts resolve to the closest instance, same-root duplicates tie-break on
+  pid); with no hint and no match, a sole surviving entry is taken, and only then
+  does it fall back to the legacy file. **Both paths still resolve — a reader
+  that models only one of them is wrong** (this is what made review finding
+  F-26's one-file repro fail). Hard-killed instances leave their `<pid>.json`
+  behind; `sweep_stale_discoveries` probes and deletes them at the next instance
+  start. The token rotates every launch; on Unix the files are `chmod 600`
   (best-effort; Windows ACL tightening is a TODO).
 - **Security model / residual risk:** loopback-only bind + token auth keep another
   local process from driving offloads or reading task text *in flight*. A

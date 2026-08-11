@@ -529,12 +529,31 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
 > yours to run; back up `<exe-dir>/.cimp-discovery/<pid>.json` first, and note the
 > box below wants the miss reason on stderr **exactly once per process**, so watch
 > a single child across several calls rather than one call.
-- [ ] cImp **stopped**; a tab calls `context_note` through the MCP child →
+- [x] cImp **stopped**; a tab calls `context_note` through the MCP child →
       returns the fixed `NOT SAVED: …` string, which says the condition is
       **transient**.
+      **PASS 2026-08-11.** Precondition verified — `Get-Process cimp` returned
+      **nothing**. Driven through a real `cimp --offload-mcp --tab <v32 tab>`
+      child over MCP stdio (`<scratchpad>/r17.mjs`, which runs several calls
+      through **one** child so the once-per-process box below is answerable).
+      All three `context_note` calls returned `HEADLESS_WRITE_UNAVAILABLE`
+      verbatim, closing on *"this is a transient condition, not a permanent
+      boundary"*.
 - [ ] It writes its own `ok:false` activity row.
-- [ ] `context_recall` and `graph_*` reads on the same path **still work**
+      _(Owed: not observable while the app is down — check the Events tab for the
+      phase-1 refusals now that cImp is back up.)_
+- [x] `context_recall` and `graph_*` reads on the same path **still work**
       (reads stay fail-open — a contaminated tab must not lose its own memory).
+      **PASS 2026-08-11.** In the same headless child: `context_recall` returned
+      the working set inside its `RECALLED MEMORY` / `UNTRUSTED-DATA` envelope,
+      and `graph_outline` returned the full outline of `signature.rs`. So the
+      write is refused while both read paths stay open, which is the asymmetry
+      decision 21 specifies.
+      **Bonus, and it is the box below's property proven early:** stderr named
+      the miss reason **exactly once across all three writes** — one
+      `no-instance` mention, not three — so the guard is per process, not per
+      call. The message also names the remedy: *"If cImp IS running, the
+      discovery file under `.cimp-discovery/` is unreadable or stale."*
 - [ ] cImp **running**: corrupt one byte of
       `<portable_root>/.cimp-discovery/<pid>.json` → same refusal, and stderr
       names the miss reason (`unparseable-response` / `no-instance` / …)
@@ -1468,14 +1487,31 @@ Extended 2026-08-08 — four consumers the above does not reach:
 ### 18 — per-tab OpenCode plugin files (H-2)
 Two OpenCode tabs in one working directory; A has L3 `On` for
 `opencode_native_gate`, B at the app-wide default.
-- [ ] After spawning both, `.opencode/plugin/` contains `cimp-inject-<A>.js`
+- [x] After spawning both, `.opencode/plugin/` contains `cimp-inject-<A>.js`
       **and** `cimp-inject-<B>.js` — never one shared `cimp-inject.js`.
+      **PASS 2026-08-11 with THREE live OpenCode tabs.** The directory holds
+      `cimp-inject-opencode.js`, `cimp-inject-ai-56c6811f-….js` and
+      `cimp-inject-ai-ac26857b-….js` — one file per tab, no shared
+      `cimp-inject.js`, and each bakes its OWN `const CIMP_TAB_ID` matching its
+      filename (checked per file). All three bake
+      `CIMP_NATIVE_GATE_ENABLED = true`.
 - [x] The legacy file is deleted on the first spawn after upgrade.
       **PASS 2026-08-11.** `.opencode/plugin/` holds exactly one file,
       `cimp-inject-opencode.js` (the per-tab name for tab id `opencode`), and a
       tree-wide search for `cimp-inject*.js` outside `node_modules` returns that
       file and nothing else — **no legacy shared `cimp-inject.js` anywhere.**
-- [~] Latch A EXTERNAL → a native `read` in **A is refused**, in **B is not**.
+- [x] Latch A EXTERNAL → a native `read` in **A is refused**, in **B is not**.
+      **PASS 2026-08-11 WITH TWO REAL TABS AND THE REAL EMITTED FILES** — the
+      user spawned two more OpenCode tabs, so this no longer rests on the
+      synthetic copy below. `/latch/beacon` engaged EXTERNAL on tab A
+      (`ai-56c6811f…`) only; both real plugin files were then imported with
+      `CIMP_TAB_ID` set to A:
+      | file | read | bash | webfetch | its own POSTs |
+      |---|---|---|---|---|
+      | A `cimp-inject-ai-56c6811f….js` | **REFUSED** | **REFUSED** | ADMITTED | `/latch/state`, `/latch/beacon` |
+      | B `cimp-inject-ai-ac26857b….js` | ADMITTED | ADMITTED | ADMITTED | **(none)** |
+      B stayed completely inert under A's identity — no handler fired twice.
+      Earlier synthetic run (retained, same result):
       **THE H-2 ISOLATION MECHANISM PASSES 2026-08-11; the two-real-tab form
       still needs a second tab.** OpenCode loads *every* file in
       `.opencode/plugin/` into *every* session, so the property that actually

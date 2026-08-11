@@ -1430,7 +1430,22 @@ Two OpenCode tabs in one working directory; A has L3 `On` for
       `cimp-inject-opencode.js` (the per-tab name for tab id `opencode`), and a
       tree-wide search for `cimp-inject*.js` outside `node_modules` returns that
       file and nothing else — **no legacy shared `cimp-inject.js` anywhere.**
-- [ ] Latch A EXTERNAL → a native `read` in **A is refused**, in **B is not**.
+- [~] Latch A EXTERNAL → a native `read` in **A is refused**, in **B is not**.
+      **THE H-2 ISOLATION MECHANISM PASSES 2026-08-11; the two-real-tab form
+      still needs a second tab.** OpenCode loads *every* file in
+      `.opencode/plugin/` into *every* session, so the property that actually
+      carries this box is "a file that is not this process's tab is completely
+      inert". Tested by importing **two** plugin copies into one process —
+      the real one plus a copy differing **only** in the baked `CIMP_TAB_ID`
+      (`opencode-B`), which is exactly the constant cImp varies per tab — with
+      `process.env.CIMP_TAB_ID=opencode` and tab A latched `external`:
+      | file | read | bash | webfetch | its own POSTs |
+      |---|---|---|---|---|
+      | A (this tab) | **REFUSED** | **REFUSED** | ADMITTED | `/latch/state`, `/latch/beacon` |
+      | B (other tab) | ADMITTED | ADMITTED | ADMITTED | **(none)** |
+      So B's flags never ran under A's identity and **no handler fired twice** —
+      the failure H-2 exists to prevent. What is still unrun is the literal box:
+      two genuine OpenCode tabs where B is a live session of its own.
 - [ ] Delete tab B from settings and respawn A → B's file is swept, A's
       untouched.
 - [x] Run `opencode` **by hand** in that directory (no `CIMP_TAB_ID`) → no
@@ -1454,14 +1469,49 @@ The one thing no source assertion can show.
       ... ok`, `1 passed; 0 failed; 1935 filtered out`. Run from `src-tauri/`,
       not the repo root. **Checked "1 passed" rather than the exit code**, per
       the known trap that `cargo test` exits 0 when a filter matches nothing.
-- [ ] Live: gate ON, OpenCode dispatches `read` and `webfetch` concurrently so
+- [x] Live: gate ON, OpenCode dispatches `read` and `webfetch` concurrently so
       the `read` query is in flight when the `webfetch` beacon engages EXTERNAL
       → the `read` verdict is **dropped, not applied**; the next
       `read`/`bash`/`edit` re-queries immediately and is refused, rather than
       being admitted for the remaining TTL.
-- [ ] Second half, the more important one: native-web `off` (or `deny`) with the
+      **PASS 2026-08-11, both arms, via the direct-import harness
+      (`<scratchpad>/r19-race.mjs`).** **Only network latency was controlled** —
+      the first `/latch/state` was held open 900 ms so the `webfetch` beacon's
+      epoch bump lands while it is still in flight; the plugin's own logic was
+      not touched. The discriminator is whether the raced verdict is **committed
+      to the cache**, counted in `/latch/state` requests, with both final calls
+      well inside `CIMP_GATE_TTL_MS` (2000 ms) so a committed verdict would still
+      be live:
+      | arm | timeline | `/latch/state` issued by the final `read` |
+      |---|---|---|
+      | control (no beacon) | `#1 START t+3` → `#1 DONE t+940`, cached | **0** — reused |
+      | race | `#1 START t+3`; `#2 t+136→163`; **`/latch/beacon t+163`**; `#1 DONE t+914` | **1** (`#3 t+914`) — re-queried |
+      So the in-flight verdict was **dropped, not applied**, exactly as H-1
+      specifies, and the next call re-read a latch that had by then moved.
+      **A first run at a 1500 ms delay collided with the plugin's own
+      `AbortSignal.timeout(1500)`** and is worth recording as its own result: the
+      raced query aborted, `settle(open)` fired, and the arms then read
+      `ADMITTED` (control, stale verdict cached for the rest of the TTL) vs
+      `REFUSED` (race, re-queried) — the vivid form of the same property, and
+      incidental live confirmation of the never-deny-on-doubt fail-open path.
+      The 900 ms run above is the clean one, with a real server verdict raced.
+- [~] Second half, the more important one: native-web `off` (or `deny`) with the
       gate ON → the cache is still invalidated when the latch moves (the
       invalidation now sits **above** the beacon's own enable guard).
+      **VERIFIED STRUCTURALLY 2026-08-11, in the EMITTED per-tab artifact rather
+      than the source template** — which is the part that matters, since this
+      file is generated per tab with its flags baked in. In
+      `.opencode/plugin/cimp-inject-opencode.js`: `CIMP_GATE_EPOCH++` (`:263`),
+      the cache reset `CIMP_GATE_STATE = {at:0,…}` (`:264`) and
+      `CIMP_WEB_PENDING++` (`:274`) **all precede**
+      `if (!CIMP_BEACON_ENABLED) return;` (`:276`), and the `try` opens before
+      that guard so a disabled beacon closes the in-flight window on its way out.
+      The race run above also observed the ordering live: epoch bump and
+      `CIMP_WEB_PENDING++` took effect at `t+163`, at the `/latch/beacon` POST.
+      **Not run behaviourally**, because this file bakes `CIMP_BEACON_ENABLED =
+      true`; the `off`/`deny` variant needs a tab spawned under that setting
+      (spawn-baked). Flipping the constant in a copy would test edited code, not
+      the shipped artifact, so it was deliberately not done.
       _Note F-14 (open, LOW): the spec's "most hardened combination" phrasing
       overstates this — expect the narrower behaviour, don't file it twice._
 

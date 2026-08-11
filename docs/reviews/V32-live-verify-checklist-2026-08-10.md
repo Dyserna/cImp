@@ -963,6 +963,30 @@ header and the screens it names.
         box that matters most and it passed.**
 
 ### 11 — updater (rewritten 2026-08-08; the original predates the outcome split)
+
+> **⏸ DEFERRED 2026-08-11 — user decision. Split out to
+> [issue #53](https://github.com/Dyserna/cImp/issues/53): "Detection rule
+> updater: harden + complete live verification, incl. F-25 scheduler lead."**
+> These boxes are **not abandoned and not failing** — they are moved, with the
+> staging scaffolding, the F-25 lead and the redundancy analysis carried into
+> that issue. **Do not count them against the rest of this run**, which stands at
+> 90/144 with recipes 11/11b and 17 outstanding.
+>
+> The reason it earns its own issue: detection rules are the layer that flags
+> hostile external content, and if the updater silently stops, protection
+> degrades with **no user-visible signal** — Settings keeps showing a healthy
+> channel. That is a different risk shape from the rest of V32, where a failure
+> refuses a tool and the user sees it.
+>
+> **Two legs are already substantially covered by 11c and should be skipped
+> rather than re-run:** the **302-to-another-host** box (11c's negative leg
+> stopped *at* `HTTP 302 Found` without reaching the body and wrote
+> `updater/rules/target:unavailable/ok:true` — same claim, same mechanism) and
+> the **404 → `unavailable`** box, whose real assertion (neutral `ok:true` row,
+> ordinary-colour line, no card) that run already demonstrated. The **three
+> traversal forms are worth keeping in full** — they exercise the *artifact URL*
+> validator, not recipe 7's outbound screen, and recipe 7's C-4 legs already
+> showed this codebase has parser-differential behaviour.
 Serve the staged bundle from a loopback HTTP server. Plaintext is loopback-only,
 so a `http://` manifest URL on any other host is `Rejected` **before any request
 is made**:
@@ -975,7 +999,7 @@ Happy path:
       **ATTEMPTED 2026-08-11 WITHOUT CLICKS, AND IT RAISED F-25 INSTEAD — see
       below. Not scored either way.**
 
-### F-25 — raised 2026-08-11, **LEAD (needs one `RUST_LOG` run to confirm or kill)**: the updater's scheduler did not tick for 34+ minutes with due-ness forced
+### F-25 — raised 2026-08-11, **LEAD — tracked in [#53](https://github.com/Dyserna/cImp/issues/53); needs one `RUST_LOG` run to confirm or kill**: the updater's scheduler did not tick for 34+ minutes with due-ness forced
 
 **What was done.** To drive recipe 11's happy path with no UI, the updater's own
 state file was edited (backed up first): `installed_version` lowered
@@ -1097,7 +1121,7 @@ Revert's own failure modes:
       card, and any pending "available" version still shown (not withdrawn, not
       re-offered as a downgrade).
 
-### 11b — #48's four checks (Settings → **Offload task tools** → Injection detection / Detection updates)
+### 11b — ⏸ DEFERRED to [#53](https://github.com/Dyserna/cImp/issues/53) — #48's four checks (Settings → **Offload task tools** → Injection detection / Detection updates)
 _The spec says "Settings → Tools → Detection". **There is no Tools section** — see
 F-18. The real path is Settings → Offload task tools, scrolling past Backend pool
 and Limits: Injection protection (`SettingsApp.svelte:4414`), Native web tools

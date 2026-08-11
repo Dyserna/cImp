@@ -132,6 +132,144 @@ export interface ActivityRecord extends ActivityEntry {
   response: string;
 }
 
+// ── Row status (#48, M-24) ────────────────────────────────────────────────
+//
+// **Why this is here and not in either feed component.** Both the Tool Activity
+// tab and the Events tab render this store, and both collapsed every
+// `injection_flag` row into one treatment: Tool Activity painted the whole kind
+// chip danger-red ("the only kind with a tinted chip"), and Events mapped
+// `ok ? 'flagged' : 'denied'`. So `unscreened`, the two detector screens,
+// `memory_quarantine` and `latch_override` all arrived on screen as the same
+// alarm — and `unscreened`, whose entire meaning is *"we did not look at all of
+// it"*, read as *"we blocked something"*, which is the opposite of the truth.
+// `latch_override` — a user GRANTING capability back — read as containment
+// firing.
+//
+// One classifier, in the `.ts` file that has a test harness, consumed by both
+// feeds: the security vocabulary of this app must not differ between two tabs
+// showing the same rows.
+
+/// Sources that are TELEMETRY CHANNELS rather than tool invocations:
+/// `read_advisor` reports advisor reminders and full-file-`Read` bypasses,
+/// `harness` reports contract/sub-agent drift. Both record `ok: false` to mean
+/// "this signal fired", not "this call failed" — so painting them with the error
+/// colour made the feed read as mostly-broken when nothing had broken (20 of 28
+/// red rows on one machine were bypass canaries).
+export const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
+
+/// What one feed row actually reports, as one word.
+///
+/// The word IS the class name and the rendered label (the existing Events-tab
+/// idiom), so a state that has no word here cannot be drawn.
+///
+/// Three plain call outcomes:
+/// - `ok` — the call worked.
+/// - `failed` — the call failed.
+/// - `signal` — a telemetry channel fired ([`CANARY_SOURCES`]); not a failure.
+///
+/// …and nine `injection_flag` outcomes, which are NOT interchangeable:
+/// - `denied` — a screen stopped the call. The only one that means "we blocked
+///   something", and the only one wearing danger. Name and semantics kept from
+///   the Events tab's own `denied`/`flagged` split, which this EXTENDS rather
+///   than replaces: two chip vocabularies for the same rows across two views
+///   would be a fresh reporting-honesty defect of exactly M-24's kind.
+/// - `flagged` — a detector matched and the result was delivered anyway
+///   (detection is surface-only, locked decision 5).
+/// - `unscreened` — part of the result was never looked at. Nothing found,
+///   nothing stopped: the absence of a verdict is not a verdict of absence.
+/// - `held` — a memory write was stored and withheld pending human review.
+/// - `engaged` — containment came ON for a tab (a native-web beacon; a
+///   conversation becoming contaminated). Nothing was refused.
+/// - `granted` — a user gave capability back (a latch override; a contamination
+///   flag cleared). A release, not a block — which is exactly why it must not
+///   share a treatment with one.
+/// - `update` / `rejected` — the detection auto-updater acted, or refused a
+///   bundle. Not a screen over a tool call at all.
+/// - `recorded` — an `injection_flag` source this build has no category for.
+///   Deliberately NOT folded into `blocked` or `flagged`: a future screen must
+///   render as "we do not have a word for this" rather than inherit a claim.
+export type RowStatus =
+  | 'ok'
+  | 'failed'
+  | 'signal'
+  | 'denied'
+  | 'flagged'
+  | 'unscreened'
+  | 'held'
+  | 'engaged'
+  | 'granted'
+  | 'update'
+  | 'rejected'
+  | 'recorded';
+
+/// Classify one row.
+///
+/// `ok` is read as the denial predicate ONLY for the screens that follow it.
+/// `Screen::is_denial` is the backend's rule and `record_flag` publishes it as
+/// `ok: false` — but `updater` rows are documented as the one source written
+/// outside `record_flag`, where `ok` is the bundle OUTCOME (`rejected ⇒ false`).
+/// Reading `!ok` as "denied" there would report a refused rules bundle as a
+/// blocked tool call, which is the same collapse this function exists to undo,
+/// so `updater` is matched on `source` before `ok` is consulted at all.
+export function rowStatus(e: ActivityEntry): RowStatus {
+  if (e.kind === 'injection_flag') {
+    switch (e.source) {
+      // Checked first: its `ok` is an outcome, not a denial (see above).
+      case 'updater':
+        return e.ok ? 'update' : 'rejected';
+      case 'signature':
+      case 'classifier':
+        return 'flagged';
+      case 'unscreened':
+        return 'unscreened';
+      case 'memory_quarantine':
+        return 'held';
+      case 'latch_beacon':
+      case 'contamination':
+        return 'engaged';
+      case 'latch_override':
+      case 'contamination_cleared':
+        return 'granted';
+      case 'ssrf':
+      case 'budget':
+      case 'canary':
+      case 'latch_refusal':
+        return 'denied';
+      default:
+        // A screen added backend-side that this build predates. `ok: false`
+        // still carries `Screen::is_denial`, which is a claim we can make; a
+        // delivered one gets the no-category word rather than a borrowed one.
+        return e.ok ? 'recorded' : 'denied';
+    }
+  }
+  if (!e.ok) return CANARY_SOURCES.has(e.source) ? 'signal' : 'failed';
+  return 'ok';
+}
+
+/// The tooltip each status wears. The first five are the Events tab's own
+/// sentences, kept; every state ADDED here says explicitly what was *not*
+/// blocked, because reading a containment row as a block is the whole of M-24.
+export const STATUS_TITLE: Record<RowStatus, string> = {
+  ok: 'Call succeeded',
+  failed: 'Call failed',
+  denied: 'Blocked by an injection-containment screen',
+  flagged: 'Delivered, but a detection screen flagged it — nothing was blocked',
+  signal: 'A telemetry signal fired — not a failure',
+  unscreened:
+    'Part of this result was never screened — a size cap dropped some of it, or a layer did not finish. Nothing was found and nothing was blocked: the absence of a verdict is not a verdict of absence.',
+  held: 'A memory write was stored but withheld from every read path until you review it in Code Intelligence → Memory. Nothing was blocked.',
+  engaged:
+    'Containment came ON for a tab — a native-web beacon, or a conversation becoming contaminated. Nothing was blocked.',
+  granted:
+    'A user action gave capability BACK — a latch override, or a contamination flag cleared. This is a release, not a block.',
+  update:
+    'The detection auto-updater acted on the rules/classifier bundle. Not a screen over a tool call.',
+  rejected:
+    'The detection auto-updater REFUSED a rules/classifier bundle. Not a screen over a tool call, and not a blocked call.',
+  recorded:
+    'A containment event this build has no category for. Open the row for the detail.',
+};
+
 /// The feed (graph + offload), newest first, payload-free. Pass `sinceTs` to
 /// fetch only entries newer than a high-water mark; omit it for the full
 /// list (both feeds poll the full list — they need an authoritative snapshot

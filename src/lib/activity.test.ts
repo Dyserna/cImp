@@ -17,14 +17,17 @@ import {
   isTabAttribution,
   matchesTabFilter,
   mergeEntries,
+  rowStatus,
   tabFilterValue,
   FILTER_ANY,
   NO_FILTER,
+  STATUS_TITLE,
   TAB_FILTER_HEADLESS,
   TAB_FILTER_UNATTRIBUTED,
   TAB_FILTER_UNRECOGNIZED,
   type ActivityEntry,
   type Attribution,
+  type RowStatus,
 } from './activity';
 
 function entry(id: number, over: Partial<ActivityEntry> = {}): ActivityEntry {
@@ -232,5 +235,121 @@ describe('filterEntries', () => {
       tab: TAB_FILTER_HEADLESS,
     });
     expect(got.map((e) => e.id)).toEqual([3]);
+  });
+});
+
+// ── rowStatus (#48, M-24) ─────────────────────────────────────────────────
+//
+// The finding: `Unscreened`, the detector flags, `MemoryQuarantine` and
+// `LatchOverride` all collapsed into ONE red chip, so "we did not look at all of
+// it" read as "we blocked something" — the opposite of the truth — and a latch
+// override the USER applied to hand capability back read as containment firing.
+//
+// These pin the distinctions rather than the current words: what must not
+// regress is that no two of these screens share a status, and that the only
+// status meaning "we stopped it" is reached by the screens that actually did.
+
+/// One `injection_flag` row for `screen`.
+function flag(screen: string, ok = true): ActivityEntry {
+  return entry(1, { kind: 'injection_flag', source: screen, ok, tool: 'WebFetch' });
+}
+
+describe('rowStatus', () => {
+  it('gives every containment screen its OWN status — no two collapse', () => {
+    const byScreen: Record<string, RowStatus> = {
+      // `is_denial` screens: the backend publishes these as ok:false.
+      ssrf: rowStatus(flag('ssrf', false)),
+      budget: rowStatus(flag('budget', false)),
+      canary: rowStatus(flag('canary', false)),
+      latch_refusal: rowStatus(flag('latch_refusal', false)),
+      // Everything below denied NOTHING.
+      signature: rowStatus(flag('signature')),
+      unscreened: rowStatus(flag('unscreened')),
+      memory_quarantine: rowStatus(flag('memory_quarantine')),
+      latch_override: rowStatus(flag('latch_override')),
+      latch_beacon: rowStatus(flag('latch_beacon')),
+    };
+    // The four denials share `denied`, which is correct — they all stopped a
+    // call. The five that stopped nothing must each differ from that AND from
+    // one another.
+    expect(byScreen.ssrf).toBe('denied');
+    expect(byScreen.budget).toBe('denied');
+    expect(byScreen.canary).toBe('denied');
+    expect(byScreen.latch_refusal).toBe('denied');
+    const nonDenials = [
+      byScreen.signature,
+      byScreen.unscreened,
+      byScreen.memory_quarantine,
+      byScreen.latch_override,
+      byScreen.latch_beacon,
+    ];
+    expect(new Set(nonDenials).size).toBe(nonDenials.length);
+    expect(nonDenials).not.toContain('denied');
+  });
+
+  it('never reports an unscreened result as a denial or as clean', () => {
+    // The whole finding in one assertion: an absent verdict is neither a
+    // verdict of absence nor an alarm.
+    const s = rowStatus(flag('unscreened'));
+    expect(s).toBe('unscreened');
+    expect(s).not.toBe('denied');
+    expect(s).not.toBe('ok');
+    expect(STATUS_TITLE[s]).toContain('nothing was blocked');
+  });
+
+  it('reports a user latch override as a GRANT, not as containment firing', () => {
+    expect(rowStatus(flag('latch_override'))).toBe('granted');
+    expect(rowStatus(flag('contamination_cleared'))).toBe('granted');
+    // A grant and a block must not share a word — a release that reads as a
+    // refusal is the inverted half of the same defect.
+    expect(rowStatus(flag('latch_override'))).not.toBe('denied');
+  });
+
+  it('reports a held memory write as held, not as a refusal', () => {
+    expect(rowStatus(flag('memory_quarantine'))).toBe('held');
+    expect(STATUS_TITLE.held).toContain('Nothing was blocked');
+  });
+
+  it('does NOT read a rejected updater bundle as a blocked call', () => {
+    // `updater` is documented as the one source written outside `record_flag`:
+    // its `ok` is the bundle OUTCOME, not `Screen::is_denial`. Reading `!ok` as
+    // "denied" there reported a refused rules bundle as a blocked tool call.
+    expect(rowStatus(flag('updater', true))).toBe('update');
+    expect(rowStatus(flag('updater', false))).toBe('rejected');
+    expect(rowStatus(flag('updater', false))).not.toBe('denied');
+  });
+
+  it('gives an unknown screen no category rather than a borrowed one', () => {
+    // A screen added backend-side after this build. Delivered ⇒ we have no word
+    // for it; refused ⇒ `Screen::is_denial` is a claim we can still make.
+    expect(rowStatus(flag('some_future_screen', true))).toBe('recorded');
+    expect(rowStatus(flag('some_future_screen', false))).toBe('denied');
+  });
+
+  it('keeps the three plain call outcomes intact', () => {
+    expect(rowStatus(entry(1))).toBe('ok');
+    expect(rowStatus(entry(1, { ok: false }))).toBe('failed');
+    // Telemetry channels record ok:false to mean "this signal fired".
+    expect(rowStatus(entry(1, { ok: false, source: 'read_advisor' }))).toBe('signal');
+    expect(rowStatus(entry(1, { ok: false, source: 'harness' }))).toBe('signal');
+  });
+
+  it('has a tooltip for every status it can return', () => {
+    // A status with no sentence would render a bare word in a security feed.
+    const all: RowStatus[] = [
+      'ok',
+      'failed',
+      'signal',
+      'denied',
+      'flagged',
+      'unscreened',
+      'held',
+      'engaged',
+      'granted',
+      'update',
+      'rejected',
+      'recorded',
+    ];
+    for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
   });
 });

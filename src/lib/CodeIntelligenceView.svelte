@@ -29,6 +29,7 @@
     advisorMarkApplied,
     graphPath,
     graphArchitecture,
+    quarantineReason,
     onGraphStatus,
     onGraphAnalyses,
     type GraphStatus,
@@ -339,8 +340,33 @@
   let quarantined = $derived(memory?.quarantined ?? []);
   let reviewBusy = $state<string | null>(null);
 
+  /// Which quarantined note has an armed confirmation, and for which action.
+  ///
+  /// **#48, M-23 — the polarity was inverted.** Promote — which un-quarantines
+  /// attacker-authored text into project memory, where recall returns it and the
+  /// launch-time injection carries it into every future session — was ONE
+  /// unconfirmed click, while Discard, which can only lose a note, sat behind a
+  /// `confirm()` dialog. The safety-destructive action cost less than the safe
+  /// one, which is backwards.
+  ///
+  /// Both are confirmed now and the WEIGHT is the right way round, copying the
+  /// shape `TaintMenu.svelte` already gets right for "Restore full access": a
+  /// trailing `…` on the trigger, a sentence that spells out the consequence
+  /// before the second click, and the danger treatment on the action that
+  /// releases containment — not on the one that merely deletes.
+  ///
+  /// One armed row at a time, keyed by note id: opening a second confirmation
+  /// replaces the first, so a stray Enter can never resolve a note the user is
+  /// no longer looking at.
+  let reviewConfirm = $state<{ note: string; action: 'promote' | 'discard' } | null>(null);
+
+  /// Arm (or re-arm) the confirmation for one note + action.
+  function armReview(noteId: string, action: 'promote' | 'discard'): void {
+    reviewConfirm = { note: noteId, action };
+  }
+
   async function reviewNote(noteId: string, action: 'promote' | 'discard'): Promise<void> {
-    if (action === 'discard' && !confirm('Discard this quarantined note permanently?')) return;
+    reviewConfirm = null;
     reviewBusy = noteId;
     try {
       await graphNoteReview(noteId, action);
@@ -2234,32 +2260,118 @@
         <div class="history-head">
           ⚠ Quarantined notes <span class="muted">({quarantined.length})</span>
         </div>
+        <!-- #48, F-24: the old copy named only ONE of the three causes that put
+             a note here (the session taint latch), which is why a
+             credential-screen hold read as an injected-instruction hold. Each
+             row now states its own cause; this paragraph says what the queue is
+             and which way round the two buttons cut. -->
         <p class="caveat">
-          Written while the session had used an external tool (web/MCP-server), so
-          they are held out of recall, listings and the launch-time injection — an
-          injected instruction must not gain persistence. Promote to accept a note
-          into project memory (keeping its pinned state), or discard it.
+          Held out of recall, listings and the launch-time injection until you
+          decide. A note lands here because its session had already used an
+          external tool, because the write could not be attributed to a tab, or
+          because the write-time credential screen matched it — each row says
+          which. <strong>Promote</strong> accepts a note into project memory
+          (keeping its pinned state) and into every future session, so it is the
+          one that asks you to be sure; <strong>Discard</strong> deletes it and
+          releases nothing.
         </p>
         <div class="rows">
           {#each quarantined as n (n.note_id)}
-            <div class="arow note tainted">
-              <span class="qmark" title="Quarantined pending review">⚠</span>
-              <span class="ntext" title={`session: ${n.session_id || '(none)'}${n.pinned ? ' · would be pinned' : ''}`}
-                >{n.text}</span
-              >
-              <span class="aloc">{fmtTime(n.ts_ms)}</span>
-              <button
-                class="mini"
-                disabled={reviewBusy === n.note_id}
-                title="Accept into project memory"
-                onclick={() => reviewNote(n.note_id, 'promote')}>Promote</button
-              >
-              <button
-                class="mini danger"
-                disabled={reviewBusy === n.note_id}
-                title="Delete permanently"
-                onclick={() => reviewNote(n.note_id, 'discard')}>Discard</button
-              >
+            {@const why = quarantineReason(n)}
+            <div class="qitem">
+              <!--
+                #48, F-24: the WHY comes first, above the note text.
+
+                The card used to show text + time + Promote/Discard and nothing
+                else, which inverts locked decision 22: three different causes
+                land in this queue (the session taint latch, an unattributable
+                write, and the write-time credential screen), and for the third
+                one the note text IS the credential — so the card displayed the
+                secret value and withheld the rule name that matched it. The rule
+                is now the first thing on the row, in full weight, above a note
+                body that is no longer the only thing you can read.
+
+                The reason is NOT reconstructed here when the backend does not
+                send it. See `quarantineReason` in graph.ts for what is owed and
+                why guessing would be worse than a blank.
+              -->
+              <div class="qwhy" class:missing={!why}>
+                <span class="qmark" title="Quarantined pending review">⚠</span>
+                {#if why}
+                  <span class="qreason">{why.reason}</span>
+                  {#if why.rules.length > 0}
+                    <span class="qrules" title="The rules that matched"
+                      >{why.rules.join(', ')}</span
+                    >
+                  {/if}
+                  <span class="qscreen" title="The screen that held this write">{why.screen}</span>
+                {:else}
+                  <span class="qreason"
+                    >Reason not recorded — this build does not store which screen
+                    or rule held this note.</span
+                  >
+                {/if}
+              </div>
+              <div class="arow note tainted">
+                <span class="ntext" title={`session: ${n.session_id || '(none)'}${n.pinned ? ' · would be pinned' : ''}`}
+                  >{n.text}</span
+                >
+                <span class="aloc">{fmtTime(n.ts_ms)}</span>
+                <!-- M-23: Promote wears the `…` and the danger colour, because it
+                     is the click that puts this text back into every future
+                     session. Discard is confirmed too (deletion is permanent) but
+                     stays plain — it releases nothing. -->
+                <button
+                  class="mini danger"
+                  disabled={reviewBusy === n.note_id}
+                  title="Accept into project memory — asks for confirmation"
+                  onclick={() => armReview(n.note_id, 'promote')}>Promote…</button
+                >
+                <button
+                  class="mini"
+                  disabled={reviewBusy === n.note_id}
+                  title="Delete permanently — asks for confirmation"
+                  onclick={() => armReview(n.note_id, 'discard')}>Discard…</button
+                >
+              </div>
+              {#if reviewConfirm?.note === n.note_id}
+                <div class="qconfirm" class:warn={reviewConfirm.action === 'promote'}>
+                  {#if reviewConfirm.action === 'promote'}
+                    <p>
+                      Promoting accepts this text into project memory. It was
+                      written while the session had already used an external
+                      tool, so it may be an instruction someone planted — once
+                      promoted it is returned by recall, rides the launch-time
+                      guidance into new sessions, and no longer says where it came
+                      from. Read it above first. Continue?
+                    </p>
+                    <div class="qconfirm-row">
+                      <button
+                        class="mini danger"
+                        disabled={reviewBusy === n.note_id}
+                        onclick={() => reviewNote(n.note_id, 'promote')}
+                        >Yes, promote into memory</button
+                      >
+                      <button class="mini" onclick={() => (reviewConfirm = null)}>Cancel</button>
+                    </div>
+                  {:else}
+                    <p>
+                      Discarding deletes this note permanently and cannot be
+                      undone. Nothing else changes: it is already held out of
+                      every read path, so discarding releases nothing. Continue?
+                    </p>
+                    <div class="qconfirm-row">
+                      <button
+                        class="mini"
+                        disabled={reviewBusy === n.note_id}
+                        onclick={() => reviewNote(n.note_id, 'discard')}
+                        >Yes, discard permanently</button
+                      >
+                      <button class="mini" onclick={() => (reviewConfirm = null)}>Cancel</button>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -2954,15 +3066,86 @@
     grid-template-columns: auto 1fr auto;
   }
   /* V32 Phase C2: the quarantine review queue. Warning-tinted rather than
-     danger-tinted — a held note is a decision waiting, not a failure. */
+     danger-tinted — a held note is a decision waiting, not a failure.
+     Four columns since F-24 moved the ⚠ up into the reason line above. */
   .arow.note.tainted {
-    grid-template-columns: auto 1fr auto auto auto;
+    grid-template-columns: 1fr auto auto auto;
+    border-bottom: none;
   }
   .card.quarantine {
     border-color: var(--border-warning, #c9820a);
   }
   .qmark {
     color: var(--surface-warning, #c9820a);
+  }
+  /* #48, F-24 — one held note: the cause, then the text, then the decision. */
+  .qitem {
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
+    padding-bottom: 3px;
+  }
+  .qwhy {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 4px 4px 0;
+    font-size: 12px;
+  }
+  /* The rule/reason line is the note's headline, at full weight — decision 22
+     forbids the value being more prominent than the rule that matched it, and
+     the value is `.ntext` below. */
+  .qreason {
+    color: var(--text-primary, #ddd);
+    font-weight: 600;
+  }
+  /* A reason we could not be told is not a reason. Rendered as the app's
+     "not a confident claim" treatment (quiet, italic) rather than as an
+     explanation — see `quarantineReason` for why it is never reconstructed. */
+  .qwhy.missing .qreason {
+    color: var(--text-tertiary, #9aa0aa);
+    font-weight: 400;
+    font-style: italic;
+  }
+  /* The matched rule identifiers, verbatim. Monospace because they are
+     identifiers the user may search the ruleset for. */
+  .qrules {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-warning, #f0c060);
+    border: 1px solid var(--border-warning, #6a571a);
+    border-radius: var(--radius-sm, 2px);
+    padding: 0 3px;
+  }
+  .qscreen {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-tertiary, #9aa0aa);
+  }
+  /* M-23's confirmation. Amber for Promote (it releases containment), neutral
+     for Discard (it releases nothing) — the same polarity TaintMenu uses. */
+  .qconfirm {
+    margin: 0 4px 4px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-default, #3f4554);
+    border-radius: var(--radius-md, 3px);
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+  }
+  .qconfirm.warn {
+    border-color: var(--border-warning, #6a571a);
+    background: var(--surface-warning-faint, rgba(240, 160, 32, 0.1));
+  }
+  .qconfirm p {
+    margin: 0 0 6px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-secondary, #b8bec9);
+  }
+  .qconfirm.warn p {
+    color: var(--text-warning, #f0c060);
+  }
+  .qconfirm-row {
+    display: flex;
+    gap: 6px;
   }
   .arow.fact {
     grid-template-columns: auto 1fr auto auto;

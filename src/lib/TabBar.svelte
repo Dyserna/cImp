@@ -8,7 +8,6 @@
     isTainted,
     latchByTab,
     reducedFeaturesFor,
-    type FeatureState,
     type LatchRow,
   } from './latch';
   import { tabs } from './tabs/store';
@@ -65,12 +64,43 @@
   // badge can now open on a CLEAN tab whose controls are switched off — and a
   // popover that then said only "not latched" would be answering a question
   // nobody asked.
+  //
+  // **#48, M-24 → M-22: this cell holds the ANCHOR, never the state.** It used
+  // to carry the `LatchRow` and the reduced-feature rows copied out of the
+  // stores at click time, so the popover was a click-time SNAPSHOT that never
+  // moved again. A tab that became contaminated — or latched EXTERNAL by a
+  // native-web beacon — while the user was reading the popover kept saying
+  // "Not latched.", in the one surface whose entire job is to say what is in
+  // force *right now*, and whose buttons the user is about to press on the
+  // strength of it.
+  //
+  // The fix is to derive the row and the reduced list below instead of copying
+  // them, so the popover re-renders from the SAME 4 s `startLatchPolling` tick
+  // that already drives the badge. Deliberately no timer of its own: an
+  // interval added here would also have to be gated on `appViewVisibility`
+  // (`appViews.ts` keeps views alive in a portal registry and never destroys
+  // them on a tab switch), and there is nothing for a second poller to learn
+  // that the store does not already have.
   let taintMenu = $state<{
     x: number;
     y: number;
-    row: LatchRow;
-    reduced: FeatureState[];
+    tab: TabId;
   } | null>(null);
+
+  /// The popover's LIVE row — re-read from `latchByTab` on every poll tick for
+  /// as long as the popover is open (M-22).
+  const taintMenuRow = $derived(
+    taintMenu ? rowFor(taintMenu.tab, $latchByTab[taintMenu.tab]) : null,
+  );
+
+  /// The popover's LIVE reduced-protection rows, from the same tick. Kept
+  /// beside the row rather than fetched separately for the reason
+  /// `startLatchPolling` fetches them together: the badge means one thing when
+  /// the latch is engaged and another when the latch feature is switched off, so
+  /// the two disagreeing for a poll interval is how a badge stops being read.
+  const taintMenuReduced = $derived(
+    taintMenu ? reducedFeaturesFor($injectionStatus, taintMenu.tab) : [],
+  );
 
   /// The row a badge click carries. A tab with no gated call yet has no latch
   /// row at all, so synthesize the "nothing latched" one rather than making the
@@ -93,14 +123,13 @@
     );
   }
 
-  function onTaintBadge(tab: TabId, row: LatchRow | undefined, e: MouseEvent): void {
+  /// Open the popover. Takes only the anchor and the tab id — the state comes
+  /// from the stores, live (M-22). `row` stays in the signature because the
+  /// badge already holds it and the call site reads better naming what it is
+  /// about; it is deliberately not stored.
+  function onTaintBadge(tab: TabId, _row: LatchRow | undefined, e: MouseEvent): void {
     menu = null;
-    taintMenu = {
-      x: e.clientX,
-      y: e.clientY,
-      row: rowFor(tab, row),
-      reduced: reducedFeaturesFor($injectionStatus, tab),
-    };
+    taintMenu = { x: e.clientX, y: e.clientY, tab };
   }
 
   /// Refresh the latch snapshot immediately after an override, instead of
@@ -419,12 +448,16 @@
   />
 {/if}
 
-{#if taintMenu}
+<!-- M-22: `row` / `reduced` are the DERIVED values, not the click-time copies,
+     so an open popover follows the tab's real state instead of freezing the
+     instant it was opened. `TaintMenu` already renders entirely from its props,
+     so it needed no change for this. -->
+{#if taintMenu && taintMenuRow}
   <TaintMenu
     x={taintMenu.x}
     y={taintMenu.y}
-    row={taintMenu.row}
-    reduced={taintMenu.reduced}
+    row={taintMenuRow}
+    reduced={taintMenuReduced}
     onDismiss={() => (taintMenu = null)}
     onApplied={refreshLatches}
   />

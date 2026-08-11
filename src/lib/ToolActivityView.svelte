@@ -24,9 +24,11 @@
     activityDetail,
     activityList,
     mergeEntries,
+    rowStatus,
     type ActivityEntry,
     type ActivityRecord,
   } from './activity';
+  import StatusChip from './StatusChip.svelte';
   import { settings } from './settings/store';
   import { fmtTime } from './format';
   import { fmtTok } from './usageMath';
@@ -277,16 +279,23 @@
     return KNOWN_SOURCES.has(source) ? ` ${source}` : '';
   }
 
-  // Sources that are TELEMETRY CHANNELS rather than tool invocations:
-  // `read_advisor` reports advisor reminders and full-file-Read bypasses,
-  // `harness` reports contract/sub-agent drift. Both record `ok: false` to mean
-  // "this signal fired", not "this call failed" — so painting them with the
-  // error colour made the feed read as mostly-broken when nothing had broken
-  // (20 of 28 red rows on this machine were bypass canaries). They get their own
-  // muted treatment and a "signal" label instead of "failed".
-  const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
-  function isCanary(e: ActivityEntry): boolean {
-    return !e.ok && CANARY_SOURCES.has(e.source);
+  // #48, M-24: the row's real meaning comes from the shared classifier in
+  // `activity.ts`, which both this feed and the Events tab now read. It used to
+  // be decided here as `!ok && !isCanary(e)`, which painted every
+  // `injection_flag` denial red and left every *other* containment state
+  // indistinguishable from ordinary traffic — while the kind chip painted all of
+  // them the same danger red regardless. `unscreened` ("we did not look at all
+  // of it") therefore rendered as "we blocked something", and a user's own latch
+  // override rendered as containment firing.
+  //
+  // Only the two states that really are failures tint the ROW; every containment
+  // state is carried by its own chip, so the feed no longer reads as broken
+  // because containment is working.
+  function rowTone(e: ActivityEntry): '' | 'err' | 'canary' {
+    const s = rowStatus(e);
+    if (s === 'failed' || s === 'denied') return 'err';
+    if (s === 'signal') return 'canary';
+    return '';
   }
 
   function rowMain(e: ActivityEntry): string {
@@ -363,8 +372,8 @@
           {#each entries as r (r.id)}
             <div
               class="hrow"
-              class:err={!r.ok && !isCanary(r)}
-              class:canary={isCanary(r)}
+              class:err={rowTone(r) === 'err'}
+              class:canary={rowTone(r) === 'canary'}
               role="button"
               tabindex="0"
               onclick={() => void openDetail(r.id)}
@@ -376,7 +385,17 @@
               }}
             >
               <span class="htime">{fmtTime(r.ts_ms)}</span>
-              <span class="hkind {r.kind}">{r.kind}</span>
+              <!-- #48, M-24: a containment row's chip says WHAT HAPPENED, not
+                   just that it was a containment row. The old chip rendered the
+                   literal word `injection_flag` in one danger-red treatment for
+                   every screen, so a held memory note, an unscreened result and
+                   a blocked SSRF target were one pixel-identical alarm. The
+                   screen's own name is still in the source column beside it. -->
+              {#if r.kind === 'injection_flag'}
+                <StatusChip status={rowStatus(r)} />
+              {:else}
+                <span class="hkind {r.kind}">{r.kind}</span>
+              {/if}
               <span class="hsrc{srcClass(r.source)}" title={r.source}>{r.source}</span>
               <span class="hmain" title={rowMain(r)}>{rowMain(r)}</span>
               <span class="hmeta">{rowMeta(r)}</span>
@@ -452,8 +471,12 @@
         <div class="detail-title">
           <span class="hkind {detail.kind}">{detail.kind}</span>
           <span class="detail-tool">{detail.tool}</span>
-          {#if isCanary(detail)}<span class="detail-signal">signal</span>
-          {:else if !detail.ok}<span class="detail-failed">failed</span>{/if}
+          <!-- #48, M-24: the same chip as the row, from the same classifier, so
+               a row and the popup it opens can never say different things. The
+               popup used to be able to say only `failed` or `signal`, which left
+               every containment state (held, unscreened, granted, engaged)
+               silent in the one place the user opens to find out what happened. -->
+          {#if rowStatus(detail) !== 'ok'}<StatusChip status={rowStatus(detail)} />{/if}
         </div>
         <button type="button" class="detail-close" onclick={closeDetail} aria-label="Close">×</button>
       </header>
@@ -649,7 +672,9 @@
   }
   .hrow {
     display: grid;
-    grid-template-columns: 5.5rem 4.5rem 6rem 1fr 12rem 1.4rem;
+    /* Column 2 widened from 4.5rem for M-24's status words (`unscreened` is the
+       longest); the kind labels it also holds are all shorter than that. */
+    grid-template-columns: 5.5rem 6rem 6rem 1fr 12rem 1.4rem;
     align-items: center;
     gap: 8px;
     height: var(--hrow-h);
@@ -721,14 +746,18 @@
   .hkind.mcp {
     color: var(--accent-purple, #d2a8ff);
   }
-  /* V32: injection-containment denials. Danger red, and the only kind with a
-     tinted chip — a blocked SSRF target or a canary hit is the one row in this
-     feed that means "something tried something", so it must not read as
-     ordinary traffic when scrolling past. */
+  /* V32 injection-containment rows. This chip used to be danger red — "the only
+     kind with a tinted chip" — for EVERY screen, which is #48 M-24: a held
+     memory note, a result that was only partly screened, and a latch override
+     the USER applied were all drawn as "we blocked something". The verdict now
+     lives in `StatusChip`, which has a word and a treatment per state, so this
+     label is back to being what it is — a KIND, not a claim — and is tinted
+     neutrally. Only reachable from the detail popup's header now; the feed rows
+     render the status chip in this slot instead. */
   .hkind.injection_flag {
-    color: var(--danger, #f06080);
-    background: color-mix(in srgb, var(--danger, #f06080) 14%, transparent);
-    border-radius: 3px;
+    color: var(--text-secondary, #b8bec9);
+    background: var(--surface-4, rgba(255, 255, 255, 0.06));
+    border-radius: var(--radius-sm, 3px);
     padding: 0 3px;
   }
   /* Agent-source accents for graph rows (claude/opencode/offload, plus the
@@ -809,16 +838,8 @@
   .detail-tool {
     font-family: var(--font-mono, monospace);
   }
-  .detail-failed {
-    color: var(--text-danger-soft, #ffb4ab);
-    text-transform: uppercase;
-    font-size: 0.8em;
-  }
-  .detail-signal {
-    color: var(--text-warning, #e3b341);
-    text-transform: uppercase;
-    font-size: 0.8em;
-  }
+  /* `.detail-failed` / `.detail-signal` are gone: the popup's verdict is now the
+     shared `StatusChip`, which covers all twelve states instead of those two. */
   .detail-close {
     border: none;
     background: transparent;

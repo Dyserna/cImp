@@ -20,6 +20,7 @@
     attributionState,
     filterEntries,
     mergeEntries,
+    rowStatus,
     tabFilterValue,
     FILTER_ANY,
     NO_FILTER,
@@ -31,6 +32,7 @@
     type AttributionState,
     type FeedFilter,
   } from './activity';
+  import StatusChip from './StatusChip.svelte';
   import { fmtTime } from './format';
   import { fmtTok } from './usageMath';
   import { EVENTS_TAB_ID } from './tabs/types';
@@ -167,32 +169,23 @@
   }
 
   // `ok` alone does not mean "the call worked" in this store, so the status
-  // column untangles the three overlapping conventions instead of painting a
-  // bare pass/fail:
-  //  * `injection_flag` INVERTS it — a denial (SSRF block, budget refusal) is
-  //    `ok: false`, while a detection screen that still delivered the result
-  //    is `ok: true` and means "flagged", not "fine".
-  //  * the telemetry-channel sources (`read_advisor` advisor reminders,
-  //    `harness` drift reports) record `ok: false` to mean "this signal
-  //    fired", not "this call failed" — painting those red made the feed read
-  //    as mostly-broken when nothing had broken.
-  //  * everything else is a plain tool call.
-  const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
-  type Status = 'ok' | 'failed' | 'denied' | 'flagged' | 'signal';
-
-  function status(e: ActivityEntry): Status {
-    if (e.kind === 'injection_flag') return e.ok ? 'flagged' : 'denied';
-    if (!e.ok) return CANARY_SOURCES.has(e.source) ? 'signal' : 'failed';
-    return 'ok';
-  }
-
-  const STATUS_TITLE: Record<Status, string> = {
-    ok: 'Call succeeded',
-    failed: 'Call failed',
-    denied: 'Blocked by an injection-containment screen',
-    flagged: 'Delivered, but a detection screen flagged it',
-    signal: 'A telemetry signal fired — not a failure',
-  };
+  // column untangles the overlapping conventions instead of painting a bare
+  // pass/fail. The rule itself now lives in `activity.ts::rowStatus` and is
+  // rendered by `StatusChip`, shared with the Tool Activity feed.
+  //
+  // **What moved and why** (#48, M-24). The local version here was
+  // `e.ok ? 'flagged' : 'denied'` for every `injection_flag` row, so five
+  // distinct facts arrived as one word: a detector match, a result that was only
+  // PARTLY screened (`unscreened` — nothing found, nothing stopped), a memory
+  // write held for review, containment engaging, and a latch override the USER
+  // applied to give capability BACK. The last two are not even containment
+  // firing, and `unscreened` read as the opposite of what it means. It also read
+  // `!ok` as "denied" for `updater` rows, whose `ok` is a bundle outcome — so a
+  // rejected rules bundle reported as a blocked tool call.
+  //
+  // Kept in a `.ts` file because `.svelte` has no test harness here, and shared
+  // with the other feed because the security vocabulary of this app must not
+  // differ between two tabs rendering the same rows.
 
   function rowTool(e: ActivityEntry): string {
     // mcp tools are namespaced `<server>__<tool>` — render the first `__` as
@@ -359,7 +352,7 @@
             <span class="esrc{srcClass(r.source)}" title={r.source}>{r.source}</span>
             <span class="etool" title={r.tool}>{rowTool(r)}</span>
             <span class="etarget" title={r.target}>{r.target}</span>
-            <span class="estatus {status(r)}" title={STATUS_TITLE[status(r)]}>{status(r)}</span>
+            <StatusChip status={rowStatus(r)} />
             <span class="eattr attr-{attrState(r)}" title={attrTitle(r)}>{attrLabel(r)}</span>
             <span class="esession" class:none={!r.session} title={r.session ?? 'No session recorded'}
               >{shortSession(r.session)}</span
@@ -379,9 +372,7 @@
         <div class="detail-title">
           <span class="ekind {detail.kind}">{detail.kind}</span>
           <span class="detail-tool">{detail.tool}</span>
-          <span class="estatus {status(detail)}" title={STATUS_TITLE[status(detail)]}
-            >{status(detail)}</span
-          >
+          <StatusChip status={rowStatus(detail)} />
         </div>
         <button type="button" class="detail-close icon" onclick={closeDetail} aria-label="Close"
           >×</button
@@ -531,7 +522,10 @@
   }
   .erow {
     display: grid;
-    grid-template-columns: 5.5rem 5rem 6rem 9rem 1fr 4.5rem 9rem 5.5rem;
+    /* Status column widened from 4.5rem: M-24 replaced five words with twelve
+       and `unscreened` is the longest of them. The slack comes out of the
+       flexible target column, not out of another fixed one. */
+    grid-template-columns: 5.5rem 5rem 6rem 9rem 1fr 6.5rem 9rem 5.5rem;
     align-items: center;
     gap: 8px;
     height: var(--erow-h);
@@ -608,22 +602,10 @@
   .etarget {
     opacity: 0.85;
   }
-  .estatus {
-    text-transform: uppercase;
-    font-size: 0.78em;
-    font-weight: 600;
-  }
-  .estatus.ok {
-    opacity: 0.45;
-  }
-  .estatus.failed,
-  .estatus.denied {
-    color: var(--text-danger-soft, #ffb4ab);
-  }
-  .estatus.flagged,
-  .estatus.signal {
-    color: var(--text-warning, #e3b341);
-  }
+  /* The status cell is `StatusChip` now (#48, M-24) — twelve states with twelve
+     words instead of this file's five, and one copy of the treatments, shared
+     with the Tool Activity feed so the two tabs cannot describe the same row
+     differently. Its own scoped styles own the colours. */
 
   /* ── The four attribution states ──────────────────────────────────────
      Four visually SEPARATE treatments, on purpose. A real tab is the only

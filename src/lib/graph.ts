@@ -245,6 +245,42 @@ export interface WorkingSetEntry {
   top_symbols: string[];
 }
 
+/// Why one note is quarantined — the screen that held it, the rules that
+/// matched, and one sentence a human can act on.
+///
+/// **#48, F-24 — THIS IS NOT PUBLISHED BY THE BACKEND YET.** The Memory view's
+/// review queue showed text + time + Promote/Discard and nothing about the
+/// cause, which inverts locked decision 22: for a secret-screen hold the note
+/// TEXT is the credential, so the card displayed the secret value and withheld
+/// the rule name. The reason does exist — `graph::mcp::record_secret_screen_flag`
+/// composes it from `secrets::write_notice(hits)`, which names rules like
+/// `secret_aws_access_key_id`, and the two latch paths in `offload::loopback`
+/// write `QUARANTINE_WRITE_NOTICE` / `UNATTRIBUTED_WRITE_NOTICE` — but it goes
+/// into an `injection_flag` activity row, i.e. to the model, which cannot act on
+/// it, and not to the human, who must. The note row itself
+/// (`graph::index::notes`' `mem_quarantined_notes` → `graph::memory::MemNote`)
+/// carries no screen, no rule and no reason.
+///
+/// So this type is the SHAPE the backend owes, and the card below renders it.
+/// Until `MemNote` carries it, `quarantine` is absent on every note and the card
+/// says so in as many words. Deliberately NOT reconstructed on this side: the
+/// activity rows carry no `note_id`, so a join would be a guess, and the note
+/// text cannot be re-screened here — a plausible-but-wrong cause in a security
+/// UI is worse than a blank field (#48, F-23 is that exact mistake elsewhere).
+export interface NoteQuarantine {
+  /// The screen that held the write — the `outbound::Screen` slug, e.g.
+  /// `memory_quarantine`.
+  screen: string;
+  /// The rule identifiers that matched, e.g. `secret_aws_access_key_id`. EMPTY
+  /// for the two latch causes, which match no rule at all — a legitimate empty,
+  /// which is why it is not the field [`quarantineReason`] tests for
+  /// substantiveness.
+  rules: string[];
+  /// One sentence naming the cause, in the user's words. The field a human acts
+  /// on, so it is the one that must never arrive blank.
+  reason: string;
+}
+
 /// A remembered note. Mirror of Rust `graph::memory::MemNote`.
 export interface MemNote {
   note_id: string;
@@ -258,6 +294,31 @@ export interface MemNote {
   /// until promoted here. Always `false` for entries in `MemorySnapshot.notes`
   /// and `true` for entries in `MemorySnapshot.quarantined`.
   tainted: boolean;
+  /// #48, F-24: why this note is held. Optional because this build's backend
+  /// does not publish it — see [`NoteQuarantine`] for what is owed and where the
+  /// data already exists. Absent on every clean note by definition.
+  quarantine?: NoteQuarantine | null;
+}
+
+/// The reason to SHOW for a quarantined note, or `null` when there is none to
+/// show.
+///
+/// **"Empty is not absent" applied, and the direction chosen deliberately**
+/// (#48, F-24). Three inputs collapse to `null` here — the field missing (an
+/// older backend), the field `null`, and the field present with a blank or
+/// whitespace-only `reason` — and the card renders that one `null` as *"Reason
+/// not recorded"*, never as "this note had no reason". Collapsing them is safe
+/// only because they are collapsed toward the HONEST end: every one of them
+/// means *we cannot tell you why*, and none of them may render as an
+/// explanation. A present-but-blank `reason` is a backend defect, and treating
+/// it as absent is what makes it visible instead of invisible.
+///
+/// `rules` is NOT part of the predicate: the latch and unattributed-write causes
+/// legitimately match no rule, so requiring one would suppress a real reason.
+export function quarantineReason(n: MemNote): NoteQuarantine | null {
+  const q = n.quarantine;
+  if (!q) return null;
+  return q.reason.trim() === '' ? null : q;
 }
 
 /// A session summary row. Mirror of Rust `graph::memory::SessionInfo`.

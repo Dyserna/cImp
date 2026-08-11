@@ -1632,9 +1632,13 @@ beacon is *accepted* and the second check passes for the wrong reason.
       per tab and `/status` reports the tab's configured consumer regardless, so
       a fresh **unlatched** subject requires reopening the tab, not renaming the
       consumer. `?consumer=` still gives a fresh fetch budget and SSRF ledger.)*
-- [x] Master ON, taint latch OFF app-wide, one tab's override `On` → that tab
+- [~] Master ON, taint latch OFF app-wide, one tab's override `On` → that tab
       latches, a second does not, and `/status` names which level decided each.
-      **PASS 2026-08-11.** Setup: *Taint latch* app-wide checkbox unticked,
+      **PARTIAL — re-scored `[x]` → `[~]` 2026-08-11 by the orchestrator, not by
+      the runner: the Override leg PASSED, the Inherit leg is UNRUN** (see the
+      harness trap below — `graph_snippet` answered for the wrong reason). The
+      tick was hiding an unrun leg behind a scanned checkbox, which is the exact
+      class of defect this fix phase is closing. Setup: *Taint latch* app-wide checkbox unticked,
       `v32ClaudeTestTab` L3 → `On`, OpenCode left at Inherit; the subject tab was
       reset with **Full unlatch** rather than reopened, because per-tab overrides
       are keyed to the tab id and a reopen discards them.

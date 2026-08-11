@@ -1224,9 +1224,10 @@ Extended 2026-08-08 — four consumers the above does not reach:
       predicate, so a button and a tick can never disagree"* (`:1263-1266`), and
       it returns `Err`, deliberately, because *"a security control that does
       nothing when clicked, and says nothing about it, teaches the user to
-      distrust it"*. **Still owed:** invoke `detection_check_now` directly (a
-      devtools console in the Settings window, or a test-only hook) and confirm
-      `tick_once` issues no request.
+      distrust it"*. **Still owed, and now known to need a test-only hook:**
+      invoke `detection_check_now` directly and confirm `tick_once` issues no
+      request. **Devtools does not open on this build (verified 2026-08-11)**, so
+      there is no external route to a Tauri IPC command — same blocker as 14g.
       **⚠ F-18 HAS A FIFTH SITE, AND IT IS IN RUST.** That refusal string tells
       the user to go to **"Settings → Tools → Injection protection"**
       (`ipc/commands.rs:1276-1279`) — the section that does not exist. F-18's
@@ -1297,9 +1298,23 @@ Extended 2026-08-08 — four consumers the above does not reach:
       tab showed a contamination badge while its latch was `open`** — the
       contaminated-but-not-EXTERNAL state, which is exactly **F-13**'s shape,
       reached live for the first time.
-- [ ] Break `injection_status` (stop the backend mid-poll) → after three
+- [!] Break `injection_status` (stop the backend mid-poll) → after three
       consecutive failures the chip reads `⛨ unknown` and both poll failures
       `console.warn`; it must **never** render as fully protected.
+      **NOT RUNNABLE ON A RELEASE BUILD — needs a test-only hook. Confirmed
+      2026-08-11; do not keep retrying it.** The box's method is impossible as
+      written: `injection_status` is a **Tauri IPC command**
+      (`latch.ts:157` — `invoke<InjectionStatus>('injection_status')`), served by
+      the same process that draws the window, so "stop the backend mid-poll"
+      cannot be done without killing the UI whose chip is the thing under test.
+      The one external route left was a devtools console (stub
+      `window.__TAURI__.core.invoke` to throw for that one command, which would
+      drive the N-consecutive-failure path exactly) — **devtools does not open on
+      this build**, verified live. Same blocker as 14d's residual leg.
+      Either add a debug-only failure injector or cover it in `latch.test.ts`,
+      which already owns the regression this box protects (`:169`, `:190` — a
+      permanently failing poll leaving the chip hidden and every tab badge
+      absent).
 - [ ] A disarmed signature layer shows as reduced protection, carrying its own
       `reason`, counted separately from switches (ties to recipe 11).
 

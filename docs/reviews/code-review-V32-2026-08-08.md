@@ -56,12 +56,12 @@ test; **DECLINED** means a recorded decision not to fix, with reasoning;
 | F-6 | H-2's decode proof degrades silently if the CLI drops `sessionId` | **OPEN** | raised by the fix run; wants a drift canary |
 | F-7 | Auto-injection still pushes signatures into a contaminated tab | **OPEN** | raised by the fix run; bounds what H-1 claims |
 | F-8 | A denied URL still leaks its hostname to DNS | **OPEN** | raised by the fix run; bounds what "denied" means |
-| F-9 | The signature scan's 1 s budget is wall clock spanning both passes | **OPEN** | pre-existing (H-4); fails honestly, but thins under load |
+| F-9 | The signature scan's 1 s budget is wall clock spanning both passes | **OPEN — DECIDED 2026-08-11, ready to implement** | **Options 1 + 3: give the normalized pass its OWN budget instead of the remainder, and size both now that H-4 doubled the work.** Rationale + the two rejected options in the F-9 entry below |
 | F-18 | Every pointer to the V32 controls names a Settings section that does not exist | **OPEN** | found live 2026-08-10 on v0.51.0-rc.1 — the first defect found by *running* the build |
 | F-19 | No `claude-opus-5` row in the seeded price table — session cost reads $0 | **FIXED** | `1524efa` — seed row **plus** a `pricing_seeded_generation` watermark migration for existing installs; tripwire `every_built_in_priced_model_is_reachable_by_existing_installs` |
 | F-10 | `NativeRouter` never re-gated `graph_*`/audit tools — `LOCAL_DATA_TOOLS` lists only read_file/list_dir/code_search/run_command/filesystem/git | **FIXED** | `f895e74` — carried by M-2's `GatePass`; exploitable half was `graph_*` on a cloud/LAN backend via the headless child |
 | F-11 | `select_discovery` prefers the DEEPEST matching root — one `Write` of a well-formed discovery file with a dead port forces the fallback *and* chooses the reason it reports | **OPEN** | steers `audit/mcp.rs` and every hook shim; decide with F-26, which shows the same file set is larger than documented |
-| F-12 | `run_check` is **advertised** to a cloud/LAN backend and executes the project's configured commands | **OPEN — NEEDS A USER DECISION** | HIGH. Recommendation recorded: re-gate behind its own opt-in via `BackendGate` **plus** add to `LOCAL_DATA_TOOLS`. Third finding in one family with M-8 and M-7's residual #1 — decide the three together |
+| F-12 | `run_check` is **advertised** to a cloud/LAN backend and executes the project's configured commands | **OPEN — DECIDED 2026-08-11, ready to implement** | HIGH. **User decision: add `run_check` to `LOCAL_DATA_TOOLS`, denying it to cloud backends BY DEFAULT, with a user opt-in.** Both halves are required and neither is sufficient alone: `LOCAL_DATA_TOOLS` fixes **new** backends, and the `BackendGate` opt-in must be enforced **at call time** so **existing** configured backends are fixed too (this is exactly F-10's shape — *"the helper is right, the call site is missing"*). Implement with M-8's residual and M-7 residual #1, one family |
 | F-13 | `/latch/state` publishes `contaminated`, but the OpenCode plugin's gate reads only `st.latch`, so a **contaminated-but-not-EXTERNAL** tab admits every local tool | **OPEN** | **reached live 2026-08-11** — an OpenCode tab sat `contaminated:true` with `latch:"open"` and rendered a contamination badge in that state. Signal with no consumer; decide with the contamination-clear path |
 | F-14 | H-1's "most hardened combination" comment overstates what gate-ON + beacon-OFF invalidates | **OPEN** | LOW. Bounded live by recipe 19's second half, which verified the invalidation *does* sit above the beacon's enable guard |
 | F-15 | `GraphIndex::mem_add_note` is still `pub` and takes a raw `&str`, so M-20's `NoteText` guards the *path*, not the *store* | **OPEN** | same shape as the `mem_quarantined_notes` tripwire gap; decide the two together |
@@ -1675,10 +1675,43 @@ fails honestly, so this is a detection-availability issue rather than a
 containment hole, but "the defence thins exactly when someone is pushing on it"
 should be chosen, not inherited.
 
-Options, none taken: give the normalized pass its own budget rather than the
+Options: give the normalized pass its own budget rather than the
 remainder; measure CPU time instead of wall clock; raise `SCAN_TIMEOUT` now that
 it covers two passes; or accept it and make the two affected tests tolerant of
 `DidNotComplete` so the suite stops reporting a real property as a failure.
+
+**USER DECISION 2026-08-11 — take options 1 AND 3 together.**
+
+- **Option 1 is the one that addresses the actual harm.** The problem is not that
+  scans time out, it is *which* layer dies first: the normalized pass runs on
+  `SCAN_TIMEOUT - elapsed`, so pass 1 starves it, and the normalized pass is the
+  **obfuscation defence — the thing the attacker controls**. Anyone who can make
+  the machine busy raises the odds that precisely the pass which would catch them
+  never runs. Giving each pass its own budget removes that asymmetry. Cheap,
+  portable, no new dependencies.
+- **Option 3 belongs with it as the sizing half**: H-4 added the second pass
+  without widening the budget, so the current value was never sized for the work
+  it now covers. Alone it only moves the threshold.
+- **Option 2 (CPU time) REJECTED** despite being the theoretically clean answer:
+  Rust's std has no portable thread-CPU-time API, so it means platform-specific
+  code, and — the real objection — it **removes the wall-clock latency bound the
+  caller depends on**, so a pathologically slow scan would no longer be bounded
+  in real time. That trades a detection-availability issue for a caller-blocking
+  one.
+- **Option 4 alone REJECTED as the trap**: making the tests tolerant of
+  `DidNotComplete` turns a real property into a silenced one, and this family
+  already fires in CI on release commits — a check that goes red for known
+  reasons stops being read (global principle 3).
+- **The tests must still change, as a consequence of 1+3**: re-point them at the
+  invariant that matters — **the normalized pass ran, and the outcome is never
+  `Clean`** — rather than asserting a specific match that load can legitimately
+  defeat. Sizing must be justified against the measured scale below (~105 ms for
+  64 KB across both passes), not picked round.
+
+**Separate but adjacent, worth fixing in the same pass:** `release.yml` triggers
+on the tag and only `needs: build-windows`, so it **never consults Tests** — a
+green tag is not evidence the suite passed, which currently masks exactly this
+class of failure.
 
 **One measured data point, from M-6's fix.** A 64 KB audit report (the largest
 this new caller can produce) costs **~105 ms over both passes** against the

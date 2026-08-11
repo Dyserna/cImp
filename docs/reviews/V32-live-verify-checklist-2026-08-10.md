@@ -539,9 +539,26 @@ credential was used. Run on `claude:claude`, which `/status` confirmed
       All three `context_note` calls returned `HEADLESS_WRITE_UNAVAILABLE`
       verbatim, closing on *"this is a transient condition, not a permanent
       boundary"*.
-- [ ] It writes its own `ok:false` activity row.
-      _(Owed: not observable while the app is down — check the Events tab for the
-      phase-1 refusals now that cImp is back up.)_
+- [x] It writes its own `ok:false` activity row.
+      **PASS 2026-08-11**, read straight out of `<exe-dir>/tool-activity.jsonl`
+      (no Events-tab hunt needed — `refuse_headless` calls `activity::record_bg`,
+      which appends to that file even with the app down). Three rows, one per
+      refused call:
+      `kind:"graph" source:"claude" tool:"context_note" ok:false chars:390 ms:0`
+      — `chars` being the length of the `NOT SAVED` message, `ms:0` because no
+      work was attempted.
+      **⚠ AND IT SHARPENS F-20 INTO SOMETHING ACTIONABLE.** These refusal rows
+      carry **`"tab":{"tab":"ai-861e08c3-…"}` — they NAME THE TAB.** The
+      `ok:true` rows from the same child, on the same store, minutes apart, carry
+      **`"tab":"headless"`**. So on this one file the **refusal** path attributes
+      correctly while the **served** path drops the identity, even though the
+      child was launched `--tab ai-861e08c3-…` in both cases.
+      That is exactly what `refuse_headless`'s own comment intends — *"`tab` is
+      almost always None here — but not necessarily … that row should still name
+      the tab it refused"* (`graph/mcp.rs:744-747`). **F-20's fix therefore
+      already exists in the same file, one function away, and the two paths can
+      be compared directly.** Previously F-20 was "both tool-serving routes drop
+      the identity"; it is now "one route drops it and its neighbour does not".
 - [x] `context_recall` and `graph_*` reads on the same path **still work**
       (reads stay fail-open — a contaminated tab must not lose its own memory).
       **PASS 2026-08-11.** In the same headless child: `context_recall` returned

@@ -9,12 +9,273 @@ on:
       tag:
         description: 'Existing tag to (re-)build, e.g. v0.1.0'
         required: true
+      allow_untested:
+        description: 'Release WITHOUT a green Tests run — type: i-accept-an-untested-release'
+        required: false
+        default: ''
 
 permissions:
-  contents: write   # needed by `gh release create`
+  contents: write   # needed by `gh release create`; also lets gate-tests use the compare API
+  actions: read     # gate-tests reads tests.yml's runs for the released commit
 
 jobs:
+  # Code review 2026-08-08, F-9's adjacent half. This workflow triggers on the
+  # TAG and used to start at `build-windows`, so NOTHING in the release path ever
+  # consulted the Tests workflow: a green release meant the app COMPILED and said
+  # nothing at all about the suite. That is how a known-red test family kept
+  # riding release commits. Do not delete this job as ceremony — it is the
+  # missing consumer of the only signal that says the suite passed.
+  #
+  # It does not re-run the suite: a second cold Windows build is ~40 minutes for
+  # a result that already exists, and a copy of tests.yml's steps here would
+  # drift from tests.yml. It requires tests.yml to have run and PASSED on the
+  # exact commit being released, waiting for it while it is still in flight —
+  # the normal case, since the tag is pushed seconds after the branch push that
+  # started it.
+  gate-tests:
+    runs-on: ubuntu-24.04
+    # tests.yml gives itself 75 minutes for a fully cold run; the wait below is
+    # 80 (75 + runner queueing) and this ceiling leaves headroom for the API
+    # calls around it. Bounded on purpose: the gate FAILS on timeout, it never
+    # deadlocks a release forever and never falls through to a pass.
+    timeout-minutes: 90
+    steps:
+      # No checkout: this job reads the API and touches no repo file. Node comes
+      # from the runner image via setup-node (same action + pin as every other
+      # job here) — the gate is a Node script rather than a jq pipeline for
+      # exactly the reason advisories.yml's is: it can be run verbatim, off-CI,
+      # against real API output, which is how the paths and no-run branches
+      # below were checked before this file was committed.
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Require a green Tests run for the commit being released
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # The workflow FILE name, not the display name "Tests" — the runs API
+          # keys on the file (or the numeric id).
+          TESTS_WORKFLOW: 'tests.yml'
+          # env indirection keeps untrusted context data out of the script text
+          # (same shell-injection hardening as the Resolve tag step below); the
+          # gate re-validates the tag itself before putting it in a URL.
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          HEAD_SHA: ${{ github.sha }}
+          ALLOW_UNTESTED: ${{ inputs.allow_untested }}
+          POLL_SECONDS: '30'
+          # 160 x 30 s = 80 min: tests.yml's own ceiling is 75, plus runner
+          # queueing, and this job's timeout-minutes leaves headroom on top.
+          MAX_ATTEMPTS: '160'
+          # A run created by the push that carried this commit registers within
+          # seconds of it, so 20 x 30 s = 10 min is generous for "it is about to
+          # appear". Past that, "no run" is a fact rather than a race, and the
+          # gate stops waiting 80 minutes to say so.
+          NO_RUN_ATTEMPTS: '20'
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/gate-tests.mjs" <<'GATE'
+          import { execFileSync } from "node:child_process";
+
+          const REPO = process.env.REPO;
+          const WORKFLOW = process.env.TESTS_WORKFLOW;
+          const EVENT = process.env.EVENT_NAME ?? "";
+          const INPUT_TAG = process.env.INPUT_TAG ?? "";
+          const HEAD_SHA = process.env.HEAD_SHA ?? "";
+          const ALLOW_UNTESTED = process.env.ALLOW_UNTESTED ?? "";
+          const POLL_SECONDS = Number(process.env.POLL_SECONDS);
+          const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS);
+          const NO_RUN_ATTEMPTS = Number(process.env.NO_RUN_ATTEMPTS);
+
+          // The bypass sentence, spelled once. See §2.
+          const BYPASS = "i-accept-an-untested-release";
+          // How many recent green-tested commits may be tried as an ancestor
+          // (§3). Bounds the API calls a release can spend in that branch.
+          const ANCESTORS_TRIED = 20;
+          // The compare API caps `.files` at 300 and truncates it silently.
+          const COMPARE_FILE_CAP = 300;
+
+          const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
+          function die(msg) {
+            console.log(`::error::${msg}`);
+            process.exit(1);
+          }
+          function api(path) {
+            return JSON.parse(execFileSync("gh", ["api", path], {
+              encoding: "utf8",
+              maxBuffer: 32 * 1024 * 1024,
+            }));
+          }
+          function apiOrNull(path) {
+            try { return api(path); } catch { return null; }
+          }
+
+          // ── 1. which commit is being released? ────────────────────────────
+          let sha = HEAD_SHA;
+          if (EVENT === "workflow_dispatch") {
+            // Stricter than the Resolve tag step's regex on purpose: this value
+            // goes into an API path, so the tail is charset-limited too.
+            if (!/^v\d+\.\d+\.\d+[A-Za-z0-9.+-]*$/.test(INPUT_TAG)) {
+              die(`tag '${INPUT_TAG}' does not match v<X>.<Y>.<Z>`);
+            }
+            const ref = apiOrNull(`repos/${REPO}/git/ref/tags/${INPUT_TAG}`);
+            if (!ref?.object?.sha) die(`tag '${INPUT_TAG}' does not exist in ${REPO}`);
+            sha = ref.object.sha;
+            // An ANNOTATED tag's ref points at a tag object, not at the commit.
+            if (ref.object.type === "tag") {
+              sha = api(`repos/${REPO}/git/tags/${sha}`).object.sha;
+            }
+          }
+          if (!/^[0-9a-f]{40}$/.test(sha)) {
+            die(`could not resolve the commit being released (got '${sha}') — refusing to gate on nothing`);
+          }
+          console.log(`gating the release on ${sha}`);
+
+          // ── 2. the bypass ────────────────────────────────────────────────
+          // Deliberately awkward: an exact sentence, dispatch-only (a tag push
+          // cannot set it), and a ::warning:: on the run. A near-miss FAILS
+          // rather than quietly gating, so "I meant to bypass" and "I
+          // fat-fingered a release" can never look the same. It exists so that
+          // re-building an old tag whose Tests run has aged out of retention is
+          // possible at all — it is not a path any normal release run takes.
+          if (ALLOW_UNTESTED === BYPASS) {
+            console.log(`::warning::the Tests gate was BYPASSED by explicit dispatch input for ${sha} — this release is NOT evidence that the suite passed`);
+            process.exit(0);
+          }
+          if (ALLOW_UNTESTED !== "") {
+            die(`allow_untested must be exactly '${BYPASS}' — refusing to guess at a bypass`);
+          }
+
+          // ── 3. the paths: hole ───────────────────────────────────────────
+          // tests.yml filters its push/pull_request triggers by `paths:`, so a
+          // commit touching only excluded files produces NO run for that sha —
+          // and "no run found" is then ambiguous between "tests were skipped
+          // legitimately" and "tests never ran on code that changed". The
+          // ambiguous case must never default to pass; but hard-failing BOTH
+          // cases would send every docs-only release to the bypass, which is
+          // how an awkward bypass becomes a reflex.
+          //
+          // So it is resolved by EVIDENCE rather than by re-deriving tests.yml's
+          // filter here (a second copy of that list would drift from it, and one
+          // too-generous glob would silently pass untested code): find a commit
+          // that IS an ancestor of the released one and DID get a green Tests
+          // run, and require every file changed between the two to be one the
+          // suite cannot observe. The tree the suite actually compiled is then,
+          // for everything the suite can see, the tree being released.
+          //
+          // RESIDUAL, stated rather than hidden: TEST_BLIND must stay a subset
+          // both of what tests.yml's `paths:` filter excludes and of what no
+          // test reads, so it is deliberately tiny. Checked 2026-08-11 that
+          // nothing in the suite reads any of it — the suite's on-disk fixtures
+          // are `detection/`, `themes/`, `palettes/`, `models/` and
+          // `scripts/patterns.default.json` (via CARGO_MANIFEST_DIR). Note that
+          // the first three are NOT in tests.yml's `paths:` filter either, so a
+          // commit touching only those is both untested AND runless; they are
+          // absent from TEST_BLIND, so the gate fails such a tag, which is the
+          // correct answer until tests.yml's filter covers them.
+          //
+          // Second residual: only the ANCESTORS_TRIED most recent green-tested
+          // commits are considered, so this reasoning reaches back a bounded
+          // distance from the tip. A release tag is near the tip by definition;
+          // a tag far behind it simply finds no ancestor and fails closed.
+          const TEST_BLIND = (f) =>
+            f.startsWith("docs/") ||
+            f.endsWith(".md") ||
+            f === "LICENSE" ||
+            f === "NOTICE" ||
+            f === ".github/workflows/release.yml";
+
+          function explainedByATestedAncestor() {
+            // `push` runs only: their head_sha IS the tree that was compiled. A
+            // pull_request run's head_sha is the PR head while the run tested a
+            // MERGE PREVIEW of it, which proves nothing about the tree this
+            // argument needs.
+            const listed = apiOrNull(`repos/${REPO}/actions/workflows/${WORKFLOW}/runs?status=success&event=push&per_page=100`);
+            if (!Array.isArray(listed?.workflow_runs)) return false;
+            const bases = [...new Set(listed.workflow_runs.map((r) => r.head_sha))].slice(0, ANCESTORS_TRIED);
+
+            for (const base of bases) {
+              const cmp = apiOrNull(`repos/${REPO}/compare/${base}...${sha}`);
+              // "ahead" is exactly "base is an ancestor of sha".
+              if (cmp?.status !== "ahead") continue;
+              // A truncated or absent file list cannot PROVE irrelevance, so it
+              // is never allowed to imply it.
+              if (!Array.isArray(cmp.files) || cmp.files.length >= COMPARE_FILE_CAP) {
+                console.log(`  ${base} is a green-tested ancestor, but its diff is too large for the compare API to enumerate — irrelevance cannot be proven, so it is not assumed`);
+                continue;
+              }
+              const files = cmp.files.map((f) => f.filename);
+              const visible = files.filter((f) => !TEST_BLIND(f));
+              if (visible.length) {
+                console.log(`  ${base} is a green-tested ancestor, but the suite can see ${visible.length} of the ${files.length} files changed since (e.g. ${visible[0]})`);
+                continue;
+              }
+              console.log(`  green Tests run on the ancestor ${base}`);
+              console.log(`  changed since, none of it visible to the suite: ${files.join(", ") || "<nothing>"}`);
+              console.log(`::notice::no Tests run exists for ${sha} because tests.yml's paths: filter had nothing to run on: every change since the green-tested ancestor ${base} is invisible to the suite`);
+              return true;
+            }
+            return false;
+          }
+
+          // ── 4. poll ──────────────────────────────────────────────────────
+          let analysed = false;
+          for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            const listed = api(`repos/${REPO}/actions/workflows/${WORKFLOW}/runs?head_sha=${sha}&per_page=100`);
+            if (!Array.isArray(listed.workflow_runs)) {
+              die("the workflow-runs API returned no .workflow_runs array. Re-check this gate against the API rather than trusting a green run.");
+            }
+            const runs = listed.workflow_runs;
+
+            if (runs.length) {
+              for (const r of runs) {
+                console.log(`  Tests: ${r.event} ${r.status}/${r.conclusion ?? "-"} ${r.html_url}`);
+              }
+              const green = runs.filter((r) => r.conclusion === "success");
+              if (green.length) {
+                // A success is a success: the suite passed on THIS tree. The two
+                // caveats are surfaced rather than acted on silently.
+                if (!green.some((r) => r.event !== "pull_request")) {
+                  console.log(`::warning::the only green Tests run for ${sha} came from a pull_request event, which tests the MERGE of that commit into its base rather than the commit alone`);
+                }
+                if (runs.some((r) => r.status === "completed" && r.conclusion !== "success")) {
+                  console.log(`::warning::another Tests run on ${sha} did not succeed (listed above) — the gate passes on the green one, but a suite that needed a re-run is worth a look`);
+                }
+                console.log(`Tests passed for ${sha}`);
+                process.exit(0);
+              }
+              if (runs.some((r) => r.status !== "completed")) {
+                console.log(`Tests has not finished for ${sha}; waiting ${POLL_SECONDS}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
+                await sleep(POLL_SECONDS);
+                continue;
+              }
+              die(`every Tests run for ${sha} is finished and none passed (${runs.map((r) => r.conclusion ?? "?").join(", ")}). A tag is not evidence the suite passed — fix the suite, or re-run tests.yml on that commit, then re-run this workflow.`);
+            }
+
+            // No run at all for this commit — see §3. The analysis is
+            // deterministic, so it is done once and then only waited out.
+            if (!analysed) {
+              analysed = true;
+              if (explainedByATestedAncestor()) process.exit(0);
+            }
+            if (attempt >= NO_RUN_ATTEMPTS) {
+              die(`no Tests run exists for ${sha} and no green-tested ancestor explains its absence, so this tag is NOT evidence the suite passed. Run tests.yml on that commit (push it to develop/main, or dispatch tests.yml on the branch whose head it is) and re-run this workflow. If its run has aged out of retention, dispatch this workflow with allow_untested=${BYPASS}.`);
+            }
+            console.log(`no Tests run for ${sha} yet; waiting ${POLL_SECONDS}s (attempt ${attempt}/${NO_RUN_ATTEMPTS})`);
+            await sleep(POLL_SECONDS);
+          }
+
+          die(`the Tests run for ${sha} did not finish inside the gate's ${Math.max(1, Math.round((MAX_ATTEMPTS * POLL_SECONDS) / 60))} minute wait — it is still going or it stalled. The gate fails rather than releasing on an unfinished suite: re-run this workflow once Tests is green.`);
+          GATE
+
+          node "$RUNNER_TEMP/gate-tests.mjs"
+
   build-windows:
+    needs: gate-tests
     runs-on: windows-latest
     # Exposed so build-linux (which `needs` this job) can reuse the resolved tag
     # and upload its tarballs to the release this job creates.

@@ -552,7 +552,7 @@ pub async fn wrap_external_result(name: &str, text: String, ctx: ResultCtx<'_>) 
     if !spotlight::is_external(name) {
         return text;
     }
-    compose(name, text, ctx, spotlight::envelope).await
+    compose(name, text, ctx, spotlight::envelope, None).await
 }
 
 /// V32 review finding M-6 (#48) — the same composition for a **local scanner
@@ -575,19 +575,82 @@ pub async fn wrap_external_result(name: &str, text: String, ctx: ResultCtx<'_>) 
 /// or become a second hand-maintained name list. The caller is the boundary
 /// that knows what it is delivering.
 pub async fn wrap_local_report(name: &str, text: String, ctx: ResultCtx<'_>) -> String {
-    compose(name, text, ctx, spotlight::scanner_envelope).await
+    compose(name, text, ctx, spotlight::scanner_envelope, None).await
+}
+
+/// #48 finding M-17 — the same composition for a **failed** EXTERNAL call.
+///
+/// The success path was enveloped, screened and bounded; the failure path
+/// returned the server's `error.message` verbatim, and comments at both
+/// boundaries asserted the opposite. This is the third population of untrusted
+/// text that reaches the model through a trusted channel, and it gets the same
+/// treatment as the other two.
+///
+/// `diagnostic` is cImp's own sentence and stays outside the envelope, where it
+/// belongs: the model needs to know which call failed, and that fact is not in
+/// question. `remote` is the bounded half
+/// (`mcp_host::HostError::remote`) — the only path to those bytes.
+///
+/// **There is deliberately no `is_external(name)` gate.** Like
+/// [`wrap_local_report`], the decision is a property of the BYTES' author, not of
+/// the tool's class — a server's error message is server-authored whatever the
+/// tool is classified as — and every name that reaches an MCP host is namespaced
+/// and therefore EXTERNAL anyway, so a gate here would be a no-op that reads as a
+/// safety property. (F-26's lesson, applied.)
+///
+/// The flood bound is the one [`compose`] already has: at most one
+/// `injection_flag` row per flagged error, through the same `ScopeAudit` claim
+/// bits a flagged success uses, so a server erroring in a loop is bounded exactly
+/// as a research session fetching fifty pages is. That is why the composer is
+/// reused rather than hand-rolled here.
+pub async fn wrap_remote_error(
+    name: &str,
+    diagnostic: &str,
+    remote: Option<&str>,
+    ctx: ResultCtx<'_>,
+) -> String {
+    match remote {
+        // Nothing remote in it: cImp's own refusal or transport message, which is
+        // what the old comments CLAIMED every error was. Unchanged.
+        None => diagnostic.to_string(),
+        Some(bytes) => {
+            compose(
+                name,
+                bytes.to_string(),
+                ctx,
+                spotlight::remote_error_envelope,
+                Some(diagnostic),
+            )
+            .await
+        }
+    }
 }
 
 /// Detect → envelope → header, in the one order that is correct. `wrap` is the
 /// envelope vocabulary the calling boundary delivers under; everything else is
 /// identical for every population of untrusted text.
-async fn compose(name: &str, text: String, ctx: ResultCtx<'_>, wrap: fn(&str) -> String) -> String {
+async fn compose(
+    name: &str,
+    text: String,
+    ctx: ResultCtx<'_>,
+    wrap: fn(&str) -> String,
+    // #48 M-17: cImp-composed text that must sit OUTSIDE the envelope and BELOW
+    // the warning header — the error diagnostic that says which call failed.
+    // Threaded through here rather than prepended by the caller so that the
+    // three-part order (header, then notice, then body) keeps exactly one
+    // definition.
+    lead: Option<&str>,
+) -> String {
     // 1. Detect on the RAW text, before any cImp-composed bytes are added.
     let verdict = screen(&text, ctx.cfg).await;
     // 2. Envelope — unless V32 Phase G's spotlighting switch is off for this
     //    scope, in which case the raw text is the body and the header (if any)
     //    describes it as such.
     let wrapped = if ctx.spotlight { wrap(&text) } else { text };
+    let wrapped = match lead {
+        Some(l) => format!("{l}\n{wrapped}"),
+        None => wrapped,
+    };
     // 3. Headers, outside the markers and in front of the preamble. The
     //    unscreened notice (#48, D-1) is composed first so it can sit BELOW the
     //    warning when both apply: the warning is the sharper statement and must
@@ -957,6 +1020,69 @@ mod tests {
                 wrap_external_result(trusted, HOSTILE.to_string(), ctx(signature_only())).await;
             assert_eq!(out, HOSTILE, "{trusted}");
         }
+    }
+
+    /// #48 M-17 — the vector, end to end: a hostile server's `error.message`
+    /// reaches the model inside a nonced envelope, screened, with cImp's own
+    /// diagnostic OUTSIDE the markers, and a signature hit produces a flag row.
+    ///
+    /// Before this the whole `Err` arm was returned verbatim under comments at
+    /// both boundaries asserting it was cImp-composed.
+    #[tokio::test]
+    async fn a_remote_error_message_is_enveloped_screened_and_flagged() {
+        outbound::test_rows::reset();
+        let out = wrap_remote_error(
+            "ddg__fetch_content",
+            "http status 500",
+            Some(HOSTILE),
+            ctx(signature_only()),
+        )
+        .await;
+        // The warning header is the first line a truncating reader sees.
+        assert!(out.starts_with(WARNING_HEADER_PREFIX), "{out}");
+        let body = strip_warning_header(&out);
+        // cImp's diagnostic sits above the envelope, outside the markers.
+        let (lead, rest) = body.split_once('\n').expect("a lead line");
+        assert_eq!(lead, "http status 500");
+        assert!(
+            rest.starts_with(spotlight::REMOTE_ERROR_PREAMBLE),
+            "the REMOTE-ERROR standing instruction, not the external one: {rest}"
+        );
+        assert!(!rest.starts_with(spotlight::SPOTLIGHT_PREAMBLE), "{rest}");
+        // Locked decision 5 holds here too: strip our additions and the bytes are
+        // the server's, unchanged.
+        let inner = rest
+            .strip_prefix(spotlight::REMOTE_ERROR_PREAMBLE)
+            .and_then(|r| r.strip_prefix('\n'))
+            .and_then(|r| r.split_once('\n'))
+            .map(|(_, rest)| rest)
+            .and_then(|r| r.rsplit_once('\n'))
+            .map(|(body, _)| body)
+            .expect("the enveloped region");
+        assert_eq!(inner, HOSTILE, "content must be byte-identical");
+        // And it produced a row — the flood bound is `compose`'s own claim ledger,
+        // so a server erroring in a loop is bounded exactly as fifty fetches are.
+        let rows = outbound::test_rows::drain();
+        assert_eq!(
+            outbound::test_rows::of_screen(&rows, Screen::Signature).len(),
+            1,
+            "one flagged error, one row"
+        );
+    }
+
+    /// An error with no remote half is passed through untouched — the property
+    /// the old comments claimed for ALL errors, now true of exactly the errors it
+    /// is true of.
+    #[tokio::test]
+    async fn a_cimp_composed_error_is_not_enveloped() {
+        let out = wrap_remote_error(
+            "ddg__fetch_content",
+            "REFUSED: cImp does not allow this",
+            None,
+            ctx(signature_only()),
+        )
+        .await;
+        assert_eq!(out, "REFUSED: cImp does not allow this");
     }
 
     /// #48 M-6: the local-report sibling. It must screen and envelope a name

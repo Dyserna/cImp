@@ -1136,6 +1136,12 @@ impl GraphService {
     /// both are resolved at the proxy, which is the only layer that knows the
     /// calling TAB and can therefore resolve the three-level hierarchy at the
     /// right scope.
+    /// #48 F-20: `tab` is the attribution the loopback handler resolved from the
+    /// request body's `tab` field through `latch_scope`/`LatchScoping::attribution`
+    /// (so an id naming no configured tab arrives as `Unrecognized`, never as a
+    /// tab). It is threaded rather than derived here for the same reason `guards`
+    /// is: only the proxy knows the calling tab.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_graph_tool(
         &self,
         cwd: &Path,
@@ -1144,6 +1150,7 @@ impl GraphService {
         consumer: &str,
         session: Option<&str>,
         guards: crate::offload::toolclass::CallGuards,
+        tab: crate::activity::Attribution,
     ) -> Result<String, String> {
         let settings = self.settings.current();
         let sub = settings.graph.effective_db_subdir();
@@ -1157,15 +1164,20 @@ impl GraphService {
         // entirely (same rationale as `mcp::handle_call`'s special case).
         if name == "run_check" {
             let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
-            return super::mcp::run_check_tool(&root, &settings, source, args, None).await;
+            return super::mcp::run_check_tool(&root, &settings, source, args, tab).await;
         }
 
         let root = super::mcp::find_graph_root(cwd, &sub)
             .ok_or_else(|| format!("no code graph found from {}", cwd.display()))?;
         let idx = self.index_for(&root).map_err(|e| e.to_string())?;
-        // No tab: this is the offload worker's in-process route.
+        // #48 F-20: this is the loopback `/graph_run` route (see the fn doc), NOT
+        // the worker's — the comment that used to sit here said the opposite, and
+        // it is why every Claude/OpenCode graph and memory call filed as
+        // `Headless` while the `injection_flag` row beside it named the tab. The
+        // worker's route is `graph::mcp::offload_query`, which passes `Headless`
+        // for real.
         super::mcp::dispatch_recorded(
-            &root, &idx, &settings, source, name, args, session, guards, None,
+            &root, &idx, &settings, source, name, args, session, guards, tab,
         )
             .await
     }
@@ -1173,6 +1185,23 @@ impl GraphService {
     /// The configured per-project db subdirectory (default `.cimp`).
     pub(super) fn db_subdir(&self) -> String {
         self.settings.current().graph.effective_db_subdir()
+    }
+
+    /// The activity `root_key` a call from `cwd` will be recorded under — the
+    /// SAME resolution [`Self::run_graph_tool`] uses (`find_graph_root`, falling
+    /// back to `cwd`), exposed so a caller that must record a row *before*
+    /// dispatch cannot name a different project than the dispatch will.
+    ///
+    /// #48 F-16: added for `loopback::handle_graph_run`, which writes the
+    /// unattributed-write quarantine row at gate time — before `run_graph_tool`
+    /// has resolved anything. Two resolutions here would mean one call producing
+    /// two rows filed under two projects, which is the failure this finding is
+    /// about wearing a different hat. `graph::mcp` is a private module of `graph`,
+    /// so the loopback cannot reach `find_graph_root` itself; this is the seam.
+    pub fn graph_root_key(&self, cwd: &Path) -> String {
+        let sub = self.db_subdir();
+        let root = super::mcp::find_graph_root(cwd, &sub).unwrap_or_else(|| cwd.to_path_buf());
+        crate::activity::root_key(&root)
     }
 
     /// Get (opening + caching if needed) the warm index for `root`.

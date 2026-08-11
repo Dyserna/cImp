@@ -166,7 +166,31 @@ fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
 /// arbitrary but deterministic). With no hint or no match: a sole surviving
 /// entry is unambiguous, else fall back to the legacy last-writer-wins file.
 /// Pure — unit-tested directly.
-fn select_discovery(mut entries: Vec<Discovery>, hint: Option<&Path>) -> Option<Discovery> {
+fn select_discovery(entries: Vec<Discovery>, hint: Option<&Path>) -> Option<Discovery> {
+    select_with_legacy(entries, hint, read_discovery)
+}
+
+/// [`select_discovery`] with its **third** preference injected, so the whole
+/// three-step order is unit-testable and not just the first two.
+///
+/// #48 F-26 is why this split exists. Two `graph/mcp.rs` comments documented a
+/// repro — "truncate `.cimp-discovery/<pid>.json` and the child goes headless" —
+/// that does not reproduce, because the entry `read_all_discoveries` silently
+/// drops merely takes the caller to step 3, where `.cimp-offload.json` still
+/// resolves. That step used to be an inline `read_discovery()` call reading a
+/// real file next to the executable, so the one property the wrong comment got
+/// wrong was the one property no test could state. `legacy` makes it statable.
+///
+/// The order, in one place:
+/// 1. among per-instance entries with a non-empty `root` that is an ancestor of
+///    (or equal to) the hint, the DEEPEST root, higher pid breaking a tie;
+/// 2. the sole per-instance entry, when exactly one survives;
+/// 3. `legacy` — in production `.cimp-offload.json`.
+fn select_with_legacy(
+    mut entries: Vec<Discovery>,
+    hint: Option<&Path>,
+    legacy: impl FnOnce() -> Option<Discovery>,
+) -> Option<Discovery> {
     if let Some(h) = hint {
         let mut best: Option<(usize, &Discovery)> = None;
         for d in &entries {
@@ -192,7 +216,7 @@ fn select_discovery(mut entries: Vec<Discovery>, hint: Option<&Path>) -> Option<
     if entries.len() == 1 {
         return entries.pop();
     }
-    read_discovery()
+    legacy()
 }
 
 /// Root-aware discovery: resolve the instance serving `hint` (a child's cwd
@@ -1227,6 +1251,42 @@ impl LatchScoping {
         }
     }
 
+    /// #51 / #48 F-20 — which tab an activity row written for this call belongs
+    /// to.
+    ///
+    /// The mapping is one-to-one onto [`crate::activity::Attribution`], and that
+    /// is the whole point: both enums were derived from the same three facts — no
+    /// tab identity at all / an id naming no configured tab / a configured tab —
+    /// and the row's column exists to report which of the three this call was.
+    /// Written here, once, so `/graph_run` and `/mcp/call` cannot answer it
+    /// differently, and so a future route gets the answer by resolving identity
+    /// rather than by remembering to.
+    ///
+    /// Both handlers used to call [`Self::into_scope`] immediately, which
+    /// collapses `Anonymous` and `Unknown` into one `None`. That collapse is
+    /// right for the latch (both fail open) and wrong for the row, which has to
+    /// keep them apart — that collapse IS finding F-20.
+    ///
+    /// **Not `Attribution::from_child_argv`.** A tab id that reached this frame
+    /// came out of a request BODY, which a caller can invent; the argv
+    /// constructor's own doc forbids it here. [`latch_scope`] has already run the
+    /// id through [`is_configured_tab`], and `Unrecognized` is what the
+    /// unvalidated case is called on the row.
+    ///
+    /// [`Attribution::Unattributed`](crate::activity::Attribution::Unattributed)
+    /// is deliberately unreachable from this function: a route that resolved a
+    /// `LatchScoping` at all DOES know, and "the writer does not know" would be a
+    /// false claim — the one thing that column must never make.
+    fn attribution(&self) -> crate::activity::Attribution {
+        match self {
+            LatchScoping::Anonymous => crate::activity::Attribution::Headless,
+            LatchScoping::Unknown(id) => {
+                crate::activity::Attribution::Unrecognized(id.clone())
+            }
+            LatchScoping::Scoped(s) => crate::activity::Attribution::Tab(s.tab.clone()),
+        }
+    }
+
     /// The injection-hierarchy scope this call resolves features against.
     /// Both identity-less variants resolve **app-wide** (`Scope::App`), the
     /// same fail-open reading [`GatePolicy::resolve`] has always taken for a
@@ -1967,27 +2027,60 @@ pub(super) struct CallProvenance<'a> {
     url: Option<&'a str>,
     /// That URL's host — the at-a-glance column.
     host: Option<&'a str>,
+    /// #48 F-16: the project this call runs against, in
+    /// [`crate::activity::root_key`] form, for a row the registry writes when it
+    /// has no scope to take one from ([`unattributed_write`]). `None` where the
+    /// route genuinely has no project in view — `/latch/beacon` and the IPC
+    /// override are about a tab, not a directory.
+    ///
+    /// Why the ROUTE and not the registry: [`LatchScope::root`] comes from the
+    /// TAB (`tab_root_key`, F-3) precisely so a request body cannot redirect a
+    /// contamination row. This field is the case where there IS no tab, and the
+    /// only project in view is the one the call is about to write into — the same
+    /// one the call's own `kind:"graph"` row files under, resolved by the same
+    /// function (`GraphService::graph_root_key`), so the two rows for one call
+    /// cannot name different projects.
+    root: Option<&'a str>,
 }
 
 impl<'a> CallProvenance<'a> {
     /// cImp's own dispatch, executing a call it was already running, with no
-    /// fetched content in view. Every native route.
+    /// fetched content in view and no project in view either. Native routes that
+    /// are about a TAB rather than a directory.
     const fn internal() -> Self {
         CallProvenance {
             origin: outbound::Origin::Internal,
             url: None,
             host: None,
+            root: None,
+        }
+    }
+
+    /// cImp's own dispatch on a native route that knows which project the call
+    /// runs against (`/graph_run`). See [`Self::root`].
+    const fn internal_in(root: &'a str) -> Self {
+        CallProvenance {
+            origin: outbound::Origin::Internal,
+            url: None,
+            host: None,
+            root: Some(root),
         }
     }
 
     /// cImp's own dispatch over the proxied intake, naming the page it is
     /// about to read (either half may be absent — a search tool has arguments
     /// but no URL).
+    ///
+    /// No `root`: a PERSISTENT-WRITE cannot arrive on `/mcp/call` (every
+    /// namespaced id classifies EXTERNAL), so the one row that reads
+    /// [`Self::root`] is unreachable from here and a root passed in would be
+    /// speculative.
     fn intake(url: Option<&'a str>, host: Option<&'a str>) -> Self {
         CallProvenance {
             origin: outbound::Origin::Internal,
             url,
             host,
+            root: None,
         }
     }
 
@@ -2000,6 +2093,7 @@ impl<'a> CallProvenance<'a> {
             origin: outbound::Origin::Http,
             url: None,
             host: None,
+            root: None,
         }
     }
 }
@@ -2445,7 +2539,18 @@ fn note_contamination(
 /// keeps the two switches independent, and this is a quarantine decision, not a
 /// latch decision. Nothing here reads or moves a latch — there is no scope to
 /// move one for, which is the whole point.
-fn unattributed_write(policy: GatePolicy, route: LatchRoute, name: &str) -> WriteTaint {
+///
+/// #48 F-16: `prov` is here for one field — [`CallProvenance::root`]. The
+/// finding's own wording, *"`LatchRegistry::gate` has no scope to derive a root
+/// from"*, is true of `gate` and **false of the route that calls it**: the only
+/// route that can reach this line with a PERSISTENT-WRITE is `/graph_run`, and
+/// that handler holds the project the note is about to be written into.
+fn unattributed_write(
+    policy: GatePolicy,
+    route: LatchRoute,
+    name: &str,
+    prov: CallProvenance<'_>,
+) -> WriteTaint {
     let class = toolclass::classify(name);
     if !policy.quarantine || class != ToolClass::PersistentWrite || !route.can_execute(name, class)
     {
@@ -2473,7 +2578,14 @@ fn unattributed_write(policy: GatePolicy, route: LatchRoute, name: &str) -> Writ
         url: None,
         resolved_ip: None,
         canary: false,
-        root: String::new(),
+        // #48 F-16: the route's project, not an empty string. There is no scope
+        // to take a root from — that is this function's whole premise — but the
+        // ROUTE knows which project the note is about to be written into, and
+        // that is the project a reviewer filters by. `None` would be a route with
+        // no project in view, which cannot reach this line today; the fallback is
+        // still empty rather than invented, and `""` is a positive claim of
+        // ignorance with a documented meaning (see `ActivityEntry::root`).
+        root: prov.root.unwrap_or_default().to_string(),
         detail: toolclass::UNATTRIBUTED_WRITE_NOTICE,
     });
     WriteTaint::Unattributed
@@ -2520,7 +2632,7 @@ impl LatchRegistry {
         // for the one class where "we do not know who this is" is itself the
         // hazard. See [`unattributed_write`].
         let Some(scope) = scope else {
-            return Ok(unattributed_write(policy, route, name));
+            return Ok(unattributed_write(policy, route, name, prov));
         };
         let class = toolclass::classify(name);
         // #48, findings A-1 and M-2: a call that cannot execute on this route
@@ -3186,7 +3298,10 @@ impl LatchRegistry {
     /// exists to stop a loop. Taking the whole decision here — rather than a
     /// `map` at the call site — is what makes it testable: the handler's use is
     /// one unconditional statement above the match it used to be inside.
-    fn charge_call(&self, scope: Option<&LatchScope>, result: &Result<String, String>) {
+    /// Generic over the error half since #48 M-17 made it a
+    /// `mcp_host::HostError`: this function reads only `is_ok`/`len`, and the byte
+    /// charge is unchanged by the error type.
+    fn charge_call<E>(&self, scope: Option<&LatchScope>, result: &Result<String, E>) {
         self.charge(scope, result.as_ref().map(|t| t.len()).unwrap_or(0));
     }
 
@@ -3661,13 +3776,18 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // id is now validated against the configured tab list and that check must
     // use the same snapshot as the policy it feeds.
     let settings = live_settings(app);
-    let scope = latch_scope(
+    let scoping = latch_scope(
         app,
         &settings,
         crate::graph::source_for_consumer(consumer),
         body.tab.as_deref(),
-    )
-    .into_scope();
+    );
+    // #48 F-20: resolved BEFORE `into_scope()` collapses `Anonymous` and
+    // `Unknown` into one `None`. That collapse is right for the latch (both fail
+    // open) and wrong for the row, which has to say which of the three this call
+    // was. See `LatchScoping::attribution`.
+    let tab_attr = scoping.attribution();
+    let scope = scoping.into_scope();
     let session = scope.as_ref().and_then(|s| s.session.clone());
 
     // V32 Phase B: the session taint latch over the tools THIS route serves —
@@ -3686,13 +3806,17 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
     // V32 Phase G: both halves resolve through the three-level hierarchy at this
     // tab's scope, from ONE settings read — so a tab with the latch overridden
     // off still quarantines, and a tab with the master switch off does neither.
+    // #48 F-16: resolved here, from the service, so the quarantine row this gate
+    // may write and the activity row the dispatch will write name the SAME
+    // project. `graph_root_key` is `run_graph_tool`'s own resolution, exposed.
+    let call_root = graph.graph_root_key(&cwd);
     let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
     let taint = match latches().gate(
         scope.as_ref(),
         LatchRoute::Native,
         &body.name,
         gate_policy,
-        CallProvenance::internal(),
+        CallProvenance::internal_in(&call_root),
     ) {
         Ok(t) => t,
         Err(refusal) => {
@@ -3729,6 +3853,7 @@ async fn handle_graph_run(stream: &mut TcpStream, app: &AppHandle, req: &Request
                     &settings,
                 ),
             },
+            tab_attr,
         )
         .await
     {
@@ -4663,6 +4788,15 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
                 false, // a drift report is never "ok" — it flags the entry in the feed
                 // The report is about the harness shim, not a tab's call — but
                 // the session it drifted in is known and is the join key.
+                //
+                // #48 F-20 left this ALONE, and `Unattributed` is honest here:
+                // `ContractDriftBody` carries no `tab` field at all, so this
+                // writer genuinely does not know. The shim *does* (`--tab {tab}`
+                // is baked into its hook command line, `tabs/config.rs`), so the
+                // fix is a wire change — `#[serde(default)] tab: Option<String>`
+                // on the body plus the shim sending it — and both skew directions
+                // degrade safely. That is a shim/app contract change and belongs
+                // with F-6's drift-canary work, not here.
                 crate::activity::Attribution::Unattributed,
                 Some(session.clone()),
             ),
@@ -5494,7 +5628,12 @@ async fn handle_mcp_call(
     // the fix is to thread `settings` into `mcp_call`. Do not restore the old
     // wording without making it true.
     let settings = live_settings(app);
-    let scope = latch_scope(app, &settings, agent, body.tab.as_deref()).into_scope();
+    let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
+    // #48 F-20 — see `handle_graph_run`: resolved before the collapse. This is
+    // the row that answers "which tab fetched that page", and it is the one the
+    // finding says could not.
+    let tab_attr = scoping.attribution();
+    let scope = scoping.into_scope();
     let inj_scope = crate::settings::injection::Scope::for_tab(agent, body.tab.as_deref());
     let gate_policy = GatePolicy::resolve(&settings, scope.as_ref());
     // V32 Phase C: the flagged row's provenance, read from the arguments before
@@ -5573,6 +5712,7 @@ async fn handle_mcp_call(
             cwd.as_deref(),
             &scope_label,
             body.tab.as_deref(),
+            tab_attr,
             &audit,
         )
         .await;
@@ -5587,8 +5727,13 @@ async fn handle_mcp_call(
         // the call carried tab identity, since none of the three needs it. The
         // same `wrap_external_result` the worker's boundary calls, so the
         // external-only rule and the composition order have one definition.
-        // Errors are cImp-composed strings, not fetched content, and are never
-        // screened or wrapped.
+        //
+        // #48 M-17 corrects the sentence that used to end this comment — "Errors
+        // are cImp-composed strings, not fetched content, and are never screened
+        // or wrapped." The diagnostic half is cImp's; the server's own
+        // `error.message` never was, and it reached the model here with no bound,
+        // no envelope and no screen. `HostError` keeps the two halves apart and
+        // `wrap_remote_error` treats the remote half as what it is.
         Ok(text) => {
             let wrapped = detection::wrap_external_result(
                 &body.name,
@@ -5614,7 +5759,24 @@ async fn handle_mcp_call(
         Err(e) => RunResult {
             ok: false,
             text: None,
-            error: Some(e),
+            error: Some(
+                detection::wrap_remote_error(
+                    &body.name,
+                    e.diagnostic(),
+                    e.remote(),
+                    detection::ResultCtx {
+                        consumer: agent,
+                        scope: &scope_label,
+                        root: root_key,
+                        url: flag_url,
+                        host: flag_host,
+                        cfg: detection_cfg,
+                        spotlight: spotlight_on,
+                        audit: &audit,
+                    },
+                )
+                .await,
+            ),
         },
     };
     write_json(stream, 200, &r).await
@@ -6251,6 +6413,13 @@ mod tests {
     /// no fetched page in view. What every pre-F-3 `gate` test was implicitly
     /// asserting, since none of them was an intake.
     const NO_CONTENT: CallProvenance<'static> = CallProvenance::internal();
+
+    /// #48 F-16: what `/graph_run` actually states — a native route that knows
+    /// which project the call runs against. Any test that drives a
+    /// PERSISTENT-WRITE through `gate` must use this rather than [`NO_CONTENT`],
+    /// because that path writes a `MemoryQuarantine` row and `record_flag`'s
+    /// tripwire refuses to let one be filed under no project.
+    const NATIVE_IN_PROJECT: CallProvenance<'static> = CallProvenance::internal_in(TEST_ROOT);
     /// The provenance the `/latch/beacon` route states — always `Http`.
     const BEACON_PROV: CallProvenance<'static> = CallProvenance::http();
 
@@ -6795,6 +6964,59 @@ mod tests {
         let entries = vec![disc(7, 1007, "P:\\elsewhere")];
         let picked = select_discovery(entries, Some(Path::new("Q:\\other"))).expect("sole entry");
         assert_eq!(picked.pid, 7);
+    }
+
+    /// #48 F-26 — the repro two `graph/mcp.rs` comments used to document, pinned
+    /// as a test because the wrong version of that sentence produced a false PASS
+    /// in live verification (the tester truncated one file, saw a served call, and
+    /// recorded "no fallback reachable").
+    ///
+    /// A truncated per-instance entry is dropped by `read_all_discoveries`'s
+    /// `filter_map(… .ok())`, so selection sees it not at all — and that is
+    /// exactly step 3's cue: the legacy `.cimp-offload.json` still resolves, the
+    /// app is still reached, and nothing goes headless. `ProxyMiss::NoInstance`
+    /// needs BOTH stores unusable.
+    #[test]
+    fn a_corrupt_per_instance_entry_still_resolves_through_the_legacy_file() {
+        let hint = PathBuf::from("P:\\proj\\src");
+        let legacy = disc(99, 4444, "");
+        // The corrupted `<pid>.json` is simply absent from the entry list.
+        let picked = select_with_legacy(vec![], Some(&hint), || Some(legacy.clone()))
+            .expect("the legacy store still resolves");
+        assert_eq!(picked.pid, 99, "step 3 was not consulted");
+        assert_eq!(picked.port, 4444);
+        // And only when the first two preferences produce nothing: a matching
+        // per-instance entry must never be overridden by the legacy file.
+        let picked = select_with_legacy(
+            vec![disc(1, 1001, "P:\\proj")],
+            Some(&hint),
+            || panic!("the legacy store must not be read when a per-instance entry matches"),
+        )
+        .expect("match");
+        assert_eq!(picked.pid, 1);
+    }
+
+    /// …and the single-write trigger, which is F-26's other half: a well-formed
+    /// DEEPER entry outranks the real instance whatever its port, so ONE `Write`
+    /// steers a child onto a dead endpoint and the reported reason is
+    /// `ProxyMiss::Transport` rather than `NoInstance`.
+    ///
+    /// This pins F-11's primitive **on purpose**: F-11 is open, and whichever way
+    /// it is fixed the fix has to edit this test deliberately rather than by
+    /// accident. Do not read a green suite here as F-11 closed.
+    #[test]
+    fn a_deeper_well_formed_entry_outranks_the_running_instance() {
+        let real = disc(10, 4000, "P:\\proj");
+        let planted = disc(11, 1, "P:\\proj\\sub");
+        let hint = PathBuf::from("P:\\proj\\sub\\deeper");
+        let picked = select_with_legacy(vec![real, planted], Some(&hint), || {
+            panic!("a matching per-instance entry exists")
+        })
+        .expect("a matching entry exists");
+        // The planted entry wins on DEPTH alone — selection never probes the
+        // port, so "dead" costs the attacker nothing.
+        assert_eq!(picked.pid, 11);
+        assert_eq!(picked.port, 1);
     }
 
     #[test]
@@ -7652,6 +7874,105 @@ mod tests {
         );
     }
 
+    /// #48 F-20 — the three-way mapping, pinned to concrete values.
+    ///
+    /// [`LatchScoping`] and [`crate::activity::Attribution`] were derived from the
+    /// same three facts, and the row's column exists to say which of the three a
+    /// call was. The `match` below is exhaustive on purpose: a fourth variant has
+    /// to be given a reading here rather than silently inheriting one.
+    #[test]
+    fn latch_scoping_maps_onto_exactly_one_attribution_state_each() {
+        use crate::activity::Attribution;
+        assert_eq!(LatchScoping::Anonymous.attribution(), Attribution::Headless);
+        assert_eq!(
+            LatchScoping::Unknown("ghost".to_string()).attribution(),
+            Attribution::Unrecognized("ghost".to_string())
+        );
+        assert_eq!(
+            LatchScoping::Scoped(scope("claude-1", Some("sess-a"))).attribution(),
+            Attribution::Tab("claude-1".to_string())
+        );
+        for s in [
+            LatchScoping::Anonymous,
+            LatchScoping::Unknown("ghost".to_string()),
+            LatchScoping::Scoped(scope("claude-1", None)),
+        ] {
+            // Exhaustiveness: the compiler is the enumeration guard.
+            let _: () = match &s {
+                LatchScoping::Anonymous | LatchScoping::Unknown(_) | LatchScoping::Scoped(_) => (),
+            };
+            assert_ne!(
+                s.attribution(),
+                Attribution::Unattributed,
+                "a route that resolved a scoping DOES know which of the three this was"
+            );
+        }
+    }
+
+    /// The case the whole finding is about: `Anonymous` and `Unknown` are ONE
+    /// `None` to the latch — correctly, both fail open — and must be TWO states
+    /// on the row.
+    #[test]
+    fn an_unrecognized_tab_id_is_never_reported_as_headless() {
+        use crate::activity::Attribution;
+        let ghost = || LatchScoping::Unknown("not-a-real-tab".to_string());
+        // The collapse that is right for the latch…
+        assert!(
+            ghost().into_scope().is_none(),
+            "#45's bound: an unrecognized id keys no registry entry"
+        );
+        assert!(LatchScoping::Anonymous.into_scope().is_none());
+        // …and wrong for the row.
+        assert_ne!(ghost().attribution(), Attribution::Headless);
+        assert_ne!(
+            ghost().attribution(),
+            LatchScoping::Anonymous.attribution(),
+            "F-20: these two were one `None` and must be two row states"
+        );
+    }
+
+    /// …and an unrecognized id is never reported as a real tab either — the rule
+    /// `activity::tests::only_a_configured_tab_counts_as_a_tab` states, from the
+    /// producer side.
+    #[test]
+    fn an_unrecognized_tab_id_is_never_reported_as_a_tab() {
+        let attr = LatchScoping::Unknown("not-a-real-tab".to_string()).attribution();
+        assert!(
+            !attr.is_tab(),
+            "filtering by a tab id must never surface a row that merely quoted it"
+        );
+        assert_eq!(attr.id(), Some("not-a-real-tab"));
+    }
+
+    /// #48 F-16 — the unattributed-write row names the project it was about to
+    /// write into.
+    ///
+    /// [`LatchRegistry::gate`] has no scope to take a root from — that is
+    /// [`unattributed_write`]'s whole premise — but the ROUTE does (`/graph_run`
+    /// holds `body.cwd`, resolved through `GraphService::graph_root_key`, the same
+    /// resolution the dispatch's own `kind:"graph"` row uses). Before this the row
+    /// carried `root: ""`, so a project-scoped review could not see it.
+    #[test]
+    fn an_unattributed_write_row_names_the_project_it_was_about_to_write_into() {
+        outbound::test_rows::reset();
+        let reg = LatchRegistry::default();
+        assert_eq!(
+            reg.gate(
+                None,
+                LatchRoute::Native,
+                "context_note",
+                ON,
+                CallProvenance::internal_in(TEST_ROOT),
+            ),
+            Ok(WriteTaint::Unattributed)
+        );
+        let rows = outbound::test_rows::drain();
+        let held = outbound::test_rows::of_screen(&rows, outbound::Screen::MemoryQuarantine);
+        assert_eq!(held.len(), 1, "one held note, one review-queue row");
+        assert_eq!(held[0].entry.root, TEST_ROOT);
+        assert!(!held[0].entry.root.is_empty());
+    }
+
     /// #48 (2026-08-08 re-review), M-19 — the identity-less PERSISTENT-WRITE.
     ///
     /// This case used to be the tail of the test above, asserting
@@ -7670,7 +7991,13 @@ mod tests {
     fn an_identityless_persistent_write_is_held_not_stored_clean() {
         let reg = LatchRegistry::default();
         assert_eq!(
-            reg.gate(None, LatchRoute::Native, "context_note", ON, NO_CONTENT),
+            reg.gate(
+                None,
+                LatchRoute::Native,
+                "context_note",
+                ON,
+                NATIVE_IN_PROJECT
+            ),
             Ok(WriteTaint::Unattributed)
         );
         assert!(WriteTaint::Unattributed.is_quarantined());
@@ -7712,7 +8039,7 @@ mod tests {
                 LatchRoute::Native,
                 "context_note",
                 quarantine_only,
-                NO_CONTENT
+                NATIVE_IN_PROJECT
             ),
             Ok(WriteTaint::Unattributed)
         );
@@ -8129,7 +8456,7 @@ mod tests {
             (LatchRoute::Native, "context_note", WriteTaint::Unattributed),
         ] {
             assert_eq!(
-                reg.gate(None, route, name, ON, NO_CONTENT),
+                reg.gate(None, route, name, ON, NATIVE_IN_PROJECT),
                 Ok(taint),
                 "{name}"
             );
@@ -8355,7 +8682,7 @@ mod tests {
             )
             .is_ok());
         reg.charge_call(Some(&s), &failure);
-        reg.charge_call(Some(&s), &Ok("x".repeat(999)));
+        reg.charge_call::<String>(Some(&s), &Ok("x".repeat(999)));
         assert!(
             reg.budget_gate(Some(&s), TEST_LIMITS, "ddg__fetch_content")
                 .is_ok(),

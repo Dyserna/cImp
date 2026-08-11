@@ -264,10 +264,17 @@ impl ToolRouter for HostRouter {
             // — the one place a proxied server's bytes enter the worker's
             // conversation — so detection, the spotlighting envelope and the
             // warning header all compose here, in `wrap_external_result`'s one
-            // definition of the order (locked decisions 5 and 6). Only the
-            // success path: an `Err` is a cImp-composed refusal/transport
-            // message, not untrusted content, and screening or enveloping it
-            // would teach the model that our own strings are suspect.
+            // definition of the order (locked decisions 5 and 6).
+            //
+            // #48 M-17: BOTH paths, not just the success one. The comment that
+            // used to sit here — "an `Err` is a cImp-composed refusal/transport
+            // message, not untrusted content, and screening or enveloping it would
+            // teach the model that our own strings are suspect" — was half right
+            // and dangerous for it. cImp's diagnostic is cImp's; the remote
+            // server's `error.message` rode along inside the same `String`,
+            // unbounded and unenveloped, into this model's context. `HostError`
+            // splits them and `wrap_remote_error` envelopes only the remote half,
+            // so our own strings stay unmarked.
             //
             // The origin is read from the arguments *before* they are moved
             // into the call: a flagged row's first useful fact is which page
@@ -275,7 +282,19 @@ impl ToolRouter for HostRouter {
             let (url, host) = super::detection::origin_of(&args);
             let root = self.ctx.allowed_roots.first().map(|p| p.as_path());
             let root_key = root.map(crate::activity::root_key).unwrap_or_default();
-            let text = self
+            // Built once above the match: whichever arm runs consumes it, and the
+            // two arms must not be able to describe the same call differently.
+            let rctx = super::detection::ResultCtx {
+                consumer: "offload",
+                scope: &self.task_scope,
+                root: root_key,
+                url,
+                host,
+                cfg: self.detection,
+                spotlight: self.spotlight,
+                audit: &self.audit,
+            };
+            match self
                 .host
                 .call_recorded(
                     super::mcp_host::Consumer::Offload,
@@ -283,25 +302,25 @@ impl ToolRouter for HostRouter {
                     name,
                     args,
                     &self.task_scope,
+                    // #48 F-20: the worker has no tab, and that is a FACT rather
+                    // than missing data — `Headless`, the same reading
+                    // `graph::mcp::offload_query` and the audit runner take.
+                    // Deliberately not `Unattributed`.
+                    crate::activity::Attribution::Headless,
                     &self.policy,
                     &self.audit,
                 )
-                .await?;
-            Ok(super::detection::wrap_external_result(
-                name,
-                text,
-                super::detection::ResultCtx {
-                    consumer: "offload",
-                    scope: &self.task_scope,
-                    root: root_key,
-                    url,
-                    host,
-                    cfg: self.detection,
-                    spotlight: self.spotlight,
-                    audit: &self.audit,
-                },
-            )
-            .await)
+                .await
+            {
+                Ok(text) => Ok(super::detection::wrap_external_result(name, text, rctx).await),
+                Err(e) => Err(super::detection::wrap_remote_error(
+                    name,
+                    e.diagnostic(),
+                    e.remote(),
+                    rctx,
+                )
+                .await),
+            }
         } else {
             tools::dispatch(pass, args, &self.ctx).await
         }

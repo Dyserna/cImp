@@ -368,9 +368,23 @@ pub struct ActivityEntry {
     /// Feed kind, the serialized form of [`ActivityKind`].
     #[serde(default = "default_kind")]
     pub kind: String,
-    /// The project root the call ran against, in [`root_key`] form (empty for
-    /// offload runs with no session cwd). Lets a per-project consumer (the
-    /// Graph View pulse feed) filter out other projects' activity.
+    /// The project this row belongs to, as [`root_key`]. Lets a per-project
+    /// consumer (the Graph View pulse feed) filter out other projects' activity.
+    ///
+    /// **Empty means "not attributable to a project" — a claim, not a gap**
+    /// (#48 F-16). It covers a writer that could not derive one (an offload run
+    /// with no session cwd) AND a row that is genuinely not about a project (the
+    /// harness `contract_drift` report), and it is deliberately ONE sentinel: it
+    /// is also what a row written before this column existed deserializes to, and
+    /// such a row is honestly unknown. A future recorder that positively has "no
+    /// project" as a *fact* must not reuse this — at that point `root` becomes an
+    /// enum the way [`Attribution`] is, and this comment is the note saying so.
+    ///
+    /// Consumers must never silently HIDE a row for being rootless. The forensic
+    /// screens cannot produce one
+    /// (`offload::outbound::tests::every_forensic_screen_row_carries_a_project_root`),
+    /// and the view rule for anything that slips through belongs beside the root
+    /// filter in `src/lib/activity.ts`.
     pub root: String,
     /// Who issued it: `"claude"` / `"opencode"` / `"offload"` /
     /// `"read_advisor"` / `"auto_check"` for graph entries; the backend name
@@ -1057,6 +1071,12 @@ mod tests {
     /// `Unattributed` there would say "we don't know" about something we do
     /// know, and would make a headless `claude -p` call indistinguishable from
     /// a row written before the column existed.
+    ///
+    /// #48 F-20 narrows WHERE this constructor may be called: only at entry points
+    /// that actually hold argv (`graph::mcp::handle_call`). App-side recorders now
+    /// receive an already-classified `Attribution` — the loopback route's comes
+    /// from `loopback::LatchScoping::attribution`, which can answer
+    /// `Unrecognized`, a state this constructor cannot produce and must not.
     #[test]
     fn an_argv_tab_is_a_real_tab_and_its_absence_is_headless() {
         assert_eq!(

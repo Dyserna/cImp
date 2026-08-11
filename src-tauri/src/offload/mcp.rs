@@ -1064,13 +1064,13 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
 /// documented justification for the path's behaviour silently assumed the
 /// answer was "the app is closed".
 ///
-/// It is not. [`NoInstance`](Self::NoInstance) alone covers a corrupted
-/// `<portable_root>/.cimp-discovery/<pid>.json` — `read_all_discoveries` drops
-/// an unparseable entry with `filter_map(… .ok())` — which one file write
-/// produces and which Claude's own `Write` tool can reach. `HttpStatus(500)`
-/// means the app answered and refused, which is a completely different fact
-/// about the system and used to be indistinguishable from "cImp is not
-/// running".
+/// It is not. A corrupted `<portable_root>/.cimp-discovery/<pid>.json` does not
+/// by itself produce [`NoInstance`](Self::NoInstance) — the legacy
+/// `.cimp-offload.json` still resolves (#48 F-26) — but a well-formed entry with
+/// a dead port produces [`Transport`](Self::Transport) in ONE write, and Claude's
+/// own `Write` tool reaches it. `HttpStatus(500)` means the app answered and
+/// refused, which is a completely different fact about the system and used to be
+/// indistinguishable from "cImp is not running".
 ///
 /// Each is reported once per process (see [`report`](Self::report)): the
 /// condition is stable — a corrupt discovery file stays corrupt for the child's
@@ -1078,16 +1078,33 @@ async fn proxy_graph(params: &Value) -> Option<Result<Value, (i64, String)>> {
 /// one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProxyMiss {
-    /// No usable loopback endpoint: no discovery file, or none of the entries
-    /// parsed. **The attacker-cheapest trigger**, and the one that needs no
-    /// running process to be wrong about.
+    /// No usable loopback endpoint from EITHER discovery store: no parseable
+    /// per-instance entry under `.cimp-discovery/` **and** no parseable
+    /// `.cimp-offload.json` (`loopback::select_discovery`'s legacy fallback).
+    ///
+    /// #48 F-26: this was documented as "no discovery file, or none of the
+    /// entries parsed", which reads as one write. It is two — the legacy file
+    /// still resolves after the per-instance entry is corrupted, and a call that
+    /// still resolves is still served. [`Transport`](Self::Transport) is the
+    /// single-write trigger; see its doc.
     NoInstance,
     /// The HTTP client itself could not be constructed (TLS/backend init).
     /// Process-local and unrelated to the app's state.
     ClientBuild,
     /// The request never got an answer: connection refused, DNS, the 30 s
-    /// timeout. The app is genuinely unreachable — the case the fallback was
-    /// designed for.
+    /// timeout.
+    ///
+    /// **This is NOT the property it used to claim.** The old wording — "the app
+    /// is genuinely unreachable, the case the fallback was designed for" — reads
+    /// as a safety guarantee and is not one (#48 F-11, sharpened by F-26). One
+    /// `Write` of a *well-formed* `.cimp-discovery/<n>.json` naming a deeper root
+    /// than the running instance and a dead `port` makes
+    /// `loopback::select_discovery` prefer that entry, and the dead port lands
+    /// here. So `Transport` means "the endpoint this child resolved did not
+    /// answer" — and which endpoint it resolved is steerable by anything that can
+    /// write one file. It is the CHEAPEST reason to manufacture, not the most
+    /// trustworthy one. Nothing may gate on it; see
+    /// `graph::mcp::headless_refusal`, which gates on `--tab` instead.
     Transport,
     /// The app answered with a non-2xx status. It is RUNNING and it declined:
     /// 401 is a stale bearer token, 5xx is a fault inside the warm path.
@@ -1130,8 +1147,10 @@ impl ProxyMiss {
         eprintln!(
             "cimp-offload: graph/context calls are taking the HEADLESS fallback ({key}) — the \
              app's warm index is not serving them. Reads still work; persistent memory writes are \
-             refused until cImp is reachable. If cImp IS running, the discovery file under \
-             `.cimp-discovery/` is unreadable or stale."
+             refused until cImp is reachable. If cImp IS running, discovery resolved to the wrong \
+             or a dead endpoint: check BOTH `.cimp-discovery/<pid>.json` (preferred, deepest \
+             matching root wins) and `.cimp-offload.json` (the legacy fallback) next to the \
+             executable."
         );
     }
 }

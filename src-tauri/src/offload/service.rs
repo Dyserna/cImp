@@ -927,6 +927,17 @@ impl OffloadService {
     /// spec's Accepted residuals rather than changed in a documentation pass.
     // See `McpHost::call_recorded`, whose argument list this forwards verbatim.
     #[allow(clippy::too_many_arguments)]
+    /// #48 F-20: `tab_attr` is a SECOND, differently-typed reading of the same
+    /// fact as `tab`, and the two are deliberately not merged. `tab` answers
+    /// "which scope do the injection features resolve at", where an unrecognized
+    /// id and no id both correctly mean `Scope::App`. `tab_attr` answers "which
+    /// tab does this row belong to", where those two cases MUST stay distinct
+    /// (`Unrecognized` vs `Headless`). Collapsing them is the defect F-20 filed.
+    ///
+    /// #48 M-17: the error half is a [`HostError`], not a `String` — a failed MCP
+    /// call carries the remote server's own `error.message`, and the two authors'
+    /// bytes stay apart until a caller states which reader it is composing for.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mcp_call(
         &self,
         consumer: Consumer,
@@ -935,8 +946,9 @@ impl OffloadService {
         cwd: Option<&Path>,
         scope: &str,
         tab: Option<&str>,
+        tab_attr: crate::activity::Attribution,
         audit: &dyn outbound::ScopeAudit,
-    ) -> Result<String, String> {
+    ) -> Result<String, super::mcp_host::HostError> {
         // See `mcp_tool_descriptors`: `offload` never legitimately reaches
         // this proxy; fall back to the Claude-guarded set.
         let consumer = match consumer {
@@ -950,7 +962,7 @@ impl OffloadService {
             crate::settings::injection::Scope::for_tab(agent, tab),
         );
         self.host
-            .call_recorded(consumer, cwd, name, args, scope, &policy, audit)
+            .call_recorded(consumer, cwd, name, args, scope, tab_attr, &policy, audit)
             .await
     }
 

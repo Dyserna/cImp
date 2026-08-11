@@ -58,6 +58,119 @@ const ERR_UNSUPPORTED_REVISION: i64 = -32022;
 const UNSUPPORTED_REVISION_MSG: &str =
     "server requires a newer MCP revision than this cImp speaks (2025-06-18)";
 
+/// Hard cap on remote-authored bytes cImp will re-emit from a failed MCP
+/// request — a server's `error.message` or a non-2xx response body.
+///
+/// #48 M-17: [`jsonrpc_error`] had NO bound at all (it returned `error.message`
+/// verbatim) and [`http_error`] had a local `take(300)`. One const for both,
+/// because the two are the same population — bytes a server we do not control
+/// chose — and a per-site bound is a bound one site can forget.
+const MAX_REMOTE_ERROR_CHARS: usize = 200;
+
+/// The note appended when [`HostError::with_remote`] cut the remote half.
+const REMOTE_TRUNCATED_NOTE: &str = " …(truncated)";
+
+/// A failed MCP request, split by **who authored which bytes**.
+///
+/// # Why a type and not a `String`
+///
+/// #48 M-17: [`jsonrpc_error`]/[`http_error`] interpolated a remote server's
+/// `error.message` straight into cImp's own diagnostic, and the resulting
+/// `String` reached both models as a tool result with no bound, no spotlighting
+/// envelope and no detection pass — while comments at BOTH boundaries
+/// (`agent.rs::HostRouter::call`, `loopback.rs::handle_mcp_call`) asserted these
+/// were cImp-composed strings. Once the two halves are one `String` no
+/// downstream layer can tell them apart, and any marker it could look for is a
+/// marker a hostile server can print. So they are never joined until something
+/// states which reader it is joining them for.
+///
+/// [`remote`](Self::remote) is the ONLY way to the remote bytes, and its only
+/// caller is `detection::wrap_remote_error`, which envelopes and screens them.
+/// [`Display`](std::fmt::Display) renders the HUMAN form (bounded excerpt, no
+/// envelope) for the Settings health row and the log lines, which is why it is
+/// not the form the model gets.
+///
+/// Same shape as M-20's `NoteText`: no `Deref`, no `AsRef<str>`, one named
+/// accessor per half.
+///
+/// `pub` only because it appears in the signatures of `McpHost::call*` and
+/// `OffloadService::mcp_call`; `offload` is a private module, so the real reach is
+/// the crate. The **accessors** stay `pub(super)` — that is the containment that
+/// matters, and it is what keeps `remote()`'s caller list to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostError {
+    /// cImp's own sentence about what went wrong. Safe to interpolate anywhere.
+    diagnostic: String,
+    /// Bytes an MCP server we do not control put on the wire, bounded at
+    /// [`MAX_REMOTE_ERROR_CHARS`] the moment they were captured. `None` for an
+    /// error cImp raised by itself.
+    remote: Option<String>,
+}
+
+impl HostError {
+    /// An error cImp composed entirely itself: no server bytes in it.
+    pub(super) fn cimp(diagnostic: impl Into<String>) -> Self {
+        HostError {
+            diagnostic: diagnostic.into(),
+            remote: None,
+        }
+    }
+
+    /// cImp's diagnostic plus bytes the remote server supplied. `raw` is bounded
+    /// HERE, at capture, rather than at render: a 4 MiB `error.message` must not
+    /// sit in memory or in a log line waiting for someone to remember.
+    fn with_remote(diagnostic: impl Into<String>, raw: &str) -> Self {
+        let mut remote: String = raw.chars().take(MAX_REMOTE_ERROR_CHARS).collect();
+        if remote.chars().count() < raw.chars().count() {
+            remote.push_str(REMOTE_TRUNCATED_NOTE);
+        }
+        HostError {
+            diagnostic: diagnostic.into(),
+            remote: Some(remote),
+        }
+    }
+
+    /// cImp's half. Always safe to place outside an envelope.
+    pub(super) fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+
+    /// The remote bytes, for the ONE caller that envelopes and screens them
+    /// (`detection::wrap_remote_error`). Named `remote` rather than `text` so a
+    /// new call site cannot claim it did not know what it was holding.
+    pub(super) fn remote(&self) -> Option<&str> {
+        self.remote.as_deref()
+    }
+}
+
+/// The HUMAN form: cImp's diagnostic plus a bounded, unenveloped excerpt.
+///
+/// For the Settings health row and `tracing` — readers who need the server's
+/// wording and are not an LLM. **Never the form a model receives**; that is
+/// `detection::wrap_remote_error`.
+impl std::fmt::Display for HostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.remote {
+            Some(r) => write!(f, "{} — server said: {r}", self.diagnostic),
+            None => write!(f, "{}", self.diagnostic),
+        }
+    }
+}
+
+// The two `From` impls keep every existing `"…".into()` / `format!(…).into()`
+// site compiling unchanged — and every one of them IS cImp-composed, which is
+// exactly what `cimp` claims.
+impl From<String> for HostError {
+    fn from(s: String) -> Self {
+        HostError::cimp(s)
+    }
+}
+impl From<&str> for HostError {
+    fn from(s: &str) -> Self {
+        HostError::cimp(s)
+    }
+}
+
 /// Write/destructive leading verbs. A tool whose leading verb is in this
 /// set is filtered out — the offload worker stays read-only even when a
 /// server advertises mutating tools (`filesystem` write, `git` commit).
@@ -328,7 +441,7 @@ pub struct McpServerHealth {
 struct StdioConn {
     stdin: TokioMutex<ChildStdin>,
     child: TokioMutex<Child>,
-    pending: StdMutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    pending: StdMutex<HashMap<u64, oneshot::Sender<Result<Value, HostError>>>>,
     next_id: AtomicU64,
     /// Flipped false by the reader on EOF / fatal error.
     alive: AtomicBool,
@@ -341,7 +454,7 @@ impl StdioConn {
         method: &str,
         params: Value,
         timeout: Duration,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, HostError> {
         if !self.alive.load(Ordering::Relaxed) {
             return Err("server connection is closed".into());
         }
@@ -373,7 +486,7 @@ impl StdioConn {
             let mut stdin = self.stdin.lock().await;
             if let Err(e) = stdin.write_all(frame.as_bytes()).await {
                 self.pending.lock().unwrap().remove(&id);
-                return Err(format!("write failed: {e}"));
+                return Err(HostError::cimp(format!("write failed: {e}")));
             }
             if stdin.write_all(b"\n").await.is_err() || stdin.flush().await.is_err() {
                 self.pending.lock().unwrap().remove(&id);
@@ -385,10 +498,10 @@ impl StdioConn {
             Ok(Err(_)) => Err("server connection closed before responding".into()),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!(
+                Err(HostError::cimp(format!(
                     "server did not respond within {}s",
                     timeout.as_secs()
-                ))
+                )))
             }
         }
     }
@@ -575,7 +688,7 @@ impl McpServer {
     }
 
     /// Execute `tools/call` for a tool on this server.
-    async fn call(&self, raw_name: &str, args: Value) -> Result<String, String> {
+    async fn call(&self, raw_name: &str, args: Value) -> Result<String, HostError> {
         let params = json!({ "name": raw_name, "arguments": args });
         let result = match &self.conn {
             Some(Conn::Stdio(c)) => c.request("tools/call", params, REQUEST_TIMEOUT).await,
@@ -624,6 +737,11 @@ impl McpServer {
                 // health untouched and the next call can succeed.
                 if let Some(Conn::Stdio(c)) = &self.conn {
                     if !c.alive.load(Ordering::Relaxed) {
+                        // #48 M-17: `{e}` is `HostError`'s HUMAN form — bounded,
+                        // carrying the server's own wording, and deliberately
+                        // unenveloped. This is where the author-split earns its
+                        // keep: the Settings health row's reader is a person, and
+                        // an envelope there would be noise.
                         self.set_unhealthy(format!("connection lost: {e}"));
                     }
                 }
@@ -780,7 +898,7 @@ impl McpHost {
         consumer: Consumer,
         namespaced: &str,
         args: Value,
-    ) -> Result<String, String> {
+    ) -> Result<String, HostError> {
         let owns = {
             let servers = self.servers.read().await;
             servers
@@ -788,17 +906,17 @@ impl McpHost {
                 .any(|s| consumer.wants(s) && s.raw_name(namespaced).is_some())
         };
         if !owns {
-            return Err(format!(
+            return Err(HostError::cimp(format!(
                 "tool `{namespaced}` is not available to {} (no {}-enabled MCP server offers it)",
                 consumer.label(),
                 consumer.label(),
-            ));
+            )));
         }
         self.call(namespaced, args).await
     }
 
     /// Route a namespaced `<server>__<tool>` call to its owning server.
-    pub async fn call(&self, namespaced: &str, args: Value) -> Result<String, String> {
+    pub async fn call(&self, namespaced: &str, args: Value) -> Result<String, HostError> {
         // Route by actual ownership (an exact match on the namespaced def
         // name) rather than parsing a `<prefix>__` split — a server or raw
         // tool name that itself contains `__` would make the split route to
@@ -811,13 +929,15 @@ impl McpHost {
                 .cloned()
         };
         let Some(server) = server else {
-            return Err(format!("no MCP server owns tool `{namespaced}`"));
+            return Err(HostError::cimp(format!(
+                "no MCP server owns tool `{namespaced}`"
+            )));
         };
         let Some(raw) = server.raw_name(namespaced).map(|s| s.to_string()) else {
-            return Err(format!(
+            return Err(HostError::cimp(format!(
                 "server `{}` no longer offers `{namespaced}`",
                 server.name
-            ));
+            )));
         };
         let was_healthy = server.is_healthy();
         let result = server.call(&raw, args).await;
@@ -884,9 +1004,22 @@ impl McpHost {
         namespaced: &str,
         args: Value,
         scope: &str,
+        // #48 F-20: which tab this proxied call belongs to. The comment that used
+        // to stand at the row below — "the proxied MCP route knows its consumer
+        // but the tab is not threaded to this frame yet" — was the whole finding:
+        // the SSRF and detection `injection_flag` rows this same function writes
+        // name the tab (they derive it from `scope`), while the row for the call
+        // itself said `unattributed`. So the row that answers "which tab fetched
+        // that page?" was the one that could not.
+        //
+        // An `Attribution` rather than an id: the loopback route's id came out of
+        // a request body and is classified by `LatchScoping::attribution`; the
+        // worker has no tab and says so with `Headless`. Neither caller can pass
+        // the other's reading by accident.
+        tab: crate::activity::Attribution,
         policy: &outbound::Policy,
         audit: &dyn outbound::ScopeAudit,
-    ) -> Result<String, String> {
+    ) -> Result<String, HostError> {
         let started = crate::activity::now_ms();
         let target = mcp_target(&args);
         let request = serde_json::to_string_pretty(&args).unwrap_or_default();
@@ -924,7 +1057,8 @@ impl McpHost {
                         detail: &outbound::ssrf_flag_detail(row),
                     });
                 }
-                return Err(outbound::REFUSAL_SSRF.to_string());
+                // cImp's own fixed refusal — no remote half, nothing to envelope.
+                return Err(HostError::cimp(outbound::REFUSAL_SSRF));
             }
         }
         let result = self.call_for_consumer(consumer, namespaced, args).await;
@@ -939,15 +1073,18 @@ impl McpHost {
                 result.as_ref().map(|t| t.chars().count()).unwrap_or(0),
                 crate::activity::now_ms().saturating_sub(started),
                 result.is_ok(),
-                // #51 follow-up: the proxied MCP route knows its consumer but
-                // the tab is not threaded to this frame yet.
-                crate::activity::Attribution::Unattributed,
+                tab,
                 None,
             ),
             request,
             response: match &result {
                 Ok(text) => text.clone(),
-                Err(msg) => format!("[error] {msg}"),
+                // The activity detail pane's reader is a HUMAN, so this is
+                // `HostError`'s `Display` — bounded, with the server's wording,
+                // and deliberately unenveloped (#48 M-17). The MODEL's copy is
+                // composed at the two boundaries by
+                // `detection::wrap_remote_error`.
+                Err(e) => format!("[error] {e}"),
             },
         });
         result
@@ -1128,7 +1265,7 @@ async fn connect_stdio(
                 if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
                     if let Some(tx) = conn.pending.lock().unwrap().remove(&id) {
                         let res = if let Some(err) = v.get("error") {
-                            Err(jsonrpc_error_text(err))
+                            Err(jsonrpc_error(err))
                         } else {
                             Ok(v.get("result").cloned().unwrap_or(Value::Null))
                         };
@@ -1159,7 +1296,13 @@ async fn connect_stdio(
         "capabilities": {},
         "clientInfo": { "name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") }
     });
-    let init_result = conn.request("initialize", init, CONNECT_TIMEOUT).await?;
+    // #48 M-17: a CONNECT failure is surfaced to a human (the Settings health
+    // row), so `HostError`'s `Display` — the bounded, unenveloped form — is the
+    // right rendering here. The MODEL never reads a connect error.
+    let init_result = conn
+        .request("initialize", init, CONNECT_TIMEOUT)
+        .await
+        .map_err(|e| e.to_string())?;
     // Record the revision the server settled on. stdio frames carry no
     // headers, so there is nothing to echo back — but a server answering with
     // a different revision than we asked for is exactly the signal that
@@ -1177,7 +1320,8 @@ async fn connect_stdio(
 
     let list = conn
         .request("tools/list", json!({}), CONNECT_TIMEOUT)
-        .await?;
+        .await
+        .map_err(|e| e.to_string())?;
     let tools = parse_tools(&cfg.name, &list);
     Ok((Conn::Stdio(conn), tools))
 }
@@ -1217,7 +1361,10 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         None,
         CONNECT_TIMEOUT,
     )
-    .await?;
+    .await
+    // #48 M-17: a connect failure's reader is the Settings health row — a human —
+    // so the bounded, unenveloped `Display` form is the right one here.
+    .map_err(|e| e.to_string())?;
     // Adopt whatever revision the server answered with (see
     // [`negotiated_version`]) and speak that from here on.
     let protocol_version = negotiated_version(&init_result);
@@ -1249,7 +1396,8 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         Some(protocol_version.as_str()),
         CONNECT_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(|e| e.to_string())?;
     // Fall back to a session id assigned on the tools/list response if the
     // initialize response carried none (some servers assign it late).
     if session_id.is_none() {
@@ -1286,19 +1434,29 @@ fn negotiated_version(init_result: &Value) -> String {
         .to_string()
 }
 
-/// Render a JSON-RPC `error` object into the message the host surfaces (health
+/// Render a JSON-RPC `error` object into the failure the host surfaces (health
 /// row + tool-call failure). Codes are otherwise opaque, but
 /// [`ERR_UNSUPPORTED_REVISION`] is the one a user can act on, so it gets named.
-fn jsonrpc_error_text(err: &Value) -> String {
-    let msg = err
-        .get("message")
-        .and_then(|m| m.as_str())
-        .unwrap_or("server error");
-    match err.get("code").and_then(|c| c.as_i64()) {
+///
+/// #48 M-17: the server's `message` is REMOTE-authored — it is carried on
+/// [`HostError::remote`], bounded, and never concatenated into the diagnostic.
+/// It used to be returned verbatim and unbounded, and it reached both models as
+/// a tool result.
+fn jsonrpc_error(err: &Value) -> HostError {
+    let msg = err.get("message").and_then(|m| m.as_str());
+    let diagnostic = match err.get("code").and_then(|c| c.as_i64()) {
         Some(ERR_UNSUPPORTED_REVISION) => {
-            format!("{UNSUPPORTED_REVISION_MSG} — JSON-RPC error -32022: {msg}")
+            format!("{UNSUPPORTED_REVISION_MSG} — JSON-RPC error -32022")
         }
-        _ => msg.to_string(),
+        Some(c) => format!("the MCP server returned JSON-RPC error {c}"),
+        None => "the MCP server returned a JSON-RPC error".to_string(),
+    };
+    match msg {
+        // "server error" was the old placeholder for an error object with no
+        // `message`. It is cImp's word, not the server's, so the diagnostic above
+        // stands alone and carries no remote half.
+        None => HostError::cimp(diagnostic),
+        Some(m) => HostError::with_remote(diagnostic, m),
     }
 }
 
@@ -1307,20 +1465,30 @@ fn jsonrpc_error_text(err: &Value) -> String {
 /// [`ERR_UNSUPPORTED_REVISION`]; recognize that shape explicitly, and treat a
 /// bare `400` on `initialize` as *possibly* the same cause (some servers send
 /// a plain-text 400) instead of leaking an unexplained status code.
-fn http_error_text(status: u16, method: &str, body: &str) -> String {
-    let excerpt: String = body.chars().take(300).collect();
+///
+/// #48 M-17: the response BODY is remote-authored and rides
+/// [`HostError::remote`] under the one shared bound, replacing the local
+/// `take(300)`.
+fn http_error(status: u16, method: &str, body: &str) -> HostError {
     let code = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("error")?.get("code")?.as_i64());
     if code == Some(ERR_UNSUPPORTED_REVISION) {
-        return format!("{UNSUPPORTED_REVISION_MSG} — HTTP {status}, JSON-RPC error -32022");
+        // Recognized by CODE, so nothing remote needs re-emitting.
+        return HostError::cimp(format!(
+            "{UNSUPPORTED_REVISION_MSG} — HTTP {status}, JSON-RPC error -32022"
+        ));
     }
     if status == 400 && method == "initialize" {
-        return format!(
-            "MCP handshake rejected with HTTP {status} — possibly the {UNSUPPORTED_REVISION_MSG}; response: {excerpt}"
+        return HostError::with_remote(
+            format!(
+                "MCP handshake rejected with HTTP {status} — possibly the \
+                 {UNSUPPORTED_REVISION_MSG}"
+            ),
+            body,
         );
     }
-    format!("http status {status}: {excerpt}")
+    HostError::with_remote(format!("http status {status}"), body)
 }
 
 /// Core Streamable-HTTP request: POST one JSON-RPC frame and return the
@@ -1345,7 +1513,7 @@ async fn http_request(
     session_id: Option<&str>,
     protocol_version: Option<&str>,
     timeout: Duration,
-) -> Result<(Option<String>, Value), String> {
+) -> Result<(Option<String>, Value), HostError> {
     // Unique per-call id (JSON-RPC ids must be unique within a session; some
     // servers reject a repeated id even on a stateless POST).
     static HTTP_RPC_ID: AtomicU64 = AtomicU64::new(1);
@@ -1364,10 +1532,12 @@ async fn http_request(
     if let Some(v) = protocol_version {
         req = req.header("MCP-Protocol-Version", v);
     }
+    // reqwest's `e` is cImp/reqwest-composed, not server-authored: a transport
+    // failure means no server bytes arrived at all.
     let mut resp = req
         .send()
         .await
-        .map_err(|e| format!("http request failed: {e}"))?;
+        .map_err(|e| HostError::cimp(format!("http request failed: {e}")))?;
     let status = resp.status();
     let new_session = resp
         .headers()
@@ -1382,7 +1552,7 @@ async fn http_request(
         .to_string();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(http_error_text(status.as_u16(), method, &body));
+        return Err(http_error(status.as_u16(), method, &body));
     }
     // For an SSE-framed body, read incrementally and return on the first frame
     // carrying a JSON-RPC result/error — a server that streams progress events
@@ -1394,11 +1564,12 @@ async fn http_request(
         let text = resp
             .text()
             .await
-            .map_err(|e| format!("http body read failed: {e}"))?;
-        serde_json::from_str::<Value>(&text).map_err(|e| format!("http parse failed: {e}"))?
+            .map_err(|e| HostError::cimp(format!("http body read failed: {e}")))?;
+        serde_json::from_str::<Value>(&text)
+            .map_err(|e| HostError::cimp(format!("http parse failed: {e}")))?
     };
     if let Some(err) = v.get("error") {
-        return Err(jsonrpc_error_text(err));
+        return Err(jsonrpc_error(err));
     }
     Ok((new_session, v.get("result").cloned().unwrap_or(Value::Null)))
 }
@@ -1495,7 +1666,7 @@ impl SseAssembler {
 /// chunks (decoded at line granularity, so a multibyte char split across two
 /// chunks isn't corrupted), so we never wait for the server to close a stream
 /// that keeps emitting progress notifications after the result.
-async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> {
+async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, HostError> {
     // Bound the unframed accumulation: complete lines are drained below, so this
     // caps a SINGLE newline-less line. Without it a server that streams bytes
     // without a newline grows `buf` until OOM (the caller's timeout is the only
@@ -1508,9 +1679,9 @@ async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> 
             Ok(Some(bytes)) => {
                 buf.extend_from_slice(&bytes);
                 if buf.len() > MAX_SSE_BYTES {
-                    return Err(format!(
+                    return Err(HostError::cimp(format!(
                         "SSE response exceeded {MAX_SSE_BYTES} bytes without a complete line"
-                    ));
+                    )));
                 }
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
@@ -1521,7 +1692,7 @@ async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> 
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(format!("http body read failed: {e}")),
+            Err(e) => return Err(HostError::cimp(format!("http body read failed: {e}"))),
         }
     }
     // Stream ended: feed any unterminated trailing line, then flush.
@@ -1540,9 +1711,10 @@ async fn read_sse_result(resp: &mut reqwest::Response) -> Result<Value, String> 
 /// counterpart to [`read_sse_result`] (kept for the unit tests). A
 /// `text/event-stream` body is SSE-framed; a plain body is parsed directly.
 #[cfg(test)]
-fn decode_jsonrpc_body(content_type: &str, body: &str) -> Result<Value, String> {
+fn decode_jsonrpc_body(content_type: &str, body: &str) -> Result<Value, HostError> {
     if !is_event_stream(content_type) {
-        return serde_json::from_str::<Value>(body).map_err(|e| format!("http parse failed: {e}"));
+        return serde_json::from_str::<Value>(body)
+            .map_err(|e| HostError::cimp(format!("http parse failed: {e}")));
     }
     let mut asm = SseAssembler::default();
     for line in body.lines() {
@@ -1728,20 +1900,31 @@ mod tests {
             .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
             .await
             .unwrap_err();
-        assert!(err.contains("not available to Claude"), "got: {err}");
+        assert!(
+            err.diagnostic().contains("not available to Claude"),
+            "got: {err:?}"
+        );
+        // #48 M-17: a cImp-composed refusal has no remote half.
+        assert_eq!(err.remote(), None);
         // OpenCode must not reach the Claude-only server's tool.
         let err2 = host
             .call_for_consumer(Consumer::Opencode, "alpha__x", json!({}))
             .await
             .unwrap_err();
-        assert!(err2.contains("not available to OpenCode"), "got: {err2}");
+        assert!(
+            err2.diagnostic().contains("not available to OpenCode"),
+            "got: {err2:?}"
+        );
         // The offload worker must not reach a server without offload_access
         // (the guard `HostRouter` now goes through via `call_recorded`).
         let err3 = host
             .call_for_consumer(Consumer::Offload, "alpha__x", json!({}))
             .await
             .unwrap_err();
-        assert!(err3.contains("not available to the offload worker"), "got: {err3}");
+        assert!(
+            err3.diagnostic().contains("not available to the offload worker"),
+            "got: {err3:?}"
+        );
     }
 
     #[test]
@@ -2043,25 +2226,40 @@ mod tests {
         assert_eq!(negotiated_version(&Value::Null), PROTOCOL_VERSION);
     }
 
+    /// #48 M-17 rewrote these five against [`HostError`]'s two halves rather than
+    /// one flat string. The diagnostic is cImp's and the `message` is the
+    /// server's, and after this pass nothing can join them without saying which
+    /// reader it is joining them for.
     #[test]
     fn jsonrpc_error_names_the_unsupported_revision() {
         let err =
             json!({ "code": ERR_UNSUPPORTED_REVISION, "message": "unsupported protocol version" });
-        let text = jsonrpc_error_text(&err);
-        assert!(text.contains("newer MCP revision"), "got: {text}");
-        assert!(text.contains("-32022"), "got: {text}");
-        // The server's own wording is preserved alongside the explanation.
-        assert!(text.contains("unsupported protocol version"), "got: {text}");
+        let e = jsonrpc_error(&err);
+        assert!(e.diagnostic().contains("newer MCP revision"), "{e:?}");
+        assert!(e.diagnostic().contains("-32022"), "{e:?}");
+        // The server's own wording is still available — on the remote half, where
+        // a downstream layer can see it is the server's.
+        assert_eq!(e.remote(), Some("unsupported protocol version"));
+        assert!(
+            !e.diagnostic().contains("unsupported protocol version"),
+            "remote bytes must not be concatenated into cImp's diagnostic: {e:?}"
+        );
     }
 
     #[test]
     fn jsonrpc_error_passes_other_codes_through() {
-        // Ordinary tool-level errors must keep their plain message — the
-        // revision hint would be actively misleading there.
+        // Ordinary tool-level errors keep their message — as the REMOTE half, and
+        // the revision hint (which would be misleading here) stays absent.
         let err = json!({ "code": -32602, "message": "invalid params" });
-        assert_eq!(jsonrpc_error_text(&err), "invalid params");
-        let bare = json!({ "code": -1 });
-        assert_eq!(jsonrpc_error_text(&bare), "server error");
+        let e = jsonrpc_error(&err);
+        assert_eq!(e.remote(), Some("invalid params"));
+        assert!(!e.diagnostic().contains("newer MCP revision"), "{e:?}");
+        assert!(e.diagnostic().contains("-32602"), "{e:?}");
+        // An error object with no `message` has nothing remote in it at all: the
+        // old "server error" placeholder was cImp's word, never the server's.
+        let bare = jsonrpc_error(&json!({ "code": -1 }));
+        assert_eq!(bare.remote(), None);
+        assert!(bare.diagnostic().contains("-1"), "{bare:?}");
     }
 
     #[test]
@@ -2069,50 +2267,104 @@ mod tests {
         // The modern-only shape: HTTP 400 + JSON-RPC -32022, no fall-forward.
         let body =
             r#"{"jsonrpc":"2.0","error":{"code":-32022,"message":"protocol revision retired"}}"#;
-        let text = http_error_text(400, "initialize", body);
-        assert!(text.contains("newer MCP revision"), "got: {text}");
-        assert!(text.contains("-32022"), "got: {text}");
+        let e = http_error(400, "initialize", body);
+        assert!(e.diagnostic().contains("newer MCP revision"), "{e:?}");
+        assert!(e.diagnostic().contains("-32022"), "{e:?}");
+        // Recognized by CODE, so nothing remote needs re-emitting at all.
+        assert_eq!(e.remote(), None);
         // Recognized by code, not by status — a server using another status
         // for the same refusal is still explained.
-        let other = http_error_text(426, "tools/list", body);
-        assert!(other.contains("newer MCP revision"), "got: {other}");
+        let other = http_error(426, "tools/list", body);
+        assert!(other.diagnostic().contains("newer MCP revision"), "{other:?}");
     }
 
     #[test]
     fn http_error_hints_on_bare_handshake_400_only() {
         // A plain-text 400 on `initialize` gets the "possibly" hint...
-        let at_handshake = http_error_text(400, "initialize", "Bad Request");
-        assert!(at_handshake.contains("handshake"), "got: {at_handshake}");
-        assert!(
-            at_handshake.contains("newer MCP revision"),
-            "got: {at_handshake}"
-        );
-        assert!(at_handshake.contains("Bad Request"), "got: {at_handshake}");
+        let at_handshake = http_error(400, "initialize", "Bad Request");
+        assert!(at_handshake.diagnostic().contains("handshake"));
+        assert!(at_handshake.diagnostic().contains("newer MCP revision"));
+        // ...and the body is the server's, on the remote half.
+        assert_eq!(at_handshake.remote(), Some("Bad Request"));
         // ...but a 400 on a later call, or any other status, stays generic —
         // a missing session id and a bad argument both land here.
-        let later = http_error_text(400, "tools/call", "Missing session ID");
-        assert!(!later.contains("newer MCP revision"), "got: {later}");
-        assert!(later.contains("http status 400"), "got: {later}");
-        let five_oh_three = http_error_text(503, "initialize", "upstream down");
+        let later = http_error(400, "tools/call", "Missing session ID");
+        assert!(!later.diagnostic().contains("newer MCP revision"));
+        assert!(later.diagnostic().contains("http status 400"));
+        assert_eq!(later.remote(), Some("Missing session ID"));
+        let five_oh_three = http_error(503, "initialize", "upstream down");
+        assert!(!five_oh_three.diagnostic().contains("newer MCP revision"));
+        assert!(five_oh_three.diagnostic().contains("http status 503"));
+    }
+
+    /// #48 M-17: the bound is at CAPTURE and covers both producers. The JSON-RPC
+    /// half had none at all — `error.message` was returned verbatim — so a hostile
+    /// server had an unbounded channel into both models.
+    #[test]
+    fn remote_error_text_is_bounded_at_capture_on_both_producers() {
+        let long = "x".repeat(10_000);
+        let e = jsonrpc_error(&json!({ "code": -1, "message": long.clone() }));
+        let remote = e.remote().expect("the server's message is remote-authored");
         assert!(
-            !five_oh_three.contains("newer MCP revision"),
-            "got: {five_oh_three}"
+            remote.chars().count()
+                <= MAX_REMOTE_ERROR_CHARS + REMOTE_TRUNCATED_NOTE.chars().count(),
+            "got {} chars",
+            remote.chars().count()
         );
+        assert!(remote.ends_with(REMOTE_TRUNCATED_NOTE), "{remote}");
+        // cImp's own diagnostic is never inside the remote half.
+        assert!(!remote.contains("JSON-RPC error"));
+
+        let h = http_error(500, "tools/call", &long);
+        let hr = h.remote().expect("the body is remote-authored");
         assert!(
-            five_oh_three.contains("http status 503"),
-            "got: {five_oh_three}"
+            hr.chars().count() <= MAX_REMOTE_ERROR_CHARS + REMOTE_TRUNCATED_NOTE.chars().count()
+        );
+        assert!(hr.ends_with(REMOTE_TRUNCATED_NOTE), "{hr}");
+
+        // A short message is not decorated — the note means something.
+        let short = jsonrpc_error(&json!({ "code": -1, "message": "nope" }));
+        assert_eq!(short.remote(), Some("nope"));
+    }
+
+    /// #48 M-17: there is NO way to a `String` containing remote bytes except
+    /// [`HostError::remote`], whose one caller envelopes them. `Display` is the
+    /// HUMAN form: bounded, carrying the server's wording, and unenveloped — the
+    /// Settings health row's reader is a person, not a model.
+    #[test]
+    fn the_human_form_is_bounded_and_carries_no_envelope() {
+        let long = "y".repeat(5_000);
+        let e = http_error(500, "tools/call", &long);
+        let shown = e.to_string();
+        assert!(shown.starts_with("http status 500"), "{shown}");
+        assert!(shown.contains("server said:"), "{shown}");
+        assert!(
+            shown.chars().count() < 400,
+            "the human form is bounded too, got {}",
+            shown.chars().count()
+        );
+        // No envelope, no preamble, no markers: those are the model's form.
+        assert!(!shown.contains("UNTRUSTED-DATA"), "{shown}");
+        assert!(
+            !shown.contains(crate::offload::spotlight::REMOTE_ERROR_PREAMBLE),
+            "{shown}"
         );
     }
 
+    /// An error cImp raised itself has no remote half, so the boundary passes it
+    /// through untouched — the property the old comments claimed for ALL errors.
     #[test]
-    fn http_error_truncates_long_bodies() {
-        let body = "x".repeat(1000);
-        let text = http_error_text(500, "tools/call", &body);
-        assert!(
-            text.len() < 400,
-            "body should be excerpted, got {}",
-            text.len()
-        );
+    fn a_cimp_composed_error_has_no_remote_half() {
+        for e in [
+            HostError::cimp("server is not connected"),
+            HostError::from("write/flush failed".to_string()),
+            HostError::from(outbound::REFUSAL_SSRF),
+            jsonrpc_error(&json!({ "code": ERR_UNSUPPORTED_REVISION })),
+        ] {
+            assert_eq!(e.remote(), None, "{e:?}");
+            // With no remote half the human form IS the diagnostic, unadorned.
+            assert_eq!(e.to_string(), e.diagnostic());
+        }
     }
 
     #[test]

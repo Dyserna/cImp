@@ -1493,6 +1493,72 @@ impl Screen {
                 | Screen::ContaminationCleared
         )
     }
+
+    /// #48 F-16 — whether a row from this screen **must** name a project.
+    ///
+    /// The finding: two of the three [`Screen::MemoryQuarantine`] producers wrote
+    /// `root: ""`, and live reproduction showed the rootless one was the
+    /// SECRET-screen row. So in a project-scoped review of the memory queue, the
+    /// row recording that a *credential* was held was exactly the one that
+    /// vanished. Both producers are fixed; this is what stops a third from
+    /// re-opening it — [`rootless_forensic`] logs it and a debug build asserts on
+    /// it, so a new producer fails in the test that exercises it rather than in a
+    /// review six weeks later.
+    ///
+    /// Deliberately just the one screen, and the `match` is exhaustive so a new
+    /// screen has to answer:
+    ///
+    /// * `MemoryQuarantine` — **yes.** Every producer runs on a route that knows
+    ///   the project the note is being written into (`/graph_run`'s `body.cwd`,
+    ///   the worker's confinement root, or the tab's own root via `tab_root_key`),
+    ///   and the row's whole job is to be findable later in that project's queue.
+    /// * `Ssrf` / `Signature` / `Classifier` / `Unscreened` / `Canary` — **no.**
+    ///   These fire at `McpHost::call_recorded` and the detection boundary, where
+    ///   the project comes from the *calling session's* cwd and is legitimately
+    ///   absent (a worker task with no configured roots, a `/mcp/call` body with
+    ///   no `cwd`). Requiring one here would turn a real posture into a false
+    ///   alarm.
+    /// * `Budget` / `LatchRefusal` / `LatchOverride` / `LatchBeacon` /
+    ///   `Contamination` / `ContaminationCleared` — **no**, on a narrower
+    ///   technicality: they take `scope.root` from `tab_root_key`, which is
+    ///   non-empty in every reachable case but returns `""` when even
+    ///   `current_dir()` fails (a deleted cwd). That is a real degradation, not a
+    ///   forgotten field, and it must not read as one.
+    /// * `Updater` — **no.** Not about a project at all: it records the detection
+    ///   bundle changing, app-wide.
+    pub fn requires_project_root(self) -> bool {
+        match self {
+            Screen::MemoryQuarantine => true,
+            Screen::Ssrf
+            | Screen::Budget
+            | Screen::Canary
+            | Screen::LatchRefusal
+            | Screen::Signature
+            | Screen::Classifier
+            | Screen::Unscreened
+            | Screen::Updater
+            | Screen::LatchOverride
+            | Screen::LatchBeacon
+            | Screen::Contamination
+            | Screen::ContaminationCleared => false,
+        }
+    }
+}
+
+/// #48 F-16's tripwire predicate: a row that claims a screen which must name a
+/// project, and names none.
+///
+/// A function rather than an inline condition so the property is assertable
+/// without provoking the `debug_assert!` in [`record_flag`] — the assert is the
+/// enforcement, this is what a test can point at.
+///
+/// `""` keeps its ONE meaning throughout: *not attributable to a project* (see
+/// [`crate::activity::ActivityEntry::root`]). It is also what a row written before
+/// the column existed deserializes to, and such a row is honestly unknown — which
+/// is exactly why a live forensic producer must never emit it, and why this
+/// predicate exists instead of a second sentinel.
+pub fn rootless_forensic(flag: &Flag<'_>) -> bool {
+    flag.screen.requires_project_root() && flag.root.trim().is_empty()
 }
 
 /// One flag row's contents. A struct rather than eight positional arguments
@@ -1568,6 +1634,29 @@ pub struct Flag<'a> {
 /// content is that a path fires it, so a test that re-derives the payload
 /// beside the path proves nothing.
 pub fn record_flag(flag: Flag<'_>) {
+    // #48 F-16 — the tripwire, at the one function every flag row goes through.
+    // The `debug_assert` is what makes it a tripwire rather than a note: any test
+    // (or dev run) that drives a forensic producer without a project fails here,
+    // at the producer, instead of leaving a row a root filter would hide. The
+    // `error!` is the release-build consumer, because a signal with no consumer is
+    // a silent failure with extra steps.
+    if rootless_forensic(&flag) {
+        tracing::error!(
+            target: "offload",
+            screen = flag.screen.as_str(),
+            tool = flag.tool,
+            scope = flag.scope,
+            "outbound: a forensic flag row was written with no project root (#48 F-16) — it will \
+             be invisible to every project-scoped review surface"
+        );
+        debug_assert!(
+            false,
+            "#48 F-16: screen `{}` must name a project (tool `{}`, scope `{}`)",
+            flag.screen.as_str(),
+            flag.tool,
+            flag.scope
+        );
+    }
     let record = flag_record(flag);
     #[cfg(test)]
     test_rows::push(record);
@@ -1871,6 +1960,66 @@ mod tests {
         assert_eq!(scope_attribution("task-abc123"), Attribution::Headless);
         assert_eq!(scope_attribution("claude:"), Attribution::Headless);
         assert_eq!(scope_attribution(""), Attribution::Headless);
+    }
+
+    /// #48 F-16 — no screen that a project-scoped review reads may write a row
+    /// with no project.
+    ///
+    /// The finding: of the two rows a dual-trip `context_note` produces (latch
+    /// quarantine + secret screen), the rootless one was the SECRET-screen row —
+    /// so in a project-scoped review the row recording that a credential was held
+    /// was the one that vanished.
+    ///
+    /// This asserts the CLASSIFICATION and the predicate. The enforcement is the
+    /// `debug_assert!` in [`record_flag`], which is why the two per-producer tests
+    /// — `graph::mcp::tests::a_held_secret_note_records_the_project_it_was_written_against`
+    /// and
+    /// `loopback::tests::an_unattributed_write_row_names_the_project_it_was_about_to_write_into`
+    /// — assert on the real rows, and why *any* future test that drives a
+    /// forensic producer without a project fails at the producer instead of
+    /// leaving a hidden row.
+    ///
+    /// It is also the reason the empty string can safely keep meaning "unknown":
+    /// after this, "unknown" has no forensic instance, so the two readings a bare
+    /// `""` could carry cannot both occur.
+    #[test]
+    fn every_forensic_screen_row_carries_a_project_root() {
+        // The set is a decision, not an accident: exactly the memory review
+        // queue. Widening it would make a legitimately project-less row (a worker
+        // SSRF denial with no configured root) read as a defect.
+        let required: Vec<&str> = Screen::ALL
+            .iter()
+            .filter(|s| s.requires_project_root())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(required, vec!["memory_quarantine"]);
+
+        let flag = |screen: Screen, root: &str| Flag {
+            screen,
+            origin: Origin::Internal,
+            consumer: "claude",
+            scope: "claude:tab-1",
+            session: None,
+            tool: "context_note",
+            host: None,
+            url: None,
+            resolved_ip: None,
+            canary: false,
+            root: root.to_string(),
+            detail: "held",
+        };
+        assert!(rootless_forensic(&flag(Screen::MemoryQuarantine, "")));
+        // Whitespace is not a project either — `""` has one meaning and a blank
+        // must not be a way around it.
+        assert!(rootless_forensic(&flag(Screen::MemoryQuarantine, "   ")));
+        assert!(!rootless_forensic(&flag(
+            Screen::MemoryQuarantine,
+            "p:\\proj"
+        )));
+        // A screen legitimately about something other than a project is NOT in
+        // the set, and says so by name rather than by escaping the check.
+        assert!(!rootless_forensic(&flag(Screen::Updater, "")));
+        assert!(!rootless_forensic(&flag(Screen::Ssrf, "")));
     }
 
     /// The label `loopback` builds and the label `scope_attribution` recognizes

@@ -118,12 +118,22 @@ below — F-22 is the one to read first).
       `detection_update_manifest_url`, `offload.injection` and much of `graph`
       actually live on this install. Comparing the app against the global file
       alone produced a full false finding (F-22, withdrawn).
-- [ ] **⚠ `detection_update_manifest_url` is NOT cleared** — the global reads
-      `""` but the **project overlay still points at
-      `…/detection-v1-rehearsal/manifest.json`**, the throwaway ref. So the app
-      is checking the rehearsal channel, not the pinned `detection-v1` default.
-      Clear it in the overlay before recipes 11 / 11b / 11c, or they verify the
-      wrong channel — and delete the rehearsal branch only after.
+- [x] ~~**⚠ `detection_update_manifest_url` is NOT cleared**~~ — **RESOLVED,
+      re-checked 2026-08-11: the override IS cleared.** The project overlay no
+      longer carries the key at all and the global reads `""`, which resolves to
+      the pinned default (`manifest_url`, `updater/mod.rs:226-232`).
+      `DEFAULT_MANIFEST_URL` =
+      `raw.githubusercontent.com/Dyserna/cImp/detection-v1/manifest.json`
+      (`manifest.rs:162`), verified live at **HTTP 200, zero redirects**, serving
+      bundle `2026.08.10`. Recipes 11 / 11b / 11c will check the **real** channel.
+      **Still owed:** delete the `detection-v1-rehearsal` branch.
+      **⚠ And note the version ladder is currently FLAT:** the installed bundle
+      is `2026.08.10` — the same version the channel publishes, with all three
+      `rules.d` digests byte-identical to the manifest — so a plain "Check now"
+      against the default URL reports **up to date and verifies nothing**. Use
+      the staged loopback battery (recipe 11 continued) or publish a higher
+      version. `previous_version: 2026.08.09.1` is retained, so **Revert is
+      runnable as-is**.
 - [ ] **Throwaway project root**, not a real one. Recipes 11/11c write to
       `<exe-dir>/detection-updates/`, 17 corrupts `.cimp-discovery/<pid>.json`,
       18 writes `.opencode/plugin/`, 21 writes into
@@ -1020,6 +1030,17 @@ anywhere on this install** (checked), so `RUST_LOG` is the only route.
 `installed_version` `2026.08.10`, `last_check_ms` back to the original,
 `previous_version` `2026.08.09.1` intact, and all three `rules.d` digests
 unchanged.
+
+### 11 (continued) — the rest of the updater's boxes
+
+> All of the boxes below need the **Manifest URL override** field pointed at a
+> different URL per test, so they need the UI. **The whole battery is already
+> staged**: `<scratchpad>/r11-server.js` (`node r11-server.js 8799`) serves one
+> manifest per box — happy path, bad checksum, non-compiling rule, artifact URL
+> outside the manifest directory, `?query`, `#fragment`, the three U-1
+> traversals, a 302 to another host, and a 404 — and logs every artifact request
+> at `/hits`, so *"zero artifact requests reached the attacker path"* is an
+> observation rather than an assumption. It prints the paste-list on startup.
 
 `local/` survives and cannot veto (U-4):
 - [ ] A hand-written rule in `rules.d/local/` still matches after the update.

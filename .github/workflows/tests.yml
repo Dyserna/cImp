@@ -125,8 +125,10 @@ jobs:
       #
       # Only the node-backed ones can run here, deliberately:
       #  * `tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query`
-      #    (H-1) and `tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight`
-      #    (M-15) need `node` on PATH, which this job has unconditionally — `npx
+      #    (H-1), `tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight`
+      #    (M-15) and
+      #    `tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab`
+      #    (F-13) need `node` on PATH, which this job has unconditionally — `npx
       #    vitest run` is ten steps up. That is the whole reason O-1 is cheap.
       #  * `tts::engine::tests::synthesizes` needs the Kokoro model + voicepack
       #    and `tts::phonemize::tests::espeak_fallback_engages_on_oov` needs the
@@ -151,7 +153,8 @@ jobs:
           # The node-backed ones, run below one at a time.
           $nodeBacked = @(
             'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query',
-            'tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight'
+            'tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight',
+            'tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab'
           )
           $expected = ($nodeBacked + @(
             'tts::engine::tests::synthesizes',

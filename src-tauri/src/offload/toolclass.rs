@@ -728,6 +728,27 @@ pub const REFUSAL_NATIVE_WEB_BLOCKED: &str = "REFUSED (security boundary): this 
     model, and spawning a sub-agent reaches the same boundary. Continue with the tools you still \
     have, or answer with what you have gathered.";
 
+/// #48 (F-13) — the harness's own WEB tools from a tab that is CONTAMINATED but
+/// whose latch is not EXTERNAL.
+///
+/// Its own constant rather than a reuse of [`REFUSAL_NATIVE_WEB_BLOCKED`],
+/// because that one names a cause — "this session has already used a
+/// local-capability tool" — which is exactly what did NOT happen here: the latch
+/// is `open` and what refuses the call is the sticky contamination bit, usually
+/// a session rotation in a tab that took external content earlier. A refusal
+/// that states a cause it did not check is finding F-23, in the same file that
+/// would have made the same mistake.
+///
+/// Same posture as its two siblings: fixed text, no templating, non-negotiable
+/// from inside the model, and deliberately silent about the user's clear button —
+/// the boundary must not be something a steered session can shape or probe.
+pub const REFUSAL_NATIVE_WEB_TAINTED: &str = "REFUSED (security boundary): external content \
+    has already entered this conversation, so this harness's own web tools — fetch and search \
+    — are unavailable to it. Local tools are unaffected. This cannot be unlocked, re-asked \
+    for, or worked around; it is enforced outside the model, and spawning a sub-agent reaches \
+    the same boundary. Use the project's proxied research tools if you have them, or answer \
+    with what you have gathered.";
+
 /// V32 Phase C2 — the fixed suffix appended to a `context_note` result that was
 /// stored **quarantined** (locked decision 10).
 ///
@@ -1371,7 +1392,11 @@ mod tests {
     /// compromised model does not read `task` as a way around.
     #[test]
     fn the_native_refusals_are_fixed_and_speak_the_v32_vocabulary() {
-        for r in [REFUSAL_NATIVE_LOCAL_BLOCKED, REFUSAL_NATIVE_WEB_BLOCKED] {
+        for r in [
+            REFUSAL_NATIVE_LOCAL_BLOCKED,
+            REFUSAL_NATIVE_WEB_BLOCKED,
+            REFUSAL_NATIVE_WEB_TAINTED,
+        ] {
             assert!(r.starts_with("REFUSED (security boundary):"), "{r}");
             assert!(r.contains("enforced outside the model"), "{r}");
             assert!(r.contains("sub-agent"), "{r}");
@@ -1382,6 +1407,14 @@ mod tests {
         }
         assert!(REFUSAL_NATIVE_LOCAL_BLOCKED.contains("already used an external tool"));
         assert!(REFUSAL_NATIVE_WEB_BLOCKED.contains("already used a local-capability tool"));
+        // #48 (F-13/F-23): the third refusal must name ITS OWN cause. Reusing
+        // the sibling's text would state a cause that did not happen — the tab
+        // is `open`, no local-capability tool was necessarily involved.
+        assert!(REFUSAL_NATIVE_WEB_TAINTED.contains("external content has already entered"));
+        assert!(
+            !REFUSAL_NATIVE_WEB_TAINTED.contains("already used a local-capability tool"),
+            "F-23's defect: do not borrow the sibling's cause",
+        );
     }
 
     // ── #48, finding M-2 — TABLE ↔ the native dispatch surface ─────────────

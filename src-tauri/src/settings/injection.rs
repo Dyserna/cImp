@@ -96,13 +96,22 @@
 //!
 //! # Spawn-baked vs live
 //!
-//! [`Feature::spawn_baked`] names the features applied when a tab launches
-//! ([`Feature::NativeWeb`], [`Feature::ConsumerHygiene`], and Phase H's
-//! [`Feature::OpencodeNativeGate`], whose flag is compiled into the generated
-//! OpenCode plugin). Their L2 *and* L3 values ride
-//! `tabs::config::spawn_inject_sig` via [`spawn_sig`], so flipping any of them
-//! raises the restart hint. Every other feature resolves per call and takes
-//! effect immediately.
+//! [`Feature::spawn_baked`] names the features whose value is baked into a tab
+//! when it launches: [`Feature::NativeWeb`], [`Feature::ConsumerHygiene`],
+//! Phase H's [`Feature::OpencodeNativeGate`] (whose flag is compiled into the
+//! generated OpenCode plugin), and — since #48's M-3 — [`Feature::Spotlighting`],
+//! which `tabs::config::fact_promotion_block` reads at launch to decide whether
+//! the pinned-memory addendum enters the system prompt ENVELOPED. Their L2 *and*
+//! L3 values ride `tabs::config::spawn_inject_sig` via [`spawn_sig`], so
+//! flipping any of them raises the restart hint.
+//!
+//! Spotlighting is the one control in **both** columns — the addendum is baked,
+//! the proxy's EXTERNAL envelope is per call — and the predicate resolves that
+//! by asking "does the user owe this a restart?", not "is it ever live?". A
+//! spawn-time call site can no longer disagree with the list:
+//! [`Feature::baked_at_spawn`] is const-asserted at the site.
+//!
+//! Every other feature resolves per call and takes effect immediately.
 
 use serde::{Deserialize, Serialize};
 
@@ -314,21 +323,43 @@ impl Feature {
         }
     }
 
-    /// Whether this feature is applied at TAB SPAWN rather than per call.
+    /// Whether this feature is applied at TAB SPAWN — so a change to it does not
+    /// reach a tab that is already running.
     ///
     /// The consumer of this predicate is `tabs::config::spawn_inject_sig` (via
     /// [`spawn_sig`]): a spawn-baked feature's L2/L3 values must move the
     /// signature so the user gets the restart hint, because a running tab keeps
-    /// whatever posture it launched with.
+    /// whatever posture it launched with. `SettingsApp.svelte` reads the same
+    /// bit to render "(needs a tab restart)" beside the control.
+    ///
+    /// **Not the complement of "live" (#48, M-3).** It used to be worded "applied
+    /// at TAB SPAWN *rather than* per call", and that framing is what let
+    /// [`Feature::Spotlighting`] out: spotlighting is applied per call at the
+    /// proxy AND baked at spawn, because `tabs::config::fact_promotion_block`
+    /// decides at launch whether the pinned-memory addendum goes into the system
+    /// prompt enveloped. Under the old wording nobody could say which list it
+    /// belonged to, so it was in neither and the restart hint never fired —
+    /// leaving a tab toggled ON mid-session injecting UNENVELOPED pre-V32 memory
+    /// into its system prompt. The question this predicate answers is therefore
+    /// "does the user owe this control a restart?", and *any* spawn-baked
+    /// component is enough to answer yes.
     ///
     /// [`Feature::OpencodeNativeGate`] joins the pair in Phase H: its flag is
     /// baked into the generated OpenCode plugin, and the plugin is written at
     /// tab spawn.
-    pub fn spawn_baked(self) -> bool {
+    ///
+    /// `const` so [`baked_at_spawn`](Self::baked_at_spawn) can turn a
+    /// disagreement between this list and a spawn-time call site into a BUILD
+    /// ERROR rather than a source-scan test that only sees the half it scans.
+    pub const fn spawn_baked(self) -> bool {
         match self {
-            Feature::NativeWeb | Feature::ConsumerHygiene | Feature::OpencodeNativeGate => true,
+            Feature::NativeWeb
+            | Feature::ConsumerHygiene
+            | Feature::OpencodeNativeGate
+            // #48 (M-3): baked by `fact_promotion_block` into the launch
+            // addendum. Also live at the proxy — see the note above.
+            | Feature::Spotlighting => true,
             Feature::TaintLatch
-            | Feature::Spotlighting
             | Feature::Detection
             | Feature::SsrfGuard
             | Feature::FetchBudgets
@@ -336,6 +367,30 @@ impl Feature {
             | Feature::MemoryQuarantine
             | Feature::TerminalEscapeHygiene => false,
         }
+    }
+
+    /// [`spawn_baked`](Self::spawn_baked) as a **compile-time assertion**, for
+    /// the call sites that BAKE a control into a tab's launch.
+    ///
+    /// Used in a `const` item it is const-evaluated, so a feature resolved at
+    /// spawn while `spawn_baked()` says otherwise fails the BUILD. That is the
+    /// tripwire M-3 was missing and the V26 field report wanted: a source scan
+    /// over `effective(` would have to be remembered by whoever adds the next
+    /// spawn-time read, which is exactly the person who already forgot.
+    ///
+    /// Returns `self` so the call site reads as the feature it names:
+    ///
+    /// ```ignore
+    /// const SPOTLIGHT_AT_SPAWN: Feature = Feature::Spotlighting.baked_at_spawn();
+    /// ```
+    pub const fn baked_at_spawn(self) -> Self {
+        assert!(
+            self.spawn_baked(),
+            "this control is resolved at TAB SPAWN, so `Feature::spawn_baked` must return \
+             true for it — otherwise `spawn_inject_sig` never moves and the user gets no \
+             restart hint (#48, M-3)"
+        );
+        self
     }
 }
 
@@ -925,11 +980,16 @@ impl Consumer {
             // Phase H's gate exists only inside the generated OpenCode plugin.
             // This is the row the shared blob was nagging Claude tabs about.
             Feature::OpencodeNativeGate => self == Consumer::Opencode,
+            // #48 (M-3): BOTH consumers bake it. `fact_promotion_block` is
+            // called for `claude` and for `opencode` alike (the `agent`
+            // parameter), landing in `--append-system-prompt` on one side and
+            // the managed instructions file on the other — so an L2 flip owes
+            // both a hint, and an L3 flip owes the tab's own consumer one.
+            Feature::Spotlighting => true,
             // Live features never reach a spawn signature at all — filtered out
             // by `Feature::spawn_baked` before this is asked — but naming them
             // keeps the match total.
             Feature::TaintLatch
-            | Feature::Spotlighting
             | Feature::Detection
             | Feature::SsrfGuard
             | Feature::FetchBudgets
@@ -1646,6 +1706,13 @@ mod tests {
     /// "a restart nag for a change that needs no restart is how a hint stops
     /// being read" violating it. The third column below is the property: exactly
     /// which consumers each flip is allowed to disturb.
+    ///
+    /// #48 (M-3) moved `spotlighting` out of the `stays` list and into `moves`:
+    /// its `stays` entry PINNED THE DEFECT, because `fact_promotion_block`
+    /// resolves the control at LAUNCH and bakes envelope-or-not into the system
+    /// prompt. It is the one feature in both columns — live at the proxy, baked
+    /// in the addendum — and `spawn_baked` answers "does the user owe this a
+    /// restart?", so it belongs here.
     #[test]
     fn the_spawn_signature_tracks_only_spawn_baked_levels() {
         use Consumer::{Claude, Opencode};
@@ -1705,6 +1772,24 @@ mod tests {
                 }),
                 &[Opencode],
             ),
+            // #48 (M-3): spotlighting is BOTH live and spawn-baked. The baked
+            // half is `fact_promotion_block`'s decision to envelope the pinned-
+            // memory addendum, taken at launch and written into the system
+            // prompt — so a mid-session flip owes a restart hint. This entry
+            // used to live in the `stays` list below and PINNED THE DEFECT.
+            (
+                "spotlighting L2 (the memory addendum is baked)",
+                Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::Spotlighting, false)),
+                &[Claude, Opencode],
+            ),
+            (
+                "spotlighting L3 on the Claude tab",
+                Box::new(|s: &mut Settings| {
+                    let id = tab_of(s, Claude);
+                    set_tab_override(s, &id, Feature::Spotlighting, Override::Off);
+                }),
+                &[Claude],
+            ),
             (
                 // L1 reaches every launch there is, so both objects carry it.
                 "the global master",
@@ -1734,13 +1819,6 @@ mod tests {
                 Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::TaintLatch, false)),
             ),
             (
-                "spotlighting L3",
-                Box::new(|s: &mut Settings| {
-                    let id = tab_of(s, Claude);
-                    set_tab_override(s, &id, Feature::Spotlighting, Override::Off);
-                }),
-            ),
-            (
                 "detection L2",
                 Box::new(|s: &mut Settings| s.set_l2_for_test(Feature::Detection, false)),
             ),
@@ -1760,6 +1838,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #48 (M-3): the launch-time reader and the restart-hint list must agree.
+    ///
+    /// The real guard is the const assert at
+    /// `tabs::config::fact_promotion_block`'s `SPOTLIGHT_AT_SPAWN` — this test
+    /// exists so the FAILURE is legible: a build error there says "const eval
+    /// failed", and this says what the invariant was.
+    #[test]
+    fn every_control_baked_into_a_launch_is_declared_spawn_baked() {
+        assert!(
+            Feature::Spotlighting.spawn_baked(),
+            "`fact_promotion_block` resolves spotlighting at LAUNCH and writes the answer into \
+             the system prompt; without this the user gets no restart hint and a tab toggled ON \
+             mid-session keeps injecting UNENVELOPED pre-V32 memory"
+        );
+        // …and the predicate is const, which is what makes the call site a
+        // build error rather than a comment.
+        const _: Feature = Feature::Spotlighting.baked_at_spawn();
     }
 
     /// **Splitting the signature must not DROP a cell** (#48, F-x). Every AI tab

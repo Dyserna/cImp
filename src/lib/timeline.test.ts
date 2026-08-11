@@ -388,6 +388,65 @@ describe('what the view says when it cannot show everything', () => {
     expect(notices.map((n) => n.kind)).toEqual(['other-root']);
     expect(notices[0].text).toMatch(/^1 contamination event /);
   });
+
+  /// #48 F-16, in the one view that actually narrows by root. `root === ''` is a
+  /// CLAIM — "not attributable to a project" — and the row F-16 found missing was
+  /// one recording that a credential had been held. Reachable here without any
+  /// producer bug: the contamination screens take their root from `tab_root_key`,
+  /// which degrades to `""` when the process cwd cannot be read.
+  ///
+  /// Two failures are pinned, and they are different: showing an empty list
+  /// (silence), and folding the row into the other-root count (a sentence that
+  /// says "came from another project directory" about a row that names none).
+  it('announces a rootless event as its own case, never as another project’s', () => {
+    const notices = evidenceNotices({
+      events: [ev({ id: 1, root: '' })],
+      root: ROOT,
+      latch: [],
+      error: null,
+    });
+    expect(notices.map((n) => n.kind)).toEqual(['rootless']);
+    expect(notices[0].text).toMatch(/^1 contamination event /);
+    // Not the other-root sentence: that one asserts the row belongs to a
+    // different directory, which is a fact a rootless row does not carry.
+    const otherRoot = evidenceNotices({
+      events: [ev({ id: 1, root: 'P:\\other' })],
+      root: ROOT,
+      latch: [],
+      error: null,
+    });
+    expect(notices[0].text).not.toBe(otherRoot[0].text);
+    expect(notices[0].text).not.toContain('came from another project directory');
+
+    // …and it is withheld from the rows, which is precisely why the notice has
+    // to exist: the two together are the "surfaced, not silenced" property.
+    expect(
+      buildTimelineRows([], [ev({ id: 1, root: '' })], ROOT).filter((r) => r.kind !== 'checkpoint'),
+    ).toEqual([]);
+  });
+
+  it('keeps the two withholding reasons separately counted', () => {
+    const notices = evidenceNotices({
+      events: [ev({ id: 1, root: 'P:\\other' }), ev({ id: 2, root: '' })],
+      root: ROOT,
+      latch: [],
+      error: null,
+    });
+    expect(notices.map((n) => n.kind)).toEqual(['other-root', 'rootless']);
+    // A rootless row folded into the other-root count would read "2 … came from
+    // another project directory", which is one claim too many.
+    for (const n of notices) expect(n.text).toMatch(/^1 contamination event /);
+  });
+
+  it('does not announce a rootless CLEAR, on the same live-only rule as other roots', () => {
+    const notices = evidenceNotices({
+      events: [ev({ id: 1, root: '', cleared: true, tool: 'clear_contamination' })],
+      root: ROOT,
+      latch: [],
+      error: null,
+    });
+    expect(notices).toEqual([]);
+  });
 });
 
 describe('step 5d — the flag and the latch are separate holds', () => {

@@ -24,6 +24,20 @@ export interface ContaminationEvent {
   /// [`precedes`] for the one place the two are compared.
   ts_ms: number;
   /// `activity::root_key` form.
+  ///
+  /// **Empty means "not attributable to a project" — a claim, not a gap** (#48
+  /// F-16): the same one sentinel `ActivityEntry.root` carries, covering a writer
+  /// that could not derive a root (the contamination screens take theirs from
+  /// `tab_root_key`, which degrades to `""` when even the process cwd cannot be
+  /// read) and a row written before the column existed. A future recorder that
+  /// positively has "no project" as a fact must not reuse it.
+  ///
+  /// This is the one field in this file that a view NARROWS by
+  /// ([`buildTimelineRows`]), so it is also the one that can hide a row: `''`
+  /// matches no real root, and F-16's live reproduction was exactly that — a row
+  /// recording that a credential was held, missing from a project-scoped view.
+  /// [`evidenceNotices`] is what keeps that visible; a rootless event is announced
+  /// on its own terms and never counted as another project's.
   root: string;
   /// `false` = the bit was SET, `true` = it was released.
   cleared: boolean;
@@ -193,6 +207,13 @@ export type TimelineRow =
 /// Events are filtered to `root` — the Timeline's checkpoints are this root's,
 /// and a row from another project has no restore point here. What the other
 /// roots' events become is [`evidenceNotices`]' job, not silence.
+///
+/// A **rootless** event (`root === ''`, "not attributable to a project" — see
+/// [`ContaminationEvent.root`](ContaminationEvent)) matches no real root and is
+/// therefore withheld here too. That is deliberate, not an oversight: it has no
+/// project to correlate against these checkpoints. It is NOT silent, though —
+/// [`evidenceNotices`] announces it as its own case, because #48 F-16 was a
+/// rootless forensic row disappearing from exactly this kind of view.
 export function buildTimelineRows(
   checkpoints: readonly Checkpoint[],
   events: readonly ContaminationEvent[],
@@ -354,7 +375,7 @@ export function clearedLine(event: ContaminationEvent): string {
 /// A banner above the rows. Never decorative: each one exists because rendering
 /// the list alone would be a confident claim that is not true.
 export interface EvidenceNotice {
-  kind: 'error' | 'not-retained' | 'other-root';
+  kind: 'error' | 'not-retained' | 'other-root' | 'rootless';
   text: string;
 }
 
@@ -383,6 +404,14 @@ export interface EvidenceInput {
 /// It deliberately does not name a cause: eviction, a different root, and a
 /// cleared history all produce the same observation, and picking one would be a
 /// guess printed as a fact.
+///
+/// The `rootless` one is #48 F-16 in this view. `root === ''` means "not
+/// attributable to a project", so such an event is withheld by
+/// [`buildTimelineRows`] like any non-matching root — but it must not be
+/// DESCRIBED as another project's, and it must not be silent, because the row
+/// F-16 found missing was one recording that a credential had been held. Its own
+/// notice, and it is subtracted from the `other-root` count so that sentence
+/// keeps meaning what it says.
 export function evidenceNotices(input: EvidenceInput): EvidenceNotice[] {
   const notices: EvidenceNotice[] = [];
   if (input.error) {
@@ -406,11 +435,28 @@ export function evidenceNotices(input: EvidenceInput): EvidenceNotice[] {
     });
   }
 
-  const elsewhere = input.events.filter((e) => e.root !== input.root && !e.cleared).length;
+  // #48 F-16: `''` is "not attributable to a project", so a rootless event is
+  // neither here nor at another root — and calling it another project's would be
+  // a fact this row does not carry. Counted (and announced) separately, and
+  // excluded from `elsewhere` below so that sentence stays true.
+  const isRootless = (e: ContaminationEvent) => e.root.trim() === '';
+  const elsewhere = input.events.filter(
+    (e) => !isRootless(e) && e.root !== input.root && !e.cleared,
+  ).length;
   if (elsewhere > 0) {
     notices.push({
       kind: 'other-root',
       text: `${elsewhere} contamination event${elsewhere === 1 ? '' : 's'} came from another project directory and ${elsewhere === 1 ? 'is' : 'are'} not shown. This Timeline covers ${input.root}; a tab running in a worktree writes both its checkpoints and its containment history against that worktree instead.`,
+    });
+  }
+
+  // Only when this Timeline HAS a root: with no root of its own it is not
+  // narrowing by one, so nothing is being withheld to announce.
+  const rootless = input.events.filter((e) => isRootless(e) && !e.cleared).length;
+  if (rootless > 0 && input.root.trim() !== '') {
+    notices.push({
+      kind: 'rootless',
+      text: `${rootless} contamination event${rootless === 1 ? '' : 's'} ${rootless === 1 ? 'names' : 'name'} no project directory and ${rootless === 1 ? 'is' : 'are'} not shown. That is not the same as coming from another project: cImp could not attribute ${rootless === 1 ? 'it' : 'them'} to one at all, so ${rootless === 1 ? 'it cannot' : 'they cannot'} be correlated with the checkpoints below. Open the Events tab to read ${rootless === 1 ? 'it' : 'them'} — the row is retained in full there.`,
     });
   }
   return notices;

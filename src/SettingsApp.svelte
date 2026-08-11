@@ -39,6 +39,10 @@
     findTab,
     findTabIndex,
     harnessStatusBlocks,
+    // V32 / #48 F-27: the ONE list of spawn-baked injection features, read by
+    // both restart-hint shapes below.
+    spawnBakedInjectionL2,
+    spawnBakedTabOverrides,
     toPresetConfig,
   } from './lib/settings/types';
   import { contentClear, contentOpenFolder, setEnabledAiTabs } from './lib/ipc';
@@ -1523,37 +1527,42 @@
       cwd: t.cwd,
       env: t.env,
       use_local_provider: t.use_local_provider,
-      // V32 Phase G: three of this tab's injection overrides are SPAWN-BAKED
-      // (native-web visibility, consumer hygiene, and V32 Phase H's OpenCode
-      // native-tool gate, whose flag is compiled into the generated plugin), so
-      // flipping any of them needs the tab restarted before it means anything.
-      // The others resolve per call and are deliberately excluded — a restart
-      // hint for a change that takes effect immediately is how a hint stops
-      // being read. This mirrors `spawn_inject_sig`'s split on the backend.
-      injection_spawn_baked: [
-        t.injection_overrides?.native_web ?? 'inherit',
-        t.injection_overrides?.consumer_hygiene ?? 'inherit',
-        t.injection_overrides?.opencode_native_gate ?? 'inherit',
-      ],
+      // V32 Phase G: some of this tab's injection overrides are SPAWN-BAKED, so
+      // flipping one needs the tab restarted before it means anything. The
+      // others resolve per call and are deliberately excluded — a restart hint
+      // for a change that takes effect immediately is how a hint stops being
+      // read. This mirrors `spawn_inject_sig`'s split on the backend.
+      //
+      // WHICH ones is not spelled here (#48, F-27 second instance): this used to
+      // be a hand-written trio and it went stale the moment `spotlighting`
+      // became spawn-baked (M-3), which left this window silent about a flip
+      // every running tab was carrying the old answer for. One list, in
+      // `SPAWN_BAKED_INJECTION_FEATURES`, read by both this and
+      // `injectionAppShape` below.
+      injection_spawn_baked: spawnBakedTabOverrides(t.injection_overrides),
     };
   }
 
-  /// The APP-WIDE spawn-baked injection cells: L1 and the three app-wide L2
-  /// inputs the hierarchy feeds into `spawn_inject_sig`.
+  /// The APP-WIDE spawn-baked injection cells: L1 plus the app-wide L2 input of
+  /// every spawn-baked feature, the same set the hierarchy feeds into
+  /// `spawn_inject_sig`.
   ///
-  /// `restartShape` above covers a TAB's three L3 cells and nothing else (#48,
-  /// F-x), so flipping the master switch — or the native-web mode, consumer
-  /// hygiene or the OpenCode native gate at L2 — raised no hint in this window
-  /// at all, even though every one of them moves the backend signature and
-  /// therefore every running tab's posture. Section-level rather than per-tab
-  /// because that is what they are: they affect all tabs at once.
+  /// `restartShape` above covers a TAB's L3 cells and nothing else (#48, F-x), so
+  /// flipping the master switch — or any spawn-baked feature at L2 — raised no
+  /// hint in this window at all, even though every one of them moves the backend
+  /// signature and therefore every running tab's posture. Section-level rather
+  /// than per-tab because that is what they are: they affect all tabs at once.
+  ///
+  /// The feature cells come from `spawnBakedInjectionL2`, not from a list written
+  /// out here (#48, F-27 second instance): the hand-written version omitted
+  /// `spotlighting_enabled` from the day it became spawn-baked (M-3). L1 is
+  /// prepended rather than joining that list because it is not a feature — it is
+  /// the master above all of them, and it reaches every launch there is.
   function injectionAppShape(s: Settings | null): string {
     if (!s) return '';
     return JSON.stringify([
       s.offload.injection.protection,
-      s.offload.native_web_visibility,
-      s.offload.injection.consumer_hygiene_enabled,
-      s.offload.injection.opencode_native_gate_enabled,
+      ...spawnBakedInjectionL2(s.offload),
     ]);
   }
 

@@ -379,6 +379,82 @@ export interface InjectionSettings {
   worker: WorkerInjectionOverrides;
 }
 
+/// V32: the injection features whose value is **baked into a tab when it
+/// launches**, so a change to one cannot reach a tab that is already running and
+/// the user is owed a restart before it means anything.
+///
+/// Hand-mirror of Rust `Feature::spawn_baked`
+/// (`src-tauri/src/settings/injection.rs`), in `Feature::ALL` declaration order
+/// — the order Rust's `spawn_sig` emits them in, so the two are diffable by eye.
+/// Note that `spawn_baked` is **not** the complement of "live": `spotlighting`
+/// is both (per call at the proxy, and baked into the launch addendum by
+/// `fact_promotion_block`), and the predicate answers "does the user owe this
+/// control a restart?".
+///
+/// **One source, two readers** (#48, finding **F-27**, second instance). The
+/// Settings window used to hand-mirror this set TWICE — once as a tab's L3 cells
+/// (`restartShape`) and once as the app-wide L2 cells (`injectionAppShape`) —
+/// and BOTH went stale when `spotlighting` became spawn-baked (finding M-3), so
+/// flipping Spotlighting raised no in-window restart hint at all. Nothing on this
+/// side can catch Rust growing a fifth member (a Rust-side `include_str!`
+/// tripwire over this file is owed, exactly as for [`LOCAL_DATA_TOOLS`]), but
+/// adding one HERE is a compile error until its app-wide cell is named in
+/// `SPAWN_BAKED_L2` below, and both readers then pick it up for free.
+///
+/// `satisfies keyof TabInjectionOverrides` because every member must also carry a
+/// per-tab L3 row: Rust's `Feature::has_tab_scope` is true for all four, and
+/// [`spawnBakedTabOverrides`] reads them by these exact keys. A future
+/// spawn-baked feature with no tab row would fail here rather than silently read
+/// `undefined`.
+export const SPAWN_BAKED_INJECTION_FEATURES = [
+  'spotlighting',
+  'native_web',
+  'consumer_hygiene',
+  'opencode_native_gate',
+] as const satisfies readonly (keyof TabInjectionOverrides)[];
+
+/// One of the spawn-baked feature keys.
+export type SpawnBakedInjectionFeature = (typeof SPAWN_BAKED_INJECTION_FEATURES)[number];
+
+/// Each spawn-baked feature's APP-WIDE (L2) input, as Rust's `spawn_sig` reads
+/// it. A `Record` over the union rather than a second array, so a member added
+/// to the list above does not compile until its cell is named — which is the
+/// drift the two hand-lists allowed.
+///
+/// `native_web`'s cell is the tri-mode STRING, not a boolean: `sensor` and `deny`
+/// both resolve the feature "on" but launch a tab very differently, so a boolean
+/// would lose a mode change. Same reconciliation Rust's `spawn_sig` makes.
+const SPAWN_BAKED_L2: Record<
+  SpawnBakedInjectionFeature,
+  (o: OffloadSettings) => string | boolean
+> = {
+  spotlighting: (o) => o.injection.spotlighting_enabled,
+  native_web: (o) => o.native_web_visibility,
+  consumer_hygiene: (o) => o.injection.consumer_hygiene_enabled,
+  opencode_native_gate: (o) => o.injection.opencode_native_gate_enabled,
+};
+
+/// The app-wide L2 cell of every spawn-baked feature, in
+/// [`SPAWN_BAKED_INJECTION_FEATURES`] order. The Settings window folds this into
+/// its section-level restart hint; the L1 master rides alongside it there,
+/// because it is not a feature and reaches every launch there is.
+export function spawnBakedInjectionL2(o: OffloadSettings): (string | boolean)[] {
+  return SPAWN_BAKED_INJECTION_FEATURES.map((f) => SPAWN_BAKED_L2[f](o));
+}
+
+/// One tab's L3 override for every spawn-baked feature, in
+/// [`SPAWN_BAKED_INJECTION_FEATURES`] order.
+///
+/// A missing overrides object — or a missing key on one written by an older
+/// build — reads as `'inherit'`, the same default the Rust resolver applies, so
+/// such a tab compares equal to one that carries the row instead of looking like
+/// a change.
+export function spawnBakedTabOverrides(
+  overrides: Partial<TabInjectionOverrides> | null | undefined,
+): InjectionOverride[] {
+  return SPAWN_BAKED_INJECTION_FEATURES.map((f) => overrides?.[f] ?? 'inherit');
+}
+
 export interface ShellTabConfig {
   kind: 'shell';
   id: string;

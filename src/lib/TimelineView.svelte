@@ -301,7 +301,14 @@
        rows and independently of them — an empty list with a suppressed notice
        is the exact failure these exist to prevent. -->
   {#each notices as n (n.kind)}
-    <p class="msg notice" class:err={n.kind === 'error'} class:unknown={n.kind === 'not-retained'}>
+    <!-- `rootless` wears the same unknown treatment as `not-retained` (#48
+         F-16): both say "there is evidence this view cannot show you", which is
+         not the same claim as the neutral `other-root` one. -->
+    <p
+      class="msg notice"
+      class:err={n.kind === 'error'}
+      class:unknown={n.kind === 'not-retained' || n.kind === 'rootless'}
+    >
       {n.text}
     </p>
   {/each}

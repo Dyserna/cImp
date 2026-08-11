@@ -83,7 +83,29 @@ export interface ActivityEntry {
   /// canary hit, taint-latch refusal, a memory-quarantine hold, or a
   /// surface-only detection flag).
   kind: 'graph' | 'offload' | 'audit' | 'mcp' | 'injection_flag';
-  /// Canonicalized project root the call ran against ('' when unknown).
+  /// The project this row belongs to, canonicalized backend-side
+  /// (`activity::root_key`). Lets a per-project consumer filter out other
+  /// projects' activity.
+  ///
+  /// **Empty means "not attributable to a project" — a claim, not a gap**
+  /// (#48 F-16). It covers a writer that could not derive one (an offload run
+  /// with no session cwd) AND a row that is genuinely not about a project (the
+  /// harness `contract_drift` report), and it is deliberately ONE sentinel: it is
+  /// also what a row written before this column existed deserializes to, and such
+  /// a row is honestly unknown. A future recorder that positively has "no
+  /// project" as a *fact* must not reuse this — at that point `root` becomes a
+  /// tagged union the way [`Attribution`] is, and this comment is the note saying
+  /// so. Mirror of the Rust doc on `activity::ActivityEntry::root`; the two must
+  /// keep saying the same thing.
+  ///
+  /// **Consumers must never silently HIDE a row for being rootless.** F-16's live
+  /// reproduction was a memory-quarantine row that recorded a CREDENTIAL being
+  /// held, written with `root: ""` — so in a project-scoped review it was the one
+  /// row that vanished. The producers that owe a root are now asserted backend-
+  /// side (`Screen::requires_project_root`), but the screens that legitimately
+  /// have none still write `""`, so any view that narrows by root must say what it
+  /// is not showing. See [`FeedFilter`] for where that rule lands here, and
+  /// `timeline.ts`'s `evidenceNotices` for the pattern that says it out loud.
   root: string;
   /// Agent (claude/opencode/offload/read_advisor/auto_check) for graph
   /// entries; the backend name for offload entries. For `injection_flag` rows
@@ -369,6 +391,23 @@ export function matchesTabFilter(a: Attribution | null | undefined, value: TabFi
 /// distinct from a wire-level filter: every axis is always
 /// set (a `<select>` always has a value) and `FILTER_ANY` is how "don't
 /// constrain it" is spelled.
+///
+/// **There is deliberately no `root` axis, and adding one carries a rule**
+/// (#48 F-16). [`ActivityEntry.root`](ActivityEntry) uses `''` for "not
+/// attributable to a project", which is a CLAIM and not a gap — so a
+/// `root === selected` comparison drops every rootless row, including the ones
+/// F-16 was about (a memory-quarantine row recording that a credential was held).
+/// Whoever adds this axis owes two things with it:
+///
+///  1. rootless rows are **surfaced, not silenced** — either kept in the view or
+///     announced above it, the way `timeline.ts`'s `evidenceNotices` announces
+///     the events it is withholding; and
+///  2. they are never described as belonging to *another* project, because `''`
+///     does not say that.
+///
+/// The one root filter that exists today is the Timeline's
+/// (`timeline.ts`'s `buildTimelineRows` / `evidenceNotices`), and it is written
+/// to that rule — copy it rather than re-deriving it.
 export interface FeedFilter {
   kind: string;
   source: string;

@@ -6023,6 +6023,12 @@ async fn handle_mcp_call(
                     cfg: detection_cfg,
                     spotlight: spotlight_on,
                     audit: &audit,
+                    // #48/M-5: the proxy truncates NOTHING after this point — the
+                    // consumer (a Claude/OpenCode tab) receives the whole result.
+                    // This is the boundary where the unscreened notice is
+                    // load-bearing, and the reason it is derived rather than
+                    // deleted.
+                    delivered_bytes: usize::MAX,
                 },
             )
             .await;
@@ -6049,6 +6055,8 @@ async fn handle_mcp_call(
                         cfg: detection_cfg,
                         spotlight: spotlight_on,
                         audit: &audit,
+                        // As above: nothing truncates a proxied error either.
+                        delivered_bytes: usize::MAX,
                     },
                 )
                 .await,

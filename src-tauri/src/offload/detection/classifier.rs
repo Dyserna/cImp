@@ -340,19 +340,28 @@ fn capped(text: &str) -> &str {
 ///
 /// `score: None` is "this screen has nothing to say" — inert (no weights),
 /// nothing tokenized, or inference failed — and never "this text is safe".
-/// `bounded` is the separate fact the D-1 finding is about: the caps below
-/// dropped part of the text before the model ever saw it, so even a `Some`
-/// score describes only a prefix.
+/// `truncated_input`/`window_capped` are the separate fact the D-1 finding is
+/// about: the caps below dropped part of the text before the model ever saw it,
+/// so even a `Some` score describes only a prefix.
+///
+/// The two caps are recorded **separately** since #48/M-5, because they are facts
+/// about different consumers: one drops a byte *tail* nobody past the cap will
+/// read, the other leaves a gap *inside* the prefix that was read. Both were
+/// `bounded: bool` and were formatted as one sentence, which printed nonsense
+/// ("scored the first 64 KiB of 20 KiB") whenever only the window cap fired.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Scored {
     /// Maximum window score, when the screen ran.
     pub score: Option<f32>,
-    /// A cap ([`MAX_INPUT_BYTES`] or [`MAX_WINDOWS`]) left part of the text
-    /// unread. Always `false` when the screen did not run at all — a layer that
-    /// is inert did not *drop* anything, and reporting a truncation for it
-    /// would put an unscreened notice on every page of every install without
-    /// the weights.
-    pub bounded: bool,
+    /// [`MAX_INPUT_BYTES`] cut a **tail** off the input before tokenization.
+    /// Always `false` when the screen did not run at all — a layer that is inert
+    /// did not *drop* anything, and reporting a truncation for it would put an
+    /// unscreened notice on every page of every install without the weights.
+    pub truncated_input: bool,
+    /// [`MAX_WINDOWS`] stopped the sliding window before it covered the token
+    /// stream, so part of what *was* read went unscored. Same inert rule as
+    /// [`truncated_input`](Self::truncated_input).
+    pub window_capped: bool,
     /// Inference **started and did not finish**: a window's `run_one` failed
     /// (an `ort` session error, an unrecognized logits shape) after the screen
     /// was already running (#48, M-4).
@@ -368,6 +377,22 @@ pub struct Scored {
     /// every external result in existence), and a tokenization failure (the
     /// screen said nothing at all, which `score: None` already carries).
     pub failed: bool,
+}
+
+impl Scored {
+    /// Either cap bit — "a size cap left part of the text unread".
+    ///
+    /// Kept so the callers that only need the coarse answer (`Verdict::bounded`,
+    /// the inert-layer assertions) read one predicate instead of OR-ing two
+    /// fields at each site and eventually forgetting one.
+    ///
+    /// The running app reads the two fields separately — that separation *is*
+    /// #48/M-5 — so this is a test-only accessor today; same `cfg_attr` shape as
+    /// `signature::ScanOutcome::matched`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn bounded(&self) -> bool {
+        self.truncated_input || self.window_capped
+    }
 }
 
 /// Score `text`.
@@ -410,8 +435,11 @@ fn score_with(engine: &mut Engine, text: &str) -> Scored {
     };
     let ids = encoding.get_ids();
     // #48/D-1: both caps, decided once, from the same tokenization the scoring
-    // uses — so `bounded` describes the text the model actually saw.
-    let bounded = cut.len() < text.len() || windows_truncated(ids);
+    // uses — so the gaps describe the text the model actually saw. #48/M-5:
+    // recorded separately, because a dropped tail and an unscored middle are
+    // different facts about different consumers.
+    let truncated_input = cut.len() < text.len();
+    let window_capped = windows_truncated(ids);
     let cls = special_id(&engine.tokenizer, &["[CLS]", "<s>", "<|startoftext|>"]);
     let sep = special_id(&engine.tokenizer, &["[SEP]", "</s>", "<|endoftext|>"]);
     let mut scores = Vec::new();
@@ -441,7 +469,8 @@ fn score_with(engine: &mut Engine, text: &str) -> Scored {
     }
     Scored {
         score: verdict(&scores, 0.0).map(|(max, _)| max),
-        bounded,
+        truncated_input,
+        window_capped,
         failed,
     }
 }
@@ -614,7 +643,7 @@ mod tests {
             // #48/D-1: an inert layer did not *drop* anything. Reporting it as
             // bounded would put an "unscreened" notice on every external result
             // of every install that has not fetched the HF-gated weights.
-            assert!(!scored.bounded, "inert is not truncated");
+            assert!(!scored.bounded(), "inert is not truncated");
         }
     }
 
@@ -697,13 +726,15 @@ mod tests {
             let scored = score_blocking(&text);
             let ms = t.elapsed().as_millis();
             eprintln!(
-                "{:>7} chars  ~{:>5} tokens  {:>2} window(s)  {:>6} ms  score={:?} bounded={}",
+                "{:>7} chars  ~{:>5} tokens  {:>2} window(s)  {:>6} ms  score={:?} \
+                 truncated_input={} window_capped={}",
                 text.len(),
                 ids,
                 windows(&vec![0u32; ids]).len(),
                 ms,
                 scored.score.map(|v| (v * 1000.0).round() / 1000.0),
-                scored.bounded
+                scored.truncated_input,
+                scored.window_capped
             );
         }
     }

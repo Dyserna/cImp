@@ -88,9 +88,10 @@ const SOURCE: &str = include_str!("secrets.yar");
 /// the two cannot drift apart silently.
 ///
 /// **64 KiB, not 256.** The value is deliberately well *under* the prefix cap
-/// rather than equal to it, so the scanner's second (normalized) pass — which
-/// can grow the buffer it works on — keeps a wide margin against
-/// [`signature::SCAN_TIMEOUT`] too. It is the same figure the classifier bounds
+/// rather than equal to it, so both of the scanner's passes keep a wide margin
+/// against [`signature::SCAN_PASS_TIMEOUT`] too — a 64 KiB note measures ~52 ms
+/// per pass (indicative, inherited from the M-6 fix run) against a guaranteed
+/// floor of a second (#48, F-9). It is the same figure the classifier bounds
 /// its own input at (`classifier::MAX_INPUT_BYTES`), and ~16k words is already
 /// far past what a memory note is for.
 pub const MAX_NOTE_BYTES: usize = 64 * 1024;
@@ -211,8 +212,12 @@ fn compile(source: &str) -> Option<Arc<yara_x::Rules>> {
 /// stored Clean.
 ///
 /// The **timeout** bound is not proven unreachable, only made implausible: a
-/// bounded ≤64 KiB buffer against a 1 s ceiling, where the detection path scans
-/// four times that within the same budget. If it is ever hit, the outcome is
+/// bounded ≤64 KiB buffer against a per-pass ceiling that guarantees a second of
+/// scanning for work measured at ~52 ms, where the detection path scans four
+/// times that within the same budget. F-9 widened this margin rather than
+/// narrowing it — before it, a pass could be aborted having read nothing, which
+/// is the mechanism behind this module's own known test flake. If it is ever hit,
+/// the outcome is
 /// the deliberate fail-open every screen in this codebase takes when it cannot
 /// run — the note stores clean — for the reason [`rules`] gives: a screen that
 /// cannot run must not become a refusal path. That residual is stated, not

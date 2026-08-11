@@ -1502,6 +1502,12 @@ impl OffloadService {
         // this task correlates. The SSRF carve-out policy is snapshotted here
         // beside the tool surface, from the same settings read.
         let task_scope = outbound::new_task_scope();
+        // #48/M-5: ONE reading of the result cap for both the loop (which
+        // truncates with it) and the router (which tells the detection boundary
+        // how much of a result the model will actually see). Two readings of
+        // `per_tool_result_token_cap.max(256)` could drift, and the drift would
+        // silently make the "unscreened" notice wrong again.
+        let result_cap_tokens = snap.per_tool_result_token_cap.max(256);
         let router = HostRouter::new(
             native_defs,
             mcp_defs,
@@ -1516,6 +1522,7 @@ impl OffloadService {
                 WORKER,
                 &cur,
             ),
+            result_cap_tokens,
         );
         let cfg = AgentConfig {
             base_url: entry.base_url.clone(),
@@ -1524,7 +1531,7 @@ impl OffloadService {
             budget_tokens: view.per_slot_budget(),
             n_ctx: view.n_ctx,
             slots: view.slots,
-            per_tool_result_token_cap: snap.per_tool_result_token_cap.max(256),
+            per_tool_result_token_cap: result_cap_tokens,
             auth_token: entry.auth_token.clone(),
             per_call_timeout: Duration::from_secs(snap.offload_timeout_secs.max(30)),
             task_scope,

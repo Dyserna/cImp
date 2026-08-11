@@ -63,9 +63,10 @@ const MAX_FINDINGS: usize = 300;
 /// standing instruction would trade the thing the user asked for against the
 /// thing that makes it safe to read, and 1.5% is not a trade worth making.
 ///
-/// It is also what keeps `Verdict::bounded` unreachable here: 64 KB is far below
-/// both `signature::SCAN_PREFIX_BYTES` (256 KiB) and
-/// `classifier::MAX_INPUT_BYTES`, so an audit report is always screened whole.
+/// It is also what keeps the *byte-prefix* half of `Verdict::bounded` unreachable
+/// here: 64 KB is at or below both `signature::SCAN_PREFIX_BYTES` (256 KiB) and
+/// `classifier::MAX_INPUT_BYTES` (64 KiB), so no byte of an audit report is
+/// dropped before screening. The window-cap half can still fire (#48/M-5).
 const MAX_RESULT_BYTES: usize = 64 * 1024;
 
 // ── Shared tool surface ────────────────────────────────────────────────────
@@ -405,8 +406,11 @@ impl RawReport {
     /// so a fresh [`TaskAudit`](crate::offload::outbound::TaskAudit) per delivery
     /// cannot flood anything — and borrowing the tab's ledger would let an
     /// unrelated big page suppress *this* report's coverage caveat. Note the
-    /// caveat is close to unreachable here anyway: `bounded` cannot fire,
-    /// because [`MAX_RESULT_BYTES`] (64 KB) is far below both screening caps.
+    /// caveat is close to unreachable here: [`MAX_RESULT_BYTES`] (64 KB) is at or
+    /// below both byte-prefix screening caps. It is not *impossible* — the
+    /// classifier's `MAX_WINDOWS` cap can bite on dense content well inside 64 KB
+    /// (#48/M-5) — which is exactly why the notice is derived per reason rather
+    /// than switched off per boundary.
     pub async fn deliver(self, d: Delivery<'_>) -> String {
         use crate::offload::detection;
         let audit = crate::offload::outbound::TaskAudit::default();
@@ -429,6 +433,10 @@ impl RawReport {
                     d.settings,
                 ),
                 audit: &audit,
+                // #48/M-5: the text is already final — `MAX_RESULT_BYTES` was
+                // applied while composing it — so this boundary truncates nothing
+                // after screening and the whole report reaches the model.
+                delivered_bytes: usize::MAX,
             },
         )
         .await

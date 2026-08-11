@@ -62,12 +62,40 @@ use super::manifest::Component;
 /// latency, not the fetch path's.
 pub const COMPILE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Per-document ceiling on the smoke scan. Deliberately the same value as
-/// `signature::SCAN_TIMEOUT`, the budget the live scanner enforces: a bundle
-/// that needs longer than the fetch path will give it would, in production,
-/// produce timeouts instead of verdicts — an unscreened result dressed up as a
-/// working layer.
-pub const SCAN_BUDGET: Duration = signature::SCAN_TIMEOUT;
+/// Per-document ceiling on the smoke scan: a bundle that needs longer than the
+/// fetch path will give it would, in production, produce timeouts instead of
+/// verdicts — an unscreened result dressed up as a working layer.
+///
+/// # Why `SCAN_PASS_GUARANTEED` and not the new total (#48, F-9)
+///
+/// This used to read `= signature::SCAN_TIMEOUT`, and deleting that constant made
+/// this line a compile error deliberately, because F-9 changed the *meaning* of
+/// the number and not only its name. The scanner is now budgeted **per pass**
+/// (2 s each, 4 s worst case for the two), and this measurement wraps
+/// `signature::scan_with`, which runs both. Three readings were available:
+///
+/// - the 4 s worst case — rejected: it is what the scanner *might* give, and a
+///   bundle validated against a budget that depends on heartbeat phase would pass
+///   here and time out in production;
+/// - 2 s, the sum of the two per-pass guaranteed floors — rejected, and this is
+///   the trap the milestone warned about. It is only correct when the work splits
+///   evenly between the passes. A document that needs 1.8 s in the raw pass and
+///   0.2 s in the normalized one totals 2 s and would pass, while its raw pass
+///   blows its own 1 s floor; and a document that normalizes to itself costs
+///   exactly ONE pass, so a 2 s total is loose by 2× for it. Taking it would also
+///   have silently re-priced the gauntlet, letting a bundle twice as slow through;
+/// - **`SCAN_PASS_GUARANTEED` (1 s) — chosen.** A measured total is an upper bound
+///   on either pass alone, so `total ≤ 1 s` implies `every pass ≤ 1 s`, which is
+///   the scanning every pass is *certainly* given. Conservative in every split,
+///   including the one-pass case, and it leaves the gauntlet's numeric ceiling
+///   exactly where it was — F-9 loosens nothing here.
+///
+/// The cost of the choice, stated: a document whose two passes each take 0.9 s
+/// really would complete in production (1.8 s total, each pass inside its floor)
+/// and is rejected here. Rejecting a *slow* bundle fails closed, is user-visible
+/// with a clear message, and a smoke document that near the floor is not a bundle
+/// anyone should activate on a fetch path.
+pub const SCAN_BUDGET: Duration = signature::SCAN_PASS_GUARANTEED;
 
 /// Directory name under `<exe-dir>/detection/` holding the smoke corpus.
 pub const SMOKE_DIR: &str = "smoke";

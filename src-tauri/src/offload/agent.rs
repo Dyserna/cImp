@@ -196,6 +196,15 @@ pub struct HostRouter {
     /// equivalent rides the tab's `Budget`, where a session rotation resets
     /// it.)
     audit: super::outbound::TaskAudit,
+    /// #48/M-5: how many bytes of an EXTERNAL result this worker will actually
+    /// deliver to the model — [`cap_result`]'s cut, which is below both screening
+    /// caps on the shipped default. Carried here so the detection boundary can
+    /// tell a real coverage gap from a tail nobody will read.
+    ///
+    /// It covers the failure path too: an `Err` becomes `format!("ERROR: {e}")`
+    /// and goes through the same [`cap_result`], so M-17's remote-error envelope
+    /// is delivered under exactly this bound.
+    delivered_bytes: usize,
 }
 
 impl HostRouter {
@@ -216,6 +225,11 @@ impl HostRouter {
         policy: super::outbound::Policy,
         detection: super::detection::Config,
         spotlight: bool,
+        // #48/M-5: the loop's own result cap, so the router can tell the detection
+        // boundary how much of a result the model will actually see. Passed in
+        // rather than re-read here because `AgentConfig` applies the same value —
+        // one reading, two consumers, no way for them to disagree.
+        result_cap_tokens: u32,
     ) -> Self {
         let defs: Vec<ToolDef> = native_defs
             .into_iter()
@@ -232,6 +246,7 @@ impl HostRouter {
             detection,
             spotlight,
             audit: super::outbound::TaskAudit::default(),
+            delivered_bytes: result_cap_bytes(result_cap_tokens),
         }
     }
 }
@@ -293,6 +308,7 @@ impl ToolRouter for HostRouter {
                 cfg: self.detection,
                 spotlight: self.spotlight,
                 audit: &self.audit,
+                delivered_bytes: self.delivered_bytes,
             };
             match self
                 .host
@@ -516,7 +532,7 @@ narration, no citation markers, and cite nothing — the JSON is the whole answe
 /// single truncation point in the loop, so it re-closes the envelope itself
 /// (`spotlight::ensure_closed` is a no-op for every other result).
 fn cap_result(result: String, cap_tokens: u32) -> String {
-    let cap_bytes = (cap_tokens as usize).saturating_mul(4);
+    let cap_bytes = result_cap_bytes(cap_tokens);
     if result.len() <= cap_bytes {
         return result;
     }
@@ -527,6 +543,27 @@ fn cap_result(result: String, cap_tokens: u32) -> String {
     let mut out = result[..cut].to_string();
     out.push_str("\n[result truncated — refine your query or page through it]");
     super::spotlight::ensure_closed(out)
+}
+
+/// The byte length [`cap_result`] will truncate to for `cap_tokens`.
+///
+/// **The invariant this exists for (#48/M-5):** the number the "unscreened"
+/// notice is computed from and the number [`cap_result`] actually cuts at must be
+/// the same number. Two copies of `cap_tokens × 4` is how the notice came to be
+/// false at the worker in the first place; one function, called by both, is what
+/// keeps a future change to the cap from silently un-truthing the notice.
+///
+/// **The seam nobody else defends:** this must stay the *only* definition of the
+/// worker's delivery cap. If a future change caps results anywhere else (a second
+/// truncation in `mcp_host`, a per-server limit), the notice silently becomes
+/// wrong again in the same direction.
+///
+/// Read as a bound on *content* bytes it is deliberately conservative: the header,
+/// the notice and the spotlight preamble are composed **before** `cap_result`
+/// cuts, so the model actually receives rather fewer than this many bytes of the
+/// result itself. Over-reporting a gap is the safe direction.
+pub fn result_cap_bytes(cap_tokens: u32) -> usize {
+    (cap_tokens as usize).saturating_mul(4)
 }
 
 /// Whether to think on a given turn under the policy.

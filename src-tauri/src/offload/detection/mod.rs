@@ -70,7 +70,7 @@ pub mod signature;
 pub mod updater;
 
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::outbound::{self, Screen};
 use super::spotlight;
@@ -246,6 +246,43 @@ pub const LAYER_SIGNATURE: &str = "signature";
 /// See [`LAYER_SIGNATURE`].
 pub const LAYER_CLASSIFIER: &str = "classifier";
 
+/// One reason part of a result went unexamined, **and how far down the result
+/// that reason reaches** (#48, finding M-5).
+///
+/// The distinction is the whole finding. A layer that stopped at a byte prefix
+/// says nothing about a consumer that will never read that far, and the worker —
+/// which truncates every tool result to `per_tool_result_token_cap × 4`, 32,000
+/// bytes by default, below **both** screening caps — was told "part of this was
+/// not screened" about a tail it then threw away. A layer that RAN and did not
+/// finish, or a window cap that left gaps inside the prefix it did read, applies
+/// however little is delivered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gap {
+    /// The sentence the header and the activity row carry. Composed from cImp's
+    /// own facts, never from the content.
+    pub reason: String,
+    /// `Some(n)`: this layer examined **everything below byte `n`**, so the gap
+    /// applies only to a consumer delivered more than `n` bytes.
+    ///
+    /// `None`: coverage was incomplete *within* what was examined — a yara-x
+    /// timeout, a failed inference, a screening task that never ran, the
+    /// classifier's window cap. Never filtered by a delivery cap: "empty is not
+    /// absent", and a screen that did not run must not be silenced by a small
+    /// result.
+    pub examined_prefix: Option<usize>,
+}
+
+impl Gap {
+    /// Whether this gap describes bytes a consumer delivered `delivered` bytes of
+    /// the result will actually read.
+    fn applies_to(&self, delivered: usize) -> bool {
+        match self.examined_prefix {
+            Some(examined) => delivered > examined,
+            None => true,
+        }
+    }
+}
+
 /// What the layers found — **and what they did not look at** (#48, D-1).
 ///
 /// `flagged` is `!layers.is_empty()`. `bounded`/`incomplete` are the other
@@ -271,9 +308,10 @@ pub struct Verdict {
     /// timeout or scanner error, a classifier task that failed. Not knowable in
     /// advance and not reproducible: the same page may scan clean next time.
     pub incomplete: bool,
-    /// One line per reason, in cheap-to-expensive layer order, for the header
-    /// and the row. Composed from cImp's own facts, never from the content.
-    pub unscreened_detail: Vec<String>,
+    /// One gap per reason, in cheap-to-expensive layer order, each carrying how
+    /// far down the result it reaches (#48/M-5 — see [`Gap`]). Composed from
+    /// cImp's own facts, never from the content.
+    pub gaps: Vec<Gap>,
 }
 
 impl Verdict {
@@ -281,20 +319,35 @@ impl Verdict {
         !self.layers.is_empty()
     }
 
-    /// Whether part of this result was not screened, for either reason.
+    /// Whether part of this result was not screened **for a consumer that will
+    /// read `delivered` bytes of it**.
     ///
     /// Deliberately **not** folded into `flagged()`: a flag is a statement
     /// about the content and this is a statement about cImp, they have
     /// different consumers, and conflating them would put a `Screen::Signature`
     /// row on a page nothing matched.
-    pub fn unscreened(&self) -> bool {
-        self.bounded || self.incomplete
+    ///
+    /// The parameter is not decoration (#48/M-5). Pass `usize::MAX` only if the
+    /// caller really delivers the whole result — the proxy does, the worker does
+    /// not. `bounded`/`incomplete` remain the raw facts about the *screen*; this
+    /// is the question a delivery boundary asks.
+    pub fn unscreened(&self, delivered: usize) -> bool {
+        self.gaps.iter().any(|g| g.applies_to(delivered))
+    }
+
+    /// The reasons that apply to a consumer delivered `delivered` bytes.
+    fn reasons(&self, delivered: usize) -> Vec<String> {
+        self.gaps
+            .iter()
+            .filter(|g| g.applies_to(delivered))
+            .map(|g| g.reason.clone())
+            .collect()
     }
 
     /// The activity row's response payload: what fired and how hard. Composed
     /// by cImp from cImp's own facts — rule identifiers and a float — never
     /// from the scanned content.
-    fn detail(&self) -> String {
+    fn detail(&self, delivered: usize) -> String {
         let mut out = format!("flagged by: {}", self.layers.join(" + "));
         if !self.rules.is_empty() {
             out.push_str(&format!("\nsignature rules: {}", self.rules.join(", ")));
@@ -302,8 +355,8 @@ impl Verdict {
         if let Some(s) = self.score {
             out.push_str(&format!("\nclassifier score: {s:.3}"));
         }
-        if self.unscreened() {
-            out.push_str(&format!("\n\n{}", self.unscreened_summary()));
+        if self.unscreened(delivered) {
+            out.push_str(&format!("\n\n{}", self.unscreened_summary(delivered)));
         }
         out.push_str(
             "\n\nSurface-only: the result was delivered unmodified with a warning header \
@@ -315,12 +368,12 @@ impl Verdict {
     /// The unscreened row's response payload, and the paragraph a flagged row
     /// carries when it *also* did not see everything. One composition, so the
     /// two surfaces cannot describe the same fact differently.
-    fn unscreened_summary(&self) -> String {
+    fn unscreened_summary(&self, delivered: usize) -> String {
         format!(
             "Part of this result was NOT screened: {}\n\nThe result was delivered unmodified. \
              This row is not a finding — it records that the absence of one covers less than the \
              whole result.",
-            self.unscreened_detail.join("; ")
+            self.reasons(delivered).join("; ")
         )
     }
 }
@@ -332,7 +385,9 @@ impl Verdict {
 /// The signature screen was called synchronously on the async fetch path beside
 /// a classifier that was correctly moved off it. That was wrong on its own
 /// terms — yara-x's timeout is epoch interruption *inside* the call, so it is a
-/// real block of up to a second (see [`signature::SCAN_TIMEOUT`]), and a cold
+/// real block of up to two seconds per pass and **four in total** (see
+/// [`signature::SCAN_PASS_TIMEOUT`], and #48/F-9 for why the budget is per pass),
+/// and a cold
 /// slot additionally does `read_dir` plus a full compile inline. Both layers
 /// now run in one blocking task over one owned copy of the text, which is also
 /// one allocation instead of the extra `to_string` the classifier needed.
@@ -360,9 +415,13 @@ pub async fn screen(text: &str, cfg: Config) -> Verdict {
             // verdict that reads as a clean one.
             Verdict {
                 incomplete: true,
-                unscreened_detail: vec![
-                    "the detection task did not run (worker pool failure)".into()
-                ],
+                gaps: vec![Gap {
+                    reason: "the detection task did not run (worker pool failure)".into(),
+                    // "Empty is not absent": a screen that never ran is not a
+                    // statement about a tail, so no delivery cap may silence it
+                    // (#48/M-5).
+                    examined_prefix: None,
+                }],
                 ..Verdict::default()
             }
         }
@@ -397,15 +456,22 @@ fn screen_blocking(text: &str, cfg: Config) -> Verdict {
     let mut v = Verdict::default();
     if cfg.signature {
         match signature::scan(text) {
-            signature::ScanOutcome::Hits(rules) => {
+            // #48/F-9a: a scan can match AND have failed to finish, and the two
+            // facts are recorded separately. Before it, `merged_with` folded
+            // `Hits ⊕ DidNotComplete` into a plain `Hits` and this arm reported a
+            // truncated scan as a complete one.
+            signature::ScanOutcome::Hits { rules, incomplete } => {
                 v.layers.push(LAYER_SIGNATURE);
                 v.rules = rules;
+                if let Some(why) = incomplete {
+                    v.incomplete = true;
+                    v.gaps.push(signature_did_not_finish(&why));
+                }
             }
             signature::ScanOutcome::Clean => {}
             signature::ScanOutcome::DidNotComplete(why) => {
                 v.incomplete = true;
-                v.unscreened_detail
-                    .push(format!("{LAYER_SIGNATURE}: {why}"));
+                v.gaps.push(signature_did_not_finish(&why));
             }
         }
         // The prefix cap is a separate fact from the outcome: the scanner can
@@ -413,11 +479,16 @@ fn screen_blocking(text: &str, cfg: Config) -> Verdict {
         // the page.
         if signature::is_bounded(text) {
             v.bounded = true;
-            v.unscreened_detail.push(format!(
-                "{LAYER_SIGNATURE}: only the first {} KiB of {} KiB were scanned",
-                signature::SCAN_PREFIX_BYTES / 1024,
-                text.len() / 1024
-            ));
+            v.gaps.push(Gap {
+                reason: format!(
+                    "{LAYER_SIGNATURE}: only the first {} KiB of {} KiB were scanned",
+                    signature::SCAN_PREFIX_BYTES / 1024,
+                    text.len() / 1024
+                ),
+                // Everything below this byte WAS scanned (#48/M-5), so a consumer
+                // delivered less than this reads nothing unexamined.
+                examined_prefix: Some(signature::SCAN_PREFIX_BYTES),
+            });
         }
     }
     if cfg.classifier {
@@ -425,6 +496,20 @@ fn screen_blocking(text: &str, cfg: Config) -> Verdict {
         note_classifier(&mut v, &scored, text.len(), cfg.classifier_threshold);
     }
     v
+}
+
+/// The gap a signature pass that RAN and did not finish produces.
+///
+/// One definition because two arms of the match above reach it (#48/F-9a): a scan
+/// that only timed out, and one that timed out *and* matched. `examined_prefix`
+/// is `None` for both — a scan that stopped mid-pass says nothing about where it
+/// got to, so it applies at any delivery size (#48/M-5), and this is the leg a
+/// blanket per-boundary suppression would have deleted.
+fn signature_did_not_finish(why: &str) -> Gap {
+    Gap {
+        reason: format!("{LAYER_SIGNATURE}: {why}"),
+        examined_prefix: None,
+    }
 }
 
 /// Fold one [`classifier::Scored`] into the verdict.
@@ -457,20 +542,51 @@ fn note_classifier(v: &mut Verdict, scored: &classifier::Scored, text_len: usize
         // the failure both flags AND says the pass was partial.
         if scored.failed {
             v.incomplete = true;
-            v.unscreened_detail.push(format!(
-                "{LAYER_CLASSIFIER}: inference did not finish; {} window(s) were scored before it \
-                 stopped",
-                if scored.score.is_some() { "some" } else { "no" }
-            ));
+            v.gaps.push(Gap {
+                reason: format!(
+                    "{LAYER_CLASSIFIER}: inference did not finish; {} window(s) were scored \
+                     before it stopped",
+                    if scored.score.is_some() { "some" } else { "no" }
+                ),
+                examined_prefix: None,
+            });
         }
-        if scored.bounded {
+        // #48/M-5: the two caps were one sentence, and they are two facts.
+        // `MAX_INPUT_BYTES` drops a *tail* — irrelevant to a consumer that will
+        // not read that far. `MAX_WINDOWS` leaves the tail of the *token* stream
+        // unscored inside the prefix it did read, so it applies at any delivery
+        // size. The old single line also printed "scored the first 64 KiB of
+        // 20 KiB" when only the window cap had fired, because `cut.len() ==
+        // text.len()` in that case.
+        if scored.truncated_input {
             v.bounded = true;
-            v.unscreened_detail.push(format!(
-                "{LAYER_CLASSIFIER}: scored the first {} KiB of {} KiB, and at most {} windows",
-                classifier::MAX_INPUT_BYTES / 1024,
-                text_len / 1024,
-                classifier::MAX_WINDOWS
-            ));
+            v.gaps.push(Gap {
+                reason: format!(
+                    "{LAYER_CLASSIFIER}: scored the first {} KiB of {} KiB",
+                    classifier::MAX_INPUT_BYTES / 1024,
+                    text_len / 1024
+                ),
+                examined_prefix: Some(classifier::MAX_INPUT_BYTES),
+            });
+        }
+        if scored.window_capped {
+            v.bounded = true;
+            v.gaps.push(Gap {
+                reason: format!(
+                    "{LAYER_CLASSIFIER}: at most {} windows were scored, so part of what it did \
+                     read was not examined",
+                    classifier::MAX_WINDOWS
+                ),
+                // Conservative on purpose: the exact byte the last scored window
+                // ended at is derivable from the tokenizer's offsets, but
+                // over-reporting a real gap is the safe direction — and this leg
+                // is the one case where the notice is TRUE at the worker, because
+                // the cap binds at 14,336 tokens, which dense content (base64,
+                // CJK, minified JS) reaches inside the ~32 KB the worker delivers.
+                // (That byte figure is an order-of-magnitude for dense input, not
+                // a measurement; only the token figure comes from the constants.)
+                examined_prefix: None,
+            });
         }
     }
 }
@@ -519,6 +635,19 @@ pub struct ResultCtx<'a> {
     /// is the task's); the proxy passes a handle to the tab session's ledger,
     /// which rides that tab's `Budget` and so resets when its session rotates.
     pub audit: &'a dyn outbound::ScopeAudit,
+    /// How many bytes of this result the calling boundary will actually hand its
+    /// model, **after its own truncation** (#48, finding M-5).
+    ///
+    /// The proxy delivers the whole result and passes `usize::MAX`; the worker
+    /// truncates to `agent::result_cap_bytes(per_tool_result_token_cap)`, 32,000
+    /// bytes on the shipped default — below **both** screening caps, so every byte
+    /// its model sees was scanned and a prefix-cap notice there was false every
+    /// time it fired.
+    ///
+    /// **Derived, never hardcoded.** The cap is a user setting; raise it past
+    /// `classifier::MAX_INPUT_BYTES` and the notice legitimately returns. A
+    /// constant here would be a scale cap that stops scaling.
+    pub delivered_bytes: usize,
 }
 
 /// The first http(s) URL in a call's arguments and its host — the provenance an
@@ -691,7 +820,7 @@ async fn compose(
         resolved_ip: None,
         canary: false,
         root: ctx.root,
-        detail: &verdict.detail(),
+        detail: &verdict.detail(ctx.delivered_bytes),
     });
     let header = warning_header(&verdict.layers, ctx.spotlight);
     match notice {
@@ -718,8 +847,43 @@ async fn compose(
 /// It never gates delivery: locked decision 5 says a detection signal *"NEVER
 /// blocks, aborts, or alters the content"*, and an unscreened result is less
 /// than a signal, not more.
+///
+/// # Per reason, not per boundary (#48, M-5)
+///
+/// Every gap is filtered against `ctx.delivered_bytes` before it is spoken. M-5
+/// reported this notice as *"false every time it fires"* at the worker, and that
+/// is true of the two **byte-prefix** legs only: the worker screens the whole
+/// result and then truncates it to ~32 KB, below both screening caps, so the model
+/// read nothing unexamined. It is **true and load-bearing** for the classifier's
+/// window cap and for every `incomplete` leg — a yara-x timeout, a failed
+/// inference, a screening task that never ran — each of which is a statement about
+/// the bytes that *were* delivered, whatever their length. A blanket suppression
+/// at the worker would have deleted truthful signals to fix an untruthful one:
+/// decision 5's own D-1 failure, run backwards.
 fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Option<String> {
-    if !verdict.unscreened() {
+    let reasons = verdict.reasons(ctx.delivered_bytes);
+    if reasons.is_empty() {
+        // #48/M-5: the gaps that exist but do not reach this consumer are still a
+        // fact about cImp's caps, so they are logged rather than dropped — they
+        // are just not this model's problem, and telling it otherwise trained the
+        // reader to discount a notice that is TRUE at the proxy. Disposition
+        // (global principle 3): surface where it applies, log at debug where it
+        // does not, never an activity row for a gap the consumer cannot reach.
+        if !verdict.gaps.is_empty() {
+            debug!(
+                target: "offload",
+                tool = %name,
+                scope = %ctx.scope,
+                delivered = ctx.delivered_bytes,
+                why = %verdict
+                    .gaps
+                    .iter()
+                    .map(|g| g.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                "detection: a screening cap dropped bytes this consumer will not read"
+            );
+        }
         return None;
     }
     warn!(
@@ -729,7 +893,8 @@ fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Opti
         host = ctx.host.as_deref().unwrap_or("-"),
         bounded = verdict.bounded,
         incomplete = verdict.incomplete,
-        why = %verdict.unscreened_detail.join("; "),
+        delivered = ctx.delivered_bytes,
+        why = %reasons.join("; "),
         "detection: part of a tool result was NOT screened"
     );
     // One row per scope: large pages are ordinary, and a row per page would
@@ -747,10 +912,10 @@ fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Opti
             resolved_ip: None,
             canary: false,
             root: ctx.root.clone(),
-            detail: &verdict.unscreened_summary(),
+            detail: &verdict.unscreened_summary(ctx.delivered_bytes),
         });
     }
-    Some(unscreened_header(&verdict.unscreened_detail))
+    Some(unscreened_header(&reasons))
 }
 
 /// Compile the rules and report classifier availability, once at app start.
@@ -819,6 +984,7 @@ pub fn status(settings: &Settings) -> DetectionStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::offload::agent;
     use serde_json::json;
 
     /// #48/M-4 — a classifier that RAN and did not finish must be
@@ -834,40 +1000,41 @@ mod tests {
     /// re-implementation, because the defect was in exactly this mapping.
     #[test]
     fn a_classifier_pass_that_did_not_finish_is_not_reported_as_clean() {
-        let scored = |score, failed, bounded| classifier::Scored {
+        let scored = |score, failed| classifier::Scored {
             score,
             failed,
-            bounded,
+            truncated_input: false,
+            window_capped: false,
         };
 
         // Ran, finished, found nothing: neither flagged nor unscreened. This is
         // the only shape that means "read end to end, nothing found".
         let mut clean = Verdict::default();
-        note_classifier(&mut clean, &scored(Some(0.02), false, false), 2048, 0.9);
-        assert!(!clean.flagged() && !clean.unscreened(), "{clean:?}");
+        note_classifier(&mut clean, &scored(Some(0.02), false), 2048, 0.9);
+        assert!(!clean.flagged() && !clean.unscreened(WHOLE), "{clean:?}");
 
         // Ran and died mid-pass with nothing scored yet: unscreened, not clean.
         let mut died = Verdict::default();
-        note_classifier(&mut died, &scored(None, true, false), 2048, 0.9);
+        note_classifier(&mut died, &scored(None, true), 2048, 0.9);
         assert!(died.incomplete, "a pass that stopped early must say so");
-        assert!(died.unscreened() && !died.flagged(), "{died:?}");
+        assert!(died.unscreened(WHOLE) && !died.flagged(), "{died:?}");
         assert!(
-            died.unscreened_detail.iter().any(|d| d.contains("no window")),
+            died.reasons(WHOLE).iter().any(|d| d.contains("no window")),
             "{:?}",
-            died.unscreened_detail
+            died.gaps
         );
 
         // The sharp case: it had ALREADY crossed the threshold when a later
         // window failed. The flag must survive — that verdict was the whole
         // point of running — and the partial pass must be reported too.
         let mut both = Verdict::default();
-        note_classifier(&mut both, &scored(Some(0.98), true, false), 2048, 0.9);
+        note_classifier(&mut both, &scored(Some(0.98), true), 2048, 0.9);
         assert!(both.flagged(), "the score that fired must not be discarded");
         assert!(both.incomplete, "and the pass was still partial");
         assert!(
-            both.unscreened_detail.iter().any(|d| d.contains("some window")),
+            both.reasons(WHOLE).iter().any(|d| d.contains("some window")),
             "{:?}",
-            both.unscreened_detail
+            both.gaps
         );
 
         // The two EXCLUDED cases keep their exclusion: an inert layer (no
@@ -878,12 +1045,67 @@ mod tests {
         let mut inert = Verdict::default();
         note_classifier(&mut inert, &classifier::Scored::default(), 2048, 0.9);
         assert!(
-            !inert.unscreened() && !inert.flagged(),
+            !inert.unscreened(WHOLE) && !inert.flagged(),
             "an inert classifier must say nothing: {inert:?}"
         );
     }
 
+    /// #48/M-5 — the two classifier caps are two facts, and only one of them is
+    /// about a tail.
+    ///
+    /// The window cap fires *inside* the prefix that was read, so its gap must
+    /// have no `examined_prefix` (it applies at any delivery size), and its
+    /// sentence must not be the byte-prefix one — which is what produced "scored
+    /// the first 64 KiB of 20 KiB" when the two were formatted as one line.
+    #[test]
+    fn the_two_classifier_caps_are_reported_as_separate_facts() {
+        let mut v = Verdict::default();
+        note_classifier(
+            &mut v,
+            &classifier::Scored {
+                score: Some(0.1),
+                truncated_input: false,
+                window_capped: true,
+                failed: false,
+            },
+            20 * 1024,
+            0.9,
+        );
+        assert_eq!(v.gaps.len(), 1, "{:?}", v.gaps);
+        let gap = &v.gaps[0];
+        assert_eq!(gap.examined_prefix, None, "a gap inside the prefix read");
+        assert!(gap.reason.contains("at most 32 windows"), "{}", gap.reason);
+        assert!(
+            !gap.reason.contains("scored the first"),
+            "the byte-prefix sentence must not be borrowed for the window cap: {}",
+            gap.reason
+        );
+        assert!(v.bounded && !v.incomplete, "a cap, not a failure: {v:?}");
+        // And it is spoken to a small-delivery consumer, because it is TRUE there.
+        assert!(v.unscreened(agent::result_cap_bytes(8000)), "{v:?}");
+    }
+
+    /// The delivery size of a consumer that receives the whole result — the proxy
+    /// and the audit-report boundary. Named rather than spelled `usize::MAX` at
+    /// twenty call sites so the assertions read as the contract they pin.
+    const WHOLE: usize = usize::MAX;
+
+    /// A context for a boundary that delivers the **whole** result: the proxy
+    /// (`loopback.rs`) and the audit report (`audit/mcp.rs`). This is the default
+    /// because it is the boundary at which the unscreened notice is load-bearing.
     fn ctx(cfg: Config) -> ResultCtx<'static> {
+        ctx_delivering(cfg, WHOLE)
+    }
+
+    /// A context for the **worker**, which truncates to `cap_tokens` before its
+    /// model reads anything (#48/M-5). Driven through `agent::result_cap_bytes` on
+    /// purpose: the number this test computes and the number `cap_result` cuts at
+    /// must be the same function, not two copies of `× 4`.
+    fn ctx_worker(cfg: Config, cap_tokens: u32) -> ResultCtx<'static> {
+        ctx_delivering(cfg, agent::result_cap_bytes(cap_tokens))
+    }
+
+    fn ctx_delivering(cfg: Config, delivered_bytes: usize) -> ResultCtx<'static> {
         ResultCtx {
             consumer: "offload",
             scope: "task-test",
@@ -896,6 +1118,7 @@ mod tests {
             // is claimed once per SCOPE, so a shared one would make the claim's
             // outcome depend on test ordering.
             audit: Box::leak(Box::new(outbound::TaskAudit::default())),
+            delivered_bytes,
         }
     }
 
@@ -1241,7 +1464,7 @@ mod tests {
         assert!(v.flagged());
         assert_eq!(v.layers, vec![LAYER_SIGNATURE]);
         assert!(!v.rules.is_empty());
-        let d = v.detail();
+        let d = v.detail(WHOLE);
         assert!(d.contains("signature"));
         assert!(d.contains("Nothing was blocked"));
     }
@@ -1312,10 +1535,13 @@ mod tests {
 
     /// The `Verdict` states the two questions separately, and only their
     /// combination reads as "read end to end, nothing found".
+    ///
+    /// Asserted at [`WHOLE`] throughout: this is the **proxy**'s contract, the
+    /// boundary that delivers everything (#48/M-5).
     #[tokio::test]
     async fn bounded_and_incomplete_are_separate_from_flagged() {
         let clean = screen("ordinary release notes", signature_only()).await;
-        assert!(!clean.flagged() && !clean.unscreened());
+        assert!(!clean.flagged() && !clean.unscreened(WHOLE));
 
         let cut = screen(
             &"a".repeat(signature::SCAN_PREFIX_BYTES + 1),
@@ -1324,17 +1550,31 @@ mod tests {
         .await;
         assert!(!cut.flagged(), "nothing matched");
         assert!(cut.bounded && !cut.incomplete, "a cap, not a failure");
-        assert!(cut.unscreened());
-        assert!(!cut.unscreened_detail.is_empty(), "the row needs a reason");
+        assert!(cut.unscreened(WHOLE));
+        assert!(!cut.reasons(WHOLE).is_empty(), "the row needs a reason");
+        // …and the same gap does NOT reach a consumer that stops well short of it.
+        // The finding, in one line.
+        assert!(
+            !cut.unscreened(agent::result_cap_bytes(8000)),
+            "a dropped tail is not a gap for a worker that delivers 32 KB: {:?}",
+            cut.gaps
+        );
 
         // A layer that ran and did not finish is the other half, and it is a
-        // different field: the scan may succeed next time on the same bytes.
+        // different field: the scan may succeed next time on the same bytes. Its
+        // gap carries no `examined_prefix`, so no delivery cap can silence it.
         let died = Verdict {
             incomplete: true,
-            unscreened_detail: vec!["signature: the signature scan did not complete".into()],
+            gaps: vec![signature_did_not_finish(
+                "the signature scan's raw pass did not complete: timeout",
+            )],
             ..Verdict::default()
         };
-        assert!(died.unscreened() && !died.flagged() && !died.bounded);
+        assert!(died.unscreened(WHOLE) && !died.flagged() && !died.bounded);
+        assert!(
+            died.unscreened(1024),
+            "a screen that did not finish speaks at any delivery size"
+        );
     }
 
     /// Locked decision 5, for the new state: an unscreened result is still
@@ -1354,6 +1594,140 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the enveloped region");
         assert_eq!(inner, text, "content must be byte-identical");
+    }
+
+    /// #48/M-5 — **the finding, both ways.** The worker truncates every tool
+    /// result below both screening caps, so a notice about a dropped *tail* was
+    /// false every time it fired there; the same result delivered whole at the
+    /// proxy must still carry it.
+    #[tokio::test]
+    async fn the_worker_gets_no_prefix_notice_for_a_tail_it_will_never_read() {
+        let big = || {
+            format!(
+                "{}{}",
+                "a".repeat(signature::SCAN_PREFIX_BYTES + 4096),
+                "ordinary release notes"
+            )
+        };
+        // The worker: 8000 tokens ⇒ 32,000 bytes, below SCAN_PREFIX_BYTES.
+        let worker = wrap_external_result(
+            "ddg__fetch_content",
+            big(),
+            ctx_worker(signature_only(), 8000),
+        )
+        .await;
+        assert!(
+            !worker.contains(UNSCREENED_HEADER_PREFIX),
+            "the model read only bytes that WERE scanned: {}",
+            &worker[..200]
+        );
+        // The proxy, same bytes: nothing truncates after screening, so the tail is
+        // genuinely unexamined content the consumer will read.
+        let proxy = wrap_external_result("ddg__fetch_content", big(), ctx(signature_only())).await;
+        assert!(
+            proxy.starts_with(UNSCREENED_HEADER_PREFIX),
+            "{}",
+            &proxy[..200]
+        );
+    }
+
+    /// The leg a blanket per-boundary suppression would have deleted: a screen
+    /// that RAN and did not finish is a statement about the bytes that *were*
+    /// delivered, however few (#48/M-5).
+    #[test]
+    fn the_worker_still_gets_the_notice_when_the_screen_did_not_finish() {
+        let died = Verdict {
+            incomplete: true,
+            gaps: vec![signature_did_not_finish(
+                "the signature scan's normalized pass did not complete: timeout",
+            )],
+            ..Verdict::default()
+        };
+        let ctx = ctx_worker(signature_only(), 8000);
+        assert!(died.unscreened(ctx.delivered_bytes), "{died:?}");
+        let notice = unscreened_notice("ddg__fetch_content", &died, &ctx)
+            .expect("a timeout is spoken at any delivery size");
+        assert!(notice.contains("normalized pass"), "{notice}");
+    }
+
+    /// "Empty is not absent": a screening task that never ran must not be silenced
+    /// by a small delivery cap either (#48/M-5).
+    #[tokio::test]
+    async fn a_screening_task_that_never_ran_is_never_silenced_by_a_delivery_cap() {
+        // The verdict `screen`'s `spawn_blocking` failure arm produces.
+        let never_ran = Verdict {
+            incomplete: true,
+            gaps: vec![Gap {
+                reason: "the detection task did not run (worker pool failure)".into(),
+                examined_prefix: None,
+            }],
+            ..Verdict::default()
+        };
+        // 256 tokens is the floor `service.rs` clamps the cap to — the smallest
+        // delivery this app can produce.
+        let ctx = ctx_worker(signature_only(), 256);
+        assert_eq!(ctx.delivered_bytes, 1024);
+        assert!(
+            unscreened_notice("ddg__fetch_content", &never_ran, &ctx).is_some(),
+            "a screen that never ran says so at 1 KiB just as at 4 MiB"
+        );
+    }
+
+    /// **Derived, never hardcoded** (#48/M-5). The same 300 KiB result carries a
+    /// different set of reasons at three delivery caps, because the caps are the
+    /// user's setting and the notice must track them.
+    #[test]
+    fn the_unscreened_notice_tracks_the_delivery_cap_the_worker_actually_applies() {
+        // Both byte-prefix legs, as `screen_blocking`/`note_classifier` build them.
+        let both = Verdict {
+            bounded: true,
+            gaps: vec![
+                Gap {
+                    reason: "signature: only the first 256 KiB of 300 KiB were scanned".into(),
+                    examined_prefix: Some(signature::SCAN_PREFIX_BYTES),
+                },
+                Gap {
+                    reason: "classifier: scored the first 64 KiB of 300 KiB".into(),
+                    examined_prefix: Some(classifier::MAX_INPUT_BYTES),
+                },
+            ],
+            ..Verdict::default()
+        };
+        // 8000 tokens ⇒ 32,000 bytes: under both caps, so neither leg applies.
+        assert!(both.reasons(agent::result_cap_bytes(8000)).is_empty());
+        // 20,000 tokens ⇒ 80,000 bytes: past MAX_INPUT_BYTES, not past the prefix.
+        let mid = both.reasons(agent::result_cap_bytes(20_000));
+        assert_eq!(mid.len(), 1, "{mid:?}");
+        assert!(mid[0].starts_with("classifier:"), "{mid:?}");
+        // 80,000 tokens ⇒ 320,000 bytes: past both.
+        assert_eq!(both.reasons(agent::result_cap_bytes(80_000)).len(), 2);
+        // And the whole-result consumer sees both, which is the proxy's contract.
+        assert_eq!(both.reasons(WHOLE).len(), 2);
+    }
+
+    /// A gap the consumer cannot reach must not spend the once-per-scope
+    /// `Screen::Unscreened` claim either — the row would be un-actionable, and the
+    /// claim is a finite resource the *reachable* gaps need (#48/M-5).
+    #[tokio::test]
+    async fn the_unscreened_row_is_written_only_for_a_gap_the_consumer_can_reach() {
+        outbound::test_rows::reset();
+        let big = format!(
+            "{}{}",
+            "a".repeat(signature::SCAN_PREFIX_BYTES + 4096),
+            "ordinary release notes"
+        );
+        let out = wrap_external_result(
+            "ddg__fetch_content",
+            big,
+            ctx_worker(signature_only(), 8000),
+        )
+        .await;
+        assert!(!out.contains(UNSCREENED_HEADER_PREFIX));
+        let rows = outbound::test_rows::drain();
+        assert!(
+            outbound::test_rows::of_screen(&rows, Screen::Unscreened).is_empty(),
+            "no row for a tail the model will never read: {rows:?}"
+        );
     }
 
     /// The unscreened row is bounded to one per scope — the same discipline the

@@ -258,7 +258,27 @@ declares its class AND its mutation capability in one reviewed place.
 ## Design — locked decisions
 
 1. **The latch is bidirectional mutual exclusion, per task (worker) / per
-   session (consumers).** One direction only (external → block local) leaves
+   session (consumers).**
+
+   > **Precision amendment 2026-08-11 (M-1's implementation, `78b6fc6`) — "per
+   > task" was loose language here, and the distinction is load-bearing.** On
+   > the worker side a *task* is up to **four** `run_on` attempts (fail-over,
+   > the thinking retry, tier escalation). As of M-1: the **budget** and every
+   > **reporting claim** (the `task-xxxxxxxx` scope id, the `TaskAudit` ledger,
+   > the once-per-task `Screen::Budget` / `Screen::LatchRefusal` rows, the SSRF
+   > doubling ledger, the unscreened bit) are genuinely **per task** — they were
+   > per attempt, which is what M-1 fixed. **The latch itself is per ATTEMPT,
+   > deliberately, and that is not a defect:** each attempt builds a fresh
+   > conversation from the same clean inputs, so no contaminated byte crosses
+   > the attempt boundary, and a tier escalation legitimately gets a clean latch
+   > and may touch a class the previous attempt had latched away from.
+   > Consequence worth stating: this decision's stickiness guarantee — *"the
+   > latch must be sticky for the contaminated…"* — is sticky **within an
+   > attempt** on the worker, and sticky for the session on the consumer side.
+   > Do not "fix" the worker latch into persisting across attempts; do not read
+   > this bullet as promising that it does.
+
+   One direction only (external → block local) leaves
    read-then-exfil open. First EXTERNAL call locks out LOCAL-CAPABILITY for
    the remainder; first LOCAL-CAPABILITY call locks out EXTERNAL. TRUSTED is
    always available. *Rejected:* time-window or per-turn resets — an injected

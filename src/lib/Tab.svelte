@@ -180,7 +180,18 @@
           ? 'This session has used web / external content: local file and source-text tools are closed for it.'
           : taint.latch === 'local'
             ? 'This session has used local file / source-text tools: web and other external tools are closed for it.'
-            : 'This session has read external content. Memory writes stay quarantined for this tab until cImp is restarted.',
+            : taint.awaiting_session_clear
+              ? // A checkpoint was restored, so there is no "clear now" button to
+                // point at (`can_clear` is false) and the flag lifts on the next
+                // session — the same fact TaintMenu's awaiting note states.
+                'This session has read external content: memory writes stay quarantined and external results stay wrapped for this tab. A checkpoint was restored, so the flag lifts when this tab starts a new session.'
+              : // The `open` + contaminated state, where the latch itself holds
+                // nothing: `unlatch` does not apply (`can_unlatch` is false for an
+                // open latch), so the action to name is the badge's own
+                // "clear the flag" (`clear_contamination`). This used to promise a
+                // cImp restart — false since step 4 (`05e613f`) and doubly so now
+                // that a full unlatch clears contamination too (`e4513b5`).
+                'This session has read external content: memory writes stay quarantined and external results stay wrapped for this tab. Click this badge to clear the flag once you have judged the content harmless.',
       // #48/H-10: the sentence used to end in the word "off" for every row,
       // including one whose state cImp had failed to read. `reducedTabLine`
       // splits the two claims.

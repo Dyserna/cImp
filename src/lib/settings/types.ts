@@ -696,6 +696,22 @@ export interface Settings {
   /// V22 Phase D: set once the user dismisses the "N suggested checks" nudge for
   /// this project. Per-project (overlay); written by `checks_dismiss_suggestion`.
   checks_suggestion_dismissed: boolean;
+  /// #48, finding **F-12**: let the offload worker run this project's configured
+  /// checks (`run_check`) while it is working on a **remote** backend. Mirror of
+  /// Rust `Settings::checks_allow_remote_worker`, and deliberately the same shape
+  /// as `graph.allow_remote_worker_access` — a remote backend (LAN *or* cloud)
+  /// would pick which of the configured build/test/lint commands runs on this
+  /// machine and would receive their output, which quotes source.
+  ///
+  /// **Default `false` = denied**, and `false` is the safe value: the Rust
+  /// container carries `#[serde(default)]`, so a config file or a stale Settings
+  /// snapshot that omits the key deserializes to denied (the F-19 trap's safe
+  /// direction). Rides the per-project `.cimp/config.json` overlay like `checks`
+  /// itself. Enforced at call time by `BackendGate` — not spawn-baked, so a
+  /// change applies from the worker's next call with no tab restart.
+  ///
+  /// Edited in Settings → Checks → "Offload worker access".
+  checks_allow_remote_worker: boolean;
   /// Which AI-tool tabs are enabled. The checkbox group in
   /// Settings → Tabs is the canonical way to flip this; the backend's
   /// `set_enabled_ai_tabs` IPC opens / closes the corresponding AI
@@ -1268,8 +1284,59 @@ export type ToolScope =
   | { mode: 'allexcept'; tools: string[] };
 
 /// V8-02: native + MCP tool names treated as local-data (denied to cloud
-/// backends by default). Mirrors Rust `LOCAL_DATA_TOOLS`.
-export const LOCAL_DATA_TOOLS = ['read_file', 'list_dir', 'code_search', 'run_command', 'filesystem', 'git'];
+/// backends by default). Mirrors Rust `LOCAL_DATA_TOOLS`
+/// (`src-tauri/src/settings/schema.rs`) — kept in the same order so the two are
+/// diffable by eye.
+///
+/// **This is a hand-mirrored constant with no compile-time link to the Rust
+/// one** (#48, finding **F-27**): the Settings window WRITES this list into a
+/// backend's `tool_scope` when its cloud flag is toggled, so a stale copy here
+/// silently narrows the exclusion Rust intended — which is exactly what F-27
+/// was: `run_check` joined the Rust set for finding **F-12** and this array was
+/// left at six entries, so the `LOCAL_DATA_TOOLS` half of F-12's fix had no
+/// production effect (no hole opened — `BackendGate`'s call-time rule still
+/// refuses `run_check` on a remote backend). A Rust-side `include_str!` tripwire
+/// over this file is owed; until it exists, any edit to Rust's
+/// `LOCAL_DATA_TOOLS` has to be repeated here in the same commit.
+///
+/// Consumers must treat it as a SET, never by length — see [`toolScopeMode`].
+export const LOCAL_DATA_TOOLS = [
+  'read_file',
+  'list_dir',
+  'code_search',
+  'run_command',
+  'run_check',
+  'filesystem',
+  'git',
+];
+
+/// The "web/docs only" preset: everything except the local-data set. The one
+/// place that materializes it, so a writer cannot ship a list that
+/// [`toolScopeMode`] would then fail to recognize.
+export function localDataExcludedScope(): ToolScope {
+  return { mode: 'allexcept', tools: [...LOCAL_DATA_TOOLS] };
+}
+
+/// Which tool-scope preset a backend's scope corresponds to: `all` (no
+/// restriction), `web` (the web/docs-only preset — everything except the
+/// local-data set), or `custom` (a hand-picked list).
+///
+/// F-27: this compares **set membership in both directions**, not array length.
+/// The length test it replaces made a *correct* list read as "custom" the moment
+/// Rust's set grew and this mirror lagged — and clicking the "web/docs only"
+/// radio then wrote the shorter list back, silently dropping the new member from
+/// the exclusion. Order and duplicates are irrelevant to what the scope means,
+/// so they are irrelevant here; a list that merely CONTAINS the preset plus
+/// extras is stricter than the preset and stays `custom`.
+export function toolScopeMode(scope: ToolScope): 'all' | 'web' | 'custom' {
+  if (scope.mode === 'all') return 'all';
+  if (scope.mode !== 'allexcept') return 'custom';
+  const excluded = new Set(scope.tools);
+  const preset = new Set(LOCAL_DATA_TOOLS);
+  const coversPreset = LOCAL_DATA_TOOLS.every((t) => excluded.has(t));
+  const noExtras = [...excluded].every((t) => preset.has(t));
+  return coversPreset && noExtras ? 'web' : 'custom';
+}
 
 /// V8-02: kind-specific config for one backend (mirror of Rust
 /// `OffloadBackendKind`). Local = cImp owns the process; Remote = a
@@ -1896,6 +1963,9 @@ export function defaultSettings(): Settings {
     checks: [],
     checks_auto_configure: false,
     checks_suggestion_dismissed: false,
+    // F-12: denied by default — a remote worker does not get to run this
+    // project's commands until the user says so.
+    checks_allow_remote_worker: false,
     enabled_ai_tabs: ['claude'],
     logging: {
       level: 'info',

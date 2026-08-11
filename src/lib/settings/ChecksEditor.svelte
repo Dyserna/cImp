@@ -31,10 +31,17 @@
     checks,
     onchange,
     root = undefined,
+    allowRemoteWorker = false,
   }: {
     checks: CheckDef[];
     onchange: (next: CheckDef[]) => void;
     root?: string;
+    /// #48, finding **F-12**: `Settings.checks_allow_remote_worker`. Only the
+    /// exposure line reads it — "offload worker ✓" was unqualified, and since
+    /// F-12 a REMOTE worker is refused at call time unless this is on. Defaults
+    /// to the safe (denied) value so a caller that forgets it under-claims
+    /// rather than over-claims.
+    allowRemoteWorker?: boolean;
   } = $props();
 
   // Local editable copy — rows are owned here so a half-typed field doesn't
@@ -282,7 +289,8 @@
     {#if exposed}
       <span class="exp-dot" aria-hidden="true"></span>
       <span class="exp-text"
-        >run_check exposed: MCP <strong>✓</strong> / offload worker <strong>✓</strong></span
+        >run_check exposed: MCP <strong>✓</strong> / offload worker
+        <strong>✓</strong>{allowRemoteWorker ? '' : ' (local worker only)'}</span
       >
     {:else}
       <span class="exp-dot" aria-hidden="true"></span>

@@ -84,7 +84,7 @@
     composeTemplatesGlobalSet,
     composeTemplatesProjectGet,
   } from './lib/compose/templates';
-  import { LOCAL_DATA_TOOLS } from './lib/settings/types';
+  import { localDataExcludedScope, toolScopeMode } from './lib/settings/types';
   import type { AiTabId } from './lib/tabs/types';
   import { AI_TABS } from './lib/tabs/types';
   import { version as appVersion } from '../package.json';
@@ -996,7 +996,7 @@
       if (b.kind.type !== 'remote') return;
       b.kind.is_cloud = isCloud;
       if (isCloud) {
-        b.tool_scope = { mode: 'allexcept', tools: [...LOCAL_DATA_TOOLS] };
+        b.tool_scope = localDataExcludedScope();
       } else {
         b.kind.cloud_consent = false;
         b.tool_scope = { mode: 'all' };
@@ -1004,20 +1004,18 @@
     });
   }
   // Tool-scope picker: 'all' | 'web' (web/docs only) | custom (allexcept local-data).
+  //
+  // F-27: both the reader and the writer come from `settings/types` now, so the
+  // radio cannot recognize a different set than the one it writes — and neither
+  // depends on the exclusion list's LENGTH (a length test made a migrated
+  // 7-entry list read as "custom", and clicking "web/docs only" then wrote the
+  // stale 6-entry list back, dropping `run_check` from the exclusion).
   function scopeMode(scope: ToolScope): 'all' | 'web' | 'custom' {
-    if (scope.mode === 'all') return 'all';
-    if (
-      scope.mode === 'allexcept' &&
-      LOCAL_DATA_TOOLS.every((t) => scope.tools.includes(t)) &&
-      scope.tools.length === LOCAL_DATA_TOOLS.length
-    ) {
-      return 'web';
-    }
-    return 'custom';
+    return toolScopeMode(scope);
   }
   function setScopeMode(i: number, mode: 'all' | 'web'): void {
     updateBackend(i, (b) => {
-      b.tool_scope = mode === 'all' ? { mode: 'all' } : { mode: 'allexcept', tools: [...LOCAL_DATA_TOOLS] };
+      b.tool_scope = mode === 'all' ? { mode: 'all' } : localDataExcludedScope();
     });
   }
   // Per-tab "applied" baselines — used to compute the Restart Required
@@ -6186,8 +6184,52 @@
           </small>
           <ChecksEditor
             checks={snapshot.checks}
+            allowRemoteWorker={snapshot.checks_allow_remote_worker}
             onchange={(next) => patch((s) => (s.checks = next))}
           />
+
+          <!-- F-12's opt-in (`checks_allow_remote_worker`). Deliberately the same
+               shape, heading and tone as Code Intelligence → Code graph →
+               "Offload worker access" (`graph.allow_remote_worker_access`): per
+               project, global across backends, denied by default. It sits in THIS
+               section because the setting lives at the settings root beside
+               `checks`, not inside `graph` — and because the commands it governs
+               are the ones listed right above. Until this landed, the setting
+               existed only in Rust and was reachable only by hand-editing
+               `.cimp/config.json`.
+
+               NOTE for whoever fixes F-18: the Rust refusal message
+               (`offload/backend_gate.rs`) points at "Settings → Code Intelligence
+               → Checks", which does not exist — Checks is a top-level section,
+               a SIBLING of Code Intelligence. The real path is
+               "Settings → Checks → Offload worker access". Not corrected here:
+               the string is Rust-side and F-18 is pending a user decision. -->
+          <h3>Offload worker access</h3>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.checks_allow_remote_worker}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.checks_allow_remote_worker = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Allow a <strong>remote</strong> offload worker to run these checks</span>
+          </label>
+          <small class="hint">
+            ⚠ <strong>Runs commands on this machine:</strong> the local offload
+            worker can always run these checks. A <strong>remote</strong> backend —
+            a box on your LAN or a public cloud API — cannot, unless you tick this.
+            Ticking it lets that remote choose which of the checks above runs here,
+            against your working tree, and hands it their output, which quotes your
+            source. Denied by default; leave it off unless you trust the remote.
+            The Claude / OpenCode session's own <code>run_check</code> is
+            unaffected — this governs the offload worker only. Applies from the
+            worker's next call; no tab restart needed.
+          </small>
         </section>
       {:else if activeSection === 'code-audit'}
         <section>

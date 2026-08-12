@@ -248,25 +248,50 @@ export interface WorkingSetEntry {
 /// Why one note is quarantined — the screen that held it, the rules that
 /// matched, and one sentence a human can act on.
 ///
-/// **#48, F-24 — THIS IS NOT PUBLISHED BY THE BACKEND YET.** The Memory view's
-/// review queue showed text + time + Promote/Discard and nothing about the
-/// cause, which inverts locked decision 22: for a secret-screen hold the note
-/// TEXT is the credential, so the card displayed the secret value and withheld
-/// the rule name. The reason does exist — `graph::mcp::record_secret_screen_flag`
-/// composes it from `secrets::write_notice(hits)`, which names rules like
-/// `secret_aws_access_key_id`, and the two latch paths in `offload::loopback`
-/// write `QUARANTINE_WRITE_NOTICE` / `UNATTRIBUTED_WRITE_NOTICE` — but it goes
-/// into an `injection_flag` activity row, i.e. to the model, which cannot act on
-/// it, and not to the human, who must. The note row itself
-/// (`graph::index::notes`' `mem_quarantined_notes` → `graph::memory::MemNote`)
-/// carries no screen, no rule and no reason.
+/// Mirror of Rust `graph::memory::NoteQuarantine`, which is what publishes it.
 ///
-/// So this type is the SHAPE the backend owes, and the card below renders it.
-/// Until `MemNote` carries it, `quarantine` is absent on every note and the card
-/// says so in as many words. Deliberately NOT reconstructed on this side: the
+/// **#48, F-24.** The Memory view's review queue used to show text + time +
+/// Promote/Discard and nothing about the cause, which inverts locked decision 22:
+/// for a secret-screen hold the note TEXT is the credential, so the card
+/// displayed the secret value and withheld the rule name. The reason existed even
+/// then, but it went into the tool result and an `injection_flag` activity row —
+/// i.e. to the model, which cannot act on it, and not to the human, who must. It
+/// now travels on the note row itself, so it cannot age out of a capped activity
+/// lane (whose highest-volume lane is this very screen) and the user cannot clear
+/// it without deleting the note.
+///
+/// # Composed at the STORE boundary, never by a caller
+///
+/// `NoteQuarantine::for_write(taint, rules)` builds it and
+/// `GraphIndex::mem_add_note` calls it on the facts it was handed. No write path
+/// composes its own, and that placement is the whole point: a caller-side version
+/// re-opens exactly the gap F-15 closes — a second write path that stores a note
+/// unscreened, or held with no reason, or held with the wrong one. It is also why
+/// `MemNote.tainted` and this record cannot disagree: the store derives both from
+/// this one value.
+///
+/// # What therefore arrives here
+///
+/// - **Both causes when both fired.** A note held by the session taint latch
+///   *and* the credential screen carries BOTH sentences in `reason` — the latch's
+///   first (the writing conversation's state, then the note's own content) — and
+///   the screen's hits in `rules` regardless of the latch verdict. Collapsing the
+///   two into a single `bool` was the original defect; nothing on this side may
+///   re-collapse them, so render `reason` whole rather than parsing it.
+/// - **`screen` is singular and not lossy.** All three causes are the one
+///   `memory_quarantine` screen — the accurate name for every one of them (a
+///   memory write was held) — so no choice is being hidden by the single field.
+/// - **A pre-migration row arrives as `null`,** and must render as the
+///   placeholder. `GraphIndex::migrate_mem_note_quarantine` migrates rows written
+///   before the column existed to no-reason rather than synthesizing a cause it
+///   does not know.
+///
+/// Still deliberately NOT reconstructed on this side when it is absent: the
 /// activity rows carry no `note_id`, so a join would be a guess, and the note
 /// text cannot be re-screened here — a plausible-but-wrong cause in a security
 /// UI is worse than a blank field (#48, F-23 is that exact mistake elsewhere).
+/// [`quarantineReason`] below is the one predicate for "is there a reason to
+/// show", and it collapses missing / `null` / blank toward that blank.
 export interface NoteQuarantine {
   /// The screen that held the write — the `outbound::Screen` slug, e.g.
   /// `memory_quarantine`.
@@ -294,9 +319,16 @@ export interface MemNote {
   /// until promoted here. Always `false` for entries in `MemorySnapshot.notes`
   /// and `true` for entries in `MemorySnapshot.quarantined`.
   tainted: boolean;
-  /// #48, F-24: why this note is held. Optional because this build's backend
-  /// does not publish it — see [`NoteQuarantine`] for what is owed and where the
-  /// data already exists. Absent on every clean note by definition.
+  /// #48, F-24: why this note is held, for the human who must decide about it —
+  /// see [`NoteQuarantine`]. Published with the note; the backend emits the key
+  /// on every note and sends `null` rather than omitting it, so the `?` here is
+  /// for the older backends that omit it entirely.
+  ///
+  /// Absent or `null` means *we cannot tell you why*, and it is never a claim
+  /// that there was no reason. Three things produce it, all honest: a clean note
+  /// (no hold to explain, which is every note in `MemorySnapshot.notes`), a row
+  /// written before the column existed, and a stored record that could not be
+  /// read back. Read it through [`quarantineReason`], never directly.
   quarantine?: NoteQuarantine | null;
 }
 

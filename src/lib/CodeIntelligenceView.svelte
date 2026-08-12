@@ -2291,9 +2291,13 @@
                 is now the first thing on the row, in full weight, above a note
                 body that is no longer the only thing you can read.
 
-                The reason is NOT reconstructed here when the backend does not
-                send it. See `quarantineReason` in graph.ts for what is owed and
-                why guessing would be worse than a blank.
+                The backend has published the cause since #48's F-24 fix, and
+                composes it at the store boundary so a held note cannot exist
+                without one. The `{:else}` leg below is therefore about the NOTE,
+                not about the build: rows written before the column existed carry
+                no cause. It is still never reconstructed here — see
+                `quarantineReason` in graph.ts for why guessing would be worse
+                than a blank.
               -->
               <div class="qwhy" class:missing={!why}>
                 <span class="qmark" title="Quarantined pending review">⚠</span>
@@ -2307,8 +2311,9 @@
                   <span class="qscreen" title="The screen that held this write">{why.screen}</span>
                 {:else}
                   <span class="qreason"
-                    >Reason not recorded — this build does not store which screen
-                    or rule held this note.</span
+                    >Reason not recorded for this note — it was held before cImp
+                    stored the cause, so which screen or rule matched cannot be
+                    recovered.</span
                   >
                 {/if}
               </div>

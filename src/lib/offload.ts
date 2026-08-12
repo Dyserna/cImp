@@ -350,6 +350,25 @@ export interface UpdaterStatus {
   interval_hours: number;
   rules_dir: string;
   state_dir: string;
+  /// #48 (M-21): whether the updater may do anything at all — Rust's
+  /// `updater::updates_enabled`, resolved at the APP scope with the master
+  /// switch folded in.
+  ///
+  /// **This is the predicate the two IPC commands enforce**, published so a
+  /// surface that greys a control reads it rather than assembling a second
+  /// opinion out of the resolved-scope matrix. Two predicates for one question
+  /// is how a greyed button and a served command come to disagree.
+  updates_enabled: boolean;
+  /// #48 (M-21): injection detection is armed for the OFFLOAD WORKER while this
+  /// updater is inert — the one state in which "injection detection is off" is a
+  /// false statement about this install. The worker keeps screening with the rule
+  /// bundle already on disk, so the bundle still matters even though nothing will
+  /// refresh it.
+  ///
+  /// Only ever true when `updates_enabled` is false, so the pair reads as one
+  /// three-valued answer: on / off / off here but on in the worker. Never a
+  /// verdict — no surface may use it to admit an update.
+  worker_only_detection: boolean;
 }
 
 /// Read the detection status, **propagating the failure**. `reload = true`

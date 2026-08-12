@@ -604,6 +604,7 @@ describe('isTainted', () => {
       can_unlatch: false,
       can_clear: false,
       awaiting_session_clear: false,
+      local_by_user_flip: false,
     };
     expect(isTainted(undefined)).toBe(false);
     expect(isTainted(row)).toBe(false);

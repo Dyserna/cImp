@@ -51,6 +51,21 @@ export interface LatchRow {
   /// The UI needs it to explain why a contaminated tab is showing no "clear now"
   /// button after a restore — and to tell the user what will lift it.
   awaiting_session_clear: boolean;
+  /// #48 (F-23): whether `latch` reads `local` because the USER flipped it there
+  /// with the decision-15 workflow move, rather than because a local-capability
+  /// tool ran. `false` for every latch that is not `local`, by construction.
+  ///
+  /// Carried here because this interface is declared a mirror of Rust
+  /// `LatchStatus` + `LatchView`, and a mirror that quietly drops a field is the
+  /// defect M-21 was: a type that says it describes the wire, and does not.
+  ///
+  /// **Nothing in this app renders it yet.** Its live consumer is the OpenCode
+  /// plugin's web-direction refusal, which reads the same fact off
+  /// `/latch/state` to pick the refusal whose cause it actually checked. A
+  /// surface that wants to say *why* a tab is `local` should read this rather
+  /// than assume a tool call — `can_flip_local` is about what is OFFERED, not
+  /// about what happened.
+  local_by_user_flip: boolean;
 }
 
 /// The user-initiated containment moves. Mirror of Rust `LatchOverride`, which

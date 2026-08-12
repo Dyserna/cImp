@@ -81,6 +81,7 @@ function latch(over: Partial<LatchRow> = {}): LatchRow {
     can_unlatch: true,
     can_clear: true,
     awaiting_session_clear: false,
+    local_by_user_flip: false,
     ...over,
   };
 }

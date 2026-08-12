@@ -439,22 +439,75 @@
   // survive.
   let injection = $state<InjectionStatus | null>(null);
 
-  /// Whether the detection updater may run at all — the same question the
-  /// backend's `updater::updates_enabled` answers, read from the backend's own
-  /// resolved view rather than recomputed from `snapshot`: `app` scope +
-  /// `detection` IS `effective(Feature::Detection, Scope::App)`, master switch
-  /// folded in. (That row's `in_scope` is false — detection's override cells
-  /// live on tabs and the worker — which says there is no app-level OVERRIDE to
-  /// set, not that the feature is unresolvable here.)
+  /// Whether the detection updater may run at all — **the backend's own
+  /// `updates_enabled`, read verbatim** (#48, M-21).
   ///
-  /// Defaults to `true` while the first poll is in flight: this only disables
-  /// buttons, and the enforcement is in the IPC command. Greying out three
+  /// It used to be re-derived here from the resolved-scope matrix (`app` scope +
+  /// `detection`), which is the same conjunction and was correct — but it was a
+  /// SECOND reading of the question the two IPC commands enforce with the first,
+  /// assembled from a different poll's payload. Two predicates for one gate can
+  /// drift; one cannot. `updates_allowed` in `ipc/commands.rs` and this line now
+  /// resolve through the same `updater::updates_enabled`, so a greyed button and
+  /// a served command cannot disagree about the state, only about the moment.
+  ///
+  /// Defaults to `true` while the first poll is in flight — and if a build ever
+  /// omits the field: this only disables buttons, and the enforcement is in the
+  /// IPC command, which refuses with the sentence below. Greying out three
   /// controls for a second at startup would be the more visible bug.
-  const detectionUpdatesEnabled = $derived(
-    injection?.scopes
-      .find((s) => s.scope === 'app')
-      ?.features.find((f) => f.feature === 'detection')?.effective ?? true,
-  );
+  const detectionUpdatesEnabled = $derived(detection?.updater.updates_enabled ?? true);
+
+  /// WHY the updater is inert, or `undefined` when it is not (#48, M-21).
+  ///
+  /// One string, rendered on the button row, on all three buttons and in the
+  /// prose above them, because those four used to carry four hand-written copies
+  /// of a single claim — *"injection detection is off"* — and that claim is FALSE
+  /// in one of the three states that produce it. A worker-only override leaves
+  /// this updater off while the offload worker is still screening every fetched
+  /// page with the bundle on disk; telling that user their detection is switched
+  /// off is a false statement about a running security layer, and it is the one
+  /// they would act on.
+  ///
+  /// **Reporting only.** Nothing here decides anything: `detectionUpdatesEnabled`
+  /// alone gates the controls, and the IPC commands refuse independently. The
+  /// sentences deliberately mirror `ipc::commands::updates_allowed`'s two
+  /// refusals — the same state must not get two different explanations depending
+  /// on whether the user read a tooltip or clicked and got an error.
+  ///
+  /// The three states, in the order they are checked:
+  /// 1. `worker_only_detection` — off here, ON in the worker. Backend-published,
+  ///    never inferred: absent (an older backend) reads `false`, which serves the
+  ///    generic sentence rather than claiming a layer is running.
+  /// 2. the L1 master is off, which resolves detection off with it. Claimed only
+  ///    when `injection` has actually been read — an unread hierarchy falls
+  ///    through to (3), whose parenthetical covers the master either way.
+  /// 3. detection is off app-wide and nowhere else is running it. The backend's
+  ///    own wording for exactly this branch.
+  const detectionUpdatesOffReason = $derived.by((): string | undefined => {
+    if (detectionUpdatesEnabled) return undefined;
+    if (detection?.updater.worker_only_detection === true) {
+      return (
+        'Injection detection is switched off app-wide and for every AI tab, so nothing is ' +
+        'polled or swapped — not on the daily schedule and not from these buttons. It is ' +
+        'still switched ON for the offload worker, which keeps screening with the rule ' +
+        'bundle already on disk: the updater follows the app-wide answer, and one worker ' +
+        'override does not start it. To keep that bundle current, turn injection detection ' +
+        'back on app-wide above.'
+      );
+    }
+    if (injection?.protection === false) {
+      return (
+        'Injection protection is switched off at the master switch above, which resolves ' +
+        'injection detection off with it — so nothing is polled or swapped, not on the ' +
+        'daily schedule and not from these buttons. Turn the master switch, and injection ' +
+        'detection under it, back on.'
+      );
+    }
+    return (
+      'Injection detection is switched off, so nothing is polled or swapped — not on the ' +
+      'daily schedule and not from these buttons. Turn it (and the injection-protection ' +
+      'master above it) back on.'
+    );
+  });
 
   /// The per-feature copy this window still owns: the hint text, and the L2
   /// settings key when it cannot be derived.
@@ -5188,11 +5241,27 @@
             simply cannot be reached — offline, a proxy, a release that is not
             published yet — that is reported here and nowhere else, until it has
             been unreachable long enough to mean this component has stopped
-            getting fresher. Every check follows the <em>Injection detection</em>
-            switch above (and the master switch above that): with detection off,
-            nothing is polled or swapped — not on the daily schedule and not from
-            the buttons below.
+            getting fresher. Every check follows the <em>app-wide</em> answer of
+            the <em>Injection detection</em> switch above (and the master switch
+            above that): with detection off app-wide, nothing is polled or
+            swapped — not on the daily schedule and not from the buttons below.
+            Switching it on for one AI tab counts as app-wide here, because there
+            is one rule bundle on disk for the whole app; switching it on for the
+            offload worker alone does not start the updater, and the worker goes
+            on screening with the bundle it already has.
           </small>
+          <!--
+            #48 (M-21): and WHICH of those states is in force, in the words
+            `ipc::commands::updates_allowed` refuses with. The paragraph above
+            states the rule; this states the fact, and it is rendered rather than
+            left to the tooltips because a disabled button does not reliably
+            raise one (the same reason the button row carries a title of its
+            own). Absent — including when the status could not be read at all —
+            nothing is claimed.
+          -->
+          {#if detectionUpdatesOffReason}
+            <small class="hint">{detectionUpdatesOffReason}</small>
+          {/if}
           {#if detection}
             {#each detection.updater.components as comp (comp.component)}
               <div class="updater-row">
@@ -5232,21 +5301,19 @@
                   disabled attribute is a courtesy, not a control — and the
                   tooltip sits on the ROW as well as on each button, because a
                   disabled button does not reliably raise one.
+
+                  #48 (M-21): all four tooltips render the SAME
+                  `detectionUpdatesOffReason`. They used to carry four separate
+                  literals of one claim, and that claim named a cause nobody had
+                  checked. What gates the buttons is unchanged — the reason
+                  string decides nothing and is never read by `disabled`.
                 -->
-                <div
-                  class="row"
-                  title={detectionUpdatesEnabled
-                    ? undefined
-                    : 'Injection detection is off — turn it, and the injection-protection ' +
-                      'master switch above it, back on to check or swap bundles.'}
-                >
+                <div class="row" title={detectionUpdatesOffReason}>
                   <button
                     type="button"
                     onclick={() => void checkDetectionUpdate(comp.component, false)}
                     disabled={detectionBusy !== null || !detectionUpdatesEnabled}
-                    title={detectionUpdatesEnabled
-                      ? undefined
-                      : 'Injection detection is off — nothing is polled or swapped.'}
+                    title={detectionUpdatesOffReason}
                   >
                     {detectionBusy === comp.component ? 'Checking…' : 'Check now'}
                   </button>
@@ -5256,9 +5323,7 @@
                     disabled={detectionBusy !== null ||
                       !detectionUpdatesEnabled ||
                       !comp.available_version}
-                    title={detectionUpdatesEnabled
-                      ? undefined
-                      : 'Injection detection is off — nothing is polled or swapped.'}
+                    title={detectionUpdatesOffReason}
                   >
                     Apply update
                   </button>
@@ -5268,9 +5333,7 @@
                     disabled={detectionBusy !== null ||
                       !detectionUpdatesEnabled ||
                       !comp.can_revert}
-                    title={detectionUpdatesEnabled
-                      ? undefined
-                      : 'Injection detection is off — nothing is polled or swapped.'}
+                    title={detectionUpdatesOffReason}
                   >
                     Revert to {comp.previous_version || 'previous'}
                   </button>

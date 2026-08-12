@@ -44,6 +44,7 @@
     type PathResult,
     type PathNodeRow,
     type ArchResult,
+    type SessionInfo,
     type SessionUsageRow,
     type SessionUsageDetail,
     type ModelUsage,
@@ -360,8 +361,11 @@
   /// no longer looking at.
   let reviewConfirm = $state<{ note: string; action: 'promote' | 'discard' } | null>(null);
 
-  /// Arm (or re-arm) the confirmation for one note + action.
+  /// Arm (or re-arm) the confirmation for one note + action. Mutually
+  /// exclusive with the bulk confirmation below — two armed confirmations at
+  /// once would make a stray Enter ambiguous.
   function armReview(noteId: string, action: 'promote' | 'discard'): void {
+    bulkConfirm = null;
     reviewConfirm = { note: noteId, action };
   }
 
@@ -375,6 +379,55 @@
       console.error('graph_note_review failed', e);
     } finally {
       reviewBusy = null;
+    }
+  }
+
+  /// One expanded quarantined note at a time — the full text plus the context
+  /// (session, exact timestamps, pin fate, hold identifiers) the one-line row
+  /// cannot carry, so the promote/discard decision isn't made off a truncated
+  /// first line.
+  let expandedQ = $state<string | null>(null);
+
+  function toggleQuarantined(noteId: string): void {
+    expandedQ = expandedQ === noteId ? null : noteId;
+  }
+
+  /// The writing session's summary row, when memory still has it. An EXACT
+  /// join on session_id — unlike the hold cause, which is never reconstructed
+  /// (see `quarantineReason`); a session that has aged out simply yields no
+  /// extra line, never a guess.
+  function sessionFor(sessionId: string): SessionInfo | undefined {
+    return sessionId ? memory?.sessions.find((s) => s.session_id === sessionId) : undefined;
+  }
+
+  // Bulk review: the same two actions over the whole queue, with the same
+  // confirmation polarity — Promote all releases containment on every held
+  // note at once, so it wears the danger treatment and the heavier sentence;
+  // Discard all only deletes. Sequential on purpose (`graph_note_review` is
+  // per-note); a note that fails is logged and skipped rather than aborting
+  // the sweep, and the trailing refresh repaints whatever actually happened.
+  let bulkConfirm = $state<'promote' | 'discard' | null>(null);
+  let bulkBusy = $state(false);
+
+  function armBulk(action: 'promote' | 'discard'): void {
+    reviewConfirm = null;
+    bulkConfirm = action;
+  }
+
+  async function reviewAll(action: 'promote' | 'discard'): Promise<void> {
+    bulkConfirm = null;
+    bulkBusy = true;
+    try {
+      for (const n of quarantined) {
+        try {
+          await graphNoteReview(n.note_id, action);
+        } catch (e) {
+          console.error('graph_note_review failed', n.note_id, e);
+        }
+      }
+      await refreshMemory();
+    } finally {
+      bulkBusy = false;
     }
   }
 
@@ -2259,7 +2312,57 @@
       <section class="card quarantine">
         <div class="history-head">
           ⚠ Quarantined notes <span class="muted">({quarantined.length})</span>
+          {#if quarantined.length > 1}
+            <!-- Bulk decisions, M-23's polarity kept: the sweep that releases
+                 containment wears the danger colour and the `…`; the sweep
+                 that only deletes stays plain. Both confirm below. -->
+            <button
+              class="mini danger"
+              disabled={bulkBusy || reviewBusy !== null}
+              title="Accept every held note into project memory — asks for confirmation"
+              onclick={() => armBulk('promote')}>Promote all…</button
+            >
+            <button
+              class="mini"
+              disabled={bulkBusy || reviewBusy !== null}
+              title="Delete every held note permanently — asks for confirmation"
+              onclick={() => armBulk('discard')}>Discard all…</button
+            >
+          {/if}
         </div>
+        {#if bulkConfirm}
+          <div class="qconfirm" class:warn={bulkConfirm === 'promote'}>
+            {#if bulkConfirm === 'promote'}
+              <p>
+                Promoting all {quarantined.length} notes accepts every one of
+                them into project memory unread — including any whose text an
+                attacker may have planted, and any whose text is a captured
+                credential. Each one is then returned by recall and rides the
+                launch-time guidance into every future session. If you have not
+                read them all, review them one by one instead. Continue?
+              </p>
+              <div class="qconfirm-row">
+                <button class="mini danger" disabled={bulkBusy} onclick={() => reviewAll('promote')}
+                  >Yes, promote all {quarantined.length} into memory</button
+                >
+                <button class="mini" onclick={() => (bulkConfirm = null)}>Cancel</button>
+              </div>
+            {:else}
+              <p>
+                Discarding all {quarantined.length} notes deletes them
+                permanently and cannot be undone. Nothing else changes: they are
+                already held out of every read path, so this releases nothing.
+                Continue?
+              </p>
+              <div class="qconfirm-row">
+                <button class="mini" disabled={bulkBusy} onclick={() => reviewAll('discard')}
+                  >Yes, discard all {quarantined.length} permanently</button
+                >
+                <button class="mini" onclick={() => (bulkConfirm = null)}>Cancel</button>
+              </div>
+            {/if}
+          </div>
+        {/if}
         <!-- #48, F-24: the old copy named only ONE of the three causes that put
              a note here (the session taint latch), which is why a
              credential-screen hold read as an injected-instruction hold. Each
@@ -2270,9 +2373,11 @@
           decide. A note lands here because its session had already used an
           external tool, because the write could not be attributed to a tab, or
           because the write-time credential screen matched it — each row says
-          which. <strong>Promote</strong> accepts a note into project memory
-          (keeping its pinned state) and into every future session, so it is the
-          one that asks you to be sure; <strong>Discard</strong> deletes it and
+          which. Click a note's text to read it in full with its context
+          (session, exact time, what promoting would pin).
+          <strong>Promote</strong> accepts a note into project memory (keeping
+          its pinned state) and into every future session, so it is the one
+          that asks you to be sure; <strong>Discard</strong> deletes it and
           releases nothing.
         </p>
         <div class="rows">
@@ -2318,8 +2423,23 @@
                 {/if}
               </div>
               <div class="arow note tainted">
-                <span class="ntext" title={`session: ${n.session_id || '(none)'}${n.pinned ? ' · would be pinned' : ''}`}
-                  >{n.text}</span
+                <!-- The text is the click target for expansion: the row's one
+                     line truncates, and the confirm sentence says "read it
+                     above first" — this is where reading it in full happens. -->
+                <span
+                  class="ntext expandable"
+                  role="button"
+                  tabindex="0"
+                  title={expandedQ === n.note_id
+                    ? 'Collapse'
+                    : 'Show the full text and its context'}
+                  onclick={() => toggleQuarantined(n.note_id)}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      toggleQuarantined(n.note_id);
+                    }
+                  }}>{expandedQ === n.note_id ? '▾' : '▸'} {n.text}</span
                 >
                 <span class="aloc">{fmtTime(n.ts_ms)}</span>
                 <!-- M-23: Promote wears the `…` and the danger colour, because it
@@ -2328,17 +2448,57 @@
                      stays plain — it releases nothing. -->
                 <button
                   class="mini danger"
-                  disabled={reviewBusy === n.note_id}
+                  disabled={reviewBusy === n.note_id || bulkBusy}
                   title="Accept into project memory — asks for confirmation"
                   onclick={() => armReview(n.note_id, 'promote')}>Promote…</button
                 >
                 <button
                   class="mini"
-                  disabled={reviewBusy === n.note_id}
+                  disabled={reviewBusy === n.note_id || bulkBusy}
                   title="Delete permanently — asks for confirmation"
                   onclick={() => armReview(n.note_id, 'discard')}>Discard…</button
                 >
               </div>
+              {#if expandedQ === n.note_id}
+                {@const sess = sessionFor(n.session_id)}
+                <div class="qdetail">
+                  <!-- The full text, un-truncated — the thing the one-line row
+                       cannot show and the promote confirmation depends on. -->
+                  <pre class="qtext">{n.text}</pre>
+                  <div class="qmeta">
+                    <span class="qlabel">Written</span>
+                    <span>{fmtDate(n.ts_ms)} · {fmtTime(n.ts_ms)}</span>
+                    <span class="qlabel">Session</span>
+                    <span class="qmono"
+                      >{n.session_id || '(none — the write could not be attributed)'}</span
+                    >
+                    {#if sess}
+                      <span class="qlabel">That session</span>
+                      <span
+                        >{sess.agent} · active {fmtDate(sess.started_ms)}
+                        {fmtTime(sess.started_ms)} – {fmtTime(sess.last_ms)} · {sess.events}
+                        events</span
+                      >
+                    {/if}
+                    <span class="qlabel">If promoted</span>
+                    <span>
+                      {n.pinned
+                        ? 'saved as PINNED — kept across sessions and carried into the launch-time guidance'
+                        : 'saved unpinned — ordinary project memory, returned by recall'}
+                    </span>
+                    {#if why}
+                      <span class="qlabel">Held by</span>
+                      <span class="qmono"
+                        >{why.screen}{why.rules.length > 0
+                          ? ` · ${why.rules.join(', ')}`
+                          : ''}</span
+                      >
+                    {/if}
+                    <span class="qlabel">Note id</span>
+                    <span class="qmono">{n.note_id}</span>
+                  </div>
+                </div>
+              {/if}
               {#if reviewConfirm?.note === n.note_id}
                 <div class="qconfirm" class:warn={reviewConfirm.action === 'promote'}>
                   {#if reviewConfirm.action === 'promote'}
@@ -3126,6 +3286,55 @@
     font-family: monospace;
     font-size: 11px;
     color: var(--text-tertiary, #9aa0aa);
+  }
+  /* The note text doubles as the expand toggle — the row's line truncates,
+     and the decision must not be made off a truncated first line. */
+  .ntext.expandable {
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ntext.expandable:hover,
+  .ntext.expandable:focus-visible {
+    color: var(--text-primary, #ddd);
+    text-decoration: underline dotted;
+    outline: none;
+  }
+  /* The expanded panel: full text first (it is what is being decided about),
+     then the context lines. */
+  .qdetail {
+    margin: 2px 4px 6px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-faint, #2a2a2a);
+    border-radius: var(--radius-md, 3px);
+    background: var(--surface-sunken, rgba(0, 0, 0, 0.25));
+  }
+  .qtext {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-family: inherit;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 30vh;
+    overflow-y: auto;
+  }
+  .qmeta {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 10px;
+    font-size: 11px;
+    color: var(--text-secondary, #b8bec9);
+  }
+  .qmeta .qlabel {
+    color: var(--text-tertiary, #9aa0aa);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.03em;
+    align-self: baseline;
+  }
+  .qmeta .qmono {
+    font-family: monospace;
+    word-break: break-all;
   }
   /* M-23's confirmation. Amber for Promote (it releases containment), neutral
      for Discard (it releases nothing) — the same polarity TaintMenu uses. */

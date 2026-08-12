@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). The 2026-08-11 fix phase added **25–33**, and a **pre-RC decision pass on 2026-08-12 settled every remaining open finding as locked decisions 34–40** — recorded with their accepted counter-arguments in the ledger's *User decisions taken 2026-08-12* table. **Locked decisions now run 1–40.** Note decision 34 **amends decision 2** (there are now three per-direction refusal constants, not two) and decision 35 **reaffirms decision 17** unchanged. 
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). The 2026-08-11 fix phase added **25–33**, and a **pre-RC decision pass on 2026-08-12 settled every remaining open finding as locked decisions 34–40**, then **41–42** for the two findings that pass itself raised — all recorded with their accepted counter-arguments in the ledger's *User decisions taken 2026-08-12* table. **Locked decisions now run 1–42.** Note decision 34 **amends decision 2** (there are now three per-direction refusal constants, not two) and decision 35 **reaffirms decision 17** unchanged. 
 A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–29** below.
 
 Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-2 growth-forgery, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
@@ -2725,6 +2725,116 @@ declares its class AND its mutation capability in one reviewed place.
 
     **`clippy.yml` deliberately keeps its allowlist** — its entries genuinely are
     compile inputs, so that list *is* verifiable in the way this one was not.
+
+41. **`updates_enabled` gets a NAME for the question it asks; its behaviour and
+    `injection_status`'s `app` row both stay exactly as they are (user decision
+    2026-08-12 — review finding F-38).** After decision 36's split both sites spell
+    `Scope::UnknownCaller`. That is behaviourally correct and the doc is now honest,
+    but the *name* is wrong at each: neither asks *"what applies to a caller with no
+    identity?"*
+
+    ⚠ **This entry originally said the updater asks *"does anything in this process
+    use the shared detection bundle?"* — WRONG, corrected 2026-08-12 while
+    implementing.** In M-21's worker-only state the worker **is** screening with the
+    shared bundle while this predicate is `false`, so a name asserting "in use" would
+    be false **in exactly the state that produced M-21 and F-35** — the defect this
+    decision exists to prevent. The predicate is named for what it computes:
+    **`armed_outside_the_worker`**, matching the crate's existing vocabulary, where
+    `armed_anywhere` already means *"resolves effective at that scope"* rather than
+    *"someone is scanning"*. `armed_anywhere` is re-expressed as
+    `armed_outside_the_worker || effective(_, OffloadWorker)` so the pair reads as a
+    decomposition.
+
+    **The fix is a thin named predicate delegating to today's resolution, so the call
+    site states its own question. Zero behaviour change; the 2013-test suite is the
+    guard.** This is the same medicine this decision list just applied crate-wide,
+    applied at the two sites the split could not reach without changing behaviour.
+
+    **Why naming rather than moving.** `Scope::App` produced **two** defects (M-21,
+    F-35) for exactly one reason: a name stood in for a question it did not ask.
+    Leaving `UnknownCaller` at a site that is not about unknown callers recreates
+    that condition at smaller scale, so this is preventive, not cosmetic.
+
+    *Rejected:* **`updates_enabled → AppWide`** — arguably more correct (one hardened
+    tab would stop keeping the bundle current), but a real behaviour change, and
+    today's answer is defensible because that tab genuinely uses the bundle.
+    *Rejected:* **`injection_status`'s `app` row → `AppWide`** — it changes `GET
+    /status`'s JSON **and removes the only observation point live-verify's N-1 box
+    has**, which reads the elevation off that exact row (`decided_by:"scope"` beside
+    `override_value:"inherit"`). *Rejected outright:* routing either through
+    `armed_anywhere` — M-21 already rejected it, and it would collapse
+    `worker_only_detection` to a permanent `false` and orphan the Svelte branch
+    gated on it.
+
+42. **Caller-controlled input reaching the activity store is BOUNDED, and F-37 and
+    F-39 are fixed as one class BEFORE the RC (user decision 2026-08-12).** The
+    activity store is a **capped per-lane ring**, so anything unbounded a caller
+    controls is an **eviction primitive**: fill the lane and genuine security rows
+    fall out. Two routes into the same consequence:
+
+    - **F-37** — `CONTRACT_DRIFT_SEEN` is an unbounded caller-keyed `HashSet`, so any
+      token-holder can evict the whole 400-row graph lane.
+    - **F-39** — `/graph_run`'s `LatchScoping::Unknown(tab)` becomes
+      `Attribution::Unrecognized(<body string>)` with **no length bound**.
+
+    **Both reuse primitives F-32 already left in the tree rather than reinventing
+    them:** `outbound::Doubling` for the report-rate half, and `bounded_id` for the
+    string half — **including `bounded_id`'s ORDERING, which is load-bearing:
+    truncation is applied AFTER classification, so a truncated invented id can never
+    fold onto a configured one.** Getting that order wrong would close a bloat hole
+    by opening an impersonation one.
+
+    **F-37's bar is the one F-32's route already meets and the contract-drift path
+    has no equivalent of:** key the ledger on something the **caller does not
+    control**, so the key space is bounded by the configured tabs rather than by
+    invented ids. *"The map stays small"* is not a sufficient assertion.
+
+    *Taken before the RC rather than after* — against the recommendation that a tree
+    about to face a 55-box retest should not grow two more changes. **Accepted
+    consequence: the retest now covers them**, which is the upside of the same fact.
+    Neither is reachable without a valid token, so neither ever blocked the release.
+
+    **As built, 2026-08-12 — and F-37's fix carries ONE deliberate behaviour change
+    that this decision did not anticipate.** `CONTRACT_DRIFT_SEEN` became
+    `HashMap<&'static str, Doubling>`, and its key space is now **structural rather
+    than checked**: the key *type* is `&'static str` and its only producer returns an
+    element of a 5-entry const list or a sentinel, so **a caller-supplied string
+    cannot become a key at all** (bound: 6). That is stricter than the discovery
+    route's `2 × (tabs + 1)`, and it has to be — this body carries no tab, so there
+    is nothing app-side to key on.
+
+    ⚠ **The consequence: `session_id` is DROPPED from the key, so the documented
+    "one row per shim per session" becomes "rows at reports 1, 2, 4, 8 … per shim per
+    app run."** It is unavoidable rather than a shortcut — the session id is the
+    second unbounded, caller-controlled half of the old key, with nothing to classify
+    it against, and *a missing `session_id` is frequently the very drift being
+    reported*. The change yields **more** rows for a genuinely broken shim and never
+    fewer, and the only consumer (`drift.payload.v1`) reads since process start and
+    de-duplicates by shim. **If per-session granularity is ever wanted back, the
+    honest route is classifying the session against the V28 live registry, which
+    needs `app` wired into the handler.**
+
+    Also fixed on the same route, and it mattered more than it looked: `target` is
+    **not** truncated by `ActivityStore::record` (unlike `request`/`response`), and
+    `ipc::commands::advisor_signals` copies `target` **verbatim into a user-facing
+    signal** — so the field list is now bounded too (≤12 names, ≤64 chars each,
+    overflow stated as `… (+N more)` rather than silently dropped).
+
+    **F-39 landed at `LatchScoping::attribution()`'s `Unknown` arm**, which covers
+    **both** producers (`/graph_run` and `/mcp/call`) in one edit, rather than at the
+    `latch_scope` constructor — that takes an `AppHandle` this crate cannot mock, so
+    a bound there would be unpinnable by a unit test.
+
+    **Sweep result: every production `Attribution::Unrecognized` producer now goes
+    through `bounded_id` (two sites, both verified).** Three unbounded-ish siblings
+    were found and deliberately NOT fixed, recorded so they are not rediscovered as
+    novel: `graph::mcp::arg_summary` → an untruncated `target` (but its "caller" is
+    the in-tab model whose calls are that lane's legitimate contents, and it is shared
+    by every graph producer — not a one-line fix); `oob::claude::report_subagent_drift`
+    (structurally the twin, but app-composed and keyed on a transcript path, so bounded
+    by the filesystem — **the file to check if that channel ever takes wire input**);
+    and `offload::mcp::ProxyMiss::report` (keyed `http-status:{code}`, bounded by u16,
+    child-process stderr only).
 
 ## Phases
 

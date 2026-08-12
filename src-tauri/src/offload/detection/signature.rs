@@ -215,8 +215,9 @@ fn rename_candidates(ident: &str) -> impl Iterator<Item = String> + '_ {
         .chain((2..=MAX_RENAME_ATTEMPTS).map(move |n| format!("{CUSTOM_PREFIX}{n}_{ident}")))
 }
 
-/// What the Settings → Tools → Detection block reads: how much of the layer is
-/// actually live. `files_failed` non-zero is the signal that matters — it means
+/// What the Settings → Injection protection → Injection detection block reads:
+/// how much of the layer is actually live. `files_failed` non-zero is the signal
+/// that matters — it means
 /// rules the user believes are active are not.
 ///
 /// The two booleans are **derived**, and they are fields rather than a rule

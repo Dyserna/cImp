@@ -1174,7 +1174,8 @@ pub async fn offload_reload_mcp(
 /// V32 Phase C/C3: how much of the injection-detection surface is actually live
 /// — signature rule files loaded/failed, whether the classifier's weights are
 /// installed, and (C3) the updater's installed/available versions, last check
-/// and per-component modes. Drives the Settings → Tools → Detection readout.
+/// and per-component modes. Drives the
+/// Settings → Injection protection → Injection detection readout.
 ///
 /// `reload = true` recompiles the rules from disk first, which is what the
 /// "Reload rules" button calls after the user edits a file in
@@ -1275,7 +1276,7 @@ fn updates_allowed(settings: &crate::settings::Settings) -> AppResult<()> {
     Err(AppError::Settings(
         "injection detection is switched off, so the detection updater will not check, apply or \
          revert anything. Turn it (and the injection-protection master above it) back on in \
-         Settings → Tools → Injection protection."
+         Settings → Injection protection."
             .to_string(),
     ))
 }

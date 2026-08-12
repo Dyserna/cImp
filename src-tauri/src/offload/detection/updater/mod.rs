@@ -82,8 +82,9 @@
 //! left the component no fresher, for ANY reason — the "this has stopped
 //! getting fresher" signal, and the only one whose dismissal ages, so a
 //! component cannot be frozen silently by dismissing the other two).
-//! Versions, last-check time and outcome live in Settings → Tools → Detection,
-//! next to Check now, Apply, Revert and Open rules folder.
+//! Versions, last-check time and outcome live in
+//! Settings → Injection protection → Injection detection, next to Check now,
+//! Apply, Revert and Open rules folder.
 //!
 //! # Testability
 //!
@@ -2459,7 +2460,8 @@ fn revert_inner(
             "the retained `{previous_version}` and the installed `{current_version}` are archived \
              under the same directory (`{}`), so restoring one would destroy the other — refusing \
              rather than risking an empty rules directory. Re-publish the bundle under a version \
-             that does not collide, or reinstall from Settings → Tools → Detection (Check now)",
+             that does not collide, or reinstall from \
+             Settings → Injection protection → Injection detection (Check now)",
             archive.display()
         ));
     }

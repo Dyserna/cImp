@@ -481,6 +481,9 @@ fn trim_trailing_punctuation(run: &str) -> &str {
 /// private address — "what is 192.168.1.1" is an ordinary research question —
 /// and a fetch argument that terse, with no port and no path, is the rarest
 /// form of the rarest case. Recorded in the milestone's accepted residuals.
+///
+/// #48 M-18 adds a second, narrower residual on the same reasoning, with its own
+/// accepted cost written down: see [`is_canonical_network_address`].
 fn scan_bare_authorities(s: &str, out: &mut Vec<Candidate>) {
     for word in s.split(|c: char| c.is_whitespace() || URL_TERMINATORS.contains(&c)) {
         // Square brackets are NOT trimmed here, unlike the scheme scan's
@@ -503,6 +506,14 @@ fn scan_bare_authorities(s: &str, out: &mut Vec<Candidate>) {
             Some(rest) => (rest, true),
             None => (word, false),
         };
+        // #48 M-18: CIDR notation in prose is a range, not a target. The guard
+        // fires ONLY here and only on a run that is neither scheme-bearing
+        // (`strict` is `false` for everything this function emits) nor
+        // protocol-relative — see [`is_canonical_network_address`] for the
+        // conditions and for the cost that was accepted to get this.
+        if !relative && is_canonical_network_address(rest) {
+            continue;
+        }
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         let has_path = authority.len() < rest.len();
         if !is_plausible_authority(authority, !relative && !has_path) {
@@ -510,6 +521,94 @@ fn scan_bare_authorities(s: &str, out: &mut Vec<Candidate>) {
         }
         push_candidate(format!("http://{rest}"), false, out);
     }
+}
+
+/// Whether a **schemeless** run is CIDR notation naming a canonical network
+/// address — `10.0.0.0/8` — rather than anything a fetcher could reach (#48,
+/// review finding M-18; user decision 2026-08-11, recorded as the review
+/// amendment under locked decision 11).
+///
+/// # Why an exemption exists at all
+///
+/// The widened extraction reads `host/path` as a URL, and `/8` is a path. So
+/// `"RFC1918 (10.0.0.0/8)"` — in a **search query**, in a doc placeholder, in a
+/// sentence about which ranges are private — produced the candidate
+/// `http://10.0.0.0/8`, whose host is inside `10/8`, and the whole call was
+/// refused with a security error. Refusing ordinary research prose is the
+/// failure mode that gets a security control switched off (locked decision 16's
+/// argument), and it **compounds**: every benign denial advances the
+/// power-of-two threshold in [`AuditClaims::claim_ssrf`] that would otherwise
+/// have surfaced a *real* denial later, so noise suppresses signal.
+///
+/// # The conditions, all five
+///
+/// A run is exempt only when it is a network address in the one spelling a
+/// network address has: host bits all zero for the stated prefix, a literal
+/// `/`, a prefix of `0..=31`, **no port**, and **no further path segment** past
+/// the prefix. `10.0.0.1/8` (host bits set), `10.0.0.1/32` and `10.0.0.0/32`
+/// (`/32` is a single host, not a network), `10.0.0.0:80/8` (a port is a
+/// service) and `10.0.0.0/8/admin` (a path is a fetch) all still deny.
+/// Canonical spelling is required on both halves: [`Ipv4Addr`]'s parser rejects
+/// leading zeros, so `010.0.0.0/8` — which WHATWG reads as *octal* — is not
+/// exempt, and the prefix must be plain digits without a leading zero.
+///
+/// # The accepted cost, stated
+///
+/// A scheme-guessing fetcher could now reach `http://127.0.0.0/8` on port 80.
+/// Accepted with eyes open: that string is a network **address** — host bits
+/// zero, portless, pathless past the prefix — and therefore not the loopback
+/// *service* locked decision 11's carve-out text protects. Naming a whole /8 is
+/// not how anyone reaches a listener. The deny set itself is untouched: nothing
+/// leaves it, and the *extraction* merely declines to manufacture this one class
+/// of candidate.
+///
+/// # H-3's invariant is untouched
+///
+/// H-3 is "the screen and the parser must agree", and this guard cannot reopen
+/// it: it runs only on runs that are **schemeless and not protocol-relative**,
+/// i.e. exactly the runs `Url::parse` itself cannot resolve (`10.0.0.0` is not a
+/// scheme). No generated corpus case and no C-4 row meets the conditions above:
+/// they are scheme-bearing, protocol-relative, port-bearing, or carry a real path
+/// where a prefix would have to be (`10.0.0.1/admin`) — and
+/// `the_whatwg_parser_differential_is_closed` still refuses all 29 of them. And
+/// [`screen_urls`] denies on **any** candidate,
+/// so a dropped candidate can never flip a verdict another candidate in the same
+/// call already condemns. `the_h3_corpus_audits_the_cidr_exemption` runs the
+/// corpus generator with a `/8` tail so H-3 asserts this rather than this
+/// comment claiming it.
+fn is_canonical_network_address(run: &str) -> bool {
+    let Some((host, prefix)) = run.split_once('/') else {
+        return false;
+    };
+    // Nothing may follow the prefix: a second path segment, a query or a
+    // fragment all mean the run addresses something inside a host.
+    if prefix.is_empty() || prefix.contains(['/', '?', '#']) {
+        return false;
+    }
+    // A port is a service, which is what this screen is for.
+    if host.contains(':') {
+        return false;
+    }
+    // One or two plain digits, no leading zero: `/08` is not how a prefix
+    // length is written, and the narrower the exemption the smaller its cost.
+    if !matches!(prefix.len(), 1 | 2)
+        || !prefix.bytes().all(|b| b.is_ascii_digit())
+        || (prefix.len() == 2 && prefix.starts_with('0'))
+    {
+        return false;
+    }
+    let Ok(addr) = host.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(bits) = prefix.parse::<u32>() else {
+        return false;
+    };
+    // `/32` names one HOST, so it is a target and not a range; `0..=31` always
+    // leaves at least one host bit that must be zero.
+    if bits > 31 {
+        return false;
+    }
+    u32::from(addr) & (u32::MAX >> bits) == 0
 }
 
 /// Whether `auth` reads as a `host[:port]` a URL parser would accept, strictly
@@ -1598,6 +1697,28 @@ pub struct Flag<'a> {
     pub consumer: &'a str,
     /// Which contaminated scope fired: a worker task id, or `agent:tab`.
     pub scope: &'a str,
+    /// Which tab (or none, or unknown) this row is attributed to in the Events
+    /// feed. **Required, and deliberately not derived from [`Self::scope`]**
+    /// (#48, finding F-29).
+    ///
+    /// It used to be `scope_attribution(scope)`, applied to whatever string the
+    /// producer put in `scope`. That rule maps anything without a `:` to
+    /// [`Attribution::Headless`] — correct for a worker task id, and a **false
+    /// statement** for the two producers whose `scope` is not a scope at all:
+    /// `graph::mcp`'s secret screen passes `"memory secret screen"` and
+    /// `loopback::unattributed_write` passes `"unattributed"`, so both rows
+    /// claimed *"positively no tab"* when the truth was *"the tab was never
+    /// threaded here"*. `Headless` is a positive claim — "a worker run with no
+    /// tab behind it" — and asserting it about an unknown is the same defect
+    /// class as F-20, one producer over.
+    ///
+    /// Non-defaultable on the precedent of `3e192c1`, which made the graph/mcp
+    /// seam's attribution a plain `Attribution` parameter for exactly this
+    /// reason: a struct literal must name every field, so a new call site cannot
+    /// inherit a claim by writing nothing. Callers whose `scope` really is a
+    /// latch scope label or a worker task id derive it with
+    /// [`scope_attribution`]; callers holding the tab say so directly.
+    pub attribution: Attribution,
     /// The harness session (conversation) the scope was running when this row
     /// was written, when the writer knows it — `None` for a worker task scope,
     /// which has no harness session, and for any tab whose session the V28
@@ -1708,12 +1829,15 @@ pub fn flag_record(flag: Flag<'_>) -> ActivityRecord {
             // `ok: true` and read as "flagged", which is exactly what locked
             // decision 5 says happened.
             !flag.screen.is_denial(),
-            // #51: the scope IS the attribution for a flag row, and it is
-            // already trustworthy — every scope this module sees was resolved
-            // by `latch_scope` from cImp-authored argv, never from a request
-            // body. `agent:tab` names a real tab; a worker task id does not,
-            // and saying so is the honest reading rather than inventing one.
-            scope_attribution(flag.scope),
+            // #51: the scope IS the attribution for a flag row *when the scope
+            // is a scope* — every latch scope this module sees was resolved by
+            // `latch_scope` from cImp-authored argv, never from a request body,
+            // so `agent:tab` names a real tab and a worker task id positively
+            // names none. #48 F-29: that derivation is now the CALLER's, because
+            // two producers passed a `scope` string that was neither, and the
+            // rule then turned "we do not know" into "positively no tab". See
+            // [`Flag::attribution`].
+            flag.attribution,
             flag.session.map(str::to_string),
         ),
         request: serde_json::to_string_pretty(&request).unwrap_or_default(),
@@ -1780,6 +1904,14 @@ pub const NO_TAB_IDENTITY: &str = "(no tab identity)";
 
 /// A latch scope, read as a row attribution (#51).
 ///
+/// **Only valid for a string that IS a scope** — a label
+/// `loopback::LatchScope::label` produced, or a worker task id from
+/// [`new_task_scope`]. #48 F-29: this used to be applied by [`flag_record`] to
+/// whatever a producer put in [`Flag::scope`], and the `_ => Headless` arm then
+/// made a positive "no tab" claim about two producers that pass a human-readable
+/// description instead. Those callers now name their own attribution; this
+/// function stayed a derivation for the callers whose `scope` really is one.
+///
 /// [`Flag::scope`] is either `agent:tab` or a worker task id, and the two are
 /// not interchangeable: only the first names something the user can point at in
 /// the UI. A worker task is real work with a real scope but **no tab**, so it
@@ -1799,7 +1931,7 @@ pub const NO_TAB_IDENTITY: &str = "(no tab identity)";
 /// a real `agent:tab`. Splitting naively turns it into a **tab named
 /// `(no tab identity)`**: a phantom row in the one view whose job is saying
 /// which tab did something. It is `Headless`, which is the truth.
-fn scope_attribution(scope: &str) -> Attribution {
+pub fn scope_attribution(scope: &str) -> Attribution {
     match scope.split_once(':') {
         Some((_agent, tab)) if !tab.is_empty() && tab != NO_TAB_IDENTITY => {
             Attribution::Tab(tab.to_string())
@@ -2016,6 +2148,7 @@ mod tests {
             origin: Origin::Internal,
             consumer: "claude",
             scope: "claude:tab-1",
+            attribution: Attribution::Tab("tab-1".into()),
             session: None,
             tool: "context_note",
             host: None,
@@ -2202,12 +2335,21 @@ mod tests {
     const CORPUS_PUBLIC_HOSTS: [&str; 4] =
         ["8.8.8.8", "1.1.1.1:8080", "[2001:db8::1]", "[64:ff9b::8.8.8.8]"];
 
-    const CORPUS_TAILS: [&str; 5] = [
+    /// Tails. The last one is a **CIDR prefix**, added by #48 M-18 so the H-3
+    /// corpus audits [`is_canonical_network_address`] instead of the exemption
+    /// living in a test of its own: every one of these strings is
+    /// scheme-bearing, so none of them may be exempted, and several of the
+    /// authorities above (`0.0.0.0`, and every network address under a shorter
+    /// prefix) would satisfy the exemption's host-bits rule if the guard ever
+    /// leaked out of the schemeless scan. See
+    /// `the_h3_corpus_audits_the_cidr_exemption`.
+    const CORPUS_TAILS: [&str; 6] = [
         "",
         "/",
         "/props",
         "/latest/meta-data/iam/security-credentials/",
         "/?q=1#frag",
+        "/8",
     ];
 
     /// scheme × slash run × infix × authority × tail.
@@ -2314,6 +2456,163 @@ mod tests {
                 "{arg:?} is public in every reading and must pass"
             );
         }
+    }
+
+    /// **H-3 audits M-18's exemption.** The `/8` tail in [`CORPUS_TAILS`] makes
+    /// every scheme × slash-run × infix × authority case above appear once with a
+    /// CIDR prefix on the end, and [`is_canonical_network_address`] must not
+    /// exempt a single one of them: they carry a scheme, so they are
+    /// [`scan_scheme_runs`]'s business and the guard never sees them.
+    ///
+    /// Named separately from the two corpus tests because the assertion it adds
+    /// is *not vacuous* — it proves the `/8` slice is populated and that the
+    /// oracle fires inside it, which is the only thing that makes the tail more
+    /// than a longer loop. Without this, adding a tail nobody's oracle resolves
+    /// would look identical to adding a tail that audits something.
+    #[tokio::test]
+    async fn the_h3_corpus_audits_the_cidr_exemption() {
+        let policy = Policy::default();
+        let cidr: Vec<String> = corpus(&CORPUS_DENIED_HOSTS)
+            .into_iter()
+            .filter(|c| c.ends_with("/8"))
+            .collect();
+        assert!(
+            cidr.len() > 1_000,
+            "the /8 slice must be the whole cross-product, not a handful: {}",
+            cidr.len()
+        );
+        let mut oracle_hits = 0usize;
+        for arg in &cidr {
+            if !parser_reaches_a_denied_ip(arg) {
+                continue;
+            }
+            oracle_hits += 1;
+            assert!(
+                screen_urls(&json!({ "url": arg }), &policy).await.is_err(),
+                "a scheme-bearing run is never exempt: {arg:?} was allowed"
+            );
+        }
+        assert!(
+            oracle_hits > 100,
+            "the oracle must fire inside the /8 slice, or this proves nothing; \
+             {oracle_hits} of {} resolved",
+            cidr.len()
+        );
+        // The two strings the exemption's own conditions turn on, side by side:
+        // the network address is prose, and the host inside it is not.
+        assert!(
+            screen_urls(&json!({ "q": "the block is 10.0.0.0/8" }), &policy)
+                .await
+                .is_ok(),
+            "a canonical network address is prose"
+        );
+        assert!(
+            screen_urls(&json!({ "q": "the block is 10.0.0.1/8" }), &policy)
+                .await
+                .is_err(),
+            "host bits set is a target, not a range"
+        );
+    }
+
+    /// #48 M-18 — the exemption and every near miss, generated from the deny set
+    /// rather than enumerated, so a range added to [`is_denied_ip`] is covered by
+    /// the same rows.
+    ///
+    /// The pairs are the point: for each private/loopback/link-local network,
+    /// the canonical address passes and the *same address with one host bit set*
+    /// is refused. Then the four disqualifying shapes — a port, a further path
+    /// segment, `/32`, a non-canonical spelling — plus the two provenances the
+    /// guard must never touch (scheme-bearing, protocol-relative).
+    #[tokio::test]
+    async fn a_canonical_network_address_is_exempt_and_every_near_miss_denies() {
+        let policy = Policy::default();
+        // (network address, prefix, the same network with one host bit set)
+        let networks = [
+            ("10.0.0.0", 8, "10.0.0.1"),
+            ("172.16.0.0", 12, "172.16.0.1"),
+            ("192.168.0.0", 16, "192.168.0.1"),
+            ("127.0.0.0", 8, "127.0.0.1"),
+            ("169.254.0.0", 16, "169.254.169.254"),
+            ("100.64.0.0", 10, "100.64.0.1"),
+            ("0.0.0.0", 8, "0.0.0.1"),
+        ];
+        assert!(networks.len() >= 7, "the deny set has more than one family");
+        for (net, prefix, host) in networks {
+            let prose = format!("the private range {net}/{prefix} is reserved");
+            assert!(
+                screen_urls(&json!({ "q": &prose }), &policy).await.is_ok(),
+                "{prose:?} is prose about a range and must pass"
+            );
+            // …and every disqualifying variation of the very same string.
+            for (label, arg) in [
+                ("host bits set", format!("{host}/{prefix}")),
+                ("a single host, not a network", format!("{host}/32")),
+                ("the network as a /32", format!("{net}/32")),
+                ("a port before the prefix", format!("{net}:80/{prefix}")),
+                ("a path past the prefix", format!("{net}/{prefix}/admin")),
+                ("a query past the prefix", format!("{net}/{prefix}?q=1")),
+                ("a prefix that is not one", format!("{net}/33")),
+                ("scheme-bearing", format!("http://{net}/{prefix}")),
+                ("scheme, no slashes", format!("http:{net}/{prefix}")),
+                ("protocol-relative", format!("//{net}/{prefix}")),
+            ] {
+                assert!(
+                    screen_urls(&json!({ "url": &arg }), &policy).await.is_err(),
+                    "{label}: {arg:?} must still be refused"
+                );
+            }
+        }
+        // A non-canonical spelling is not exempted, so the candidate still
+        // reaches the screen and the screen decides on its own reading.
+        for arg in ["10.0.0.0/08", "10.0.0.0/+8", "10.0.0.0/8:80"] {
+            assert!(
+                screen_urls(&json!({ "url": arg }), &policy).await.is_err(),
+                "{arg:?} is not the canonical spelling and must be refused"
+            );
+        }
+        // Leading zeros are asserted on the PREDICATE, not through the screen.
+        // `010.0.0.0` is octal to a WHATWG parser (host `8.0.0.0`, public) and is
+        // not extracted at all today — `is_plausible_host` rejects it, a
+        // pre-existing residual that has nothing to do with M-18 — so a screen
+        // assertion here would pass for the wrong reason. What M-18 owes is that
+        // the exemption itself declines the spelling, because `Ipv4Addr` and
+        // WHATWG do not agree on what it means.
+        assert!(
+            !is_canonical_network_address("010.0.0.0/8"),
+            "a leading-zero octet is not the canonical spelling"
+        );
+        assert!(is_canonical_network_address("10.0.0.0/8"));
+        assert!(!is_canonical_network_address("10.0.0.0/08"));
+        assert!(!is_canonical_network_address("10.0.0.0/8/x"));
+        assert!(!is_canonical_network_address("10.0.0.0:80/8"));
+        assert!(!is_canonical_network_address("10.0.0.0"));
+        assert!(!is_canonical_network_address("[::]/0"));
+        // The exemption's edges: `/0` and `/31` are ranges, and only the address
+        // whose host bits are zero for that prefix qualifies.
+        for arg in ["0.0.0.0/0", "10.0.0.0/31", "192.168.128.0/17"] {
+            assert!(
+                screen_urls(&json!({ "q": arg }), &policy).await.is_ok(),
+                "{arg:?} is a canonical network address"
+            );
+        }
+        for arg in ["10.0.0.1/31", "192.168.129.0/17"] {
+            assert!(
+                screen_urls(&json!({ "q": arg }), &policy).await.is_err(),
+                "{arg:?} has host bits set for its prefix"
+            );
+        }
+        // The screen denies on ANY candidate, so a real target in the same
+        // argument is not rescued by the exemption beside it (the property the
+        // amendment leans on for "a dropped duplicate cannot flip a verdict").
+        assert!(
+            screen_urls(
+                &json!({ "q": "ranges like 10.0.0.0/8 — also fetch 127.0.0.1:12344/props" }),
+                &policy
+            )
+            .await
+            .is_err(),
+            "an exempt run must not launder the target beside it"
+        );
     }
 
     /// #48 (review finding C-4) — **supplementary pins**, deliberately kept
@@ -2423,6 +2722,20 @@ mod tests {
             ("a double slash in prose", "either // or /* */ works"),
             // A private address merely *mentioned*: the documented residual.
             ("a mention", "the gateway here is 192.168.1.1 by default"),
+            // #48 M-18: CIDR notation about a range, which is what a research
+            // query and a doc placeholder are made of. The `/8` satisfied the
+            // has-a-path rule, so before this every one of these refused the
+            // whole call — and each refusal also advanced the doubling threshold
+            // that would have surfaced a real denial later.
+            ("the finding's own string", "RFC1918 (10.0.0.0/8)"),
+            (
+                "the whole deny set as prose",
+                "private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16",
+            ),
+            ("loopback as a range", "127.0.0.0/8 is loopback, not one address"),
+            ("the default route", "0.0.0.0/0 means everything"),
+            ("a subnet plan", "we split it into 192.168.128.0/17 and 192.168.0.0/17"),
+            ("a range in a search query", "what is 169.254.0.0/16 used for"),
         ] {
             assert!(
                 screen_urls(&json!({ "text": arg }), &policy).await.is_ok(),
@@ -2517,6 +2830,32 @@ mod tests {
         assert_eq!(
             extract_urls(&json!({ "u": "//169.254.169.254/latest" })),
             vec!["http://169.254.169.254/latest"]
+        );
+
+        // #48 M-18, at the extractor rather than through the screen: a canonical
+        // network address produces NO candidate, and each near miss produces one.
+        assert!(
+            extract_urls(&json!({ "u": "RFC1918 (10.0.0.0/8)" })).is_empty(),
+            "{:?}",
+            extract_urls(&json!({ "u": "RFC1918 (10.0.0.0/8)" }))
+        );
+        for (label, arg, expect) in [
+            ("host bits set", "10.0.0.1/8", "http://10.0.0.1/8"),
+            ("a single host", "10.0.0.0/32", "http://10.0.0.0/32"),
+            ("a port", "10.0.0.0:80/8", "http://10.0.0.0:80/8"),
+            ("a further segment", "10.0.0.0/8/x", "http://10.0.0.0/8/x"),
+            ("protocol-relative", "//10.0.0.0/8", "http://10.0.0.0/8"),
+        ] {
+            assert_eq!(
+                extract_urls(&json!({ "u": arg })),
+                vec![expect],
+                "{label}: {arg:?}"
+            );
+        }
+        // Scheme-bearing is `scan_scheme_runs`'s business and never exempt.
+        assert_eq!(
+            extract_urls(&json!({ "u": "http:10.0.0.0/8" })),
+            vec!["http://10.0.0.0/8"]
         );
     }
 
@@ -2870,6 +3209,7 @@ mod tests {
             origin: Origin::Internal,
             consumer: "claude",
             scope: "claude:claude-2",
+            attribution: Attribution::Tab("claude-2".into()),
             session: Some("sess-a"),
             tool: "ddg__fetch_content",
             host: Some("evil.example"),
@@ -2900,6 +3240,7 @@ mod tests {
             origin: Origin::Ipc,
             consumer: "claude",
             scope: "claude:claude-2",
+            attribution: Attribution::Tab("claude-2".into()),
             session: Some("sess-a"),
             tool: "clear_contamination",
             host: None,
@@ -2926,6 +3267,7 @@ mod tests {
             origin: Origin::Internal,
             consumer: "claude",
             scope: "claude:claude-2",
+            attribution: Attribution::Tab("claude-2".into()),
             session: None,
             tool: "ddg__search",
             host: None,
@@ -2952,6 +3294,7 @@ mod tests {
             origin: Origin::Internal,
             consumer: "claude",
             scope: "claude:claude-2",
+            attribution: Attribution::Tab("claude-2".into()),
             session: None,
             tool: "ddg__search",
             host: Some("evil.example"),
@@ -3009,6 +3352,7 @@ mod tests {
                 origin,
                 consumer: "claude",
                 scope: "claude:claude-1",
+                attribution: Attribution::Tab("claude-1".into()),
                 session: None,
                 tool: "unlatch",
                 host: None,

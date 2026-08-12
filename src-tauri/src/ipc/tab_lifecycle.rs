@@ -1174,8 +1174,9 @@ impl ToolKind {
     }
 
     /// The launch command for this tool: an explicit per-tool path from
-    /// `settings.external_tools` when the user set one (Settings → Bottom
-    /// bar), otherwise the default bare name (resolved ebin → PATH at spawn).
+    /// `settings.external_tools` when the user set one
+    /// (Settings → Bottom bar), otherwise the default bare name (resolved
+    /// ebin → PATH at spawn).
     fn command_for(self, settings: &Settings) -> String {
         let override_path = match self {
             ToolKind::Rustnet => settings.external_tools.rustnet.trim(),

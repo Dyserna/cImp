@@ -373,7 +373,7 @@ fn load_palettes() -> Vec<PaletteWire> {
 
 /// Every verified theme found on disk. The frontend fetches this once at
 /// startup, injects each theme's CSS into <head>, and lists them in
-/// Settings → Theme.
+/// Settings → Appearance.
 #[tauri::command]
 pub fn themes_list() -> Vec<ThemeWire> {
     load_themes()

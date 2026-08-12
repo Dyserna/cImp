@@ -1072,7 +1072,8 @@ impl OffloadService {
         let pool = self.resolve_pool(&snap, true).await;
         if pool.is_empty() {
             return Err(AppError::OffloadNotReady(
-                "no offload backend is configured — add one in cImp Settings → Offload".into(),
+                "no offload backend is configured — add one in cImp Settings → Offload task tools"
+                    .into(),
             ));
         }
 
@@ -1861,7 +1862,7 @@ impl OffloadService {
         if backends.is_empty() {
             return "Delegate a token-heavy subtask to a local model to conserve this session's \
                     context. (No offload backend is configured/enabled — set one up in cImp \
-                    Settings → Offload.)"
+                    Settings → Offload task tools.)"
                 .to_string();
         }
 

@@ -160,9 +160,10 @@ pub const RULE_DRIFT_SUBAGENT: &str = "drift.subagent_transcripts.v1";
 // Locked decision 13's "every signal has its consumer": the updater records
 // what it found and what it refused, and these two rules are what turn those
 // records into something the user actually sees. Both are warn-only — the fix
-// is a button in Settings → Tools → Detection, not a settings write the Apply
-// path could make — and both carry their own trigger (a fact, not a statistic),
-// so neither sits behind the global `MIN_SESSIONS` floor.
+// is a button in Settings → Injection protection → Injection detection, not a
+// settings write the Apply path could make — and both carry their own trigger
+// (a fact, not a statistic), so neither sits behind the global `MIN_SESSIONS`
+// floor.
 
 /// A newer detection bundle exists and was not applied: the component is in
 /// `check-only` mode, or its `min_app_version` is ahead of this build.
@@ -799,7 +800,8 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     // V32 C3 — detection.update_available.v1: a newer detection bundle was
     // found and not taken. This is the consumer for check-only mode: without
     // it, "check-only" would mean "silently record a version nobody reads".
-    // Warn-only — Apply lives in Settings → Tools → Detection, next to the
+    // Warn-only — Apply lives in
+    // Settings → Injection protection → Injection detection, next to the
     // versions and the revert button, because taking an update is not a
     // settings write.
     for u in &sig.detection_updates {
@@ -819,8 +821,9 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 "A newer injection-detection {} bundle ({}) is available and was not applied — \
                  this component is set to check-only, or the bundle needs a newer cImp. Detection \
                  data decays without updates, so a component that keeps declining them slowly \
-                 stops matching what attackers actually send.{} Review and take it from Settings \
-                 → Tools → Detection (Apply), or switch the component to auto.",
+                 stops matching what attackers actually send.{} Review and take it from \
+                 Settings → Injection protection → Injection detection (Apply), or switch the \
+                 component to auto.",
                 u.component,
                 u.available,
                 if u.notes.trim().is_empty() {
@@ -905,7 +908,8 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                  is still live and still scanning — but signatures and weights decay, so a \
                  component that stays frozen eventually means missing what attackers have started \
                  sending. The last check said: {}. If that is a network or proxy problem, check \
-                 access to the manifest URL shown in Settings → Tools → Detection; if a bundle is \
+                 access to the manifest URL shown in \
+                 Settings → Injection protection → Injection detection; if a bundle is \
                  being refused, see MAINTENANCE.md → \"Detection updater\"; or set the component \
                  to `off` if this machine is deliberately offline.",
                 s.component, s.streak, s.reason
@@ -952,7 +956,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                      If a previously loaded set is still in memory it keeps screening with that, \
                      but it will not survive a restart. Fix or remove the rejected file(s) — a \
                      broken rule in `rules.d/local/` is the usual cause — then press Reload rules \
-                     in Settings → Tools → Detection.",
+                     in Settings → Injection protection → Injection detection.",
                     d.dir
                 ),
                 rule_id: RULE_DETECTION_SIGNATURE_DOWN,
@@ -1035,8 +1039,8 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 );
             }
             rationale.push_str(&format!(
-                "cImp looked in {}. After editing, press Reload rules in Settings → Tools → \
-                 Detection.",
+                "cImp looked in {}. After editing, press Reload rules in \
+                 Settings → Injection protection → Injection detection.",
                 b.dir
             ));
             out.push(Proposal {
@@ -1074,7 +1078,8 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                  and cImp retries the restore on every update check and every launch. The usual \
                  cause is something holding the file open — antivirus real-time scanning, an \
                  editor, or a file manager sitting in that folder. Close it and restart cImp; if \
-                 that does not clear it, Revert from Settings → Tools → Detection restores the \
+                 that does not clear it, Revert from \
+                 Settings → Injection protection → Injection detection restores the \
                  retained copy whole.",
                 r.files.len(),
                 r.dir,

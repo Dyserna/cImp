@@ -1075,7 +1075,8 @@ impl GraphService {
             return EmbedderProbe {
                 ok: false,
                 dim: None,
-                message: "Semantic search is off — enable it in Settings → Code graph.".into(),
+                message: "Semantic search is off — enable it in Settings → Code Intelligence."
+                    .into(),
             };
         }
         let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model)
@@ -1098,7 +1099,8 @@ impl GraphService {
                     Some(t) => format!("Reachable — {dim}-dim embeddings, {t}-token input budget."),
                     None => format!(
                         "Reachable — {dim}-dim embeddings (no token budget detected; \
-                         set one in Settings → Code graph if the server rejects long chunks)."
+                         set one in Settings → Code Intelligence if the server rejects long \
+                         chunks)."
                     ),
                 },
             },

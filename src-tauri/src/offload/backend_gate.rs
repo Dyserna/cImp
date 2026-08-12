@@ -221,7 +221,7 @@ impl BackendGate {
         if name.starts_with("graph_") && !self.allow_graph {
             return Err(format!(
                 "tool `{name}` is not available on this backend (code-graph access for a remote \
-                 offload worker is off — enable it in cImp Settings → Code Graph)"
+                 offload worker is off — enable it in cImp Settings → Code Intelligence)"
             ));
         }
         // 3. V26 — the code-audit opt-in.
@@ -242,10 +242,15 @@ impl BackendGate {
         //    3): this backend is off-machine and the project has not opted in.
         if name == "run_check" && !self.allow_run_check {
             return Err(format!(
+                // #48 F-18: `Checks` is a TOP-LEVEL sidebar category, a sibling
+                // of `Code Intelligence` — not a sub-tab of it. The path this
+                // refusal shipped with resolved to nothing, and a pointer that
+                // resolves to nothing is worse than none: the reader concludes
+                // the switch does not exist.
                 "tool `{name}` is not available on this backend (it executes this project's \
                  configured build/test/lint commands, and running the project's checks on a \
-                 remote offload backend is off — enable it for this project in cImp Settings → \
-                 Code Intelligence → Checks)"
+                 remote offload backend is off — enable it for this project in \
+                 cImp Settings → Checks → Offload worker access)"
             ));
         }
         Ok(GatePass { name })

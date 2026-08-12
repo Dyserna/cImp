@@ -520,7 +520,7 @@ fn offload_task_description(settings: &OffloadSettings) -> String {
     if backends.is_empty() {
         return "Delegate a token-heavy subtask to a local model to conserve this session's \
                 context. (No offload backend is configured/enabled — set one up in cImp \
-                Settings → Offload.)"
+                Settings → Offload task tools.)"
             .to_string();
     }
 
@@ -1986,7 +1986,10 @@ async fn run_offload(
         .filter_map(ResolvedBackend::from_config)
         .collect();
     if resolved.is_empty() {
-        return Err("no offload backend is configured — add one in cImp Settings → Offload".into());
+        return Err(
+            "no offload backend is configured — add one in cImp Settings → Offload task tools"
+                .into(),
+        );
     }
 
     let client = reqwest::Client::builder()

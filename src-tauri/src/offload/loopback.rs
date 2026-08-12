@@ -1321,6 +1321,21 @@ impl LatchScope {
     fn label(&self) -> String {
         format!("{}:{}", self.agent, self.tab)
     }
+
+    /// This scope as an activity-row attribution (#48 F-29).
+    ///
+    /// A scope exists only for a **configured** tab id ([`is_configured_tab`],
+    /// checked by [`latch_scope`]), so [`Attribution::Tab`] is a fact here — the
+    /// same reading [`LatchScoping::attribution`] takes for its `Scoped` arm,
+    /// which now delegates here so the two cannot drift.
+    ///
+    /// The tab id is taken from the field, never re-split out of
+    /// [`label`](Self::label): a round trip through a formatted string is how
+    /// `"{agent}:(no tab identity)"` became a *tab named `(no tab identity)`*
+    /// once already (`outbound::scope_attribution`'s doc).
+    fn attribution(&self) -> crate::activity::Attribution {
+        crate::activity::Attribution::Tab(self.tab.clone())
+    }
 }
 
 /// Whether `tab` names an AI tab the **user has configured** (#45).
@@ -1559,7 +1574,7 @@ impl LatchScoping {
             LatchScoping::Unknown(id) => {
                 crate::activity::Attribution::Unrecognized(id.clone())
             }
-            LatchScoping::Scoped(s) => crate::activity::Attribution::Tab(s.tab.clone()),
+            LatchScoping::Scoped(s) => s.attribution(),
         }
     }
 
@@ -2487,6 +2502,12 @@ impl Contamination {
             origin: self.origin,
             consumer: self.consumer,
             scope: &self.scope,
+            // #48 F-29: derived, because this row's `scope` was built by
+            // `LatchScope::label` (or, with no tab identity, by the `/mcp/call`
+            // route's honest `"{agent}:(no tab identity)"`) — the two inputs
+            // `scope_attribution` is defined over. The struct carries the label
+            // rather than the scope, so there is no tab field to read here.
+            attribution: outbound::scope_attribution(&self.scope),
             session: self.session.as_deref(),
             tool: &self.tool,
             host: self.host.as_deref(),
@@ -2584,6 +2605,9 @@ impl ContaminationCleared {
             origin: self.origin,
             consumer: self.consumer,
             scope: &self.scope,
+            // Derived from the label this row was built with — see the
+            // contamination row above (#48 F-29).
+            attribution: outbound::scope_attribution(&self.scope),
             session: self.session.as_deref(),
             tool: self.basis.tool(),
             host: None,
@@ -2848,6 +2872,21 @@ fn unattributed_write(
         origin: outbound::Origin::Internal,
         consumer: "unattributed",
         scope: "unattributed",
+        // #48 F-29 — the reason this field exists. `"unattributed"` is a
+        // description, not a scope, and the old derivation (anything without a
+        // `:` ⇒ `Headless`) turned it into the positive claim *"a run with no tab
+        // behind it"*. This frame does not know that: it knows only that the
+        // caller's tab identity did not resolve, which is what
+        // `Attribution::Unattributed` says and what this whole row is about.
+        //
+        // Not more precise than that ON PURPOSE. The route's `LatchScoping`
+        // could distinguish "no id was sent" (`Headless`) from "an id that names
+        // no configured tab" (`Unrecognized`), but `gate` receives
+        // `Option<&LatchScope>` and both collapse to `None` before this line —
+        // the same collapse F-20 fixed one seam over. Recovering it means
+        // threading the attribution through `CallProvenance`, a separate change;
+        // claiming either half from here would be a guess.
+        attribution: crate::activity::Attribution::Unattributed,
         session: None,
         tool: name,
         host: None,
@@ -2992,6 +3031,9 @@ impl LatchRegistry {
                     origin: outbound::Origin::Internal,
                     consumer: scope.agent,
                     scope: &scope.label(),
+                    // #48 F-29: the scope is in hand, so the tab id comes from
+                    // its field rather than from a re-split label.
+                    attribution: scope.attribution(),
                     session: scope.session.as_deref(),
                     tool: name,
                     host: None,
@@ -3029,6 +3071,8 @@ impl LatchRegistry {
                     origin: outbound::Origin::Internal,
                     consumer: scope.agent,
                     scope: &scope.label(),
+                    // The scope is in hand — see `LatchScope::attribution`.
+                    attribution: scope.attribution(),
                     session: scope.session.as_deref(),
                     tool: name,
                     host: None,
@@ -3536,6 +3580,8 @@ impl LatchRegistry {
                 origin: outbound::Origin::Internal,
                 consumer: scope.agent,
                 scope: &scope.label(),
+                // The scope is in hand — see `LatchScope::attribution`.
+                attribution: scope.attribution(),
                 session: scope.session.as_deref(),
                 tool,
                 host: None,
@@ -3983,6 +4029,8 @@ pub fn apply_latch_override(
         origin: row.origin,
         consumer: agent,
         scope: &scope.label(),
+        // The scope is in hand — see `LatchScope::attribution`.
+        attribution: scope.attribution(),
         session: scope.session.as_deref(),
         tool: &row.tool,
         host: None,
@@ -6233,6 +6281,8 @@ fn report_beacon(
         origin: row.origin,
         consumer: scope.agent,
         scope: &scope.label(),
+        // The scope is in hand — see `LatchScope::attribution`.
+        attribution: scope.attribution(),
         session: scope.session.as_deref(),
         tool: &row.tool,
         host: None,
@@ -10611,6 +10661,7 @@ mod tests {
                     origin: row.origin,
                     consumer: s.agent,
                     scope: &s.label(),
+                    attribution: s.attribution(),
                     session: None,
                     tool: &row.tool,
                     host: None,

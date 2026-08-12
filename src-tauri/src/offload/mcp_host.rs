@@ -1047,6 +1047,11 @@ impl McpHost {
                         origin: outbound::Origin::Internal,
                         consumer: consumer.source(),
                         scope,
+                        // #48 F-29: derived, because `scope` here is the label
+                        // the calling route built from its `LatchScope` (or the
+                        // worker's task id) — a real scope, which is what
+                        // `scope_attribution` is defined over.
+                        attribution: outbound::scope_attribution(scope),
                         session: None,
                         tool: namespaced,
                         host: Some(&denial.host),

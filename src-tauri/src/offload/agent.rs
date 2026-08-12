@@ -1601,6 +1601,10 @@ pub async fn run(
         origin: outbound::Origin::Internal,
         consumer: "offload",
         scope: scope.id(),
+        // #48 F-29: a worker task is real work with NO TAB behind it, so
+        // `Headless` is a fact here rather than a gap — which is exactly why the
+        // field is stated per call site instead of guessed from the scope string.
+        attribution: crate::activity::Attribution::Headless,
         session: None,
         tool: "(final answer)",
         host: None,
@@ -1982,6 +1986,8 @@ async fn run_inner(
                         origin: outbound::Origin::Internal,
                         consumer: "offload",
                         scope: scope.id(),
+                        // A worker task: no tab, stated positively (#48 F-29).
+                        attribution: crate::activity::Attribution::Headless,
                         session: None,
                         tool: name,
                         host: None,
@@ -2027,6 +2033,8 @@ async fn run_inner(
                     origin: outbound::Origin::Internal,
                     consumer: "offload",
                     scope: scope.id(),
+                    // A worker task: no tab, stated positively (#48 F-29).
+                    attribution: crate::activity::Attribution::Headless,
                     session: None,
                     tool: name,
                     host: None,
@@ -2067,6 +2075,8 @@ async fn run_inner(
                             origin: outbound::Origin::Internal,
                             consumer: "offload",
                             scope: scope.id(),
+                            // A worker task: no tab, stated positively (#48 F-29).
+                            attribution: crate::activity::Attribution::Headless,
                             session: None,
                             tool: name,
                             host: None,

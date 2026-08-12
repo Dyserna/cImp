@@ -912,6 +912,10 @@ pub(crate) async fn dispatch_recorded(
             mem_agent(source),
             session,
             guards,
+            // #48 F-29: the same classification this call's own activity row is
+            // filed under, so a note held by the secret screen and the call that
+            // wrote it cannot be attributed to different tabs.
+            tab.clone(),
         )
     };
     crate::activity::record_bg(crate::activity::ActivityRecord {
@@ -1117,7 +1121,21 @@ fn write_session(session: Option<&str>) -> Option<String> {
 /// [`crate::activity::ActivityEntry::root`] for what an empty root now means and
 /// for the tripwire that keeps this set from producing one
 /// (`outbound::tests::every_forensic_screen_row_carries_a_project_root`).
-fn record_secret_screen_flag(agent: Option<&str>, hits: &[String], root: &Path) {
+/// #48 F-29: `attribution` is the CALLING TAB, threaded from
+/// [`dispatch_recorded`] — the frame that already classified the id's provenance
+/// for the call's own `kind:"graph"` row. It used to be derived from `scope`,
+/// which this producer sets to the description `"memory secret screen"`; the
+/// derivation maps anything without a `:` to `Attribution::Headless`, so the row
+/// recording that a **credential** was held claimed *"positively no tab"* about
+/// every tab that ever hit it. `scope` stays the description (it is what a human
+/// reads in the feed's scope column, and there is no latch scope here); the
+/// attribution is now a separate, stated fact.
+fn record_secret_screen_flag(
+    agent: Option<&str>,
+    attribution: crate::activity::Attribution,
+    hits: &[String],
+    root: &Path,
+) {
     use crate::offload::outbound::{record_flag, Flag, Origin, Screen};
     let detail = super::secrets::write_notice(hits);
     record_flag(Flag {
@@ -1125,6 +1143,7 @@ fn record_secret_screen_flag(agent: Option<&str>, hits: &[String], root: &Path) 
         origin: Origin::Internal,
         consumer: agent.unwrap_or("offload"),
         scope: "memory secret screen",
+        attribution,
         session: None,
         tool: "context_note",
         host: None,
@@ -1177,6 +1196,13 @@ pub fn run_tool(
     // V32 Phase C2: the taint-latch verdict for this call — `context_note`'s
     // only input beyond its arguments.
     guards: CallGuards,
+    // #48 F-29: the calling tab, already classified by the entry point that knows
+    // the id's provenance (the same value the call's `kind:"graph"` row carries).
+    // Consumed by exactly one arm — `context_note`'s secret-screen row — and
+    // taken by value rather than derived from `agent`, because `agent` is
+    // `"claude"`/`"opencode"`/`None` and names no tab. See
+    // [`record_secret_screen_flag`].
+    attribution: crate::activity::Attribution,
 ) -> Result<String, String> {
     let arg = |key: &str| -> String {
         args.get(key)
@@ -1371,7 +1397,7 @@ pub fn run_tool(
             idx.mem_add_note(&note_id, &sid, text.as_str(), ts, pin, quarantined)
                 .map(|_| {
                     if !secrets.is_empty() {
-                        record_secret_screen_flag(agent, &secrets, root);
+                        record_secret_screen_flag(agent, attribution.clone(), &secrets, root);
                     }
                     let scope = if pin {
                         " (pinned, kept across sessions)"
@@ -3296,8 +3322,19 @@ mod h1_signature_strip_tests {
     }
 
     fn call(dir: &std::path::Path, idx: &GraphIndex, name: &str, args: serde_json::Value) -> String {
-        run_tool(idx, dir, name, &args, 50, 2_000, None, None, CallGuards::clean())
-            .unwrap_or_else(|e| panic!("{name} failed: {e}"))
+        run_tool(
+            idx,
+            dir,
+            name,
+            &args,
+            50,
+            2_000,
+            None,
+            None,
+            CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
+        )
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"))
     }
 
     #[test]
@@ -3631,6 +3668,7 @@ mod recall_facts_tests {
             Some("claude"),
             None,
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("run_tool");
         assert!(out.contains("## Project facts"), "{out}");
@@ -3662,6 +3700,7 @@ mod recall_facts_tests {
             Some("claude"),
             None,
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("run_tool");
         assert!(!out.contains("## Project facts"), "{out}");
@@ -3728,6 +3767,7 @@ mod session_scope_tests {
                 Some("claude"),
                 session,
                 CallGuards::clean(),
+                crate::activity::Attribution::Unattributed,
             )
             .expect("context_notes"),
         )
@@ -3748,6 +3788,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_a"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("context_note");
         assert!(ack.starts_with("Noted"), "{ack}");
@@ -3791,6 +3832,7 @@ mod session_scope_tests {
                     taint,
                     ..CallGuards::clean()
                 },
+                crate::activity::Attribution::Unattributed,
             )
             .expect("context_note")
         };
@@ -3835,6 +3877,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_a"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("context_note");
 
@@ -3849,6 +3892,7 @@ mod session_scope_tests {
                 Some("claude"),
                 Some("ses_a"),
                 CallGuards::clean(),
+                crate::activity::Attribution::Unattributed,
             )
             .expect(tool);
             assert!(
@@ -3871,6 +3915,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_a"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("context_note");
         assert!(!ack.contains("UNTRUSTED-DATA"), "{ack}");
@@ -3889,6 +3934,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_a"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("recall");
         assert!(a.contains("alpha.rs"), "{a}");
@@ -3904,6 +3950,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_b"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("recall");
         assert!(b.contains("beta.rs"), "{b}");
@@ -3930,6 +3977,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_b"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("context_note");
 
@@ -3944,6 +3992,7 @@ mod session_scope_tests {
             Some("claude"),
             None,
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("recall");
         assert!(recall.contains("beta.rs"), "{recall}");
@@ -3976,6 +4025,7 @@ mod session_scope_tests {
             Some("claude"),
             None,
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("the tool answers, rather than erroring");
         assert!(
@@ -4019,6 +4069,7 @@ mod session_scope_tests {
             Some("claude"),
             None,
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("context_note");
         assert!(out.starts_with("Noted (pinned"), "{out}");
@@ -4058,6 +4109,7 @@ mod session_scope_tests {
             Some("claude"),
             Some("ses_never_seen"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("recall must not error");
         assert!(!recall.contains("alpha.rs"), "{recall}");
@@ -4084,6 +4136,7 @@ mod session_scope_tests {
                 None,
                 None,
                 CallGuards::clean(),
+                crate::activity::Attribution::Unattributed,
             ).expect("recall");
         assert!(out.contains("gamma.rs"), "{out}");
     }
@@ -4185,6 +4238,7 @@ mod surface_tests {
             None,
             None,
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("hidden tool still dispatches");
         assert!(!out.starts_with("unknown graph tool"), "{out}");
@@ -4337,6 +4391,7 @@ mod memory_write_boundary_tests {
             Some("claude"),
             Some("s1"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("a read must still be served with the app down");
         assert!(out.contains("we chose FNV hashing"), "{out}");
@@ -4402,6 +4457,7 @@ mod memory_write_boundary_tests {
             Some("claude"),
             Some("s1"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("the write is accepted, not refused");
         assert!(out.starts_with("Noted"), "{out}");
@@ -4444,8 +4500,16 @@ mod memory_write_boundary_tests {
     /// Driven through `run_tool`'s real `context_note` arm and asserted on the row
     /// `record_flag` actually received, not on the producer's arguments: "the
     /// parameter exists" is not the property.
+    ///
+    /// **Also #48 F-29** — and the two findings belong in one test, because they
+    /// are the same row losing two different columns. The row used to derive its
+    /// attribution from `scope`, which this producer sets to
+    /// `"memory secret screen"`; anything without a `:` mapped to
+    /// `Attribution::Headless`, so the row asserted *"positively no tab"* about a
+    /// call a real tab made. The tab is passed in here, so `Headless` would be an
+    /// observable regression rather than a missing feature.
     #[test]
-    fn a_held_secret_note_records_the_project_it_was_written_against() {
+    fn a_held_secret_note_records_the_project_and_the_tab_it_came_from() {
         use crate::offload::outbound;
         outbound::test_rows::reset();
         let (dir, idx) = temp_index("secret-root");
@@ -4459,6 +4523,7 @@ mod memory_write_boundary_tests {
             Some("claude"),
             Some("s1"),
             CallGuards::clean(),
+            crate::activity::Attribution::Tab("claude-1".into()),
         )
         .expect("the write is accepted, not refused");
 
@@ -4471,6 +4536,17 @@ mod memory_write_boundary_tests {
             "the row must file under the project the note was written against"
         );
         assert!(!held[0].entry.root.is_empty());
+        // #48 F-29: the tab, not a false "no tab" derived from the scope column.
+        assert_eq!(
+            held[0].entry.tab,
+            crate::activity::Attribution::Tab("claude-1".into()),
+            "the secret-screen row must name the tab that wrote the note"
+        );
+        assert_eq!(
+            held[0].entry.source,
+            outbound::Screen::MemoryQuarantine.as_str(),
+            "…on the secret screen's own row, not a neighbour's"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4490,6 +4566,7 @@ mod memory_write_boundary_tests {
             Some("claude"),
             Some("s1"),
             CallGuards::clean(),
+            crate::activity::Attribution::Unattributed,
         )
         .expect("write");
         assert_eq!(out, "Noted (pinned, kept across sessions).");
@@ -4517,6 +4594,7 @@ mod memory_write_boundary_tests {
                 taint: WriteTaint::Quarantined,
                 spotlight_recall: true,
             },
+            crate::activity::Attribution::Unattributed,
         )
         .expect("write");
         assert!(out.contains("QUARANTINED (security boundary)"), "{out}");
@@ -4551,6 +4629,7 @@ mod memory_write_boundary_tests {
                 taint: WriteTaint::Unattributed,
                 spotlight_recall: true,
             },
+            crate::activity::Attribution::Unattributed,
         )
         .expect("stored, not refused");
         assert!(out.starts_with("Noted"), "{out}");
@@ -4602,6 +4681,7 @@ mod memory_write_boundary_tests {
                 Some("claude"),
                 Some("s1"),
                 CallGuards::clean(),
+                crate::activity::Attribution::Unattributed,
             )
         };
 

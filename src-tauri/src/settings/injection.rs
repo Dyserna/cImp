@@ -351,6 +351,14 @@ impl Feature {
     /// `const` so [`baked_at_spawn`](Self::baked_at_spawn) can turn a
     /// disagreement between this list and a spawn-time call site into a BUILD
     /// ERROR rather than a source-scan test that only sees the half it scans.
+    ///
+    /// The **frontend** mirror of this predicate's output
+    /// (`SPAWN_BAKED_INJECTION_FEATURES` in `src/lib/settings/types.ts`) cannot be
+    /// held by the compiler, so it is held by an `include_str!` tripwire instead:
+    /// `settings::frontend_mirrors::spawn_baked_feature_mirror_is_current_in_both_directions`
+    /// compares this filtered set against that array both ways. #48 F-27, second
+    /// instance — that array is what raises the in-window restart hint, and it had
+    /// already gone stale twice over.
     pub const fn spawn_baked(self) -> bool {
         match self {
             Feature::NativeWeb

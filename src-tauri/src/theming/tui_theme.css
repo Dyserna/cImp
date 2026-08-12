@@ -6,7 +6,7 @@
    theme's complete definition.
 
    The accent family is keyed off `--tui-accent`, injected on <html> by the
-   frontend from the `ui.tui_accent` setting (Settings → Theme → Accent
+   frontend from the `ui.tui_accent` setting (Settings → Appearance → Accent
    color). Every accent step is derived from it via color-mix, so one picked
    color re-tunes the whole family. `--tui-text-on-accent` is computed
    luminance-side in JS (dark text on light accents, light on dark). The

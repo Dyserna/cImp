@@ -813,6 +813,10 @@ async fn compose(
         origin: outbound::Origin::Internal,
         consumer: ctx.consumer,
         scope: ctx.scope,
+        // #48 F-29: derived, because `ctx.scope` here really IS a scope — either
+        // `LatchScope::label`'s `agent:tab` (the proxy) or a worker task id (the
+        // worker), which is precisely the input `scope_attribution` is for.
+        attribution: outbound::scope_attribution(ctx.scope),
         session: None,
         tool: name,
         host: ctx.host.as_deref(),
@@ -905,6 +909,8 @@ fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Opti
             origin: outbound::Origin::Internal,
             consumer: ctx.consumer,
             scope: ctx.scope,
+            // Derived from a real scope — see the sibling row above (#48 F-29).
+            attribution: outbound::scope_attribution(ctx.scope),
             session: None,
             tool: name,
             host: ctx.host.as_deref(),
@@ -949,7 +955,7 @@ pub fn reload(settings: &Settings) -> DetectionStatus {
     }
 }
 
-/// What Settings → Tools → Detection renders.
+/// What Settings → Injection protection → Injection detection renders.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DetectionStatus {
     pub rules: signature::Status,

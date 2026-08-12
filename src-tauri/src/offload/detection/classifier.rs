@@ -97,8 +97,9 @@ pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 /// text; this is the belt to that braces.
 pub const MAX_WINDOWS: usize = 32;
 
-/// What the Settings → Tools → Detection block reads. `present == false` is the
-/// normal state today and is stated plainly rather than dressed up as an error.
+/// What the Settings → Injection protection → Injection detection block reads.
+/// `present == false` is the normal state today and is stated plainly rather
+/// than dressed up as an error.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Status {
     /// Both files found AND the session built.

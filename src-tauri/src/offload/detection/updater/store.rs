@@ -379,9 +379,9 @@ pub struct ComponentState {
     /// a state file lost to corruption costs a card, never a file.
     ///
     /// Consumed by `detection.rules_incomplete.v1` in `advisor.rs` and by the
-    /// Settings → Tools → Detection readout, and cleared the moment a retry (or
-    /// a later full activation, which rewrites the whole set anyway) makes it
-    /// untrue.
+    /// Settings → Injection protection → Injection detection readout, and
+    /// cleared the moment a retry (or a later full activation, which rewrites
+    /// the whole set anyway) makes it untrue.
     #[serde(default)]
     pub unrestored_files: Vec<String>,
 }

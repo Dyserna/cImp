@@ -1619,8 +1619,8 @@ pub struct OffloadSettings {
     /// neutralize config-driven hooks). Seeded with a default `git` policy
     /// (refuse config-injection / root-escape flags + the `config`
     /// subcommand, neutralize pager/ssh via env). Fully visible and editable
-    /// in Settings → Offload → Tools. A program with no matching policy gets
-    /// only the allowlist + bare-name/PATH guard.
+    /// in Settings → Offload task tools → Tools. A program with no matching
+    /// policy gets only the allowlist + bare-name/PATH guard.
     pub command_policies: Vec<CommandPolicy>,
     /// User-installed MCP tool servers aggregated by cImp's MCP host
     /// and exposed to the local model as OpenAI tools. Mirrors Claude's
@@ -2936,6 +2936,13 @@ impl Default for McpServerConfig {
 ///
 /// Mirrored by hand in `src/lib/settings/types.ts` (`LOCAL_DATA_TOOLS`), which
 /// is what the Settings window writes when a backend's cloud flag is toggled.
+///
+/// #48 finding **F-27**: that mirror went stale the day `run_check` was added
+/// here, so the settings-side half of F-12 had no effect for a release. It is now
+/// held by an `include_str!` tripwire —
+/// `settings::frontend_mirrors::local_data_tools_mirror_is_current` — which
+/// compares the two as SETS in both directions, so editing this list without
+/// editing that file fails `cargo test`.
 pub const LOCAL_DATA_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
@@ -3887,7 +3894,8 @@ pub struct WaveformSettings {
     /// non-empty value is a user override that wins regardless of theme.
     /// Render the audio waveform over the avatar. When false the waveform
     /// canvas is hidden entirely (the avatar itself is unaffected). Toggled
-    /// by the "Show waveform" checkbox in Settings → Waveform. Defaults off.
+    /// by the "Show waveform" checkbox in Settings → Avatar → Waveform.
+    /// Defaults off.
     pub visible: bool,
     pub color: String,
     pub line_width: f32,

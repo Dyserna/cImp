@@ -176,6 +176,14 @@ impl ActivityKind {
 ///
 /// `injection_flag` is deliberately absent: its rows are never counted per kind
 /// (see [`Lane`]), so a cap here would be a number nothing reads.
+///
+/// **Adding an event class? Pick a lane on purpose** (#51). The graph-window
+/// fallback below exists for FORWARD COMPAT (a file written by a newer build
+/// must still load here), not as a home: a kind left on it can be evicted by
+/// ordinary graph traffic, which is exactly the failure H-9 closed for the
+/// containment screens. A new kind recorded by *this* build gets its own cap
+/// in the table above — or a per-source lane split like `injection_flag`'s —
+/// as part of being added, not as a follow-up.
 fn kind_cap(kind: &str) -> usize {
     if kind == ActivityKind::Offload.as_str() {
         OFFLOAD_CAP

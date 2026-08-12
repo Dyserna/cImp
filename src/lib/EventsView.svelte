@@ -3,7 +3,10 @@
   // activity store the Tool Activity tab's "Activities" section shows, but
   // rendered as the ATTRIBUTION view: every row says which tab and which
   // harness session it belongs to, and the feed is filterable by kind,
-  // source/screen and tab.
+  // source/screen and tab. Workbench CHECKPOINTS are merged in as synthetic
+  // rows (kind `checkpoint`, straight from the shadow repo — see the note at
+  // `cps` below); clicking one lands on the Workbench Timeline with that
+  // checkpoint highlighted.
   //
   // ADDITIVE by decision: Tool Activity keeps its own feed untouched, and the
   // Workbench Timeline stays a separate tab. The overlap between the three is
@@ -19,6 +22,7 @@
     attributionId,
     attributionState,
     filterEntries,
+    matchesTabFilter,
     mergeEntries,
     rowStatus,
     tabFilterValue,
@@ -29,15 +33,19 @@
     TAB_FILTER_UNRECOGNIZED,
     type ActivityEntry,
     type ActivityRecord,
+    type Attribution,
     type AttributionState,
     type FeedFilter,
   } from './activity';
   import StatusChip from './StatusChip.svelte';
   import { fmtTime } from './format';
   import { fmtTok } from './usageMath';
-  import { EVENTS_TAB_ID } from './tabs/types';
+  import { EVENTS_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
+  import { revealTab } from './tabs/visibility';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
   import { loadViewSet, loadViewString, saveViewSet, saveViewString } from './viewSection';
+  import { settings } from './settings/store';
+  import { workbenchCheckpoints, openTimelineCheckpoint, type Checkpoint } from './workbench';
 
   // ── Feed poll ─────────────────────────────────────────────────────────
   // `$state.raw`: the feed holds up to ~1.4k rows (the per-lane caps in
@@ -57,6 +65,47 @@
     }
   }
 
+  // ── Checkpoint rows (#51) ─────────────────────────────────────────────
+  // Merged CLIENT-SIDE from the shadow repo (`workbench_checkpoints`), not
+  // recorded into the activity store: checkpoints already persist in the
+  // shadow repo under their own GC, so a second copy in tool-activity.jsonl
+  // could only drift from it (a GC'd checkpoint whose "event" still claims
+  // a restore point, or the reverse), and a new store kind would also owe a
+  // retention-lane decision (see `kind_cap` in `crate::activity`). Events is
+  // the INDEX; the Timeline and its shadow repo stay the source of truth —
+  // the same one-way join the Timeline itself uses for contamination rows,
+  // pointed the other way.
+  let cps = $state.raw<Checkpoint[]>([]);
+
+  async function refreshCheckpoints(): Promise<void> {
+    if (!$settings.workbench.checkpoints) {
+      cps = [];
+      return;
+    }
+    try {
+      // Newest first (the command returns oldest-first), reusing held rows
+      // like the activity poll above.
+      cps = mergeCheckpoints(cps, (await workbenchCheckpoints()).slice().reverse());
+    } catch {
+      /* keep the last list — a failed read is not an empty timeline */
+    }
+  }
+
+  /// `mergeEntries`' reuse trick, resting on the same invariant: a checkpoint
+  /// tag's metadata never changes after creation (a dedup hit returns the
+  /// previous tag unrelabelled), so an id already held identifies identical
+  /// content.
+  function mergeCheckpoints(prev: Checkpoint[], next: Checkpoint[]): Checkpoint[] {
+    const byId = new Map(prev.map((c) => [c.id, c]));
+    let identical = prev.length === next.length;
+    const merged = next.map((c, i) => {
+      const kept = byId.get(c.id) ?? c;
+      if (identical && kept !== prev[i]) identical = false;
+      return kept;
+    });
+    return identical ? prev : merged;
+  }
+
   // ── Filters ───────────────────────────────────────────────────────────
   // CLIENT-SIDE: the poll fetches the whole feed and `filterEntries` narrows
   // it here. `activity_list` does take a server-side filter, but it can only
@@ -68,15 +117,87 @@
 
   const shown = $derived(filterEntries(entries, filter));
 
+  // The synthetic kind checkpoint rows wear in the Kind column and filter.
+  // Not an `ActivityKind` — these rows never touch the store.
+  const CHECKPOINT_KIND = 'checkpoint';
+
+  /// A checkpoint's Source cell: the harness that prompted it, or
+  /// `workbench` for the app's own triggers (burst / manual / pre-restore).
+  function cpSource(cp: Checkpoint): string {
+    return cp.agent ?? 'workbench';
+  }
+
+  /// A checkpoint's attribution, in the feed's own four-state vocabulary.
+  /// `tab` is cImp-authored (`Origin` at snapshot time), so a present id
+  /// renders as a tab. Absent splits on trigger: burst/manual/pre-restore
+  /// positively have no conversation behind them (headless), while a prompt
+  /// checkpoint without one predates the identity fields (unattributed).
+  function cpAttribution(cp: Checkpoint): Attribution {
+    if (cp.tab) return { tab: cp.tab };
+    return cp.trigger === 'prompt' ? 'unattributed' : 'headless';
+  }
+
+  const shownCps = $derived(
+    cps.filter(
+      (cp) =>
+        (filter.kind === FILTER_ANY || filter.kind === CHECKPOINT_KIND) &&
+        (filter.source === FILTER_ANY || cpSource(cp) === filter.source) &&
+        matchesTabFilter(cpAttribution(cp), filter.tab),
+    ),
+  );
+
+  // One merged, newest-first list. Row WRAPPERS are reused so long as the
+  // underlying object is the one already held (`mergeEntries` /
+  // `mergeCheckpoints` make identity mean identical content) — with fresh
+  // wrappers every poll, every row's expressions would re-evaluate each
+  // tick, the exact full-table churn `mergeEntries` exists to prevent.
+  type FeedRow =
+    | { key: string; ts: number; e: ActivityEntry; cp: null }
+    | { key: string; ts: number; e: null; cp: Checkpoint };
+  let rowCache = new Map<string, FeedRow>();
+  const shownRows = $derived.by(() => {
+    const cache = new Map<string, FeedRow>();
+    const out: FeedRow[] = [];
+    for (const e of shown) {
+      const key = `a${e.id}`;
+      const prev = rowCache.get(key);
+      const row: FeedRow = prev && prev.e === e ? prev : { key, ts: e.ts_ms, e, cp: null };
+      cache.set(key, row);
+      out.push(row);
+    }
+    for (const cp of shownCps) {
+      const key = `c${cp.id}`;
+      const prev = rowCache.get(key);
+      const row: FeedRow =
+        prev && prev.cp === cp ? prev : { key, ts: cp.ts_unix * 1000, e: null, cp };
+      cache.set(key, row);
+      out.push(row);
+    }
+    rowCache = cache;
+    // Stable sort, so same-millisecond rows keep activity-before-checkpoint
+    // order instead of flickering between polls.
+    out.sort((a, b) => b.ts - a.ts);
+    return out;
+  });
+
+  const totalCount = $derived(entries.length + cps.length);
+
   // Options are derived from the feed rather than hardcoded: `kind` gains
   // variants over time and `source` is free text (it names the offload
   // backend, or the V32 screen that fired), so anything this build doesn't
   // know still shows up and stays selectable.
   const kindOptions = $derived(
-    [...new Set(entries.map((e) => e.kind))].sort((a, b) => a.localeCompare(b)),
+    [
+      ...new Set<string>([
+        ...entries.map((e) => e.kind),
+        ...(cps.length > 0 ? [CHECKPOINT_KIND] : []),
+      ]),
+    ].sort((a, b) => a.localeCompare(b)),
   );
   const sourceOptions = $derived(
-    [...new Set(entries.map((e) => e.source))].sort((a, b) => a.localeCompare(b)),
+    [...new Set([...entries.map((e) => e.source), ...cps.map(cpSource)])].sort((a, b) =>
+      a.localeCompare(b),
+    ),
   );
   // ONLY genuine `{ tab: x }` ids become tab options. An `{ unrecognized: x }`
   // row names no configured tab, so offering it here would put a phantom tab
@@ -84,13 +205,23 @@
   // reachable through the dedicated "unrecognized" option instead.
   const tabOptions = $derived(
     [
-      ...new Set(
-        entries
+      ...new Set([
+        ...entries
           .filter((e) => attributionState(e.tab) === 'tab')
           .map((e) => attributionId(e.tab) as string),
-      ),
+        ...cps.filter((cp) => cp.tab !== null).map((cp) => cp.tab as string),
+      ]),
     ].sort((a, b) => a.localeCompare(b)),
   );
+
+  /// A checkpoint row's click: land on the Workbench Timeline with that
+  /// checkpoint highlighted — Events is the index, the Timeline is the
+  /// specialist view (#51). No detail popup for these rows; the Timeline IS
+  /// the detail.
+  function openCheckpoint(cp: Checkpoint): void {
+    openTimelineCheckpoint(cp.id);
+    revealTab(WORKBENCH_TAB_ID);
+  }
 
   function resetFilters(): void {
     filter = { ...NO_FILTER };
@@ -237,12 +368,25 @@
   // a fresh refresh runs the moment it comes back. A periodic job in a
   // reserved app view that does NOT gate on appViewVisibility keeps burning
   // IPC forever once the tab has been opened once — a known bug class here.
-  const unsubShown = onAppViewShown(EVENTS_TAB_ID, () => void refresh());
+  const unsubShown = onAppViewShown(EVENTS_TAB_ID, () => {
+    void refresh();
+    void refreshCheckpoints();
+  });
+
+  // Checkpoints change far less often than the activity feed and cost a git
+  // spawn per read, so they ride every CP_EVERY-th tick of the 2s poll (plus
+  // the on-shown refresh above) rather than all of them.
+  const CP_EVERY = 3;
+  let pollTick = 0;
 
   onMount(() => {
     void refresh();
+    void refreshCheckpoints();
     poll = setInterval(() => {
-      if (isAppViewVisible(EVENTS_TAB_ID)) void refresh();
+      if (!isAppViewVisible(EVENTS_TAB_ID)) return;
+      void refresh();
+      pollTick += 1;
+      if (pollTick % CP_EVERY === 0) void refreshCheckpoints();
     }, 2000);
     window.addEventListener('keydown', onKeyDown);
   });
@@ -310,15 +454,17 @@
   // own styling — see the `Attribution` doc in activity.ts for why collapsing
   // any two of them is a bug, and .attr-* below for how they stay visually
   // distinct.
-  function attrLabel(e: ActivityEntry): string {
-    const state = attributionState(e.tab);
+  // Over `Attribution` rather than `ActivityEntry`, so the synthetic
+  // checkpoint rows wear the exact same four-state treatment.
+  function attrLabel(a: Attribution): string {
+    const state = attributionState(a);
     switch (state) {
       case 'tab':
-        return attributionId(e.tab) as string;
+        return attributionId(a) as string;
       case 'unrecognized':
         // Never rendered as a bare id: the id is shown (it is evidence) but
         // always behind the word that says it names no tab that exists.
-        return `unrecognized: ${attributionId(e.tab)}`;
+        return `unrecognized: ${attributionId(a)}`;
       case 'headless':
         return 'no tab';
       default:
@@ -326,12 +472,12 @@
     }
   }
 
-  function attrTitle(e: ActivityEntry): string {
-    switch (attributionState(e.tab)) {
+  function attrTitle(a: Attribution): string {
+    switch (attributionState(a)) {
       case 'tab':
-        return `Tab ${attributionId(e.tab)}`;
+        return `Tab ${attributionId(a)}`;
       case 'unrecognized':
-        return `Unrecognized id "${attributionId(e.tab)}" — it names no configured tab, so this row is NOT attributable to a tab`;
+        return `Unrecognized id "${attributionId(a)}" — it names no configured tab, so this row is NOT attributable to a tab`;
       case 'headless':
         return 'No tab: a headless caller (claude -p, cron, a worker task, or cImp’s own internal work). A fact about the caller, not missing data.';
       default:
@@ -339,8 +485,8 @@
     }
   }
 
-  function attrState(e: ActivityEntry): AttributionState {
-    return attributionState(e.tab);
+  function attrState(a: Attribution): AttributionState {
+    return attributionState(a);
   }
 
   // Sessions are long opaque ids; the head is enough to eyeball two rows as
@@ -355,9 +501,9 @@
   <header>
     <h2>Events</h2>
     <span class="count">
-      {shown.length === entries.length
-        ? `${entries.length} events`
-        : `${shown.length} of ${entries.length} events`}
+      {shownRows.length === totalCount
+        ? `${totalCount} events`
+        : `${shownRows.length} of ${totalCount} events`}
     </span>
   </header>
 
@@ -452,45 +598,88 @@
         </span>
       {/each}
     </div>
-    {#if entries.length === 0}
+    {#if totalCount === 0}
       <div class="empty">
         No events recorded yet — query the graph from a Claude tab or run an
         offload_task and it shows up here.
       </div>
-    {:else if shown.length === 0}
+    {:else if shownRows.length === 0}
       <div class="empty">No events match the current filters.</div>
     {:else}
       <div class="rows">
-        {#each shown as r (r.id)}
-          <div
-            class="erow"
-            role="button"
-            tabindex="0"
-            onclick={() => void openDetail(r.id)}
-            onkeydown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                void openDetail(r.id);
-              }
-            }}
-          >
-            {#if visible.time}<span class="etime">{fmtTime(r.ts_ms)}</span>{/if}
-            {#if visible.kind}<span class="ekind {r.kind}">{r.kind}</span>{/if}
-            {#if visible.source}<span class="esrc{srcClass(r.source)}" title={r.source}
-                >{r.source}</span
-              >{/if}
-            {#if visible.tool}<span class="etool" title={r.tool}>{rowTool(r)}</span>{/if}
-            {#if visible.target}<span class="etarget" title={r.target}>{r.target}</span>{/if}
-            {#if visible.status}<StatusChip status={rowStatus(r)} />{/if}
-            {#if visible.tab}<span class="eattr attr-{attrState(r)}" title={attrTitle(r)}
-                >{attrLabel(r)}</span
-              >{/if}
-            {#if visible.session}<span
-                class="esession"
-                class:none={!r.session}
-                title={r.session ?? 'No session recorded'}>{shortSession(r.session)}</span
-              >{/if}
-          </div>
+        {#each shownRows as row (row.key)}
+          {#if row.e}
+            {@const r = row.e}
+            <div
+              class="erow"
+              role="button"
+              tabindex="0"
+              onclick={() => void openDetail(r.id)}
+              onkeydown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  void openDetail(r.id);
+                }
+              }}
+            >
+              {#if visible.time}<span class="etime">{fmtTime(r.ts_ms)}</span>{/if}
+              {#if visible.kind}<span class="ekind {r.kind}">{r.kind}</span>{/if}
+              {#if visible.source}<span class="esrc{srcClass(r.source)}" title={r.source}
+                  >{r.source}</span
+                >{/if}
+              {#if visible.tool}<span class="etool" title={r.tool}>{rowTool(r)}</span>{/if}
+              {#if visible.target}<span class="etarget" title={r.target}>{r.target}</span>{/if}
+              {#if visible.status}<StatusChip status={rowStatus(r)} />{/if}
+              {#if visible.tab}<span class="eattr attr-{attrState(r.tab)}" title={attrTitle(r.tab)}
+                  >{attrLabel(r.tab)}</span
+                >{/if}
+              {#if visible.session}<span
+                  class="esession"
+                  class:none={!r.session}
+                  title={r.session ?? 'No session recorded'}>{shortSession(r.session)}</span
+                >{/if}
+            </div>
+          {:else}
+            {@const cp = row.cp}
+            <!-- A checkpoint row: no detail popup — the click lands on the
+                 Workbench Timeline with this checkpoint highlighted. -->
+            <div
+              class="erow"
+              role="button"
+              tabindex="0"
+              title="Open in the Workbench Timeline"
+              onclick={() => openCheckpoint(cp)}
+              onkeydown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openCheckpoint(cp);
+                }
+              }}
+            >
+              {#if visible.time}<span class="etime">{fmtTime(row.ts)}</span>{/if}
+              {#if visible.kind}<span class="ekind checkpoint">checkpoint</span>{/if}
+              {#if visible.source}<span
+                  class="esrc{srcClass(cpSource(cp))}"
+                  title={cpSource(cp)}>{cpSource(cp)}</span
+                >{/if}
+              {#if visible.tool}<span class="etool" title={cp.trigger}>{cp.trigger}</span>{/if}
+              {#if visible.target}<span class="etarget" title={cp.label}>{cp.label}</span>{/if}
+              {#if visible.status}<span
+                  class="cpfiles"
+                  title="Files changed since the previous checkpoint — what this checkpoint captured when taken, not its diff against the current tree"
+                  >{cp.files_changed} files</span
+                >{/if}
+              {#if visible.tab}
+                {@const a = cpAttribution(cp)}
+                <span class="eattr attr-{attrState(a)}" title={attrTitle(a)}>{attrLabel(a)}</span>
+              {/if}
+              {#if visible.session}<span
+                  class="esession"
+                  class:none={!cp.session}
+                  title={cp.session ?? 'No session recorded'}>{shortSession(cp.session)}</span
+                >{/if}
+            </div>
+          {/if}
         {/each}
       </div>
     {/if}
@@ -516,8 +705,8 @@
           <span title={detail.target}>{detail.target}</span>{/if}
       </div>
       <div class="detail-attr">
-        <span class="eattr attr-{attrState(detail)}" title={attrTitle(detail)}
-          >{attrLabel(detail)}</span
+        <span class="eattr attr-{attrState(detail.tab)}" title={attrTitle(detail.tab)}
+          >{attrLabel(detail.tab)}</span
         >
         <span class="detail-session">
           session: {detail.session ?? 'not recorded'}
@@ -773,6 +962,18 @@
     background: color-mix(in srgb, var(--danger, #f06080) 14%, transparent);
     border-radius: 3px;
     padding: 0 3px;
+  }
+  /* Synthetic checkpoint rows (#51): teal, so they read as neither the graph
+     blue nor the offload green next to them. */
+  .ekind.checkpoint {
+    color: color-mix(in srgb, var(--text-info, #58a6ff) 45%, var(--text-success, #3fb950));
+  }
+  /* The Status cell of a checkpoint row — a fact (what it captured), not a
+     call outcome, so deliberately NOT a StatusChip word. */
+  .cpfiles {
+    font-size: 0.82em;
+    opacity: 0.75;
+    cursor: help;
   }
   .esrc.claude {
     color: var(--text-info, #58a6ff);

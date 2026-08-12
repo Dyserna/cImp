@@ -25,6 +25,8 @@
     workbenchCheckpointDiff,
     workbenchCheckpointNow,
     workbenchCheckpointsVersion,
+    timelineCheckpointRequest,
+    takeTimelineHighlightRoute,
     FULL_FILE_CONTEXT,
     type Checkpoint,
     type FileDiff,
@@ -139,7 +141,47 @@
     return () => {
       unsub();
       clearInterval(poll);
+      if (highlightTimer) clearTimeout(highlightTimer);
     };
+  });
+
+  // ── Events-tab jump target (#51) ──────────────────────────────────────────
+  // A checkpoint-row click in the Events tab lands here: highlight that row
+  // for HIGHLIGHT_MS and scroll it into view once the list contains it (the
+  // request can arrive before this component has fetched — or even mounted).
+  // One-shot per nonce via the module-scope latch in workbench.ts, so a
+  // remount inside the window does not replay a finished jump.
+  const HIGHLIGHT_MS = 20_000;
+  let highlightId = $state<string | null>(null);
+  let highlightTimer: ReturnType<typeof setTimeout> | null = null;
+  let highlightScrolled = false;
+  let rootEl: HTMLElement | null = null;
+
+  $effect(() => {
+    const req = $timelineCheckpointRequest;
+    if (!req || !takeTimelineHighlightRoute(req.nonce)) return;
+    if (highlightTimer) clearTimeout(highlightTimer);
+    highlightId = req.id;
+    highlightScrolled = false;
+    highlightTimer = setTimeout(() => {
+      highlightId = null;
+      highlightTimer = null;
+    }, HIGHLIGHT_MS);
+  });
+
+  // Runs after every DOM update while a highlight is pending: the moment the
+  // row exists (initial fetch, or a later poll if the checkpoint was created
+  // between the Events poll and the click), scroll to it — once. A checkpoint
+  // GC'd in the meantime simply never matches and the highlight quietly
+  // expires.
+  $effect(() => {
+    if (highlightId === null || highlightScrolled) return;
+    if (!rows.some((r) => r.kind === 'checkpoint' && r.checkpoint.id === highlightId)) return;
+    const el = rootEl?.querySelector(`[data-cp="${highlightId}"]`);
+    if (el) {
+      highlightScrolled = true;
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
   });
 
   const latchRows = $derived(
@@ -326,7 +368,7 @@
   }
 </script>
 
-<div class="timeline">
+<div class="timeline" bind:this={rootEl}>
   <div class="toolbar">
     <button type="button" class="checkpoint-now" onclick={checkpointNow} disabled={creatingNow}>
       {creatingNow ? 'Checkpointing…' : 'Checkpoint now'}
@@ -370,7 +412,7 @@
       {#each rows as row (row.key)}
         {#if row.kind === 'checkpoint'}
           {@const cp = row.checkpoint}
-          <div class="row">
+          <div class="row" data-cp={cp.id} class:flash={highlightId === cp.id}>
             <div class="row-main">
               <span class="trigger" title={rowTitle(row)}>{rowIcon(row)}</span>
               <span class="time">{formatTime(cp.ts)}</span>
@@ -583,6 +625,17 @@
     border: 1px solid var(--border-subtle, #444);
     border-radius: var(--radius-md, 6px);
     overflow: hidden;
+  }
+  /* The Events-tab jump target (#51): held for HIGHLIGHT_MS, then the class
+     drops and the transition fades the row back to normal. */
+  .row.flash {
+    border-color: var(--accent, #3b6ea5);
+    background: color-mix(in srgb, var(--accent, #3b6ea5) 14%, transparent);
+  }
+  .row:not(.flash) {
+    transition:
+      background 0.6s ease,
+      border-color 0.6s ease;
   }
   /* An event, not a restore point — it must not read as another checkpoint. */
   .row.contam {

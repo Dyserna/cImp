@@ -10,7 +10,14 @@
   // explaining what each section needs (git, or checkpoints once Phase C
   // lands). The sections themselves are filled in by B/C/D.
   import { onMount } from 'svelte';
-  import { workbenchStatus, sessionCommitsRequest, takeSessionCommitsRoute, type WorkbenchStatus } from './workbench';
+  import {
+    workbenchStatus,
+    sessionCommitsRequest,
+    takeSessionCommitsRoute,
+    timelineCheckpointRequest,
+    takeTimelineSectionRoute,
+    type WorkbenchStatus,
+  } from './workbench';
   import { settings } from './settings/store';
   import { WORKBENCH_TAB_ID } from './tabs/types';
   import { onAppViewShown } from './appViewVisibility';
@@ -47,6 +54,14 @@
   $effect(() => {
     const req = $sessionCommitsRequest;
     if (req && takeSessionCommitsRoute(req.nonce)) section = 'session-commits';
+  });
+
+  // An Events-tab checkpoint-row click (#51): same pattern, lands on the
+  // Timeline section; TimelineView consumes the highlight half of the request
+  // through its own latch.
+  $effect(() => {
+    const req = $timelineCheckpointRequest;
+    if (req && takeTimelineSectionRoute(req.nonce)) section = 'timeline';
   });
 
   let status = $state<WorkbenchStatus | null>(null);

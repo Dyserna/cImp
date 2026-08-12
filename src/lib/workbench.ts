@@ -415,3 +415,45 @@ export function takeSessionCommitsRoute(nonce: number): boolean {
   routedSessionCommitsNonce = nonce;
   return true;
 }
+
+// ── Events-tab → Timeline checkpoint jump (#51) ─────────────────────────────
+// Same store-bus + one-shot-latch idiom as the Session-commits jump above,
+// with one difference: TWO consumers read one request — WorkbenchView switches
+// to the Timeline section, TimelineView highlights (and scrolls to) the
+// checkpoint — so each consumes its OWN latch. Sharing one latch would make
+// whichever component's effect ran first swallow the other's half of the jump.
+
+export interface TimelineCheckpointRequest {
+  /// The checkpoint to land on (the `cp-N` tag id).
+  id: string;
+  nonce: number;
+}
+
+let timelineCheckpointNonce = 0;
+
+export const timelineCheckpointRequest = writable<TimelineCheckpointRequest | null>(null);
+
+export function openTimelineCheckpoint(id: string): void {
+  timelineCheckpointNonce += 1;
+  timelineCheckpointRequest.set({ id, nonce: timelineCheckpointNonce });
+}
+
+let routedTimelineSectionNonce = 0;
+
+/// WorkbenchView's half: switch to the Timeline section, once per request.
+export function takeTimelineSectionRoute(nonce: number): boolean {
+  if (nonce === routedTimelineSectionNonce) return false;
+  routedTimelineSectionNonce = nonce;
+  return true;
+}
+
+let routedTimelineHighlightNonce = 0;
+
+/// TimelineView's half: highlight the checkpoint, once per request. Module
+/// scope for the same reason as `takeSessionCommitsRoute` — the component is
+/// destroyed/recreated, and a replay would re-highlight a long-done jump.
+export function takeTimelineHighlightRoute(nonce: number): boolean {
+  if (nonce === routedTimelineHighlightNonce) return false;
+  routedTimelineHighlightNonce = nonce;
+  return true;
+}

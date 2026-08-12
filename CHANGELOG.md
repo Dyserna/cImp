@@ -5,6 +5,106 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0-rc.4] — 2026-08-12
+
+**Pre-release, for testing.** The finding-closure RC: **every V32 finding is
+closed** (42 locked decisions recorded), and **22 of the 25 live-verification
+recipes have now been run** — the detection auto-updater's two (11/11b) are
+deferred to #53 with the updater itself, and the remainder passed or closed
+with recorded residuals. Also carries a round of UI work: the Events tab
+finished (#51 closed), Timeline and quarantine-review usability, and a
+containment frame around latched panes. **Settings schema 30** (was 29) and
+**graph store v7** (was 6) — see the upgrade notes.
+
+### Added
+
+- **Injection protection is its own Settings category** (F-18) — the V32
+  controls no longer hide under *Offload task tools*, and every pointer to
+  them now names a section that exists.
+- **The Events tab is finished, and is now the one activity feed** (#51
+  closed). Checkpoints appear as rows (straight from the shadow repo — never
+  copied into the store), and clicking one lands on the Workbench Timeline
+  with that checkpoint highlighted for 20 s. Columns are resizable and
+  hideable, timestamps are 24-hour app-wide, and the tab column is now
+  populated for graph, audit **and proxied MCP** rows (rc.3's known issue).
+  The Tools tab's Activities section is retired into it, and the store's
+  delete / clear-history actions moved with it.
+- **Workbench Timeline usability** — auto-refresh (5 s, only while visible),
+  the standing per-row explanations folded into hover icons, and the files
+  count explains what it measures (changes since the *previous* checkpoint,
+  not the diff-vs-now).
+- **Quarantine review that supports the decision** — a held note expands to
+  its full text plus context (session and its activity window, exact time,
+  what promoting would pin, the holding screen and rules), and *Promote all…*
+  / *Discard all…* exist with the same confirmation polarity as the per-note
+  buttons.
+- **A latched tab is visible from the pane, not just the tab strip** — a 1px
+  frame in the containment color wraps the tab's content while it is latched
+  (yellow) or contaminated (red). Both colors are configurable under
+  Settings → Appearance → Containment colors, and the ⛨ badge follows the
+  same setting so the two surfaces cannot disagree.
+- **`run_check` is denied to remote offload backends by default** (F-12),
+  with an explicit opt-in.
+
+### Fixed
+
+- **A live SSRF bypass** (F-33): non-canonical IP literals — octal
+  `0177.0.0.1`, shorthand `127.1` — reached loopback/RFC1918/metadata targets
+  unscreened. Found by measuring the filed-as-cosmetic finding instead of
+  patching it.
+- **A full unlatch clears contamination** (decision 15 amendment): restoring
+  full access is the user's verdict, and the click already hands back the
+  strictly larger risk.
+- **The reporting-honesty family** (M-22/M-23/M-24/F-24): one status
+  vocabulary for containment rows across both feeds (a held memory note, an
+  unscreened result and a blocked call are no longer one red chip), the
+  promote/discard confirmation weight un-inverted, and every quarantined note
+  now states *why* it is held.
+- **The attribution/forensics family** (F-16/F-20/F-26/M-17 + F-29):
+  rootless rows are surfaced instead of silently dropped, refusals state the
+  cause that was actually checked (F-23/M-21), and containment rows derive
+  their tab from the validated scope.
+- **Scan budgets are per pass and gaps are reported honestly**
+  (F-9/F-9a/M-5/M-1): one task-scoped budget, the cap is the real cap, and
+  "not scanned" is never reported as "clean".
+- **The activity store bounds caller-controlled input** (F-37/F-39) and the
+  spawn/identity family (F-13/F-14/M-3/M-16) is closed — note these fixes are
+  spawn-baked (see upgrade notes).
+
+### Verified live
+
+22 of 25 recipes, run against real tabs and the real loopback — among them:
+the taint latch's refusal legs, flip stickiness and contamination surviving
+the flip, the gate-cache race (driven by controlling network latency alone),
+the memory-quarantine lifecycle end to end (hold → review → promote/discard),
+the enable hierarchy, and both legs of the detection channel. Failures found
+along the way were filed and fixed rather than waved through — 13 recipe
+claims were falsified during verification, three of them the orchestrator's.
+
+### Known issues
+
+- **The detection auto-updater's scheduler does not tick** (F-25, #53) — a
+  manual "Check now" works, scheduled checks do not. The updater work
+  (recipes 11/11b) is deferred to #53 wholesale.
+- **Two `audit::runner` kill-timing tests flake under heavy test-thread
+  contention** (F-17) — test-only; they pass in isolation, and a repro is
+  recorded. Re-run them alone before calling a regression.
+- **V33 items remain open by design**: sandboxing (H-7, F-4…F-8), including
+  `(consumer, tab)` cross-verification — the attribution column proves less
+  against an adversarial caller than an ordinary one.
+
+### Upgrade notes
+
+- **Settings schema 29 → 30** — migrates forward automatically; don't
+  downgrade across it.
+- **Graph store v6 → v7** — every project re-indexes on first launch; the
+  first minutes after upgrade are index-rebuild time, not a hang.
+- **Several fixes are spawn-baked** (F-13/M-16/F-23 and F-32's child half):
+  they apply to tabs spawned by the new binary. **Open a fresh tab after
+  upgrading** before judging them — an old tab reads as a failure.
+- **F-32 raises the activity JSONL ceiling** — the file compacts to the new
+  bound on first write.
+
 ## [0.51.0-rc.3] — 2026-08-10
 
 **Pre-release, for testing.** The first RC with live-verification results in it:

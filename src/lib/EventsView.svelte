@@ -37,6 +37,7 @@
   import { fmtTok } from './usageMath';
   import { EVENTS_TAB_ID } from './tabs/types';
   import { isAppViewVisible, onAppViewShown } from './appViewVisibility';
+  import { loadViewSet, loadViewString, saveViewSet, saveViewString } from './viewSection';
 
   // ── Feed poll ─────────────────────────────────────────────────────────
   // `$state.raw`: the feed holds up to ~1.4k rows (the per-lane caps in
@@ -95,6 +96,102 @@
     filter = { ...NO_FILTER };
   }
 
+  // ── Columns: visibility + drag-resize ─────────────────────────────────
+  // Both are per-machine VIEW preferences (like the sub-tab selection), so
+  // they persist through viewSection.ts / localStorage, not settings. Widths
+  // are px; `target` is the one flexible column (minmax → 1fr) so the table
+  // always fills the card, and its width acts as a minimum.
+  type ColKey = 'time' | 'kind' | 'source' | 'tool' | 'target' | 'status' | 'tab' | 'session';
+  interface Col {
+    key: ColKey;
+    label: string;
+    min: number;
+    def: number;
+    flex?: boolean;
+  }
+  const COLUMNS: readonly Col[] = [
+    { key: 'time', label: 'Time', min: 52, def: 88 },
+    { key: 'kind', label: 'Kind', min: 48, def: 80 },
+    { key: 'source', label: 'Source', min: 52, def: 96 },
+    { key: 'tool', label: 'Tool', min: 60, def: 144 },
+    { key: 'target', label: 'Target', min: 80, def: 160, flex: true },
+    { key: 'status', label: 'Status', min: 52, def: 104 },
+    { key: 'tab', label: 'Tab', min: 52, def: 144 },
+    { key: 'session', label: 'Session', min: 52, def: 88 },
+  ];
+
+  function loadWidths(): Record<ColKey, number> {
+    const out = Object.fromEntries(COLUMNS.map((c) => [c.key, c.def])) as Record<ColKey, number>;
+    try {
+      const raw = loadViewString('events', 'col-widths');
+      const saved: unknown = raw ? JSON.parse(raw) : null;
+      if (saved && typeof saved === 'object') {
+        for (const c of COLUMNS) {
+          const v = (saved as Record<string, unknown>)[c.key];
+          // Clamp to the column minimum so a corrupt/ancient value can never
+          // load a 0-width (invisible but "visible") column.
+          if (typeof v === 'number' && Number.isFinite(v)) out[c.key] = Math.max(c.min, v);
+        }
+      }
+    } catch {
+      /* unparseable → defaults */
+    }
+    return out;
+  }
+
+  function loadVisible(): Record<ColKey, boolean> {
+    // Stored as the HIDDEN set so newly added columns default to visible.
+    const hidden = new Set(loadViewSet('events', 'cols-hidden'));
+    return Object.fromEntries(COLUMNS.map((c) => [c.key, !hidden.has(c.key)])) as Record<
+      ColKey,
+      boolean
+    >;
+  }
+
+  let widths = $state<Record<ColKey, number>>(loadWidths());
+  let visible = $state<Record<ColKey, boolean>>(loadVisible());
+  let colMenuOpen = $state(false);
+
+  const shownCols = $derived(COLUMNS.filter((c) => visible[c.key]));
+  // One custom property on the card drives every row's grid — the rows
+  // themselves never re-render on resize.
+  const gridTemplate = $derived(
+    shownCols
+      .map((c) => (c.flex ? `minmax(${widths[c.key]}px, 1fr)` : `${widths[c.key]}px`))
+      .join(' '),
+  );
+
+  function toggleCol(key: ColKey): void {
+    if (visible[key] && shownCols.length === 1) return; // never hide the last one
+    visible[key] = !visible[key];
+    saveViewSet(
+      'events',
+      'cols-hidden',
+      COLUMNS.filter((c) => !visible[c.key]).map((c) => c.key),
+    );
+  }
+
+  // Drag state is a plain variable, not $state: nothing renders from it, the
+  // grip's pointer capture keeps move/up events flowing to the grip itself.
+  let resizing: { key: ColKey; min: number; startX: number; startW: number } | null = null;
+
+  function startResize(e: PointerEvent & { currentTarget: HTMLElement }, col: Col): void {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    resizing = { key: col.key, min: col.min, startX: e.clientX, startW: widths[col.key] };
+  }
+
+  function moveResize(e: PointerEvent): void {
+    if (!resizing) return;
+    widths[resizing.key] = Math.max(resizing.min, resizing.startW + e.clientX - resizing.startX);
+  }
+
+  function endResize(): void {
+    if (!resizing) return;
+    resizing = null;
+    saveViewString('events', 'col-widths', JSON.stringify(widths));
+  }
+
   // ── Detail popup ──────────────────────────────────────────────────────
   let detailOpen = $state(false);
   let detail = $state<ActivityRecord | null>(null);
@@ -126,9 +223,13 @@
   }
 
   function onKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'Escape' && detailOpen) {
+    if (e.key !== 'Escape') return;
+    if (detailOpen) {
       e.preventDefault();
       closeDetail();
+    } else if (colMenuOpen) {
+      e.preventDefault();
+      colMenuOpen = false;
     }
   }
 
@@ -260,12 +361,6 @@
     </span>
   </header>
 
-  <p class="caveat">
-    Every recorded tool call, offload run, audit scan and injection-containment
-    event, newest first, with the tab and harness session it belongs to. Click a
-    row for the captured request and response.
-  </p>
-
   <div class="filters">
     <label>
       <span>Kind</span>
@@ -312,18 +407,50 @@
         filter.tab === FILTER_ANY}
       onclick={resetFilters}>Reset</button
     >
+
+    <div class="colmenu-wrap">
+      <button type="button" class="reset" onclick={() => (colMenuOpen = !colMenuOpen)}
+        >Columns ▾</button
+      >
+      {#if colMenuOpen}
+        <!-- Transparent backdrop = outside-click-to-close, same pattern as the
+             detail dialog's backdrop but without the dimming. -->
+        <div class="colmenu-backdrop" onclick={() => (colMenuOpen = false)} role="presentation">
+        </div>
+        <div class="colmenu">
+          {#each COLUMNS as c (c.key)}
+            <label class="colopt">
+              <input
+                type="checkbox"
+                checked={visible[c.key]}
+                disabled={visible[c.key] && shownCols.length === 1}
+                onchange={() => toggleCol(c.key)}
+              />
+              <span>{c.label}</span>
+            </label>
+          {/each}
+        </div>
+      {/if}
+    </div>
   </div>
 
-  <section class="card feed">
+  <section class="card feed" style="--ecols: {gridTemplate}">
     <div class="erow head">
-      <span>Time</span>
-      <span>Kind</span>
-      <span>Source</span>
-      <span>Tool</span>
-      <span>Target</span>
-      <span>Status</span>
-      <span>Tab</span>
-      <span>Session</span>
+      {#each shownCols as c (c.key)}
+        <span>
+          {c.label}
+          <span
+            class="grip"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize {c.label} column"
+            onpointerdown={(e) => startResize(e, c)}
+            onpointermove={moveResize}
+            onpointerup={endResize}
+            onpointercancel={endResize}
+          ></span>
+        </span>
+      {/each}
     </div>
     {#if entries.length === 0}
       <div class="empty">
@@ -347,16 +474,22 @@
               }
             }}
           >
-            <span class="etime">{fmtTime(r.ts_ms)}</span>
-            <span class="ekind {r.kind}">{r.kind}</span>
-            <span class="esrc{srcClass(r.source)}" title={r.source}>{r.source}</span>
-            <span class="etool" title={r.tool}>{rowTool(r)}</span>
-            <span class="etarget" title={r.target}>{r.target}</span>
-            <StatusChip status={rowStatus(r)} />
-            <span class="eattr attr-{attrState(r)}" title={attrTitle(r)}>{attrLabel(r)}</span>
-            <span class="esession" class:none={!r.session} title={r.session ?? 'No session recorded'}
-              >{shortSession(r.session)}</span
-            >
+            {#if visible.time}<span class="etime">{fmtTime(r.ts_ms)}</span>{/if}
+            {#if visible.kind}<span class="ekind {r.kind}">{r.kind}</span>{/if}
+            {#if visible.source}<span class="esrc{srcClass(r.source)}" title={r.source}
+                >{r.source}</span
+              >{/if}
+            {#if visible.tool}<span class="etool" title={r.tool}>{rowTool(r)}</span>{/if}
+            {#if visible.target}<span class="etarget" title={r.target}>{r.target}</span>{/if}
+            {#if visible.status}<StatusChip status={rowStatus(r)} />{/if}
+            {#if visible.tab}<span class="eattr attr-{attrState(r)}" title={attrTitle(r)}
+                >{attrLabel(r)}</span
+              >{/if}
+            {#if visible.session}<span
+                class="esession"
+                class:none={!r.session}
+                title={r.session ?? 'No session recorded'}>{shortSession(r.session)}</span
+              >{/if}
           </div>
         {/each}
       </div>
@@ -437,7 +570,7 @@
     align-items: baseline;
     justify-content: space-between;
     gap: 12px;
-    margin-bottom: 4px;
+    margin-bottom: 10px;
   }
   header h2 {
     margin: 0;
@@ -446,11 +579,6 @@
   .count {
     font-size: 11px;
     opacity: 0.65;
-  }
-  .caveat {
-    font-size: 11px;
-    opacity: 0.65;
-    margin: 2px 0 10px;
   }
   .filters {
     display: flex;
@@ -522,10 +650,9 @@
   }
   .erow {
     display: grid;
-    /* Status column widened from 4.5rem: M-24 replaced five words with twelve
-       and `unscreened` is the longest of them. The slack comes out of the
-       flexible target column, not out of another fixed one. */
-    grid-template-columns: 5.5rem 5rem 6rem 9rem 1fr 6.5rem 9rem 5.5rem;
+    /* Set per-instance on the .feed card: the visible-column set and the
+       user's drag-resized widths compose `gridTemplate` in the script. */
+    grid-template-columns: var(--ecols);
     align-items: center;
     gap: 8px;
     height: var(--erow-h);
@@ -547,6 +674,73 @@
     text-transform: uppercase;
     font-size: 0.78em;
     border-bottom-color: var(--border-subtle, #3a3a3a);
+  }
+  .erow.head > span {
+    /* The grip hangs into the 8px column gap, so header cells must not clip. */
+    position: relative;
+    overflow: visible;
+  }
+  .grip {
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    right: -8px;
+    width: 9px;
+    cursor: col-resize;
+    /* The grip itself is the pointer-capture target during a drag. */
+    touch-action: none;
+  }
+  .grip::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 4px;
+    width: 1px;
+    background: var(--border-subtle, #3a3a3a);
+  }
+  .grip:hover::after,
+  .grip:active::after {
+    background: var(--text-info, #58a6ff);
+  }
+  .colmenu-wrap {
+    position: relative;
+  }
+  .colmenu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+  }
+  .colmenu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 61;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 9rem;
+    padding: 6px 8px;
+    background: var(--surface-3, #1e1e1e);
+    border: 1px solid var(--border-subtle, #3a3a3a);
+    border-radius: 6px;
+    box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.5));
+  }
+  .colopt {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 2px 2px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .colopt:has(input:disabled) {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .colopt input {
+    margin: 0;
   }
   .erow:not(.head):hover,
   .erow:not(.head):focus-visible {

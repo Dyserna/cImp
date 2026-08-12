@@ -5,7 +5,8 @@
   // (Close? Yes / No); clicking × on an already-closed shell skips the
   // confirm and calls close_tab immediately.
   import type { AvatarState } from './avatarState';
-  import { reducedTabLine, type FeatureState, type LatchRow } from './latch';
+  import { reducedTabLine, taintColor, type FeatureState, type LatchRow } from './latch';
+  import { settings } from './settings/store';
 
   let {
     tabId,
@@ -204,6 +205,15 @@
   /// Whether the badge renders at all. Either containment state counts.
   let showTaintBadge = $derived(!!taint || reduced.length > 0);
 
+  /// The badge's color for the two TAINT states, from the same settings (and
+  /// the same resolver) as the pane frame — the badge and the frame around
+  /// the tab's content must never disagree. Null for the reduced-protection
+  /// badge, which keeps its muted CSS color: nothing has happened to that
+  /// session, so it must not wear an event color.
+  let badgeColor = $derived(
+    taintColor(taint, $settings.ui.latched_color, $settings.ui.contaminated_color),
+  );
+
   function onTaintClick(e: MouseEvent): void {
     // Don't let the click also activate or drag the tab.
     e.stopPropagation();
@@ -326,6 +336,7 @@
         class:taint-contaminated={taint?.contaminated}
         class:taint-reduced={!taint && reduced.length > 0}
         class:taint-unverified={!taint && reduced.length > 0 && reduced.every((f) => f.unknown)}
+        style:color={badgeColor ?? undefined}
         role="button"
         tabindex="0"
         aria-label="Containment state for this tab"

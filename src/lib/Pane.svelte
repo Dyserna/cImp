@@ -27,6 +27,8 @@
   import { attachAppView, detachAppView, isAppViewTab } from './appViews';
   import { isShellTab, type TabId } from './tabs/types';
   import { tabs } from './tabs/store';
+  import { latchByTab, taintColor } from './latch';
+  import { settings } from './settings/store';
   import type { LayoutNode, PaneNode } from './layout/types';
 
   let { pane }: { pane: PaneNode } = $props();
@@ -100,6 +102,23 @@
 
   const focused = $derived($layout.focused_pane_id === pane.id);
 
+  // V32: the active tab's containment state, painted where the user is
+  // actually looking. The taint badge in the tab strip is 16px and easy to
+  // miss; this frames the tab's content window in the same color (yellow =
+  // latched, red = contaminated — both configurable in Settings →
+  // Appearance → Containment colors). Null (no frame) for a clean tab, and
+  // for the reduced-protection badge state, which is a configuration fact
+  // rather than an event.
+  const taintFrameColor = $derived(
+    pane.active_tab_id === null
+      ? null
+      : taintColor(
+          $latchByTab[pane.active_tab_id],
+          $settings.ui.latched_color,
+          $settings.ui.contaminated_color,
+        ),
+  );
+
   // Compute "Pane N of M, contains <active tab name> and K more tabs"
   // for screen readers. Walks the layout tree once per render — cheap
   // for the small tree sizes we ever expect (typically <8 panes). The
@@ -168,6 +187,9 @@
          effect above) — they used to render inline, but that destroyed them
          on every tab switch/hide, resetting all their state. -->
     <div class="app-slot" bind:this={appSlotEl}></div>
+    {#if taintFrameColor}
+      <div class="taint-frame" style:border-color={taintFrameColor} aria-hidden="true"></div>
+    {/if}
     {#if pane.active_tab_id !== null}
       {#if $tabs.find((m) => m.id === pane.active_tab_id)?.kind === 'preview'}
         {#key pane.active_tab_id}
@@ -213,6 +235,16 @@
     position: absolute;
     inset: 0;
     pointer-events: none;
+  }
+  /* The containment frame (see taintFrameColor above). An overlay rather
+     than a real border so the terminal never reflows/refits when
+     containment engages; click-through always. */
+  .taint-frame {
+    position: absolute;
+    inset: 0;
+    border: 2px solid;
+    pointer-events: none;
+    z-index: 10;
   }
   /* Focused-pane indicator: a 2px accent line along the top edge of
      the focused pane's tab bar. Top placement (not bottom) so it

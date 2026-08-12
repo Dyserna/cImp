@@ -13,6 +13,7 @@ import {
   HEALTHY_POLL,
   UNKNOWN_AFTER_FAILURES,
   isTainted,
+  taintColor,
   withSignatureHealth,
   SIGNATURE_RULES_FEATURE,
   type FeatureState,
@@ -612,5 +613,49 @@ describe('isTainted', () => {
     expect(isTainted({ ...row, latch: 'local' })).toBe(true);
     // Contamination survives an override, so the badge must too.
     expect(isTainted({ ...row, contaminated: true })).toBe(true);
+  });
+});
+
+describe('taintColor', () => {
+  const row = {
+    consumer: 'claude',
+    tab: TAB,
+    session: null,
+    latch: 'open',
+    contaminated: false,
+    can_flip_local: false,
+    can_unlatch: false,
+    can_clear: false,
+    awaiting_session_clear: false,
+    local_by_user_flip: false,
+  };
+  const LATCHED = '#112233';
+  const CONTAM = '#445566';
+
+  it('is null exactly where the badge/frame must not render an event color', () => {
+    expect(taintColor(undefined, LATCHED, CONTAM)).toBeNull();
+    expect(taintColor(null, LATCHED, CONTAM)).toBeNull();
+    // An open + uncontaminated row is not tainted — same predicate as the
+    // badge's, through `isTainted`, so the two can't drift.
+    expect(taintColor(row, LATCHED, CONTAM)).toBeNull();
+  });
+
+  it('picks the latched color for a latch, and contamination wins over it', () => {
+    expect(taintColor({ ...row, latch: 'external' }, LATCHED, CONTAM)).toBe(LATCHED);
+    expect(taintColor({ ...row, latch: 'local' }, LATCHED, CONTAM)).toBe(LATCHED);
+    expect(taintColor({ ...row, contaminated: true }, LATCHED, CONTAM)).toBe(CONTAM);
+    // Contamination outlives the latch — a latched AND contaminated row wears
+    // the stronger color.
+    expect(taintColor({ ...row, latch: 'external', contaminated: true }, LATCHED, CONTAM)).toBe(
+      CONTAM,
+    );
+  });
+
+  it('falls back to the historical badge colors on an invalid setting', () => {
+    // A hand-edited settings.json must not blank the containment surfaces.
+    expect(taintColor({ ...row, latch: 'external' }, 'not-a-color', CONTAM)).toBe('#fabd2f');
+    expect(taintColor({ ...row, contaminated: true }, LATCHED, '')).toBe('#fb4934');
+    // Shorthand hex is not what <input type=color> produces — rejected too.
+    expect(taintColor({ ...row, contaminated: true }, LATCHED, '#f00')).toBe('#fb4934');
   });
 });

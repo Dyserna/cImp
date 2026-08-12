@@ -115,7 +115,14 @@
   import type { AuditCensus } from './lib/codeAudit/types';
   import { resolveBundledTheme, defaultPalette } from './lib/themes';
   import { themeRegistry, paletteRegistry } from './lib/themes/registry';
-  import { TUI_THEME_ID, TUI_ACCENT_PRESETS, normalizeTuiAccent } from './lib/themes/accent';
+  import {
+    TUI_THEME_ID,
+    TUI_ACCENT_PRESETS,
+    normalizeTuiAccent,
+    normalizeHexColor,
+    DEFAULT_LATCHED_COLOR,
+    DEFAULT_CONTAMINATED_COLOR,
+  } from './lib/themes/accent';
   import type { ThemeColorsWire } from './lib/settings/types';
 
   // Whether the active theme uses the OS-native chrome — drives the custom
@@ -2737,6 +2744,70 @@
               anything.
             </small>
           {/if}
+
+          <!-- V32 containment colors. Theme-independent (unlike the TUI
+               accent above): the taint badge and pane frame render under
+               every theme, so their colors are always editable. Two states,
+               two colors — matching the badge's own distinction, where
+               contamination outlives the latch and wears the stronger one. -->
+          <h3>Containment colors</h3>
+          <small class="hint top">
+            Worn by a tab's ⛨ shield badge and drawn as a frame around that
+            tab's content while containment applies — so a latched or
+            contaminated tab is visible without reading the tab strip.
+          </small>
+          <div class="accent-row">
+            <span>Latched session</span>
+            <div class="accent-controls">
+              <input
+                type="color"
+                aria-label="Latched tab color"
+                title="The session used a gated tool (web/external or local), so the opposite tool family is closed for it"
+                value={normalizeHexColor(snapshot.ui.latched_color, DEFAULT_LATCHED_COLOR)}
+                oninput={(e) => {
+                  const color = (e.currentTarget as HTMLInputElement).value;
+                  patch((s) => (s.ui.latched_color = color));
+                }}
+              />
+              <button
+                type="button"
+                class="secondary"
+                disabled={normalizeHexColor(snapshot.ui.latched_color, DEFAULT_LATCHED_COLOR) ===
+                  DEFAULT_LATCHED_COLOR}
+                onclick={() => patch((s) => (s.ui.latched_color = DEFAULT_LATCHED_COLOR))}
+                >Reset</button
+              >
+            </div>
+          </div>
+          <div class="accent-row">
+            <span>Contaminated session</span>
+            <div class="accent-controls">
+              <input
+                type="color"
+                aria-label="Contaminated tab color"
+                title="External content entered the conversation — the stronger state; it outlives the latch"
+                value={normalizeHexColor(
+                  snapshot.ui.contaminated_color,
+                  DEFAULT_CONTAMINATED_COLOR,
+                )}
+                oninput={(e) => {
+                  const color = (e.currentTarget as HTMLInputElement).value;
+                  patch((s) => (s.ui.contaminated_color = color));
+                }}
+              />
+              <button
+                type="button"
+                class="secondary"
+                disabled={normalizeHexColor(
+                  snapshot.ui.contaminated_color,
+                  DEFAULT_CONTAMINATED_COLOR,
+                ) === DEFAULT_CONTAMINATED_COLOR}
+                onclick={() =>
+                  patch((s) => (s.ui.contaminated_color = DEFAULT_CONTAMINATED_COLOR))}
+                >Reset</button
+              >
+            </div>
+          </div>
 
           <h3>Terminal palette</h3>
           <small class="hint top">

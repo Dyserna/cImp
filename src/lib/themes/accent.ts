@@ -27,13 +27,31 @@ export const TUI_ACCENT_PRESETS: readonly { name: string; color: string }[] = [
   { name: 'Grey', color: '#c8ccd0' },
 ];
 
-/// Validate a persisted accent value. Anything but a full `#rrggbb` hex
-/// (the only shape `<input type="color">` produces) falls back to the
-/// default — a hand-edited settings.json can't break the chrome.
-export function normalizeTuiAccent(value: string | null | undefined): string {
+/// Validate any persisted `#rrggbb` color setting against a caller-supplied
+/// fallback — the same rule `normalizeTuiAccent` applies, factored out for
+/// the other color settings (the containment colors below): full hex only
+/// (the only shape `<input type="color">` produces), so a hand-edited
+/// settings.json can't break the chrome.
+export function normalizeHexColor(value: string | null | undefined, fallback: string): string {
   const v = (value ?? '').trim();
-  return /^#[0-9a-fA-F]{6}$/.test(v) ? v.toLowerCase() : DEFAULT_TUI_ACCENT;
+  return /^#[0-9a-fA-F]{6}$/.test(v) ? v.toLowerCase() : fallback;
 }
+
+/// Validate a persisted accent value. Anything but a full `#rrggbb` hex
+/// falls back to the default.
+export function normalizeTuiAccent(value: string | null | undefined): string {
+  return normalizeHexColor(value, DEFAULT_TUI_ACCENT);
+}
+
+// ── V32 containment colors ──────────────────────────────────────────────
+// Worn by a tab's taint badge and the pane frame around its content while
+// containment applies (`ui.latched_color` / `ui.contaminated_color`,
+// resolved through `latch.ts::taintColor`). Defaults mirror the TUI theme's
+// `--warning` / `--danger`, which is what the badge wore before the colors
+// became configurable; the Rust defaults in `settings/schema.rs` must match.
+
+export const DEFAULT_LATCHED_COLOR = '#fabd2f';
+export const DEFAULT_CONTAMINATED_COLOR = '#fb4934';
 
 /// Chrome text color for content painted on the accent fill (selection,
 /// filled CTAs). WCAG relative luminance with the standard ~0.179 flip

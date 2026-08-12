@@ -4122,6 +4122,18 @@ pub struct UiSettings {
     /// this needs no schema-version migration. Additive: `tool_activity_tab`
     /// is untouched and both tabs coexist.
     pub events_tab: bool,
+    /// V32: the color (`#rrggbb`) the containment surfaces wear while a tab
+    /// is LATCHED but not contaminated — the tab strip's taint badge and the
+    /// frame the pane draws around that tab's content. Rendered and validated
+    /// frontend-side only (invalid values fall back to this default there,
+    /// like `tui_accent`); the default mirrors the TUI theme's `--warning`,
+    /// which is what the badge wore before the color became configurable.
+    /// Additive with the struct-level `#[serde(default)]` — no migration.
+    pub latched_color: String,
+    /// V32: the same surfaces while the tab's conversation is CONTAMINATED —
+    /// the stronger state (it outlives the latch). Default mirrors the TUI
+    /// theme's `--danger`. Same validation/additive story as `latched_color`.
+    pub contaminated_color: String,
 }
 
 impl Default for UiSettings {
@@ -4132,6 +4144,8 @@ impl Default for UiSettings {
             status_bar: StatusBarLayout::default(),
             tool_activity_tab: true,
             events_tab: true,
+            latched_color: "#fabd2f".to_string(),
+            contaminated_color: "#fb4934".to_string(),
         }
     }
 }

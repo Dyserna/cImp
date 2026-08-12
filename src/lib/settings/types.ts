@@ -540,6 +540,16 @@ export interface UiSettings {
   /// events — attributed per tab/session and filterable). Default true.
   /// Additive: independent of `tool_activity_tab`, and both tabs coexist.
   events_tab: boolean;
+  /// V32: the color (`#rrggbb`) the containment surfaces wear while a tab is
+  /// LATCHED but not contaminated — the taint badge in the tab strip and the
+  /// frame drawn around the tab's content (Pane.svelte). Defaults to the TUI
+  /// theme's warning yellow, the badge's historical color. Invalid values
+  /// fall back frontend-side (`latch.ts::taintColor`).
+  latched_color: string;
+  /// V32: the same surfaces while the tab's conversation is CONTAMINATED —
+  /// the stronger state (it outlives the latch). Defaults to the TUI theme's
+  /// danger red. Invalid values fall back frontend-side.
+  contaminated_color: string;
 }
 
 /// A display panel in the status bar's movable left cluster.
@@ -1834,6 +1844,8 @@ export function defaultSettings(): Settings {
       },
       tool_activity_tab: true,
       events_tab: true,
+      latched_color: '#fabd2f',
+      contaminated_color: '#fb4934',
     },
     // Default terminal palette is paired with the default UI theme
     // (tui → OpenCode Grey); the pairing comes from each theme's

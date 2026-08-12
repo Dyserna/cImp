@@ -2,6 +2,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { writable, derived, type Readable } from 'svelte/store';
 import type { TabId } from './tabs/types';
 import { fetchDetectionStatus, rulesHealth, type RulesHealth } from './offload';
+import {
+  normalizeHexColor,
+  DEFAULT_LATCHED_COLOR,
+  DEFAULT_CONTAMINATED_COLOR,
+} from './themes/accent';
 
 /// V32 Phase F (locked decisions 14 + 15): the per-tab taint-latch state that
 /// drives the tab-chrome badge and its override popover.
@@ -659,6 +664,29 @@ export const latchByTab = writable<Partial<Record<TabId, LatchRow>>>({});
 /// to mean something when it appears.
 export function isTainted(row: LatchRow | undefined): boolean {
   return !!row && (row.latch !== 'open' || row.contaminated);
+}
+
+/// The color the containment surfaces wear for one tab — the taint badge in
+/// the tab strip AND the frame Pane.svelte draws around the tab's content —
+/// or `null` when the tab is not tainted (the frame doesn't render; the badge,
+/// if visible for a reduced-protection state, keeps its own muted CSS).
+///
+/// One function so the two surfaces cannot disagree about either the
+/// predicate or the color. Contamination wins over the latch state for the
+/// reason Tab.svelte's `.taint-contaminated` gives: contamination outlives
+/// the latch, so it gets the stronger color. `latched` / `contaminated` are
+/// the raw `ui.latched_color` / `ui.contaminated_color` settings values —
+/// validated here (never trust a hand-edited settings.json), falling back to
+/// the historical badge colors.
+export function taintColor(
+  row: LatchRow | null | undefined,
+  latched: string,
+  contaminated: string,
+): string | null {
+  if (!row || !isTainted(row)) return null;
+  return row.contaminated
+    ? normalizeHexColor(contaminated, DEFAULT_CONTAMINATED_COLOR)
+    : normalizeHexColor(latched, DEFAULT_LATCHED_COLOR);
 }
 
 /// Tab ids currently showing a badge. Exposed mostly for tests and debugging;

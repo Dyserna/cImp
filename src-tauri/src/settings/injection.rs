@@ -1056,7 +1056,58 @@ fn detection_layers(s: &Settings, parent_on: bool) -> crate::offload::detection:
 /// identity-less answer, six lines from the elevation that must never do it
 /// (`any_tab_override_on`, *"tabs only, deliberately"*).
 pub fn armed_anywhere(feature: Feature, s: &Settings) -> bool {
-    effective(feature, Scope::UnknownCaller, s) || effective(feature, Scope::OffloadWorker, s)
+    armed_outside_the_worker(feature, s) || effective(feature, Scope::OffloadWorker, s)
+}
+
+/// Whether `feature` is in force for any caller that is **not** the offload
+/// worker — the app-wide baseline, plus every L3 `On` a configured AI tab
+/// states (#48, F-38, locked decision 41).
+///
+/// # Why this exists at all: a name for a question, not a new resolution
+///
+/// This is `effective(feature, Scope::UnknownCaller, s)` and nothing else, so it
+/// decides nothing new. What it adds is a **name**. Locked decision 36 split
+/// `Scope::App` into [`Scope::AppWide`] and [`Scope::UnknownCaller`] because one
+/// name standing in for a question it did not ask had already produced two
+/// defects (M-21, F-35). Two sites then kept `UnknownCaller` correctly and read
+/// wrongly: [`updates_enabled`](crate::offload::detection::updater::updates_enabled)
+/// does not ask *"what applies to a caller with no identity?"* — it asks
+/// *"is the one shared detection bundle on disk worth keeping current?"*, whose
+/// answer is *"yes iff detection is armed for somebody other than the worker"*.
+/// Leaving the `UnknownCaller` spelling at such a site recreates the exact
+/// condition F-35 was about, one reader further on.
+///
+/// **The other site keeps its spelling, deliberately.**
+/// `loopback::injection_status`'s `app` row reports a whole feature *matrix*
+/// (`report(settings, Scope::UnknownCaller)`), not a predicate, so it has no use
+/// for this function — and decision 41 declined to move it for a second reason:
+/// its `decided_by`/`override_value` pair is the only observation point
+/// live-verify's N-1 box has.
+///
+/// # Why the worker is the excluded half, and why that is a CONTRACT
+///
+/// [`Scope::UnknownCaller`]'s elevation is *"tabs only, deliberately"*: it exists
+/// for a call that arrived without its tab identity, and the worker is never that
+/// caller — it always resolves through [`Scope::OffloadWorker`]. So the identity-
+/// less answer already **is** the non-worker answer, and this function is the
+/// complement half of [`armed_anywhere`], which is now literally composed from
+/// it: `armed_anywhere = armed_outside_the_worker ∨ the worker's own row`.
+///
+/// That decomposition is why `updater::worker_only_detection` — defined as
+/// `!updates_enabled ∧ effective(_, OffloadWorker)` — reads as *"armed anywhere,
+/// but not outside the worker"*, and why repointing `updates_enabled` at
+/// [`armed_anywhere`] would collapse it to a permanent `false` and orphan the
+/// Svelte branch gated on it. M-21 rejected that; this naming does not reopen it.
+///
+/// # Reporting-ish, like its sibling
+///
+/// An enforcement site asking *"may I do this?"* still wants [`effective`] for
+/// the scope it is running in. This one is for the surfaces whose subject is the
+/// process rather than the caller — a shared file on disk, a shared directory of
+/// rules — and it can be true while every individual tab has an L3 `Off`,
+/// because an identity-less call would still be screened.
+pub fn armed_outside_the_worker(feature: Feature, s: &Settings) -> bool {
+    effective(feature, Scope::UnknownCaller, s)
 }
 
 // ── Spawn signature + introspection ───────────────────────────────────────

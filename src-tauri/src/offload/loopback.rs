@@ -25,7 +25,7 @@
 //! observe task text — the same localhost-dev-server trust assumption,
 //! documented in MAINTENANCE.md.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -1752,6 +1752,18 @@ impl LatchScoping {
     /// id through [`is_configured_tab`], and `Unrecognized` is what the
     /// unvalidated case is called on the row.
     ///
+    /// **#48 F-39 / locked decision 42 — that invented id is BOUNDED here.** It
+    /// is an arbitrary-length string from a request body and it lands in a row's
+    /// attribution column, in a **capped per-lane ring**: a caller choosing how
+    /// many bytes one row occupies is choosing how much of the lane it fills, and
+    /// the rows that fall out the other end are the genuine ones. Same
+    /// consequence as F-37 by a different route, and the same cure F-32 already
+    /// left in the tree — [`bounded_id`], **applied AFTER classification**, which
+    /// is the load-bearing half: [`latch_scope`] resolved this variant by running
+    /// the FULL string through [`is_configured_tab`], so no truncated invented id
+    /// can ever fold onto a configured one. Bounding at the parse boundary
+    /// instead would close a bloat hole by opening an impersonation hole.
+    ///
     /// [`Attribution::Unattributed`](crate::activity::Attribution::Unattributed)
     /// is deliberately unreachable from this function: a route that resolved a
     /// `LatchScoping` at all DOES know, and "the writer does not know" would be a
@@ -1760,7 +1772,7 @@ impl LatchScoping {
         match self {
             LatchScoping::Anonymous => crate::activity::Attribution::Headless,
             LatchScoping::Unknown(id) => {
-                crate::activity::Attribution::Unrecognized(id.clone())
+                crate::activity::Attribution::Unrecognized(bounded_id(id))
             }
             LatchScoping::Scoped(s) => s.attribution(),
         }
@@ -5381,20 +5393,194 @@ struct ContractDriftBody {
     session_id: Option<String>,
 }
 
-/// Rate-limit state for `handle_contract_drift`: `(shim, session_id)` pairs
-/// already recorded this app run. A systematically broken payload fires the
-/// shim on every hook invocation — without this, one bad session would
-/// flood the Activity store's graph ring. Process-lifetime is the right
-/// scope: the Advisor's `drift.payload.v1` reads events since process
-/// start anyway. A missing `session_id` (itself likely part of the drift)
-/// buckets under the empty string — still one event per shim per run.
-static CONTRACT_DRIFT_SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
-    std::sync::OnceLock::new();
+/// The hook shims cImp itself installs — and, with [`DRIFT_SHIM_UNKNOWN`], the
+/// **only** keys [`CONTRACT_DRIFT_SEEN`] can hold (#48 F-37).
+///
+/// Every entry is a literal one of this crate's own shim binaries sends:
+/// `context_hook::report_contract_drift`'s first argument at four call sites,
+/// plus `taint_beacon`'s hand-rolled body (it posts through its own non-blocking
+/// dispatcher rather than through that helper). Spelling is pinned against those
+/// sources by `tests::the_drift_shim_list_is_spelled_the_way_the_shims_spell_it`.
+///
+/// Drift here fails SAFE in both directions: an unlisted shim shares the
+/// sentinel bucket (fewer rows, never more), and a listed name no shim sends is
+/// a bucket nothing ever claims.
+const DRIFT_SHIMS: [&str; 5] = [
+    "compact_hook",
+    "context_hook",
+    "notify_hook",
+    "read_hook",
+    "taint_beacon",
+];
+
+/// The one bucket every shim name cImp does not ship shares. Parenthesized like
+/// [`outbound::NO_TAB_IDENTITY`], so it cannot be confused with a real name.
+const DRIFT_SHIM_UNKNOWN: &str = "(unrecognized shim)";
+
+/// The ledger key for a caller-supplied `shim` string: its own entry in
+/// [`DRIFT_SHIMS`], or the one shared sentinel.
+///
+/// Returns `&'static str` and not `String` **on purpose** — that is the bound
+/// itself rather than a check that implements it. The ledger's key type makes a
+/// caller-supplied string unable to become a key at all, so the key space is
+/// `DRIFT_SHIMS.len() + 1` by construction and cannot drift back.
+///
+/// **Exact match, never a prefix** (after trimming): `"read_hook-forged"` is the
+/// sentinel, not `read_hook`. A prefix or truncation rule here would let an
+/// invented name claim a real shim's counter — [`bounded_id`]'s
+/// ordering rule, one route over.
+fn drift_shim_key(raw: &str) -> &'static str {
+    let raw = raw.trim();
+    DRIFT_SHIMS
+        .into_iter()
+        .find(|shim| *shim == raw)
+        .unwrap_or(DRIFT_SHIM_UNKNOWN)
+}
+
+/// Rate-limit state for `handle_contract_drift`. A systematically broken payload
+/// fires its shim on every hook invocation, and without a ledger one bad session
+/// would flood the Activity store's 400-row graph ring.
+///
+/// **#48 F-37 / locked decision 42 — this used to be a `HashSet<(String,
+/// String)>` keyed on the caller's own `shim` and `session_id`.** Both halves of
+/// the key came off the wire, so any token-holder could grow it without limit and
+/// evict the whole graph lane, taking genuine security rows out of a capped ring
+/// with it. The fix is the bar `/activity/discovery_skipped` already meets
+/// ([`DISCOVERY_REPORTS`]), in both of its halves:
+///
+/// * **The key is not the caller's** — it is [`drift_shim_key`]'s classification
+///   of it, a `&'static str` from a compile-time list. Ten thousand invented shim
+///   names buy **one** bucket.
+/// * **Repeats cost `log2(n)` rows** — [`outbound::Doubling`], the same primitive
+///   `claim_ssrf` and the discovery report use, and each row states how many
+///   reports it stands for so a fold is never a silent drop.
+///
+/// **`session_id` is deliberately no longer part of the key.** It is
+/// caller-supplied with nothing app-side to classify it against — this body
+/// carries no tab, and the missing `session_id` is frequently the very drift
+/// being reported — so keeping it would have left the unbounded half in place.
+/// The cost is the documented "one row per shim per session" becoming "rows at
+/// reports 1, 2, 4, 8 … per shim per app run": strictly more rows for a genuinely
+/// broken shim, and the consumer is unaffected, since `drift.payload.v1` reads
+/// events since process start and de-duplicates by shim
+/// (`ipc::commands::advisor_signals`).
+///
+/// Process lifetime, unchanged and for the same reason as before.
+static CONTRACT_DRIFT_SEEN: OnceLock<Mutex<HashMap<&'static str, outbound::Doubling>>> =
+    OnceLock::new();
+
+/// Count one drift report against the process ledger. See
+/// [`CONTRACT_DRIFT_SEEN`].
+fn claim_contract_drift(shim: &'static str) -> outbound::DoublingRow {
+    let ledger = CONTRACT_DRIFT_SEEN.get_or_init(Default::default);
+    let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    drift_claim_in(&mut ledger, shim)
+}
+
+/// [`claim_contract_drift`] against a caller-owned ledger, so the key-space bound
+/// and the doubling are assertable without process-global state (the suite runs
+/// cases concurrently in one process). The twin of [`claim_in`].
+fn drift_claim_in(
+    ledger: &mut HashMap<&'static str, outbound::Doubling>,
+    shim: &'static str,
+) -> outbound::DoublingRow {
+    ledger.entry(shim).or_default().claim()
+}
+
+/// How many field names one drift row may list. Every real payload check in this
+/// crate has at most five (`read_hook::contract_checks`), so this is slack for a
+/// future check rather than a limit anything genuine can reach.
+const MAX_DRIFT_MISSING: usize = 12;
+
+/// The caller's `missing` list, bounded in both dimensions before it reaches a
+/// row (#48 F-37).
+///
+/// The list is an arbitrary count of arbitrary strings and it lands in the row's
+/// `target` — which the store does **not** truncate (only `request` and
+/// `response` are capped) and which `advisor_signals` copies verbatim into a
+/// user-facing signal. Every genuine report is byte-identical to the plain
+/// `join(", ")` this replaced; only abuse is cut, and the row says it was.
+fn bounded_missing(raw: &[String]) -> String {
+    let mut out: Vec<String> = raw
+        .iter()
+        .take(MAX_DRIFT_MISSING)
+        .map(|f| bounded_id(f))
+        .collect();
+    if let Some(extra) = raw.len().checked_sub(MAX_DRIFT_MISSING).filter(|n| *n > 0) {
+        out.push(format!("… (+{extra} more)"));
+    }
+    out.join(", ")
+}
+
+/// The activity row one drift report writes, or `None` when the ledger folds it
+/// into an earlier one.
+///
+/// Split from the handler and given its ledger as a closure for the reason
+/// [`record_discovery_skipped`] documents, plus one this route owns:
+/// `activity::record_bg` has **no `cfg(test)` diversion**, so a row written
+/// inside the handler is unobservable to the suite — which is why the pre-F-37
+/// behaviour had no row-level test at all. Returning the record makes what a
+/// caller can put in the store assertable without touching the global store.
+///
+/// Nothing here is left at the caller's length: [`bounded_id`] on the shim name
+/// and on the session id, [`bounded_missing`] on the field list. The bounds are
+/// applied **after** [`drift_shim_key`] has classified, so a truncated name
+/// cannot claim a real shim's counter.
+fn contract_drift_row(
+    body: &ContractDriftBody,
+    claim: impl FnOnce(&'static str) -> outbound::DoublingRow,
+) -> Option<crate::activity::ActivityRecord> {
+    let outbound::DoublingRow::Write { total, suppressed } = claim(drift_shim_key(&body.shim))
+    else {
+        return None;
+    };
+    let shim = bounded_id(&body.shim);
+    let session = bounded_id(body.session_id.as_deref().unwrap_or_default());
+    let missing = bounded_missing(&body.missing);
+    Some(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            crate::activity::now_ms(),
+            String::new(), // no root — the report is about the harness, not a project
+            "harness".to_string(),
+            "contract_drift".to_string(),
+            format!("{shim}: {missing}"),
+            missing.chars().count(),
+            0,
+            false, // a drift report is never "ok" — it flags the entry in the feed
+            // The report is about the harness shim, not a tab's call — but
+            // the session it drifted in is known and is the join key.
+            //
+            // #48 F-20 left this ALONE, and `Unattributed` is honest here:
+            // `ContractDriftBody` carries no `tab` field at all, so this
+            // writer genuinely does not know. The shim *does* (`--tab {tab}`
+            // is baked into its hook command line, `tabs/config.rs`), so the
+            // fix is a wire change — `#[serde(default)] tab: Option<String>`
+            // on the body plus the shim sending it — and both skew directions
+            // degrade safely. That is a shim/app contract change and belongs
+            // with F-6's drift-canary work, not here.
+            crate::activity::Attribution::Unattributed,
+            Some(session.clone()),
+        ),
+        request: format!(
+            "shim {shim} payload missing required fields (session {session}) — report {total} \
+             from this shim this app run, {suppressed} folded into it"
+        ),
+        response: missing,
+    })
+}
 
 /// `POST /activity/contract_drift` (V16 Feature 3): record a shim's
 /// payload-drift report as an Activity event (`source: "harness"`,
-/// `tool: "contract_drift"`), rate-limited to one per shim per session.
+/// `tool: "contract_drift"`), rate-limited per shim by [`CONTRACT_DRIFT_SEEN`].
 /// Always answers `{ok: true}` — the shim is fail-open and fire-and-forget.
+///
+/// The 400 on a malformed body is this route's own long-standing contract and is
+/// **not** the discipline `handle_discovery_skipped` follows (one constant reply
+/// on every path, locked decision 37). The difference is deliberate: that route
+/// exists so a *child* can report containment and must give a prober no oracle;
+/// this one answers a shim of ours that is already misbehaving, and locked
+/// decision 42 moved the bound, not the protocol.
 async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResult<()> {
     let ok = serde_json::json!({ "ok": true });
     let body: ContractDriftBody = match serde_json::from_slice(&req.body) {
@@ -5408,45 +5594,8 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
             .await;
         }
     };
-    let session = body.session_id.unwrap_or_default();
-    let fresh = {
-        let seen = CONTRACT_DRIFT_SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
-        let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
-        seen.insert((body.shim.clone(), session.clone()))
-    };
-    if fresh {
-        let missing = body.missing.join(", ");
-        crate::activity::record_bg(crate::activity::ActivityRecord {
-            entry: crate::activity::ActivityEntry::new(
-                crate::activity::ActivityKind::Graph,
-                crate::activity::now_ms(),
-                String::new(), // no root — the report is about the harness, not a project
-                "harness".to_string(),
-                "contract_drift".to_string(),
-                format!("{}: {missing}", body.shim),
-                missing.chars().count(),
-                0,
-                false, // a drift report is never "ok" — it flags the entry in the feed
-                // The report is about the harness shim, not a tab's call — but
-                // the session it drifted in is known and is the join key.
-                //
-                // #48 F-20 left this ALONE, and `Unattributed` is honest here:
-                // `ContractDriftBody` carries no `tab` field at all, so this
-                // writer genuinely does not know. The shim *does* (`--tab {tab}`
-                // is baked into its hook command line, `tabs/config.rs`), so the
-                // fix is a wire change — `#[serde(default)] tab: Option<String>`
-                // on the body plus the shim sending it — and both skew directions
-                // degrade safely. That is a shim/app contract change and belongs
-                // with F-6's drift-canary work, not here.
-                crate::activity::Attribution::Unattributed,
-                Some(session.clone()),
-            ),
-            request: format!(
-                "shim {} payload missing required fields (session {session})",
-                body.shim
-            ),
-            response: missing,
-        });
+    if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
+        crate::activity::record_bg(record);
     }
     write_json(stream, 200, &ok).await
 }
@@ -5520,8 +5669,11 @@ const DISCOVERY_TOOL: &str = "discovery";
 /// body carries no `tab`, so its row is honestly `Unattributed` and naming a tab
 /// would be the wire change anyway; `activity::record_bg` has **no `cfg(test)`
 /// diversion**, which is exactly why F-20's owed test was never written, while
-/// `outbound::record_flag` does; and its dedup ledger is keyed on two
-/// caller-supplied strings with no bound (F-37, filed separately).
+/// `outbound::record_flag` does; and its dedup ledger was keyed on two
+/// caller-supplied strings with no bound (F-37, filed separately — since closed
+/// by locked decision 42, which gave that ledger this one's discipline and its
+/// row a `contract_drift_row` seam for the same reason. The first three reasons
+/// are unaffected and this route still stands on its own).
 ///
 /// # Auth
 ///
@@ -5631,7 +5783,9 @@ fn bounded_skips(raw: u32) -> Option<(u32, bool)> {
 /// The per-key doubling ledger for discovery reports (#48 F-32).
 ///
 /// **The key space is bounded by something the caller does not control**, which
-/// is the one property `CONTRACT_DRIFT_SEEN` lacks (F-37): entries are keyed on
+/// is the property [`CONTRACT_DRIFT_SEEN`] lacked until decision 42 gave it one
+/// too (F-37 — its key is a `&'static str` from a fixed list, a stricter bound
+/// than this one because that route has no tab list to key on): entries are keyed on
 /// the *resolved scope label*, so a configured tab gets its own counter and
 /// `Anonymous` + `Unknown(_)` share **one** sentinel bucket per consumer. A
 /// caller inventing ten thousand tab ids therefore gets one counter and
@@ -7075,6 +7229,13 @@ fn bounded_tool(raw: Option<&str>) -> String {
 /// choose how many bytes of a capped feed one report occupies. **Only ever
 /// applied AFTER classification** — truncating first could fold a long invented
 /// id onto a configured one, which would turn a bound into a forgery primitive.
+///
+/// Its third and fourth callers are #48 F-39 and F-37 (locked decision 42), the
+/// same string half of the same class: [`LatchScoping::attribution`]'s
+/// `Unrecognized` arm — reached by `/graph_run` and `/mcp/call`, and likewise
+/// only after [`latch_scope`] classified the full id — and
+/// [`contract_drift_row`], where the shim name and the session id a hook shim
+/// reports are both arbitrary strings that reach a row.
 ///
 /// Truncated by **chars**, not bytes, so a multi-byte id cannot be cut
 /// mid-codepoint. Control-sequence hygiene is a separate concern with its own
@@ -8592,6 +8753,243 @@ mod tests {
         );
     }
 
+    // ── #48 F-37 / locked decision 42 — the contract-drift ledger ────────────
+
+    fn drift_ledger() -> HashMap<&'static str, outbound::Doubling> {
+        HashMap::new()
+    }
+
+    fn drift_body(shim: &str, missing: &[&str], session: Option<&str>) -> ContractDriftBody {
+        ContractDriftBody {
+            shim: shim.to_string(),
+            missing: missing.iter().map(|m| (*m).to_string()).collect(),
+            session_id: session.map(str::to_string),
+        }
+    }
+
+    /// **F-37's whole point: the KEY SPACE, not the map's size.**
+    ///
+    /// The old ledger was a `HashSet<(shim, session_id)>` with both halves off
+    /// the wire, so a token-holder could mint unlimited entries and evict the
+    /// 400-row graph lane — genuine security rows included. The bar is the one
+    /// `/activity/discovery_skipped` already meets: key on something the caller
+    /// does not control.
+    ///
+    /// Three halves. The doubling, asserted on the `suppressed` counts rather
+    /// than on how many rows appear (a plain global cap would also produce "a
+    /// small number"). The key space, asserted as **membership of a compile-time
+    /// list** and not as `len() < something` — an implementation that merely
+    /// evicted or cleared a caller-keyed map when it got big would still hold
+    /// caller strings, and would pass a size assertion. And the total ceiling,
+    /// which is what "bounded" means here: five shims plus one sentinel, for
+    /// every possible input, forever.
+    ///
+    /// **What this would still pass if the implementation were wrong:** it does
+    /// not check the row's *contents* (that is the next test), and it does not
+    /// check that the sentinel is shared by the *right* strings — a classifier
+    /// that sent every name including the real ones to the sentinel would pass
+    /// halves 1 and 2 and fail half 3.
+    #[test]
+    fn a_flood_of_contract_drift_reports_keys_a_fixed_list_and_costs_log2_rows() {
+        // Half 1 — the doubling. 200 reports on one shim write 8 rows, at 1, 2,
+        // 4 … 128, each naming how many it stands for.
+        let mut ledger = drift_ledger();
+        let mut written: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..200 {
+            if let outbound::DoublingRow::Write { total, suppressed } =
+                drift_claim_in(&mut ledger, "read_hook")
+            {
+                written.push((total, suppressed));
+            }
+        }
+        assert_eq!(
+            written,
+            vec![
+                (1, 0),
+                (2, 0),
+                (4, 1),
+                (8, 3),
+                (16, 7),
+                (32, 15),
+                (64, 31),
+                (128, 63)
+            ],
+            "the magnitude of a flood must survive in the window, not be inferred \
+             from the absence of rows"
+        );
+
+        // Half 2 — the key space. Ten thousand invented shims, each with its own
+        // invented session (the old key's second half), get ONE bucket and
+        // log2-many rows, because the key is a classification and not a string
+        // the caller typed.
+        let mut invented = drift_ledger();
+        let mut rows = 0;
+        for i in 0..10_000u32 {
+            let body = drift_body(
+                &format!("invented-{i}"),
+                &["session_id"],
+                Some(&format!("sess-{i}")),
+            );
+            if contract_drift_row(&body, |k| drift_claim_in(&mut invented, k)).is_some() {
+                rows += 1;
+            }
+        }
+        assert_eq!(
+            invented.len(),
+            1,
+            "ten thousand invented names must not buy ten thousand counters: {:?}",
+            invented.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(invented.keys().copied().collect::<Vec<_>>(), [DRIFT_SHIM_UNKNOWN]);
+        assert_eq!(rows, 14, "10 000 reports must cost log2 rows, not 10 000");
+
+        // Half 3 — the ceiling. Every real shim keeps its own counter; everything
+        // else shares one; and no input of any kind can key anything else,
+        // because the key type is `&'static str` from `DRIFT_SHIMS`.
+        let mut all = drift_ledger();
+        for shim in DRIFT_SHIMS {
+            let body = drift_body(shim, &["cwd"], None);
+            assert!(contract_drift_row(&body, |k| drift_claim_in(&mut all, k)).is_some());
+        }
+        for junk in ["", "   ", "read_hook ", "READ_HOOK", "read", "read_hook2", "🙂"] {
+            let body = drift_body(junk, &["cwd"], Some("s"));
+            let _ = contract_drift_row(&body, |k| drift_claim_in(&mut all, k));
+        }
+        assert_eq!(
+            all.len(),
+            DRIFT_SHIMS.len() + 1,
+            "the key space is the shim list plus one sentinel: {:?}",
+            all.keys().collect::<Vec<_>>()
+        );
+        for key in all.keys() {
+            assert!(
+                DRIFT_SHIMS.contains(key) || *key == DRIFT_SHIM_UNKNOWN,
+                "a caller-supplied string reached the ledger's key space: {key}"
+            );
+        }
+        // Trimming is the one normalisation, and it is not a prefix rule:
+        // an invented name that merely starts with a real one is the sentinel.
+        assert_eq!(drift_shim_key("  read_hook  "), "read_hook");
+        assert_eq!(drift_shim_key("read_hook-forged"), DRIFT_SHIM_UNKNOWN);
+        assert_eq!(
+            drift_shim_key(&format!("read_hook{}", "x".repeat(5_000))),
+            DRIFT_SHIM_UNKNOWN,
+            "classification must see the whole string, never a truncation of it"
+        );
+    }
+
+    /// **The string half of the same class: what one drift report may put IN the
+    /// row.**
+    ///
+    /// `ActivityStore::record` truncates `request` and `response` and **not**
+    /// `target` — and `target` is what `ipc::commands::advisor_signals` copies
+    /// verbatim into a user-facing signal. So the shim name, the session id and
+    /// the whole `missing` list reached a capped ring at whatever length a caller
+    /// chose. Bounded here, after classification, exactly like F-39's id.
+    ///
+    /// **What this would still pass if the implementation were wrong:** it says
+    /// nothing about *control characters* in those strings — that is Phase D's
+    /// concern at the surfaces that render, and `bounded_id`'s doc says so. It
+    /// would also pass a bound applied before classification, which is why the
+    /// key-space test above asserts the ordering separately.
+    #[test]
+    fn a_forged_contract_drift_report_cannot_choose_how_many_bytes_a_row_costs() {
+        // The honest case first: byte-identical to the plain `join(", ")` this
+        // replaced, so the bound costs a real report nothing.
+        let mut ledger = drift_ledger();
+        let real = contract_drift_row(
+            &drift_body("read_hook", &["session_id", "cwd"], Some("sess-1")),
+            |k| drift_claim_in(&mut ledger, k),
+        )
+        .expect("the first report from a shim always writes");
+        assert_eq!(real.entry.target, "read_hook: session_id, cwd");
+        assert_eq!(real.entry.source, "harness");
+        assert_eq!(real.entry.tool, "contract_drift");
+        assert_eq!(real.entry.session.as_deref(), Some("sess-1"));
+        assert_eq!(real.entry.tab, crate::activity::Attribution::Unattributed);
+        assert!(!real.entry.ok, "a drift report is never `ok`");
+        assert!(
+            real.request.contains("report 1 from this shim this app run, 0 folded into it"),
+            "a folded report must be countable from the row that stands for it: {}",
+            real.request
+        );
+
+        // The forged case: every caller-supplied string bounded, and the row
+        // still filed under the sentinel rather than under `read_hook`.
+        let huge_missing: Vec<String> = (0..5_000).map(|i| format!("{}{i}", "f".repeat(4096))).collect();
+        let borrowed: Vec<&str> = huge_missing.iter().map(String::as_str).collect();
+        let long = "x".repeat(4096);
+        let mut forged_ledger = drift_ledger();
+        let forged = contract_drift_row(
+            &drift_body(&long, &borrowed, Some(&long)),
+            |k| drift_claim_in(&mut forged_ledger, k),
+        )
+        .expect("a first report writes");
+        assert_eq!(
+            forged_ledger.keys().copied().collect::<Vec<_>>(),
+            [DRIFT_SHIM_UNKNOWN]
+        );
+        // `shim: ` + at most MAX_DRIFT_MISSING bounded names + the overflow note.
+        let ceiling = (BEACON_TOOL_MAX + 1) * (MAX_DRIFT_MISSING + 1) + 64;
+        assert!(
+            forged.entry.target.chars().count() <= ceiling,
+            "{} chars reached a row the store does not truncate",
+            forged.entry.target.chars().count()
+        );
+        assert!(
+            forged.entry.session.as_deref().unwrap().chars().count() <= BEACON_TOOL_MAX + 1,
+            "the session column is a join key, not a payload"
+        );
+        assert!(
+            forged.entry.target.contains("(+4988 more)"),
+            "a cut list must say how much was cut: {}",
+            forged.entry.target
+        );
+
+        // A shim that sends nothing but empty strings still produces a row that
+        // reads honestly — "empty" must not be spelled the same way as a name.
+        let mut empty_ledger = drift_ledger();
+        let empty = contract_drift_row(&drift_body("", &[], None), |k| {
+            drift_claim_in(&mut empty_ledger, k)
+        })
+        .expect("a first report writes");
+        assert_eq!(empty.entry.target, ": ");
+        assert_eq!(empty.entry.session.as_deref(), Some(""));
+    }
+
+    /// The shim names in [`DRIFT_SHIMS`] are the ones the shims actually send.
+    ///
+    /// A typo would not break anything loudly — the misspelt entry would simply
+    /// never be claimed and its shim would share the sentinel — which is exactly
+    /// why it needs a tripwire rather than a reader's attention.
+    ///
+    /// **What this would still pass if the implementation were wrong:** a NEW
+    /// shim that reports drift under a sixth name and is never added to the list.
+    /// That case degrades safely (it shares the sentinel bucket, so it gets fewer
+    /// rows, never more) and cannot be enumerated from here without scanning the
+    /// source tree at test time.
+    #[test]
+    fn the_drift_shim_list_is_spelled_the_way_the_shims_spell_it() {
+        for (shim, src) in [
+            ("compact_hook", include_str!("../compact_hook.rs")),
+            ("context_hook", include_str!("../context_hook.rs")),
+            ("notify_hook", include_str!("../notify_hook.rs")),
+            ("read_hook", include_str!("../read_hook.rs")),
+            ("taint_beacon", include_str!("../taint_beacon.rs")),
+        ] {
+            assert!(
+                DRIFT_SHIMS.contains(&shim),
+                "{shim} reports drift and has no counter"
+            );
+            assert!(
+                src.contains(&format!("\"{shim}\"")),
+                "{shim} is not the name that module sends"
+            );
+        }
+        assert_eq!(DRIFT_SHIMS.len(), 5, "a sixth entry needs its source pinned here");
+        assert!(!DRIFT_SHIMS.contains(&DRIFT_SHIM_UNKNOWN));
+    }
+
     /// **The positive case, on the wire, and its negative control.** A skipped
     /// planted entry reaches the app; a clean resolution says nothing.
     ///
@@ -9777,6 +10175,82 @@ mod tests {
             "filtering by a tab id must never surface a row that merely quoted it"
         );
         assert_eq!(attr.id(), Some("not-a-real-tab"));
+    }
+
+    /// **#48 F-39 / locked decision 42 — an invented tab id cannot choose how
+    /// many bytes of a capped lane one row occupies, and truncating it is not a
+    /// way to become a real tab.**
+    ///
+    /// Three halves, and the ORDER is the finding's subtle part.
+    ///
+    /// 1. The bound itself, on the row the producer actually writes
+    ///    (`attribution()`, which `/graph_run` and `/mcp/call` both call).
+    /// 2. **Classification sees the FULL string.** A body id that is a configured
+    ///    tab id plus a suffix — so that a naive parse-boundary truncation would
+    ///    hand `is_configured_tab` the configured id — must still resolve as
+    ///    `Unknown`. This is the assertion that fails if a future "fix" moves
+    ///    `bounded_id` earlier, closing the bloat hole by opening an
+    ///    impersonation one.
+    /// 3. The truncated id is still not a configured tab, from the same
+    ///    `is_configured_tab` the resolution used.
+    ///
+    /// **What this would still pass if the implementation were wrong:** it would
+    /// pass a bound applied anywhere at or after `tab_identity` (the constructor
+    /// in `latch_scope`, say) — deliberately, because every such site is after
+    /// classification and any of them is correct. It would NOT pass a bound
+    /// applied to `body.tab` before the identity check, and it would not pass a
+    /// larger-than-`BEACON_TOOL_MAX` bound, an ellipsis-free truncation that
+    /// happened to equal a configured id, or no bound at all.
+    #[test]
+    fn an_invented_tab_id_is_bounded_before_it_reaches_a_row_and_after_it_is_classified() {
+        use crate::activity::Attribution;
+        // A configured id exactly as long as the bound, so a truncation applied
+        // one step too early would produce this very string.
+        let real = "t".repeat(BEACON_TOOL_MAX);
+        let s = settings_with_tabs(&[real.as_str()]);
+        let forged = format!("{real}-and-then-some{}", "x".repeat(4096));
+
+        // (2) The classifier is handed the whole thing, so the suffix counts.
+        assert!(
+            matches!(tab_identity(&s, Some(forged.as_str())), TabIdentity::Unknown(_)),
+            "truncation must not run before `is_configured_tab`"
+        );
+        assert!(matches!(
+            tab_identity(&s, Some(real.as_str())),
+            TabIdentity::Configured(_)
+        ));
+
+        // (1) The row's attribution is bounded — chars, not bytes, and one
+        // ellipsis says it was cut.
+        let attr = LatchScoping::Unknown(forged.clone()).attribution();
+        let Attribution::Unrecognized(id) = &attr else {
+            panic!("a 4 KiB invented id is not a tab: {attr:?}");
+        };
+        assert!(
+            id.chars().count() <= BEACON_TOOL_MAX + 1,
+            "{} chars reached the row",
+            id.chars().count()
+        );
+        assert!(id.ends_with('…'), "a cut id must say it was cut: {id}");
+
+        // (3) …and it is still nobody's tab.
+        assert!(!is_configured_tab(&s, id), "truncation is not a forgery");
+        assert_ne!(*id, real);
+        assert!(!attr.is_tab());
+
+        // A multi-byte id is cut on a codepoint, never mid-character.
+        let wide = LatchScoping::Unknown("é".repeat(4096)).attribution();
+        let Attribution::Unrecognized(id) = &wide else {
+            panic!("not a tab: {wide:?}");
+        };
+        assert!(id.chars().count() <= BEACON_TOOL_MAX + 1);
+
+        // An id that fits is untouched — the bound must not cost the honest case
+        // anything, since a stale-but-real id is why this variant exists.
+        assert_eq!(
+            LatchScoping::Unknown("opencode-removed".to_string()).attribution(),
+            Attribution::Unrecognized("opencode-removed".to_string())
+        );
     }
 
     /// #48 F-16 — the unattributed-write row names the project it was about to

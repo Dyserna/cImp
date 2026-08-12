@@ -952,6 +952,109 @@ fn a_worker_only_detection_override_is_reported_as_a_running_layer() {
     assert!(updates_enabled(&on) && !worker_only_detection(&on));
 }
 
+/// **#48 F-38 / locked decision 41 — the gate got a NAME, and not a new
+/// verdict.**
+///
+/// `updates_enabled` used to spell `Scope::UnknownCaller` inline; it now
+/// delegates to `injection::armed_outside_the_worker`. Decision 41 allows the
+/// name to move and **nothing else**, so the guard has to be an equivalence
+/// against the resolution as it was written before — not against the new
+/// predicate, which would be asserting the delegation against itself.
+///
+/// Three properties, over every combination of the four switches that feed it:
+///
+/// 1. **Zero behaviour change** — the gate equals
+///    `effective(Detection, Scope::UnknownCaller)` in all 36 states.
+/// 2. **It is NOT `armed_anywhere`** — the two disagree in M-21's worker-only
+///    state, which is the disagreement `worker_only_detection` is defined on. The
+///    repoint decision 41 rejected outright passes (1) and fails here.
+/// 3. **It is NOT `Scope::AppWide`** — the two disagree when one configured tab
+///    states an L3 `On` over an app-wide `Off` (N-1's elevation). The other
+///    rejected move, which is a real behaviour change, also fails here.
+///
+/// **What this would still pass if the implementation were wrong:** it cannot
+/// see a bad *name* — any predicate resolving `Feature::Detection` at
+/// `Scope::UnknownCaller` satisfies it, which is the point of an equivalence
+/// guard for a rename. What it cannot miss is a moved resolution, which is the
+/// only thing decision 41 forbids.
+#[test]
+fn the_updater_gate_delegates_to_a_named_predicate_and_changes_no_verdict() {
+    use crate::settings::injection::{
+        armed_anywhere, armed_outside_the_worker, effective, Feature, Override, Scope,
+    };
+    use crate::settings::{default_ai_tab, AiTabId, Settings, TabConfig};
+
+    let with_tab = || {
+        let mut t = default_ai_tab(AiTabId::Claude);
+        if let TabConfig::AiTool(c) = &mut t {
+            c.id = "f38-tab".to_string();
+        }
+        Settings {
+            tabs: vec![t],
+            ..Default::default()
+        }
+    };
+
+    let cells = [None, Some(Override::On), Some(Override::Off)];
+    let mut states = 0;
+    for master in [true, false] {
+        for l2 in [true, false] {
+            for tab in cells {
+                for worker in cells {
+                    let mut s = with_tab();
+                    s.set_master_for_test(master);
+                    s.set_l2_for_test(Feature::Detection, l2);
+                    if let Some(v) = tab {
+                        s.set_tab_override_for_test("f38-tab", Feature::Detection, v)
+                            .expect("detection has a per-tab row");
+                    }
+                    if let Some(v) = worker {
+                        s.set_worker_override_for_test(Feature::Detection, v)
+                            .expect("detection has a worker row");
+                    }
+                    states += 1;
+                    assert_eq!(
+                        updates_enabled(&s),
+                        effective(Feature::Detection, Scope::UnknownCaller, &s),
+                        "the rename may not move the resolution \
+                         (master={master}, l2={l2}, tab={tab:?}, worker={worker:?})"
+                    );
+                    // The named predicate is the resolution, so the pair the
+                    // decomposition claims must hold everywhere too.
+                    assert_eq!(
+                        armed_anywhere(Feature::Detection, &s),
+                        armed_outside_the_worker(Feature::Detection, &s)
+                            || effective(Feature::Detection, Scope::OffloadWorker, &s),
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(states, 36, "the sweep must actually cover the matrix");
+
+    // (2) M-21's state: armed anywhere, not armed outside the worker. Pointing
+    // the gate at `armed_anywhere` would light the updater here — and collapse
+    // `worker_only_detection` to a permanent false.
+    let mut worker_only = with_tab();
+    worker_only.set_l2_for_test(Feature::Detection, false);
+    worker_only
+        .set_worker_override_for_test(Feature::Detection, Override::On)
+        .expect("detection has a worker row");
+    assert!(!updates_enabled(&worker_only));
+    assert!(armed_anywhere(Feature::Detection, &worker_only));
+    assert!(worker_only_detection(&worker_only));
+
+    // (3) N-1's elevation: one tab's L3 `On` over an app-wide `Off` starts the
+    // updater. `Scope::AppWide` would not, which is why decision 41 declined it.
+    let mut one_tab_on = with_tab();
+    one_tab_on.set_l2_for_test(Feature::Detection, false);
+    one_tab_on
+        .set_tab_override_for_test("f38-tab", Feature::Detection, Override::On)
+        .expect("detection has a per-tab row");
+    assert!(updates_enabled(&one_tab_on));
+    assert!(!effective(Feature::Detection, Scope::AppWide, &one_tab_on));
+}
+
 /// **#48 F-35 — the user's own broken rules are reported when the layer is
 /// armed ANYWHERE, not only app-wide.**
 ///

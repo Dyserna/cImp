@@ -260,17 +260,26 @@ pub fn manifest_url(s: &Settings) -> String {
 /// N-1**: the old `Scope::App` also honoured an L3 `On` stated by any configured
 /// AI tab, so a single tab-scope `On` over an app-wide `Off` really does start
 /// the updater. Locked decision 36 split the variant in two and this site kept
-/// the behaviour it had, under the name that now describes it —
-/// [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller).
+/// the behaviour it had.
 ///
-/// The name is deliberately the visibly odd one: there is no unknown caller
-/// here, so it reads as a question nobody has answered, which is exactly what it
-/// is. Whether the updater should follow the app-wide baseline
-/// (`Scope::AppWide`, so one hardened tab stops starting it) or the
-/// armed-anywhere predicate (which M-21 explicitly rejected, `worker_only_detection`
-/// below) is a **behaviour** decision with a live-verify box attached, raised as
-/// **F-38** rather than folded into a rename that changes nothing. Until it is
-/// taken, this stays exactly as it has behaved since N-1.
+/// **#48 F-38 / locked decision 41 — the resolution is unchanged and now states
+/// its own question.** The site used to spell
+/// [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller)
+/// inline, which is *behaviourally* right and *nominally* wrong: there is no
+/// unknown caller here. The question this site asks is **"is the one shared
+/// bundle on disk worth keeping current, i.e. is detection armed for anybody
+/// other than the offload worker?"**, and
+/// [`armed_outside_the_worker`](crate::settings::injection::armed_outside_the_worker)
+/// is that question by name — the same resolution, delegated, byte for byte.
+/// This is preventive, not cosmetic: `Scope::App` produced two defects (M-21,
+/// F-35) for exactly one reason, a name standing in for a question it did not
+/// ask, and a future reader must not be able to borrow the wrong one here.
+///
+/// **Still not a behaviour decision.** Whether the updater should instead follow
+/// the app-wide baseline (`Scope::AppWide`, so one hardened tab stops starting
+/// it) or the armed-anywhere predicate (which M-21 explicitly rejected,
+/// `worker_only_detection` below) remains open and carries a live-verify box.
+/// Decision 41 declined both. This stays exactly as it has behaved since N-1.
 ///
 /// Read per call, never cached: a flip takes effect on the next tick or the
 /// next click, so this is not spawn-baked and owes no `spawn_inject_sig` entry.
@@ -281,9 +290,8 @@ pub fn manifest_url(s: &Settings) -> String {
 /// promised in so many words that with protection off nothing is polled or
 /// swapped, which a button that did both made false.
 pub fn updates_enabled(s: &Settings) -> bool {
-    crate::settings::injection::effective(
+    crate::settings::injection::armed_outside_the_worker(
         crate::settings::injection::Feature::Detection,
-        crate::settings::injection::Scope::UnknownCaller,
         s,
     )
 }
@@ -294,8 +302,9 @@ pub fn updates_enabled(s: &Settings) -> bool {
 ///
 /// # Why this state exists, and why the resolution above is still right
 ///
-/// [`updates_enabled`] resolves at
-/// [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller),
+/// [`updates_enabled`] resolves through
+/// [`armed_outside_the_worker`](crate::settings::injection::armed_outside_the_worker)
+/// — i.e. at [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller),
 /// which folds in L1 and L2 and — since N-1 — an L3 `On` stated by any configured
 /// AI tab, but **deliberately not** the `offload-worker` row: `any_tab_override_on`
 /// is *"tabs only, deliberately"*, because that elevation exists for a call that

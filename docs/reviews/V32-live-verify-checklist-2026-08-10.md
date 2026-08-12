@@ -936,7 +936,9 @@ process. The updater's redirect policy is `none()`, covered by recipe 11._
 > applied in `oob/mod.rs:145-157` (`speak()` → `processing::strip_terminal_escapes`)
 > and the module docs state it plainly: *"TTS and toasts are global surfaces per
 > the global-only avatar/TTS decision"* (`settings/injection.rs:69`). It is
-> **`Scope::App`, with no per-scope row, and it does not touch tool results.**
+> **`Scope::AppWide`** (`Scope::App` before decision 36 split it — this control
+> has no per-scope row, so the two are equal here)**, and it does not touch tool
+> results.**
 > So recipe 8's first box is really a statement about the harness's terminal, not
 > about cImp — the defence that covers a model echoing a page is the spotlight
 > envelope, not escape hygiene. Worth rewording the box, since as written it
@@ -1288,8 +1290,25 @@ tick phase** — any live 15-minute scheduler must have fired at least twice.
 - `spawn_scheduler` is called **unconditionally** (`main.rs:894`), and its own
   comment says gating is deliberately *inside* the tick so settings take effect
   "at the next tick with no restart".
-- `updates_enabled` = `Feature::Detection` at `Scope::App` (`:259-265`) —
+- `updates_enabled` = `Feature::Detection` at **`Scope::UnknownCaller`** —
   `/status` reported `effective:true` at every scope throughout.
+  ⚠ **RETESTER — this bullet was rewritten 2026-08-12 when locked decision 36
+  landed. Use this version; the old one produces a false PASS.**
+  `updates_enabled`'s doc used to claim its scope *"resolves to L1 ∧ L2"*, and
+  **that was false from N-1 onwards**. The variant it named has since been split:
+  - **`Scope::AppWide`** — the app-wide baseline, `L1 ∧ L2`, and nothing else.
+    **`updates_enabled` does NOT resolve here.**
+  - **`Scope::UnknownCaller`** — that baseline **plus** an L3 `On` from any
+    configured **AI tab** (`any_tab_override_on`, N-1). **This is where
+    `updates_enabled` resolves**, so a tab-scope `On` really does start the
+    updater, and only the `offload-worker` row is excluded.
+
+  Both still key as `"app"` in `/status`, so the JSON is unchanged and the `app`
+  row you read is the `UnknownCaller` answer — which is what makes N-1 observable
+  through `/status` at all. Concluding "a narrower override cannot matter here"
+  is the false PASS this bullet exists to prevent, on this box and on F-35's.
+  Repointing `updates_enabled` at the baseline is open as **F-38** and is NOT in
+  this build.
 - `Mode::parse("auto")` → `Mode::Auto` (`:139-143`), so `is_inert()` is false.
 - **The project overlay does not override either updater key** — checked
   explicitly, because comparing against the global file alone is what produced
@@ -1422,7 +1441,50 @@ and Limits: Injection protection (`SettingsApp.svelte:4414`), Native web tools
       `detection_check_now` anyway returns the **refusal error** rather than
       running.
 
-**Results:** 10 ____ 11 ____ 11b ____
+### 11d — **NEW 2026-08-12, never run** — F-35 / decision 36: a worker-only override still reports the user's OWN broken rules
+
+_Closes review finding **F-35**. Before the fix, both signals gated on the
+app-wide answer and returned `None` in this exact state — the user was told
+**nothing** while the offload worker went on screening every fetched page with
+rules of theirs that had failed to compile._
+
+**Arrange** (all in Settings → Offload task tools → Injection protection /
+Injection detection):
+1. Injection protection master **ON**.
+2. *Injection detection* **OFF** app-wide, and `Inherit` on every AI tab.
+3. The `offload-worker` row's *Injection detection* override → **On**.
+4. Put a deliberately broken rule in `<exe-dir>/detection/rules.d/local/`
+   (e.g. `broken.yar` containing `rule Bad { condition: }`), then click
+   **Reload rules**.
+
+**Assert:**
+- [ ] The **Advisor card** for the user's own rules fires and names
+      `local/broken.yar`. _(This is the box F-35 is about — before the fix it was
+      silent.)_
+- [ ] The **Settings row** (`DetectionStatus::local_rules_broken`) fires with the
+      same file.
+- [ ] The three updater buttons — Check now / Apply / Revert — **still refuse**,
+      with M-21's worker-only sentence: *"…still switched ON for the offload
+      worker…"*. **Reporting honesty must not have become a new capability.**
+- [ ] `/status`'s `app` row still reads `detection: effective:false` — the
+      updater's scope did not move.
+- [ ] **Control:** set the `offload-worker` override back to `Inherit` (detection
+      now armed nowhere) → both signals go **silent** again, and the refusal
+      reverts to the plain *"injection detection is switched off,"* sentence.
+- [ ] **Control:** master switch **OFF** → both signals silent, and the refusal
+      is the **new third sentence** naming the *master switch* rather than
+      injection detection (M-21's residual, folded in with F-35).
+
+### 11e — **NEW 2026-08-12** — decision 36's rename is not a wire change
+
+- [ ] `GET /status` still reports exactly three kinds of scope key: `app`,
+      `offload-worker`, and one per configured AI tab. **No new scope row
+      appears.** (`Scope::AppWide` and `Scope::UnknownCaller` both key as
+      `"app"`; a fourth row would mean the split leaked to the wire and the
+      Settings matrix will render an unwritable row for it.)
+- [ ] The Settings matrix renders unchanged, and `settings_version` did not move.
+
+**Results:** 10 ____ 11 ____ 11b ____ 11d ____ 11e ____
 
 ---
 
@@ -1731,7 +1793,8 @@ Extended 2026-08-08 — four consumers the above does not reach:
       snippet **answering**. The elevation's real consumer is the *other* switch
       — `unattributed_write` is *"deliberately not gated on `policy.latch`… only
       on `policy.quarantine`"* (`loopback.rs:2356-2361`), and `GatePolicy::resolve`
-      maps a `None` scope to `Scope::App` (`:1997-2005`), which is precisely where
+      maps a `None` scope to `Scope::UnknownCaller` (`Scope::App` when this box
+      was run; renamed by decision 36, same behaviour), which is precisely where
       `decide` applies `any_tab_override_on` (`injection.rs:678-686`).
       So the decisive pair, with *Memory quarantine* **off app-wide**:
       · one tab's L3 `On` → app row `effective:true, decided_by:"scope",
@@ -1744,12 +1807,22 @@ Extended 2026-08-08 — four consumers the above does not reach:
       single per-tab `On` and nothing else.
       *(`/status`'s app row reading `decided_by:"scope"` while its own
       `override_value` is `"inherit"` looks self-contradictory but is documented
-      N-1 behaviour — `DecidedBy::Scope` at `Scope::App` means "a narrower scope's
+      N-1 behaviour — `DecidedBy::Scope` at `Scope::UnknownCaller` (the scope
+      `/status`'s `app` row reports; see the box's own note) means "a narrower scope's
       `On` is being honoured here", and the honest alternative `Feature` would
       claim L2 said `on` when it said `off` (`injection.rs:648-654`). Do not
       re-raise it.)*
       *(Also observed, expected and separate: the anonymous fetch was still
-      **enveloped** — spotlighting resolves at `Scope::App` independently.)*
+      **enveloped** — spotlighting resolves at `Scope::UnknownCaller`
+      independently.)*
+
+      ⚠ **RETESTER, 2026-08-12 (decision 36 / F-35).** This box's PASS is still
+      valid and the behaviour is unchanged, but the vocabulary moved: what this
+      box calls `Scope::App` is now **`Scope::UnknownCaller`**, and the new
+      **`Scope::AppWide`** is a *different* scope that does NOT carry the
+      elevation. `/status`'s `app` row still reports the `UnknownCaller` answer
+      — that is deliberate, and it is the only observation point this box has.
+      Re-running it needs no change to the steps.
 - [x] **The reduced-protection count is one rule:** turn off exactly one control
       on one scope → the ⛨ tooltip and the tab badge agree; the count is of
       **distinct controls**, not scope×feature pairs; a default-off control at
@@ -2030,3 +2103,5 @@ The other half of the same job: a tester working from the rows above would file 
 | `run_check` is **refused to a remote/cloud offload backend** unless *Settings → Checks → Offload worker access* is ticked | it was advertised to a cloud backend and executed the project's commands | **F-12 — FIXED `00ae3cb` + `049fb8b`.** New block after recipe 2. ⚠ Its refusal string names *"Settings → Code Intelligence → Checks"*, which **does not resolve** — that is **F-18**'s sixth site, left knowingly |
 | The *Settings → Checks* exposure line reads `offload worker ✓ (local worker only)` when the opt-in is off, and the *"web/docs only"* preset recognizes the **7**-entry exclusion | the line claimed `offload worker ✓` unconditionally, and `scopeMode()` matched on array **length**, so a migrated install rendered as "custom" and clicking the radio silently dropped `run_check` | **F-27 — FIXED `049fb8b`.** The Rust-side `include_str!` mirror tripwire is still owed |
 | A price row for `claude-opus-5`, and existing installs backfilled by a watermark migration | session cost read $0 | **F-19 — FIXED `1524efa`** |
+| The Advisor card **and** the Settings row for the user's own `rules.d/local/` files fire whenever the signature layer is armed in **any** scope — the offload worker included — not only app-wide. The three updater buttons still refuse | with detection narrowed to the worker (`worker.detection = on`, L2 off) both signals returned `None`, so a user whose own rule file did not compile was told **nothing** while the worker screened every fetched page with it | **F-35 — FIXED 2026-08-12** (locked decision 36). New boxes **11d / 11e**. `Scope::App` no longer exists: it is `Scope::AppWide` (the baseline, `L1 ∧ L2`) + `Scope::UnknownCaller` (that plus any tab's L3 `On`, N-1), and the "armed anywhere" question is `injection::armed_anywhere` — **reporting only, never a gate.** Both scopes still key as `"app"`, so `/status` is byte-identical. `updates_enabled` is **deliberately unmoved** (F-38) |
+| The updater's refusal has **three** sentences, not two: the third names the **master switch** when L1 is off, instead of blaming injection detection | an L1 `off` produced *"injection detection is switched off…"*, pointing the user at a switch they could flip with no effect | **M-21's residual — FIXED 2026-08-12 with F-35.** The frontend already made this distinction; the two surfaces now single-source from three cases. Still `Err` on every branch — reporting honesty is not a new capability |

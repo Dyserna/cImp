@@ -1,6 +1,6 @@
 # V32 — Injection Hardening (tool-class taint latch + untrusted-content discipline)
 
-**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). 
+**Status:** IN PROGRESS — Phases A (#31), B (#32), C (#33, both halves; judge deferred) + D (#36) coded 2026-08-06; C2 (#34) + C3 (#35) + F (#40) + G (#42) coded 2026-08-07; H (#43) coded 2026-08-07; E resolved by decision 17 (E1 deferred, E2 shipped as Phase H). Deep code review 2026-08-07 (`docs/reviews/code-review-V32-2026-08-07.md`), then a **seventeen-commit fix-and-audit run — `b80f5b8`, then `09dc7ec..dc3491b`** — closing its HIGHs and most of its MEDIUMs. The last commit of that run (`dc3491b`, 2026-08-08) audited this document against the code at `aed6289` and corrected every stale "as built" claim in place — amendments dated 2026-08-08 are that pass. The decisions the run itself took are **locked decisions 17–24** below (17 restored from `522b62d`, where it was written into the phases and never numbered; 18–24 recorded 2026-08-08). The 2026-08-11 fix phase added **25–33**, and a **pre-RC decision pass on 2026-08-12 settled every remaining open finding as locked decisions 34–40** — recorded with their accepted counter-arguments in the ledger's *User decisions taken 2026-08-12* table. **Locked decisions now run 1–40.** Note decision 34 **amends decision 2** (there are now three per-direction refusal constants, not two) and decision 35 **reaffirms decision 17** unchanged. 
 A **full re-review on 2026-08-08** (`docs/reviews/code-review-V32-2026-08-08.md`, 11 parallel agents over the whole `033b36e~1..f31978c` range) then found **10 HIGHs open on a fully green build** — including that C-1 and C-2 had never actually been closed, and that two individually-correct fixes had made the update channel unfetchable by construction. The governing pattern it named, and the one to check first on any future fix run here: **the fixes were correct against their proof-of-concept and incomplete against their invariant**, with three regression tests pinning the PoC's *shape* rather than the property. The decisions taken in response are **locked decisions 25–29** below.
 
 Remaining: live-verifies 1–22; the containment HIGHs the re-review reopened (C-2 growth-forgery, `/audit/run`'s opt-in gate, forensic-row eviction); the six updater MEDIUMs M-9…M-14; and publishing `detection-v1`, which is now **unblocked** (decision 24, rewritten). GitHub: milestone 5, umbrella #29.
@@ -1755,8 +1755,16 @@ declares its class AND its mutation capability in one reviewed place.
     covers neither (decision 16 / #44).
     **App scope, not per tab**, deliberately: there is one bundle on disk for
     the whole process, and a per-tab detection override changes which tab
-    *scans* with it, not whether it is worth keeping current. `Scope::App`
-    resolves to L1 ∧ L2, which is exactly that question.
+    *scans* with it, not whether it is worth keeping current.
+    **⚠ AMENDED 2026-08-12 (decision 36 / F-35): the sentence that used to close
+    this paragraph — *"`Scope::App` resolves to L1 ∧ L2, which is exactly that
+    question"* — has been FALSE since N-1.** `Scope::App` also honoured an L3
+    `On` from any configured AI tab, so one tab-scope `On` over an app-wide `Off`
+    really does start the updater; only the `offload-worker` row is excluded.
+    Decision 36 split the variant, and this site kept the behaviour it had under
+    the name that now describes it, `Scope::UnknownCaller`. Whether it *should*
+    follow the app-wide baseline (`Scope::AppWide`) instead is **F-38** — a
+    behaviour change with a retest box, not a rename.
     *Rejected:* keep `master_enabled` and correct only the comment. The comment
     already described the behaviour the user wanted; when the prose and the code
     disagree about a security gate, the cheap fix is the wrong one.
@@ -2382,6 +2390,341 @@ declares its class AND its mutation capability in one reviewed place.
     **Status: settled 2026-08-11, not yet coded.** Take with F-20 and F-29 — four
     findings now cluster on *"containment right, reporting wrong"*, and they share
     one seam.
+
+34. **A refusal that follows a USER's flip says so on BOTH routes — a third
+    per-direction constant, chosen in `gate` and never in `refusal` (user decision
+    2026-08-12 — review finding F-34).** Locked decision 2's doc calls
+    `REFUSAL_LOCAL_BLOCKED` and `REFUSAL_EXTERNAL_BLOCKED` *"the two per-direction
+    constants required by locked decision 2"*. **That line is hereby amended: there
+    are three.** F-23 already established the shape on the native route; this is the
+    same defect on the **proxied** route, where a user who clicked "Switch to local"
+    is still told *"this task has already used a local-capability tool"* — a cause
+    that did not happen, which a tab's model has already repeated to a user as fact.
+
+    **The constant is selected in `LatchRegistry::gate`, which holds
+    `entry.local_by_user_flip`, and NEVER inside `Latch::refusal`.** That placement
+    is load-bearing, not stylistic: `Latch::refusal` is a pure function over `Latch`
+    that the **offload worker** also calls, and the worker has no user-flip concept
+    to thread. The rule is therefore a convention rather than a type, and wants a
+    comment or tripwire at the boundary.
+
+    Containment must stay byte-identical — only the chosen message changes — and
+    `flip_local_reopens_local_tools_and_closes_the_external_side` pins the old
+    string by name: **split it, do not loosen it.**
+
+    **Note the asymmetry with F-13 and F-23: those sit behind the Phase H gate and
+    are inert at the shipped default, while this one fires on the proxied path,
+    which is LIVE.** That is why it was taken despite amending a locked decision.
+
+    **Status: CODED 2026-08-12** as `REFUSAL_EXTERNAL_USER_LOCAL`
+    (`offload/toolclass.rs`), selected by `user_flip_refusal` in
+    `LatchRegistry::gate`'s `ProxyGate::Refuse` arm. 2002 passed / 0 failed /
+    5 ignored, clippy clean. The convention is guarded by a real tripwire,
+    `the_user_flip_constant_is_never_reachable_from_the_pure_latch_functions`,
+    which reddens if the logic is ever migrated down into the shared functions —
+    *"a worker that claims a human clicked something in a process with no human."*
+
+    **Two facts the implementation established, both worth carrying:**
+    - **The fix reaches further than "proxied":** every route through
+      `LatchRegistry::gate` gets it, including `LatchRoute::Native` and `Hook`.
+      Only the OpenCode plugin's in-process JS gate stays on F-23's separate path.
+    - ⚠ **This one is NOT spawn-baked** — `gate` reads live registry state per call
+      in cImp's own process. **Do not add it to the fresh-tab deploy-trap list
+      alongside F-13 / M-16 / F-23**; no tab restart is needed to observe it.
+
+35. **The Phase H OpenCode gate STAYS default-off — decision 17 reaffirmed, and the
+    real defect was a comprehension hazard (user decision 2026-08-12 — review
+    finding F-31).** Re-examined because F-13, F-23 and F-34 all enforce through a
+    gate that protects nobody out of the box. Decision 17's reasoning is unchanged
+    and still correct: the spike verdict is GO-*with-caveats*, and a control that
+    refuses a native `bash` on a fresh install gets answered by switching V32 off
+    wholesale (decision 16's own argument). Added here: the gate **runs inside the
+    agent's process and is bypassable by design** — `OPENCODE_PURE=1`, spawning an
+    ungated `opencode`, and user-typed `!shell`/PTY all walk around it — so shipping
+    it on would imply containment it cannot deliver. Real containment stays V33's.
+
+    **What F-31 actually found was not a posture error but a reading error: the
+    review itself repeatedly reasoned about F-13 and F-14 as though the gate were
+    live.** The deliverable is therefore documentation — every row whose fix lands
+    behind this gate must say **INERT AT THE SHIPPED DEFAULT** on its face.
+
+    **Accepted consequence, stated plainly: the OpenCode native surface is ungated
+    out of the box, and F-13/F-23's protections do not exist until a user opts in.**
+
+36. **`Scope::App` is split into distinct named questions (user decision 2026-08-12
+    — review finding F-35, with M-21).** The scope's own doc admits it *"stands in
+    for two different questions"* — *"what is the app-wide answer"* and *"what
+    applies to a call that sent no `--tab`"* — and `updates_enabled` then borrowed it
+    for a **third**, *"does anything in this process use the shared bundle?"* It has
+    now produced **two** symptoms: M-21 (a false claim) and F-35 (a suppressed one,
+    where a user whose own `rules.d/local/` rules fail to compile is told nothing
+    while the worker keeps scanning with them). Fixed as **vocabulary**, before a
+    fourth borrower appears.
+
+    Three call sites are repointed at the question each actually asks:
+    `updates_enabled`, `broken_local_rules`/`advisor_signals`, and the N-1
+    unattributed-caller path.
+
+    *Rejected:* a local "effective in any scope" predicate inside the updater module
+    — it closes F-35's symptom while leaving the overload live, which is how M-21 and
+    F-35 both happened.
+
+    **⚠ IMPLEMENTED 2026-08-12, with two corrections to the paragraphs above.** The
+    design pass and the implementation both landed against the code rather than
+    against this text, and two of its claims did not survive:
+
+    - **`advisor_signals` is the wrong citation.** `updater::advisor_signals()`
+      (`updater/mod.rs:957`) takes no `Settings`, resolves no scope and gates on
+      nothing. F-35's second site is **`signature::advisor_signal`** (singular,
+      `detection/signature.rs`), a different function in a different file. The pair
+      is `updater::broken_local_rules` + `signature::advisor_signal`.
+    - **`updates_enabled` is not a third borrower — it asks the FIRST question and
+      receives the second's answer.** Its own doc claimed *"`Scope::App` resolves to
+      L1 ∧ L2"*; that has been **false since N-1**, which also folds in an L3 `On`
+      from any configured AI tab. So the real shape is three questions of which the
+      *first* was unspellable by anyone:
+
+      | | question | formula | before | after |
+      |---|---|---|---|---|
+      | **A** | the app-wide baseline | `L1 ∧ L2` | nothing spelled it | `Scope::AppWide` |
+      | **B** | what applies to a caller with no `--tab` | `L1 ∧ (L2 ∨ ∃tab.L3=On)` | `Scope::App` — B under A's name | `Scope::UnknownCaller` |
+      | **C** | is this armed **anywhere**, worker included | `B ∨ worker.L3` | missing | `injection::armed_anywhere` |
+
+    **C is a function, deliberately not a `Scope::Anywhere` variant.** Every helper
+    keyed on `Scope` would have accepted such a variant, and `native_web_mode(s,
+    Scope::Anywhere)` would take a tool away from one tab because a *different* tab
+    was hardened. "Armed anywhere" is a reporting predicate, not a place a control is
+    enforced at; it is documented **reporting only, never a gate**.
+
+    **`Scope::App` was RENAMED, not supplemented.** `Scope` is matched exhaustively
+    in only three places, all inside `injection.rs` — so *adding* `UnknownCaller`
+    beside `App` would have been a compile error in three arms in the file already
+    being edited and would have migrated **none** of the thirteen production
+    borrowers. The rename is the only exhaustive migration tool available.
+
+    **What actually changed behaviour: exactly two call sites**, both reporting —
+    `broken_local_rules` and `signature::advisor_signal` now gate on
+    `Config::armed_anywhere(s)`. Everything else is a token change proven equal site
+    by site. **`updates_enabled` is untouched** and still resolves at what is now
+    `Scope::UnknownCaller`; moving it is a behaviour change with a live-verify box,
+    and it is raised as **F-38** together with `injection_status`'s app row (which
+    also stays on `UnknownCaller`, because `/status`'s `app` row is the only
+    observation point live-verify recipe *"an identity-less call honours a per-tab
+    `On`"* has). M-21's residual — `updates_allowed` had two refusals where the UI
+    had three states — is folded in: the master-off case gets its own sentence in
+    Rust, still an `Err`, so both surfaces single-source from three cases.
+
+    **Cross-module contract, stated because the split could have broken it
+    silently:** `updates_enabled` and `worker_only_detection` must keep answering two
+    DIFFERENT questions. `worker_only_detection` is `!updates_enabled ∧
+    effective(Detection, OffloadWorker)`, and the frontend renders a distinct
+    worker-only sentence gated on it — so repointing `updates_enabled` at
+    `armed_anywhere` would make that field permanently `false` and kill a Svelte
+    branch that still *looks* reachable. If F-38 moves `updates_enabled`, the
+    frontend branch moves in the same change or is deleted.
+
+    **Mandatory de-risking, part of the decision, because this edits `decide()` —
+    the single source of truth for every V32 enforcement site — days before a 55-box
+    retest:** land it **before** the RC build, or the retest validates a tree that is
+    about to change; ship **two commits**, a pure rename/split with zero behaviour
+    change (the 1999-test suite is the guard) then the one intentional change; and
+    **pin N-1 with a named test FIRST** — *"only `On` travels up, an L3 `Off` stays
+    where the user put it"* — so the split cannot quietly widen or narrow it.
+
+37. **A child gets a route to report what it contained (user decision 2026-08-12 —
+    review finding F-32).** F-11's fix makes a child skip a discovery entry that
+    fails liveness verification, and reports it to **stderr** — an operator consumer
+    with no user consumer. The case that goes unreported is exactly the interesting
+    one: a **planted** entry was skipped *and the child reached the real app anyway*,
+    so containment worked perfectly and nobody is told an attacker probed.
+
+    A **token-authenticated child→app loopback route** is added so the child can file
+    an activity row. It **must** clear recipe 21's forgery bar, already proven for
+    `POST /latch/beacon`: a forged row leaves the store untouched, and **the route
+    answers identically on every path, so the response is not the signal.**
+
+    **⚠ AMENDMENT 2026-08-12, from the design pass — the first half of that bar is
+    UNACHIEVABLE AS WORDED and is hereby restated.** *"A forged row leaves the store
+    untouched"* was a property of routes whose protected asset was the **registry**;
+    this route's entire **purpose** is to write a row, so a bar forbidding that
+    forbids the feature. The achievable — and strictly stronger — property, which is
+    what the implementation must satisfy: **a token-holder can cause a row, but
+    cannot make it say anything a genuine row could not, cannot name a
+    non-configured tab, cannot cost another lane a row, cannot exceed log2(n) rows
+    in its own lane, cannot touch any latch, and cannot learn anything from the
+    reply** — `200 {"ok":true}` byte-identical on every path, deliberately diverging
+    from both sibling routes' `400`s. The second half of the bar (*the response is
+    not the signal*) is unchanged and still binding.
+
+    **⚠ Premise correction, same pass: `/activity/contract_drift` ALREADY IS a
+    child→app activity-row route.** The finding's *"there is no loopback route for a
+    child to file an activity row"* was **wrong**. The decision to build a new one
+    stands on other grounds (four of them, in the design plan — including that
+    `record_bg` has no test seam, which is why F-20's owed test was never written).
+
+    Design plan: `plan-f32-child-report-route.md`. Route shape `POST
+    /activity/discovery_skipped`, `consumer` **in the body** (the query-string form
+    exists only for `/mcp/call`, whose body is foreign MCP JSON-RPC); new
+    `Screen::DiscoverySkipped` lane; **Anonymous attribution ⇒ `Unattributed`, never
+    `Headless`** (F-20/F-29's exact shape); flood discipline reuses `claim_ssrf`'s
+    doubling rather than reimplementing it. **Spawn-baked: yes, child half.**
+
+    **Status: CODED 2026-08-12.** 2013 passed / 0 failed / 5 ignored, clippy clean.
+    All seven clauses of the restated bar are satisfied and individually tested.
+    Notes worth carrying:
+
+    - **The doubling counter was EXTRACTED, not copied** — `claim_ssrf`'s counter
+      became `outbound::Doubling { seen, reported }` and `claim_ssrf` delegates to
+      it. The return type was renamed `SsrfRow` → **`DoublingRow`** across 21
+      compiler-checked sites, on the argument that a shared primitive named for one
+      of its two consumers is the misleading-name shape that produced F-20/F-29.
+    - **No once-per-process flag on the child side, deliberately.**
+      `forget_resolved_discovery()` makes re-resolution normal, so a `SAID`-style bit
+      would make the signal one-shot and its **absence** would read as "no attack" —
+      F-24's defect reappearing inside its own fix. Both sides double instead.
+    - **Fail-open is bounded**: 80 ms connect + 80 ms write, response never read, on
+      a path that already costs ~1.2 s per cold resolution.
+    - ⚠ **Deploy consequence:** the new `Screen` variant raises
+      `INJECTION_FLAG_TOTAL_CAP` by 64 and `FILE_COMPACT_LINES` with it. Derived by
+      design, so no migration — but the activity JSONL's ceiling grows.
+    - **No settings key and no feature flag**, deliberately: this is a report rather
+      than an enforcement, and a default-off gate would be the very
+      "signal with no consumer" shape this workstream exists to close.
+
+    **⚠⚠ LIVE-VERIFY: SPAWN-BAKED, CHILD HALF — three traps, all of which have
+    produced false failures on this project before (F-13 / M-16 / F-23):**
+    1. **FRESH TAB, as the recipe's first line.** The route is live the moment the
+       upgraded app starts, but the reporting code is in the **child** binary,
+       spawned per tab. An upgraded binary under an already-open tab keeps the old
+       child, which never posts.
+    2. **`RESOLVED` memoises per hint**, so the planted `.cimp-discovery/<n>.json`
+       must exist *before* the tab starts. Planting it afterwards produces nothing.
+    3. **A suppressed report is a PASS.** With doubling on both sides, a second leg
+       in the same tab is observable only at report 2, 4, 8… A recipe expecting a row
+       every time manufactures its own false negative.
+
+    *Rejected:* moving the signal into the shims — `taint_beacon`'s entire safety
+    argument is that it writes nothing to stdout/stderr and awaits nothing, so the
+    signal stays in `proxy_base_for`. *Accepted cost:* a new authenticated write path
+    into the activity store, reviewed during RC week.
+
+38. **Held quarantined rows are readable only through a capability, not a comment
+    (user decision 2026-08-12 — the `mem_quarantined_notes` tripwire gap).**
+    `mem_quarantined_notes` is a `pub` accessor returning **tainted rows**, including
+    the secret values the screen caught, with no bound on who may call it; decision
+    10's note-query scan cannot help, because it guards the query's *location*, not
+    the filter, and the scan sees datalog rather than method calls.
+
+    It takes a `QuarantineReview` capability whose **only** constructor is reachable
+    from the `MemorySnapshot` path — **no `pub fn new()`**, since F-15's lesson is
+    that the constructor *is* the guard — plus a `#[cfg(test)]`-only constructor for
+    the test sites. Same discipline as F-15: **made unrepresentable, not detected.**
+
+    The open design question the review recorded (*"is the authorized consumer
+    `memory_snapshot` today, an IPC command tomorrow, an export later?"*) **does not
+    need answering**: there is exactly **one** production caller today
+    (`graph/service.rs:2059`), so today's consumer is nameable and tomorrow's must
+    construct the token deliberately — which is the code-review moment we want when
+    someone starts routing held secret values somewhere new.
+
+    ⚠ **Three lines above that call site a comment already states the rule** — *"the
+    Memory UI is the only reader allowed to see them"*. **Sixth instance of this
+    codebase's signature defect: a comment standing in for a check.**
+
+    **Status: CODED 2026-08-12.** 2013 passed / 0 failed / 5 ignored, clippy clean.
+    As built, with two refinements the decision did not specify:
+
+    - **The token is taken BY VALUE and derives neither `Clone` nor `Copy`**, so it
+      cannot be stashed and re-used for a second read. `_review` is unused on
+      purpose — *"a proof obligation, not data."*
+    - **TWO independent bounds, not one.** Beyond the private constructor,
+      `graph::memory` is a **private module** and `QuarantineReview` is deliberately
+      **not re-exported** from `graph/mod.rs`. Outside `crate::graph` the type cannot
+      be *named*, so the accessor is uncallable there regardless of intent — which
+      forecloses this decision's own hypothesised *"an IPC command tomorrow"*
+      (`ipc/commands.rs`) structurally rather than by review.
+    - **The snapshot assembly MOVED into `memory.rs`** (`MemorySnapshot::assemble`).
+      This is the load-bearing choice: a private constructor only bounds the module
+      it lives in, and `service.rs` is **6,540 lines**, so leaving assembly there
+      would have forced the constructor up to `pub(super)` — constructible from
+      anywhere in `graph::`, **including the model-facing `graph/mcp.rs`.**
+      `service.rs::memory_snapshot` keeps its early return and delegates; it cannot
+      mint a token.
+
+    **`mem_quarantined_count` deliberately does NOT take the token**, and this is not
+    a close call: requiring it would mean minting one on the `context_notes` path
+    (`graph/mcp.rs:1344`), **handing the capability to the exact caller class it
+    exists to exclude** and making it constructible from model-facing code — strictly
+    worse than not having it. A count is not tainted text, and locked decision 22
+    *wants* the model told its write landed in review. Recorded on the fn itself so
+    the next reviewer finds the decision instead of re-litigating it.
+
+    **Scale correction:** the accessor had **7** test call sites, not the ~13 the
+    brief estimated; the rest belong to `mem_quarantined_count`.
+
+39. **F-33 is MEASURED before it is fixed, and the measurement gates the RC (user
+    decision 2026-08-12).** `010.0.0.0/8` produces no SSRF candidate at all —
+    `is_plausible_host` rejects leading-zero octets while the URL parser reads them
+    as octal — but that spelling resolves to a **public** address, so the row as
+    filed is evidence of a screen/parser disagreement (H-3's family) and **not yet
+    evidence of a hole.**
+
+    The measurement that decides it: run the leading-zero family against the **C-4
+    parser-differential corpus**, above all **`0177.0.0.1` → `127.0.0.1`** — the
+    inverse case, an address whose *canonical* form is loopback but whose *written*
+    form carries a leading zero. **If a private-canonical form is extracted by
+    neither path, that is an SSRF bypass and it BLOCKS the release candidate.**
+
+    Fix shape if confirmed: accept leading-zero octets **and normalize them to the
+    parser's own reading**. *Rejected:* "accept anything numeric" — it widens the
+    candidate set the screen pays for on every call, and both the screen's cost and
+    its false-positive behaviour scale with candidate count.
+
+    **OUTCOME 2026-08-12 — the measurement CONFIRMED A LIVE BYPASS, and F-33 named
+    the wrong root cause.** Leading zeros were one of *four* escaping families;
+    `127.1:8080/x` — plain decimal, no zero anywhere — is a shorter loopback bypass
+    than anything F-33 names. Raised as **F-36** and closed with it.
+
+    **Two corrections to this decision's own wording, both earned by implementing it:**
+    - *"Normalize to the parser's own reading"* was **wrong as instructed** and was
+      rightly refused. Re-spelling the host inside the extractor is a **second**
+      WHATWG IPv4 parser for the screen to disagree with — H-3's family again. The
+      shipped fix instead **deletes** the hand-written predicate and asks
+      `Url::parse` directly, emitting the candidate **verbatim**. There are now
+      **zero IPv4 parsers written in `outbound.rs`**, which is the real cure.
+    - *"The C-4 corpus is the harness"* was **wrong**: its oracle parses the string
+      as written, and `Url::parse("127.1:8080/x")` fails because `127.1` is not a
+      scheme. The hole lives entirely in the **schemeless** `scan_bare_authorities`,
+      so the corpus serves the scheme-bearing pins only.
+
+    **Accepted residual, then CLOSED by user decision the same day:** the carve-out
+    that protects prose ratios (`"mix them 0.5:1 by volume"`) also exempted the bare
+    `0` — `Url::parse("http://0/")` is `0.0.0.0` — so schemeless `0/admin` and
+    `0:8080/x` reached localhost. Pre-existing rather than opened here, and
+    **schemeless-only**: `is_plausible_host` has exactly one production call site, in
+    the bare-authority path, so scheme-bearing `http://0/admin` was always screened.
+    **Decision: close it** — exempt zero-first-octet short forms *except* those
+    reading as exactly `0.0.0.0`. **Accepted price, measured not guessed: `"0:00
+    UTC"`, `"0/10 tests passed"`, `"the match ended 0:0"` now deny.** Taken because
+    `http://0/` is the shortest payload in the very class this work closed, and
+    because leaving it meant shipping a test that asserts a bypass passes.
+
+40. **The Tests workflow triggers by exclusion, not by allowlist (user decision
+    2026-08-12 — review finding F-30).** `detection/`, `themes/` and `palettes/` are
+    read from disk by the suite and appeared in no `paths:` filter, so a commit
+    touching only those was **untested *and* runless** — no Tests run existed for the
+    release gate to consult, and the failure surfaced at *tag* time.
+
+    The allowlist is replaced by `paths-ignore:` (`docs/**`, root `*.md`, issue
+    templates). The reason is not the three missing entries but that **the allowlist
+    could not be verified**: what the suite reads from disk cannot be reliably
+    enumerated, so the list drifts whenever a data directory is added — and it drifts
+    **fail-open**, a forgotten entry meaning the tests silently do not run. Inverting
+    it makes drift **fail-safe**, and needs no tripwire because nothing must be kept
+    in sync.
+
+    **`clippy.yml` deliberately keeps its allowlist** — its entries genuinely are
+    compile inputs, so that list *is* verifiable in the way this one was not.
 
 ## Phases
 
@@ -3259,6 +3602,11 @@ declares its class AND its mutation capability in one reviewed place.
       `session_id` and no tab identity at all, so `Scope::App` is not a fallback
       here — it is the only scope that exists on the route. Same choice, same
       reason, as the headless MCP child's.
+      *(Amended 2026-08-12, decision 36 / F-35: the scope is now spelled
+      `Scope::UnknownCaller` — same behaviour, and this site was always asking
+      that question. **Raised, not decided:** the route DOES carry a
+      `session_id`, and V34's `--session-id` pinning means it could in principle
+      resolve to a real `Scope::Tab` through the live-session registry.)*
   - **Amendment 2026-08-08 (#48, M-2 + N-1, user decision) — the headless MCP
     child refuses persistent writes; reads stay fail-open.** (Locked
     decision 21; it extends decision 10 to the path where neither of decision
@@ -4113,6 +4461,16 @@ declares its class AND its mutation capability in one reviewed place.
     `Scope::OffloadWorker` | `Scope::App`, with `Scope::for_tab(agent, tab_opt)`
     resolving an identity-less call to `App` — the app-wide answer, matching
     V28's fail-open discipline rather than downgrading to "off".
+    **⚠ AMENDED 2026-08-12 (decision 36 / F-35): `Scope::App` no longer exists.**
+    It was renamed to **`Scope::AppWide`** (the app-wide baseline, `L1 ∧ L2`, and
+    nothing else) and its second reading was split off as
+    **`Scope::UnknownCaller`** (that baseline **plus** any configured tab's L3
+    `On` — N-1). `Scope::for_tab` resolves an identity-less call to
+    `UnknownCaller`. Both key as `"app"` on the wire, so `/status`, the
+    `injection_status` IPC command and the Settings matrix are unchanged. The
+    third question — *"is this armed anywhere, worker included?"* — is
+    `injection::armed_anywhere`, a **reporting-only function** and deliberately
+    not a fourth variant.
   - **Three small resolved-value helpers** exist beside it, and they are the
     only other legal readers of the raw fields: `budget_limits` (returns `0/0`,
     the *existing* no-cap spelling, when the feature is off — so the two budget
@@ -4433,6 +4791,15 @@ declares its class AND its mutation capability in one reviewed place.
       Only `On` travels up, so it can add protection and never remove it; the
       resolution order for a *known* scope is untouched. The fallback is
       fail-open **relative to L2**, not absolutely — the module docs say so now.
+      **⚠ AMENDED 2026-08-12 (decision 36 / F-35): N-1 was RIGHT, it was
+      *named* wrong.** The behaviour above is unchanged and now lives on
+      `Scope::UnknownCaller`; `Scope::AppWide` is the app-wide baseline it was
+      squatting under. Its exact width is pinned by
+      `n1_carries_an_on_up_from_configured_tabs_only`, landed against the
+      pre-split code and changed by the split in **one token only** — driven with
+      `Feature::Detection` because it is the only feature carrying both a tab row
+      and a worker row, which is what makes "the worker's `On` does NOT travel
+      up" observable at all.
     - **One reduced-protection predicate, not three (G-2).** The status chip
       counted `in_scope && !effective` and omitted the `default_on` clause Phase
       H published to prevent exactly that, so the chip and the tab badge beside
@@ -4482,7 +4849,9 @@ declares its class AND its mutation capability in one reviewed place.
     **two** enforcement sites, in two languages — **corrected 2026-08-08 (#48,
     review Part 7 item 9)**, where this residual said "the TTS composition path
     only". Rust: `OobContext::speak`, which *is* gated on
-    `Feature::TerminalEscapeHygiene` at `Scope::App`. TypeScript:
+    `Feature::TerminalEscapeHygiene` at `Scope::AppWide` (`Scope::App` until
+    decision 36 split it; this control has no per-scope row, so the two are
+    provably equal here and the honest name is the baseline one). TypeScript:
     `src/lib/toast.ts`'s `showToast`, a hand-written twin of
     `processing::strip_terminal_escapes` (its own doc says so) covering CSI, the
     C1 string introducers and bare controls. Two consequences worth having
@@ -4506,6 +4875,18 @@ declares its class AND its mutation capability in one reviewed place.
     `offload/loopback.rs` (`LatchScoping::injection`, `GatePolicy::resolve`),
     which is why it was not done here; the current shape fixes every
     identity-less site at once and can only add protection.
+    **✅ (e) is CLOSED 2026-08-12 by locked decision 36 / F-35**, and by exactly
+    the work it predicted: the variant was split into `Scope::AppWide` and
+    `Scope::UnknownCaller`, and `LatchScoping::injection` and
+    `GatePolicy::resolve` were both repointed at the second. Two corrections to
+    its own wording, worth recording because the residual was written before
+    anyone measured it: the split is a **rename plus** a new variant, not an
+    addition (`Scope` is matched exhaustively in only three places, all inside
+    `injection.rs`, so *adding* a variant would have migrated no borrower at
+    all); and the two questions it names turned out to be two of **three** — the
+    missing one, *"is this armed anywhere, the offload worker included?"*, is
+    what F-35's suppressed signal was actually asking, and it is a reporting-only
+    **function** (`injection::armed_anywhere`), never a scope.
 
 ## Accepted residuals (documented, not solved)
 

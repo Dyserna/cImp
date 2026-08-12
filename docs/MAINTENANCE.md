@@ -715,11 +715,17 @@ validated rule bundles itself. The run now does two things instead:
      `finish` and still stamps `last_check_ms` — an unreachable channel
      produces a **fresh** timestamp with `unavailable` beside it, not a stale
      one. The commonest cause today is the **feature switch**: `tick_once` is
-     gated on `effective(Feature::Detection, Scope::App)`, so *Injection
-     detection* off (or the L1 master off) stops the scheduler dead — no
-     polling, no network, no swap, and the manual buttons refuse from the IPC
-     command with a tooltip naming the switch. Check that first, then a mode of
-     `off` on the component, then the scheduler task itself.
+     gated on `effective(Feature::Detection, Scope::UnknownCaller)` (spelled
+     `Scope::App` before #48's decision 36 split that variant; same behaviour),
+     so *Injection detection* off (or the L1 master off) stops the scheduler dead
+     — no polling, no network, no swap, and the manual buttons refuse from the
+     IPC command with a tooltip naming the switch. **Note what that scope does
+     and does not fold in:** an L3 `On` from any configured **AI tab** DOES start
+     the updater (N-1), while an `offload-worker` override does **not** — so
+     "detection is off app-wide" is not enough to conclude the scheduler is
+     inert, and a worker-only override leaves the worker screening with a bundle
+     nothing will refresh (`worker_only_detection`). Check the switch first, then
+     a mode of `off` on the component, then the scheduler task itself.
    - **A component that keeps refusing** — nothing is degraded, but that
      component has stopped getting fresher, which is the failure the whole
      phase exists to prevent. `stale_streak` is the counter that notices; the

@@ -1065,9 +1065,24 @@ declares its class AND its mutation capability in one reviewed place.
     screen that refuses ordinary prose about RFC1918, which is the failure mode
     that gets a security control switched off (decision 16's argument). **H-3's
     screen/parser-agreement invariant is untouched and survives intact** — all
-    21,120 generated corpus cases and all 30 C-4 rows are scheme-bearing,
-    relative, or port-bearing, so none of them meets the exemption's conditions;
-    and `screen_urls` denies on **any** candidate (`outbound.rs:719-732`), so
+    generated corpus cases and all C-4 rows still deny, so none of them meets the
+    exemption's conditions.
+
+    > **Precision correction 2026-08-11 (found while implementing, `11792cb`).**
+    > This paragraph originally said the corpus and C-4 rows are all
+    > "scheme-bearing, relative, or port-bearing" and gave the counts as 21,120
+    > and 30. **Both were wrong in detail, and the reasoning is what matters:**
+    > the C-4 row `10.0.0.1/admin` is *none* of those three. It is still not
+    > exempt, because its prefix segment (`admin`) is not numeric — so the
+    > conclusion holds, but by a different discriminator than the one written
+    > here. Actual counts after the implementation added a `/8` axis: the
+    > generated corpus is **19,008** cases (from 15,840) and there are **29**
+    > C-4 rows. **The exemption is audited by H-3's own generator** — a new test
+    > runs the 3,168-case `/8` slice non-vacuously (>1,000 cases, >100 oracle
+    > hits). Recorded rather than silently corrected, because "every case is X"
+    > is exactly the kind of claim that reads as verified and is not.
+
+    And `screen_urls` denies on **any** candidate (`outbound.rs:719-732`), so
     dropping one candidate can never flip a verdict that another candidate in the
     same call already condemns.
 

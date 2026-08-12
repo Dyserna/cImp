@@ -5471,6 +5471,10 @@ mod tests {
     use super::*;
     use crate::graph::{parse_file, Lang};
 
+    /// #48, locked decision 38: the read side's mirror image — the held-note
+    /// accessor takes a capability, and tests mint theirs from the `#[cfg(test)]`
+    /// constructor rather than from the production one, which is private.
+    use crate::graph::memory::QuarantineReview;
     /// #48, F-15: `mem_add_note` takes a note the credential screen has already
     /// read in full, so a fixture is built the way production builds one.
     use crate::graph::secrets::test_screened as screened;
@@ -6800,7 +6804,7 @@ pub struct Point { x: i32 }
             .any(|n| n.note_id == "clean"));
 
         // The review queue sees exactly the quarantined one.
-        let held = idx.mem_quarantined_notes().unwrap();
+        let held = idx.mem_quarantined_notes(QuarantineReview::for_test()).unwrap();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].note_id, "dirty");
         assert!(held[0].tainted);
@@ -6876,7 +6880,7 @@ pub struct Point { x: i32 }
         )
         .unwrap();
         idx.mem_set_note_pinned("dirty2", true).unwrap();
-        let held = idx.mem_quarantined_notes().unwrap();
+        let held = idx.mem_quarantined_notes(QuarantineReview::for_test()).unwrap();
         assert_eq!(held.len(), 1);
         assert!(held[0].pinned && held[0].tainted);
         assert_eq!(
@@ -6925,7 +6929,7 @@ pub struct Point { x: i32 }
         )
         .unwrap();
 
-        let held = idx.mem_quarantined_notes().unwrap();
+        let held = idx.mem_quarantined_notes(QuarantineReview::for_test()).unwrap();
         assert_eq!(held.len(), 2, "both are held: {held:?}");
         assert_eq!(idx.mem_quarantined_count().unwrap(), 2);
         assert!(
@@ -7072,7 +7076,7 @@ pub struct Point { x: i32 }
         assert_eq!(notes[0].note_id, "ok");
         // The held note is still HELD — a migration that quietly released a
         // quarantined note would be the worst possible way to pass this test.
-        let held = idx2.mem_quarantined_notes().unwrap();
+        let held = idx2.mem_quarantined_notes(QuarantineReview::for_test()).unwrap();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].note_id, "was-held");
         assert!(held[0].tainted);
@@ -7084,7 +7088,7 @@ pub struct Point { x: i32 }
         // Re-running is a no-op, and the notes are untouched by it.
         idx2.migrate_mem_note_quarantine()
             .expect("re-run is a no-op");
-        assert_eq!(idx2.mem_quarantined_notes().unwrap().len(), 1);
+        assert_eq!(idx2.mem_quarantined_notes(QuarantineReview::for_test()).unwrap().len(), 1);
         assert_eq!(idx2.mem_notes("s1").unwrap().len(), 1);
 
         drop(idx2);

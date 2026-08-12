@@ -473,22 +473,62 @@ pub fn forget_resolved_discovery() {
     }
 }
 
+/// Who a stdio MCP child is, as cImp itself composed its argv at spawn.
+///
+/// A required parameter of [`proxy_base_for`] rather than a module-level
+/// `OnceLock` set at child startup, and that is the point: an unset `OnceLock`
+/// lets a future caller inherit *"no tab"* by writing nothing — the exact
+/// omission shape [`outbound::Flag::attribution`] and `BackendGate::new`'s
+/// required positional were both introduced to make impossible. A compile error
+/// beats a convention.
+///
+/// Both fields are cImp-authored (`--consumer` / `--tab`, `tabs/config.rs`) and
+/// neither is forgeable *inside the child*. They stop being trustworthy the
+/// moment they cross the loopback, which is why the app re-classifies the tab
+/// through [`tab_identity`] instead of believing the wire — see
+/// [`record_discovery_skipped`].
+#[derive(Clone, Copy)]
+pub struct ChildIdentity<'a> {
+    /// `claude` / `opencode`, as the child was launched.
+    pub consumer: &'a str,
+    /// The cImp tab this child serves, or `None` for a child spawned without
+    /// `--tab` (by hand, or by a pre-V28 cImp).
+    pub tab: Option<&'a str>,
+}
+
 /// Base URL + bearer token of the loopback endpoint of the instance serving
 /// `hint` — the one endpoint resolver every stdio MCP child uses
 /// (`offload/mcp.rs`, `audit/mcp.rs`). `None` ⇒ no instance answered.
-pub fn proxy_base_for(hint: Option<&Path>) -> Option<(String, String)> {
+pub fn proxy_base_for(hint: Option<&Path>, who: ChildIdentity<'_>) -> Option<(String, String)> {
     let d = read_discovery_for(hint);
-    // The consumer for [`SKIPPED_CANDIDATES`], placed here rather than in
+    // The first consumer for [`SKIPPED_CANDIDATES`], placed here rather than in
     // `read_discovery_for` on purpose: this resolver serves the two stdio MCP
     // children, which already own a stderr diagnostic channel (the handshake
     // lines and `ProxyMiss::report`). The hook shims call `read_discovery_for`
     // directly and must stay on the silent path — `taint_beacon`'s whole safety
     // argument is that it writes nothing to stdout or stderr and awaits nothing.
-    // Surfacing a planted entry to the USER (an activity row) needs a loopback
-    // route that does not exist yet; that is recorded as follow-up work, not
-    // solved by making a hook noisy.
     report_skipped_candidates();
     let d = d?;
+    // #48 F-32 / locked decision 37 — the USER consumer, and it lives here for
+    // three reasons that are each load-bearing:
+    //
+    // 1. **After the `?`.** It fires only when an endpoint resolved, which is
+    //    exactly F-32's interesting case: a planted entry was skipped AND the
+    //    child reached the real app anyway, so containment worked and nobody was
+    //    told. When nothing resolved there is by construction no app to tell,
+    //    and stderr stays the only channel — a bound this route's doc states
+    //    rather than papers over. (That case is also the loud one: the child is
+    //    already degraded through `ProxyMiss::Transport` / `headless_refusal`.)
+    // 2. **`d`'s own port and token**, never a re-resolution: no second probe
+    //    budget is spent, and the report itself cannot be steered by the very
+    //    entry it is reporting.
+    // 3. **Still not on the shims' path.** `read_discovery_for` is what
+    //    `context_hook` and `taint_beacon` call; this function has exactly two
+    //    callers, both stdio MCP children. Moving the POST down one frame would
+    //    hand `taint_beacon` a write and a wait and destroy locked decision 14's
+    //    safety argument — pinned by
+    //    `tests::the_discovery_report_never_reaches_the_hook_shims_path`.
+    report_skipped_to_app(&d, who, fresh_skips());
     Some((format!("http://127.0.0.1:{}", d.port), d.token))
 }
 
@@ -509,6 +549,153 @@ fn report_skipped_candidates() {
          did not expect it, list `.cimp-discovery/` next to the cImp executable."
     );
 }
+
+/// How much of [`SKIPPED_CANDIDATES`] this child has already told the app
+/// about, so a later resolution reports only what is NEW.
+///
+/// Without it the counter's monotonicity would make every resolution after the
+/// first restate skips already on record — a row saying "2 candidates were
+/// skipped" for a resolution that skipped none. The row must not overstate.
+static SKIPS_REPORTED_TO_APP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Skips this child has not yet reported to the app, marking them reported.
+///
+/// Deliberately untested in isolation: both counters are process-global and
+/// `SKIPPED_CANDIDATES` is written by every `select_verified` in the suite, so a
+/// test here would race its neighbours. The COUNT is therefore a parameter of
+/// [`report_skipped_to_app`], which is where the decision lives and where the
+/// tests are.
+fn fresh_skips() -> usize {
+    let seen = SKIPPED_CANDIDATES.load(std::sync::atomic::Ordering::Relaxed);
+    seen.saturating_sub(SKIPS_REPORTED_TO_APP.swap(seen, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The child's entire network budget for one discovery report, applied to the
+/// connect and to the write separately (the response is never read, so there is
+/// no third wait).
+///
+/// The same 80 ms `taint_beacon::DISPATCH_TIMEOUT` uses and for the same reason:
+/// on loopback a live app accepts into the backlog immediately and a dead one
+/// refuses in microseconds, so this bound is only ever spent against a *wedged*
+/// app — the case where waiting would be worst.
+///
+/// **The arithmetic, stated rather than implied** (decision 30 writes its
+/// numbers down for the same reason): the worst case this adds is 160 ms, on a
+/// path that already costs up to `MAX_DISCOVERY_PROBES × DISCOVERY_PROBE_TIMEOUT`
+/// = **1.2 s** per COLD resolution, against a 10 s heartbeat interval, and runs
+/// once per hint per process (the winner is memoized — [`RESOLVED`]). Blocking
+/// parks the child's `new_current_thread` runtime exactly as [`responds`] does,
+/// and within the bound `responds` already established.
+const DISCOVERY_REPORT_TIMEOUT: Duration = Duration::from_millis(80);
+
+/// Tell the app that this child skipped `skipped` candidate endpoints —
+/// #48 F-32, locked decision 37.
+///
+/// Silent when nothing was skipped, which is what makes the row mean something:
+/// a clean resolution posts nothing at all.
+///
+/// **No once-per-process flag, and that is the single largest design decision
+/// here.** Mirroring [`report_skipped_candidates`]'s `SAID` bit would make the
+/// signal fire at most once per child, ever — so its *absence* would read as
+/// "nothing was planted" rather than "this was not observable". That is F-24's
+/// own defect reappearing inside the fix for its family, and it would be
+/// invisible to every test, because tests run in a fresh process.
+/// [`forget_resolved_discovery`] is called on *every* endpoint failure, so a
+/// child legitimately re-resolves during its life and a second planted entry
+/// appearing later must remain reportable.
+///
+/// Instead the same doubling discipline the app applies
+/// ([`outbound::Doubling`]) is applied child-side: reports go out at
+/// resolutions-with-skips 1, 2, 4, 8 … so the child's own cost is `log2`-bounded
+/// while the signal stays repeatable. The app remains the authority; this only
+/// keeps a looping child from being the flood.
+fn report_skipped_to_app(d: &Discovery, who: ChildIdentity<'_>, skipped: usize) {
+    if skipped == 0 {
+        return;
+    }
+    static SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let nth = SENT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if !nth.is_power_of_two() {
+        return;
+    }
+    dispatch_discovery_report(d, who, skipped);
+}
+
+/// POST one discovery report and return **without reading the response** —
+/// `taint_beacon::dispatch`'s shape, deliberately, and for its reasons.
+///
+/// Hand-rolled blocking TCP rather than `reqwest`: there is nothing to wait for,
+/// and waiting would make this child's latency a function of app health.
+/// Every failure — a refused connect, a partial write, a rotated token, a 404
+/// from an older app — is swallowed. **Fail-open on reporting; never fail-closed
+/// on the child's actual job.** A lost report understates a probe; a blocked
+/// tool call breaks a tab, and we never trade the second for the first.
+///
+/// The body carries only what a child can honestly assert about itself. There is
+/// no `cwd`, no path, no free-text field, and no pid/port/root of the skipped
+/// entries: those would be attacker-choosable strings presented to an incident
+/// reader as forensic fact. The app derives everything else.
+fn dispatch_discovery_report(d: &Discovery, who: ChildIdentity<'_>, skipped: usize) {
+    use std::io::Write;
+
+    let mut body = serde_json::json!({
+        "consumer": who.consumer,
+        // Clamped on BOTH sides. A single resolution cannot skip more than its
+        // probe budget (`Probe::answers`), so the app treats anything above it
+        // as definitionally not-a-genuine-child; sending a clamped value keeps
+        // the wire honest rather than relying on the far end to fix it.
+        "skipped": skipped.min(MAX_DISCOVERY_PROBES),
+    });
+    // Inserted rather than always-present, so a child with no `--tab` sends a
+    // body with no `tab` key at all. `null` and absent read identically to the
+    // route, but "the field was never sent" is the more honest wire.
+    if let (Some(tab), Some(map)) = (who.tab, body.as_object_mut()) {
+        map.insert("tab".to_string(), serde_json::Value::String(tab.to_string()));
+    }
+    let body = body.to_string();
+
+    let addr = std::net::SocketAddr::from(([127u8, 0, 0, 1], d.port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, DISCOVERY_REPORT_TIMEOUT)
+    else {
+        // The memoized endpoint answered a probe moments ago and is refusing
+        // now: drop it so the child's next call re-resolves rather than
+        // inheriting a dead endpoint. Same move `taint_beacon::dispatch` makes.
+        forget_resolved_discovery();
+        return;
+    };
+    if stream
+        .set_write_timeout(Some(DISCOVERY_REPORT_TIMEOUT))
+        .is_err()
+    {
+        return;
+    }
+    let req = format!(
+        "POST {DISCOVERY_SKIPPED_PATH} HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Authorization: Bearer {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        d.token,
+        body.len()
+    );
+    let _ = stream.write_all(req.as_bytes());
+    // No read: the peer's response goes unread and the socket closes on drop.
+    // The reply is a fixed `{"ok":true}` on every path anyway — see
+    // [`handle_discovery_skipped`], where that is the property, not an accident.
+}
+
+/// The path both ends of the discovery report name.
+///
+/// The dispatch `match` arm has to be a literal (the route-inventory test scans
+/// the source for it), so this constant is what the CHILD sends and it is also
+/// what `ROUTE_CONTAINMENT` declares — which is what makes the two unable to
+/// drift: `no_http_route_can_reach_a_contamination_clear` compares the scanned
+/// arm against the declared list, so changing one and not the other fails.
+const DISCOVERY_SKIPPED_PATH: &str = "/activity/discovery_skipped";
 
 /// Delete per-instance entries whose endpoint no longer answers — hard-killed
 /// instances leave their `<pid>.json` behind (removal is graceful-exit only).
@@ -977,6 +1164,7 @@ async fn handle_conn(
         ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
         ("POST", "/memory/event") => handle_memory_event(&mut stream, &app, &req).await,
         ("POST", "/activity/contract_drift") => handle_contract_drift(&mut stream, &req).await,
+        ("POST", "/activity/discovery_skipped") => handle_discovery_skipped(&mut stream, &app, &req).await,
         ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
         ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
         ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
@@ -1579,14 +1767,20 @@ impl LatchScoping {
     }
 
     /// The injection-hierarchy scope this call resolves features against.
-    /// Both identity-less variants resolve **app-wide** (`Scope::App`), the
-    /// same fail-open reading [`GatePolicy::resolve`] has always taken for a
-    /// scope-less call: a feature's app-wide answer is the honest one when
-    /// there is no tab to ask about, and it is what an unrecognized id
-    /// resolved to before #45 (L3 not found ⇒ `Inherit` ⇒ L2 ⇒ L1).
+    /// Both identity-less variants resolve as an **unknown caller**
+    /// (`Scope::UnknownCaller`), the same fail-open reading
+    /// [`GatePolicy::resolve`] has always taken for a scope-less call: the
+    /// app-wide answer is the honest floor when there is no tab to ask about,
+    /// and it is what an unrecognized id resolved to before #45 (L3 not found ⇒
+    /// `Inherit` ⇒ L2 ⇒ L1).
+    ///
+    /// #48 F-35: that variant was called `Scope::App` until locked decision 36
+    /// split it in two. Behaviour is unchanged — this site was always asking the
+    /// identity-less question, and it keeps N-1's elevation (any configured
+    /// tab's L3 `On` is honoured, because the caller IS one of those tabs).
     fn injection(&self) -> crate::settings::injection::Scope<'_> {
         self.scope().map_or(
-            crate::settings::injection::Scope::App,
+            crate::settings::injection::Scope::UnknownCaller,
             LatchScope::injection,
         )
     }
@@ -2490,11 +2684,13 @@ struct GatePolicy {
 }
 
 impl GatePolicy {
-    /// Resolve both switches for one tab scope. `None` scope ⇒ the app-wide
-    /// answer, the same fail-open reading `Scope::for_tab` takes.
+    /// Resolve both switches for one tab scope. `None` scope ⇒ the unknown
+    /// caller's answer, the same fail-open reading `Scope::for_tab` takes
+    /// (#48 F-35: `Scope::UnknownCaller` is what `Scope::App` was called at this
+    /// site before locked decision 36; no behaviour moved).
     fn resolve(settings: &crate::settings::Settings, scope: Option<&LatchScope>) -> Self {
         use crate::settings::injection::{effective, Feature, Scope};
-        let s = scope.map_or(Scope::App, LatchScope::injection);
+        let s = scope.map_or(Scope::UnknownCaller, LatchScope::injection);
         GatePolicy {
             latch: effective(Feature::TaintLatch, s, settings),
             quarantine: effective(Feature::MemoryQuarantine, s, settings),
@@ -2966,6 +3162,51 @@ fn unattributed_write(
     WriteTaint::Unattributed
 }
 
+/// #48 (F-34) — pick the refusal that states the cause the gate **checked**,
+/// for the one latch position that has two possible causes.
+///
+/// # What this is, and what it is deliberately not
+///
+/// It is a **message selector**, not a gate. Containment is decided entirely by
+/// [`Latch::proxy_gate`](toolclass::Latch::proxy_gate) before this runs and is
+/// byte-identical to what it always was: `Some(_)` in, `Some(_)` out, and the
+/// same calls refused. `local_by_user_flip` never joins the guard — for F-13's
+/// reason, an unknown value must be able to cost only the better *message* and
+/// never the refusal, so a `false` here simply serves the pre-F-34 constant.
+///
+/// # Why it is here and not in [`Latch::refusal`](toolclass::Latch::refusal)
+///
+/// **Locked decision 34 places the choice in `LatchRegistry::gate`, which holds
+/// `TabLatch::local_by_user_flip`, and NEVER in `Latch::refusal`** — and that is
+/// load-bearing rather than stylistic. `Latch::refusal` is a *pure function over
+/// [`Latch`](toolclass::Latch)* that the **offload worker** also calls
+/// (`offload::agent`), and the worker has no user-flip concept to thread:
+/// migrating this down would either break it or force it to pass a meaningless
+/// `false` forever. The rule is a convention, not a type, so it is also guarded
+/// by a tripwire in `toolclass`
+/// (`the_user_flip_constant_is_never_reachable_from_the_pure_latch_functions`).
+///
+/// Written as a free function taking the bool rather than a `TabLatch` method so
+/// the ONE fact it may consult is visible in its signature: nothing from the
+/// caller, the model or the tool arguments can reach the string.
+///
+/// # The match, and why on the constant
+///
+/// `REFUSAL_EXTERNAL_BLOCKED` is produced by exactly one state — `Latch::Local`
+/// blocking [`ToolClass::External`] — so keying on it is equivalent to keying on
+/// that pair, and it cannot silently capture a future refusal that means
+/// something else. The other two constants are unreachable under a `Local`
+/// latch, so they fall through untouched.
+fn user_flip_refusal(refusal: &'static str, local_by_user_flip: bool) -> &'static str {
+    if local_by_user_flip && refusal == toolclass::REFUSAL_EXTERNAL_BLOCKED {
+        // The user's own IPC flip closed the external side. Saying a tool call
+        // did it is F-23's defect on the route that ships ON.
+        toolclass::REFUSAL_EXTERNAL_USER_LOCAL
+    } else {
+        refusal
+    }
+}
+
 impl LatchRegistry {
     /// Decide one call, and engage the latch when it may proceed.
     ///
@@ -3108,7 +3349,11 @@ impl LatchRegistry {
                 return Ok(held);
             }
             ProxyGate::Proceed(WriteTaint::Clean) => None,
-            ProxyGate::Refuse(r) => Some(r),
+            // #48 (F-34): the message, and ONLY the message. `decision` above is
+            // untouched, so what gets refused is byte-identical to what always
+            // did — this arm just picks which fixed constant states the cause,
+            // from a fact only this frame holds. See [`user_flip_refusal`].
+            ProxyGate::Refuse(r) => Some(user_flip_refusal(r, entry.local_by_user_flip)),
         };
         if let Some(refusal) = refusal {
             warn!(
@@ -3803,11 +4048,11 @@ fn latches() -> &'static LatchRegistry {
 struct TabAudit<'a>(Option<&'a LatchScope>);
 
 impl outbound::ScopeAudit for TabAudit<'_> {
-    fn claim_ssrf(&self) -> outbound::SsrfRow {
+    fn claim_ssrf(&self) -> outbound::DoublingRow {
         latches().claim(
             self.0,
             outbound::Budget::claim_ssrf_flag,
-            outbound::SsrfRow::Write {
+            outbound::DoublingRow::Write {
                 total: 0,
                 suppressed: 0,
             },
@@ -5206,6 +5451,437 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
     write_json(stream, 200, &ok).await
 }
 
+// ── #48 F-32 / locked decision 37: a child reports what containment did ──────
+
+/// A `POST /activity/discovery_skipped` request body — a cImp stdio MCP child
+/// saying it skipped one or more candidate discovery entries and reached this
+/// instance anyway (#48 F-32).
+///
+/// Modelled field-for-field on [`LatchBeaconBody`]'s two identity fields,
+/// including the `#[serde(default)] Option<String>` spelling and the
+/// `source_for_consumer(…unwrap_or("claude"))` normalisation, so one tab is
+/// named the same way from every route. **`consumer` is a BODY field**: the
+/// query-string form exists only on `/mcp/call`, whose body is not ours — it is
+/// MCP JSON-RPC, owned by another protocol — so cImp's transport metadata cannot
+/// go in it. Every route whose body cImp defines end to end carries `consumer`
+/// here.
+///
+/// **Three deliberate omissions, each closing an attack:**
+///
+/// * **No `cwd` and no path of any kind.** `/audit/run` needs the child's cwd
+///   for its wrong-instance check; this does not. A body-supplied path would let
+///   a caller file a *security* row under a project it is not about. The root is
+///   derived app-side from the tab ([`tab_root_key`]) or left honestly empty.
+/// * **No free-text field.** `/latch/beacon` needs [`bounded_tool`] purely
+///   because it accepts a caller-chosen `tool` string. With no such field there
+///   is no truncation and no control-sequence question at all: this row's `tool`
+///   column is the fixed literal `"discovery"`.
+/// * **No pid, port or root of the skipped entries.** They would be
+///   attacker-chosen strings presented to an incident reader as forensic fact.
+///   What the app can say about the directory, it observes itself
+///   ([`discovery_census`]).
+#[derive(Deserialize, Default)]
+struct DiscoverySkippedBody {
+    /// The cImp tab id the reporting child was spawned for. Absent ⇒
+    /// [`crate::activity::Attribution::Unattributed`], never `Headless`.
+    #[serde(default)]
+    tab: Option<String>,
+    /// `claude` / `opencode`, normalized through `source_for_consumer`.
+    #[serde(default)]
+    consumer: Option<String>,
+    /// How many candidates the child says it skipped. **Caller-asserted**, and
+    /// the row says so — see [`bounded_skips`] for the bound and
+    /// [`discovery_row`] for the honesty clause that states it.
+    #[serde(default)]
+    skipped: u32,
+}
+
+/// The one and only response body this route ever produces.
+///
+/// A constant rather than a serialized value so *"the response is not the
+/// signal"* is a fact about the code and not a claim about it — see
+/// [`handle_discovery_skipped`].
+const DISCOVERY_ACK: &[u8] = br#"{"ok":true}"#;
+
+/// The row's `tool` column: a fixed literal, because nothing in the body may
+/// choose it.
+const DISCOVERY_TOOL: &str = "discovery";
+
+/// `POST /activity/discovery_skipped` (#48 F-32, locked decision 37): record
+/// that a cImp MCP child skipped candidate discovery entries which did not
+/// answer a token-authenticated `GET /health`, and reached this instance anyway.
+///
+/// **Why a new route rather than an extension of `/activity/contract_drift`.**
+/// That route already is a token-authenticated child→app activity-row writer —
+/// the finding's claim that none existed was wrong — and reusing it is still
+/// wrong, for four reasons: it writes `ActivityKind::Graph`, whose single
+/// 400-row lane is shared with every real graph tool call (a security row there
+/// is evictable by ordinary work, and a flood there evicts ordinary work); its
+/// body carries no `tab`, so its row is honestly `Unattributed` and naming a tab
+/// would be the wire change anyway; `activity::record_bg` has **no `cfg(test)`
+/// diversion**, which is exactly why F-20's owed test was never written, while
+/// `outbound::record_flag` does; and its dedup ledger is keyed on two
+/// caller-supplied strings with no bound (F-37, filed separately).
+///
+/// # Auth
+///
+/// Bearer, inherited from the pre-dispatch [`authorized`] check — no route-level
+/// auth code. And the honesty clause every `Origin::Http` producer owes: **the
+/// launch token is readable by any process running as this user** (from
+/// `.cimp-offload.json`, from `.cimp-discovery/<pid>.json`, and from the
+/// generated OpenCode plugin inside the project tree). "Authenticated" here
+/// means *a local process*, never *cImp's own child*.
+///
+/// # The response is not the signal
+///
+/// **`200` with the byte-identical body [`DISCOVERY_ACK`] on every single
+/// path** — malformed JSON, an empty body, an unknown tab, an anonymous tab,
+/// `skipped: 0`, `skipped: 9999`, a row written, a row suppressed by the gate.
+/// This function has exactly one exit and nothing before it can return early.
+///
+/// That **diverges deliberately** from both siblings, and the divergence is the
+/// point: `handle_latch_beacon` answers 400 to an unknown tab (a tab-id
+/// enumeration oracle in the other direction, moot there because a token-holder
+/// can read `settings.json` anyway, but not moot as a precedent) and
+/// `handle_contract_drift` answers 400 to a parse error. Locked decision 37
+/// requires this route to answer identically on every path. Follow the decision,
+/// not the siblings — pinned by
+/// `tests::the_discovery_report_answers_identically_on_every_path`.
+///
+/// The real signal has three consumers, none of them this reply: the activity
+/// row (the user consumer F-32 exists to add), a `warn!` on `target: "offload"`
+/// (the operator consumer), and the child's own unchanged `eprintln!`.
+async fn handle_discovery_skipped(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    // Everything that can vary happens in here and returns `()`. No `?`, no
+    // early return, no branch on the outcome.
+    note_discovery_skipped(app, &req.body);
+    write_simple(
+        stream,
+        200,
+        "application/json; charset=utf-8",
+        DISCOVERY_ACK,
+    )
+    .await
+}
+
+/// The app-side facts about a **configured** tab that a discovery row needs and
+/// a request body must never be allowed to supply.
+struct TabFacts {
+    /// [`tab_root_key`] — resolved from settings, never from the wire.
+    root: String,
+    /// The V28 live-session registry's answer for this tab, never the wire's.
+    session: Option<String>,
+}
+
+/// [`handle_discovery_skipped`] minus the socket: parse the body and record the
+/// row, swallowing everything.
+///
+/// Split so the route's single exit is structural, and so the half that needs an
+/// `AppHandle` (which this crate cannot mock) is one thin frame that injects the
+/// two app-derived facts into [`record_discovery_skipped`] as a closure — the
+/// same seam `mark_live_session_from_event` uses.
+fn note_discovery_skipped(app: &AppHandle, raw: &[u8]) {
+    // A parse failure is NOT an error path here: it degrades to a default body,
+    // whose `skipped: 0` writes no row. Answering 400 would have been a second
+    // response shape, i.e. the oracle this route exists without.
+    let body: DiscoverySkippedBody = serde_json::from_slice(raw).unwrap_or_default();
+    // ONE settings read for the whole request, the discipline `/mcp/call`
+    // documents: the tab-identity check and the root resolution must not run
+    // against two snapshots.
+    let settings = live_settings(app);
+    record_discovery_skipped(
+        &settings,
+        &body,
+        claim_discovery_report,
+        |tab, agent| TabFacts {
+            root: tab_root_key(app, &settings, tab),
+            session: app
+                .try_state::<Arc<crate::graph::GraphService>>()
+                .and_then(|g| g.live_session_for_tab(tab, agent)),
+        },
+    );
+}
+
+/// The `skipped` count a row may state, decided at the parse boundary.
+///
+/// * `None` ⇒ **no row at all.** A report of zero skips is not a report — a
+///   genuine child returns before posting — and it is also what a malformed or
+///   empty body degrades to. So "a caller can make the store write a row" costs
+///   it at least a well-formed claim.
+/// * `Some((n, clamped))` ⇒ write a row for `n`, and say so if it was clamped.
+///
+/// The ceiling is [`MAX_DISCOVERY_PROBES`], and it is not a guess: a single
+/// resolution cannot skip more than its probe budget — [`Probe::answers`]
+/// enforces that — so any larger value is *definitionally* not something a
+/// genuine child produced. It is clamped rather than rejected because rejecting
+/// would need a second response shape, which is the oracle
+/// [`handle_discovery_skipped`] exists without.
+fn bounded_skips(raw: u32) -> Option<(u32, bool)> {
+    if raw == 0 {
+        return None;
+    }
+    let cap = MAX_DISCOVERY_PROBES as u32;
+    Some((raw.min(cap), raw > cap))
+}
+
+/// The per-key doubling ledger for discovery reports (#48 F-32).
+///
+/// **The key space is bounded by something the caller does not control**, which
+/// is the one property `CONTRACT_DRIFT_SEEN` lacks (F-37): entries are keyed on
+/// the *resolved scope label*, so a configured tab gets its own counter and
+/// `Anonymous` + `Unknown(_)` share **one** sentinel bucket per consumer. A
+/// caller inventing ten thousand tab ids therefore gets one counter and
+/// `log2`-many rows, not ten thousand of each. Map size is bounded by
+/// `2 × (configured AI tabs + 1)`.
+///
+/// Process lifetime, following `CONTRACT_DRIFT_SEEN`'s precedent, and that is a
+/// decision rather than an omission: the doubling makes process lifetime cheap,
+/// and — unlike a latch or a budget — this is not a per-conversation
+/// entitlement, so there is nothing a session rotation should restore.
+static DISCOVERY_REPORTS: OnceLock<Mutex<HashMap<String, outbound::Doubling>>> = OnceLock::new();
+
+/// Count one report against the process ledger. See [`DISCOVERY_REPORTS`].
+fn claim_discovery_report(key: &str) -> outbound::DoublingRow {
+    let ledger = DISCOVERY_REPORTS.get_or_init(Default::default);
+    let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    claim_in(&mut ledger, key)
+}
+
+/// [`claim_discovery_report`] against a caller-owned ledger, so the key-space
+/// bound and the doubling are assertable without process-global state (the
+/// suite runs cases concurrently in one process).
+fn claim_in(ledger: &mut HashMap<String, outbound::Doubling>, key: &str) -> outbound::DoublingRow {
+    ledger.entry(key.to_string()).or_default().claim()
+}
+
+/// What the APP itself currently sees in `.cimp-discovery/`.
+///
+/// The half of the row a request cannot forge: the app runs on the same machine
+/// as the child, so instead of believing a claim about the directory it lists
+/// it. Called **only on the write path** (after the doubling gate), so it can
+/// never become a filesystem-scan amplifier under a flood.
+struct DirCensus {
+    /// Parseable per-instance entries present right now.
+    entries: usize,
+    /// …of which do not belong to this process.
+    foreign: usize,
+}
+
+fn discovery_census() -> DirCensus {
+    let own = std::process::id();
+    let all = read_all_discoveries();
+    DirCensus {
+        entries: all.len(),
+        foreign: all.iter().filter(|d| d.pid != own).count(),
+    }
+}
+
+/// Everything one discovery row states, gathered so [`discovery_row`] can stay
+/// pure.
+struct DiscoveryReport {
+    /// The clamped, caller-asserted skip count.
+    skipped: u32,
+    /// Whether the caller's number exceeded the probe budget.
+    clamped: bool,
+    /// Reports this scope has filed (the doubling ledger's `total`).
+    total: u32,
+    /// How many reports this row stands for beyond itself.
+    suppressed: u32,
+    /// What the app observed for itself.
+    observed: DirCensus,
+}
+
+/// Record one discovery report, given a settings snapshot and a way to resolve
+/// a configured tab's app-side facts.
+///
+/// This is where locked decision 37's bar is enforced, clause by clause. A
+/// token-holder can cause a row, and cannot:
+///
+/// * **name a non-configured tab** — the id is re-classified through
+///   [`tab_identity`] against the user's own tab list. `Configured` ⇒
+///   `Attribution::Tab`; `Unknown` ⇒ `Unrecognized` (bounded, [`bounded_id`],
+///   because the id is caller-chosen and unbounded on the wire); `Anonymous` ⇒
+///   **`Unattributed`, never `Headless`**. `Headless` is a *positive* claim —
+///   "a worker run with no tab behind it" — and a body-supplied tab is
+///   indistinguishable from an invented one, so claiming it would be F-20's
+///   defect and F-29's, one producer further on. `Attribution::from_child_argv`
+///   is forbidden here by its own doc for exactly that reason.
+/// * **say anything a genuine row could not** — every remaining field is
+///   app-derived: `root` from [`tab_root_key`], `session` from the V28 live
+///   registry, `consumer` normalized to one of two words, `tool` a fixed
+///   literal, `origin` fixed to `Http`, `skipped` clamped by [`bounded_skips`],
+///   and the directory census observed rather than asserted.
+/// * **cost another lane a row** — `Screen::DiscoverySkipped` is its own H-9
+///   retention lane, so a flood here evicts only discovery rows
+///   (`activity::tests::no_screen_can_evict_another_screens_rows` covers it for
+///   every screen, this one included, without an edit).
+/// * **exceed `log2(n)` rows in its own lane** — [`DISCOVERY_REPORTS`].
+/// * **touch any latch** — nothing in this path reaches `latches()`; it holds no
+///   registry handle and creates no entry, which
+///   `every_loopback_route_declares_what_it_does_about_the_latch` checks against
+///   the handler's source rather than believing.
+///
+/// `claim` and `facts` are injected for the same reason and it is not only
+/// testability: the ledger is a process-global map and the facts need an
+/// `AppHandle` this crate cannot mock, so a test that had to go through either
+/// would be racing its neighbours or unable to run at all. Production wires
+/// [`claim_discovery_report`] here — pinned by
+/// `tests::the_discovery_report_never_reaches_the_hook_shims_path`, which reads
+/// the wiring out of the source rather than trusting it.
+fn record_discovery_skipped(
+    settings: &crate::settings::Settings,
+    body: &DiscoverySkippedBody,
+    claim: impl FnOnce(&str) -> outbound::DoublingRow,
+    facts: impl FnOnce(&str, &'static str) -> TabFacts,
+) {
+    let Some((skipped, clamped)) = bounded_skips(body.skipped) else {
+        return;
+    };
+    let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
+    let identity = tab_identity(settings, body.tab.as_deref());
+    // The scope label doubles as the flood key, which is deliberate: both want
+    // "the identity this call actually resolved to", and the identity-less cases
+    // must collapse onto one bucket rather than onto whatever the caller typed.
+    let scope = match identity {
+        TabIdentity::Configured(tab) => format!("{agent}:{tab}"),
+        TabIdentity::Anonymous | TabIdentity::Unknown(_) => {
+            format!("{agent}:{}", outbound::NO_TAB_IDENTITY)
+        }
+    };
+    let outbound::DoublingRow::Write { total, suppressed } = claim(&scope) else {
+        return;
+    };
+
+    let (attribution, root, session) = match identity {
+        TabIdentity::Configured(tab) => {
+            let f = facts(tab, agent);
+            (
+                crate::activity::Attribution::Tab(tab.to_string()),
+                f.root,
+                f.session,
+            )
+        }
+        TabIdentity::Unknown(tab) => (
+            crate::activity::Attribution::Unrecognized(bounded_id(tab)),
+            String::new(),
+            None,
+        ),
+        TabIdentity::Anonymous => (
+            crate::activity::Attribution::Unattributed,
+            String::new(),
+            None,
+        ),
+    };
+
+    let row = discovery_row(
+        outbound::Origin::Http,
+        &DiscoveryReport {
+            skipped,
+            clamped,
+            total,
+            suppressed,
+            observed: discovery_census(),
+        },
+    );
+    // The operator consumer. The user consumer is the row below; the child's own
+    // stderr line is the third and is unchanged.
+    warn!(
+        target: "offload",
+        agent,
+        scope = %scope,
+        skipped,
+        total,
+        suppressed,
+        "loopback: /activity/discovery_skipped — a child skipped candidate discovery entries \
+         and reached this instance anyway"
+    );
+    outbound::record_flag(outbound::Flag {
+        screen: row.screen,
+        origin: row.origin,
+        consumer: agent,
+        scope: &scope,
+        attribution,
+        session: session.as_deref(),
+        tool: &row.tool,
+        host: None,
+        url: None,
+        resolved_ip: None,
+        canary: false,
+        root,
+        detail: &row.detail,
+    });
+}
+
+/// A discovery report's `injection_flag` row, composed by a **pure** function so
+/// what an incident reader is told is assertable without an `AppHandle` — the
+/// same seam [`beacon_row`] and [`override_row`] exist for.
+///
+/// The prose carries six facts, and none of them is optional:
+///
+/// 1. what happened (a child skipped N candidate entries that did not answer a
+///    token-authenticated `GET /health`);
+/// 2. that **containment worked, and this row is the proof** — the child reached
+///    *this* instance anyway, which is how the report arrived at all;
+/// 3. the benign cause (an unclean shutdown leaves `.cimp-discovery/<pid>.json`
+///    behind; removal is graceful-exit only);
+/// 4. the hostile cause (this is also exactly what a **planted** entry looks
+///    like — #48 F-11/F-28, locked decision 30);
+/// 5. what to do (list `.cimp-discovery/` next to the cImp executable), together
+///    with what the app observed there itself;
+/// 6. the **honesty clause**: an authenticated POST from a local process is not
+///    evidence of a user action, the count is caller-asserted, and nothing here
+///    moved a latch, contaminated a conversation or refused a call.
+fn discovery_row(origin: outbound::Origin, rep: &DiscoveryReport) -> FlagRow {
+    let n = rep.skipped;
+    let clamped = if rep.clamped {
+        format!(
+            " (the caller's number exceeded the probe budget of {MAX_DISCOVERY_PROBES} and was \
+             clamped)"
+        )
+    } else {
+        String::new()
+    };
+    let stands_for = if rep.suppressed > 0 {
+        format!(
+            " This is report {} for this scope and stands for {} further report(s) folded into \
+             it (rows are written at 1, 2, 4, 8 … so a loop cannot evict this lane's history).",
+            rep.total, rep.suppressed
+        )
+    } else {
+        String::new()
+    };
+    FlagRow {
+        screen: outbound::Screen::DiscoverySkipped,
+        origin,
+        tool: DISCOVERY_TOOL.to_string(),
+        detail: format!(
+            "DISCOVERY ENTRY SKIPPED (origin: {}): a cImp MCP child resolved its loopback \
+             endpoint and skipped {n} candidate discovery entr(ies) that did not answer a \
+             token-authenticated `GET /health`{clamped} — and then reached THIS instance anyway, \
+             which is how this report arrived. Containment worked; this row is the proof, not an \
+             alarm about a failure. After an unclean cImp shutdown a leftover \
+             `.cimp-discovery/<pid>.json` produces exactly this and is harmless (removal is \
+             graceful-exit only). It is ALSO what a PLANTED entry looks like: a well-formed file \
+             naming a deeper project root and a port nothing serves is how untrusted content \
+             steers a child onto a dead endpoint (#48 F-11/F-28, locked decision 30). If you did \
+             not expect it, list `.cimp-discovery/` next to the cImp executable — this app sees \
+             {} entr(ies) there right now, {} of them not its own process.{stands_for} This row \
+             records an authenticated POST from a local process: the launch token is readable by \
+             anything running as this user, so it is NOT evidence of a user action, and the count \
+             is CALLER-ASSERTED (clamped to the probe budget of {MAX_DISCOVERY_PROBES}; the \
+             directory figures above are the app's own observation and are not). Nothing here \
+             moved a latch, contaminated a conversation or refused a call.",
+            origin.as_str(),
+            rep.observed.entries,
+            rep.observed.foreign,
+        ),
+    }
+}
+
 // ── NC-2 (issue #5): hook-driven permission detection ────────────────────────
 
 /// A `POST /permission/event` request body — the Claude `--notify-hook` shim
@@ -6387,6 +7063,23 @@ fn bounded_tool(raw: Option<&str>) -> String {
     let Some(raw) = raw else {
         return "(native web tool)".to_string();
     };
+    bounded_id(raw)
+}
+
+/// One caller-supplied identifier, bounded before it reaches an activity row —
+/// the truncation half of [`bounded_tool`], shared rather than re-spelled.
+///
+/// Its second caller is [`record_discovery_skipped`]'s `Unrecognized` arm (#48
+/// F-32): a tab id that names no configured tab is an arbitrary unbounded string
+/// from a request body, and putting it in a row verbatim would let a caller
+/// choose how many bytes of a capped feed one report occupies. **Only ever
+/// applied AFTER classification** — truncating first could fold a long invented
+/// id onto a configured one, which would turn a bound into a forgery primitive.
+///
+/// Truncated by **chars**, not bytes, so a multi-byte id cannot be cut
+/// mid-codepoint. Control-sequence hygiene is a separate concern with its own
+/// owner (Phase D, at the surfaces that render); this only bounds length.
+fn bounded_id(raw: &str) -> String {
     let mut out: String = raw.chars().take(BEACON_TOOL_MAX).collect();
     if raw.chars().nth(BEACON_TOOL_MAX).is_some() {
         out.push('…');
@@ -6597,13 +7290,29 @@ async fn handle_status(stream: &mut TcpStream, app: &AppHandle) -> AppResult<()>
 /// even when nothing is overridden there is the point — the question this
 /// answers is "what is in force", and an absent row reads as "off" to exactly
 /// the user who is trying to find out.
+///
+/// **#48 F-35 — the `app` row reports [`Scope::UnknownCaller`], not
+/// [`Scope::AppWide`], and that is deliberate for now.** Locked decision 36
+/// split one `Scope::App` into those two; this row's label says
+/// *"Application-wide"* while its numbers are the identity-less caller's — the
+/// app-wide baseline PLUS any configured tab's L3 `On` (N-1). That mismatch is
+/// pre-existing rather than introduced here: it is exactly what the row has
+/// always published, it is what live-verify recipe *"an identity-less call
+/// honours a per-tab `On`"* observes through `/status` (the app row reading
+/// `decided_by:"scope"` while its own `override_value` is `"inherit"`), and
+/// moving it to `AppWide` would change `GET /status` JSON and take that recipe's
+/// only observation point away. Repointing it is a behaviour change with its own
+/// retest box and is raised as **F-38**, not folded into the split.
+///
+/// [`Scope::UnknownCaller`]: crate::settings::injection::Scope::UnknownCaller
+/// [`Scope::AppWide`]: crate::settings::injection::Scope::AppWide
 pub fn injection_status(settings: &crate::settings::Settings) -> serde_json::Value {
     use crate::settings::injection::{self as inj, Scope};
     let mut scopes = vec![
         serde_json::json!({
-            "scope": Scope::App.key(),
+            "scope": Scope::UnknownCaller.key(),
             "label": "Application-wide",
-            "features": inj::report(settings, Scope::App),
+            "features": inj::report(settings, Scope::UnknownCaller),
         }),
         serde_json::json!({
             "scope": Scope::OffloadWorker.key(),
@@ -7595,6 +8304,507 @@ mod tests {
         assert_eq!(picked.pid, 99);
     }
 
+    // ── #48 F-32 / locked decision 37 — the child→app discovery report ───────
+
+    /// A ledger local to one test. The production one is process-global and the
+    /// suite runs concurrently, so a test that used it would be racing its
+    /// neighbours on the shared `(no tab identity)` bucket — which is exactly
+    /// the bucket the key-space property is about.
+    fn test_ledger() -> HashMap<String, outbound::Doubling> {
+        HashMap::new()
+    }
+
+    /// The facts a configured tab resolves to, stood in for. The `Cell` records
+    /// whether the closure ran at all: an identity-less report must never reach
+    /// the app-side resolvers, because there is no tab to resolve.
+    fn facts_probe(
+        called: &std::cell::Cell<bool>,
+    ) -> impl FnOnce(&str, &'static str) -> TabFacts + '_ {
+        move |tab, _agent| {
+            called.set(true);
+            TabFacts {
+                root: format!("P:\\proj\\{tab}"),
+                session: Some("sess-f32".to_string()),
+            }
+        }
+    }
+
+    fn skipped_body(tab: Option<&str>, skipped: u32) -> DiscoverySkippedBody {
+        DiscoverySkippedBody {
+            tab: tab.map(str::to_string),
+            consumer: None,
+            skipped,
+        }
+    }
+
+    /// **Decision 37's bar, clauses (1), (2) and (5).** A token-holder can cause
+    /// a row; it cannot make that row name a tab that is not configured, claim
+    /// `Headless` when the truth is unknown, carry a root or a session it chose,
+    /// state a count no genuine child could produce, or move anything.
+    ///
+    /// Asserted **through** `record_discovery_skipped` with `test_rows`
+    /// observing the row the producer actually wrote — not by calling
+    /// `tab_identity` beside it and comparing to itself, which is the shape that
+    /// let three findings survive their fixes here. Deleting the `tab_identity`
+    /// call from the producer fails this test.
+    #[test]
+    fn a_forged_discovery_report_cannot_claim_a_tab_or_choose_what_the_row_says() {
+        use crate::activity::Attribution;
+        let s = settings_with_tabs(&["f32-real"]);
+        let mut ledger = test_ledger();
+        let row_for = |ledger: &mut HashMap<String, outbound::Doubling>,
+                       body: &DiscoverySkippedBody|
+         -> Option<crate::activity::ActivityRecord> {
+            outbound::test_rows::reset();
+            let called = std::cell::Cell::new(false);
+            record_discovery_skipped(&s, body, |k| claim_in(ledger, k), facts_probe(&called));
+            let mut rows = outbound::test_rows::drain();
+            assert!(rows.len() <= 1, "one report, at most one row");
+            let row = rows.pop();
+            // The app-side resolvers run for a CONFIGURED tab and for nothing
+            // else: there is no tab to resolve a root or a session for.
+            if let Some(r) = &row {
+                assert_eq!(
+                    called.get(),
+                    matches!(&r.entry.tab, Attribution::Tab(_)),
+                    "the app-side facts were resolved for a non-tab (or not for a tab)"
+                );
+            }
+            row
+        };
+
+        // A configured id is the only one that becomes a tab — and its root and
+        // session come from the app, not from the wire (there is no wire field
+        // for either).
+        let real = row_for(&mut ledger, &skipped_body(Some("f32-real"), 1)).expect("a row");
+        assert_eq!(
+            real.entry.tab,
+            Attribution::Tab("f32-real".to_string())
+        );
+        assert_eq!(real.entry.root, "P:\\proj\\f32-real");
+        assert_eq!(real.entry.session.as_deref(), Some("sess-f32"));
+        assert_eq!(real.entry.source, "discovery_skipped");
+        assert_eq!(real.entry.tool, "discovery");
+        assert!(
+            real.entry.ok,
+            "containment WORKED — a denial-shaped row would say cImp blocked the child"
+        );
+        assert!(
+            real.request.contains("\"origin\": \"http\""),
+            "a local process asserted this, and the row must say so: {}",
+            real.request
+        );
+
+        // An id naming no configured tab is `Unrecognized`, never `Tab` and
+        // never `Headless`, and it carries no root and no session.
+        let forged = row_for(&mut ledger, &skipped_body(Some("f32-not-a-tab"), 1)).expect("a row");
+        assert_eq!(
+            forged.entry.tab,
+            Attribution::Unrecognized("f32-not-a-tab".to_string())
+        );
+        assert!(
+            forged.entry.root.is_empty() && forged.entry.session.is_none(),
+            "a forged id must not be able to file a security row under a project"
+        );
+
+        // No id at all is `Unattributed` — "this writer does not know" — and
+        // explicitly NOT `Headless`, which is the positive claim "a worker run
+        // with no tab behind it". That collapse is F-20's defect and F-29's; a
+        // body-supplied tab is indistinguishable from an invented one, so this
+        // frame cannot make the positive claim.
+        let anon = row_for(&mut ledger, &skipped_body(None, 1)).expect("a row");
+        assert_eq!(anon.entry.tab, Attribution::Unattributed);
+        assert_ne!(anon.entry.tab, Attribution::Headless);
+
+        // An unbounded invented id cannot choose how many bytes of a capped feed
+        // one report occupies — bounded AFTER classification, so truncation can
+        // never fold a long id onto a configured one.
+        // (Its own ledger: the sentinel bucket is shared — which is the point of
+        // the key-space assertion below — so in the main one this report would
+        // land between powers of two and be correctly suppressed.)
+        let long = "x".repeat(4096);
+        let big = row_for(&mut test_ledger(), &skipped_body(Some(&long), 1)).expect("a row");
+        let Attribution::Unrecognized(id) = &big.entry.tab else {
+            panic!("a 4096-char id is not a tab: {:?}", big.entry.tab);
+        };
+        assert!(id.chars().count() <= BEACON_TOOL_MAX + 1, "{}", id.len());
+        assert!(!is_configured_tab(&s, id), "truncation is not a forgery");
+
+        // The count is caller-asserted and the row says so, clamped to the probe
+        // budget a genuine resolution cannot exceed.
+        let huge = row_for(&mut ledger, &skipped_body(Some("f32-real"), 9999)).expect("a row");
+        assert!(huge.response.contains("skipped 6 candidate"), "{}", huge.response);
+        assert!(huge.response.contains("clamped"), "{}", huge.response);
+        assert!(
+            huge.response.contains("CALLER-ASSERTED"),
+            "the honesty clause is not optional: {}",
+            huge.response
+        );
+
+        // A report of zero skips is not a report — and it is what a malformed or
+        // empty body degrades to, so neither writes anything.
+        assert!(row_for(&mut ledger, &skipped_body(Some("f32-real"), 0)).is_none());
+        for raw in [
+            &b"{ not json"[..],
+            &b""[..],
+            &b"null"[..],
+            &br#"{"skipped":"lots"}"#[..],
+        ] {
+            let body: DiscoverySkippedBody = serde_json::from_slice(raw).unwrap_or_default();
+            assert_eq!(bounded_skips(body.skipped), None, "{raw:?}");
+        }
+
+        // The whole exchange keyed exactly two ledger buckets: the one
+        // configured tab, plus ONE sentinel shared by every identity-less report
+        // — the anonymous one and the invented-id one landed in the same bucket.
+        assert_eq!(
+            ledger.len(),
+            2,
+            "the key space is the user's tab list plus a sentinel: {:?}",
+            ledger.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// **Decision 37's bar, clause (6): the response is not the signal.**
+    ///
+    /// Two halves, and each is load-bearing on its own. The reply is a single
+    /// constant reached by the handler's only exit — so a prober learns nothing
+    /// from bad JSON, an unknown tab, an anonymous tab, `skipped: 0`,
+    /// `skipped: 9999`, a row written or a row suppressed — **while the rows
+    /// those inputs produce differ**, which is what stops the property from
+    /// being satisfied trivially by a handler that does nothing at all.
+    #[test]
+    fn the_discovery_report_answers_identically_on_every_path() {
+        // Half 1: the bytes. One constant, one exit, no branch before it.
+        assert_eq!(DISCOVERY_ACK, br#"{"ok":true}"#);
+        let src = include_str!("loopback.rs");
+        let body = handler_body(src, "handle_discovery_skipped");
+        assert_eq!(
+            body.matches("write_").count(),
+            1,
+            "a second writer is a second response shape: {body}"
+        );
+        assert!(body.contains("DISCOVERY_ACK"), "{body}");
+        for forbidden in ["write_json", "400", "return ", "?;", "if ", "match "] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` in this handler is a path the reply could diverge on: {body}"
+            );
+        }
+
+        // Half 2: the rows DO differ, so the constant reply is hiding something.
+        let s = settings_with_tabs(&["f32-t2"]);
+        let mut ledger = test_ledger();
+        let wrote = |ledger: &mut HashMap<String, outbound::Doubling>, b: &DiscoverySkippedBody| {
+            outbound::test_rows::reset();
+            let called = std::cell::Cell::new(false);
+            record_discovery_skipped(&s, b, |k| claim_in(ledger, k), facts_probe(&called));
+            !outbound::test_rows::drain().is_empty()
+        };
+        // Reports 1 and 2 for this scope write; report 3 is folded into the
+        // next power of two. Same reply, different store.
+        assert!(wrote(&mut ledger, &skipped_body(Some("f32-t2"), 1)));
+        assert!(wrote(&mut ledger, &skipped_body(Some("f32-t2"), 1)));
+        assert!(
+            !wrote(&mut ledger, &skipped_body(Some("f32-t2"), 1)),
+            "the third report is suppressed — and answers identically"
+        );
+        assert!(!wrote(&mut ledger, &skipped_body(Some("f32-t2"), 0)));
+        outbound::test_rows::reset();
+    }
+
+    /// **Decision 37's bar, clauses (3) and (4): a flood costs `log2(n)` rows in
+    /// its own lane and none anywhere else.**
+    ///
+    /// Three halves. The doubling itself, asserted on the `suppressed` counts
+    /// and not merely on how many rows appear — a plain global cap would also
+    /// produce "a small number". The key space, which is the assertion
+    /// `/activity/contract_drift` has no equivalent of and the one that would
+    /// have caught F-37. And the lane, which comes free with the `Screen`
+    /// variant and is proved for every screen by
+    /// `activity::tests::no_screen_can_evict_another_screens_rows`.
+    #[test]
+    fn a_flood_of_discovery_reports_costs_log2_rows_and_evicts_nothing() {
+        // Half 1 — the ledger. 200 reports on one key write 8 rows, at 1, 2, 4,
+        // 8, 16, 32, 64, 128, and each names how many it stands for.
+        let mut ledger = test_ledger();
+        let mut written: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..200 {
+            if let outbound::DoublingRow::Write { total, suppressed } =
+                claim_in(&mut ledger, "claude:one-scope")
+            {
+                written.push((total, suppressed));
+            }
+        }
+        assert_eq!(
+            written,
+            vec![
+                (1, 0),
+                (2, 0),
+                (4, 1),
+                (8, 3),
+                (16, 7),
+                (32, 15),
+                (64, 31),
+                (128, 63)
+            ],
+            "the magnitude of a loop must survive in the window, not be inferred \
+             from the absence of rows"
+        );
+
+        // Half 2 — the key space. Ten thousand DISTINCT invented tab ids get ONE
+        // bucket and log2-many rows, because the key is the identity the app
+        // resolved and not the string the caller typed.
+        outbound::test_rows::reset();
+        let s = settings_with_tabs(&["f32-t3"]);
+        let mut invented = test_ledger();
+        for i in 0..10_000u32 {
+            let called = std::cell::Cell::new(false);
+            record_discovery_skipped(
+                &s,
+                &skipped_body(Some(&format!("invented-{i}")), 1),
+                |k| claim_in(&mut invented, k),
+                facts_probe(&called),
+            );
+        }
+        assert_eq!(
+            invented.len(),
+            1,
+            "ten thousand invented ids must not buy ten thousand counters: {:?}",
+            invented.keys().collect::<Vec<_>>()
+        );
+        let rows = outbound::test_rows::drain();
+        assert_eq!(
+            rows.len(),
+            14,
+            "10 000 reports must cost log2 rows, not 10 000"
+        );
+        assert!(rows.iter().all(|r| r.entry.source == "discovery_skipped"));
+
+        // Half 3 — the lane. Declaring the variant is what buys it; the
+        // every-screen-against-every-screen matrix in `activity` covers this one
+        // as both flooder and victim with no edit to that test, which is the
+        // property being relied on here.
+        assert!(
+            outbound::Screen::ALL.contains(&outbound::Screen::DiscoverySkipped),
+            "a screen missing from ALL shares the catch-all lane instead of \
+             getting its own guaranteed window"
+        );
+    }
+
+    /// **The positive case, on the wire, and its negative control.** A skipped
+    /// planted entry reaches the app; a clean resolution says nothing.
+    ///
+    /// Asserted on the BYTES a listening instance receives. `SKIPPED_CANDIDATES`
+    /// is deliberately not asserted anywhere here: that counter is F-11's, it
+    /// already works, and *the entire finding is that it has no user consumer* —
+    /// a test that asserts the counter re-pins the defect's shape.
+    #[test]
+    fn a_skipped_entry_is_reported_on_the_wire_and_a_clean_resolution_says_nothing() {
+        let (port, seen) = recording_instance("tok-f32");
+        let d = Discovery {
+            port,
+            token: "tok-f32".into(),
+            pid: 4242,
+            root: "P:\\proj".into(),
+        };
+        let who = ChildIdentity {
+            consumer: "claude",
+            tab: Some("claude-1"),
+        };
+
+        dispatch_discovery_report(&d, who, 2);
+        let req = wait_for_request(&seen, 1).expect("the live instance receives the report");
+        assert!(
+            req.starts_with("POST /activity/discovery_skipped HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("Authorization: Bearer tok-f32\r\n"), "{req}");
+        assert!(req.contains("\"skipped\":2"), "{req}");
+        assert!(req.contains("\"tab\":\"claude-1\""), "{req}");
+        assert!(req.contains("\"consumer\":\"claude\""), "{req}");
+        // Nothing else rides along: no cwd, no path, no free text, and no
+        // pid/port/root of the entries that were skipped.
+        for absent in ["cwd", "root", "pid", "port", "session"] {
+            assert!(!req.contains(absent), "`{absent}` on the wire: {req}");
+        }
+
+        // The count is clamped by the CHILD too, so the wire is honest rather
+        // than relying on the far end to fix it.
+        dispatch_discovery_report(&d, who, 9999);
+        let req = wait_for_request(&seen, 2).expect("a second report");
+        assert!(req.contains("\"skipped\":6"), "{req}");
+
+        // A child with no `--tab` sends no `tab` key at all — absent, not null.
+        dispatch_discovery_report(
+            &d,
+            ChildIdentity {
+                consumer: "opencode",
+                tab: None,
+            },
+            1,
+        );
+        let req = wait_for_request(&seen, 3).expect("a third report");
+        assert!(!req.contains("\"tab\""), "{req}");
+        assert!(req.contains("\"consumer\":\"opencode\""), "{req}");
+
+        // **The negative control.** A resolution that skipped nothing posts
+        // nothing — without this half, an implementation that reported
+        // unconditionally would pass everything above.
+        report_skipped_to_app(&d, who, 0);
+        assert!(
+            wait_for_request(&seen, 4).is_none(),
+            "a clean resolution must be silent: {:?}",
+            seen.lock().unwrap_or_else(PoisonError::into_inner).len()
+        );
+
+        // **Fail-open.** The endpoint is dead at report time: the dispatcher
+        // returns normally, quickly, and reports nothing back to its caller —
+        // its return type is `()`, so it cannot fail the child's real work.
+        let dead = Discovery {
+            port: dead_port(),
+            ..d
+        };
+        let t0 = std::time::Instant::now();
+        dispatch_discovery_report(&dead, who, 1);
+        assert!(
+            t0.elapsed() < DISCOVERY_REPORT_TIMEOUT * 4,
+            "a dead endpoint must cost the stated bound at most: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// **The hard constraint, as behaviour rather than a source scan for a call
+    /// that is not there.** The report must never appear on the hook shims'
+    /// resolution path: `taint_beacon`'s entire safety argument is that it
+    /// writes nothing to stdout or stderr and awaits nothing, and it reaches
+    /// discovery through `read_discovery_for`, not through `proxy_base_for`.
+    ///
+    /// A `grep` for `dispatch(` in `taint_beacon.rs` would stay green while a
+    /// refactor moved the POST one frame down into the shared resolver. The
+    /// socket assertion would not.
+    #[test]
+    fn the_discovery_report_never_reaches_the_hook_shims_path() {
+        // The shims' own resolution shape, against a real socket: one probe, and
+        // nothing else, ever leaves this path.
+        let (port, seen) = recording_instance("tok-shim");
+        let live = Discovery {
+            port,
+            token: "tok-shim".into(),
+            pid: 10,
+            root: "P:\\proj".into(),
+        };
+        let planted = disc(4242, dead_port(), "P:\\proj\\sub");
+        let cwd = PathBuf::from("P:\\proj\\sub\\pkg");
+        let picked = select_verified(vec![live, planted], Some(&cwd), responds, || None)
+            .expect("the shim still finds the running instance");
+        assert_eq!(picked.port, port);
+        std::thread::sleep(Duration::from_millis(250));
+        let reqs = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(reqs.len(), 1, "the resolver sent more than a probe: {reqs:?}");
+        assert!(reqs[0].starts_with("GET /health "), "{}", reqs[0]);
+
+        // …and structurally: the ONE report site sits in `proxy_base_for`, after
+        // the `?` that proves an endpoint resolved.
+        let src = include_str!("loopback.rs");
+        let resolver = top_level_fn(src, "pub fn proxy_base_for(");
+        let after_q = resolver.find("let d = d?;").expect("the `?` is the guard");
+        let report = resolver
+            .find("report_skipped_to_app(")
+            .expect("the report site");
+        assert!(
+            report > after_q,
+            "reporting before the `?` would fire with no endpoint to report to"
+        );
+        assert!(
+            !top_level_fn(src, "pub fn read_discovery_for(").contains("report_skipped_to_app"),
+            "the shims call `read_discovery_for`; a report there is a write and a \
+             wait inside `taint_beacon`"
+        );
+        // The production ledger really is what the route claims: the process-wide
+        // doubling map, not a per-call one that would bound nothing.
+        assert!(
+            top_level_fn(src, "fn note_discovery_skipped(").contains("claim_discovery_report"),
+            "the handler must claim against the process ledger"
+        );
+    }
+
+    /// A [`fake_instance`] that also **records every request it received**, so a
+    /// test can assert on what left a code path rather than on what that path
+    /// decided. Answers exactly as `fake_instance` does.
+    #[allow(clippy::type_complexity)]
+    fn recording_instance(token: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 2048];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let ok = req.contains(&format!("Authorization: Bearer {token}\r\n"));
+                sink.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(req);
+                let body: &[u8] = if ok { b"ok" } else { b"unauthorized" };
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    if ok { 200 } else { 401 },
+                    if ok { "OK" } else { "Unauthorized" },
+                    body.len()
+                );
+                let _ = conn.write_all(head.as_bytes());
+                let _ = conn.write_all(body);
+            }
+        });
+        (port, seen)
+    }
+
+    /// Wait up to 250 ms for the `n`th request to arrive, since the dispatcher
+    /// never waits for the peer. `None` ⇒ it never came, which is the assertion
+    /// the negative control needs.
+    fn wait_for_request(seen: &Arc<Mutex<Vec<String>>>, n: usize) -> Option<String> {
+        for _ in 0..50 {
+            if let Some(req) = seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(n - 1)
+            {
+                return Some(req.clone());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    /// The source text of one top-level `fn`, signature to closing brace — the
+    /// non-`async` twin of [`handler_body`], with the same CRLF normalisation
+    /// and the same "a `}` in column 0 ends it" rule.
+    fn top_level_fn(src: &str, sig: &str) -> String {
+        let mut out = String::new();
+        let mut inside = false;
+        for line in src.lines() {
+            if !inside {
+                if !line.starts_with(sig) {
+                    continue;
+                }
+                inside = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            if line == "}" {
+                break;
+            }
+        }
+        assert!(!out.is_empty(), "no top-level `{sig}`");
+        assert!(out.ends_with("}\n"), "`{sig}` was not terminated");
+        out
+    }
+
     /// A port on the loopback interface that nothing is listening on: bound,
     /// read, and released before the test uses the number. A `connect` to it is
     /// refused immediately, which is also why a dead planted entry costs the
@@ -7726,7 +8936,7 @@ mod tests {
     // ── V32 Phase B — the proxy's per-session taint latch ──────────────────
 
     use crate::offload::toolclass::{
-        REFUSAL_EXTERNAL_BLOCKED, REFUSAL_LOCAL_BLOCKED,
+        REFUSAL_EXTERNAL_BLOCKED, REFUSAL_EXTERNAL_USER_LOCAL, REFUSAL_LOCAL_BLOCKED,
     };
 
     /// A scope for `tab`, claiming session `session` (`None` = the registry
@@ -8752,17 +9962,25 @@ mod tests {
     /// longer have — and "the user switched containment off" and "cImp could
     /// not find your tab" then rendered identically to the plugin.
     ///
-    /// The verdict now follows the resolved scope, which is app-wide for both
-    /// identity-less shapes. Asserted as the *equality* the fix is about: an
-    /// unknown id answers what the app answers, whatever that is.
+    /// The verdict now follows the resolved scope, which is the unknown
+    /// caller's for both identity-less shapes. Asserted as the *equality* the
+    /// fix is about: an unknown id answers what an unattributed call answers,
+    /// whatever that is.
+    ///
+    /// **Renamed with #48 F-35** (was
+    /// `…_resolves_the_app_wide_gate_verdict_…`): locked decision 36 split
+    /// `Scope::App` into `Scope::AppWide` and `Scope::UnknownCaller`, and this
+    /// test asserts the second one. "App-wide" stopped describing it — the
+    /// resolved answer here also carries any configured tab's L3 `On` (N-1),
+    /// which the app-wide baseline does not.
     #[test]
-    fn an_unknown_tab_id_resolves_the_app_wide_gate_verdict_not_a_hard_off() {
+    fn an_unknown_tab_id_resolves_as_an_unknown_caller_not_a_hard_off() {
         use crate::settings::injection::{Feature, Scope};
         let (mut s, _id) = oc_settings();
         let stale = LatchScoping::Unknown("opencode-removed".to_string());
         let anon = LatchScoping::Anonymous;
-        assert!(matches!(stale.injection(), Scope::App));
-        assert!(matches!(anon.injection(), Scope::App));
+        assert!(matches!(stale.injection(), Scope::UnknownCaller));
+        assert!(matches!(anon.injection(), Scope::UnknownCaller));
 
         // Off app-wide ⇒ off for a stale id. (The regression was invisible in
         // this direction, which is why #45 shipped.)
@@ -8777,8 +9995,8 @@ mod tests {
         );
         assert_eq!(
             native_gate_verdict(&s, stale.injection()),
-            native_gate_verdict(&s, Scope::App),
-            "and it must be the SAME answer the app gives, by construction"
+            native_gate_verdict(&s, Scope::UnknownCaller),
+            "and it must be the SAME answer an unattributed call gives, by construction"
         );
 
         // Through the reply the plugin actually reads, which is where the
@@ -9332,7 +10550,7 @@ mod tests {
     /// the tab's `Budget`.
     #[test]
     fn ssrf_denial_rows_are_bounded_per_session_and_reset_on_rotation() {
-        use outbound::{ScopeAudit, SsrfRow};
+        use outbound::{ScopeAudit, DoublingRow};
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
@@ -9349,13 +10567,13 @@ mod tests {
             reg.claim(
                 Some(&s),
                 outbound::Budget::claim_ssrf_flag,
-                SsrfRow::Suppress,
+                DoublingRow::Suppress,
             )
         };
         let written: Vec<u32> = (0..200)
             .filter_map(|_| match claim() {
-                SsrfRow::Write { total, .. } => Some(total),
-                SsrfRow::Suppress => None,
+                DoublingRow::Write { total, .. } => Some(total),
+                DoublingRow::Suppress => None,
             })
             .collect();
         assert_eq!(
@@ -9374,9 +10592,9 @@ mod tests {
             fresh.claim(
                 Some(&f),
                 outbound::Budget::claim_ssrf_flag,
-                SsrfRow::Suppress
+                DoublingRow::Suppress
             ),
-            SsrfRow::Write { total: 1, .. }
+            DoublingRow::Write { total: 1, .. }
         ));
 
         // A new conversation is entitled to its own rows: the rotation that
@@ -9395,15 +10613,15 @@ mod tests {
             reg.claim(
                 Some(&rotated),
                 outbound::Budget::claim_ssrf_flag,
-                SsrfRow::Suppress
+                DoublingRow::Suppress
             ),
-            SsrfRow::Write { total: 1, .. }
+            DoublingRow::Write { total: 1, .. }
         ));
 
         // A call with no tab identity has no session to attribute a repeat to,
         // so it reports — the same fail-open the latch and the budget take.
         let unscoped = TabAudit(None);
-        assert!(matches!(unscoped.claim_ssrf(), SsrfRow::Write { .. }));
+        assert!(matches!(unscoped.claim_ssrf(), DoublingRow::Write { .. }));
         assert!(unscoped.claim_unscreened());
     }
 
@@ -9745,6 +10963,16 @@ mod tests {
     /// The flip is the decision-15 workflow: research done, now apply it. It
     /// restores the proxied local-capability tools and CLOSES the external side
     /// in the same move — at no instant does the session hold both.
+    ///
+    /// **#48 (F-34) SPLIT this test rather than loosening it.** It used to assert
+    /// `Err(REFUSAL_EXTERNAL_BLOCKED)` for the closed side, which pinned the
+    /// defect's *shape* — the string that says *"this task has already used a
+    /// local-capability tool"* about a latch no tool call moved. What it is FOR
+    /// is containment: after the flip the external side is closed, exactly and
+    /// only. That is what stays here, still asserted against an exact constant.
+    /// Which sentence each cause gets is
+    /// [`the_proxied_external_refusal_names_the_user_flip_only_when_a_user_flipped_it`],
+    /// and the old constant is still pinned there for the case where it is true.
     #[test]
     fn flip_local_reopens_local_tools_and_closes_the_external_side() {
         let reg = LatchRegistry::default();
@@ -9781,8 +11009,185 @@ mod tests {
             .is_ok());
         assert_eq!(
             reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
-            Err(REFUSAL_EXTERNAL_BLOCKED)
+            Err(REFUSAL_EXTERNAL_USER_LOCAL),
+            "the external side is closed — and by the flip, which is what closed it"
         );
+    }
+
+    /// **#48 (F-34): the proxied external refusal states the cause the gate
+    /// checked — F-23's twin, on the route that ships ON.**
+    ///
+    /// The defect: after the user clicked "Switch to local", a proxied external
+    /// call was refused with `REFUSAL_EXTERNAL_BLOCKED` — *"this task has already
+    /// used a local-capability tool"*. False. No tool call latched that tab; the
+    /// user's own IPC flip did. Observed live, a tab's model believed the string
+    /// and told its user that `graph_snippet` had caused the latch: a confident,
+    /// wrong causal story about a security event.
+    ///
+    /// Both halves are asserted, because the fix is a *split*, not a rename — the
+    /// old constant is the TRUE statement for a latch a tool call earned, and a
+    /// fix written as "local ⇒ the user did it" fails the first case below.
+    ///
+    /// It also proves the invariant locked decision 34 inherits from F-23: **the
+    /// flag cannot outlive the latch it explains.** Both exits from `Local` are
+    /// walked on this route — the rotation reset and the unlatch — and after each
+    /// one a latch re-earned by a *tool call* is refused with the old constant
+    /// again. A stale `true` would be F-34 with the operands swapped: a tool
+    /// call's latch reported to the model as the user's decision.
+    #[test]
+    fn the_proxied_external_refusal_names_the_user_flip_only_when_a_user_flipped_it() {
+        // 1. EARNED by a local-capability tool call. The pre-F-34 sentence is the
+        //    true one here and must survive untouched.
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        assert_eq!(reg.view_for(&s).latch, "local");
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
+            Err(REFUSAL_EXTERNAL_BLOCKED),
+            "a tool call really did close this side"
+        );
+
+        // 2. The finding's own path: fetch → EXTERNAL → the user's workflow flip.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        reg.apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip");
+        assert_eq!(
+            reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
+            Err(REFUSAL_EXTERNAL_USER_LOCAL),
+            "no tool call closed this side, and the refusal must not say one did"
+        );
+        // Containment is byte-identical: only the sentence moved. The local side
+        // is open (that is what the flip is FOR) and the write path is unchanged.
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        // …and the row a reviewer reads carries the same corrected sentence,
+        // rather than the feed and the model being told different stories.
+        outbound::test_rows::reset();
+        let s2 = scope("claude-2", Some("sess-a"));
+        assert!(reg
+            .gate(
+                Some(&s2),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        reg.apply_override(&s2, LatchOverride::FlipLocal)
+            .expect("flip");
+        let _ = outbound::test_rows::drain();
+        assert_eq!(
+            reg.gate(Some(&s2), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
+            Err(REFUSAL_EXTERNAL_USER_LOCAL)
+        );
+        let rows = outbound::test_rows::drain();
+        let refusals = outbound::test_rows::of_screen(&rows, outbound::Screen::LatchRefusal);
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(
+            refusals[0].response, REFUSAL_EXTERNAL_USER_LOCAL,
+            "the incident row quotes what the model was told, verbatim"
+        );
+
+        // 3. The flag cannot outlive its latch — exit A, the rotation reset. The
+        //    NEXT conversation's own `graph_snippet` is what closes its external
+        //    side, and it must be told so.
+        let rotated = scope("claude-1", Some("sess-b"));
+        assert_eq!(reg.view_for(&rotated).latch, "open", "the rotation reopened");
+        assert!(reg
+            .gate(
+                Some(&rotated),
+                LatchRoute::Proxied,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        assert_eq!(
+            reg.gate(
+                Some(&rotated),
+                LatchRoute::Proxied,
+                "ddg__search",
+                ON,
+                NO_CONTENT
+            ),
+            Err(REFUSAL_EXTERNAL_BLOCKED),
+            "F-34 with the operands swapped: this one really was a tool call"
+        );
+
+        // 4. Exit B, the unlatch. Both sides open again, so there is nothing to
+        //    explain; and a latch re-earned afterwards reports the tool call.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        reg.apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip");
+        reg.apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT)
+            .is_ok());
+        assert_eq!(
+            reg.gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            ),
+            Err(REFUSAL_LOCAL_BLOCKED),
+            "the unlatch is not a free pass: the tab re-latched EXTERNAL"
+        );
+
+        // 5. The user flip is the ONLY thing that selects the new sentence. A
+        //    tab whose contamination the user cleared, and one the user armed for
+        //    a session clear, are user actions too — neither leaves the latch
+        //    `local` by decision, and neither may borrow the flip's sentence.
+        let (reg, s) = contaminated_local_registry();
+        for action in [
+            // Ordered so each precondition holds: the arm needs the bit set, the
+            // clear consumes it.
+            LatchOverride::AwaitSessionClear,
+            LatchOverride::ClearContamination,
+        ] {
+            reg.apply_override(&s, action).expect("applies");
+            assert_eq!(
+                reg.gate(Some(&s), LatchRoute::Proxied, "ddg__search", ON, NO_CONTENT),
+                Err(REFUSAL_EXTERNAL_BLOCKED),
+                "{action:?}: the latch is still the one graph_snippet earned"
+            );
+        }
     }
 
     /// **#48 (F-23): a `local` latch carries the reason it is `local`,** because
@@ -12239,6 +13644,18 @@ mod tests {
             "POST",
             "handle_contract_drift",
             Containment::NoRegistry("a shim reporting its own broken payload; returns nothing"),
+        ),
+        route(
+            // The constant the CHILD sends, so the two ends cannot drift: the
+            // dispatch arm is scanned from the source and compared against this
+            // list, which is built from `DISCOVERY_SKIPPED_PATH`.
+            DISCOVERY_SKIPPED_PATH,
+            "POST",
+            "handle_discovery_skipped",
+            Containment::NoRegistry(
+                "a child reporting a discovery entry it skipped; answers a fixed `ok` on every \
+                 path and touches no registry",
+            ),
         ),
         route(
             "/permission/event",

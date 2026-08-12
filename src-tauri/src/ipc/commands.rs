@@ -1270,14 +1270,31 @@ pub async fn detection_revert(
 /// does nothing when clicked, and says nothing about it, teaches the user to
 /// distrust it (the same reasoning as `latch_override`'s verbatim errors).
 ///
-/// **#48 (M-21): two refusals, because there are two states and they are
+/// **#48 (M-21): three refusals, because there are three states and they are
 /// different statements.** The gate is unchanged — one predicate,
-/// `updates_enabled`, resolved at the app scope, so a button and a tick can still
-/// never disagree — but *why* it said no is not always "detection is off". A
-/// worker-scope override leaves this updater inert while injection detection is
-/// armed for the offload worker, which keeps screening with the bundle already on
-/// disk; telling that user their detection is switched off is a false claim about
-/// a running security layer, and it is the claim they would act on.
+/// `updates_enabled`, so a button and a tick can still never disagree — but *why*
+/// it said no is not always "detection is off". A worker-scope override leaves
+/// this updater inert while injection detection is armed for the offload worker,
+/// which keeps screening with the bundle already on disk; telling that user their
+/// detection is switched off is a false claim about a running security layer, and
+/// it is the claim they would act on.
+///
+/// The third case is M-21's residual, folded in with F-35: the **L1 master** is
+/// off, which resolves detection off with it. Saying "injection detection is
+/// switched off" there points the user at the wrong switch — the one they can
+/// flip without effect until the master above it is back on. `SettingsApp.svelte`
+/// had already added this distinction as a frontend refinement; the two surfaces
+/// now single-source from the same three cases rather than the tooltip being
+/// more specific than the error.
+///
+/// Checked in the frontend's order, which is also the only correct one: the
+/// master-off case cannot collide with `worker_only_detection` (`decide`
+/// short-circuits every feature to `false` with L1 off, so no scope is armed),
+/// and the generic sentence keeps its parenthetical about the master because it
+/// is still the fall-through for a state nobody positively identified.
+///
+/// **Reporting only, and asserted as such** — every branch still returns `Err`.
+/// Reporting honesty must not become a new capability.
 fn updates_allowed(settings: &crate::settings::Settings) -> AppResult<()> {
     use crate::offload::detection::updater;
     if updater::updates_enabled(settings) {
@@ -1294,8 +1311,17 @@ fn updates_allowed(settings: &crate::settings::Settings) -> AppResult<()> {
                 .to_string(),
         ));
     }
-    // Reached only when the worker's row is off too, which is what makes this
-    // sentence true rather than merely conventional.
+    if !crate::settings::injection::master_enabled(settings) {
+        return Err(AppError::Settings(
+            "injection protection is switched off at the master switch, which resolves injection \
+             detection off with it — so the detection updater will not check, apply or revert \
+             anything. Turn the master switch, and injection detection under it, back on in \
+             Settings → Injection protection."
+                .to_string(),
+        ));
+    }
+    // Reached only when the worker's row is off too and the master is on, which
+    // is what makes this sentence true rather than merely conventional.
     Err(AppError::Settings(
         "injection detection is switched off, so the detection updater will not check, apply or \
          revert anything. Turn it (and the injection-protection master above it) back on in \
@@ -3485,9 +3511,37 @@ mod tests {
             !named.contains("injection detection is switched off,"),
             "the false claim must not survive beside the true one: {named}"
         );
-        // Both refusals point at a section the sidebar has (F-18's tripwire holds
-        // the pointer itself; this holds that the new sentence carries one).
-        for r in [&plain, &named] {
+        // #48 F-35, M-21's residual: the THIRD state. The L1 master is off,
+        // which resolves detection off with it — so "injection detection is
+        // switched off" points at the wrong switch, the one the user can flip
+        // with no effect until the master above it is back on. The frontend had
+        // already made this distinction (`detectionUpdatesOffReason`); the two
+        // surfaces now single-source from the same three cases.
+        let mut master = Settings::default();
+        master.set_master_for_test(false);
+        assert!(
+            super::updates_allowed(&master).is_err(),
+            "reporting honesty must not become a new capability"
+        );
+        let l1 = super::updates_allowed(&master)
+            .expect_err("still refused")
+            .to_string();
+        assert!(
+            l1.contains("master switch"),
+            "the switch that is actually off must be named: {l1}"
+        );
+        assert!(
+            !l1.contains("injection detection is switched off,"),
+            "the sentence that points at the wrong switch must not survive: {l1}"
+        );
+        assert!(
+            !l1.contains("offload worker"),
+            "an L1 off arms nothing anywhere: {l1}"
+        );
+
+        // All three refusals point at a section the sidebar has (F-18's tripwire
+        // holds the pointer itself; this holds that the new sentences carry one).
+        for r in [&plain, &named, &l1] {
             assert!(r.contains("Injection protection"), "{r}");
         }
     }

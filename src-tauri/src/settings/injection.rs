@@ -64,11 +64,17 @@
 //! Tabs are the scope for the consumer-side controls, but the offload worker is
 //! a task-scoped service with no tab. It is a first-class pseudo-scope
 //! ([`Scope::OffloadWorker`]) with its own L3 row, and the features that exist
-//! only there ([`Feature::Canary`]) carry only that row. [`Scope::App`] is the
-//! third: the scope of a control with no per-scope row at all
-//! ([`Feature::TerminalEscapeHygiene`] — TTS and toasts are global surfaces per
-//! the global-only avatar/TTS decision), and the honest answer for a call that
-//! could not resolve a narrower one.
+//! only there ([`Feature::Canary`]) carry only that row.
+//!
+//! The remaining two are the halves of what used to be one `Scope::App`
+//! (#48, F-35, locked decision 36). [`Scope::AppWide`] is the app-wide baseline
+//! and nothing else — L1 ∧ L2 — the scope of a control with no per-scope row at
+//! all ([`Feature::TerminalEscapeHygiene`] — TTS and toasts are global surfaces
+//! per the global-only avatar/TTS decision). [`Scope::UnknownCaller`] is a real
+//! call from a real tab whose identity did not arrive: the app-wide baseline
+//! **plus** any configured tab's L3 `On` (N-1). One variant answered both
+//! questions under the first one's name, which produced two defects — M-21's
+//! false claim and F-35's suppressed signal — before it was split.
 //!
 //! Which features carry which rows is expressed *structurally*, not by
 //! convention: [`TabInjectionOverrides`] and [`WorkerInjectionOverrides`] are
@@ -415,22 +421,40 @@ pub enum Scope<'a> {
     Tab { agent: &'a str, tab: &'a str },
     /// The offload worker — a task-scoped service with no tab.
     OffloadWorker,
-    /// No narrower scope applies: an app-wide feature, or a call that carries no
-    /// tab identity.
+    /// **The app-wide baseline and nothing else: L1 ∧ L2.**
     ///
-    /// **Both readings share one variant, so its resolution has to be safe for
-    /// the second one** (#48, N-1). An app-wide feature genuinely has no
-    /// narrower answer; an identity-less *call* does — the caller is some tab,
-    /// we just cannot tell which. So this scope resolves to the app-wide answer
-    /// **plus every L3 `On` any configured tab states**: see [`decide`]. The
-    /// elevation is one-directional (an L3 `Off` never travels up), so it can
-    /// only ever add protection.
-    App,
+    /// The honest answer for a control that has no per-scope row at all
+    /// ([`Feature::TerminalEscapeHygiene`]) and for any surface that must report
+    /// what the *application* is configured to do. It never borrows another
+    /// scope's answer — that is what distinguishes it from
+    /// [`Scope::UnknownCaller`], and the distinction is the whole of F-35
+    /// (locked decision 36).
+    AppWide,
+    /// **A real call from a real tab whose identity did not arrive** (#48, N-1).
+    ///
+    /// Resolves to the app-wide baseline **plus every L3 `On` any configured AI
+    /// tab states**: see [`decide`]. Over-protective on purpose, because the
+    /// caller *is* one of those tabs and we cannot say which. The elevation is
+    /// one-directional (an L3 `Off` never travels up), so it can only ever add
+    /// protection.
+    ///
+    /// **Not the worker.** The offload worker always has an identity and always
+    /// resolves through [`Scope::OffloadWorker`], so it is never the caller
+    /// behind an identity-less call; folding its row in here would raise
+    /// protection for a population this scope does not describe. The question
+    /// *"is this control armed ANYWHERE, worker included?"* is a different one
+    /// and has its own function, `armed_anywhere` — deliberately not a fourth
+    /// variant, because every helper keyed on `Scope` would then accept it and
+    /// silently deny one scope on another's behalf.
+    ///
+    /// Shares [`APP_SCOPE_KEY`] with [`Scope::AppWide`]: the split is a
+    /// vocabulary change in Rust, never a wire change (see [`Scope::key`]).
+    UnknownCaller,
 }
 
 impl<'a> Scope<'a> {
     /// The scope for a consumer-side call: the tab when the child sent an
-    /// identity, [`Scope::App`] otherwise.
+    /// identity, [`Scope::UnknownCaller`] otherwise.
     ///
     /// `None`/empty is the **fail-open** case, and it resolves to the app-wide
     /// answer rather than to "off": V28's discipline is that a tool call must
@@ -448,10 +472,16 @@ impl<'a> Scope<'a> {
     /// therefore honours any tab's L3 `On` at this scope — over-protective for a
     /// caller with no identity, which is the correct direction for a control
     /// whose failure mode is silent under-enforcement.
+    ///
+    /// **This mapping is the only thing that distinguishes the two app-level
+    /// variants at the consumer boundary** (#48, F-35): a call that could not
+    /// name its tab lands on [`Scope::UnknownCaller`], never on
+    /// [`Scope::AppWide`], because the app-wide baseline is a statement about
+    /// the *application* and this is a statement about a *caller*.
     pub fn for_tab(agent: &'a str, tab: Option<&'a str>) -> Self {
         match tab.map(str::trim).filter(|t| !t.is_empty()) {
             Some(tab) => Scope::Tab { agent, tab },
-            None => Scope::App,
+            None => Scope::UnknownCaller,
         }
     }
 
@@ -470,11 +500,20 @@ impl<'a> Scope<'a> {
 
 impl Scope<'_> {
     /// The stable wire/UI key for this scope.
+    ///
+    /// **Both app-level variants key as [`APP_SCOPE_KEY`], deliberately**
+    /// (#48, F-35): splitting them is a Rust vocabulary change, and the wire
+    /// must not move with it. A key of its own for [`Scope::UnknownCaller`]
+    /// would grow `/status` a scope the Settings matrix does not know and would
+    /// render an unwritable row for it. The arm is load-bearing rather than
+    /// defensive — `audit::mcp::Delivery` keys the activity row's `scope` column
+    /// off a scope built by [`Scope::for_tab`], so a proxied audit with no
+    /// `--tab` reaches it in production.
     pub fn key(&self) -> String {
         match self {
             Scope::Tab { agent, tab } => format!("{agent}:{tab}"),
             Scope::OffloadWorker => WORKER_SCOPE_KEY.to_string(),
-            Scope::App => APP_SCOPE_KEY.to_string(),
+            Scope::AppWide | Scope::UnknownCaller => APP_SCOPE_KEY.to_string(),
         }
     }
 }
@@ -709,11 +748,12 @@ pub enum DecidedBy {
     Feature,
     /// L3: this scope states its own answer.
     ///
-    /// At [`Scope::App`] it means something slightly wider — "a narrower scope's
-    /// `On` is being honoured here", the identity-less elevation on [`decide`]
-    /// (#48, N-1). The app scope has no cell of its own, so there is no other
-    /// reading of `scope` available there, and the honest alternative
-    /// ([`DecidedBy::Feature`]) would claim L2 said `on` when it said `off`.
+    /// At [`Scope::UnknownCaller`] it means something slightly wider — "a
+    /// narrower scope's `On` is being honoured here", the identity-less
+    /// elevation on [`decide`] (#48, N-1). That scope has no cell of its own, so
+    /// there is no other reading of `scope` available there, and the honest
+    /// alternative ([`DecidedBy::Feature`]) would claim L2 said `on` when it
+    /// said `off`. [`Scope::AppWide`] never produces this value.
     Scope,
 }
 
@@ -731,14 +771,16 @@ pub struct Decision {
 ///
 /// - [`Feature::NativeWeb`]'s L2 is derived from the tri-mode rather than stored
 ///   as a boolean ([`native_web_l2`]);
-/// - at [`Scope::App`] an L3 `On` stated by **any** configured tab is honoured
-///   (#48, N-1). That scope stands in for two different questions — "what is the
-///   app-wide answer" and "what applies to a call that sent no `--tab`" — and
-///   the second one has a tab behind it that we simply cannot name. Only `On`
+/// - at [`Scope::UnknownCaller`] an L3 `On` stated by **any** configured tab is
+///   honoured (#48, N-1). That scope is the second of the two questions one
+///   `Scope::App` used to answer — "what applies to a call that sent no
+///   `--tab`" — and it has a tab behind it that we simply cannot name. Only `On`
 ///   travels up: an L3 `Off` stays where the user put it, so this can never
 ///   remove protection, only add it to a caller with no identity. It never
-///   applies to a scope that HAS an answer (a known tab, the worker), so the
-///   locked resolution order for a known scope does not move.
+///   applies to a scope that HAS an answer (a known tab, the worker) and never
+///   to [`Scope::AppWide`], which is the *first* question — the app-wide
+///   baseline, L1 ∧ L2, borrowing nobody's answer (#48, F-35). So the locked
+///   resolution order for a known scope does not move.
 pub fn decide(feature: Feature, scope: Scope<'_>, s: &Settings) -> Decision {
     let inj = &s.offload.injection;
     if !inj.protection {
@@ -756,9 +798,13 @@ pub fn decide(feature: Feature, scope: Scope<'_>, s: &Settings) -> Decision {
             effective: false,
             decided_by: DecidedBy::Scope,
         },
-        // N-1: the app scope has no cell of its own, so this is where the
-        // identity-less reading gets its answer, BEFORE falling through to L2.
-        Override::Inherit if matches!(scope, Scope::App) && any_tab_override_on(feature, s) => {
+        // N-1: the identity-less scope has no cell of its own, so this is where
+        // its reading gets its answer, BEFORE falling through to L2. F-35: this
+        // arm is the entire behavioural difference between the two app-level
+        // variants — `AppWide` falls straight through to L2.
+        Override::Inherit
+            if matches!(scope, Scope::UnknownCaller) && any_tab_override_on(feature, s) =>
+        {
             Decision {
                 effective: true,
                 decided_by: DecidedBy::Scope,
@@ -772,8 +818,8 @@ pub fn decide(feature: Feature, scope: Scope<'_>, s: &Settings) -> Decision {
 }
 
 /// Whether ANY configured AI tab states an L3 `On` for `feature` — the
-/// identity-less elevation described on [`Scope::App`] and [`Scope::for_tab`]
-/// (#48, N-1).
+/// identity-less elevation described on [`Scope::UnknownCaller`] and
+/// [`Scope::for_tab`] (#48, N-1).
 ///
 /// Tabs only, deliberately: the offload worker is never the caller behind an
 /// identity-less consumer call (it resolves through [`Scope::OffloadWorker`],
@@ -801,7 +847,10 @@ pub fn effective(feature: Feature, scope: Scope<'_>, s: &Settings) -> bool {
 /// asked about a tab).
 fn scope_override(feature: Feature, scope: Scope<'_>, s: &Settings) -> Override {
     match scope {
-        Scope::App => Override::Inherit,
+        // Neither app-level scope has a cell: the baseline has nothing to
+        // override, and the identity-less caller's elevation is `decide`'s, not
+        // a stored value (#48, F-35).
+        Scope::AppWide | Scope::UnknownCaller => Override::Inherit,
         Scope::OffloadWorker => s.offload.injection.worker.get(feature),
         Scope::Tab { tab, .. } => s
             .tabs
@@ -929,7 +978,26 @@ pub fn budget_limits(s: &Settings, scope: Scope<'_>) -> crate::offload::outbound
 /// both layers are off *regardless of the two per-layer sub-toggles*, which stay
 /// exactly what they were (the layer selection inside an enabled surface).
 pub fn detection_config(s: &Settings, scope: Scope<'_>) -> crate::offload::detection::Config {
-    if !effective(Feature::Detection, scope, s) {
+    detection_layers(s, effective(Feature::Detection, scope, s))
+}
+
+/// [`detection_config`], for the *"armed anywhere in this process"* question
+/// (#48, F-35).
+///
+/// **Reporting only. Never a gate** — see [`armed_anywhere`], whose caveats all
+/// apply. It exists rather than leaving its two callers to write
+/// `armed_anywhere(Feature::Detection, s) && …signature_enabled` because that
+/// second conjunct is a raw settings field, which is a privacy error outside
+/// this module (the no-raw-reads invariant in the module docs) and would compose
+/// the per-layer sub-toggle a second time.
+pub fn detection_config_anywhere(s: &Settings) -> crate::offload::detection::Config {
+    detection_layers(s, armed_anywhere(Feature::Detection, s))
+}
+
+/// The layer composition both readings share, so the parent switch and the two
+/// sub-toggles meet in exactly one place whichever question asked.
+fn detection_layers(s: &Settings, parent_on: bool) -> crate::offload::detection::Config {
+    if !parent_on {
         return crate::offload::detection::Config {
             signature: false,
             classifier: false,
@@ -941,6 +1009,54 @@ pub fn detection_config(s: &Settings, scope: Scope<'_>) -> crate::offload::detec
         classifier: s.offload.detection_classifier_enabled,
         classifier_threshold: s.offload.detection_classifier_threshold,
     }
+}
+
+/// Whether `feature` is in force in **any** scope this process has: app-wide, on
+/// any configured AI tab, or in the offload worker (#48, F-35, locked decision
+/// 36).
+///
+/// # Reporting only. Never a gate.
+///
+/// An enforcement site asking *"may I do this?"* wants [`effective`] for the
+/// scope it is actually running in. This predicate is true when a control is
+/// armed for **somebody else**, so gating on it would refuse a call on another
+/// scope's behalf — which is why the third question got a function and
+/// deliberately **not** a `Scope::Anywhere` variant: every helper keyed on
+/// [`Scope`] would have accepted that variant, and `native_web_mode(s,
+/// Scope::Anywhere)` would take a tool away from one tab because a *different*
+/// tab was hardened.
+///
+/// # Its consumers, and why they are the right ones
+///
+/// The two signals that describe the user's own `detection/rules.d/local/`
+/// directory: `updater::broken_local_rules` and `signature::advisor_signal`.
+/// That directory is **one directory shared by every scope**, so "is anyone
+/// scanning with these files" is genuinely the question they ask — and they
+/// asked it at the app scope until F-35, which meant a user who narrowed
+/// detection to the offload worker (L2 `off`, `worker.detection = on`) was told
+/// **nothing** while the worker screened every fetched page with rules of theirs
+/// that had failed to compile.
+///
+/// # What it is NOT
+///
+/// It is not `updates_enabled`'s question. M-21 settled that one: the updater
+/// stays app-scoped and one worker override does not start it. Repointing
+/// `updates_enabled` here would also collapse `worker_only_detection` — defined
+/// as `!updates_enabled && effective(Detection, OffloadWorker)` — to a permanent
+/// `false`, killing the frontend branch that renders the worker-only sentence.
+///
+/// # Composition
+///
+/// Built from [`decide`] rather than from raw fields, so L1 still
+/// short-circuits: with the master off this is `false` for every feature, at
+/// every scope, like everything else. The union is
+/// [`Scope::UnknownCaller`] (L1 ∧ (L2 ∨ any tab's `On`)) with
+/// [`Scope::OffloadWorker`] (which contributes the worker's own row) — the one
+/// place in the crate where the worker's row is deliberately folded into an
+/// identity-less answer, six lines from the elevation that must never do it
+/// (`any_tab_override_on`, *"tabs only, deliberately"*).
+pub fn armed_anywhere(feature: Feature, s: &Settings) -> bool {
+    effective(feature, Scope::UnknownCaller, s) || effective(feature, Scope::OffloadWorker, s)
 }
 
 // ── Spawn signature + introspection ───────────────────────────────────────
@@ -1136,7 +1252,12 @@ fn feature_in_scope(feature: Feature, scope: Scope<'_>) -> bool {
     match scope {
         Scope::Tab { .. } => feature.has_tab_scope(),
         Scope::OffloadWorker => feature.has_worker_scope(),
-        Scope::App => !feature.has_tab_scope() && !feature.has_worker_scope(),
+        // Structural, so the two app-level scopes answer alike: the question is
+        // "is there a row here", and neither has one for a feature that keeps
+        // its cells on tabs or on the worker.
+        Scope::AppWide | Scope::UnknownCaller => {
+            !feature.has_tab_scope() && !feature.has_worker_scope()
+        }
     }
 }
 
@@ -1205,7 +1326,10 @@ pub fn protection_reduced(s: &Settings) -> bool {
             f.default_enabled() && feature_in_scope(*f, scope) && !effective(*f, scope, s)
         })
     };
-    if any_off(Scope::App) || any_off(Scope::OffloadWorker) {
+    // `AppWide`, not `UnknownCaller` (#48, F-35), and the two are provably equal
+    // here: `feature_in_scope` admits only features with no tab row, and only a
+    // tab row can carry the N-1 elevation.
+    if any_off(Scope::AppWide) || any_off(Scope::OffloadWorker) {
         return true;
     }
     s.tabs.iter().any(|t| match t {
@@ -1377,7 +1501,7 @@ mod tests {
     ///
     /// The property, stated against behaviour rather than against field names:
     /// for every feature, flipping its L2 moves that feature's resolved value at
-    /// [`Scope::App`] and **no other feature's**. `set_l2_for_test`'s exhaustive
+    /// [`Scope::AppWide`] and **no other feature's**. `set_l2_for_test`'s exhaustive
     /// `match` is what makes a new variant impossible to add without naming its
     /// storage; this test is what makes naming the WRONG storage fail.
     #[test]
@@ -1417,7 +1541,7 @@ mod tests {
         let s = settings();
         let id = a_tab(&s);
         for f in Feature::ALL {
-            for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::App] {
+            for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::AppWide] {
                 let d = decide(*f, scope, &s);
                 assert_eq!(
                     d.effective,
@@ -1547,7 +1671,7 @@ mod tests {
         ));
 
         s.offload.injection.protection = false;
-        for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::App] {
+        for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::AppWide] {
             assert_eq!(
                 decide(Feature::TaintLatch, scope, &s),
                 Decision {
@@ -1558,7 +1682,7 @@ mod tests {
         }
         // And with the master off EVERY feature is off, at every scope.
         for f in Feature::ALL {
-            for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::App] {
+            for scope in [tab_scope(&id), Scope::OffloadWorker, Scope::AppWide] {
                 assert!(!effective(*f, scope, &s), "{f:?} at {scope:?}");
             }
         }
@@ -1667,15 +1791,15 @@ mod tests {
         let off = budget_limits(&s, Scope::OffloadWorker);
         assert_eq!((off.max_calls, off.max_bytes), (0, 0));
 
-        let cfg = detection_config(&s, Scope::App);
+        let cfg = detection_config(&s, Scope::AppWide);
         assert!(cfg.signature && cfg.classifier);
         s.offload.injection.detection_enabled = false;
-        let cfg = detection_config(&s, Scope::App);
+        let cfg = detection_config(&s, Scope::AppWide);
         assert!(!cfg.signature && !cfg.classifier);
         // The parent wins over the sub-toggles, in both directions: with the
         // parent off, turning a layer on changes nothing.
         s.offload.detection_signature_enabled = true;
-        assert!(!detection_config(&s, Scope::App).signature);
+        assert!(!detection_config(&s, Scope::AppWide).signature);
     }
 
     /// One Claude tab and one OpenCode tab — the shape the per-consumer spawn
@@ -2073,7 +2197,9 @@ mod tests {
     /// **#48, N-1 — an identity-less call must not silently ignore a per-tab
     /// L3 `On`.**
     ///
-    /// [`Scope::for_tab`] maps a missing `--tab` to [`Scope::App`], documented as
+    /// [`Scope::for_tab`] maps a missing `--tab` to [`Scope::UnknownCaller`]
+    /// (which was [`Scope::AppWide`]'s other half until F-35 split them),
+    /// documented as
     /// unconditionally fail-OPEN. That reading holds only while L2 ≥ L3, and
     /// locked decision 17 ships the configuration that inverts it: one hardened
     /// tab (L3 `On`) over an app-wide `Off`. The app-wide answer is `off`, so a
@@ -2089,7 +2215,7 @@ mod tests {
         // Nothing overridden: the app-wide answer is the L2 default, decided at
         // L2. The elevation must not fire on an untouched config.
         assert_eq!(
-            decide(f, Scope::App, &s),
+            decide(f, Scope::UnknownCaller, &s),
             Decision {
                 effective: false,
                 decided_by: DecidedBy::Feature
@@ -2099,7 +2225,7 @@ mod tests {
         // One hardened tab. The identity-less call now resolves ON.
         set_tab_override(&mut s, &id, f, Override::On);
         assert_eq!(
-            decide(f, Scope::App, &s),
+            decide(f, Scope::UnknownCaller, &s),
             Decision {
                 effective: true,
                 decided_by: DecidedBy::Scope
@@ -2116,7 +2242,7 @@ mod tests {
         let mut s = settings();
         set_tab_override(&mut s, &id, Feature::TaintLatch, Override::Off);
         assert_eq!(
-            decide(Feature::TaintLatch, Scope::App, &s),
+            decide(Feature::TaintLatch, Scope::UnknownCaller, &s),
             Decision {
                 effective: true,
                 decided_by: DecidedBy::Feature
@@ -2129,7 +2255,7 @@ mod tests {
         set_tab_override(&mut s, &id, f, Override::On);
         s.set_master_for_test(false);
         assert_eq!(
-            decide(f, Scope::App, &s),
+            decide(f, Scope::UnknownCaller, &s),
             Decision {
                 effective: false,
                 decided_by: DecidedBy::Global
@@ -2154,7 +2280,7 @@ mod tests {
             let mut s = settings();
             s.set_l2_for_test(*feature, false);
             assert!(
-                !effective(*feature, Scope::App, &s),
+                !effective(*feature, Scope::UnknownCaller, &s),
                 "{feature:?} has no tab row, so nothing can elevate it"
             );
         }
@@ -2164,6 +2290,249 @@ mod tests {
         set_tab_override(&mut s, &id, Feature::TaintLatch, Override::On);
         s.set_l2_for_test(Feature::TerminalEscapeHygiene, false);
         assert!(protection_reduced(&s));
+    }
+
+    /// **N-1's exact width, pinned before `Scope::App` was split (F-35,
+    /// locked decision 36).**
+    ///
+    /// The split introduces [`armed_anywhere`], which DOES fold the offload
+    /// worker's row in, a few lines from the elevation that must not. The two
+    /// invariants this locks:
+    ///
+    /// - **only `On` travels up** — an L3 `Off` stays where the user put it, so
+    ///   this can never remove protection, only add it to a caller with no
+    ///   identity;
+    /// - **it never applies to a scope that HAS an answer** — a known tab, or
+    ///   the worker.
+    ///
+    /// Driven with [`Feature::Detection`] deliberately: it is the only kind of
+    /// feature where the tab/worker distinction is observable at all (a tab row
+    /// AND a worker row), and it is F-35's own feature.
+    /// [`an_identity_less_call_honours_any_tabs_scope_on`] uses
+    /// `OpencodeNativeGate` (no worker row) and `Canary` (no tab row), so a
+    /// regression that folded the worker into [`any_tab_override_on`] leaves it
+    /// green. That is the regression this test exists for.
+    ///
+    /// It landed against the pre-split code with `Scope::App` at every scope
+    /// argument, and the split changed **only that token** to
+    /// [`Scope::UnknownCaller`] — diff it that way, because any other edit to it
+    /// during the refactor is the refactor telling you it widened or narrowed
+    /// N-1.
+    #[test]
+    fn n1_carries_an_on_up_from_configured_tabs_only() {
+        let f = Feature::Detection;
+        let id = a_tab(&settings());
+
+        // 1. Untouched: the elevation does not fire on a config nobody
+        //    overrode.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        assert_eq!(
+            decide(f, Scope::UnknownCaller, &s),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Feature
+            },
+            "no override anywhere ⇒ the L2 answer, decided at L2"
+        );
+
+        // 2. Only `On` travels up.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        set_tab_override(&mut s, &id, f, Override::On);
+        assert_eq!(
+            decide(f, Scope::UnknownCaller, &s),
+            Decision {
+                effective: true,
+                decided_by: DecidedBy::Scope
+            },
+            "a call with no identity may be from the hardened tab"
+        );
+
+        // 3. `Off` never travels up — this can add protection, never remove it.
+        let mut s = settings(); // L2 on for Detection by default
+        set_tab_override(&mut s, &id, f, Override::Off);
+        assert_eq!(
+            decide(f, Scope::UnknownCaller, &s),
+            Decision {
+                effective: true,
+                decided_by: DecidedBy::Feature
+            },
+            "an L3 Off stays where the user put it"
+        );
+        assert!(
+            !effective(f, tab_scope(&id), &s),
+            "…and stays in force there"
+        );
+
+        // 4. TABS ONLY. The worker's row must NOT travel up. This is the
+        //    assertion `armed_anywhere` exists to violate deliberately, and
+        //    nothing else may.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        s.set_worker_override_for_test(f, Override::On)
+            .expect("detection has a worker row");
+        assert_eq!(
+            decide(f, Scope::UnknownCaller, &s),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Feature
+            },
+            "the worker always has an identity, so it is never the caller behind an \
+             identity-less call — folding its row in would raise protection for a \
+             population it does not describe"
+        );
+        assert!(
+            effective(f, Scope::OffloadWorker, &s),
+            "…and keeps its own On"
+        );
+
+        // 5. It never reaches a scope that HAS an answer.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        set_tab_override(&mut s, &id, f, Override::On);
+        assert!(effective(f, tab_scope(&id), &s), "the tab that asked for it");
+        assert!(
+            !effective(f, tab_scope("a-tab-that-did-not"), &s),
+            "a known tab keeps L2"
+        );
+        assert!(
+            !effective(f, Scope::OffloadWorker, &s),
+            "the worker keeps its own row"
+        );
+
+        // 6. Per feature, not per tab: one feature's `On` elevates only that
+        //    feature.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        s.set_l2_for_test(Feature::SsrfGuard, false);
+        set_tab_override(&mut s, &id, f, Override::On);
+        assert!(effective(f, Scope::UnknownCaller, &s));
+        assert!(
+            !effective(Feature::SsrfGuard, Scope::UnknownCaller, &s),
+            "a tab hardening one control does not harden the rest"
+        );
+
+        // 7. The MAPPING, not just the variant: a call with no `--tab` — or a
+        //    blank one — lands on the elevating scope, and a real one does not.
+        assert_eq!(Scope::for_tab("claude", None), Scope::UnknownCaller);
+        assert_eq!(Scope::for_tab("claude", Some("   ")), Scope::UnknownCaller);
+        assert_eq!(
+            Scope::for_tab("claude", Some(&id)),
+            Scope::Tab {
+                agent: "claude",
+                tab: &id
+            }
+        );
+
+        // 8. L1 short-circuits the elevation like everything else.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        set_tab_override(&mut s, &id, f, Override::On);
+        s.set_master_for_test(false);
+        assert_eq!(
+            decide(f, Scope::UnknownCaller, &s),
+            Decision {
+                effective: false,
+                decided_by: DecidedBy::Global
+            }
+        );
+    }
+
+    /// **#48 F-35 — `armed_anywhere` is the third question, and it is exactly
+    /// one row wider than N-1.**
+    ///
+    /// It sits beside an elevation that must NOT fold the worker in and
+    /// deliberately does, so the difference is asserted as a difference: the
+    /// same settings, the two predicates, opposite answers. Everything else it
+    /// must keep — L1 short-circuiting, `Off` not travelling up, per-feature
+    /// scoping — is asserted too, because a predicate this permissive is exactly
+    /// the one a future reader will reach for as a gate.
+    #[test]
+    fn armed_anywhere_is_n1_plus_the_worker_row_and_nothing_else() {
+        let f = Feature::Detection;
+        let id = a_tab(&settings());
+
+        // Baseline: on app-wide ⇒ armed, trivially.
+        let s = settings();
+        assert!(armed_anywhere(f, &s));
+
+        // THE DIFFERENCE. Narrowed to the worker: N-1 says no, this says yes,
+        // and F-35 is the gap between those two answers.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        s.set_worker_override_for_test(f, Override::On)
+            .expect("detection has a worker row");
+        assert!(
+            !effective(f, Scope::UnknownCaller, &s),
+            "the identity-less caller is not the worker — N-1 is unchanged"
+        );
+        assert!(!effective(f, Scope::AppWide, &s), "and the baseline is off");
+        assert!(
+            armed_anywhere(f, &s),
+            "but the worker IS scanning, which is the whole of F-35"
+        );
+
+        // A tab's `On` counts as well, through the N-1 half.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        assert!(!armed_anywhere(f, &s), "nobody is armed");
+        set_tab_override(&mut s, &id, f, Override::On);
+        assert!(armed_anywhere(f, &s), "that tab is armed");
+
+        // An `Off` still travels nowhere: one tab opting out does not disarm
+        // the rest, so this can never read as "nobody is scanning" while
+        // somebody is.
+        let mut s = settings();
+        set_tab_override(&mut s, &id, f, Override::Off);
+        s.set_worker_override_for_test(f, Override::Off)
+            .expect("detection has a worker row");
+        assert!(
+            armed_anywhere(f, &s),
+            "L2 is still on, so every other tab is scanning"
+        );
+
+        // L1 closes it everywhere, like everything else built on `decide`.
+        let mut s = settings();
+        s.set_worker_override_for_test(f, Override::On)
+            .expect("detection has a worker row");
+        set_tab_override(&mut s, &id, f, Override::On);
+        s.set_master_for_test(false);
+        for feature in Feature::ALL {
+            assert!(
+                !armed_anywhere(*feature, &s),
+                "{feature:?} — the master switch always wins"
+            );
+        }
+
+        // Per feature, not a blanket "anything is on".
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        s.set_l2_for_test(Feature::SsrfGuard, false);
+        s.set_worker_override_for_test(f, Override::On)
+            .expect("detection has a worker row");
+        assert!(armed_anywhere(f, &s));
+        assert!(
+            !armed_anywhere(Feature::SsrfGuard, &s),
+            "arming one control does not arm the rest"
+        );
+
+        // And the resolved-value form composes the sub-toggle exactly once,
+        // like `detection_config` does for a scope.
+        let mut s = settings();
+        s.set_l2_for_test(f, false);
+        s.set_worker_override_for_test(f, Override::On)
+            .expect("detection has a worker row");
+        assert!(detection_config_anywhere(&s).signature);
+        assert!(
+            !detection_config(&s, Scope::AppWide).signature,
+            "the app-wide reading is still off, and both are available"
+        );
+        s.set_detection_layer_for_test(DetectionLayer::Signature, false);
+        assert!(
+            !detection_config_anywhere(&s).signature,
+            "the per-layer sub-toggle still wins inside an armed surface"
+        );
     }
 
     /// The report is the introspection contract: one row per feature, naming

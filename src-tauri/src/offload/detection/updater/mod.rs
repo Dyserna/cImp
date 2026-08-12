@@ -252,8 +252,25 @@ pub fn manifest_url(s: &Settings) -> String {
 ///
 /// **App scope, not per tab.** There is one bundle on disk for the whole
 /// process; a per-tab detection override changes which tab SCANS with it, not
-/// whether it is worth keeping current. `Scope::App` resolves to L1 ∧ L2, which
-/// is exactly that question.
+/// whether it is worth keeping current.
+///
+/// **⚠ #48 F-35 — that argument describes `Scope::AppWide`, and this site does
+/// not resolve there.** The paragraph above used to end *"`Scope::App` resolves
+/// to L1 ∧ L2, which is exactly that question"*, and **that has been false since
+/// N-1**: the old `Scope::App` also honoured an L3 `On` stated by any configured
+/// AI tab, so a single tab-scope `On` over an app-wide `Off` really does start
+/// the updater. Locked decision 36 split the variant in two and this site kept
+/// the behaviour it had, under the name that now describes it —
+/// [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller).
+///
+/// The name is deliberately the visibly odd one: there is no unknown caller
+/// here, so it reads as a question nobody has answered, which is exactly what it
+/// is. Whether the updater should follow the app-wide baseline
+/// (`Scope::AppWide`, so one hardened tab stops starting it) or the
+/// armed-anywhere predicate (which M-21 explicitly rejected, `worker_only_detection`
+/// below) is a **behaviour** decision with a live-verify box attached, raised as
+/// **F-38** rather than folded into a rename that changes nothing. Until it is
+/// taken, this stays exactly as it has behaved since N-1.
 ///
 /// Read per call, never cached: a flip takes effect on the next tick or the
 /// next click, so this is not spawn-baked and owes no `spawn_inject_sig` entry.
@@ -266,7 +283,7 @@ pub fn manifest_url(s: &Settings) -> String {
 pub fn updates_enabled(s: &Settings) -> bool {
     crate::settings::injection::effective(
         crate::settings::injection::Feature::Detection,
-        crate::settings::injection::Scope::App,
+        crate::settings::injection::Scope::UnknownCaller,
         s,
     )
 }
@@ -277,13 +294,26 @@ pub fn updates_enabled(s: &Settings) -> bool {
 ///
 /// # Why this state exists, and why the resolution above is still right
 ///
-/// [`updates_enabled`] resolves at [`Scope::App`](crate::settings::injection::Scope::App),
+/// [`updates_enabled`] resolves at
+/// [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller),
 /// which folds in L1 and L2 and — since N-1 — an L3 `On` stated by any configured
 /// AI tab, but **deliberately not** the `offload-worker` row: `any_tab_override_on`
 /// is *"tabs only, deliberately"*, because that elevation exists for a call that
 /// arrived with no tab identity, and the worker is never that caller (it always
 /// resolves through `Scope::OffloadWorker`). That argument is sound for what it
 /// was written for and this function does not disturb it.
+///
+/// **#48 F-35 — this asymmetry is a CONTRACT, not an accident, and the split
+/// preserved it on purpose.** These two functions answer two different
+/// questions, and the frontend renders a distinct sentence for the worker-only
+/// case gated on the published `worker_only_detection`, which is only ever
+/// `true` while `updates_enabled` is `false`. Folding the offload-worker row
+/// into `updates_enabled` — by repointing it at
+/// [`armed_anywhere`](crate::settings::injection::armed_anywhere), which does
+/// fold it in — would make `worker_only_detection` permanently `false` and kill
+/// that branch while it still looks reachable in the Svelte source. If F-38 ever
+/// moves `updates_enabled`, the frontend branch moves in the same change or it
+/// is deleted; it may not be orphaned.
 ///
 /// What went wrong was not the resolution but the **claim made about it**. A
 /// worker-only override leaves the whole updater surface off — the scheduler
@@ -1023,19 +1053,32 @@ pub struct BrokenLocalRules {
 /// to compile, or any of them live under a renamed identifier.
 ///
 /// `None` in every healthy or irrelevant case: the layer is switched off (the
-/// switch is resolved through [`super::Config::from_settings`], the same call
+/// switch is resolved through [`super::Config::armed_anywhere`], the same call
 /// [`super::signature::advisor_signal`] uses, so the L1 master and the per-layer
 /// toggle compose exactly once and never as a second opinion), the whole set
 /// compiles with no collisions, or the failure is in a BUNDLE file — that is the
 /// updater's problem and already has three cards; this one is about the files
 /// only the user can change.
 ///
+/// **"Switched off" means armed in NO scope** (#48, F-35, locked decision 36),
+/// not "off app-wide". It resolved at `Scope::App` until the split, and a user
+/// who narrowed detection to the offload worker — L2 `off`,
+/// `worker.detection = on`, the supported state M-21 documents — got `None` here
+/// while the worker kept screening with those very files. Their own file failing
+/// to compile has no other user-facing trace: `signature::reload` keeps the old
+/// set live and warns to a log nobody has open. This card is where they find
+/// out.
+///
+/// This does **not** move [`updates_enabled`], which is still app-scoped: naming
+/// a broken file of the user's is reporting, starting a network updater is a
+/// capability, and only the first one widened.
+///
 /// It also stays quiet when the layer is disarmed, because
 /// `detection.signature_down.v1` is already saying something louder and more
 /// urgent about the same directory, and two cards about one folder is how a
 /// user learns to dismiss both.
 pub fn broken_local_rules(s: &Settings) -> Option<BrokenLocalRules> {
-    if !super::Config::from_settings(s, crate::settings::injection::Scope::App).signature {
+    if !super::Config::armed_anywhere(s).signature {
         return None;
     }
     from_status(super::signature::status())

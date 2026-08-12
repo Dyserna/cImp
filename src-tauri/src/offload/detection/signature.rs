@@ -961,16 +961,25 @@ pub struct SignatureDown {
 ///
 /// `None` — no card — in the two healthy cases and one deliberate one:
 /// the layer is armed, or the user switched it off. The switch is resolved
-/// through [`Config::from_settings`](super::Config::from_settings) at the app
-/// scope, never a raw settings field (decision 16 / #44), so the parent
-/// `Feature::Detection` and the per-layer sub-toggle compose exactly once.
+/// through [`Config::armed_anywhere`](super::Config::armed_anywhere), never a
+/// raw settings field (decision 16 / #44), so the parent `Feature::Detection`
+/// and the per-layer sub-toggle compose exactly once.
+///
+/// **Armed ANYWHERE, not app-wide** (#48, F-35, locked decision 36). This
+/// resolved at `Scope::App` until the split, which meant a user who narrowed
+/// detection to the offload worker — L2 `off`, `worker.detection = on`, a
+/// supported state M-21 documents — was told nothing about a rule directory the
+/// worker was still scanning every fetched page with. There is one
+/// `rules.d/local/` on disk for the whole process, so "is this layer armed
+/// somewhere" is the question this card actually asks. It is still reporting
+/// only: nothing here admits an update or opens a gate.
 ///
 /// The predicate is `!armed`, i.e. `files_loaded == 0 || rules == 0` — a
 /// *partially* broken bundle is degraded but still matching and is reported by
 /// the Settings dot, not by a card. Nothing here is a proposal: the fix is a
 /// file on disk, so the rule is warn-only.
 pub fn advisor_signal(s: &crate::settings::Settings) -> Option<SignatureDown> {
-    if !super::Config::from_settings(s, crate::settings::injection::Scope::App).signature {
+    if !super::Config::armed_anywhere(s).signature {
         return None;
     }
     let st = status();
@@ -2462,6 +2471,76 @@ anything automatically.\n";
         // that compiled to nothing can never look healthy because old rules
         // survived it.
         assert!(super::super::updater::health_from_rules(&reported, &empty).is_err());
+
+        std::fs::remove_dir_all(&empty).ok();
+        reload();
+    }
+
+    /// **#48 F-35 — `advisor_signal`'s gate is "armed anywhere", not
+    /// "armed app-wide".**
+    ///
+    /// A user who narrows detection to the offload worker — L2 `off`,
+    /// `worker.detection = on`, the state M-21 documents as supported — has a
+    /// worker screening every fetched page with a rule directory this card
+    /// describes. Gating on the app-wide answer returned `None` and told them
+    /// nothing.
+    ///
+    /// Driven against the real process-wide slot, under [`test_lock`] and with
+    /// [`reload`] restoring it, in the same shape as
+    /// [`a_reload_that_compiles_to_nothing_keeps_the_previous_rules_live`]:
+    /// this function has no `from_status` half to drive purely, so the slot has
+    /// to be put into the "not armed" state the card exists for.
+    #[test]
+    fn the_signature_down_card_follows_the_layer_wherever_it_is_armed() {
+        use crate::settings::injection::{Feature, Override};
+        let _g = test_lock().lock().unwrap_or_else(PoisonError::into_inner);
+
+        // Arrange the slot into the state the card reports on: a directory that
+        // compiled to nothing, so `status().armed` is false.
+        let empty = std::env::temp_dir().join(format!("cimp-sig-f35-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let (rules, st) = compile_report(Some(&empty));
+        assert!(!st.armed, "the fixture must be a disarmed layer");
+        install(rules, st);
+        assert!(!status().armed, "…and that is what the slot holds");
+
+        // On by default ⇒ the card fires. This is the control: it proves the
+        // slot is arranged so the gate is the only thing under test below.
+        let mut s = crate::settings::Settings::default();
+        assert!(
+            advisor_signal(&s).is_some(),
+            "the layer is on and has nothing to match with"
+        );
+
+        // Off everywhere ⇒ silent, unchanged by F-35.
+        s.set_l2_for_test(Feature::Detection, false);
+        assert!(
+            advisor_signal(&s).is_none(),
+            "the user switched the layer off; this card is not the place to argue"
+        );
+
+        // THE CHANGE. Narrowed to the worker: the worker is scanning with this
+        // directory, so the card must fire. Before F-35 this returned `None`.
+        s.set_worker_override_for_test(Feature::Detection, Override::On)
+            .expect("detection has a worker row");
+        assert!(
+            advisor_signal(&s).is_some(),
+            "the offload worker is screening with these very rules"
+        );
+
+        // The per-layer sub-toggle still wins inside an armed surface, and
+        // still composes exactly once.
+        s.set_detection_layer_for_test(
+            crate::settings::injection::DetectionLayer::Signature,
+            false,
+        );
+        assert!(advisor_signal(&s).is_none(), "the signature layer is off");
+        s.set_detection_layer_for_test(crate::settings::injection::DetectionLayer::Signature, true);
+
+        // And the master switch still closes it, everywhere: reporting honesty
+        // never outranks L1.
+        s.set_master_for_test(false);
+        assert!(advisor_signal(&s).is_none(), "nothing runs past an L1 off");
 
         std::fs::remove_dir_all(&empty).ok();
         reload();

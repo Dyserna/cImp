@@ -579,8 +579,14 @@ pub async fn handle_call(
     //
     // V32 Phase G: the recall envelope, unlike the latch, needs no registry —
     // only settings, which this path already read. It therefore resolves for
-    // real, at `Scope::App` (there is no tab identity here to key an override
-    // on), so the master switch reaches the headless path too.
+    // real, at `Scope::UnknownCaller` (there is no tab identity here to key an
+    // override on), so the master switch reaches the headless path too.
+    //
+    // #48 F-35: that scope was called `Scope::App` until locked decision 36
+    // split it. The name is the only thing that moved — this is the
+    // identity-less reading, and it always was: the child serves SOME tab, it
+    // just could not say which, so an L3 `On` from any configured tab is
+    // honoured here (N-1).
     let result = dispatch_recorded(
         &root,
         &idx,
@@ -593,7 +599,7 @@ pub async fn handle_call(
             taint: WriteTaint::Clean,
             spotlight_recall: crate::settings::injection::effective(
                 crate::settings::injection::Feature::Spotlighting,
-                crate::settings::injection::Scope::App,
+                crate::settings::injection::Scope::UnknownCaller,
                 &settings,
             ),
         },
@@ -4349,6 +4355,7 @@ mod surface_tests {
 #[cfg(test)]
 mod memory_write_boundary_tests {
     use super::*;
+    use crate::graph::memory::QuarantineReview;
     use crate::graph::secrets::test_screened as screened;
     use crate::graph::GraphIndex;
     use crate::offload::toolclass::WriteTaint;
@@ -4499,7 +4506,7 @@ mod memory_write_boundary_tests {
             "a held note must not reach a recall path"
         );
         // …but recoverable: it is in the review queue, with its text intact.
-        let held = idx.mem_quarantined_notes().expect("review queue");
+        let held = idx.mem_quarantined_notes(QuarantineReview::for_test()).expect("review queue");
         assert_eq!(held.len(), 1);
         assert!(
             held[0].text.contains("AKIAIOSFODNN7EXAMPLE"),
@@ -4670,7 +4677,7 @@ mod memory_write_boundary_tests {
         // Held, on the same shelf, recoverable the same way.
         assert!(idx.mem_notes("s1").expect("read").is_empty());
         assert_eq!(idx.mem_quarantined_count().expect("count"), 1);
-        let held = idx.mem_quarantined_notes().expect("queue");
+        let held = idx.mem_quarantined_notes(QuarantineReview::for_test()).expect("queue");
         assert_eq!(held.len(), 1);
         idx.mem_promote_note(&held[0].note_id).expect("promote");
         assert_eq!(idx.mem_notes("s1").expect("read").len(), 1);

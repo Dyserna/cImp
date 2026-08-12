@@ -952,6 +952,65 @@ fn a_worker_only_detection_override_is_reported_as_a_running_layer() {
     assert!(updates_enabled(&on) && !worker_only_detection(&on));
 }
 
+/// **#48 F-35 — the user's own broken rules are reported when the layer is
+/// armed ANYWHERE, not only app-wide.**
+///
+/// `worker.detection = on` over an app-wide `off` is a supported state (M-21):
+/// the worker keeps screening every fetched page with `rules.d/local/`, so a
+/// file of the user's that does not compile is silently not protecting them —
+/// `signature::reload` keeps the old set live and warns to a log nobody has
+/// open. Gating this signal on the app-wide answer told that user **nothing**.
+///
+/// Asserted on the GATE rather than through `broken_local_rules` itself, which
+/// reads the process-wide signature status this suite must not disturb (the
+/// same reason `from_status` exists — see
+/// [`a_collided_user_rule_is_reported_by_the_broken_local_rules_signal`]). The
+/// gate is the whole of the change; `from_status` past it is untouched.
+#[test]
+fn a_worker_only_detection_override_still_reports_the_users_broken_rules() {
+    use crate::settings::injection::{armed_anywhere, Feature, Override};
+    let mut s = crate::settings::Settings::default();
+
+    // Baseline: armed app-wide ⇒ the layer resolves on for the signal's gate.
+    assert!(armed_anywhere(Feature::Detection, &s));
+    assert!(crate::offload::detection::Config::armed_anywhere(&s).signature);
+
+    // Narrowed to the worker: the updater stays inert (M-21, unchanged) …
+    s.set_l2_for_test(Feature::Detection, false);
+    s.set_worker_override_for_test(Feature::Detection, Override::On)
+        .expect("detection has a worker row");
+    assert!(
+        !updates_enabled(&s),
+        "the updater is app-scoped, as decided (M-21)"
+    );
+    assert!(
+        worker_only_detection(&s),
+        "and this is exactly M-21's state"
+    );
+
+    // … but the layer IS armed, so the signal's gate must be open. Before F-35
+    // this was the app-wide answer and both signals returned `None`.
+    assert!(
+        armed_anywhere(Feature::Detection, &s),
+        "the worker is scanning with these very rules"
+    );
+    assert!(crate::offload::detection::Config::armed_anywhere(&s).signature);
+
+    // The per-layer sub-toggle still composes exactly once, and still wins.
+    s.set_detection_layer_for_test(
+        crate::settings::injection::DetectionLayer::Signature,
+        false,
+    );
+    assert!(!crate::offload::detection::Config::armed_anywhere(&s).signature);
+    s.set_detection_layer_for_test(crate::settings::injection::DetectionLayer::Signature, true);
+
+    // L1 still closes it, everywhere — reporting honesty never outranks the
+    // master switch.
+    s.set_master_for_test(false);
+    assert!(!armed_anywhere(Feature::Detection, &s));
+    assert!(!crate::offload::detection::Config::armed_anywhere(&s).signature);
+}
+
 // ── The scheduler's policy (previously untested — review U/notes) ──────────
 
 /// `is_due` IS the scheduler's policy; the 15-minute loop is only its clock.

@@ -661,7 +661,14 @@ impl Latch {
 }
 
 /// Refusal served when LOCAL-CAPABILITY is blocked (the task went EXTERNAL
-/// first). One of the two per-direction constants required by locked decision 2.
+/// first). One of the **three** per-direction constants required by locked
+/// decision 2 as amended by locked decision 34 (#48, F-34).
+///
+/// It was two until 2026-08-12. The third is [`REFUSAL_EXTERNAL_USER_LOCAL`],
+/// which splits the `Latch::Local` direction by *why* the latch is there — the
+/// same split F-23 made on the native route. Nothing about THIS constant's
+/// direction changed: an EXTERNAL latch has exactly one cause, an admitted
+/// external call, so there is nothing here to disambiguate.
 pub const REFUSAL_LOCAL_BLOCKED: &str = "REFUSED (security boundary): this task has already used \
     an external tool (web/MCP-server), so local-capability tools — file reads, directory listings, \
     code search, command execution, and source-text graph lookups — are unavailable for the \
@@ -669,13 +676,65 @@ pub const REFUSAL_LOCAL_BLOCKED: &str = "REFUSED (security boundary): this task 
     enforced outside the model. Continue with the tools you still have, or answer with what you \
     have gathered.";
 
-/// Refusal served when EXTERNAL is blocked (the task went local first).
+/// Refusal served when EXTERNAL is blocked **and the task went local first** —
+/// that is, a local-capability tool call earned the latch.
+///
+/// Since #48 (F-34) this states a cause the gate has *checked*, because the
+/// other cause of a `Local` latch now has its own constant:
+/// [`REFUSAL_EXTERNAL_USER_LOCAL`]. Selecting between them is
+/// `LatchRegistry::gate`'s job and **never** [`Latch::refusal`]'s — see that
+/// constant's docs for why the placement is load-bearing.
 pub const REFUSAL_EXTERNAL_BLOCKED: &str = "REFUSED (security boundary): this task has already \
     used a local-capability tool (file read, directory listing, code search, command execution, or \
     a source-text graph lookup), so external tools — web search/fetch and every other MCP-server \
     tool — are unavailable for the remainder of this task. This cannot be unlocked, re-asked for, \
     or worked around; it is enforced outside the model. Continue with the tools you still have, or \
     answer with what you have gathered.";
+
+/// #48 (F-34) — EXTERNAL is blocked because the **user** restored this task's
+/// local capability, not because a local-capability tool call earned the latch.
+/// The third per-direction constant, and the amendment to locked decision 2 that
+/// locked decision 34 records.
+///
+/// # The defect this exists to close
+///
+/// [`REFUSAL_EXTERNAL_BLOCKED`] names a cause — *"this task has already used a
+/// local-capability tool"* — and after a user's decision-15 workflow flip
+/// (`LatchOverride::FlipLocal`) that cause **did not happen**: nothing the model
+/// called moved the latch, a human clicked. Served live, that string made a tab's
+/// model tell its user which tool had latched the session, naming one that never
+/// ran. A refusal that states a cause it did not check is a confident, wrong
+/// causal story about a security event, and a standing instruction a model can
+/// catch out is one it learns to discount.
+///
+/// This is F-23's **proxied twin**, and the live half of it: F-23's native fix
+/// sits inside the Phase H OpenCode gate, which ships off (locked decision 35),
+/// while this route is on by default.
+///
+/// # Where it is selected, and why not here
+///
+/// **In [`LatchRegistry::gate`](crate::offload::loopback::LatchRegistry), which
+/// holds `TabLatch::local_by_user_flip` — and NEVER inside [`Latch::refusal`].**
+/// `Latch::refusal` is a pure function over [`Latch`] that the **offload worker**
+/// also calls (`offload::agent`), and the worker has no user-flip concept to
+/// thread; pushing the choice down there would either break it or force it to
+/// pass a meaningless `false` forever. The rule is a convention rather than a
+/// type, so it is guarded by the tripwire
+/// `the_user_flip_constant_is_never_reachable_from_the_pure_latch_functions`
+/// below.
+///
+/// Same posture as its siblings: fixed text, no templating, identical
+/// vocabulary, and **deliberately silent about the user's own controls** — it
+/// states what the user's decision *did* and nothing about how to obtain
+/// anything, because a refusal that names the human's escape hatch is a refusal
+/// that teaches an injected page to ask for it.
+pub const REFUSAL_EXTERNAL_USER_LOCAL: &str = "REFUSED (security boundary): the user restored \
+    this task's local capability, which closed its external side in the same move, so external \
+    tools — web search/fetch and every other MCP-server tool — are unavailable for the remainder \
+    of this task. No tool call of yours caused this and none can undo it: the decision was taken \
+    outside the conversation. This cannot be unlocked, re-asked for, or worked around; it is \
+    enforced outside the model. Continue with the tools you still have, or answer with what you \
+    have gathered.";
 
 /// Refusal served when a persistent (memory) write is attempted under an
 /// EXTERNAL latch.
@@ -1229,9 +1288,94 @@ mod tests {
             REFUSAL_LOCAL_BLOCKED,
             REFUSAL_EXTERNAL_BLOCKED,
             REFUSAL_WRITE_BLOCKED,
+            REFUSAL_EXTERNAL_USER_LOCAL,
         ] {
             assert!(!s.contains('{'), "refusal must be a fixed string: {s}");
         }
+    }
+
+    /// **#48 (F-34): the third per-direction constant states its OWN cause, and
+    /// is unreachable from the pure latch functions.**
+    ///
+    /// Two rules, and the second is the tripwire locked decision 34 asks for.
+    ///
+    /// 1. *Its own cause and no sibling's.* Reusing a sibling's text is exactly
+    ///    the defect F-13 avoided and F-23/F-34 named; the table IS the
+    ///    assertion.
+    /// 2. *Selected in `LatchRegistry::gate`, never here.* `refusal` and
+    ///    `proxy_gate` are pure over [`Latch`] and the offload **worker** shares
+    ///    them, so they cannot know whether a human moved the latch. If a future
+    ///    refactor migrates the choice down into them — the obvious "tidy-up" —
+    ///    this fails rather than shipping a worker that claims a user clicked
+    ///    something in a process that has no user.
+    #[test]
+    fn the_user_flip_constant_is_never_reachable_from_the_pure_latch_functions() {
+        // 1. Four proxied-family refusals, four causes, no borrowing.
+        let causes = [
+            (REFUSAL_LOCAL_BLOCKED, "already used an external tool"),
+            (
+                REFUSAL_EXTERNAL_BLOCKED,
+                "already used a local-capability tool",
+            ),
+            (REFUSAL_WRITE_BLOCKED, "may not write persistent memory"),
+            (REFUSAL_EXTERNAL_USER_LOCAL, "the user restored"),
+        ];
+        for (refusal, own) in causes {
+            assert!(
+                refusal.starts_with("REFUSED (security boundary):")
+                    && refusal.contains("enforced outside the model"),
+                "{refusal}"
+            );
+            for (_, other) in causes {
+                assert_eq!(
+                    refusal.contains(other),
+                    other == own,
+                    "a refusal must state its OWN cause and no sibling's: {refusal}",
+                );
+            }
+        }
+        // …and it must not name the control that produced it (locked decision 2's
+        // "no escape hatch" posture): the user's own button by name, or the tab
+        // UI it lives in, would be a refusal teaching an injected page what to
+        // ask for.
+        for banned in ["flip_local", "Switch to local", "unlatch", "override"] {
+            assert!(
+                !REFUSAL_EXTERNAL_USER_LOCAL.contains(banned),
+                "the refusal must name no control: {banned}",
+            );
+        }
+
+        // 2. The tripwire. No latch position and no class may produce it here.
+        for latch in [Latch::Open, Latch::External, Latch::Local] {
+            for class in [
+                ToolClass::External,
+                ToolClass::LocalCapability,
+                ToolClass::PersistentWrite,
+                ToolClass::Trusted,
+            ] {
+                assert_ne!(
+                    latch.refusal(class),
+                    Some(REFUSAL_EXTERNAL_USER_LOCAL),
+                    "F-34's constant is chosen in LatchRegistry::gate, which holds \
+                     TabLatch::local_by_user_flip — never in Latch::refusal, which the \
+                     offload worker shares and which has no user-flip concept ({latch:?}, \
+                     {class:?})",
+                );
+                assert_ne!(
+                    latch.proxy_gate(class),
+                    ProxyGate::Refuse(REFUSAL_EXTERNAL_USER_LOCAL),
+                    "…nor in Latch::proxy_gate, which is `refusal` plus the write \
+                     quarantine and equally pure ({latch:?}, {class:?})",
+                );
+            }
+        }
+        // The pure function's answer for the direction F-34 splits is unchanged —
+        // the OLD constant, which is still the true statement for a latch a tool
+        // call earned. Only `gate` may swap it, and only on the recorded flip.
+        assert_eq!(
+            Latch::Local.refusal(ToolClass::External),
+            Some(REFUSAL_EXTERNAL_BLOCKED)
+        );
     }
 
     /// V32 Phase C2: the proxy gate quarantines a PERSISTENT-WRITE where the

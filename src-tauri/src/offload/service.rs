@@ -52,8 +52,9 @@ use super::Backend;
 /// V32 Phase G: the offload worker's injection scope (locked decision 16's
 /// `offload-worker` pseudo-scope). A const so every worker-side resolution names
 /// the same scope — the worker is a task-scoped service with no tab, and a
-/// resolution that reached for `Scope::App` instead would silently ignore the
-/// worker's own override row.
+/// resolution that reached for either app-level scope instead
+/// (`Scope::AppWide`, `Scope::UnknownCaller`) would silently ignore the worker's
+/// own override row.
 const WORKER: crate::settings::injection::Scope<'static> =
     crate::settings::injection::Scope::OffloadWorker;
 
@@ -903,9 +904,9 @@ impl OffloadService {
     /// which is what turns `scope`'s human label into a resolvable
     /// [`Scope`](crate::settings::injection::Scope) for the SSRF guard's
     /// three-level switch. Without it the call resolves at
-    /// [`Scope::App`](crate::settings::injection::Scope::App) — the app-wide
-    /// answer, the same fail-open shape the latch takes for an identity-less
-    /// call.
+    /// [`Scope::UnknownCaller`](crate::settings::injection::Scope::UnknownCaller)
+    /// — the app-wide answer plus any configured tab's L3 `On`, the same
+    /// fail-open shape the latch takes for an identity-less call.
     ///
     /// #48: `audit` is the calling tab session's claim ledger, threaded from
     /// the loopback handler (which owns the registry the ledger lives in) to
@@ -930,7 +931,11 @@ impl OffloadService {
     /// #48 F-20: `tab_attr` is a SECOND, differently-typed reading of the same
     /// fact as `tab`, and the two are deliberately not merged. `tab` answers
     /// "which scope do the injection features resolve at", where an unrecognized
-    /// id and no id both correctly mean `Scope::App`. `tab_attr` answers "which
+    /// id and no id both correctly mean `Scope::UnknownCaller` — the scope whose
+    /// whole definition is "a real tab we cannot name" (#48 F-35; it was called
+    /// `Scope::App` when this sentence was written, and this site is the
+    /// clearest statement of that question anywhere in the tree). `tab_attr`
+    /// answers "which
     /// tab does this row belong to", where those two cases MUST stay distinct
     /// (`Unrecognized` vs `Headless`). Collapsing them is the defect F-20 filed.
     ///

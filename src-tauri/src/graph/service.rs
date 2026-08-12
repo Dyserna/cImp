@@ -2044,27 +2044,17 @@ impl GraphService {
                 sessions: Vec::new(),
             };
         };
-        let current = idx.mem_current_session().ok().flatten();
-        let working_set = current
-            .as_deref()
-            .map(|s| idx.mem_working_set(s, 50).unwrap_or_default())
-            .unwrap_or_default();
-        // With a current session, notes = its notes + pinned; without, just
-        // pinned. Quarantined notes are NOT among them (`mem_notes` filters them
-        // at the storage layer) — they come back separately below, project-wide,
-        // because the Memory UI is the only reader allowed to see them.
-        let notes = idx
-            .mem_notes(current.as_deref().unwrap_or(""))
-            .unwrap_or_default();
-        let quarantined = idx.mem_quarantined_notes().unwrap_or_default();
-        let sessions = idx.mem_sessions().unwrap_or_default();
-        MemorySnapshot {
-            current_session: current,
-            working_set,
-            notes,
-            quarantined,
-            sessions,
-        }
+        // #48, locked decision 38 — the assembly moved to `MemorySnapshot::assemble`.
+        //
+        // What stood here was the comment *"they come back separately below,
+        // project-wide, because the Memory UI is the only reader allowed to see
+        // them"* — three lines of prose that were the entire bound on who may
+        // read held note text, credential values included. The rule now lives in
+        // the accessor's signature: reading quarantined rows needs a
+        // `QuarantineReview`, whose only production constructor is private to
+        // `graph::memory` and is called from `assemble` and nowhere else. This
+        // function cannot mint one, which is the point — it delegates instead.
+        MemorySnapshot::assemble(&idx)
     }
 
     /// V32 Phase C2: release a quarantined note into normal memory (its pinned
@@ -2605,12 +2595,21 @@ impl GraphService {
         // memory-replay path and had no envelope. Resolved HERE rather than
         // threaded from the caller because the caller is the loopback's
         // `POST /context/compaction` route, whose body carries a `cwd` and a
-        // `session_id` and no tab identity at all — so `Scope::App` is not a
-        // fallback, it is the only scope that exists on this route. The same
-        // choice, for the same reason, as the headless MCP child's.
+        // `session_id` and no tab identity at all — so `Scope::UnknownCaller` is
+        // not a fallback, it is the only scope that exists on this route. The
+        // same choice, for the same reason, as the headless MCP child's.
+        //
+        // #48 F-35: named `Scope::App` until locked decision 36 split that
+        // variant; behaviour is unchanged, and this site was always asking the
+        // identity-less question rather than the app-wide-baseline one. **Open,
+        // deliberately not decided here:** the route DOES carry a `session_id`,
+        // and V34's `--session-id` pinning means a session can in principle be
+        // resolved to a tab through the live-session registry — which would make
+        // this a real `Scope::Tab` rather than an unknown caller. Raised, not
+        // taken, because it is a behaviour change and this commit has none.
         let spotlight = crate::settings::injection::effective(
             crate::settings::injection::Feature::Spotlighting,
-            crate::settings::injection::Scope::App,
+            crate::settings::injection::Scope::UnknownCaller,
             &self.settings.current(),
         );
         let block = super::context::compaction_block(&idx, session_id, spotlight);

@@ -8,8 +8,11 @@
 //! live on [`super::index::GraphIndex`]; these are the plain, serializable
 //! shapes returned to the service / IPC layer.
 
+use std::marker::PhantomData;
+
 use serde::{Deserialize, Serialize};
 
+use super::index::GraphIndex;
 use crate::offload::outbound::Screen;
 use crate::offload::toolclass::WriteTaint;
 
@@ -204,9 +207,141 @@ pub struct MemorySnapshot {
     /// the review queue must not hide a note behind "which session is current".
     /// This is the ONE read path a tainted note is allowed to reach, and its
     /// consumer is the Memory UI's promote-or-discard affordance.
+    ///
+    /// #48, locked decision 38: *"the ONE read path"* is now a fact about the
+    /// code rather than a sentence about it — [`Self::assemble`] is the only
+    /// place a [`QuarantineReview`] is minted, and the accessor that fills this
+    /// field takes one.
     pub quarantined: Vec<MemNote>,
     /// All known sessions, newest activity first.
     pub sessions: Vec<SessionInfo>,
+}
+
+/// #48, locked decision 38 — the capability that admits a caller to the **held**
+/// notes, in place of a comment that claimed the same thing.
+///
+/// # The finding
+///
+/// [`GraphIndex::mem_quarantined_notes`] returns **tainted** rows: the text a
+/// contaminated session wrote, including the credential values the write-time
+/// screen caught. It was `pub`, took no argument, and had exactly one production
+/// caller — so the whole bound on who may read held secret values was three lines
+/// of prose above that call site (*"the Memory UI is the only reader allowed to
+/// see them"*). Locked decision 10's note-query scan cannot cover this: it guards
+/// a query's **location, not its filter**, and it reads datalog rather than
+/// method calls, so a second caller of the accessor would pass every guard with
+/// the suite green. Sixth instance of this codebase's signature defect — a
+/// comment standing in for a check.
+///
+/// # The shape, and why it mirrors F-15
+///
+/// Same discipline as [`ScreenedNote`](super::secrets::ScreenedNote), which
+/// closed the matching **write** side: *made unrepresentable, not detected*.
+/// There is deliberately **no `pub fn new()`** — F-15's lesson is that the
+/// constructor *is* the guard. The token is minted by exactly one private line,
+/// inside [`MemorySnapshot::assemble`], the readout the Memory UI consumes.
+///
+/// Two independent bounds, not one:
+///
+/// 1. The field is private, so the token can be built **only inside this
+///    module** — no other file in `graph::` can write the literal.
+/// 2. `graph::memory` is a private module and this type is deliberately **not**
+///    re-exported from `graph::mod`, so outside `crate::graph` the type cannot
+///    even be *named*, which makes the accessor uncallable there regardless of
+///    intent.
+///
+/// Neither `Clone` nor `Copy`, and taken **by value**: a token cannot be stashed
+/// and re-used for a second read, so every held-note read traces back to a mint.
+///
+/// # What a future consumer must do
+///
+/// The review recorded an open question — *is the authorized consumer
+/// `memory_snapshot` today, an IPC command tomorrow, an export later?* It does
+/// not need answering in advance. Tomorrow's consumer adds a second minting site
+/// **here**, in the module that owns the rule, which is exactly the code-review
+/// moment we want when someone starts routing held credential text somewhere new.
+/// What it must not do is add a `pub fn new()`; that would restore the status quo
+/// this closed, with an extra argument.
+///
+/// # Deliberately NOT applied to [`GraphIndex::mem_quarantined_count`]
+///
+/// The count has a production caller in the **model-facing** `context_notes`
+/// footer, and that is by design (locked decision 22): the model is told *that*
+/// its write landed in review, never the withheld text. Threading this token
+/// through it would put a `QuarantineReview` in the hands of the one caller class
+/// the capability exists to exclude — the token would then be constructible from
+/// the model-facing path, which is strictly worse than not having it. A count is
+/// not tainted text; the accessor that returns text is the one that is bounded.
+#[derive(Debug)]
+pub struct QuarantineReview {
+    /// The seal. Private, so the struct literal is unwritable outside this
+    /// module; [`PhantomData`] rather than `()` so it is a field nothing is
+    /// tempted to read, rather than a value with a use.
+    seal: PhantomData<()>,
+}
+
+impl QuarantineReview {
+    /// The **only** production constructor, private to this module and called
+    /// from exactly one place ([`MemorySnapshot::assemble`]).
+    ///
+    /// Not `pub`, not `pub(super)`, not `pub(crate)` — see the type's docs. The
+    /// name is the audit trail: a `grep` for it lands on every authorized
+    /// consumer there is.
+    fn for_memory_snapshot() -> Self {
+        QuarantineReview { seal: PhantomData }
+    }
+
+    /// A token for the store's own tests.
+    ///
+    /// `#[cfg(test)]` on purpose, exactly as F-15 did for
+    /// [`test_screened`](super::secrets::test_screened): the whole point is that
+    /// production code cannot obtain one without going through the authorized
+    /// path, and a convenience constructor compiled into the binary would be the
+    /// escape hatch this finding is about.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        QuarantineReview { seal: PhantomData }
+    }
+}
+
+impl MemorySnapshot {
+    /// Assemble the full memory readout for one project's index.
+    ///
+    /// #48, locked decision 38 — **this lives here, and not in
+    /// `GraphService::memory_snapshot`, because this is where the
+    /// [`QuarantineReview`] token is minted.** Moving the assembly next to the
+    /// capability is what lets the capability be private: the authorized
+    /// consumer and the constructor that authorizes it are the same few lines,
+    /// and `service.rs` (6,500 lines) is not a place a private constructor would
+    /// bound anything.
+    ///
+    /// With a current session, `notes` = its notes + pinned; without, just
+    /// pinned. Quarantined notes are NOT among them — [`GraphIndex::mem_notes`]
+    /// filters them at the storage layer — they come back separately, project-
+    /// wide, in [`Self::quarantined`].
+    pub(super) fn assemble(idx: &GraphIndex) -> Self {
+        let current = idx.mem_current_session().ok().flatten();
+        let working_set = current
+            .as_deref()
+            .map(|s| idx.mem_working_set(s, 50).unwrap_or_default())
+            .unwrap_or_default();
+        let notes = idx
+            .mem_notes(current.as_deref().unwrap_or(""))
+            .unwrap_or_default();
+        // The one mint. Everything the comment above the old call site claimed is
+        // now carried by this line's existence and by there being no other.
+        let quarantined = idx
+            .mem_quarantined_notes(QuarantineReview::for_memory_snapshot())
+            .unwrap_or_default();
+        let sessions = idx.mem_sessions().unwrap_or_default();
+        MemorySnapshot {
+            current_session: current,
+            working_set,
+            notes,
+            quarantined,
+            sessions,
+        }
+    }
 }
 
 // ── V12 Phase E: memory distillation (durable project facts) ─────────────

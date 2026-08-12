@@ -468,12 +468,13 @@ fn trim_trailing_punctuation(run: &str) -> &str {
 /// resolve them happily.
 ///
 /// The plausibility rules in [`is_plausible_authority`] are what keeps this from
-/// refusing prose: a bare run needs an explicit port **or** a path, and an
-/// all-numeric host must be a full four-octet IPv4 literal. Without the first
-/// rule, `"the meeting at 12:30"` becomes `http://12:30/`, whose WHATWG host is
-/// `0.0.0.12` — inside `0.0.0.0/8`, and therefore a refusal served for a
-/// sentence about a meeting; without the second, `"upgraded to 10.0.0.1"` is a
-/// refusal served for a build number.
+/// refusing prose: a bare run needs an explicit port **or** a path, and a
+/// numeric host must be one the app's own URL parser reads as an IPv4 literal
+/// with a non-zero first octet ([`is_prose_shaped_ipv4`]). Without the first
+/// rule, `"upgraded to 10.0.0.1"` is a refusal served for a build number;
+/// without the second, `"the meeting at 12:30"` becomes `http://12:30/`, whose
+/// WHATWG host is `0.0.0.12` — inside `0.0.0.0/8`, and therefore a refusal
+/// served for a sentence about a meeting.
 ///
 /// The residual those rules leave, deliberately: a bare IP with neither port
 /// nor path (`{"url": "10.0.0.1"}`, which `curl` would fetch) is not extracted.
@@ -648,16 +649,26 @@ fn is_port(p: &str) -> bool {
     !p.is_empty() && p.len() <= 5 && p.parse::<u32>().is_ok_and(|n| n <= 65535)
 }
 
-/// A four-octet IPv4 literal, or a dotted name whose last label starts with a
-/// letter. The second clause is what rejects `0.5`, `12`, `2026.08.07` and
-/// every other numeric run prose is full of, while keeping `router.lan` and
-/// `internal.example.com`.
+/// A four-octet IPv4 literal in the canonical spelling, **anything else the
+/// app's own URL parser reads as an IPv4 literal** ([`whatwg_ipv4_literal`],
+/// minus the one prose carve-out in [`is_prose_shaped_ipv4`]), or a dotted name
+/// whose last label starts with a letter.
+///
+/// The last clause is what keeps `router.lan` and `internal.example.com` while
+/// rejecting `2026.08.07` and the rest of the numeric runs prose is full of that
+/// are not addresses at all.
 fn is_plausible_host(host: &str) -> bool {
     if host.is_empty() || host.len() > 253 {
         return false;
     }
+    // The canonical dotted quad, cheaply: `Ipv4Addr` and WHATWG cannot disagree
+    // about four unpadded decimal octets, so this is a fast path and not a
+    // second opinion.
     if host.parse::<Ipv4Addr>().is_ok() {
         return true;
+    }
+    if let Some(addr) = whatwg_ipv4_literal(host) {
+        return !is_prose_shaped_ipv4(host, addr);
     }
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
@@ -667,6 +678,137 @@ fn is_plausible_host(host: &str) -> bool {
         && labels
             .iter()
             .all(|l| l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+/// Whether the app's own URL parser reads `host` as an IPv4 literal, and which
+/// address it reads it as (#48, review findings F-33 and **F-36**).
+///
+/// # The disagreement this closes
+///
+/// [`Ipv4Addr`]'s parser accepts exactly one spelling: four unpadded decimal
+/// octets. A WHATWG parser accepts a whole family beyond it, and every member
+/// of that family was a run `is_plausible_host` rejected — so it produced **no
+/// candidate at all**, the screen never ran, and a scheme-guessing fetcher
+/// resolved it happily:
+///
+/// | written | `Url::parse` host |
+/// |---|---|
+/// | `0177.0.0.1` (F-33: octal) | `127.0.0.1` |
+/// | `127.1`, `127.0.1` (**short forms**) | `127.0.0.1` |
+/// | `10.1`, `192.168.1`, `172.16.1` | `10.0.0.1`, `192.168.0.1`, `172.16.0.1` |
+/// | `169.254.43518` | `169.254.169.254` — the cloud metadata service |
+/// | `127.0.0.1.` (trailing dot) | `127.0.0.1` |
+/// | `0x7f.0.0.1`, `0177.0.0.0x1` (hex, mixed) | `127.0.0.1` |
+/// | `2130706433`, `0x7f000001`, `017700000001` (dword) | `127.0.0.1` |
+///
+/// F-33 closed the first row with a hand-written predicate for that one shape.
+/// F-36 measured the rest still open — none of them carries a leading zero, so
+/// none of them was covered. Enumerating shapes is what C-4 was "fixed" three
+/// times by; the fix is to stop enumerating.
+///
+/// # The parser is the only authority
+///
+/// So this asks [`Url::parse`] — the same code the fetch path uses and the same
+/// code [`screen_one`] will use on the candidate — instead of re-deriving what a
+/// host means. Nothing is re-spelled: the candidate is still emitted **verbatim**
+/// as `http://{run}` and parsed again downstream. A second implementation of the
+/// WHATWG IPv4 parser for the screen to disagree with is the *defect* (H-3's
+/// whole family), not the fix, and one existed here until F-36 deleted it.
+///
+/// # The cheap gate in front of it
+///
+/// `is_plausible_host` runs on every word of every argument, so a `Url::parse`
+/// per word would be a real cost on the hot path. An IPv4 literal in any WHATWG
+/// spelling starts with an ASCII digit and is built only from hex digits, `x`
+/// (the `0x` marker) and `.`, so anything else is turned away before the parse.
+/// The gate can only ever *reject*; it never says yes on the parser's behalf.
+fn whatwg_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
+    if !host.starts_with(|c: char| c.is_ascii_digit())
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b'x' || b == b'X')
+    {
+        return None;
+    }
+    match Url::parse(&format!("http://{host}/")).ok()?.host()? {
+        Host::Ipv4(v4) => Some(v4),
+        _ => None,
+    }
+}
+
+/// The one carve-out from [`whatwg_ipv4_literal`]: a **short** IPv4 spelling —
+/// fewer than four parts — whose first octet is zero (#48, finding F-36; user
+/// decision 2026-08-12).
+///
+/// # Why a carve-out exists at all
+///
+/// Reading every IPv4 literal as plausible is what closes F-36, and it is also
+/// what turns the numeric runs ordinary prose is made of into candidates —
+/// because WHATWG pads a short form on the *left*, so a small number becomes an
+/// address in `0.0.0.0/8`, which is denied:
+///
+/// | prose | host | reads as |
+/// |---|---|---|
+/// | `"mix them 0.5:1 by volume"` | `0.5` | `0.0.0.5` |
+/// | `"the meeting is at 12:30"` | `12` | `0.0.0.12` |
+/// | `"a 1/2 cup"`, `"open 24/7"` | `1`, `24` | `0.0.0.1`, `0.0.0.24` |
+/// | `"on 10/11/2026"` | `10` | `0.0.0.10` |
+///
+/// [`screen_urls`] denies on **any** candidate, so one of these in a paragraph
+/// refuses the whole call — and every benign refusal advances the power-of-two
+/// threshold in [`AuditClaims::claim_ssrf`] that would otherwise have surfaced a
+/// real one, so the noise suppresses the signal. Locked decision 16's argument:
+/// a screen that refuses prose is a screen the user switches off.
+///
+/// # Why it costs no containment worth having
+///
+/// A first octet of zero is exactly what left-padding a *small* number produces,
+/// and **not one** of F-36's bypass spellings has one — they all name a real
+/// first octet (`127`, `10`, `192`, `172`, `169`). The carve-out is confined to
+/// **short** forms for the same reason: `0.0.0.0` is a genuine SSRF target (it
+/// routes to localhost on Linux), so the full four-part spelling of `0.0.0.0/8`
+/// stays denied. Dropping `0.0.0.0/8` from the deny set instead would have been
+/// cheaper and was rejected: it trades a real target for prose comfort.
+///
+/// # The residual, stated — and CLOSED 2026-08-12
+///
+/// A *short* spelling of `0.0.0.0/8` is not screened, and the sharpest case was
+/// the bare `0` — `Url::parse("http://0/")` is `0.0.0.0`, so `0/admin` and
+/// `0:8080/x` reached it. That was **pre-existing** (`is_plausible_host("0")`
+/// was already `false`) rather than opened by F-36, and **schemeless-only**:
+/// this predicate has exactly one production call site, in the bare-authority
+/// scan, so a scheme-bearing `http://0/admin` was always screened.
+///
+/// **User decision 2026-08-12: closed anyway.** `0.0.0.0` is excluded from the
+/// carve-out — see [`is_prose_shaped_ipv4`]. It is the shortest payload in the
+/// very class F-36 closed, and leaving it meant shipping a test that asserts a
+/// bypass passes. **Accepted price, measured over 41 realistic strings rather
+/// than guessed: `"0:00 UTC"`, `"0/10 tests passed"` and `"the match ended 0:0"`
+/// now deny.** `a_short_zero_form_is_prose_and_the_full_spelling_is_a_target`
+/// pins both halves, so the trade stays visible instead of becoming folklore.
+///
+/// # Trailing dots
+///
+/// WHATWG removes **one** trailing empty part before parsing, so `127.0.0.1.` is
+/// a four-part literal and not a three-part short form. Counting parts without
+/// that removal would hand the trailing-dot bypass right back.
+fn is_prose_shaped_ipv4(host: &str, addr: Ipv4Addr) -> bool {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.last() == Some(&"") {
+        parts.pop();
+    }
+    // `0.0.0.0` itself is NEVER prose (#48, F-36 residual, user decision
+    // 2026-08-12). Every other zero-first-octet short form still is: the
+    // carve-out exists for `0.5:1`, `0.1.2.3` and friends, whose left-padded
+    // addresses land harmlessly inside `0.0.0.0/8` — but the bare `0` reads as
+    // `0.0.0.0` exactly, which reaches localhost on Linux and is one of the
+    // shortest SSRF payloads there is.
+    //
+    // Measured price, accepted knowingly rather than guessed: `"0:00 UTC"`,
+    // `"0/10 tests passed"` and `"the match ended 0:0"` now deny. That is the
+    // whole cost — a short form can only read as exactly `0.0.0.0` when every
+    // part is zero, so no other prose shape is reachable from here.
+    parts.len() < 4 && addr.octets()[0] == 0 && !addr.is_unspecified()
 }
 
 // ── The allow-exception policy ─────────────────────────────────────────────
@@ -1029,7 +1171,7 @@ impl Budget {
     }
 
     /// Claim this scope's next SSRF denial row — see [`AuditClaims::claim_ssrf`].
-    pub fn claim_ssrf_flag(&mut self) -> SsrfRow {
+    pub fn claim_ssrf_flag(&mut self) -> DoublingRow {
         self.claims.claim_ssrf()
     }
 
@@ -1068,15 +1210,63 @@ impl Budget {
 // already solved this for the exhaustion row; these are the two screens that
 // were missed.
 
-/// What one SSRF denial should do about its `injection_flag` row (#48).
+/// What one event in a doubling-suppressed series should do about its
+/// `injection_flag` row (#48).
+///
+/// Named for the *discipline* rather than for the SSRF screen that introduced
+/// it (#48 F-32): [`Doubling`] now has two consumers, and a type called
+/// `SsrfRow` returned by the discovery-report ledger would have been a lie in
+/// the one place this codebase keeps being bitten by them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SsrfRow {
-    /// Write the row. `total` is how many denials this scope has served
+pub enum DoublingRow {
+    /// Write the row. `total` is how many events this ledger has counted
     /// (`0` = an unledgered scope, see [`UnscopedAudit`]), and `suppressed` how
     /// many were folded into this one since the last row was written.
     Write { total: u32, suppressed: u32 },
     /// Counted, not written.
     Suppress,
+}
+
+/// A doubling report ledger: count events, and write a row at 1, 2, 4, 8, 16 …
+///
+/// Extracted from `AuditClaims::claim_ssrf` (#48 F-32) rather than re-spelled
+/// beside it, on this file's own rule that *two spellings of one rule are two
+/// things to keep in step*. The justification is the SSRF screen's, verbatim
+/// and unchanged, and it transfers to every caller that inherits it:
+///
+/// A single event (overwhelmingly the common case) behaves exactly as it would
+/// with no ledger at all; a loop costs the capped feed `log2(n)` rows instead of
+/// `n`, so 200 events write 8. **Strict one-row-per-key was rejected** because
+/// the suppressed count would then have nowhere to go, and a counter with no
+/// consumer is the defect class this whole pass exists to close: every row
+/// written **names** how many events it stands for, so the magnitude of a loop
+/// survives in the audit window instead of being inferred from its absence.
+///
+/// `Copy` and inert by default so it can ride inside [`AuditClaims`] (which
+/// rides inside [`Budget`], whose reset is a session rotation) or inside a
+/// process-lifetime map (`loopback`'s discovery-report ledger, where the key
+/// space is bounded by the user's own tab list rather than by a caller).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Doubling {
+    /// Events counted under this key.
+    seen: u32,
+    /// [`seen`](Self::seen) as of the last row written, so a row can say how
+    /// many events it stands for.
+    reported: u32,
+}
+
+impl Doubling {
+    /// Count one event and decide whether it gets a row.
+    pub fn claim(&mut self) -> DoublingRow {
+        self.seen = self.seen.saturating_add(1);
+        let total = self.seen;
+        if !total.is_power_of_two() {
+            return DoublingRow::Suppress;
+        }
+        let suppressed = total.saturating_sub(self.reported).saturating_sub(1);
+        self.reported = total;
+        DoublingRow::Write { total, suppressed }
+    }
 }
 
 /// One scope's claim bits for the screens that can fire on **every** call.
@@ -1089,36 +1279,19 @@ pub enum SsrfRow {
 /// permanently, across every future session it ever holds.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AuditClaims {
-    /// Denials served in this scope.
-    ssrf_denials: u32,
-    /// `ssrf_denials` as of the last row written, so a row can say how many
-    /// denials it stands for.
-    ssrf_reported: u32,
+    /// This scope's SSRF-denial ledger — rows at denials 1, 2, 4, 8, 16 …
+    /// See [`Doubling`], which owns that rule for both of its consumers.
+    ssrf: Doubling,
     /// Whether the one unscreened-content row has been written.
     unscreened: bool,
 }
 
 impl AuditClaims {
-    /// Count one SSRF denial and decide whether it gets a row.
-    ///
-    /// Rows are written at denials 1, 2, 4, 8, 16 … — the count doubles between
-    /// them. A single denial (overwhelmingly the common case) behaves exactly
-    /// as it always did; a model looping denied URLs costs the feed
-    /// `log2(n)` rows instead of `n`, so 200 denials write 8. Strict
-    /// one-row-per-scope was rejected because the suppressed count would then
-    /// have nowhere to go, and a counter with no consumer is the defect class
-    /// this whole pass exists to close: every row here **names** how many
-    /// denials it stands for, so the magnitude of a loop survives in the audit
-    /// window instead of being inferred from its absence.
-    pub fn claim_ssrf(&mut self) -> SsrfRow {
-        self.ssrf_denials = self.ssrf_denials.saturating_add(1);
-        let total = self.ssrf_denials;
-        if !total.is_power_of_two() {
-            return SsrfRow::Suppress;
-        }
-        let suppressed = total.saturating_sub(self.ssrf_reported).saturating_sub(1);
-        self.ssrf_reported = total;
-        SsrfRow::Write { total, suppressed }
+    /// Count one SSRF denial and decide whether it gets a row — the doubling
+    /// discipline, delegated to [`Doubling::claim`] since #48 F-32 gave it a
+    /// second consumer.
+    pub fn claim_ssrf(&mut self) -> DoublingRow {
+        self.ssrf.claim()
     }
 
     /// Claim the ONE "part of this content was not screened" row for this
@@ -1143,7 +1316,7 @@ impl AuditClaims {
 /// `&self`. Both claim by locking for the length of one claim.
 pub trait ScopeAudit: Send + Sync {
     /// See [`AuditClaims::claim_ssrf`].
-    fn claim_ssrf(&self) -> SsrfRow;
+    fn claim_ssrf(&self) -> DoublingRow;
     /// See [`AuditClaims::claim_unscreened`].
     fn claim_unscreened(&self) -> bool;
 }
@@ -1161,7 +1334,7 @@ pub trait ScopeAudit: Send + Sync {
 pub struct TaskAudit(std::sync::Mutex<AuditClaims>);
 
 impl ScopeAudit for TaskAudit {
-    fn claim_ssrf(&self) -> SsrfRow {
+    fn claim_ssrf(&self) -> DoublingRow {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1182,9 +1355,9 @@ impl ScopeAudit for TaskAudit {
 /// The refusal string is unchanged and stays first, because the row's job is to
 /// show exactly what was served (locked decision 11 fixes that string so the
 /// model never learns which address it hit; nothing here reaches the model).
-pub fn ssrf_flag_detail(row: SsrfRow) -> String {
+pub fn ssrf_flag_detail(row: DoublingRow) -> String {
     match row {
-        SsrfRow::Write { total, suppressed } if total > 1 => format!(
+        DoublingRow::Write { total, suppressed } if total > 1 => format!(
             "{REFUSAL_SSRF}\n\n[cImp: SSRF denial #{total} for this scope. {suppressed} \
              intervening denial(s) were counted but not written — this feed is capped and a loop \
              of refused URLs must not evict the rows that record an attack that got through.]"
@@ -1492,6 +1665,27 @@ pub enum Screen {
     /// clean again — which is precisely why it is recorded rather than inferred
     /// from the absence of later rows.
     ContaminationCleared => "contamination_cleared",
+    /// #48 finding F-32 (locked decision 37): a cImp MCP **child skipped one or
+    /// more candidate discovery entries** that did not answer a
+    /// token-authenticated `GET /health`, and then reached this instance anyway.
+    ///
+    /// F-11's fix (locked decision 30) made the child skip such an entry; the
+    /// only consumer of that fact was the child's own stderr, which is an
+    /// operator channel. The case that went unreported is the interesting one —
+    /// a **planted** entry was skipped and containment worked perfectly, so
+    /// nobody was told an attacker probed. `POST /activity/discovery_skipped`
+    /// (`loopback::handle_discovery_skipped`) is the user consumer.
+    ///
+    /// **Not a denial**, and the distinction matters more here than anywhere
+    /// else in this enum: the child's real work *proceeded*, the resolution
+    /// *succeeded*, and nothing was refused. Painting containment-that-worked as
+    /// a denial is the M-24/F-24 defect class, in the fix for its own family.
+    ///
+    /// Its [`Origin`] is always [`Origin::Http`] and the row says so in words: a
+    /// local process asserted this, and every fact the *body* carried is either
+    /// validated app-side (the tab, through `loopback::tab_identity`) or clamped
+    /// (the count, to the probe budget). See `loopback::discovery_row`.
+    DiscoverySkipped => "discovery_skipped",
 }
 }
 
@@ -1594,7 +1788,9 @@ impl Screen {
     /// (a refused call never contaminates — that is the whole point of setting
     /// the bit on the far side of the gate), nor
     /// [`Screen::ContaminationCleared`], which records the bit being **released**
-    /// on the user's authority.
+    /// on the user's authority, nor [`Screen::DiscoverySkipped`], which records
+    /// containment that **worked** — the child skipped a dead entry and reached
+    /// the real instance, so nothing was refused and nothing failed.
     pub fn is_denial(self) -> bool {
         !matches!(
             self,
@@ -1607,6 +1803,7 @@ impl Screen {
                 | Screen::LatchBeacon
                 | Screen::Contamination
                 | Screen::ContaminationCleared
+                | Screen::DiscoverySkipped
         )
     }
 
@@ -1642,6 +1839,15 @@ impl Screen {
     ///   forgotten field, and it must not read as one.
     /// * `Updater` — **no.** Not about a project at all: it records the detection
     ///   bundle changing, app-wide.
+    /// * `DiscoverySkipped` — **no**, on the same narrow technicality as the
+    ///   latch group *plus* one of its own (#48 F-32). Its root comes from
+    ///   `tab_root_key`, so a deleted cwd empties it; and the two identity-less
+    ///   cases (a body with no `tab`, or one naming no configured tab) have no
+    ///   tab to derive a root from at all. That is a **positive statement** —
+    ///   locked decision 33's *"not attributable to a project"* — and a security
+    ///   row must state it rather than fabricate a project. Requiring one here
+    ///   would fire `rootless_forensic`'s `debug_assert!` on an honest
+    ///   degradation.
     pub fn requires_project_root(self) -> bool {
         match self {
             Screen::MemoryQuarantine => true,
@@ -1656,7 +1862,8 @@ impl Screen {
             | Screen::LatchOverride
             | Screen::LatchBeacon
             | Screen::Contamination
-            | Screen::ContaminationCleared => false,
+            | Screen::ContaminationCleared
+            | Screen::DiscoverySkipped => false,
         }
     }
 }
@@ -2084,6 +2291,255 @@ mod tests {
         s.parse().expect("test address parses")
     }
 
+    /// #48 finding F-33 — the **schemeless** half of the leading-zero family,
+    /// which the corpus oracle cannot express.
+    ///
+    /// `Url::parse("0177.0.0.1:8080/admin")` fails (`0177.0.0.1` is not a
+    /// scheme), so no property written in terms of the oracle can demand these
+    /// rows — exactly the reason
+    /// [`the_whatwg_parser_differential_is_closed`] still exists. A
+    /// scheme-*guessing* fetcher resolves every one of them, and before F-33
+    /// `is_plausible_host` produced **no candidate at all** for any of them: the
+    /// address was extracted by neither path and the screen never ran.
+    ///
+    /// The public rows are not decoration. F-33 as reported was the harmless
+    /// direction (`010.0.0.0`, octal `8.0.0.0`), and a fix that refused it would
+    /// have traded a bypass for the denial-of-research that locked decision 16
+    /// is about.
+    #[tokio::test]
+    async fn the_leading_zero_family_reaches_the_screen() {
+        let policy = Policy::default();
+        // The predicate itself: padded spellings in, prose out.
+        for host in ["0177.0.0.1", "010.0.0.1", "0300.0250.0.1", "127.000.000.001"] {
+            assert!(is_plausible_host(host), "{host:?} is a padded IPv4 literal");
+            assert!(
+                host.parse::<Ipv4Addr>().is_err(),
+                "{host:?} must be the NON-canonical spelling, or this proves nothing"
+            );
+        }
+        // …and the runs that are not addresses at all. Since F-36 the reason is
+        // uniform: the app's own parser cannot read them as an IPv4 literal, so
+        // no candidate is manufactured for them.
+        for prose in [
+            "2026.08.07",    // `2026` overflows the first octet
+            "0192.0168.0.1", // `9`/`8` are not octal digits
+            "0177.0.0.400",  // octal 400 overflows an octet
+        ] {
+            assert!(
+                whatwg_ipv4_literal(prose).is_none(),
+                "{prose:?} is not an IPv4 literal to the parser"
+            );
+            assert!(!is_plausible_host(prose), "{prose:?} must not be a host");
+        }
+
+        // Denied targets, in the shapes `scan_bare_authorities` accepts: a
+        // port, a path, or protocol-relative syntax.
+        for (label, arg, ip) in [
+            ("octal loopback + port + path", "0177.0.0.1:8080/admin", "127.0.0.1"),
+            ("octal loopback + port", "0177.0.0.1:8080", "127.0.0.1"),
+            ("octal loopback + path", "0177.0.0.1/admin", "127.0.0.1"),
+            ("octal loopback, protocol-relative", "//0177.0.0.1/", "127.0.0.1"),
+            ("zero-padded loopback", "127.000.000.001:8080/x", "127.0.0.1"),
+            ("the llama-server pivot", "0177.0.0.1:12344/props", "127.0.0.1"),
+            ("octal RFC1918", "0300.0250.0.1:8080/x", "192.168.0.1"),
+            ("octal metadata", "0251.0376.0251.0376:80/latest/", "169.254.169.254"),
+            ("octal in prose", "please fetch 0177.0.0.1:8080/admin now", "127.0.0.1"),
+            // The as-written scan and the stripped scan must agree here too.
+            ("octal with a tab", "0177.0.0\t.1:8080/admin", "127.0.0.1"),
+        ] {
+            let err = screen_urls(&json!({ "url": arg }), &policy)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label}: {arg:?} must be refused"));
+            assert_eq!(err.ip, ip, "{label}: the row must name the resolved address");
+        }
+
+        // …and the harmless direction, which must keep working.
+        for (label, arg) in [
+            ("F-33's own string", "RFC1918 (010.0.0.0/8)"),
+            ("octal 8.0.0.1", "010.0.0.1:8080/x"),
+            ("zero-padded public", "010.020.030.040:8080/x"),
+            ("a ratio", "mix them 0.5:1 by volume"),
+            ("a padded version", "upgraded to 1.02.03.04:8080/notes"),
+            ("a dotted date", "released 2026.08.07:12 in the changelog"),
+        ] {
+            assert!(
+                screen_urls(&json!({ "text": arg }), &policy).await.is_ok(),
+                "{label}: {arg:?} must pass"
+            );
+        }
+    }
+
+    /// #48 finding **F-36** — the rest of the WHATWG IPv4 family, which F-33's
+    /// leading-zero predicate did not cover and which the C-4 corpus cannot
+    /// express.
+    ///
+    /// The corpus oracle is `Url::parse` on the string *as written*, and
+    /// `Url::parse("127.1:8080/x")` fails — `127.1` is not a scheme. So the whole
+    /// class lives in the **schemeless** scan and has to be pinned here.
+    ///
+    /// Every row was measured against the shipped `candidates()` before the fix
+    /// and produced **no candidate at all**: the screen never ran, while the
+    /// app's own parser resolves each one to loopback, RFC1918, or the cloud
+    /// metadata service. None of them carries a leading zero, which is why F-33
+    /// left them open.
+    ///
+    /// The candidate assertion is not decoration either. The run is emitted
+    /// **verbatim** and [`screen_one`] does the reading — re-spelling the host in
+    /// the extractor would be the second IPv4 parser that H-3 is about.
+    #[tokio::test]
+    async fn the_short_and_hex_ipv4_family_reaches_the_screen() {
+        let policy = Policy::default();
+        // (label, the argument, the candidate it must produce VERBATIM, the
+        // address the screen must name)
+        for (label, arg, expect, ip) in [
+            // ── short dotted-decimal forms: WHATWG pads on the LEFT.
+            ("two-part loopback", "127.1:8080/x", "http://127.1:8080/x", "127.0.0.1"),
+            ("three-part loopback", "127.0.1:8080/x", "http://127.0.1:8080/x", "127.0.0.1"),
+            ("two-part RFC1918", "10.1:8080/x", "http://10.1:8080/x", "10.0.0.1"),
+            ("three-part RFC1918", "192.168.1:8080/x", "http://192.168.1:8080/x", "192.168.0.1"),
+            ("three-part carrier range", "172.16.1:8080/x", "http://172.16.1:8080/x", "172.16.0.1"),
+            // The last part of a short form absorbs the remaining octets, so a
+            // 16-bit tail reaches the cloud metadata service.
+            (
+                "three-part metadata",
+                "169.254.43518:8080/x",
+                "http://169.254.43518:8080/x",
+                "169.254.169.254",
+            ),
+            ("two-part, protocol-relative", "//127.1/x", "http://127.1/x", "127.0.0.1"),
+            ("two-part, path only", "127.1/admin", "http://127.1/admin", "127.0.0.1"),
+            (
+                "the llama-server pivot, short",
+                "127.1:12344/props",
+                "http://127.1:12344/props",
+                "127.0.0.1",
+            ),
+            // ── a trailing dot: WHATWG removes ONE empty part before parsing,
+            // so this is the four-part literal it looks like.
+            ("trailing dot", "127.0.0.1.:8080/x", "http://127.0.0.1.:8080/x", "127.0.0.1"),
+            (
+                "trailing dot, octal",
+                "0177.0.0.1.:8080/x",
+                "http://0177.0.0.1.:8080/x",
+                "127.0.0.1",
+            ),
+            // ── hex, and hex mixed with octal.
+            ("hex first octet", "0x7f.0.0.1:8080/x", "http://0x7f.0.0.1:8080/x", "127.0.0.1"),
+            ("hex, uppercase", "0X7F.0.0.1:8080/x", "http://0X7F.0.0.1:8080/x", "127.0.0.1"),
+            (
+                "octal + hex in one host",
+                "0177.0.0.0x1:8080/x",
+                "http://0177.0.0.0x1:8080/x",
+                "127.0.0.1",
+            ),
+            // ── single-part dwords, in all three radixes.
+            ("decimal dword", "2130706433:8080/x", "http://2130706433:8080/x", "127.0.0.1"),
+            ("hex dword", "0x7f000001:8080/x", "http://0x7f000001:8080/x", "127.0.0.1"),
+            ("octal dword", "017700000001:8080/x", "http://017700000001:8080/x", "127.0.0.1"),
+            ("dword, path only", "2130706433/admin", "http://2130706433/admin", "127.0.0.1"),
+            ("dword, protocol-relative", "//0x7f000001/x", "http://0x7f000001/x", "127.0.0.1"),
+            // ── and buried in prose, in a field that is not called `url`.
+            (
+                "short form in prose",
+                "please fetch 127.1:12344/props now",
+                "http://127.1:12344/props",
+                "127.0.0.1",
+            ),
+            (
+                "dword in prose",
+                "GET 2130706433:8080/admin for me",
+                "http://2130706433:8080/admin",
+                "127.0.0.1",
+            ),
+        ] {
+            // The run reaches the screen as written, with no re-spelling.
+            let found = extract_urls(&json!({ "url": arg }));
+            assert!(
+                found.iter().any(|c| c == expect),
+                "{label}: {arg:?} must produce {expect:?} verbatim, got {found:?}"
+            );
+            let err = screen_urls(&json!({ "note": arg }), &policy)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label}: {arg:?} must be refused"));
+            assert_eq!(err.ip, ip, "{label}: the row must name the resolved address");
+        }
+    }
+
+    /// F-36's carve-out and the residual it leaves, pinned together so neither
+    /// half can be changed without seeing the other (user decision 2026-08-12).
+    ///
+    /// A short IPv4 spelling is padded on the **left**, so every small number in
+    /// prose — a ratio, a score, a fraction, a time, a date — reads as an address
+    /// in `0.0.0.0/8` and would refuse the whole call. Short forms with a zero
+    /// first octet are therefore not plausible hosts.
+    ///
+    /// The price is stated rather than hidden: a short spelling of `0.0.0.0/8` is
+    /// not screened, and the sharpest one is the bare `0`. It is **pre-existing**
+    /// — `is_plausible_host("0")` was already `false` — and the full four-part
+    /// spelling of the same range stays denied, which is the half that matters:
+    /// `0.0.0.0` routes to localhost on Linux.
+    #[tokio::test]
+    async fn a_short_zero_form_is_prose_and_the_full_spelling_is_a_target() {
+        let policy = Policy::default();
+        // The carve-out is about the FIRST OCTET the parser produces, not about
+        // how the run is spelled — that is what makes it apply to `12` as well
+        // as to `0.5`.
+        for (host, addr) in [("0.5", "0.0.0.5"), ("12", "0.0.0.12"), ("24", "0.0.0.24")] {
+            let parsed = whatwg_ipv4_literal(host).expect("the parser reads it as a literal");
+            assert_eq!(parsed.to_string(), addr, "{host:?} reads as {addr}");
+            assert!(is_prose_shaped_ipv4(host, parsed), "{host:?} is prose");
+            assert!(!is_plausible_host(host), "{host:?} must not be a host");
+        }
+        // …and it is confined to SHORT forms: a trailing dot does not shorten
+        // one, and the full spelling of the same range is still a target.
+        for host in ["0.0.0.0", "0.0.0.1", "0.0.0.1.", "127.1", "10.1", "2130706433"] {
+            assert!(is_plausible_host(host), "{host:?} must remain a host");
+        }
+        for arg in ["0.0.0.0:8080/x", "0.0.0.1/admin", "//0.0.0.0/x"] {
+            assert!(
+                screen_urls(&json!({ "url": arg }), &policy).await.is_err(),
+                "{arg:?} is the full spelling of a real target and must be refused"
+            );
+        }
+        // The residual is CLOSED (user decision 2026-08-12): `0.0.0.0` is the one
+        // address a short form may not read as. It was pre-existing rather than
+        // opened by F-36, and schemeless-only — but it is the shortest payload in
+        // the class F-36 just closed, and leaving it meant shipping the assertion
+        // below inverted, i.e. a test stating that a bypass passes.
+        for arg in ["0/admin", "0:8080/x", "//0/x", "0x0/admin"] {
+            let err = screen_urls(&json!({ "url": arg }), &policy)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{arg:?} reads as 0.0.0.0 and must be refused"));
+            assert_eq!(err.ip, "0.0.0.0", "{arg:?}: the row must name the address");
+        }
+        // The price that close is paid in, measured rather than guessed and
+        // asserted here so nobody rediscovers it as a bug report. Every one of
+        // these is a bare `0` glued to a `/` or a `:`; that is the ENTIRE cost,
+        // because a short form reads as exactly `0.0.0.0` only when every part
+        // of it is zero.
+        for arg in [
+            "0/10 tests passed",
+            "the match ended 0:0",
+            "the window opens at 0:00 UTC",
+        ] {
+            assert!(
+                screen_urls(&json!({ "q": arg }), &policy).await.is_err(),
+                "{arg:?} is the accepted price of closing the residual"
+            );
+        }
+        // …while every OTHER small number in prose still passes, which is what
+        // keeps the carve-out worth having.
+        for arg in ["use a 1/2 cup", "open 24/7", "on 10/11/2026", "mix them 0.5:1"] {
+            assert!(
+                screen_urls(&json!({ "q": arg }), &policy).await.is_ok(),
+                "{arg:?} is prose and must pass"
+            );
+        }
+    }
+
     /// A scope is only a tab when it names one (#51).
     ///
     /// The `(no tab identity)` case is the one this exists for. That label is
@@ -2314,7 +2770,13 @@ mod tests {
     /// Denied authorities, one per family in [`is_denied_ip`], including the
     /// local `llama-server` that decision 11's carve-out text names as the
     /// service this screen exists to protect.
-    const CORPUS_DENIED_HOSTS: [&str; 12] = [
+    ///
+    /// The last three are the **leading-zero** spellings (#48, finding F-33):
+    /// octal `0177.0.0.1` is loopback, `0300.0250.0.1` is `192.168.0.1` and
+    /// `0251.0376.0251.0376` is the cloud metadata address. They are in the
+    /// corpus rather than in a table of their own so every scheme × slash-run ×
+    /// infix × tail spelling of them is generated too.
+    const CORPUS_DENIED_HOSTS: [&str; 15] = [
         "127.0.0.1",
         "127.0.0.1:12344",
         "169.254.169.254",
@@ -2327,13 +2789,27 @@ mod tests {
         "[::1]:9000",
         "[::ffff:127.0.0.1]",
         "[64:ff9b::10.0.0.1]",
+        "0177.0.0.1",
+        "0300.0250.0.1",
+        "0251.0376.0251.0376",
     ];
 
     /// The control group: public literals, so the suite stays offline. Every
     /// one of these must survive every spelling above — a screen that refuses
     /// them is a screen the user switches off.
-    const CORPUS_PUBLIC_HOSTS: [&str; 4] =
-        ["8.8.8.8", "1.1.1.1:8080", "[2001:db8::1]", "[64:ff9b::8.8.8.8]"];
+    ///
+    /// `010.0.0.0` is F-33's own string and is here, not above, because octal
+    /// `010` is `8` — the finding's observed case resolves to a **public**
+    /// address, and widening the extractor to see leading zeros must not turn
+    /// it into a refusal.
+    const CORPUS_PUBLIC_HOSTS: [&str; 6] = [
+        "8.8.8.8",
+        "1.1.1.1:8080",
+        "[2001:db8::1]",
+        "[64:ff9b::8.8.8.8]",
+        "010.0.0.0",
+        "010.020.030.040:8080",
+    ];
 
     /// Tails. The last one is a **CIDR prefix**, added by #48 M-18 so the H-3
     /// corpus audits [`is_canonical_network_address`] instead of the exemption
@@ -2571,12 +3047,14 @@ mod tests {
             );
         }
         // Leading zeros are asserted on the PREDICATE, not through the screen.
-        // `010.0.0.0` is octal to a WHATWG parser (host `8.0.0.0`, public) and is
-        // not extracted at all today — `is_plausible_host` rejects it, a
-        // pre-existing residual that has nothing to do with M-18 — so a screen
-        // assertion here would pass for the wrong reason. What M-18 owes is that
-        // the exemption itself declines the spelling, because `Ipv4Addr` and
-        // WHATWG do not agree on what it means.
+        // `010.0.0.0` is octal to a WHATWG parser (host `8.0.0.0`, public), so
+        // since F-33 it IS extracted — `is_plausible_host` defers to the parser
+        // — and the screen then allows it on the parser's own reading.
+        // A screen assertion here would therefore pass for a reason that has
+        // nothing to do with M-18. What M-18 owes is that the exemption itself
+        // declines the spelling, because `Ipv4Addr` and WHATWG do not agree on
+        // what it means; `the_leading_zero_family_reaches_the_screen` owns the
+        // extraction half.
         assert!(
             !is_canonical_network_address("010.0.0.0/8"),
             "a leading-zero octet is not the canonical spelling"
@@ -2702,6 +3180,28 @@ mod tests {
             ("a version", "upgraded from 0.1.2.3 to 10.0.0.1 last week"),
             ("a dotted date", "released 2026.08.07:12 in the changelog"),
             ("a timestamp", "failed at 09:15:07 with code 0.0.0.0"),
+            // #48 F-36 measured these: a short IPv4 spelling is padded on the
+            // LEFT, so every small number beside a `/` or a `:` reads as an
+            // address in `0.0.0.0/8` unless the carve-out holds. See
+            // [`is_prose_shaped_ipv4`]; `screen_urls` denies on ANY candidate,
+            // so one of these would refuse the whole paragraph.
+            ("a fraction", "use a 1/2 cup and 3/4 tsp"),
+            ("opening hours", "open 24/7 for support"),
+            ("a slashed date", "on 10/11/2026 we shipped"),
+            // NOT here, deliberately: `"0/10 tests passed"`, `"the match ended
+            // 0:0"` and `"0:00 UTC"` DENY since the F-36 residual was closed on
+            // 2026-08-12 — a bare `0` reads as `0.0.0.0` exactly, which is a real
+            // target rather than a padded small number. They are asserted as
+            // refusals in `a_short_zero_form_is_prose_and_the_full_spelling_is_a_target`,
+            // beside the payloads they buy, so the trade stays in one place.
+            // A version number with no `/` or `:` glued to it never had a port
+            // or a path, so it is not an authority at all.
+            ("a version, unglued", "macOS 10.15 and 11.0 differ"),
+            // …and glued short forms outside the deny set stay reachable, which
+            // is what makes the widening a screen and not a blanket refusal.
+            ("a public short form", "python 3.11/3.12 both work"),
+            ("a price", "priced at 19.99/month"),
+            ("a public two-part literal", "reached 172.16/32 of the way"),
             // #48 finding H-3: `\` is no longer a terminator inside a
             // scheme-bearing run, and the scheme now matches without its
             // slashes. Both widenings run straight through the two things
@@ -2944,7 +3444,7 @@ mod tests {
     async fn a_disabled_ssrf_guard_lets_private_addresses_through() {
         let mut s = crate::settings::Settings::default();
         s.set_l2_for_test(crate::settings::injection::Feature::SsrfGuard, false);
-        let policy = Policy::from_settings(&s, crate::settings::injection::Scope::App);
+        let policy = Policy::from_settings(&s, crate::settings::injection::Scope::AppWide);
         for bad in [
             "http://192.168.0.1/",
             "http://127.0.0.1:17800/status",
@@ -2958,7 +3458,7 @@ mod tests {
         // …and the master switch alone is enough, with the feature flag left on.
         let mut s = crate::settings::Settings::default();
         s.set_master_for_test(false);
-        let policy = Policy::from_settings(&s, crate::settings::injection::Scope::App);
+        let policy = Policy::from_settings(&s, crate::settings::injection::Scope::AppWide);
         assert!(screen_urls(&json!({ "url": "http://10.1.2.3/" }), &policy)
             .await
             .is_ok());
@@ -2978,7 +3478,7 @@ mod tests {
         let mut s = crate::settings::Settings::default();
         s.set_l2_for_test(crate::settings::injection::Feature::FetchBudgets, false);
         let limits =
-            crate::settings::injection::budget_limits(&s, crate::settings::injection::Scope::App);
+            crate::settings::injection::budget_limits(&s, crate::settings::injection::Scope::AppWide);
         assert_eq!((limits.max_calls, limits.max_bytes), (0, 0));
         let mut b = Budget::default();
         for _ in 0..10_000 {
@@ -3156,7 +3656,8 @@ mod tests {
                 "latch_override",
                 "latch_beacon",
                 "contamination",
-                "contamination_cleared"
+                "contamination_cleared",
+                "discovery_skipped"
             ]
         );
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
@@ -3189,6 +3690,10 @@ mod tests {
         // half of that pair is a denial.
         assert!(!Screen::Contamination.is_denial());
         assert!(!Screen::ContaminationCleared.is_denial());
+        // F-32: the child's real work PROCEEDED — the resolution succeeded and
+        // the dead entry was simply not chosen. A denial-shaped row would say
+        // cImp blocked the child, which is the opposite of what happened.
+        assert!(!Screen::DiscoverySkipped.is_denial());
         assert!(Screen::LatchRefusal.is_denial());
         assert!(Screen::Ssrf.is_denial());
     }

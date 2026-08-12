@@ -8,7 +8,11 @@
 //! quarantined rows, and every consumer inherits that — `context_notes`, the
 //! compaction carry-over, the fact distiller (and therefore the launch-time
 //! `fact_promotion_block`), the Memory UI's clean list. The review UI opts
-//! *in*, through [`GraphIndex::mem_quarantined_notes`].
+//! *in*, through [`GraphIndex::mem_quarantined_notes`] — and since #48's locked
+//! decision 38 it must present a
+//! [`QuarantineReview`](crate::graph::memory::QuarantineReview) to do so, which
+//! is a bound on the *caller* that the module boundary and the scan below cannot
+//! express (both are about where a query is written, not who invokes it).
 //!
 //! # Why this is a module and not a comment (#47)
 //!
@@ -95,7 +99,7 @@ use std::collections::{BTreeMap, HashSet};
 use cozo::{DataValue, Num, ScriptMutability};
 
 use crate::error::{AppError, AppResult};
-use crate::graph::memory::{MemNote, NoteQuarantine};
+use crate::graph::memory::{MemNote, NoteQuarantine, QuarantineReview};
 use crate::graph::secrets::ScreenedNote;
 use crate::offload::toolclass::WriteTaint;
 
@@ -537,13 +541,35 @@ impl GraphIndex {
     /// so scoping the review queue to "the current session" would hide exactly
     /// the notes that need a decision. This is the one read path allowed to
     /// return tainted rows, and its only consumer is the Memory UI
-    /// (`GraphService::memory_snapshot`).
+    /// (`MemorySnapshot::assemble`, reached from `GraphService::memory_snapshot`).
     ///
     /// #48, F-24: **the one read path that returns the hold record**, because it
     /// is the one whose consumer can act on it. A `None` here is not "no reason"
     /// — it is a row written before the column existed, and the Memory view says
     /// so in as many words rather than guessing (see [`decode_quarantine`]).
-    pub fn mem_quarantined_notes(&self) -> AppResult<Vec<MemNote>> {
+    ///
+    /// # Why the argument (#48, locked decision 38)
+    ///
+    /// The paragraph above used to be the *whole* enforcement: this was a `pub`
+    /// accessor returning the text a contaminated session wrote — **including
+    /// the credential values the write-time screen caught** — with no bound on
+    /// who could call it, and a comment at the one call site saying the Memory UI
+    /// was the only allowed reader. Locked decision 10's note-query scan does not
+    /// cover it: that guard is about a query's *location*, and it reads datalog,
+    /// not method calls, so a second caller here would have kept every guard
+    /// green.
+    ///
+    /// [`QuarantineReview`] makes it structural instead, the same way F-15's
+    /// [`ScreenedNote`] closed the write side: the token's only production
+    /// constructor is private to `graph::memory` and called from one line, and
+    /// the type is unnameable outside `crate::graph` at all. The value is unused
+    /// here on purpose — **it is a proof obligation, not data.** Nothing about
+    /// what this returns changed; only who may ask.
+    ///
+    /// Contrast [`Self::mem_quarantined_count`], which stays open: see
+    /// [`QuarantineReview`]'s docs for why bounding a count with this token would
+    /// hand one to the model-facing caller and make the capability meaningless.
+    pub fn mem_quarantined_notes(&self, _review: QuarantineReview) -> AppResult<Vec<MemNote>> {
         let rows = self.run(
             "?[note_id, session_id, text, ts_ms, pinned, quarantine] := \
                 *mem_note{note_id, session_id, text, ts_ms, pinned, tainted, quarantine}, \
@@ -602,6 +628,21 @@ impl GraphIndex {
     /// tool's count-only footer — the model is told *that* its write landed in
     /// review, never the withheld text, so a compromised session cannot use the
     /// quarantine as a side channel to read back what it planted.
+    ///
+    /// # Deliberately NOT behind [`QuarantineReview`] (#48, locked decision 38)
+    ///
+    /// It is derived from the same relation as [`Self::mem_quarantined_notes`],
+    /// so the question was asked rather than assumed. It stays open, for one
+    /// decisive reason and one supporting one:
+    ///
+    /// - Its production caller is the **model-facing** `context_notes` footer,
+    ///   which is the caller class the capability exists to exclude. Requiring a
+    ///   token here would mean minting one on that path — the token would become
+    ///   constructible from the model-facing code, which is worse than not having
+    ///   it at all. That is a token threaded somewhere that makes it meaningless.
+    /// - What it returns is a count, not tainted text. The confidentiality
+    ///   argument bounding the sibling is about the *values*; a count is already
+    ///   published to the model on purpose, and locked decision 22 wants it to be.
     pub fn mem_quarantined_count(&self) -> AppResult<usize> {
         let rows = self.run(
             "?[note_id] := *mem_note{note_id, tainted}, tainted == true",
@@ -929,7 +970,8 @@ mod tests {
              A quarantined note is one a contaminated conversation wrote; a reader that writes \
              its own datalog gets the tainted rows too, and no unit test of that call site would \
              notice. Route the read through `GraphIndex::mem_notes` (quarantine-filtered) or \
-             `GraphIndex::mem_quarantined_notes` (the review UI's explicit opt-in), or move the \
+             `GraphIndex::mem_quarantined_notes` (the review UI's explicit opt-in, which since \
+             locked decision 38 also demands a `QuarantineReview` capability), or move the \
              query into `{SELF}` beside the others."
         );
     }

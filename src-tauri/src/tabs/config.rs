@@ -3640,6 +3640,10 @@ mod tests {
             crate::offload::toolclass::REFUSAL_LOCAL_BLOCKED,
             crate::offload::toolclass::REFUSAL_EXTERNAL_BLOCKED,
             crate::offload::toolclass::REFUSAL_WRITE_BLOCKED,
+            // #48 (F-34): the third per-direction constant joins the same
+            // vocabulary — a refusal the guidance does not teach is one the
+            // model has no standing instruction for.
+            crate::offload::toolclass::REFUSAL_EXTERNAL_USER_LOCAL,
         ] {
             assert!(
                 refusal.starts_with("REFUSED (security boundary)")

@@ -33,7 +33,7 @@ use tokio::sync::Semaphore;
 use crate::error::AppError;
 use crate::mcp_stdio::tool_error;
 
-use super::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_for};
+use super::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_for, ChildIdentity};
 
 /// Root-aware endpoint resolution for this child: its cwd is the agent's
 /// project directory (inherited at spawn — the injected mcp-config sets no
@@ -46,7 +46,16 @@ use super::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_f
 /// it sits on. [`forget_resolved_discovery`] is what keeps the memo from
 /// outliving the instance; see [`proxy_graph`].
 fn proxy_base() -> Option<(String, String)> {
-    proxy_base_for(std::env::current_dir().ok().as_deref())
+    proxy_base_for(
+        std::env::current_dir().ok().as_deref(),
+        // #48 F-32: who this child is, so a skipped (possibly planted) discovery
+        // entry can be reported to the app as an activity row rather than only
+        // to this child's stderr. Both values are cImp-authored argv.
+        ChildIdentity {
+            consumer: consumer(),
+            tab: tab(),
+        },
+    )
 }
 
 use crate::offload::agent::{self, AgentConfig, NativeRouter, OffloadTask, ThinkingMode};

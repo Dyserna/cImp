@@ -1041,7 +1041,7 @@ impl McpHost {
                 // only the row is conditional. The enforcement above is
                 // untouched by it — see the function docs.
                 let row = audit.claim_ssrf();
-                if let outbound::SsrfRow::Write { .. } = row {
+                if let outbound::DoublingRow::Write { .. } = row {
                     outbound::record_flag(outbound::Flag {
                         screen: outbound::Screen::Ssrf,
                         origin: outbound::Origin::Internal,

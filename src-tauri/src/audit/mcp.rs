@@ -40,7 +40,9 @@ use super::adapters::Category;
 use super::runner::{AuditSnapshot, AuditState, ToolStatus};
 use crate::checks::Severity;
 use crate::mcp_stdio::tool_error;
-use crate::offload::loopback::{forget_resolved_discovery, parse_result_line, proxy_base_for};
+use crate::offload::loopback::{
+    forget_resolved_discovery, parse_result_line, proxy_base_for, ChildIdentity,
+};
 use crate::settings::AuditToolId;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -702,7 +704,13 @@ fn http_client() -> Result<reqwest::Client, String> {
 /// App not discoverable / not listening ⇒ the "cImp is not running" tool error.
 async fn run_via_loopback(category: Category) -> Result<String, String> {
     let cwd = std::env::current_dir().ok();
-    let Some((base, token)) = proxy_base_for(cwd.as_deref()) else {
+    // #48 F-32: this child's cImp-authored identity, so a skipped (possibly
+    // planted) discovery entry reaches the user as an activity row.
+    let who = ChildIdentity {
+        consumer: consumer(),
+        tab: tab(),
+    };
+    let Some((base, token)) = proxy_base_for(cwd.as_deref(), who) else {
         return Err("cImp is not running — start cImp to run code audits.".into());
     };
     let client = http_client()?;
@@ -1178,7 +1186,7 @@ mod tests {
         let out = hostile_report("")
             .deliver(Delivery {
                 settings: &settings,
-                scope: Scope::App,
+                scope: Scope::AppWide,
             })
             .await;
 
@@ -1215,7 +1223,7 @@ mod tests {
         let settings = envelope_only_settings();
         let d = || Delivery {
             settings: &settings,
-            scope: Scope::App,
+            scope: Scope::AppWide,
         };
         let a = hostile_report("").deliver(d()).await;
         let b = hostile_report("").deliver(d()).await;
@@ -1234,7 +1242,7 @@ mod tests {
         let out = hostile_report("")
             .deliver(Delivery {
                 settings: &settings,
-                scope: Scope::App,
+                scope: Scope::AppWide,
             })
             .await;
         assert_eq!(out, raw, "no envelope, and nothing else changed either");
@@ -1257,7 +1265,7 @@ mod tests {
         let wrapped = hostile_report("")
             .deliver(Delivery {
                 settings: &settings,
-                scope: Scope::App,
+                scope: Scope::AppWide,
             })
             .await;
         assert!(wrapped.starts_with(SCANNER_PREAMBLE), "{wrapped}");
@@ -1282,7 +1290,7 @@ mod tests {
         let out = hostile_report("")
             .deliver(Delivery {
                 settings: &settings,
-                scope: Scope::App,
+                scope: Scope::AppWide,
             })
             .await;
         assert!(
@@ -1322,7 +1330,7 @@ mod tests {
         }
         .deliver(Delivery {
             settings: &Settings::default(),
-            scope: Scope::App,
+            scope: Scope::AppWide,
         })
         .await;
         assert!(
@@ -1347,7 +1355,7 @@ mod tests {
         let out = hostile_report("")
             .deliver(Delivery {
                 settings: &Settings::default(),
-                scope: Scope::App,
+                scope: Scope::AppWide,
             })
             .await;
         assert!(out.contains(raw.trim_end()), "{out}");

@@ -222,6 +222,19 @@ impl Config {
         crate::settings::injection::detection_config(s, scope)
     }
 
+    /// [`Self::from_settings`], resolved with
+    /// [`injection::armed_anywhere`](crate::settings::injection::armed_anywhere)
+    /// — *"is this layer armed in ANY scope this process has, the offload worker
+    /// included?"* (#48, F-35).
+    ///
+    /// **Reporting only, never a gate**, and the alias exists so its two callers
+    /// keep composing the per-layer sub-toggle through this module instead of
+    /// reading `detection_signature_enabled` themselves. See
+    /// `injection::detection_config_anywhere` for the whole argument.
+    pub fn armed_anywhere(s: &Settings) -> Self {
+        crate::settings::injection::detection_config_anywhere(s)
+    }
+
     /// Whether any layer would run at all — the cheap early-out that keeps a
     /// fully disabled detection surface off the fetch path entirely.
     fn any_enabled(self) -> bool {
@@ -1422,7 +1435,7 @@ mod tests {
         s.set_detection_layer_for_test(DetectionLayer::Signature, true);
         s.set_detection_layer_for_test(DetectionLayer::Classifier, true);
         s.set_l2_for_test(crate::settings::injection::Feature::Detection, false);
-        let cfg = Config::from_settings(&s, crate::settings::injection::Scope::App);
+        let cfg = Config::from_settings(&s, crate::settings::injection::Scope::AppWide);
         assert!(!cfg.signature && !cfg.classifier);
         let out = wrap_external_result("ddg__fetch_content", HOSTILE.to_string(), ctx(cfg)).await;
         assert!(
@@ -1757,7 +1770,7 @@ mod tests {
         assert!(d.signature && d.classifier);
         assert!((d.classifier_threshold - 0.9).abs() < f32::EPSILON);
         assert_eq!(
-            Config::from_settings(&Settings::default(), crate::settings::injection::Scope::App),
+            Config::from_settings(&Settings::default(), crate::settings::injection::Scope::AppWide),
             d
         );
     }

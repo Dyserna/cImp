@@ -134,21 +134,28 @@ impl OobContext {
     ///
     /// V32 Phase G (locked decision 16): the strip is one of the eleven
     /// switchable controls (ten until Phase H added `opencode_native_gate`;
-    /// count corrected 2026-08-08, #48), resolved at [`Scope::App`] — TTS and
+    /// count corrected 2026-08-08, #48), resolved at [`Scope::AppWide`] — TTS and
     /// toasts are global surfaces
     /// (the global-only avatar/TTS decision), so this feature has an L1 and an
     /// L2 and deliberately no per-scope row. Resolved per burst rather than
     /// cached: the settings handle is already read here for `tts_enabled`, and a
     /// user who turns hygiene off wants the next thing spoken to reflect it.
     ///
-    /// [`Scope::App`]: crate::settings::injection::Scope::App
+    /// **The app-wide baseline, not the identity-less caller's answer** (#48,
+    /// F-35): the two were one variant until locked decision 36 split them, and
+    /// they are provably equal here — a feature with no per-tab row can never
+    /// carry the N-1 elevation — so this is a naming change, not a behaviour
+    /// change. `AppWide` is the honest one: this is a statement about the
+    /// application, and there is no caller to be unsure about.
+    ///
+    /// [`Scope::AppWide`]: crate::settings::injection::Scope::AppWide
     pub async fn speak(&self, text: &str) {
         if !self.tts_enabled() {
             return;
         }
         let text = if crate::settings::injection::effective(
             crate::settings::injection::Feature::TerminalEscapeHygiene,
-            crate::settings::injection::Scope::App,
+            crate::settings::injection::Scope::AppWide,
             &self.settings.current(),
         ) {
             crate::processing::strip_terminal_escapes(text)

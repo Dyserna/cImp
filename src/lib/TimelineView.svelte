@@ -375,7 +375,11 @@
               <span class="trigger" title={rowTitle(row)}>{rowIcon(row)}</span>
               <span class="time">{formatTime(cp.ts)}</span>
               <span class="label" title={cp.label}>{cp.label}</span>
-              <span class="files">{cp.files_changed} file{cp.files_changed === 1 ? '' : 's'}</span>
+              <span
+                class="files"
+                title="Files changed since the PREVIOUS checkpoint — what this one newly captured when it was taken. It is not the difference from your current tree (that is what &quot;Diff vs now&quot; shows), so the two counts rarely agree. A project's first checkpoint counts every file, since everything is new to it."
+                >{cp.files_changed} file{cp.files_changed === 1 ? '' : 's'}</span
+              >
               <span class="agent">{cp.agent ?? '—'}</span>
               <span class="actions">
                 <button type="button" onclick={() => void toggleDiff(cp.id)}>
@@ -622,6 +626,9 @@
     color: var(--text-secondary, #bbb);
     font-size: var(--font-size-xs, 11px);
     font-variant-numeric: tabular-nums;
+    /* The count's meaning lives in its title (it is NOT the diff-vs-now
+       size) — same "hover me" affordance as .note-icon. */
+    cursor: help;
   }
   .agent {
     flex: 0 0 auto;

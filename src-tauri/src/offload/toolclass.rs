@@ -782,6 +782,37 @@ pub const UNATTRIBUTED_WRITE_NOTICE: &str = " ⚠ HELD FOR REVIEW (unattributed 
     until the user releases it in cImp's Memory view. Nothing further can be done from here; do \
     not rewrite or re-save it, and include anything the user must act on now in your answer.";
 
+/// #48, F-24 — the **human**-facing reason for a latch-held note, shown as the
+/// headline of its row in the Memory view's review queue.
+///
+/// Why this is not [`QUARANTINE_WRITE_NOTICE`] itself, which is the string this
+/// path already had in hand: that one is addressed to the model and its last
+/// clause is an instruction to it ("Nothing further can be done from here; do
+/// not rewrite or re-save it, and include anything the user must act on now in
+/// your answer"). Handed to a person it is both wrong-audience and the wrong
+/// *shape* — the card renders this field as a one-line headline above the note
+/// text, and a 70-word paragraph there would bury the note it describes.
+///
+/// So the audiences get their own sentence from the same verdict, and the pair
+/// is kept honest by asserting the same CAUSE appears in both
+/// ([`tests::the_review_reasons_name_the_same_cause_as_the_model_notices`]).
+/// What must never differ is the cause; what must differ is who is being
+/// spoken to.
+pub const QUARANTINE_REVIEW_REASON: &str = "Held by the session taint latch: this note's session \
+    had already read external content (a web page or an MCP server) before the write, so the note \
+    may be repeating instructions from it rather than the session's own findings.";
+
+/// #48, F-24 — the human-facing reason for an unattributed write (M-19's cause).
+/// [`QUARANTINE_REVIEW_REASON`] carries the argument for why these exist.
+///
+/// Like [`UNATTRIBUTED_WRITE_NOTICE`] it claims only what this path knows, and
+/// deliberately does not borrow the latch's cause — the whole point of M-19's
+/// separate variant is that the two holds have different reasons and a reader
+/// (model or human) must not be given the wrong one.
+pub const UNATTRIBUTED_REVIEW_REASON: &str = "Held as an unattributed write: this call reached \
+    cImp without a resolvable tab identity, so neither the session this note belongs to nor \
+    whether that session had read external content could be established.";
+
 /// V32 Phase C2 — whether a PERSISTENT-WRITE that the gate let through must be
 /// stored quarantined. Threaded from [`Latch::proxy_gate`] through the loopback
 /// `/graph_run` route into the memory write (`GraphIndex::mem_add_note`).
@@ -813,23 +844,46 @@ pub enum WriteTaint {
 }
 
 impl WriteTaint {
-    /// The stored `mem_note.tainted` column value.
+    /// **The one match over this enum.** Whether the verdict holds the note, and
+    /// if it does, what each of its two audiences is told — the model in the tool
+    /// result, the user in the Memory view's review queue.
+    ///
+    /// One method returning both strings, rather than three parallel `match`es
+    /// (#48, F-24). The three questions this answers — *is it held*, *what does
+    /// the model see*, *what does the user see* — have to agree on every variant
+    /// or the milestone's own findings recur: a hold with no user-facing reason is
+    /// F-24, and a hold explained with the other hold's cause is M-19. Adding a
+    /// fourth verdict is therefore a non-exhaustive-match error that cannot be
+    /// satisfied by filling in one audience and forgetting the other, which is
+    /// the same argument that made this an enum instead of a `bool` in C2.
+    fn hold(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            WriteTaint::Clean => None,
+            WriteTaint::Quarantined => Some((QUARANTINE_WRITE_NOTICE, QUARANTINE_REVIEW_REASON)),
+            WriteTaint::Unattributed => {
+                Some((UNATTRIBUTED_WRITE_NOTICE, UNATTRIBUTED_REVIEW_REASON))
+            }
+        }
+    }
+
+    /// Whether this verdict quarantines the note. Read by
+    /// `graph::memory::NoteQuarantine::for_write`, which the store calls to
+    /// derive the stored `mem_note.tainted` column — the flag and the stored
+    /// reason come from this one value, so they cannot disagree.
     pub fn is_quarantined(self) -> bool {
-        matches!(self, WriteTaint::Quarantined | WriteTaint::Unattributed)
+        self.hold().is_some()
     }
 
     /// The fixed suffix the model is given for this verdict, or `None` when the
     /// write was ordinary.
-    ///
-    /// A method rather than an `if tainted { … }` at the call site so that
-    /// adding a fourth verdict is a non-exhaustive-match error here — the same
-    /// reason this is an enum and not a `bool`.
     pub fn write_notice(self) -> Option<&'static str> {
-        match self {
-            WriteTaint::Clean => None,
-            WriteTaint::Quarantined => Some(QUARANTINE_WRITE_NOTICE),
-            WriteTaint::Unattributed => Some(UNATTRIBUTED_WRITE_NOTICE),
-        }
+        self.hold().map(|(model, _)| model)
+    }
+
+    /// #48, F-24 — the sentence the **user** is shown for this verdict in the
+    /// Memory view's review queue, or `None` when the write was ordinary.
+    pub fn review_reason(self) -> Option<&'static str> {
+        self.hold().map(|(_, user)| user)
     }
 }
 
@@ -1198,6 +1252,82 @@ mod tests {
         assert!(QUARANTINE_WRITE_NOTICE.contains("until the user promotes it"));
         assert!(QUARANTINE_WRITE_NOTICE.contains("do not rewrite"));
         assert!(!QUARANTINE_WRITE_NOTICE.contains('{'));
+    }
+
+    /// #48, F-24 — every verdict that HOLDS a note owes the human a reason, and
+    /// every verdict that does not hold one owes silence.
+    ///
+    /// Asserted as the three-way agreement between
+    /// [`WriteTaint::is_quarantined`], [`WriteTaint::write_notice`] and
+    /// [`WriteTaint::review_reason`] over an exhaustive variant list, so a fourth
+    /// verdict that quarantines and forgets one of its two audiences fails here.
+    /// The exhaustiveness comes from the `match` in the loop — adding a variant
+    /// without listing it is a compile error, not a silently thinner test.
+    #[test]
+    fn every_held_verdict_has_both_audiences() {
+        for v in [
+            WriteTaint::Clean,
+            WriteTaint::Quarantined,
+            WriteTaint::Unattributed,
+        ] {
+            match v {
+                WriteTaint::Clean => assert!(!v.is_quarantined()),
+                WriteTaint::Quarantined | WriteTaint::Unattributed => assert!(v.is_quarantined()),
+            }
+            assert_eq!(
+                v.is_quarantined(),
+                v.write_notice().is_some(),
+                "{v:?}: a held write must tell the model why"
+            );
+            assert_eq!(
+                v.is_quarantined(),
+                v.review_reason().is_some(),
+                "{v:?}: a held write must tell the USER why — that is F-24"
+            );
+            // "Empty is not absent": a blank reason renders as *"Reason not
+            // recorded"* in the Memory view (`quarantineReason` in graph.ts
+            // collapses blank to null on purpose), so a present-but-blank one
+            // here would silently look like a build that stores nothing.
+            if let Some(r) = v.review_reason() {
+                assert!(!r.trim().is_empty(), "{v:?}: blank reads as *absent*");
+                assert!(!r.contains('{'), "{v:?}: no placeholder survived");
+            }
+        }
+    }
+
+    /// #48, F-24 — the two audiences may differ in wording; they may not differ
+    /// in CAUSE.
+    ///
+    /// This is the whole reason M-19 split `Unattributed` out of `Quarantined`:
+    /// a hold explained with the other hold's cause is a boundary message that
+    /// invents a fact. The model notice and the review reason are separate
+    /// strings (see [`QUARANTINE_REVIEW_REASON`] for why), so nothing but this
+    /// keeps them describing the same event.
+    #[test]
+    fn the_review_reasons_name_the_same_cause_as_the_model_notices() {
+        // The latch cause: external content, in both audiences' words.
+        assert!(QUARANTINE_WRITE_NOTICE.contains("used an external tool"));
+        assert!(QUARANTINE_REVIEW_REASON.contains("read external content"));
+        assert!(QUARANTINE_REVIEW_REASON.contains("taint latch"));
+        // The unattributed cause: no resolvable tab identity, in both.
+        assert!(UNATTRIBUTED_WRITE_NOTICE.contains("without a resolvable tab identity"));
+        assert!(UNATTRIBUTED_REVIEW_REASON.contains("without a resolvable tab identity"));
+        // And neither borrows the other's cause.
+        assert!(
+            !UNATTRIBUTED_REVIEW_REASON.contains("taint latch"),
+            "M-19's defect, in the human's copy: {UNATTRIBUTED_REVIEW_REASON}"
+        );
+        assert!(
+            !QUARANTINE_REVIEW_REASON.contains("unattributed"),
+            "M-19's defect, reversed: {QUARANTINE_REVIEW_REASON}"
+        );
+        // The human's copy carries none of the model's instructions to itself.
+        for r in [QUARANTINE_REVIEW_REASON, UNATTRIBUTED_REVIEW_REASON] {
+            assert!(!r.contains("do not rewrite"), "written at the model: {r}");
+            assert!(!r.contains("your answer"), "written at the model: {r}");
+            // One line in a card, not a paragraph in a tool result.
+            assert!(r.len() < 260, "too long for the card's headline: {r}");
+        }
     }
 
     #[test]

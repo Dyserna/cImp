@@ -8,7 +8,10 @@
 //! live on [`super::index::GraphIndex`]; these are the plain, serializable
 //! shapes returned to the service / IPC layer.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use crate::offload::outbound::Screen;
+use crate::offload::toolclass::WriteTaint;
 
 /// Newest-session cap: sessions beyond this (by `last_ms`) are evicted, cascading
 /// their events and unpinned notes.
@@ -39,6 +42,107 @@ pub struct WorkingSetEntry {
     pub top_symbols: Vec<String>,
 }
 
+/// #48, F-24 — **why** one note is quarantined, published with the note.
+///
+/// # The finding
+///
+/// All three causes already composed a sentence naming themselves, and all three
+/// sent it to the **model**: the secret screen's `secrets::write_notice(hits)`
+/// and the two latch notices went into the tool result and into an
+/// `injection_flag` activity row. The human — who is the only one that can
+/// promote or discard — got text, a timestamp and two buttons. For a
+/// secret-screen hold that inverts locked decision 22 outright: the note text
+/// *is* the credential, so the card displayed the value and withheld the rule.
+///
+/// # Why it travels with the note and not by a join (locked decision 10, as
+/// amended)
+///
+/// The obvious alternative — leave it in the `injection_flag` activity row and
+/// join at render time — fails four ways, and the third is fatal on its own:
+///
+/// 1. Those rows carry no `note_id`, so there is no key to join on.
+/// 2. The activity store is a capped per-lane ring, and its highest-volume lane
+///    is `MemoryQuarantine` (one row per held write) — so the OLDEST unreviewed
+///    notes, the ones most needing a reason, would be the first to lose it.
+/// 3. The feed is user-clearable and per-row deletable. A reason a user can
+///    delete without deleting the note is a reason that silently becomes
+///    "Reason not recorded".
+/// 4. Decision 22's action is literally *store*-and-quarantine. The reason is
+///    part of what was stored, so it belongs in the stored row.
+///
+/// # Set at the STORE boundary
+///
+/// Built by [`Self::for_write`], which
+/// [`GraphIndex::mem_add_note`](crate::graph::index::GraphIndex::mem_add_note)
+/// calls on the facts it was handed — never by a caller. A caller-side
+/// composition would re-open exactly the gap F-15 closes: a second write path
+/// that stores a held note with no reason, or with the wrong one. It is also
+/// what makes `tainted` and this field impossible to disagree — the store
+/// derives *both* from this one value.
+///
+/// Mirrored in TypeScript as `NoteQuarantine` in `src/lib/graph.ts`, field for
+/// field; `tests::the_quarantine_wire_shape_matches_the_frontend` is what keeps
+/// the two from drifting.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoteQuarantine {
+    /// The screen that held the write — the `outbound::Screen` slug. Always
+    /// `memory_quarantine` today: all three causes are that one screen, which is
+    /// why a note held by TWO of them needs no choice made here (see
+    /// [`Self::for_write`]).
+    pub screen: String,
+    /// The rule identifiers that matched, e.g. `secret_aws_access_key_id`.
+    ///
+    /// **Legitimately EMPTY for the two latch causes**, which match no rule at
+    /// all — so it is not the field the frontend tests for substantiveness, and
+    /// nothing here may treat an empty `rules` as an absent reason.
+    pub rules: Vec<String>,
+    /// One sentence naming the cause, in the user's words — the field a human
+    /// acts on, and therefore the one that must never arrive blank. Two
+    /// sentences when two causes fired.
+    pub reason: String,
+}
+
+impl NoteQuarantine {
+    /// Compose the record for one write, or `None` when the note is not held.
+    ///
+    /// **Both causes are recorded when both fired.** `mcp::run_tool` used to
+    /// collapse them into one `bool` (`tainted || !secrets.is_empty()`), so a
+    /// note held by the latch *and* the credential screen lost one of the two —
+    /// the same defect as F-9a (merging outcomes and discarding the
+    /// incompleteness), in the one place that exists so a human can see why. The
+    /// `reason` therefore carries both sentences, in cause order (the writing
+    /// conversation's state first, then the note's own content), and `rules`
+    /// carries the screen's hits regardless of the latch verdict.
+    ///
+    /// `screen` needs no choice made about it: all three causes are
+    /// [`Screen::MemoryQuarantine`](crate::offload::outbound::Screen), which is
+    /// the accurate name for every one of them (a memory write was held), so the
+    /// singular field is not lossy.
+    pub fn for_write(taint: WriteTaint, rules: &[String]) -> Option<Self> {
+        // The gate is the verdict's own `is_quarantined` — the same predicate C2
+        // wrote into the column — widened by the screen's hits. Not
+        // `reasons.is_empty()`: that would make a verdict whose reason string went
+        // missing silently *un*-quarantine the note, and of the two ways to be
+        // wrong here only one is a security regression. `WriteTaint::hold` is what
+        // makes the two impossible to disagree.
+        if !taint.is_quarantined() && rules.is_empty() {
+            return None;
+        }
+        let mut reasons: Vec<&str> = Vec::new();
+        if let Some(r) = taint.review_reason() {
+            reasons.push(r);
+        }
+        if !rules.is_empty() {
+            reasons.push(super::secrets::SECRET_REVIEW_REASON);
+        }
+        Some(NoteQuarantine {
+            screen: Screen::MemoryQuarantine.as_str().to_string(),
+            rules: rules.to_vec(),
+            reason: reasons.join(" "),
+        })
+    }
+}
+
 /// A remembered note (a decision or fact) for a session. Pinned notes survive
 /// their session's eviction and show project-wide.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -58,6 +162,20 @@ pub struct MemNote {
     /// says *whether* the note may be read at all, the other two say where.
     /// Pre-C2 rows migrate as `false` (`GraphIndex::migrate_mem_note_tainted`).
     pub tainted: bool,
+    /// #48, F-24: why this note is held, for the human who must decide about it.
+    /// See [`NoteQuarantine`].
+    ///
+    /// `None` means *we cannot tell you why*, and the Memory view renders it as
+    /// exactly that — never as "there was no reason". Three things produce it and
+    /// all three are honest: a clean note (nothing to explain), a row written
+    /// before this field existed (`GraphIndex::migrate_mem_note_quarantine`
+    /// migrates those to `None` rather than synthesizing a cause it does not
+    /// know), and a stored record that could not be read back.
+    ///
+    /// Always `None` on the clean-read path (`GraphIndex::mem_notes`), which is
+    /// not a claim about the row but about the query: that path returns only
+    /// `tainted == false` notes, and an unheld note has no hold to explain.
+    pub quarantine: Option<NoteQuarantine>,
 }
 
 /// A session summary row for the Memory UI's "recent sessions" list.
@@ -522,6 +640,174 @@ pub enum MemArg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frontend's hand-mirror of these wire types, embedded at compile time —
+    /// the same mechanism `settings::frontend_mirrors` uses, and for the same
+    /// reason: nothing in `cargo` can see across the language boundary.
+    const GRAPH_TS: &str = include_str!("../../../src/lib/graph.ts");
+
+    /// #48, F-24 — `NoteQuarantine` and `MemNote.quarantine` must reach the
+    /// frontend under the names the frontend reads.
+    ///
+    /// Only half of this is a source scan, and it is the half that has to be: the
+    /// TypeScript side is parsed out of `graph.ts`, but the **Rust** side is taken
+    /// from `serde_json` rather than from the struct's source text — so a
+    /// `#[serde(rename)]`, a `skip_serializing_if`, or a field quietly removed is
+    /// caught by what actually goes over the wire, not by a regex over the
+    /// declaration.
+    ///
+    /// Two self-guards, both of which fail loudly rather than skipping:
+    /// the interface must be found in `graph.ts` (a rename or a move panics
+    /// instead of vacuously passing), and its field set must be non-empty.
+    ///
+    /// F-24 is the finding where the backend held the reason and the human never
+    /// saw it. The failure mode this guards is the near-miss version: publishing a
+    /// reason under a key the card does not read, which renders as *"Reason not
+    /// recorded"* — indistinguishable, from the user's chair, from not publishing
+    /// it at all.
+    #[test]
+    fn the_quarantine_wire_shape_matches_the_frontend() {
+        /// The field names declared in `export interface <name> { … }`, in
+        /// declaration order: every `ident:` at the top level of the block.
+        fn ts_interface_fields(name: &str) -> Vec<String> {
+            let decl = format!("export interface {name} {{");
+            let at = GRAPH_TS.find(&decl).unwrap_or_else(|| {
+                panic!(
+                    "`{decl}` is not declared in src/lib/graph.ts — the mirror moved or was \
+                     renamed, and this guard is now watching nothing. Point it at the new name."
+                )
+            });
+            let body_start = at + decl.len();
+            let body_len = GRAPH_TS[body_start..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("`{decl}`'s body is never closed"));
+            let body = &GRAPH_TS[body_start..body_start + body_len];
+            let mut out = Vec::new();
+            for line in body.lines() {
+                let line = line.trim();
+                // Skip doc comments (`///`) and blank lines; take `name?: type;`.
+                if line.starts_with("//") || line.is_empty() {
+                    continue;
+                }
+                if let Some((lhs, _)) = line.split_once(':') {
+                    let field = lhs.trim().trim_end_matches('?');
+                    if !field.is_empty() && field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        out.push(field.to_string());
+                    }
+                }
+            }
+            assert!(!out.is_empty(), "parsed no fields out of `{decl}`");
+            out
+        }
+
+        /// The keys `serde` actually emits for a value.
+        fn wire_keys(v: &serde_json::Value) -> Vec<String> {
+            v.as_object()
+                .expect("a struct serializes as an object")
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        let q = NoteQuarantine {
+            screen: "memory_quarantine".to_string(),
+            rules: vec!["secret_aws_access_key_id".to_string()],
+            reason: "Held by the write-time credential screen.".to_string(),
+        };
+        assert_eq!(
+            wire_keys(&serde_json::to_value(&q).unwrap()),
+            ts_interface_fields("NoteQuarantine"),
+            "NoteQuarantine's wire shape and `src/lib/graph.ts`'s `NoteQuarantine` \
+             have drifted — the Memory view reads the TypeScript names"
+        );
+
+        let note = MemNote {
+            note_id: "n1".to_string(),
+            session_id: "s1".to_string(),
+            text: "held".to_string(),
+            ts_ms: 1,
+            pinned: false,
+            tainted: true,
+            quarantine: Some(q),
+        };
+        let v = serde_json::to_value(&note).unwrap();
+        assert_eq!(
+            wire_keys(&v),
+            ts_interface_fields("MemNote"),
+            "MemNote's wire shape and `src/lib/graph.ts`'s `MemNote` have drifted"
+        );
+        // The nested record survives serialization as an object under the key the
+        // card reads, and a clean note's field is `null` — which `quarantineReason`
+        // collapses to "no reason to show", never to "there was no reason".
+        assert!(v.get("quarantine").unwrap().is_object());
+        let clean = MemNote {
+            quarantine: None,
+            ..note
+        };
+        assert!(serde_json::to_value(&clean)
+            .unwrap()
+            .get("quarantine")
+            .unwrap()
+            .is_null());
+    }
+
+    /// #48, F-24 — the record is composed from the two causes, both of them, and
+    /// only when the note is actually held.
+    ///
+    /// The reason a `for_write` unit test exists on top of the store's own
+    /// end-to-end one: this is the function that decides `tainted`, so "held with
+    /// no reason" and "a reason with no hold" are both single-expression mistakes
+    /// here, and both are invisible at a call site.
+    #[test]
+    fn for_write_records_every_cause_and_nothing_when_clean() {
+        use crate::offload::toolclass::{
+            QUARANTINE_REVIEW_REASON, UNATTRIBUTED_REVIEW_REASON,
+        };
+        let aws = vec!["secret_aws_access_key_id".to_string()];
+
+        // Not held: no verdict, no hits, no record.
+        assert!(NoteQuarantine::for_write(WriteTaint::Clean, &[]).is_none());
+
+        // The screen alone.
+        let only = NoteQuarantine::for_write(WriteTaint::Clean, &aws).expect("held");
+        assert_eq!(only.screen, "memory_quarantine");
+        assert_eq!(only.rules, aws);
+        assert_eq!(only.reason, super::super::secrets::SECRET_REVIEW_REASON);
+
+        // The latch alone: a real reason with an EMPTY `rules`, which is the
+        // legitimate empty the frontend is careful not to test for.
+        let latch = NoteQuarantine::for_write(WriteTaint::Quarantined, &[]).expect("held");
+        assert!(latch.rules.is_empty());
+        assert_eq!(latch.reason, QUARANTINE_REVIEW_REASON);
+        let un = NoteQuarantine::for_write(WriteTaint::Unattributed, &[]).expect("held");
+        assert_eq!(un.reason, UNATTRIBUTED_REVIEW_REASON);
+
+        // BOTH: both sentences, in cause order (the conversation's state, then
+        // the note's own content), and the rules kept. Collapsing these into one
+        // cause is the defect this function exists to prevent.
+        let both = NoteQuarantine::for_write(WriteTaint::Quarantined, &aws).expect("held");
+        assert_eq!(both.rules, aws);
+        assert_eq!(
+            both.reason,
+            format!(
+                "{QUARANTINE_REVIEW_REASON} {}",
+                super::super::secrets::SECRET_REVIEW_REASON
+            )
+        );
+
+        // Never blank, for any held combination — a blank reason renders as
+        // "Reason not recorded", i.e. as this whole fix not having shipped.
+        for (taint, rules) in [
+            (WriteTaint::Quarantined, &[][..]),
+            (WriteTaint::Unattributed, &[][..]),
+            (WriteTaint::Clean, &aws[..]),
+            (WriteTaint::Quarantined, &aws[..]),
+        ] {
+            let q = NoteQuarantine::for_write(taint, rules).expect("held");
+            assert!(!q.reason.trim().is_empty(), "{taint:?}/{rules:?}");
+            assert!(!q.screen.trim().is_empty(), "{taint:?}/{rules:?}");
+        }
+    }
 
     #[test]
     fn classify_maps_kinds_and_ignores_meta_tools() {

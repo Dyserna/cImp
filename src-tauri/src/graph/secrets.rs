@@ -106,12 +106,15 @@ const _: () = assert!(MAX_NOTE_BYTES <= signature::SCAN_PREFIX_BYTES);
 /// of**, and the only thing `screen` accepts.
 ///
 /// The field is private and [`parse`](Self::parse) is the sole constructor, so
-/// "the screen saw the whole note" is enforced by the type checker rather than
-/// by a comment — the same shape as `RawReport`'s audit envelope and
-/// `GatePass`'s backend gate. It takes the `String` by value on purpose: at the
-/// one call site (`mcp::run_tool`'s `context_note` arm) that moves the raw text
-/// out of scope, so the note that gets *stored* is necessarily the note that
-/// was screened.
+/// "the screen *could* see the whole note" is enforced by the type checker
+/// rather than by a comment — the same shape as `RawReport`'s audit envelope and
+/// `GatePass`'s backend gate. It takes the `String` by value on purpose: that
+/// moves the raw text out of the caller's scope, so there is no unbounded copy
+/// left to store instead.
+///
+/// **This type says "screenable", not "screened"** — which is the distinction
+/// #48's F-15 turned on. That the screen actually *ran* is [`ScreenedNote`]'s
+/// job, and it is the only thing the store accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteText(String);
 
@@ -189,6 +192,75 @@ fn compile(source: &str) -> Option<Arc<yara_x::Rules>> {
     rules
 }
 
+/// #48, F-15 — a note that **has been screened**, carrying its own verdict.
+///
+/// [`NoteText`] closed half of M-20: it proves the note is small enough to be
+/// read in full. F-15 is the other half — nothing proved the screen had actually
+/// been *run* before the note was stored, because
+/// [`GraphIndex::mem_add_note`](crate::graph::index::GraphIndex::mem_add_note)
+/// took a bare `&str`. The screen lived at one caller (`mcp::run_tool`'s
+/// `context_note` arm), and "the one funnel every write path reaches" was a
+/// property of today's call graph, not of the code: a second write path — a new
+/// IPC command, a migration, an importer — would have compiled.
+///
+/// This type makes that unrepresentable. [`Self::of`] is the only constructor
+/// and it runs the screen, the store accepts nothing else, and the hits it
+/// carries are the same ones the store derives `tainted` and the human-facing
+/// quarantine reason from. There is no longer a spelling of "store this text"
+/// that skips either half.
+///
+/// The field is a [`NoteText`] and not a `String` so the size bound cannot be
+/// re-opened from inside this module either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenedNote {
+    text: NoteText,
+    hits: Vec<String>,
+}
+
+impl ScreenedNote {
+    /// The screening boundary: takes the parsed note **by value** and returns it
+    /// with its verdict attached. Consuming the [`NoteText`] is what leaves no
+    /// screened-but-unstored / unscreened-but-storable copy in scope at the call
+    /// site, the same discipline `NoteText::parse` applies to the raw `String`.
+    pub fn of(text: NoteText) -> Self {
+        let hits = screen(&text);
+        ScreenedNote { text, hits }
+    }
+
+    /// The note itself, for storage.
+    pub fn text(&self) -> &str {
+        self.text.as_str()
+    }
+
+    /// The rule identifiers that matched — empty for a clean note (and for a
+    /// screen that could not run; see [`rules`] for that deliberate fail-open).
+    pub fn hits(&self) -> &[String] {
+        &self.hits
+    }
+}
+
+/// #48, F-24 — the **human**-facing reason for a note the secret screen held,
+/// shown as the headline of its row in the Memory view's review queue.
+///
+/// Not [`write_notice`], which is the string this path already had in hand:
+/// that one is addressed to the model, ends in instructions to it ("do not
+/// rewrite or re-save it without the secret, and tell the user what you
+/// recorded"), and is a paragraph where the card has one line. See
+/// [`QUARANTINE_REVIEW_REASON`](crate::offload::toolclass::QUARANTINE_REVIEW_REASON)
+/// for the full argument; this is its sibling for the third cause.
+///
+/// It names no rule identifier, on purpose: the identifiers travel in
+/// `NoteQuarantine::rules`, which the card renders beside this sentence as their
+/// own monospace element. Repeating them here would duplicate the one part of
+/// the row a user might search the ruleset for, and locked decision 22 wants
+/// them prominent, not said twice.
+///
+/// Content-free about the note itself, exactly like every other boundary string
+/// here — it names what matched, never what the match was.
+pub const SECRET_REVIEW_REASON: &str = "Held by the write-time credential screen: this note's own \
+    text matched cImp's credential patterns, and project memory is readable by any later session, \
+    including one reading untrusted content.";
+
 /// The identifiers of every secret rule matching `note`, or an empty vec for a
 /// clean note (and for a screen that could not run — see [`rules`]).
 ///
@@ -224,7 +296,13 @@ fn compile(source: &str) -> Option<Arc<yara_x::Rules>> {
 /// designed away, and it is no longer attacker-*selectable* the way the prefix
 /// bound was: padding buys the writer nothing, because padding past
 /// [`MAX_NOTE_BYTES`] means the note is not stored at all.
-pub fn screen(note: &NoteText) -> Vec<String> {
+///
+/// **Module-private since #48/F-15.** The only way to obtain a verdict is to
+/// build a [`ScreenedNote`], which is also the only thing the store accepts —
+/// so a caller cannot screen without storing what it screened, and cannot store
+/// without screening. Keeping this callable from outside would leave the "screen
+/// here, store something else" shape available for the price of two lines.
+fn screen(note: &NoteText) -> Vec<String> {
     let Some(rules) = rules() else {
         return Vec::new();
     };
@@ -258,6 +336,18 @@ pub fn write_notice(hits: &[String]) -> String {
          where the value actually belongs.",
         hits.join(", ")
     )
+}
+
+/// A screened note built from a `&str`, for the store's own tests.
+///
+/// `#[cfg(test)]` on purpose: the whole point of [`ScreenedNote`] is that
+/// production code cannot get one without screening, and a convenience
+/// constructor compiled into the binary would be the escape hatch F-15 is about.
+/// Test fixtures still go through the real screen — a fixture that would be held
+/// in production is held here too, which is what keeps them honest.
+#[cfg(test)]
+pub fn test_screened(text: &str) -> ScreenedNote {
+    ScreenedNote::of(NoteText::parse(text.to_string()).expect("a test fixture is under the cap"))
 }
 
 #[cfg(test)]

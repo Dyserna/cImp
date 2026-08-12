@@ -1353,7 +1353,15 @@ pub fn run_tool(
             // tied to what the scanner reads, so a note cannot be stored with a
             // tail nobody screened. Taking the `String` by value leaves no raw
             // `text` in scope for the storage call below to reach for.
-            let text = super::secrets::NoteText::parse(req("text")?)?;
+            // #48, F-15: parse, then screen, in one expression that leaves
+            // neither an unscreened `NoteText` nor a raw `String` in scope. The
+            // screen used to run further down and hand the store a `&str`; the
+            // store now takes only a `ScreenedNote`, so this is where the note
+            // becomes storable rather than where one caller remembered to check
+            // it. See `GraphIndex::mem_add_note`.
+            let note = super::secrets::ScreenedNote::of(super::secrets::NoteText::parse(
+                req("text")?,
+            )?);
             let pin = args.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
             // F21: an UNPINNED note needs a real session to attach to — with none,
             // it would be stored under a sentinel "" id and never resurface in the
@@ -1380,24 +1388,25 @@ pub fn run_tool(
             // promotes it. The Phase A/B behaviour was a hard refusal, which
             // threw away the legitimate conclusions a research session exists to
             // produce; the model is told the difference in the result below.
-            let tainted = guards.taint.is_quarantined();
-            // V32 Phase C2, #48 (user decision 2026-08-07): the SECRET screen,
-            // which is about the note's own content rather than the writing
-            // conversation's state. Same holding pen, second reason — see
-            // `graph::secrets` for why a hit quarantines rather than refuses or
-            // redacts, and why the reads were not latched instead.
             //
-            // Screened HERE, in `run_tool`, because this is the one funnel every
-            // write path reaches: the loopback `/graph_run` route, the headless
-            // MCP child and the offload worker's native route all land on this
-            // arm. A screen at any caller would be a screen one caller could
-            // forget.
-            let secrets = super::secrets::screen(&text);
-            let quarantined = tainted || !secrets.is_empty();
-            idx.mem_add_note(&note_id, &sid, text.as_str(), ts, pin, quarantined)
+            // V32 Phase C2, #48 (user decision 2026-08-07): the SECRET screen is
+            // the second cause, about the note's own content rather than the
+            // writing conversation's state — see `graph::secrets` for why a hit
+            // quarantines rather than refuses or redacts.
+            //
+            // #48, F-24: NEITHER decision is made here any more. This arm hands
+            // the store the two facts (the latch verdict and the screen's hits)
+            // and the store composes the hold record and derives `tainted` from
+            // it. What used to happen here — `tainted || !secrets.is_empty()`,
+            // collapsed into one `bool` — is exactly how a note held for BOTH
+            // reasons arrived in the user's review queue explained by only one of
+            // them; and a reason composed at a caller is a reason the next caller
+            // forgets, which is the gap F-15 closes one layer down.
+            idx.mem_add_note(&note_id, &sid, &note, ts, pin, guards.taint)
                 .map(|_| {
+                    let secrets = note.hits();
                     if !secrets.is_empty() {
-                        record_secret_screen_flag(agent, attribution.clone(), &secrets, root);
+                        record_secret_screen_flag(agent, attribution.clone(), secrets, root);
                     }
                     let scope = if pin {
                         " (pinned, kept across sessions)"
@@ -1417,7 +1426,7 @@ pub fn run_tool(
                         out.push_str(notice);
                     }
                     if !secrets.is_empty() {
-                        out.push_str(&super::secrets::write_notice(&secrets));
+                        out.push_str(&super::secrets::write_notice(secrets));
                     }
                     out
                 })
@@ -4340,7 +4349,9 @@ mod surface_tests {
 #[cfg(test)]
 mod memory_write_boundary_tests {
     use super::*;
+    use crate::graph::secrets::test_screened as screened;
     use crate::graph::GraphIndex;
+    use crate::offload::toolclass::WriteTaint;
 
     fn temp_index(tag: &str) -> (std::path::PathBuf, GraphIndex) {
         let dir = std::env::temp_dir().join(format!("ckg-{tag}-{}", uuid::Uuid::new_v4()));
@@ -4377,8 +4388,15 @@ mod memory_write_boundary_tests {
         );
 
         let (dir, idx) = temp_index("headless-write");
-        idx.mem_add_note("n1", "s1", "we chose FNV hashing", 1_000, true, false)
-            .expect("seed a note");
+        idx.mem_add_note(
+            "n1",
+            "s1",
+            &screened("we chose FNV hashing"),
+            1_000,
+            true,
+            WriteTaint::Clean,
+        )
+        .expect("seed a note");
 
         // The read half of the same path.
         let out = run_tool(
@@ -4419,8 +4437,15 @@ mod memory_write_boundary_tests {
     #[test]
     fn a_pinned_sessionless_note_is_project_wide_and_unattributable() {
         let (dir, idx) = temp_index("pin-no-session");
-        idx.mem_add_note("n1", "", "reachable from every session", 1_000, true, false)
-            .expect("write");
+        idx.mem_add_note(
+            "n1",
+            "",
+            &screened("reachable from every session"),
+            1_000,
+            true,
+            WriteTaint::Clean,
+        )
+        .expect("write");
         for sid in ["", "some-other-session", "a-third-one"] {
             let notes = idx.mem_notes(sid).expect("read");
             assert_eq!(

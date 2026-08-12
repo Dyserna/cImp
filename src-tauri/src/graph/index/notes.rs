@@ -95,7 +95,9 @@ use std::collections::{BTreeMap, HashSet};
 use cozo::{DataValue, Num, ScriptMutability};
 
 use crate::error::{AppError, AppResult};
-use crate::graph::memory::MemNote;
+use crate::graph::memory::{MemNote, NoteQuarantine};
+use crate::graph::secrets::ScreenedNote;
+use crate::offload::toolclass::WriteTaint;
 
 use super::{cell_bool, cell_i64, cell_str, GraphIndex};
 
@@ -120,6 +122,23 @@ pub(super) const RM_ALL: &str = "?[note_id] := *mem_note{note_id}\n:rm mem_note 
 pub(super) const RM_UNPINNED_BY_SESSION: &str =
     "?[note_id] := *mem_note{note_id, session_id, pinned}, session_id == $sid, pinned == false\n\
      :rm mem_note {note_id}";
+
+// ── Migration reads ────────────────────────────────────────────────────────
+//
+// Each names a HISTORICAL column set, and each is deliberately not derived from
+// the current DDL for the same reason [`FIXTURE_CREATE_PRE_C2`] is not: a
+// migration input that tracked the current shape would stop being the shape it
+// has to cope with the day the shape changes again.
+
+/// Every note in the PRE-C2 shape — no `tainted`, no `quarantine`.
+/// [`GraphIndex::migrate_mem_note_tainted`]'s input.
+const READ_PRE_C2: &str = "?[note_id, session_id, text, ts_ms, pinned] := \
+     *mem_note{note_id, session_id, text, ts_ms, pinned}";
+
+/// Every note in the C2 shape — `tainted` present, `quarantine` not yet.
+/// [`GraphIndex::migrate_mem_note_quarantine`]'s input (#48, F-24).
+const READ_C2: &str = "?[note_id, session_id, text, ts_ms, pinned, tainted] := \
+     *mem_note{note_id, session_id, text, ts_ms, pinned, tainted}";
 
 impl GraphIndex {
     /// Ensure the relation exists. Called from
@@ -146,10 +165,17 @@ impl GraphIndex {
     /// failing — the same honest-default posture as `ref.confidence`. Every
     /// writer in this file still passes it explicitly; the default is the
     /// backstop, not the contract.
+    ///
+    /// #48, F-24: `quarantine` carries **why** a held note is held, as the JSON
+    /// of [`NoteQuarantine`] — one column rather than three so that "no record"
+    /// has exactly one spelling (the empty string) instead of three that could
+    /// disagree. Its default is `''` = *no record*, which the read path renders
+    /// as *"Reason not recorded"* and never as *"there was no reason"*; see
+    /// [`decode_quarantine`].
     pub(super) fn mem_note_create_ddl(name: &str) -> String {
         format!(
             ":create {name} {{note_id: String => session_id: String, text: String, ts_ms: Int, \
-                pinned: Bool, tainted: Bool default false}}"
+                pinned: Bool, tainted: Bool default false, quarantine: String default ''}}"
         )
     }
 
@@ -178,6 +204,53 @@ impl GraphIndex {
     /// protected instead by the [`super::GRAPH_SCHEMA_VERSION`] gate, which refuses a
     /// store whose `mem_note` has not been migrated yet.
     pub(super) fn migrate_mem_note_tainted(&self) -> AppResult<()> {
+        self.migrate_mem_note_shape(
+            "tainted",
+            READ_PRE_C2,
+            &[DataValue::Bool(false), DataValue::Str("".into())],
+        )
+    }
+
+    /// #48, F-24: add the `quarantine` column to a `mem_note` that already has
+    /// `tainted`, defaulting existing rows to **no record**.
+    ///
+    /// The second migration exists because the first one cannot reach these
+    /// stores: [`Self::migrate_mem_note_tainted`] returns early the moment
+    /// `tainted` is present, which is every store this milestone has already
+    /// shipped to. Both bring `mem_note` to the *current* shape; which one does
+    /// the work depends only on where the store starts.
+    ///
+    /// **Pre-existing rows migrate to `None`, never to a synthesized cause.** The
+    /// reason a note was held is not recoverable after the fact: the
+    /// `injection_flag` row that carried it has no `note_id`, its lane is a capped
+    /// ring the user can clear, and re-screening the text would answer a
+    /// *different* question (what matches now) while inventing a cause for the two
+    /// latch holds, which match no rule at all. So these rows say "not recorded",
+    /// which is true. F-23 is the finding for doing the other thing.
+    pub(super) fn migrate_mem_note_quarantine(&self) -> AppResult<()> {
+        self.migrate_mem_note_shape("quarantine", READ_C2, &[DataValue::Str("".into())])
+    }
+
+    /// The stage-and-swap engine both `mem_note` migrations run: read the old
+    /// shape with `read_script`, append `defaults` for the columns being added,
+    /// stage the result in the CURRENT shape, verify the row count, then swap.
+    ///
+    /// One engine rather than two copies because the crash-safety is the subtle
+    /// part (CozoDB autocommits each script, so a naive remove→create→put loses
+    /// data if the process dies mid-sequence), and a second hand-rolled copy of
+    /// it is a second chance to get the abort path wrong. `added_column` is the
+    /// idempotence probe: present ⇒ this migration already ran.
+    ///
+    /// The recovery branch is shared too, and deliberately: [`Self::MEM_NOTE_STAGE`]
+    /// always holds the *current* shape, whichever migration built it, so
+    /// whichever one runs first may adopt it. What must never happen is adopting
+    /// `mem_note` over a populated stage — that is the direction that loses notes.
+    fn migrate_mem_note_shape(
+        &self,
+        added_column: &str,
+        read_script: &str,
+        defaults: &[DataValue],
+    ) -> AppResult<()> {
         let existing = self.existing_relations()?;
         // Recovery: a leftover stage means a prior migration was interrupted
         // after the stage was durably populated. Adopt the stage over whatever
@@ -188,21 +261,16 @@ impl GraphIndex {
         if !existing.contains("mem_note") {
             return Ok(());
         }
-        if self.relation_has_column("mem_note", "tainted")? {
+        if self.relation_has_column("mem_note", added_column)? {
             return Ok(());
         }
-        let rows = self.run(
-            "?[note_id, session_id, text, ts_ms, pinned] := \
-                *mem_note{note_id, session_id, text, ts_ms, pinned}",
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )?;
+        let rows = self.run(read_script, BTreeMap::new(), ScriptMutability::Immutable)?;
         let expected = rows.rows.len();
         let migrated: Vec<DataValue> = rows
             .rows
             .into_iter()
             .map(|mut r| {
-                r.push(DataValue::Bool(false));
+                r.extend(defaults.iter().cloned());
                 DataValue::List(r)
             })
             .collect();
@@ -216,7 +284,7 @@ impl GraphIndex {
             p.insert("rows".to_string(), DataValue::List(migrated));
             self.run_mut(
                 &format!(
-                    "?[note_id, session_id, text, ts_ms, pinned, tainted] <- $rows\n{}",
+                    "?[note_id, session_id, text, ts_ms, pinned, tainted, quarantine] <- $rows\n{}",
                     Self::mem_note_create_ddl(Self::MEM_NOTE_STAGE)
                 ),
                 p,
@@ -270,35 +338,62 @@ impl GraphIndex {
         Ok(rows.rows.len())
     }
 
-    /// Record a note (a decision/fact) for a session.
+    /// Record a note (a decision/fact) for a session. **The one write path into
+    /// the note relation**, and since #48 the one place the quarantine decision
+    /// is made.
     ///
-    /// V32 Phase C2: `tainted` marks the note **quarantined** — stored, but
-    /// invisible to every read path until a human promotes it
-    /// ([`Self::mem_promote_note`]). It is decided by the loopback taint latch
-    /// (`Latch::proxy_gate`) and threaded here through `run_graph_tool` →
-    /// `dispatch_recorded` → `run_tool`; nothing in this layer infers it, so a
-    /// caller that forgets it writes a clean note — which is why the parameter
-    /// is a `WriteTaint` at every layer above rather than a bare `bool`.
+    /// # What the two non-obvious parameters are for
+    ///
+    /// `note` is a [`ScreenedNote`], not a `&str` (#48, **F-15**). M-20 gave the
+    /// *path* a guard — `mcp::run_tool`'s `context_note` arm parses a
+    /// [`NoteText`](crate::graph::secrets::NoteText) and screens it — but left
+    /// the *store* taking any string at all, so the guarantees were a property of
+    /// one caller rather than of the code. `ScreenedNote`'s only constructor caps
+    /// the size and runs the credential screen, so "store a note nobody screened"
+    /// no longer compiles. A tripwire was the alternative and is strictly worse:
+    /// this is a compile error at the exact line that would have been the bug.
+    ///
+    /// `taint` is a [`WriteTaint`], not a `bool`: the verdict is decided by the
+    /// loopback taint latch (`Latch::proxy_gate`) and threaded here through
+    /// `run_graph_tool` → `dispatch_recorded` → `run_tool`. Nothing in this layer
+    /// infers it, so a caller that gets it wrong writes the wrong thing — which is
+    /// why it is an enum whose variants say what they mean at the call site.
+    ///
+    /// # Why `tainted` is derived here and not passed (#48, F-24)
+    ///
+    /// The caller used to compute `tainted = latched || !secrets.is_empty()` and
+    /// hand down one `bool`, which threw away *which* of the two causes fired (and
+    /// both, when both did). Now the store composes
+    /// [`NoteQuarantine::for_write`] from the two facts it was given and derives
+    /// the flag from that: `tainted` is exactly "there is a hold record". The two
+    /// therefore cannot disagree, and no caller can store a held note with no
+    /// reason attached or a reason with no hold — which is the gap F-24 was, one
+    /// layer up.
     pub fn mem_add_note(
         &self,
         note_id: &str,
         session_id: &str,
-        text: &str,
+        note: &ScreenedNote,
         ts_ms: i64,
         pinned: bool,
-        tainted: bool,
+        taint: WriteTaint,
     ) -> AppResult<()> {
+        let hold = NoteQuarantine::for_write(taint, note.hits());
         let mut p = BTreeMap::new();
         p.insert("nid".to_string(), DataValue::Str(note_id.into()));
         p.insert("sid".to_string(), DataValue::Str(session_id.into()));
-        p.insert("text".to_string(), DataValue::Str(text.into()));
+        p.insert("text".to_string(), DataValue::Str(note.text().into()));
         p.insert("ts".to_string(), DataValue::Num(Num::Int(ts_ms)));
         p.insert("pin".to_string(), DataValue::Bool(pinned));
-        p.insert("taint".to_string(), DataValue::Bool(tainted));
+        p.insert("taint".to_string(), DataValue::Bool(hold.is_some()));
+        p.insert(
+            "hold".to_string(),
+            DataValue::Str(encode_quarantine(hold.as_ref()).into()),
+        );
         self.run_mut(
-            "?[note_id, session_id, text, ts_ms, pinned, tainted] <- \
-                [[$nid, $sid, $text, $ts, $pin, $taint]]\n\
-             :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted}",
+            "?[note_id, session_id, text, ts_ms, pinned, tainted, quarantine] <- \
+                [[$nid, $sid, $text, $ts, $pin, $taint, $hold]]\n\
+             :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted, quarantine}",
             p,
         )?;
         Ok(())
@@ -309,13 +404,24 @@ impl GraphIndex {
         self.rewrite_note(note_id, |n| n.pinned = pinned)
     }
 
-    /// V32 Phase C2: release a quarantined note into normal memory. Clears
-    /// `tainted` only — the pinned state is preserved, because the model's
-    /// `pin: true` was a statement about the note's *scope*, and re-deciding it
-    /// on the user's behalf would either lose a durable finding or silently
-    /// promote a session note to project-wide.
+    /// V32 Phase C2: release a quarantined note into normal memory. The pinned
+    /// state is preserved, because the model's `pin: true` was a statement about
+    /// the note's *scope*, and re-deciding it on the user's behalf would either
+    /// lose a durable finding or silently promote a session note to project-wide.
+    ///
+    /// #48, F-24: clears the hold RECORD along with the flag, so the pairing
+    /// `tainted ⇔ quarantine.is_some()` holds for every row in the relation and
+    /// not merely for freshly written ones. The field answers "why is this note
+    /// held", and a released note is not held; leaving a stale *"Held by the
+    /// session taint latch"* on a note the user has accepted into project memory
+    /// would be the same class of defect as the finding itself — a true fact
+    /// reported as a current one. The provenance that survives is the
+    /// `injection_flag` activity row, which is where an audit trail belongs.
     pub fn mem_promote_note(&self, note_id: &str) -> AppResult<()> {
-        self.rewrite_note(note_id, |n| n.tainted = false)
+        self.rewrite_note(note_id, |n| {
+            n.tainted = false;
+            n.quarantine = None;
+        })
     }
 
     /// V32 Phase C2: permanently delete one note (the quarantine review's
@@ -340,8 +446,9 @@ impl GraphIndex {
         let mut p = BTreeMap::new();
         p.insert("nid".to_string(), DataValue::Str(note_id.into()));
         let rows = self.run(
-            "?[session_id, text, ts_ms, pinned, tainted] := \
-                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted}, note_id == $nid",
+            "?[session_id, text, ts_ms, pinned, tainted, quarantine] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted, quarantine}, \
+                note_id == $nid",
             p.clone(),
             ScriptMutability::Immutable,
         )?;
@@ -355,6 +462,10 @@ impl GraphIndex {
             ts_ms: cell_i64(r, 2),
             pinned: cell_bool(r, 3),
             tainted: cell_bool(r, 4),
+            // Read back and written whole, so `mem_set_note_pinned` cannot drop
+            // the reason a note is held — the same hazard, and the same fix, as
+            // the `tainted` column this method was extended for in C2.
+            quarantine: decode_quarantine(&cell_str(r, 5), note_id),
         };
         mutate(&mut note);
         p.insert(
@@ -365,10 +476,14 @@ impl GraphIndex {
         p.insert("ts".to_string(), DataValue::Num(Num::Int(note.ts_ms)));
         p.insert("pin".to_string(), DataValue::Bool(note.pinned));
         p.insert("taint".to_string(), DataValue::Bool(note.tainted));
+        p.insert(
+            "hold".to_string(),
+            DataValue::Str(encode_quarantine(note.quarantine.as_ref()).into()),
+        );
         self.run_mut(
-            "?[note_id, session_id, text, ts_ms, pinned, tainted] <- \
-                [[$nid, $sid, $text, $ts, $pin, $taint]]\n\
-             :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted}",
+            "?[note_id, session_id, text, ts_ms, pinned, tainted, quarantine] <- \
+                [[$nid, $sid, $text, $ts, $pin, $taint, $hold]]\n\
+             :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted, quarantine}",
             p,
         )?;
         Ok(())
@@ -405,6 +520,10 @@ impl GraphIndex {
                 ts_ms: cell_i64(r, 3),
                 pinned: cell_bool(r, 4),
                 tainted: false,
+                // Not read, rather than read-and-discarded: this query returns
+                // `tainted == false` rows only, and an unheld note has no hold to
+                // explain. See `MemNote::quarantine`.
+                quarantine: None,
             })
             .collect();
         notes.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.ts_ms.cmp(&a.ts_ms)));
@@ -419,27 +538,64 @@ impl GraphIndex {
     /// the notes that need a decision. This is the one read path allowed to
     /// return tainted rows, and its only consumer is the Memory UI
     /// (`GraphService::memory_snapshot`).
+    ///
+    /// #48, F-24: **the one read path that returns the hold record**, because it
+    /// is the one whose consumer can act on it. A `None` here is not "no reason"
+    /// — it is a row written before the column existed, and the Memory view says
+    /// so in as many words rather than guessing (see [`decode_quarantine`]).
     pub fn mem_quarantined_notes(&self) -> AppResult<Vec<MemNote>> {
         let rows = self.run(
-            "?[note_id, session_id, text, ts_ms, pinned] := \
-                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted}, tainted == true",
+            "?[note_id, session_id, text, ts_ms, pinned, quarantine] := \
+                *mem_note{note_id, session_id, text, ts_ms, pinned, tainted, quarantine}, \
+                tainted == true",
             BTreeMap::new(),
             ScriptMutability::Immutable,
         )?;
         let mut notes: Vec<MemNote> = rows
             .rows
             .iter()
-            .map(|r| MemNote {
-                note_id: cell_str(r, 0),
-                session_id: cell_str(r, 1),
-                text: cell_str(r, 2),
-                ts_ms: cell_i64(r, 3),
-                pinned: cell_bool(r, 4),
-                tainted: true,
+            .map(|r| {
+                let note_id = cell_str(r, 0);
+                MemNote {
+                    quarantine: decode_quarantine(&cell_str(r, 5), &note_id),
+                    note_id,
+                    session_id: cell_str(r, 1),
+                    text: cell_str(r, 2),
+                    ts_ms: cell_i64(r, 3),
+                    pinned: cell_bool(r, 4),
+                    tainted: true,
+                }
             })
             .collect();
         notes.sort_by_key(|n| std::cmp::Reverse(n.ts_ms));
         Ok(notes)
+    }
+
+    /// Test-only: the raw `quarantine` column of one note, exactly as stored
+    /// (`""` for no record, and for a note that does not exist).
+    ///
+    /// #48, F-24: the pairing invariant *`tainted` ⇔ a hold record* is otherwise
+    /// unobservable in one direction. [`Self::mem_promote_note`] clears both, and
+    /// a promoted note leaves [`Self::mem_quarantined_notes`] — the only read path
+    /// that reads the column — so "the record was cleared too" would be a claim no
+    /// test could make. This is what lets
+    /// `index::tests::quarantined_notes_are_hidden_from_reads_until_promoted` make
+    /// it. `#[cfg(test)]` because production has no business reading a hold record
+    /// off an unheld note.
+    #[cfg(test)]
+    pub(super) fn mem_note_quarantine_raw(&self, note_id: &str) -> AppResult<String> {
+        let mut p = BTreeMap::new();
+        p.insert("nid".to_string(), DataValue::Str(note_id.into()));
+        let rows = self.run(
+            "?[quarantine] := *mem_note{note_id, quarantine}, note_id == $nid",
+            p,
+            ScriptMutability::Immutable,
+        )?;
+        Ok(rows
+            .rows
+            .first()
+            .map(|r| cell_str(r, 0))
+            .unwrap_or_default())
     }
 
     /// How many notes are quarantined project-wide. Feeds the `context_notes`
@@ -453,6 +609,63 @@ impl GraphIndex {
             ScriptMutability::Immutable,
         )?;
         Ok(rows.rows.len())
+    }
+}
+
+// ── The `quarantine` column's encoding (#48, F-24) ─────────────────────────
+
+/// Serialize a hold record for the `quarantine` column. `None` ⇒ the empty
+/// string, which is the column's only spelling of *no record*.
+///
+/// The fallback is `""` rather than a panic or an `Err`: serializing three owned
+/// `String`/`Vec<String>` fields cannot fail in practice, and if it somehow did,
+/// refusing the whole write would throw away the note (the outcome locked
+/// decision 22 rejects) while a stored note with no reason degrades to the
+/// honest *"Reason not recorded"* the frontend already renders. Logged at
+/// `error`, because it would be a bug and not a condition.
+fn encode_quarantine(hold: Option<&NoteQuarantine>) -> String {
+    let Some(hold) = hold else {
+        return String::new();
+    };
+    serde_json::to_string(hold).unwrap_or_else(|e| {
+        tracing::error!(
+            target: "graph",
+            error = %e,
+            "mem_note: a quarantine reason could not be encoded — the note is stored held, but \
+             the Memory view will show it as `Reason not recorded`"
+        );
+        String::new()
+    })
+}
+
+/// Read a hold record back. `None` for the empty column (a row written before
+/// F-24, or a promoted note) **and** for a value that will not parse.
+///
+/// Both map to `None` on purpose, and the direction is the safe one: the
+/// frontend renders `None` as *"Reason not recorded — this build does not store
+/// which screen or rule held this note"*, never as *"there was no reason"*.
+/// Every input that reaches this fallback means the same thing — *we cannot tell
+/// you why* — which is what makes collapsing them honest rather than lossy. The
+/// alternative, reconstructing a plausible cause from the note text, is F-23.
+///
+/// `note_id` is only for the log line; a store that starts failing to parse its
+/// own column must be findable.
+fn decode_quarantine(raw: &str, note_id: &str) -> Option<NoteQuarantine> {
+    if raw.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<NoteQuarantine>(raw) {
+        Ok(q) => Some(q),
+        Err(e) => {
+            tracing::error!(
+                target: "graph",
+                note_id = %note_id,
+                error = %e,
+                "mem_note: the stored quarantine reason did not parse — the note stays held and \
+                 the Memory view shows it as `Reason not recorded`"
+            );
+            None
+        }
     }
 }
 
@@ -487,12 +700,27 @@ pub(super) const FIXTURE_PUT_PRE_C2: &str =
     "?[note_id, session_id, text, ts_ms, pinned] <- $rows\n\
      :put mem_note {note_id => session_id, text, ts_ms, pinned}";
 
-/// Insert `$rows` into the migration stage, in the C2 column set — what an
+/// The relation's shape at Phase C2 as SHIPPED — `tainted`, no `quarantine`
+/// (#48, F-24). The starting point of every store this milestone has already
+/// reached, and therefore [`GraphIndex::migrate_mem_note_quarantine`]'s input.
+/// Not derived from the current DDL, for [`FIXTURE_CREATE_PRE_C2`]'s reason.
+#[cfg(test)]
+pub(super) const FIXTURE_CREATE_C2: &str =
+    ":create mem_note {note_id: String => session_id: String, text: String, ts_ms: Int, \
+     pinned: Bool, tainted: Bool default false}";
+
+/// Insert `$rows` in the C2 column set (`tainted`, no `quarantine`).
+#[cfg(test)]
+pub(super) const FIXTURE_PUT_C2: &str =
+    "?[note_id, session_id, text, ts_ms, pinned, tainted] <- $rows\n\
+     :put mem_note {note_id => session_id, text, ts_ms, pinned, tainted}";
+
+/// Insert `$rows` into the migration stage, in the CURRENT column set — what an
 /// interrupted swap leaves behind for the recovery branch to adopt.
 #[cfg(test)]
 pub(super) const FIXTURE_PUT_STAGE: &str =
-    "?[note_id, session_id, text, ts_ms, pinned, tainted] <- $rows\n\
-     :put mem_note_v32 {note_id => session_id, text, ts_ms, pinned, tainted}";
+    "?[note_id, session_id, text, ts_ms, pinned, tainted, quarantine] <- $rows\n\
+     :put mem_note_v32 {note_id => session_id, text, ts_ms, pinned, tainted, quarantine}";
 
 #[cfg(test)]
 mod tests {
@@ -596,14 +824,18 @@ mod tests {
     /// MAINTENANCE.md's § *Cross-module invariants* requires "a per-file floor
     /// for every known site" of any surviving scan, and this one shipped
     /// without it: `mine > 0` alone tolerated eight of the nine vanishing. The
-    /// nine, in file order: `RM_BY_SESSION`, `RM_ALL`,
-    /// `RM_UNPINNED_BY_SESSION`, the migration's read, `mem_delete_note`,
+    /// eleven, in file order: `RM_BY_SESSION`, `RM_ALL`,
+    /// `RM_UNPINNED_BY_SESSION`, `READ_PRE_C2`, `READ_C2`, `mem_delete_note`,
     /// `rewrite_note`'s read, `mem_notes`, `mem_quarantined_notes`,
-    /// `mem_quarantined_count`.
+    /// `mem_note_quarantine_raw`, `mem_quarantined_count`.
     ///
     /// Raise it when a query is added; lowering it is a decision that belongs
-    /// in a commit message, which is the point of it being a constant.
-    const NOTE_QUERIES: usize = 9;
+    /// in a commit message, which is the point of it being a constant. It went
+    /// 9 → 11 with F-24: `READ_C2` (a second historical shape to migrate FROM,
+    /// not a new way to read a live note) and `mem_note_quarantine_raw` (test-only
+    /// — the count is over the file's text, and a `#[cfg(test)]` query is still a
+    /// query a reviewer must see).
+    const NOTE_QUERIES: usize = 11;
 
     /// The cross-module half of locked decision 10, as a backstop to the module
     /// boundary above: no file outside this one queries the note relation, so
@@ -766,5 +998,41 @@ mod tests {
         assert!(!super::FIXTURE_PUT_PRE_C2.contains("tainted"));
         assert!(super::FIXTURE_PUT_STAGE.contains("tainted"));
         assert_eq!(super::FIXTURE_DROP, "::remove mem_note");
+        // #48, F-24: the C2 pair is the SHIPPED shape — `tainted` but no
+        // `quarantine`. A fixture that grew the new column would make
+        // `migrate_mem_note_quarantine`'s test a no-op that still passed.
+        assert!(super::FIXTURE_CREATE_C2.contains("tainted"));
+        assert!(!super::FIXTURE_CREATE_C2.contains("quarantine"));
+        assert!(super::FIXTURE_PUT_C2.contains("tainted"));
+        assert!(!super::FIXTURE_PUT_C2.contains("quarantine"));
+        // ...and the stage is the CURRENT shape, which is what makes adopting it
+        // on recovery correct for either migration.
+        assert!(super::FIXTURE_PUT_STAGE.contains("quarantine"));
+    }
+
+    /// #48, F-24 — the column's encoding round-trips, and every *"we cannot tell
+    /// you why"* input arrives as `None`.
+    ///
+    /// The empty string is the column default and therefore what every
+    /// pre-migration row reads as; unparseable JSON is what a corrupted or
+    /// future-shaped value reads as. Both must land on the frontend's honest
+    /// placeholder rather than on a fabricated cause (F-23) or a panic.
+    #[test]
+    fn the_quarantine_column_round_trips_and_degrades_honestly() {
+        use crate::graph::memory::NoteQuarantine;
+        let q = NoteQuarantine {
+            screen: "memory_quarantine".to_string(),
+            rules: vec!["secret_aws_access_key_id".to_string()],
+            reason: "Held by the write-time credential screen.".to_string(),
+        };
+        let raw = super::encode_quarantine(Some(&q));
+        assert!(!raw.is_empty(), "a real record must not encode as absent");
+        assert_eq!(super::decode_quarantine(&raw, "n1"), Some(q));
+        // Absent stays absent, in both directions.
+        assert_eq!(super::encode_quarantine(None), "");
+        assert_eq!(super::decode_quarantine("", "n1"), None);
+        // Garbage is absent, not a guess and not a panic.
+        assert_eq!(super::decode_quarantine("{not json", "n1"), None);
+        assert_eq!(super::decode_quarantine("{\"screen\":1}", "n1"), None);
     }
 }

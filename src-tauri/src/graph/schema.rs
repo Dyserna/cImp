@@ -31,7 +31,17 @@
 /// store rather than query a `mem_note` that has no `tainted` column yet.
 /// The cost is one derived-relation rebuild per project, which is the accepted
 /// price of this discipline (every `RELATIONS` row is re-derivable from source).
-pub const GRAPH_SCHEMA_VERSION: i64 = 6;
+/// V32 (#48, F-24) == 7: `mem_note` gains a `quarantine` column carrying **why**
+/// a held note is held, for the human who must promote or discard it. Everything
+/// the V32 == 6 note says applies unchanged, including the part that is the
+/// reason this bump exists at all: `GraphIndex::open` only migrates inside the
+/// version-mismatch branch, so without the bump a store already stamped 6 would
+/// keep a `mem_note` with no `quarantine` column while every note query names
+/// one. The column add is
+/// `GraphIndex::migrate_mem_note_quarantine`; existing rows default to *no
+/// record*, which the Memory view shows as "Reason not recorded" rather than
+/// inventing a cause it cannot know.
+pub const GRAPH_SCHEMA_VERSION: i64 = 7;
 
 /// `(name, create-script)` for every stored relation. Order matters only in
 /// that all are ensured before any write.

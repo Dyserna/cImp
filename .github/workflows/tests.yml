@@ -17,30 +17,37 @@ name: Tests
 #    (Cargo.toml declares only `[[bin]]`), so `cargo test --lib` fails outright.
 #  * Windows, matching clippy.yml — it is the primary platform, and same-OS
 #    jobs can share one cargo cache.
+#
+# Trigger shape — `paths-ignore`, NOT `paths` (F-30, user decision 2026-08-12).
+# This job used to carry an ALLOWLIST of paths that can affect the tests. That
+# list was wrong: `detection/`, `themes/` and `palettes/` are all read from disk
+# by the suite and appeared in neither block, so a commit touching only those was
+# untested *and* runless — no Tests run existed for the release gate to consult,
+# and the failure surfaced at TAG time, the most expensive moment to learn it.
+#
+# The deeper problem is that the allowlist could not be verified: there is no
+# reliable way to enumerate what the suite reads from disk, so the list drifts
+# every time a data directory is added — and it drifts FAIL-OPEN, because a
+# forgotten entry means the tests silently do not run. Inverting it flips the
+# drift direction: anything not named here triggers, so a forgotten entry gets
+# TESTED rather than skipped. Nothing has to be kept in sync, which is why this
+# needs no tripwire.
+#
+# Only paths that provably cannot affect a test result belong below. Note
+# `clippy.yml` deliberately KEEPS its allowlist — its entries really are compile
+# inputs, so that list is verifiable in the way this one was not.
 on:
   push:
     branches: [develop, main]
-    paths:
-      - 'src-tauri/**'
-      - 'src/**'
-      - 'scripts/patterns.default.json'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'vite.config.ts'
-      - 'index.html'
-      - 'settings.html'
-      - '.github/workflows/tests.yml'
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.github/ISSUE_TEMPLATE/**'
   pull_request:
-    paths:
-      - 'src-tauri/**'
-      - 'src/**'
-      - 'scripts/patterns.default.json'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'vite.config.ts'
-      - 'index.html'
-      - 'settings.html'
-      - '.github/workflows/tests.yml'
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
 
 permissions:

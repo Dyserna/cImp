@@ -74,8 +74,15 @@
   let diffErrors = $state<Map<string, string>>(new Map());
   let diffLoading = $state<Set<string>>(new Set());
 
-  async function refresh(): Promise<void> {
-    loading = true;
+  // Overlap guard for BOTH refresh flavours — `loading` alone can't carry it
+  // because quiet (poll-driven) refreshes deliberately never set it, so the
+  // toolbar's Refresh button doesn't flash disabled on every tick.
+  let refreshing = false;
+
+  async function refresh(quiet = false): Promise<void> {
+    if (refreshing) return;
+    refreshing = true;
+    if (!quiet) loading = true;
     loadError = null;
     try {
       // Newest first — the shadow module returns oldest-first (matches
@@ -87,9 +94,10 @@
     } catch (e) {
       loadError = errorMessage(e);
     } finally {
-      loading = false;
+      if (!quiet) loading = false;
     }
     await refreshEvidence();
+    refreshing = false;
   }
 
   /// Step 5a. Keeps the last known events on failure — a read that failed is
@@ -118,19 +126,31 @@
 
   // Keep-alive (appViews.ts): auto-checkpoints that landed while the tab was
   // off-screen don't bump the version store — refetch when the tab returns
-  // (the pre-keep-alive remount used to cover this).
-  onMount(() => onAppViewShown(WORKBENCH_TAB_ID, () => void refresh()));
+  // (the pre-keep-alive remount used to cover this) and, since auto-refresh,
+  // every POLL_MS while it stays open. The poll gates on appViewVisibility
+  // (the keep-alive cost rule: a detached view keeps polling forever
+  // otherwise) and skips while a fetch or a latch action is in flight.
+  const POLL_MS = 5000;
+  onMount(() => {
+    const unsub = onAppViewShown(WORKBENCH_TAB_ID, () => void refresh());
+    const poll = setInterval(() => {
+      if (isAppViewVisible(WORKBENCH_TAB_ID) && !actionBusy) void refresh(true);
+    }, POLL_MS);
+    return () => {
+      unsub();
+      clearInterval(poll);
+    };
+  });
 
   const latchRows = $derived(
     Object.values($latchByTab).filter((r): r is LatchRow => r !== undefined),
   );
 
-  // Step 5a: contamination happens between refreshes, and this view is not
-  // allowed a timer of its own (appViews.ts cost rule). It rides the latch
-  // poll that already runs app-wide instead: when the SET of contaminated tabs
-  // changes, the evidence is refetched once. Not a poll — a change signal — and
-  // skipped while the view is detached, because `onAppViewShown` above already
-  // refreshes on return.
+  // Step 5a: contamination can land between the poll's ticks above, so the
+  // evidence read also rides the latch poll that already runs app-wide: when
+  // the SET of contaminated tabs changes, the evidence is refetched once,
+  // immediately. Not a poll — a change signal — and skipped while the view is
+  // detached, because `onAppViewShown` above already refreshes on return.
   let lastContaminationSig = '';
   $effect(() => {
     const sig = latchRows
@@ -311,7 +331,7 @@
     <button type="button" class="checkpoint-now" onclick={checkpointNow} disabled={creatingNow}>
       {creatingNow ? 'Checkpointing…' : 'Checkpoint now'}
     </button>
-    <button type="button" class="refresh" onclick={refresh} disabled={loading}>Refresh</button>
+    <button type="button" class="refresh" onclick={() => void refresh()} disabled={loading}>Refresh</button>
   </div>
 
   <!-- Step 5a: what this view cannot show, said out loud. Rendered above the

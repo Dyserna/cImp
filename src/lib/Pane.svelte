@@ -242,7 +242,7 @@
   .taint-frame {
     position: absolute;
     inset: 0;
-    border: 2px solid;
+    border: 1px solid;
     pointer-events: none;
     z-index: 10;
   }

@@ -17,6 +17,8 @@
   // gate on appViewVisibility (a detached view keeps running otherwise).
   import { onMount, onDestroy } from 'svelte';
   import {
+    activityClear,
+    activityDelete,
     activityDetail,
     activityList,
     attributionId,
@@ -53,13 +55,19 @@
   // plain `$state` would deep-proxy every row on every poll for nothing.
   let entries = $state.raw<ActivityEntry[]>([]);
   let poll: ReturnType<typeof setInterval> | null = null;
+  // Bumped by every local mutation (delete/clear — moved here from the Tools
+  // tab's retired Activities section). A poll response already in flight when
+  // a mutation landed is stale — applying it would resurrect just-deleted
+  // rows for a poll cycle — so refresh() drops it.
+  let mutationSeq = 0;
 
   async function refresh(): Promise<void> {
+    const seq = mutationSeq;
     try {
       const list = await activityList();
       // Reuse the rows already held (see `mergeEntries`) — a plain
       // `entries = list` re-renders the whole feed on every 2s poll.
-      entries = mergeEntries(entries, list);
+      if (seq === mutationSeq) entries = mergeEntries(entries, list);
     } catch {
       /* backend unavailable mid-teardown — keep whatever we have */
     }
@@ -353,6 +361,56 @@
     detailMissing = false;
   }
 
+  // ── Delete / clear ────────────────────────────────────────────────────
+  // Moved here from the Tools tab when its Activities section was retired
+  // (#51 consolidation) — this feed is now the one place the store is read,
+  // so it is also the one place it can be pruned. ACTIVITY ROWS ONLY: the
+  // checkpoint rows merged in above live in the shadow repo under its own
+  // GC and are untouched by both actions.
+  //
+  // Both update optimistically, then unconditionally refresh AFTER the final
+  // seq bump: the bump invalidates any poll that raced the backend mutation,
+  // and the trailing refresh (which captures the post-bump seq) repaints
+  // authoritatively — restoring the rows if the backend call failed.
+  async function removeEntry(id: number): Promise<void> {
+    mutationSeq += 1;
+    entries = entries.filter((e) => e.id !== id);
+    if (detail?.id === id) closeDetail();
+    try {
+      await activityDelete(id);
+    } catch {
+      /* the refresh below restores the row */
+    }
+    mutationSeq += 1;
+    void refresh();
+  }
+
+  // Two-step confirm (same pattern as the retired section's): the first
+  // click arms the button, a second within 4s clears for real.
+  let confirmClear = $state(false);
+  let clearTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function clearHistory(): Promise<void> {
+    if (!confirmClear) {
+      confirmClear = true;
+      clearTimer = setTimeout(() => (confirmClear = false), 4000);
+      return;
+    }
+    if (clearTimer) clearTimeout(clearTimer);
+    clearTimer = null;
+    confirmClear = false;
+    mutationSeq += 1;
+    entries = [];
+    closeDetail();
+    try {
+      await activityClear();
+    } catch {
+      /* the refresh below restores the feed */
+    }
+    mutationSeq += 1;
+    void refresh();
+  }
+
   function onKeyDown(e: KeyboardEvent): void {
     if (e.key !== 'Escape') return;
     if (detailOpen) {
@@ -393,6 +451,7 @@
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
+    if (clearTimer) clearTimeout(clearTimer);
     window.removeEventListener('keydown', onKeyDown);
     unsubShown();
   });
@@ -500,11 +559,22 @@
 <div class="events">
   <header>
     <h2>Events</h2>
-    <span class="count">
-      {shownRows.length === totalCount
-        ? `${totalCount} events`
-        : `${shownRows.length} of ${totalCount} events`}
-    </span>
+    <div class="head-right">
+      <span class="count">
+        {shownRows.length === totalCount
+          ? `${totalCount} events`
+          : `${shownRows.length} of ${totalCount} events`}
+      </span>
+      {#if entries.length > 0}
+        <button
+          type="button"
+          class="clear-btn"
+          class:arm={confirmClear}
+          title="Clears the recorded activity history. Checkpoint rows stay — they live in the shadow repo under its own retention."
+          onclick={clearHistory}
+        >{confirmClear ? 'Confirm clear' : 'Clear history'}</button>
+      {/if}
+    </div>
   </header>
 
   <div class="filters">
@@ -723,6 +793,13 @@
         </div>
       </div>
       <footer class="detail-actions">
+        <button
+          type="button"
+          class="detail-delete"
+          onclick={() => {
+            if (detail) void removeEntry(detail.id);
+          }}
+        >Delete entry</button>
         <button type="button" class="detail-dismiss" onclick={closeDetail}>Close</button>
       </footer>
     {:else if detailMissing}
@@ -765,9 +842,34 @@
     margin: 0;
     font-size: 15px;
   }
+  .head-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
   .count {
     font-size: 11px;
     opacity: 0.65;
+  }
+  .clear-btn {
+    border: 1px solid var(--border-subtle, #3a3a3a);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-primary, #ddd);
+    font-size: 11px;
+    padding: 2px 10px;
+    cursor: pointer;
+    opacity: 0.75;
+  }
+  .clear-btn:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.06);
+  }
+  /* Armed state: the second click clears for real. */
+  .clear-btn.arm {
+    color: var(--text-danger-soft, #ffb4ab);
+    border-color: var(--text-danger-soft, #ffb4ab);
+    opacity: 1;
   }
   .filters {
     display: flex;
@@ -1174,5 +1276,12 @@
   }
   .detail-actions button:hover {
     background: rgba(255, 255, 255, 0.06);
+  }
+  .detail-delete {
+    color: var(--text-danger-soft, #ffb4ab);
+    border-color: var(--border-danger-soft, rgba(255, 180, 171, 0.5));
+  }
+  .detail-delete:hover {
+    border-color: var(--text-danger-soft, #ffb4ab);
   }
 </style>

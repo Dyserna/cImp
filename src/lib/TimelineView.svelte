@@ -287,6 +287,23 @@
     const where = row.opened.host ? ` · ${row.opened.host}` : '';
     return `External content entered this tab — ${row.opened.tool}${where}`;
   }
+
+  // The standing per-row explanations, shown as hover text behind the note
+  // icons below rather than as paragraphs — they repeat on every row, so as
+  // prose they cost more height than the rows themselves. The sentences are
+  // unchanged; only where they live moved.
+  const NOTE_NOT_RETAINED =
+    'The event that set the flag is no longer retained, so there is nothing to correlate this to.';
+  const NOTE_AWAITING_CLEAR =
+    'A restore was recorded for this tab: the flag lifts once cImp sees it start a new session.';
+  const NOTE_NO_TAB =
+    "cImp could not read which tab this event belongs to, so it cannot offer the flag actions here. They are on the tab's own containment badge.";
+  function noLiveStateNote(scope: string): string {
+    return `cImp holds no live containment state for ${scope} — the tab has made no gated call this run, so there is no flag here to act on. If it is open, its containment badge is the place to check.`;
+  }
+  function sessionNote(session: string): string {
+    return `Started in session ${session}. The flag belongs to the tab, not to that conversation — it survives a /clear, so a later session on this tab is covered by this same row and writes no second one.`;
+  }
 </script>
 
 <div class="timeline">
@@ -377,34 +394,59 @@
               <span class="agent">{row.scope}</span>
             </div>
             <div class="row-detail">
-              <!-- The join's limits, on the row they apply to. `linkLine` names
-                   whose checkpoint this is; it is never presented as "this
-                   tab's restore point" unless it is one. -->
-              <p class="line">{linkLine(row.link)}</p>
-              {#if row.opened?.session}
-                <p class="line dim">
-                  Started in session <code>{row.opened.session}</code>. The flag belongs to the
-                  tab, not to that conversation — it survives a <code>/clear</code>, so a later
-                  session on this tab is covered by this same row and writes no second one.
-                </p>
-              {/if}
-              {#if row.opened === null}
-                <p class="line dim">
-                  The event that set the flag is no longer retained, so there is nothing to
-                  correlate this to.
-                </p>
-              {/if}
+              <!-- Every STANDING explanation on a contamination row is an
+                   icon whose hover (and aria-label) carries the full
+                   sentence — as prose they repeat on every row and cost more
+                   height than the rows themselves. The icons differ per
+                   note so rows can be told apart without hovering. Transient
+                   text (the clear confirmation) and data (the cleared line)
+                   stay written out. The sentences are the same ones as
+                   before; step 5d's still comes verbatim from `timeline.ts`,
+                   shared with the popover. -->
+              <p class="line notes">
+                <!-- The join's limits, on the row they apply to. `linkLine`
+                     names whose checkpoint this is; it is never presented as
+                     "this tab's restore point" unless it is one. -->
+                <span class="note-icon" title={linkLine(row.link)} role="img" aria-label={linkLine(row.link)}
+                  >🔗</span
+                >
+                {#if row.opened?.session}
+                  {@const t = sessionNote(row.opened.session)}
+                  <span class="note-icon" title={t} role="img" aria-label={t}>💬</span>
+                {/if}
+                {#if row.opened === null}
+                  <span
+                    class="note-icon dim"
+                    title={NOTE_NOT_RETAINED}
+                    role="img"
+                    aria-label={NOTE_NOT_RETAINED}>❔</span
+                  >
+                {/if}
+                {#if row.cleared === null}
+                  {#if memoryNote}
+                    <span class="note-icon warn" title={memoryNote} role="img" aria-label={memoryNote}
+                      >⚠</span
+                    >
+                  {/if}
+                  {#if latch?.can_clear && latch.awaiting_session_clear}
+                    <span
+                      class="note-icon"
+                      title={NOTE_AWAITING_CLEAR}
+                      role="img"
+                      aria-label={NOTE_AWAITING_CLEAR}>⏳</span
+                    >
+                  {/if}
+                  {#if !latch?.can_clear}
+                    {@const t = row.tab === null ? NOTE_NO_TAB : noLiveStateNote(row.scope)}
+                    <span class="note-icon dim" title={t} role="img" aria-label={t}>ℹ</span>
+                  {/if}
+                {/if}
+              </p>
               {#if row.cleared}
                 <p class="line ok">{clearedLine(row.cleared)} · {formatMs(row.cleared.ts_ms)}</p>
               {/if}
 
               {#if row.cleared === null}
-                {#if memoryNote}
-                  <!-- Step 5d. Same sentence as the popover's, from
-                       `timeline.ts` — two surfaces phrasing one rule in their
-                       own words is how they come to disagree. -->
-                  <p class="line warn">{memoryNote}</p>
-                {/if}
                 {#if latch?.can_clear}
                   <div class="row-actions">
                     {#if target}
@@ -434,6 +476,9 @@
                     {/if}
                   </div>
                   {#if confirmingClear === row.key}
+                    <!-- Deliberately still TEXT, not an icon: this appears
+                         only while the destructive confirm is open, and a
+                         warning gating a click must not require a hover. -->
                     <p class="line warn">
                       Clearing says the flagged content was harmless. If it was not, this tab's
                       memory writes stop being held for review while a model that read it is
@@ -441,23 +486,6 @@
                       nothing is rolled back.
                     </p>
                   {/if}
-                  {#if latch.awaiting_session_clear}
-                    <p class="line dim">
-                      A restore was recorded for this tab: the flag lifts once cImp sees it start
-                      a new session.
-                    </p>
-                  {/if}
-                {:else if row.tab === null}
-                  <p class="line dim">
-                    cImp could not read which tab this event belongs to, so it cannot offer the
-                    flag actions here. They are on the tab's own containment badge.
-                  </p>
-                {:else}
-                  <p class="line dim">
-                    cImp holds no live containment state for {row.scope} — the tab has made no
-                    gated call this run, so there is no flag here to act on. If it is open, its
-                    containment badge is the place to check.
-                  </p>
                 {/if}
               {/if}
             </div>
@@ -621,18 +649,29 @@
     line-height: 1.45;
     color: var(--text-secondary, #bbb);
   }
-  .row-detail .line.dim {
-    color: var(--text-tertiary, #999);
-  }
   .row-detail .line.warn {
     color: var(--awaiting, #d0a24c);
   }
+  .row-detail .line.notes {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .note-icon {
+    /* The sentence lives in the title — `help` says "hover me" the way a
+       bare glyph on its own cannot. */
+    cursor: help;
+    font-size: 1.15em;
+    line-height: 1;
+  }
+  .note-icon.warn {
+    color: var(--awaiting, #d0a24c);
+  }
+  .note-icon.dim {
+    color: var(--text-tertiary, #999);
+  }
   .row-detail .line.ok {
     color: var(--text-success, #7ec699);
-  }
-  .row-detail code {
-    font-family: var(--font-mono, monospace);
-    color: var(--text-primary, #ddd);
   }
   .row-actions {
     display: flex;

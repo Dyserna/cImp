@@ -1750,6 +1750,41 @@ struct TabLatch {
     /// contamination included — so an arm outliving one is meaningless by
     /// construction.
     awaiting_session_clear: bool,
+    /// #48 (F-23): this tab's `local` latch was put there by the USER's
+    /// [`LatchOverride::FlipLocal`] click — it was **not** earned by a
+    /// local-capability tool call.
+    ///
+    /// # Why the position alone is not enough
+    ///
+    /// `Latch::Local` has two causes and the refusals for them are different
+    /// statements. Reached by [`Latch::engage`] it means *"this session read a
+    /// file, so the web side closed"*; reached by decision 15's workflow flip it
+    /// means *"a human closed the web side and handed local capability back"*.
+    /// The web-direction refusal used to serve the first sentence in both cases
+    /// ([`toolclass::REFUSAL_NATIVE_WEB_BLOCKED`]), which is F-23: a refusal
+    /// stating a cause it did not check. The gate cannot recover that cause from
+    /// [`Latch`] — the enum is a position, not a history — so the fact is
+    /// recorded here at the one site that performs the flip, beside the
+    /// [`outbound::Screen::LatchOverride`] row that records the same act for the
+    /// audit trail.
+    ///
+    /// # Lifetime, and why it cannot outlive its latch
+    ///
+    /// Set **only** in `apply_override`'s [`LatchOverride::FlipLocal`] arm, and
+    /// cleared everywhere the latch leaves `Local`: the [`LatchOverride::Unlatch`]
+    /// arm and [`observe`](Self::observe)'s rotation reset. Those are the only
+    /// three writes to [`latch`](Self::latch) in this module, so the field cannot
+    /// describe a latch position that is no longer in force — a stale `true` on a
+    /// re-latched `local` would attribute a tool call's latch to the user, which
+    /// is F-23 with the operands swapped.
+    ///
+    /// It is deliberately **not** a "the user touched this tab" flag: `Unlatch`,
+    /// `ClearContamination` and `AwaitSessionClear` are user actions too and none
+    /// of them leaves the latch `local`. What this answers is exactly one
+    /// question — *why is the web side closed?* — and it is read by exactly one
+    /// consumer, the native-web direction of the Phase H gate, through
+    /// [`LatchView::local_by_user_flip`].
+    local_by_user_flip: bool,
 }
 
 impl TabLatch {
@@ -1765,6 +1800,7 @@ impl TabLatch {
             beacon_flagged: false,
             contaminated: false,
             awaiting_session_clear: false,
+            local_by_user_flip: false,
         }
     }
 
@@ -1785,6 +1821,12 @@ impl TabLatch {
             // currently one field wide.
             can_clear: self.contaminated,
             awaiting_session_clear: self.awaiting_session_clear,
+            // F-23: published rather than re-derived, for the same reason
+            // `can_flip_local` is — a consumer that inferred "the user must have
+            // flipped it" from `latch == "local" && contaminated` would be
+            // guessing, and would be wrong for the tab that fetched a page,
+            // latched EXTERNAL and was never flipped at all.
+            local_by_user_flip: self.local_by_user_flip,
         }
     }
 
@@ -1895,6 +1937,11 @@ impl TabLatch {
                 let prior_latch = self.latch.label();
                 self.session = Some(s.to_string());
                 self.latch = Latch::Open;
+                // #48 (F-23): the latch this described is gone, so the reason it
+                // was in that position goes with it. Left set, a `local` latch
+                // re-earned by the next conversation's file read would be
+                // reported as the user's decision.
+                self.local_by_user_flip = false;
                 // V32 Phase C: the new conversation gets a fresh budget and a
                 // fresh right to report — same scope, same reset.
                 self.budget.reset();
@@ -2011,6 +2058,18 @@ pub struct LatchView {
     /// restore-linked entry point must be able to tell an already-armed tab from
     /// a fresh one without re-deriving the rule.
     pub awaiting_session_clear: bool,
+    /// #48 (F-23): whether [`latch`](Self::latch) reads `local` because the USER
+    /// flipped it there, rather than because a local-capability tool ran. See
+    /// [`TabLatch::local_by_user_flip`].
+    ///
+    /// Published on `/latch/state` so the OpenCode plugin's web-direction refusal
+    /// can serve the constant whose cause it actually checked. It is a fact cImp
+    /// recorded when it applied the override, so selecting a message with it is a
+    /// lookup — not a message composed from anything a caller supplied.
+    ///
+    /// `false` for every latch that is not `local`, by construction: the three
+    /// writes to the underlying latch keep the two in step.
+    pub local_by_user_flip: bool,
 }
 
 impl Default for LatchView {
@@ -2024,6 +2083,7 @@ impl Default for LatchView {
             can_unlatch: false,
             can_clear: false,
             awaiting_session_clear: false,
+            local_by_user_flip: false,
         }
     }
 }
@@ -3386,6 +3446,13 @@ impl LatchRegistry {
                     ))
                 } else {
                     entry.latch = Latch::Local;
+                    // #48 (F-23): record WHY the latch is `local`, at the only
+                    // site that can know. This is the fact the native-web
+                    // refusal is selected on — see
+                    // [`TabLatch::local_by_user_flip`] — and it is written under
+                    // the same lock as the assignment above so the two cannot be
+                    // observed apart.
+                    entry.local_by_user_flip = true;
                     Ok(())
                 }
             }
@@ -3422,6 +3489,11 @@ impl LatchRegistry {
                     // `unlatch_clear_row`.
                     prior_taint = entry.clear_contamination();
                     entry.latch = Latch::Open;
+                    // #48 (F-23): the web side is open again, so nothing is being
+                    // refused for this reason any more. Cleared here rather than
+                    // left to the next rotation because the field must never
+                    // outlive the latch position it explains.
+                    entry.local_by_user_flip = false;
                     Ok(())
                 }
             }
@@ -6482,6 +6554,11 @@ fn latch_state_reply(
         // full view rides along for a human reading a trace.
         "latch": view.latch,
         "contaminated": view.contaminated,
+        // #48 (F-23): WHY the latch is where it is, for the one position that has
+        // two possible causes. The plugin refuses the same calls either way — this
+        // decides only which fixed refusal it serves, so a plugin (or a loopback)
+        // that does not know the field loses nothing but the better message.
+        "local_by_user_flip": view.local_by_user_flip,
     })
 }
 
@@ -9708,6 +9785,118 @@ mod tests {
         );
     }
 
+    /// **#48 (F-23): a `local` latch carries the reason it is `local`,** because
+    /// the two reasons are different statements and the native-web refusal has to
+    /// make the one it checked.
+    ///
+    /// The defect: after the user's flip the OpenCode gate served
+    /// `REFUSAL_NATIVE_WEB_BLOCKED` — *"this session has already used a
+    /// local-capability tool"* — and a live tab's model believed it and told its
+    /// user that `graph_snippet` had latched the session. No such call happened;
+    /// a human clicked. The fix records WHY at the one site that knows and
+    /// publishes it on the wire the gate reads.
+    ///
+    /// Every assertion here is about the FACT, not about the message: the message
+    /// is a fixed constant selected on this boolean, and which sentence the
+    /// generated plugin serves for it is pinned in `tabs::config`.
+    #[test]
+    fn a_user_flipped_local_latch_records_that_no_tool_call_closed_the_web_side() {
+        let reg = LatchRegistry::default();
+        let s = scope("claude-1", Some("sess-a"));
+
+        // A `local` latch EARNED by a local-capability tool: the pre-F-23
+        // sentence is the true one here, so the flag must stay false. This is the
+        // assertion that fails if the fix is written as "local ⇒ the user did it".
+        assert!(reg
+            .gate(Some(&s), LatchRoute::Native, "graph_snippet", ON, NO_CONTENT)
+            .is_ok());
+        let earned = reg.view_for(&s);
+        assert_eq!(earned.latch, "local");
+        assert!(!earned.local_by_user_flip, "a tool call latched this tab");
+
+        // The finding's own path: fetch → EXTERNAL → the user's workflow flip.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        assert!(!reg.view_for(&s).local_by_user_flip, "external, not flipped");
+        let out = reg
+            .apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip");
+        assert_eq!(out.view.latch, "local");
+        assert!(
+            out.view.local_by_user_flip,
+            "the flip is the cause, and it is the app that knows it"
+        );
+
+        // It reaches the plugin on the wire it already reads — the whole point,
+        // since the refusal is thrown inside the harness's own process.
+        let (settings, _id) = oc_settings();
+        let reply = latch_state_reply(
+            &settings,
+            &LatchScoping::Scoped(scope("claude-1", Some("sess-a"))),
+            reg.view_for(&s),
+        );
+        assert_eq!(reply["latch"], "local", "{reply}");
+        assert_eq!(reply["local_by_user_flip"], true, "{reply}");
+        // A tab the proxy never served says `false` rather than nothing: the
+        // plugin reads the field defensively, and "absent" must not be able to
+        // mean "the user flipped it".
+        assert_eq!(
+            latch_state_reply(&settings, &LatchScoping::Anonymous, LatchView::default())
+                ["local_by_user_flip"],
+            false
+        );
+
+        // It cannot outlive the latch it explains — in either direction out of
+        // `local`. An unlatch reopens both sides…
+        reg.apply_override(&s, LatchOverride::Unlatch)
+            .expect("unlatch");
+        assert!(!reg.view_for(&s).local_by_user_flip, "web is open again");
+
+        // …and a session rotation reopens the latch, after which the NEXT
+        // conversation's own file read is what closed its web side. Left set, that
+        // tab would be told a user flipped a latch nobody touched.
+        let reg = LatchRegistry::default();
+        assert!(reg
+            .gate(
+                Some(&s),
+                LatchRoute::Proxied,
+                "ddg__fetch_content",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        reg.apply_override(&s, LatchOverride::FlipLocal)
+            .expect("flip");
+        assert!(reg.view_for(&s).local_by_user_flip);
+        let rotated = scope("claude-1", Some("sess-b"));
+        let after = reg.view_for(&rotated);
+        assert_eq!(after.latch, "open", "the rotation reopened the latch");
+        assert!(!after.local_by_user_flip, "and the reason went with it");
+        assert!(reg
+            .gate(
+                Some(&rotated),
+                LatchRoute::Native,
+                "graph_snippet",
+                ON,
+                NO_CONTENT
+            )
+            .is_ok());
+        let relatched = reg.view_for(&rotated);
+        assert_eq!(relatched.latch, "local");
+        assert!(
+            !relatched.local_by_user_flip,
+            "F-23 with the operands swapped: this one really was a tool call"
+        );
+    }
+
     /// **The core Phase F invariant, as decision 15's 2026-08-10 amendment
     /// leaves it.** Contamination is a property of the CONVERSATION, not of the
     /// latch position: a note written after the *flip* was still composed by a
@@ -10777,6 +10966,9 @@ mod tests {
                 // field added to the wire without a decision fails here.
                 "can_clear": true,
                 "awaiting_session_clear": false,
+                // #48 (F-23): why the latch is where it is, for the one position
+                // with two causes. `external` is not that position.
+                "local_by_user_flip": false,
             }])
         );
         // After the flip: still contaminated, no further flip on offer.
@@ -10794,6 +10986,10 @@ mod tests {
                 "can_unlatch": true,
                 "can_clear": true,
                 "awaiting_session_clear": false,
+                // #48 (F-23): the flip that just happened is on the row, so the
+                // native-web refusal can name the cause it checked instead of
+                // blaming a tool call that never ran.
+                "local_by_user_flip": true,
             }])
         );
         // After the restore arm: the bit is still set (that is the whole
@@ -10812,6 +11008,9 @@ mod tests {
                 "can_unlatch": true,
                 "can_clear": true,
                 "awaiting_session_clear": true,
+                // Unchanged by the arm: it waits on the contamination bit and
+                // never touches the latch.
+                "local_by_user_flip": true,
             }])
         );
     }

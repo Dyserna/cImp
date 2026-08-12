@@ -1269,10 +1269,33 @@ pub async fn detection_revert(
 /// An `Err` rather than a silently unchanged status: a security control that
 /// does nothing when clicked, and says nothing about it, teaches the user to
 /// distrust it (the same reasoning as `latch_override`'s verbatim errors).
+///
+/// **#48 (M-21): two refusals, because there are two states and they are
+/// different statements.** The gate is unchanged — one predicate,
+/// `updates_enabled`, resolved at the app scope, so a button and a tick can still
+/// never disagree — but *why* it said no is not always "detection is off". A
+/// worker-scope override leaves this updater inert while injection detection is
+/// armed for the offload worker, which keeps screening with the bundle already on
+/// disk; telling that user their detection is switched off is a false claim about
+/// a running security layer, and it is the claim they would act on.
 fn updates_allowed(settings: &crate::settings::Settings) -> AppResult<()> {
-    if crate::offload::detection::updater::updates_enabled(settings) {
+    use crate::offload::detection::updater;
+    if updater::updates_enabled(settings) {
         return Ok(());
     }
+    if updater::worker_only_detection(settings) {
+        return Err(AppError::Settings(
+            "injection detection is switched off app-wide and for every AI tab, so the detection \
+             updater will not check, apply or revert anything. It is still switched ON for the \
+             offload worker, which keeps screening with the rule bundle already on disk — the \
+             updater follows the app-wide answer, and one worker override does not start it. To \
+             keep that bundle current, turn injection detection back on app-wide in \
+             Settings → Injection protection."
+                .to_string(),
+        ));
+    }
+    // Reached only when the worker's row is off too, which is what makes this
+    // sentence true rather than merely conventional.
     Err(AppError::Settings(
         "injection detection is switched off, so the detection updater will not check, apply or \
          revert anything. Turn it (and the injection-protection master above it) back on in \
@@ -3420,6 +3443,54 @@ mod tests {
     use super::apply_incoming_settings;
     use super::is_automatic_terminal_response as auto_reply;
     use crate::settings::{PromptTemplate, Settings};
+
+    /// **#48 (M-21): the manual buttons' refusal names the layer that is off.**
+    ///
+    /// The gate is unchanged and stays app-scoped — a worker-only override does
+    /// not start the updater — so both cases below still refuse. What is asserted
+    /// is the sentence: a user whose offload worker is screening every fetched
+    /// page must not be told their injection detection is switched off, because
+    /// that is a false statement about a running security layer and it is the one
+    /// they would act on.
+    #[test]
+    fn the_updater_refusal_does_not_call_a_running_layer_off() {
+        use crate::settings::injection::{Feature, Override};
+
+        // Detection off everywhere: the plain sentence, and it is true.
+        let mut off = Settings::default();
+        off.set_l2_for_test(Feature::Detection, false);
+        let plain = super::updates_allowed(&off).expect_err("the updater is off");
+        let plain = plain.to_string();
+        assert!(plain.contains("injection detection is switched off,"), "{plain}");
+        assert!(!plain.contains("offload worker"), "nothing is running: {plain}");
+
+        // M-21's state: off app-wide, ON for the offload worker. Still refused —
+        // the scope semantics are deliberate — but for the reason that is true.
+        let mut worker = off.clone();
+        worker
+            .set_worker_override_for_test(Feature::Detection, Override::On)
+            .expect("detection has a worker row");
+        assert!(
+            super::updates_allowed(&worker).is_err(),
+            "reporting honesty must not become a new capability"
+        );
+        let named = super::updates_allowed(&worker)
+            .expect_err("still refused")
+            .to_string();
+        assert!(
+            named.contains("still switched ON for the offload worker"),
+            "the running layer must be named: {named}"
+        );
+        assert!(
+            !named.contains("injection detection is switched off,"),
+            "the false claim must not survive beside the true one: {named}"
+        );
+        // Both refusals point at a section the sidebar has (F-18's tripwire holds
+        // the pointer itself; this holds that the new sentence carries one).
+        for r in [&plain, &named] {
+            assert!(r.contains("Injection protection"), "{r}");
+        }
+    }
 
     /// `graph_ignore_pick`'s glob shaping: root-relative + `/`-anchored with
     /// forward slashes, trailing `/` for folders, longest root wins, and an

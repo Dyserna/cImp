@@ -58,6 +58,12 @@
 //!   the disk, or anything but those switches — and the three Settings buttons
 //!   refuse for the same reason, through the same [`updates_enabled`] call.
 //!
+//!   **Inert is not the same as "detection is off" (#48, M-21).** That resolution
+//!   is app-scoped and does not see the `offload-worker` row, so the updater can
+//!   be inert while the worker is screening with the bundle on disk. The
+//!   behaviour is deliberate; what had to be fixed was every sentence that
+//!   explained it by claiming a layer was off. See [`worker_only_detection`].
+//!
 //!   **One deliberate exception, and it is not about updating**:
 //!   [`recover_on_launch`] finishes a swap a crash interrupted, whatever the
 //!   switches say (#48, M-12). Gating THAT on the updater's own settings is how
@@ -263,6 +269,45 @@ pub fn updates_enabled(s: &Settings) -> bool {
         crate::settings::injection::Scope::App,
         s,
     )
+}
+
+/// #48 (M-21) — **injection detection is running in the offload worker while the
+/// updater is inert.** The one state in which *"injection detection is off"* is a
+/// false statement about this install.
+///
+/// # Why this state exists, and why the resolution above is still right
+///
+/// [`updates_enabled`] resolves at [`Scope::App`](crate::settings::injection::Scope::App),
+/// which folds in L1 and L2 and — since N-1 — an L3 `On` stated by any configured
+/// AI tab, but **deliberately not** the `offload-worker` row: `any_tab_override_on`
+/// is *"tabs only, deliberately"*, because that elevation exists for a call that
+/// arrived with no tab identity, and the worker is never that caller (it always
+/// resolves through `Scope::OffloadWorker`). That argument is sound for what it
+/// was written for and this function does not disturb it.
+///
+/// What went wrong was not the resolution but the **claim made about it**. A
+/// worker-only override leaves the whole updater surface off — the scheduler
+/// returns, the three buttons refuse — and every sentence explaining that said
+/// "detection is off", while the worker was screening every fetched page it
+/// touched with the bundle already on disk. Same class as M-5 and F-19: a value
+/// that is *presented as authoritative* about a state it does not describe.
+///
+/// # What it is for
+///
+/// Naming the layer, nothing more. It changes no verdict — no caller may use it
+/// to admit an update — and it never widens what runs: `updates_enabled` is
+/// unchanged, so the updater stays app-scoped and one worker override still does
+/// not start it. Its consumers are the refusal `ipc::commands::updates_allowed`
+/// hands the user and the `worker_only_detection` field of [`UpdaterStatus`],
+/// which the Settings surface renders instead of re-deriving the conjunction in
+/// TypeScript.
+///
+/// Note it can only be true with the L1 master ON — [`decide`](crate::settings::injection::decide)
+/// short-circuits every feature to `false` when protection is off — so the layer
+/// it reports is genuinely armed rather than merely configured.
+pub fn worker_only_detection(s: &Settings) -> bool {
+    use crate::settings::injection::{effective, Feature, Scope};
+    !updates_enabled(s) && effective(Feature::Detection, Scope::OffloadWorker, s)
 }
 
 // ── Layout ─────────────────────────────────────────────────────────────────
@@ -653,6 +698,19 @@ pub struct UpdaterStatus {
     /// visible even when the button cannot open a file manager.
     pub rules_dir: String,
     pub state_dir: String,
+    /// #48 (M-21): whether the updater may do anything at all —
+    /// [`updates_enabled`], published so a surface that greys a control reads the
+    /// SAME predicate the two IPC commands enforce instead of a second opinion
+    /// assembled from the resolved-scope matrix.
+    pub updates_enabled: bool,
+    /// #48 (M-21): [`worker_only_detection`] — detection is armed for the offload
+    /// worker while this updater is inert.
+    ///
+    /// It exists so no surface has to say "detection is off" about a layer that is
+    /// running. Only ever true when `updates_enabled` is false, so a reader can
+    /// treat the pair as one three-valued answer: on / off / off here but on in
+    /// the worker.
+    pub worker_only_detection: bool,
 }
 
 /// Build the status from the cached state plus the live settings.
@@ -690,6 +748,10 @@ pub fn status(settings: &Settings) -> UpdaterStatus {
         state_dir: store::state_dir()
             .map(|d| d.display().to_string())
             .unwrap_or_default(),
+        // #48 (M-21): both from the predicates themselves, in one snapshot, so the
+        // readout cannot disagree with the buttons' enforcement.
+        updates_enabled: updates_enabled(settings),
+        worker_only_detection: worker_only_detection(settings),
     }
 }
 

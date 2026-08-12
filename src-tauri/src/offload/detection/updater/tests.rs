@@ -892,6 +892,66 @@ fn the_updater_gate_resolves_the_detection_feature_not_just_the_master() {
     assert!(!updates_enabled(&s));
 }
 
+/// **#48 (M-21): the updater stays app-scoped, and stops claiming the worker's
+/// layer is off.**
+///
+/// A worker-only override is a supported state: detection resolves ON for the
+/// `offload-worker` scope, so the worker screens every page it fetches with the
+/// bundle on disk, while `updates_enabled` — app-scoped by decision, because
+/// there is one bundle for the process and `any_tab_override_on` is tabs-only —
+/// resolves OFF and nothing polls or swaps. Both halves are deliberate. What was
+/// not is that every sentence explaining the second half said *"injection
+/// detection is off"* about the first.
+///
+/// The predicate asserted here is the one the refusal and the Settings readout
+/// branch on. It is reporting only: `updates_enabled` above is untouched, so this
+/// can never start a check.
+#[test]
+fn a_worker_only_detection_override_is_reported_as_a_running_layer() {
+    use crate::settings::injection::{effective, Feature, Override, Scope};
+    let mut s = crate::settings::Settings::default();
+
+    // The shipped default: on everywhere, so there is nothing to disambiguate.
+    assert!(updates_enabled(&s));
+    assert!(
+        !worker_only_detection(&s),
+        "with the updater enabled there is no false claim to correct"
+    );
+
+    // M-21's state. L2 off, worker L3 On.
+    s.set_l2_for_test(Feature::Detection, false);
+    s.set_worker_override_for_test(Feature::Detection, Override::On)
+        .expect("detection has a worker row");
+    assert!(!updates_enabled(&s), "the updater is app-scoped, as decided");
+    assert!(
+        effective(Feature::Detection, Scope::OffloadWorker, &s),
+        "…and the worker is screening"
+    );
+    assert!(
+        worker_only_detection(&s),
+        "which is exactly the state a refusal must not describe as 'off'"
+    );
+    // The status the Settings window renders carries both facts, from the
+    // predicates themselves rather than a second derivation.
+    let st = status(&s);
+    assert!(!st.updates_enabled);
+    assert!(st.worker_only_detection);
+
+    // Nothing past the master. With L1 off the worker resolves false too, so
+    // there is no layer to name and the plain sentence is the true one — the
+    // property that keeps the two refusals from swapping places.
+    s.set_master_for_test(false);
+    assert!(!effective(Feature::Detection, Scope::OffloadWorker, &s));
+    assert!(!worker_only_detection(&s), "an L1 off arms nothing anywhere");
+
+    // A worker override OFF while the app is on is the ordinary case and must not
+    // report a running layer: the updater is enabled, so the pair is (true, false).
+    let mut on = crate::settings::Settings::default();
+    on.set_worker_override_for_test(Feature::Detection, Override::Off)
+        .expect("detection has a worker row");
+    assert!(updates_enabled(&on) && !worker_only_detection(&on));
+}
+
 // ── The scheduler's policy (previously untested — review U/notes) ──────────
 
 /// `is_due` IS the scheduler's policy; the 15-minute loop is only its clock.

@@ -749,6 +749,42 @@ pub const REFUSAL_NATIVE_WEB_TAINTED: &str = "REFUSED (security boundary): exter
     the same boundary. Use the project's proxied research tools if you have them, or answer \
     with what you have gathered.";
 
+/// #48 (F-23) — the harness's own WEB tools from a tab whose LOCAL latch was put
+/// there by the **user**, not earned by a local-capability tool call.
+///
+/// # The defect this exists to close
+///
+/// [`REFUSAL_NATIVE_WEB_BLOCKED`] names a cause — *"this session has already
+/// used a local-capability tool"* — and after a user's decision-15 workflow flip
+/// that cause **did not happen**: nothing the model called moved the latch, a
+/// human did. Served live, that string made a tab's model tell its user which
+/// tool had latched the session, naming one that never ran. A refusal that
+/// states a cause it did not check is a confident, wrong causal story about a
+/// security event, and a standing instruction a model can catch out is one it
+/// learns to discount.
+///
+/// The fix is the one F-13 set the precedent for: a **fourth fixed constant**,
+/// not a dynamic message. What selects between them is a lookup on a fact cImp
+/// itself recorded when it applied the override
+/// (`loopback::TabLatch::local_by_user_flip`, set in the one arm that performs
+/// [`LatchOverride::FlipLocal`](crate::offload::loopback::LatchOverride) and
+/// published on `/latch/state`) — never anything the caller says about itself,
+/// and never composition from untrusted input.
+///
+/// Same posture as its three siblings: fixed text, no templating, identical
+/// vocabulary, and **deliberately silent about the user's own controls**. It
+/// states what the user's decision *did* — restored local capability, which
+/// closes the web side in the same move — and nothing about how to obtain
+/// anything, because a refusal that names the human's escape hatch is a refusal
+/// that teaches an injected page to ask for it.
+pub const REFUSAL_NATIVE_WEB_USER_LOCAL: &str = "REFUSED (security boundary): the user restored \
+    this session's local capability, which closed its external side in the same move, so this \
+    harness's own web tools — fetch and search — are unavailable for the remainder of this \
+    session. No tool call of yours caused this and none can undo it: the decision was taken \
+    outside the conversation. This cannot be unlocked, re-asked for, or worked around; it is \
+    enforced outside the model, and spawning a sub-agent reaches the same boundary. Continue with \
+    the tools you still have, or answer with what you have gathered.";
+
 /// V32 Phase C2 — the fixed suffix appended to a `context_note` result that was
 /// stored **quarantined** (locked decision 10).
 ///
@@ -1526,6 +1562,7 @@ mod tests {
             REFUSAL_NATIVE_LOCAL_BLOCKED,
             REFUSAL_NATIVE_WEB_BLOCKED,
             REFUSAL_NATIVE_WEB_TAINTED,
+            REFUSAL_NATIVE_WEB_USER_LOCAL,
         ] {
             assert!(r.starts_with("REFUSED (security boundary):"), "{r}");
             assert!(r.contains("enforced outside the model"), "{r}");
@@ -1541,10 +1578,36 @@ mod tests {
         // the sibling's text would state a cause that did not happen — the tab
         // is `open`, no local-capability tool was necessarily involved.
         assert!(REFUSAL_NATIVE_WEB_TAINTED.contains("external content has already entered"));
-        assert!(
-            !REFUSAL_NATIVE_WEB_TAINTED.contains("already used a local-capability tool"),
-            "F-23's defect: do not borrow the sibling's cause",
-        );
+        // #48 (F-23) itself: the user-flip refusal states the cause the gate
+        // actually checked — a recorded user override — and no other. This is the
+        // ONE state in which the web-blocked sibling above is a false statement:
+        // the latch reads `local` because a human moved it, not because a
+        // local-capability tool ran.
+        assert!(REFUSAL_NATIVE_WEB_USER_LOCAL.contains("the user restored"));
+        // Four causes, four constants, and no constant may claim another's. The
+        // table is the assertion: reusing a sibling's text is exactly the defect
+        // F-13 avoided and F-23 named.
+        let causes = [
+            (REFUSAL_NATIVE_LOCAL_BLOCKED, "already used an external tool"),
+            (
+                REFUSAL_NATIVE_WEB_BLOCKED,
+                "already used a local-capability tool",
+            ),
+            (
+                REFUSAL_NATIVE_WEB_TAINTED,
+                "external content has already entered",
+            ),
+            (REFUSAL_NATIVE_WEB_USER_LOCAL, "the user restored"),
+        ];
+        for (refusal, own) in causes {
+            for (_, other) in causes {
+                assert_eq!(
+                    refusal.contains(other),
+                    other == own,
+                    "a refusal must state its OWN cause and no sibling's: {refusal}",
+                );
+            }
+        }
     }
 
     // ── #48, finding M-2 — TABLE ↔ the native dispatch surface ─────────────

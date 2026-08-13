@@ -382,14 +382,51 @@
     }
   }
 
-  /// One expanded quarantined note at a time — the full text plus the context
-  /// (session, exact timestamps, pin fate, hold identifiers) the one-line row
-  /// cannot carry, so the promote/discard decision isn't made off a truncated
-  /// first line.
-  let expandedQ = $state<string | null>(null);
+  /// The quarantined note whose detail dialog is open, by id — `null` for none.
+  ///
+  /// This replaced an inline expander that grew the row in place. The queue is
+  /// a review list: its job is to let you see at a glance how many decisions
+  /// are waiting and what each one is about, and a wrapped reason sentence plus
+  /// a wrapped note body plus an expansion panel cost four-plus lines per note,
+  /// so three held notes filled the section. Every row is one line now and the
+  /// full text + context live in a dialog, the same row → detail-popup shape
+  /// the Events feed uses.
+  ///
+  /// The dialog is where the decision is made: it carries the whole reason
+  /// sentence, the un-truncated text, the context and BOTH buttons, so nothing
+  /// that was needed to decide moved further away than one click.
+  let detailQ = $state<string | null>(null);
 
-  function toggleQuarantined(noteId: string): void {
-    expandedQ = expandedQ === noteId ? null : noteId;
+  /// The open note, resolved against the LIVE queue rather than captured at
+  /// click time. Promote/discard removes it from `quarantined`, and so does a
+  /// background refresh of a note reviewed elsewhere — resolving each render
+  /// means the dialog closes itself instead of sitting open over a note that no
+  /// longer exists (and, worse, offering to promote it).
+  let detailNote = $derived(
+    detailQ === null ? null : (quarantined.find((n) => n.note_id === detailQ) ?? null),
+  );
+
+  function openQuarantined(noteId: string): void {
+    // A confirmation armed on the previous note must not survive into this
+    // one's dialog — same reason `armReview` clears the bulk one.
+    reviewConfirm = null;
+    bulkConfirm = null;
+    detailQ = noteId;
+  }
+
+  function closeQuarantined(): void {
+    detailQ = null;
+    reviewConfirm = null;
+  }
+
+  /// Escape closes the dialog, per the app's dialog convention (EventsView).
+  /// Guarded on the dialog being open so the Memory section never swallows an
+  /// Escape meant for something else.
+  function onKeyDown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && detailQ !== null) {
+      e.preventDefault();
+      closeQuarantined();
+    }
   }
 
   /// The writing session's summary row, when memory still has it. An EXACT
@@ -1598,12 +1635,14 @@
     poll = setInterval(() => {
       if (isAppViewVisible(GRAPH_MONITOR_TAB_ID)) void refresh();
     }, 2000);
+    window.addEventListener('keydown', onKeyDown);
   });
 
   onDestroy(() => {
     if (poll) clearInterval(poll);
     unsubShown();
     unsubActiveTab();
+    window.removeEventListener('keydown', onKeyDown);
   });
 </script>
 
@@ -2373,8 +2412,8 @@
           decide. A note lands here because its session had already used an
           external tool, because the write could not be attributed to a tab, or
           because the write-time credential screen matched it — each row says
-          which. Click a note's text to read it in full with its context
-          (session, exact time, what promoting would pin).
+          which. Click a row to open the note: full text, its context (session,
+          exact time, what promoting would pin) and the two decisions.
           <strong>Promote</strong> accepts a note into project memory (keeping
           its pinned state) and into every future session, so it is the one
           that asks you to be sure; <strong>Discard</strong> deletes it and
@@ -2383,160 +2422,54 @@
         <div class="rows">
           {#each quarantined as n (n.note_id)}
             {@const why = quarantineReason(n)}
-            <div class="qitem">
-              <!--
-                #48, F-24: the WHY comes first, above the note text.
+            <!--
+              One held note = ONE row: ⚠, the cause, a peek at the text, the
+              time. Everything else (the un-truncated text, the context grid,
+              both decisions and their confirmations) is in the dialog below.
 
-                The card used to show text + time + Promote/Discard and nothing
-                else, which inverts locked decision 22: three different causes
-                land in this queue (the session taint latch, an unattributable
-                write, and the write-time credential screen), and for the third
-                one the note text IS the credential — so the card displayed the
-                secret value and withheld the rule name that matched it. The rule
-                is now the first thing on the row, in full weight, above a note
-                body that is no longer the only thing you can read.
+              #48, F-24's ordering is kept and still load-bearing: the WHY comes
+              before the note text, at full weight, because three different
+              causes land in this queue (the session taint latch, an
+              unattributable write, and the write-time credential screen) and
+              for the third one the note text IS the credential. Locked decision
+              22 forbids showing the matched value more prominently than the rule
+              that matched it — so the reason leads the row and the text follows
+              it, dimmed and truncated. Both columns truncate rather than wrap;
+              the row's `title` carries the full reason for a hover, and the
+              dialog carries everything.
 
-                The backend has published the cause since #48's F-24 fix, and
-                composes it at the store boundary so a held note cannot exist
-                without one. The `{:else}` leg below is therefore about the NOTE,
-                not about the build: rows written before the column existed carry
-                no cause. It is still never reconstructed here — see
-                `quarantineReason` in graph.ts for why guessing would be worse
-                than a blank.
-              -->
-              <div class="qwhy" class:missing={!why}>
-                <span class="qmark" title="Quarantined pending review">⚠</span>
-                {#if why}
-                  <span class="qreason">{why.reason}</span>
-                  {#if why.rules.length > 0}
-                    <span class="qrules" title="The rules that matched"
-                      >{why.rules.join(', ')}</span
-                    >
-                  {/if}
-                  <span class="qscreen" title="The screen that held this write">{why.screen}</span>
-                {:else}
-                  <span class="qreason"
-                    >Reason not recorded for this note — it was held before cImp
-                    stored the cause, so which screen or rule matched cannot be
-                    recovered.</span
-                  >
-                {/if}
-              </div>
-              <div class="arow note tainted">
-                <!-- The text is the click target for expansion: the row's one
-                     line truncates, and the confirm sentence says "read it
-                     above first" — this is where reading it in full happens. -->
-                <span
-                  class="ntext expandable"
-                  role="button"
-                  tabindex="0"
-                  title={expandedQ === n.note_id
-                    ? 'Collapse'
-                    : 'Show the full text and its context'}
-                  onclick={() => toggleQuarantined(n.note_id)}
-                  onkeydown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      toggleQuarantined(n.note_id);
-                    }
-                  }}>{expandedQ === n.note_id ? '▾' : '▸'} {n.text}</span
-                >
-                <span class="aloc">{fmtTime(n.ts_ms)}</span>
-                <!-- M-23: Promote wears the `…` and the danger colour, because it
-                     is the click that puts this text back into every future
-                     session. Discard is confirmed too (deletion is permanent) but
-                     stays plain — it releases nothing. -->
-                <button
-                  class="mini danger"
-                  disabled={reviewBusy === n.note_id || bulkBusy}
-                  title="Accept into project memory — asks for confirmation"
-                  onclick={() => armReview(n.note_id, 'promote')}>Promote…</button
-                >
-                <button
-                  class="mini"
-                  disabled={reviewBusy === n.note_id || bulkBusy}
-                  title="Delete permanently — asks for confirmation"
-                  onclick={() => armReview(n.note_id, 'discard')}>Discard…</button
-                >
-              </div>
-              {#if expandedQ === n.note_id}
-                {@const sess = sessionFor(n.session_id)}
-                <div class="qdetail">
-                  <!-- The full text, un-truncated — the thing the one-line row
-                       cannot show and the promote confirmation depends on. -->
-                  <pre class="qtext">{n.text}</pre>
-                  <div class="qmeta">
-                    <span class="qlabel">Written</span>
-                    <span>{fmtDate(n.ts_ms)} · {fmtTime(n.ts_ms)}</span>
-                    <span class="qlabel">Session</span>
-                    <span class="qmono"
-                      >{n.session_id || '(none — the write could not be attributed)'}</span
-                    >
-                    {#if sess}
-                      <span class="qlabel">That session</span>
-                      <span
-                        >{sess.agent} · active {fmtDate(sess.started_ms)}
-                        {fmtTime(sess.started_ms)} – {fmtTime(sess.last_ms)} · {sess.events}
-                        events</span
-                      >
-                    {/if}
-                    <span class="qlabel">If promoted</span>
-                    <span>
-                      {n.pinned
-                        ? 'saved as PINNED — kept across sessions and carried into the launch-time guidance'
-                        : 'saved unpinned — ordinary project memory, returned by recall'}
-                    </span>
-                    {#if why}
-                      <span class="qlabel">Held by</span>
-                      <span class="qmono"
-                        >{why.screen}{why.rules.length > 0
-                          ? ` · ${why.rules.join(', ')}`
-                          : ''}</span
-                      >
-                    {/if}
-                    <span class="qlabel">Note id</span>
-                    <span class="qmono">{n.note_id}</span>
-                  </div>
-                </div>
+              The backend has published the cause since #48's F-24 fix, and
+              composes it at the store boundary so a held note cannot exist
+              without one. The `{:else}` leg is therefore about the NOTE, not
+              about the build: rows written before the column existed carry no
+              cause. It is still never reconstructed here — see
+              `quarantineReason` in graph.ts for why guessing would be worse
+              than a blank.
+            -->
+            <div
+              class="qrow"
+              class:open={detailQ === n.note_id}
+              role="button"
+              tabindex="0"
+              title={why
+                ? `${why.reason}\n\nClick to open the note, its context and the two decisions.`
+                : 'Reason not recorded for this note.\n\nClick to open the note, its context and the two decisions.'}
+              onclick={() => openQuarantined(n.note_id)}
+              onkeydown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openQuarantined(n.note_id);
+                }
+              }}
+            >
+              <span class="qmark" title="Quarantined pending review">⚠</span>
+              {#if why}
+                <span class="qreason">{why.reason}</span>
+              {:else}
+                <span class="qreason missing">Reason not recorded</span>
               {/if}
-              {#if reviewConfirm?.note === n.note_id}
-                <div class="qconfirm" class:warn={reviewConfirm.action === 'promote'}>
-                  {#if reviewConfirm.action === 'promote'}
-                    <p>
-                      Promoting accepts this text into project memory. It was
-                      written while the session had already used an external
-                      tool, so it may be an instruction someone planted — once
-                      promoted it is returned by recall, rides the launch-time
-                      guidance into new sessions, and no longer says where it came
-                      from. Read it above first. Continue?
-                    </p>
-                    <div class="qconfirm-row">
-                      <button
-                        class="mini danger"
-                        disabled={reviewBusy === n.note_id}
-                        onclick={() => reviewNote(n.note_id, 'promote')}
-                        >Yes, promote into memory</button
-                      >
-                      <button class="mini" onclick={() => (reviewConfirm = null)}>Cancel</button>
-                    </div>
-                  {:else}
-                    <p>
-                      Discarding deletes this note permanently and cannot be
-                      undone. Nothing else changes: it is already held out of
-                      every read path, so discarding releases nothing. Continue?
-                    </p>
-                    <div class="qconfirm-row">
-                      <button
-                        class="mini"
-                        disabled={reviewBusy === n.note_id}
-                        onclick={() => reviewNote(n.note_id, 'discard')}
-                        >Yes, discard permanently</button
-                      >
-                      <button class="mini" onclick={() => (reviewConfirm = null)}>Cancel</button>
-                    </div>
-                  {/if}
-                </div>
-              {/if}
+              <span class="qpeek">{n.text}</span>
+              <span class="aloc">{fmtTime(n.ts_ms)}</span>
             </div>
           {/each}
         </div>
@@ -2973,6 +2906,137 @@
 
 </div>
 
+<!--
+  The quarantine detail dialog (V32 Phase C2 / #48). Outside `.graph-monitor`
+  on purpose: that container is `position: absolute; overflow-y: auto`, so a
+  dialog rendered inside it would scroll with the list and clip at its edges.
+  Same structure and z-order as the Events feed's event popup, so a held note
+  reads like every other "click the row for the whole record" surface.
+
+  `detailNote` is resolved from the live queue each render (see its
+  declaration): a note that gets promoted, discarded, or aged out closes its
+  own dialog instead of leaving a promotable ghost on screen.
+-->
+{#if detailNote}
+  {@const n = detailNote}
+  {@const why = quarantineReason(n)}
+  {@const sess = sessionFor(n.session_id)}
+  <div class="backdrop" onclick={closeQuarantined} role="presentation"></div>
+  <div class="qdialog" role="dialog" aria-label="Quarantined note">
+    <header class="qd-head">
+      <div class="qd-title"><span class="qmark">⚠</span> Quarantined note</div>
+      <button type="button" class="qd-close icon" onclick={closeQuarantined} aria-label="Close"
+        >×</button
+      >
+    </header>
+    <!-- The cause first, in full — the row could only show one truncated line
+         of it, and this is the sentence the decision turns on. -->
+    <div class="qd-why" class:missing={!why}>
+      {#if why}
+        <p class="qreason">{why.reason}</p>
+        <div class="qd-rulerow">
+          {#if why.rules.length > 0}
+            <span class="qrules" title="The rules that matched">{why.rules.join(', ')}</span>
+          {/if}
+          <span class="qscreen" title="The screen that held this write">{why.screen}</span>
+        </div>
+      {:else}
+        <p class="qreason">
+          Reason not recorded for this note — it was held before cImp stored the
+          cause, so which screen or rule matched cannot be recovered.
+        </p>
+      {/if}
+    </div>
+    <div class="qd-body">
+      <!-- The full text, un-truncated — what is actually being decided about,
+           and what the promote confirmation says to read first. -->
+      <div class="qd-sec">Note text</div>
+      <pre class="qtext">{n.text}</pre>
+      <div class="qmeta">
+        <span class="qlabel">Written</span>
+        <span>{fmtDate(n.ts_ms)} · {fmtTime(n.ts_ms)}</span>
+        <span class="qlabel">Session</span>
+        <span class="qmono">{n.session_id || '(none — the write could not be attributed)'}</span>
+        {#if sess}
+          <span class="qlabel">That session</span>
+          <span
+            >{sess.agent} · active {fmtDate(sess.started_ms)}
+            {fmtTime(sess.started_ms)} – {fmtTime(sess.last_ms)} · {sess.events} events</span
+          >
+        {/if}
+        <span class="qlabel">If promoted</span>
+        <span>
+          {n.pinned
+            ? 'saved as PINNED — kept across sessions and carried into the launch-time guidance'
+            : 'saved unpinned — ordinary project memory, returned by recall'}
+        </span>
+        {#if why}
+          <span class="qlabel">Held by</span>
+          <span class="qmono"
+            >{why.screen}{why.rules.length > 0 ? ` · ${why.rules.join(', ')}` : ''}</span
+          >
+        {/if}
+        <span class="qlabel">Note id</span>
+        <span class="qmono">{n.note_id}</span>
+      </div>
+    </div>
+    {#if reviewConfirm?.note === n.note_id}
+      <div class="qconfirm" class:warn={reviewConfirm.action === 'promote'}>
+        {#if reviewConfirm.action === 'promote'}
+          <p>
+            Promoting accepts this text into project memory. It was written
+            while the session had already used an external tool, so it may be an
+            instruction someone planted — once promoted it is returned by
+            recall, rides the launch-time guidance into new sessions, and no
+            longer says where it came from. Read it above first. Continue?
+          </p>
+          <div class="qconfirm-row">
+            <button
+              class="mini danger"
+              disabled={reviewBusy === n.note_id}
+              onclick={() => reviewNote(n.note_id, 'promote')}>Yes, promote into memory</button
+            >
+            <button class="mini" onclick={() => (reviewConfirm = null)}>Cancel</button>
+          </div>
+        {:else}
+          <p>
+            Discarding deletes this note permanently and cannot be undone.
+            Nothing else changes: it is already held out of every read path, so
+            discarding releases nothing. Continue?
+          </p>
+          <div class="qconfirm-row">
+            <button
+              class="mini"
+              disabled={reviewBusy === n.note_id}
+              onclick={() => reviewNote(n.note_id, 'discard')}>Yes, discard permanently</button
+            >
+            <button class="mini" onclick={() => (reviewConfirm = null)}>Cancel</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+    <!-- M-23's polarity, unchanged by the move: Promote wears the `…` and the
+         danger colour because it is the click that puts this text back into
+         every future session. Discard is confirmed too (deletion is permanent)
+         but stays plain — it releases nothing. -->
+    <footer class="qd-actions">
+      <button
+        class="mini danger"
+        disabled={reviewBusy === n.note_id || bulkBusy}
+        title="Accept into project memory — asks for confirmation"
+        onclick={() => armReview(n.note_id, 'promote')}>Promote…</button
+      >
+      <button
+        class="mini"
+        disabled={reviewBusy === n.note_id || bulkBusy}
+        title="Delete permanently — asks for confirmation"
+        onclick={() => armReview(n.note_id, 'discard')}>Discard…</button
+      >
+      <button class="mini qd-dismiss" onclick={closeQuarantined}>Close</button>
+    </footer>
+  </div>
+{/if}
+
 <style>
   .graph-monitor {
     /* Sit ABOVE the pane's absolutely-positioned (empty) terminal slot —
@@ -3232,45 +3296,60 @@
     grid-template-columns: auto 1fr auto;
   }
   /* V32 Phase C2: the quarantine review queue. Warning-tinted rather than
-     danger-tinted — a held note is a decision waiting, not a failure.
-     Four columns since F-24 moved the ⚠ up into the reason line above. */
-  .arow.note.tainted {
-    grid-template-columns: 1fr auto auto auto;
-    border-bottom: none;
-  }
+     danger-tinted — a held note is a decision waiting, not a failure. */
   .card.quarantine {
     border-color: var(--border-warning, #c9820a);
   }
   .qmark {
     color: var(--surface-warning, #c9820a);
   }
-  /* #48, F-24 — one held note: the cause, then the text, then the decision. */
-  .qitem {
-    border-bottom: 1px solid var(--border-faint, #2a2a2a);
-    padding-bottom: 3px;
-  }
-  .qwhy {
-    display: flex;
+  /* #48, F-24 — one held note, ONE LINE: ⚠, cause, text peek, time. Both text
+     columns get `minmax(0, …)` so they truncate instead of forcing the row
+     wider; the 2fr/3fr split keeps the cause readable at the narrow widths
+     this card sits at while still showing enough of the note to tell two
+     apart. The whole row is the click target (dialog). */
+  .qrow {
+    display: grid;
+    grid-template-columns: auto minmax(0, 2fr) minmax(0, 3fr) auto;
     align-items: baseline;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 4px 4px 0;
+    gap: 8px;
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--border-faint, #2a2a2a);
     font-size: 12px;
+    cursor: pointer;
   }
-  /* The rule/reason line is the note's headline, at full weight — decision 22
-     forbids the value being more prominent than the rule that matched it, and
-     the value is `.ntext` below. */
+  .qrow:hover,
+  .qrow:focus-visible,
+  .qrow.open {
+    background: var(--surface-2, rgba(255, 255, 255, 0.04));
+    outline: none;
+  }
+  /* The cause is the row's headline, at full weight — decision 22 forbids the
+     matched value being more prominent than the rule that matched it, and the
+     value is `.qpeek` beside it. */
   .qreason {
     color: var(--text-primary, #ddd);
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   /* A reason we could not be told is not a reason. Rendered as the app's
      "not a confident claim" treatment (quiet, italic) rather than as an
      explanation — see `quarantineReason` for why it is never reconstructed. */
-  .qwhy.missing .qreason {
+  .qreason.missing,
+  .qd-why.missing .qreason {
     color: var(--text-tertiary, #9aa0aa);
     font-weight: 400;
     font-style: italic;
+  }
+  /* A peek at the note, deliberately quieter than the cause and never wrapped:
+     when the cause is the credential screen, this text IS the secret. */
+  .qpeek {
+    color: var(--text-secondary, #b8bec9);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   /* The matched rule identifiers, verbatim. Monospace because they are
      identifiers the user may search the ruleset for. */
@@ -3287,36 +3366,117 @@
     font-size: 11px;
     color: var(--text-tertiary, #9aa0aa);
   }
-  /* The note text doubles as the expand toggle — the row's line truncates,
-     and the decision must not be made off a truncated first line. */
-  .ntext.expandable {
-    cursor: pointer;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  /* ── The detail dialog. Same conventions as the Events feed's event popup
+     (backdrop + centred card + Escape/backdrop close), so "click the row to
+     see the whole record" behaves identically wherever it appears. ─────── */
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 100;
   }
-  .ntext.expandable:hover,
-  .ntext.expandable:focus-visible {
+  .qdialog {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    width: min(760px, calc(100vw - 40px));
+    max-height: min(80vh, 900px);
+    box-sizing: border-box;
+    padding: 14px 16px;
+    background: var(--surface-3, #1e1e1e);
+    /* Warning-bordered like the card it opens from: the dialog is the same
+       decision, enlarged. */
+    border: 1px solid var(--border-warning, #c9820a);
+    border-radius: var(--radius-lg, 10px);
+    box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.5));
     color: var(--text-primary, #ddd);
-    text-decoration: underline dotted;
-    outline: none;
+    font-size: 13px;
+    z-index: 101;
   }
-  /* The expanded panel: full text first (it is what is being decided about),
-     then the context lines. */
-  .qdetail {
-    margin: 2px 4px 6px;
-    padding: 6px 8px;
-    border: 1px solid var(--border-faint, #2a2a2a);
-    border-radius: var(--radius-md, 3px);
-    background: var(--surface-sunken, rgba(0, 0, 0, 0.25));
+  .qd-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
   }
+  .qd-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+  }
+  .qd-close {
+    border: none;
+    background: transparent;
+    color: var(--text-primary, #ddd);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 2px 6px;
+  }
+  .qd-close:hover {
+    opacity: 1;
+  }
+  /* The cause block: the whole sentence, then the identifiers under it. */
+  .qd-why {
+    margin-bottom: 10px;
+  }
+  .qd-why .qreason {
+    margin: 0;
+    /* Unlike the row, the dialog has room — never truncate the cause here. */
+    white-space: normal;
+    overflow: visible;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .qd-rulerow {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .qd-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .qd-sec {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-bottom: 4px;
+  }
+  .qd-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 12px;
+  }
+  .qd-dismiss {
+    margin-left: 6px;
+  }
+  /* The payload treatment the Events popup uses for request/response bodies:
+     sunken, wrapped, independently scrollable so a long note cannot push the
+     context grid and the two buttons out of reach. */
   .qtext {
-    margin: 0 0 6px;
+    margin: 0 0 10px;
+    padding: 8px 10px;
     font-size: 12px;
     font-family: inherit;
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 30vh;
+    max-height: 40vh;
     overflow-y: auto;
+    background: var(--surface-sunken, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--border-faint, #2a2a2a);
+    border-radius: var(--radius-md, 3px);
   }
   .qmeta {
     display: grid;
@@ -3348,6 +3508,12 @@
   .qconfirm.warn {
     border-color: var(--border-warning, #6a571a);
     background: var(--surface-warning-faint, rgba(240, 160, 32, 0.1));
+  }
+  /* In the dialog the confirmation sits between the scrolling body and the
+     buttons, so it uses the dialog's own gutters rather than the card's. */
+  .qdialog .qconfirm {
+    margin: 10px 0 0;
+    flex: none;
   }
   .qconfirm p {
     margin: 0 0 6px;

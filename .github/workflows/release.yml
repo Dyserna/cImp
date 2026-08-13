@@ -150,9 +150,14 @@ jobs:
             die(`allow_untested must be exactly '${BYPASS}' — refusing to guess at a bypass`);
           }
 
-          // ── 3. the paths: hole ───────────────────────────────────────────
-          // tests.yml filters its push/pull_request triggers by `paths:`, so a
+          // ── 3. the trigger-filter hole ───────────────────────────────────
+          // tests.yml filters its push/pull_request triggers, so a
           // commit touching only excluded files produces NO run for that sha —
+          // (F-30 inverted that filter from an allowlist `paths:` to
+          // `paths-ignore:`, which narrowed this hole but did not close it:
+          // a commit touching only docs/** still produces no run. The logic
+          // below is unaffected by the inversion — only the population of
+          // "excluded files" changed.)
           // and "no run found" is then ambiguous between "tests were skipped
           // legitimately" and "tests never ran on code that changed". The
           // ambiguous case must never default to pass; but hard-failing BOTH

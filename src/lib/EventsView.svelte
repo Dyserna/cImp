@@ -40,7 +40,7 @@
     type FeedFilter,
   } from './activity';
   import StatusChip from './StatusChip.svelte';
-  import { fmtTime } from './format';
+  import { fmtDate, fmtTime } from './format';
   import { fmtTok } from './usageMath';
   import { EVENTS_TAB_ID, WORKBENCH_TAB_ID } from './tabs/types';
   import { revealTab } from './tabs/visibility';
@@ -222,13 +222,20 @@
     ].sort((a, b) => a.localeCompare(b)),
   );
 
-  /// A checkpoint row's click: land on the Workbench Timeline with that
-  /// checkpoint highlighted — Events is the index, the Timeline is the
-  /// specialist view (#51). No detail popup for these rows; the Timeline IS
-  /// the detail.
+  /// Land on the Workbench Timeline with that checkpoint highlighted — Events
+  /// is the index, the Timeline is the specialist view (#51).
+  ///
+  /// This USED to be the checkpoint row's click. It isn't any more: a row that
+  /// silently switched tabs was the one row in the feed whose click did
+  /// something other than "show me this record", and there was no way to read a
+  /// checkpoint's commit, seq or full label without leaving the feed. The jump
+  /// is now a button in the detail popup, so every row in the feed opens its
+  /// record and the tab switch is something you ask for.
   function openCheckpoint(cp: Checkpoint): void {
     openTimelineCheckpoint(cp.id);
     revealTab(WORKBENCH_TAB_ID);
+    // Nothing behind this dialog is what the user is looking at any more.
+    closeDetail();
   }
 
   function resetFilters(): void {
@@ -339,9 +346,24 @@
   // must not let A's late response overwrite the popup.
   let detailSeq = 0;
 
+  /// The checkpoint the popup is showing, by id — `null` when the popup is
+  /// showing an activity row (or nothing). Which of the two the popup renders
+  /// is decided by this id, NOT by `detail`, so a checkpoint click can never
+  /// land in the "Loading…" leg of the activity branch.
+  let detailCpId = $state<string | null>(null);
+
+  /// Resolved against the LIVE checkpoint list each render rather than captured
+  /// at click time: the shadow repo has its own GC, and turning checkpoints off
+  /// empties `cps` outright. A stale captured copy would keep offering "Open in
+  /// Timeline" for a checkpoint the Timeline no longer has.
+  let detailCp = $derived(
+    detailCpId === null ? null : (cps.find((c) => c.id === detailCpId) ?? null),
+  );
+
   async function openDetail(id: number): Promise<void> {
     const seq = ++detailSeq;
     detailOpen = true;
+    detailCpId = null;
     detail = null;
     detailMissing = false;
     try {
@@ -354,11 +376,24 @@
     }
   }
 
+  /// A checkpoint row's click. No fetch: the row already holds the whole
+  /// record (the feed merges it from `workbench_checkpoints` client-side), so
+  /// the popup opens populated. The seq bump still matters — it invalidates an
+  /// activity fetch started by a previous click that hasn't landed yet.
+  function openCheckpointDetail(cp: Checkpoint): void {
+    detailSeq += 1;
+    detail = null;
+    detailMissing = false;
+    detailCpId = cp.id;
+    detailOpen = true;
+  }
+
   function closeDetail(): void {
     detailSeq += 1; // invalidate any in-flight fetch
     detailOpen = false;
     detail = null;
     detailMissing = false;
+    detailCpId = null;
   }
 
   // ── Delete / clear ────────────────────────────────────────────────────
@@ -721,18 +756,19 @@
             </div>
           {:else}
             {@const cp = row.cp}
-            <!-- A checkpoint row: no detail popup — the click lands on the
-                 Workbench Timeline with this checkpoint highlighted. -->
+            <!-- A checkpoint row opens the same detail popup every other row
+                 opens; the jump to the Workbench Timeline is a button inside
+                 it (see `openCheckpoint`). -->
             <div
               class="erow"
               role="button"
               tabindex="0"
-              title="Open in the Workbench Timeline"
-              onclick={() => openCheckpoint(cp)}
+              title="Show this checkpoint's details"
+              onclick={() => openCheckpointDetail(cp)}
               onkeydown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  openCheckpoint(cp);
+                  openCheckpointDetail(cp);
                 }
               }}
             >
@@ -768,8 +804,89 @@
 
 {#if detailOpen}
   <div class="backdrop" onclick={closeDetail} role="presentation"></div>
-  <div class="detail-card" role="dialog" aria-label="Event detail">
-    {#if detail}
+  <div
+    class="detail-card"
+    role="dialog"
+    aria-label={detailCpId ? 'Checkpoint detail' : 'Event detail'}
+  >
+    {#if detailCpId}
+      <!-- The checkpoint leg. Branching on the ID (not on `detailCp`) keeps a
+           GC'd or filtered-out checkpoint in THIS leg, where it can say so,
+           instead of falling through to the activity branch's "Loading…". -->
+      {#if detailCp}
+        {@const cp = detailCp}
+        {@const cpTs = cp.ts_unix * 1000}
+        {@const a = cpAttribution(cp)}
+        <header class="detail-head">
+          <div class="detail-title">
+            <span class="ekind checkpoint">checkpoint</span>
+            <span class="detail-tool" title={cp.label}>{cp.label}</span>
+            <span
+              class="cpfiles"
+              title="Files changed since the previous checkpoint — what this checkpoint captured when taken, not its diff against the current tree"
+              >{cp.files_changed} files</span
+            >
+          </div>
+          <button type="button" class="detail-close icon" onclick={closeDetail} aria-label="Close"
+            >×</button
+          >
+        </header>
+        <div class="detail-meta">
+          {fmtDate(cpTs)} · {fmtTime(cpTs)} · {cpSource(cp)} · {cp.trigger}
+        </div>
+        <div class="detail-attr">
+          <span class="eattr attr-{attrState(a)}" title={attrTitle(a)}>{attrLabel(a)}</span>
+          <span class="detail-session">
+            session: {cp.session ?? 'not recorded'}
+          </span>
+        </div>
+        <div class="detail-body">
+          <!-- The fields the feed's columns cannot carry. The commit and the
+               tag id are here because they are what you take to git or to a
+               bug report; the row only ever showed the label. -->
+          <div class="cpgrid">
+            <span class="cplabel">Label</span>
+            <span>{cp.label}</span>
+            <span class="cplabel">Trigger</span>
+            <span>{cp.trigger}</span>
+            <span class="cplabel">Taken</span>
+            <span>{fmtDate(cpTs)} · {fmtTime(cpTs)}</span>
+            <span class="cplabel">Files changed</span>
+            <span>{cp.files_changed} since the previous checkpoint</span>
+            <span class="cplabel">Tab</span>
+            <span class="cpmono">{cp.tab ?? 'not recorded'}</span>
+            <span class="cplabel">Session</span>
+            <span class="cpmono">{cp.session ?? 'not recorded'}</span>
+            <span class="cplabel">Commit</span>
+            <span class="cpmono">{cp.commit}</span>
+            <span class="cplabel">Checkpoint</span>
+            <span class="cpmono">{cp.id} · seq {cp.seq}</span>
+          </div>
+          <p class="cpnote">
+            Checkpoints live in the shadow repo under its own retention, not in
+            the activity history — clearing this feed leaves them untouched, and
+            restoring one is done from the Timeline.
+          </p>
+        </div>
+        <footer class="detail-actions">
+          <button type="button" class="detail-goto" onclick={() => openCheckpoint(cp)}
+            >Open in Timeline</button
+          >
+          <button type="button" class="detail-dismiss" onclick={closeDetail}>Close</button>
+        </footer>
+      {:else}
+        <header class="detail-head">
+          <div class="detail-title">Checkpoint not available</div>
+          <button type="button" class="detail-close icon" onclick={closeDetail} aria-label="Close"
+            >×</button
+          >
+        </header>
+        <div class="detail-meta">
+          It has aged out of the shadow repo's retention, or checkpoints were
+          turned off since this row was drawn.
+        </div>
+      {/if}
+    {:else if detail}
       <header class="detail-head">
         <div class="detail-title">
           <span class="ekind {detail.kind}">{detail.kind}</span>
@@ -1300,5 +1417,43 @@
   }
   .detail-delete:hover {
     border-color: var(--text-danger-soft, #ffb4ab);
+  }
+  /* The checkpoint popup's jump to the Timeline — the action the row's click
+     used to be. Teal, matching the kind chip, so it reads as "go to the
+     checkpoint" rather than as a second dismiss. */
+  .detail-goto {
+    /* The same mix `.ekind.checkpoint` wears, so the button reads as "go to
+       the checkpoint" rather than as a second dismiss. */
+    color: color-mix(in srgb, var(--text-info, #58a6ff) 45%, var(--text-success, #3fb950));
+    border-color: color-mix(in srgb, currentColor 50%, transparent);
+    /* Pushed to the left edge: it is the action, Close is the way out. */
+    margin-right: auto;
+  }
+  .detail-goto:hover {
+    border-color: currentColor;
+  }
+  /* The checkpoint field grid — the record behind the row's columns. */
+  .cpgrid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 3px 12px;
+    font-size: 12px;
+  }
+  .cpgrid .cplabel {
+    color: var(--text-tertiary, #9aa0aa);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.03em;
+    align-self: baseline;
+  }
+  .cpgrid .cpmono {
+    font-family: var(--font-mono, monospace);
+    word-break: break-all;
+  }
+  .cpnote {
+    margin: 12px 0 0;
+    font-size: 11px;
+    line-height: 1.4;
+    opacity: 0.7;
   }
 </style>

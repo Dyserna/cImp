@@ -15,8 +15,13 @@ name: Tests
 #    plain `cargo test` is the right surface here.
 #  * `--bin cimp` is REQUIRED, not a preference: the crate has no lib target
 #    (Cargo.toml declares only `[[bin]]`), so `cargo test --lib` fails outright.
-#  * Windows, matching clippy.yml — it is the primary platform, and same-OS
-#    jobs can share one cargo cache.
+#  * TWO jobs since 2026-08-13: `tests` on Windows (the primary platform, and
+#    the OS whose cargo cache it shares with clippy.yml) and `test-linux` on
+#    ubuntu-24.04. Before the second one, cargo ran on Linux in exactly ONE
+#    place — release.yml's `build-linux`, which is tag-triggered, `needs:
+#    build-windows`, and builds without testing — so a Linux break surfaced at
+#    tag time or not at all. The long note on `test-linux` below has the
+#    reasoning, incl. why it is a separate job rather than a matrix.
 #
 # Trigger shape — `paths-ignore`, NOT `paths` (F-30, user decision 2026-08-12).
 # This job used to carry an ALLOWLIST of paths that can affect the tests. That
@@ -135,8 +140,14 @@ jobs:
       #    (H-1), `tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight`
       #    (M-15) and
       #    `tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab`
-      #    (F-13) need `node` on PATH, which this job has unconditionally — `npx
-      #    vitest run` is ten steps up. That is the whole reason O-1 is cheap.
+      #    (F-13) and
+      #    `tabs::config::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load`
+      #    (V33 C6 / H-7 — the only executable proof that binding `fetch` at
+      #    plugin load actually survives a later `globalThis.fetch` swap; every
+      #    other test of that template greps the emitted source, which cannot
+      #    reach the property) need `node` on PATH, which this job has
+      #    unconditionally — `npx vitest run` is ten steps up. That is the whole
+      #    reason O-1 is cheap.
       #  * `tts::engine::tests::synthesizes` needs the Kokoro model + voicepack
       #    and `tts::phonemize::tests::espeak_fallback_engages_on_oov` needs the
       #    `espeak-ng-data` dir; neither is on the runner (see the header note).
@@ -161,7 +172,8 @@ jobs:
           $nodeBacked = @(
             'tabs::config::tests::the_gate_cache_survives_a_beacon_racing_an_in_flight_query',
             'tabs::config::tests::the_gate_refuses_local_tools_while_the_beacon_is_in_flight',
-            'tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab'
+            'tabs::config::tests::the_gate_refuses_native_web_from_a_contaminated_but_unlatched_tab',
+            'tabs::config::tests::the_gate_and_beacon_survive_a_fetch_swap_after_load'
           )
           $expected = ($nodeBacked + @(
             'tts::engine::tests::synthesizes',
@@ -193,3 +205,181 @@ jobs:
               exit 1
             }
           }
+
+  # V33, 2026-08-13. The same suite on Linux, because until this job existed
+  # cargo ran on Linux in exactly ONE place: release.yml's `build-linux`. That
+  # job is tag-triggered, carries `needs: build-windows`, and BUILDS ONLY — it
+  # runs no test at all. So a Linux-only compile break or test failure could
+  # not surface before tag time, inside the most expensive job in the pipeline,
+  # *after* the Windows build had already created the GitHub release. The gap
+  # is recorded in docs/MAINTENANCE.md ("CI coverage — what the workflows do
+  # and do not check"); this job is what closes it.
+  #
+  # V33 is what turns that from tidy into urgent. Stage 1 gives
+  # `process_guard` / `procutil::kill_tree` a Linux implementation, and Phase D
+  # adds Landlock sandboxing behind `[target.'cfg(unix)']` + `pre_exec` — code
+  # the Windows job cannot compile at all, let alone run. Writing Linux-only
+  # code with no Linux CI is writing untested code, and the `tests` job above
+  # goes green while none of it is touched.
+  #
+  # A SEPARATE JOB, not a matrix on `tests`. Four reasons, heaviest first:
+  #  1. The steps genuinely differ — an apt step, a LIBCLANG_PATH that has to
+  #     be discovered rather than hardcoded, and no PowerShell. A matrix would
+  #     hang `if: runner.os == …` off roughly half its steps, which reads worse
+  #     than two jobs and fails worse: an `if:` that silently evaluates false
+  #     is a step that quietly stops running — the same fail-open shape as the
+  #     `paths:` allowlist F-30 replaced.
+  #  2. Combining them shares nothing. The cargo-cache argument that keeps the
+  #     Windows job next to clippy.yml does not cross OSes —
+  #     Swatinem/rust-cache keys on runner OS + rustc version no matter what
+  #     `shared-key` says — so a matrix would still be two cold caches. Linux
+  #     gets its own key family below, ready for a Linux clippy job to share
+  #     the way the two Windows jobs already do.
+  #  3. Matrix `fail-fast` defaults to TRUE, so the first OS to go red cancels
+  #     the other — destroying the one thing this job exists to tell you:
+  #     whether a failure is cross-platform or Linux-only. `fail-fast: false`
+  #     fixes that, but a matrix that shares no cache and fails independently
+  #     is just two jobs with extra indirection.
+  #  4. Independent timeouts (see below).
+  #
+  # THE RELEASE GATE NEEDS NO CHANGE — checked, not assumed. release.yml's
+  # `gate-tests` polls the workflow-RUNS API and matches on
+  # `r.conclusion === "success"`, the workflow-level roll-up; it never names a
+  # job. A red job here therefore turns the whole Tests run red and blocks the
+  # tag on its own. That is the intent, and it is worth stating plainly: this
+  # job can now stop a release, which is precisely the point of moving the
+  # failure from tag time to push time.
+  test-linux:
+    # Pinned, NOT `ubuntu-latest`: that label drifts to the next LTS on
+    # GitHub's schedule, and this job's whole value is predicting what
+    # release.yml's `build-linux` will do — which is pinned to ubuntu-24.04
+    # because the shipped binary's floor is 24.04/glibc 2.39 (ort's WebGPU
+    # prebuilt; see docs/MILESTONE-linux-support.md and MAINTENANCE.md). The
+    # floor argument does not strictly bind a DEFAULT-feature job, which never
+    # links ort's WebGPU EP — matching the release runner does.
+    runs-on: ubuntu-24.04
+    # Same 75 as the Windows job, and the number matters beyond this file:
+    # release.yml's gate-tests waits 80 minutes (160 x 30 s) for the Tests RUN
+    # to finish. Jobs run in parallel, so a run's wall clock is the SLOWER job
+    # rather than the sum — 75 here keeps the run inside the ceiling the gate
+    # already budgets for. Raising it above 80 would make the gate time out
+    # (and fail the release) instead of reading a result.
+    timeout-minutes: 75
+    env:
+      # Node 24 actions runtime (see release.yml).
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # Derived from release.yml's `build-linux` — the only Linux recipe in
+      # this repo that is PROVEN to compile the tree — minus the rows that
+      # exist for the GPU features. Every package below is copied from there,
+      # not invented; the deltas, and why each is safe, are:
+      #
+      #  * DROPPED `libvulkan-dev glslang-tools spirv-tools
+      #    mesa-vulkan-drivers`, and the whole LunarG-repo step that installs
+      #    `shaderc`/`vulkan-headers` for `glslc`. Those serve `stt-vulkan`
+      #    only (`whisper-rs/vulkan` → ggml-vulkan's shader-generator
+      #    sub-build). This job builds DEFAULT features, and `default = []` in
+      #    src-tauri/Cargo.toml — no Vulkan, no glslc, and several minutes of
+      #    apt saved on every run.
+      #  * DROPPED `unzip`: nothing in the release job's own steps invokes it
+      #    (scripts/fetch-models.ps1 does no archive extraction either), and
+      #    this job runs neither the models fetch nor any staging step.
+      #  * KEPT the whole Tauri/GTK/appindicator block verbatim. Paring it to
+      #    "what default features surely need" would be guessing at which of
+      #    tauri's optional link inputs the tree drags in; the proven set costs
+      #    nothing and guesses nothing.
+      #  * KEPT `libssl-dev` even though nothing GPU is being built — this is
+      #    the answer to "do default features need a native dep at all", and it
+      #    is yes. `ort`'s `download-binaries` feature is on UNCONDITIONALLY in
+      #    Cargo.toml (the EP features are what's optional), and ort-sys'
+      #    downloader is ureq → native-tls → openssl on Linux. Build-time only;
+      #    it does not link into the binary.
+      #  * KEPT `espeak-ng-data`. Strictly it is not required — build.rs's
+      #    `copy_espeak_data` panics on Windows when the data is missing but
+      #    only warns off Windows — so omitting it would still compile. It
+      #    stays because a permanently-warning build teaches people to ignore
+      #    build warnings, and because the package is small.
+      #  * KEPT `cmake clang libclang-dev llvm` (whisper.cpp's C build +
+      #    bindgen for whisper-rs-sys / espeak-rs-sys) and `libasound2-dev`
+      #    (cpal/rodio's ALSA backend). All three are default-feature deps.
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev build-essential pkg-config file \
+            libasound2-dev cmake clang libclang-dev llvm \
+            libssl-dev espeak-ng-data
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # `npm install`, not `npm ci` — see the Windows job's note above.
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      # No `vitest` step here on purpose. The frontend suite is Node-only and
+      # platform-independent; the Windows job already runs it, and a second
+      # copy would double the maintenance surface to re-prove a result that
+      # cannot differ by OS. `npm run build` is NOT optional though —
+      # tauri-build resolves `frontendDist` (../dist) at compile time, so the
+      # bundle must exist before cargo runs.
+      - name: Build frontend
+        run: npm run build
+
+      # Floating stable, same pin and same accepted MSRV gap as the Windows
+      # job. `toolchain:` is explicit because the action is pinned to a SHA
+      # rather than to the `stable` branch, and otherwise infers from the ref.
+      - name: Setup Rust (floating stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch, 2026-07-15
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          # Its own key family: rust-cache already scopes by runner OS, so this
+          # could never have collided with `cimp-win-src-tauri` — naming it
+          # separately is for the reader, and reserves the key a future Linux
+          # clippy job would share (mirroring the Windows pair).
+          shared-key: cimp-linux-src-tauri
+          cache-on-failure: true
+
+      - name: cargo test
+        working-directory: src-tauri
+        shell: bash
+        # Same command as the Windows job — `--bin cimp` because there is no
+        # lib target, `--locked` so CI tests the committed Cargo.lock.
+        #
+        # The `#[ignore]`d tests are NOT run here. The inventory-pin step lives
+        # on the Windows job and asserts a GLOBAL property of the suite (which
+        # tests carry `#[ignore]`), so a second copy would be a second thing to
+        # update rather than a second signal; and the model-backed ones need
+        # Kokoro/Whisper blobs this runner does not have either.
+        run: |
+          set -e
+          # bindgen (whisper-rs-sys, espeak-rs-sys) needs libclang; find it
+          # regardless of the runner's LLVM version. Verbatim from
+          # release.yml's build-linux.
+          #
+          # This export is what neutralises src-tauri/.cargo/config.toml, whose
+          # `[env]` block hardcodes LIBCLANG_PATH to 'C:\Program Files\LLVM\bin'
+          # (and VULKAN_SDK to a C:\ path, unused without stt-vulkan). Cargo's
+          # `[env]` does NOT override a variable already in the environment
+          # unless the entry sets `force = true`, which neither does — so the
+          # value exported here wins. Same mechanism release.yml's build-linux
+          # relies on, which is where the evidence that it works comes from.
+          export LIBCLANG_PATH="$(dirname "$(find /usr/lib/llvm-* -name libclang.so 2>/dev/null | sort | tail -1)")"
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+          cargo test --locked --bin cimp

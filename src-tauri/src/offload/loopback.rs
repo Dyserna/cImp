@@ -175,10 +175,37 @@ fn canon(p: &Path) -> PathBuf {
 /// Component-wise "is `root` an ancestor of (or equal to) `hint`" — case
 /// insensitive on Windows, where on-disk casing and agent-reported cwds
 /// routinely disagree.
+///
+/// **An unresolved `..` on either side is refused, never matched** (V33). This
+/// walk compares components literally: it cannot resolve a
+/// [`Component::ParentDir`](std::path::Component::ParentDir), and its partner
+/// [`canon`] only resolves one when the path EXISTS — otherwise `canonicalize`
+/// fails and the raw path is kept verbatim. So `<root>/../../evil` arrives here
+/// still carrying its `..`, and a plain zip-compare answers "descendant of
+/// `<root>`" because the leading components genuinely do match. The refusal
+/// lives here rather than at either caller so that both of them —
+/// [`audit_admit`] step 3 and [`admitted_hook_root`] — get the same answer by
+/// construction; a per-route copy is exactly the check that drifts.
+///
+/// This is written from a measurement, because the tempting "Windows already
+/// rejects it" rebuttal is wrong in both directions. `canon` adds a `\\?\`
+/// verbatim prefix when it succeeds and not when it fails, so
+/// `P:\root\..\..\evil` is rejected only on an accidental *prefix* mismatch —
+/// while `\\?\P:\root\..\..\evil`, which a caller may simply spell that way,
+/// matches on the prefix and walks straight through. On Linux there is no
+/// prefix at all and the plain spelling walks through too. An accident is not a
+/// check, which is why this is one.
 fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
     let rc: Vec<_> = root.components().collect();
     let hc: Vec<_> = hint.components().collect();
     if rc.is_empty() || rc.len() > hc.len() {
+        return false;
+    }
+    if rc
+        .iter()
+        .chain(hc.iter())
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return false;
     }
     rc.iter().zip(hc.iter()).all(|(a, b)| {
@@ -4803,6 +4830,16 @@ fn audit_admit(
     //    root, so a child whose cwd falls outside it was misrouted (stale or
     //    foreign discovery entry — possible with several cImp instances off one
     //    install). A clean error beats silently auditing the wrong project.
+    //
+    //    **This is a routing guard, not a boundary, and must not be read as
+    //    one** (V33, recorded so the asymmetry with `/context/post_edit` is not
+    //    re-raised): `cwd` is `#[serde(default)]` for older children, so step 3
+    //    is skipped outright when the field is absent — a caller holding the
+    //    loopback token opts out of it by saying nothing. Nothing is gained by
+    //    doing so either: passing this check does not choose what gets scanned;
+    //    `served_root` does, and it comes from the app. What the two routes DO
+    //    share is the path comparison itself, and its `..` refusal now lives in
+    //    `is_ancestor_or_equal` so neither route can drift from the other.
     if let Some(child_cwd) = body.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let served = canon(served_root);
         if !is_ancestor_or_equal(&served, &canon(Path::new(child_cwd))) {
@@ -6847,24 +6884,21 @@ fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec
 ///    **as written**. The path string keys the single-flight `RootRunner`
 ///    bucket and the auto-check baseline downstream, so canonicalizing it here
 ///    would silently re-bucket every existing caller.
-/// 3. **Anything else** ⇒ `None`. Including a path containing `..`: a component
-///    walk cannot be relied on to reject one, because [`canon`] falls back to
-///    the raw path when `canonicalize` fails (which on Windows it does for any
-///    path that does not exist), leaving `P:\served\..\..\evil` looking like a
-///    descendant of `P:\served`. Refusing `..` outright costs nothing — every
-///    real caller sends the absolute cwd its harness reported.
+/// 3. **Anything else** ⇒ `None`. Including a path containing `..`, which is
+///    refused inside [`is_ancestor_or_equal`] rather than here: a component walk
+///    cannot resolve a `..`, and [`canon`] only resolves one for a path that
+///    EXISTS, so an unresolved `..` reaching a zip-compare reads as a
+///    descendant. That refusal is shared with [`audit_admit`] step 3
+///    deliberately — see the helper's own note for the measurement behind it,
+///    including why the Windows spelling in this comment's first draft
+///    (`P:\served\..\..\evil`) was rejected for the wrong reason and
+///    `\\?\P:\served\..\..\evil` was not rejected at all. Costs nothing here:
+///    every real caller sends the absolute cwd its harness reported.
 fn admitted_hook_root(roots: &[PathBuf], requested: Option<&str>) -> Option<PathBuf> {
     let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
         return roots.first().cloned();
     };
-    let raw = Path::new(req);
-    if raw
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return None;
-    }
-    let hint = canon(raw);
+    let hint = canon(Path::new(req));
     roots
         .iter()
         .any(|r| is_ancestor_or_equal(&canon(r), &hint))
@@ -9825,6 +9859,118 @@ mod tests {
             &proj_path("proj/a")
         ));
         assert!(!is_ancestor_or_equal(Path::new(""), &proj_path("proj")));
+    }
+
+    /// **V33: an unresolved `..` is refused by the ancestry walk itself, so
+    /// both routes that use it inherit the refusal.**
+    ///
+    /// [`canon`] resolves `..` only for a path that EXISTS — `canonicalize`
+    /// fails on anything else and the raw string is kept — so a `..` reaches
+    /// this walk intact and a plain zip-compare calls it a descendant. Both
+    /// [`audit_admit`] step 3 and [`admitted_hook_root`] feed caller-supplied
+    /// strings in, which is why the answer lives in one place.
+    ///
+    /// The Windows case is the one worth pinning, because it is the one that
+    /// looks safe and is not. `canon` adds a `\\?\` verbatim prefix on success
+    /// and not on failure, so the *plain* `P:\proj\..\..\evil` is rejected only
+    /// as a side effect of the prefixes disagreeing — nothing to do with `..`.
+    /// Spell the prefix yourself and the accident evaporates: before this
+    /// refusal, `\\?\P:\proj\..\..\evil` matched `\\?\P:\proj` and walked
+    /// through. Off Windows there is no prefix at all and the plain spelling
+    /// walked through too, so this is not a Windows-only property and its test
+    /// is not Windows-only either.
+    #[test]
+    fn is_ancestor_or_equal_refuses_an_unresolved_parent_dir() {
+        let root = proj_path("proj");
+
+        // The plain spelling, on either platform.
+        assert!(!is_ancestor_or_equal(
+            &root,
+            &root.join("..").join("..").join("evil")
+        ));
+        // A `..` that does not even leave the root is still refused: this walk
+        // cannot tell the difference, and every real caller sends a resolved
+        // absolute path.
+        assert!(!is_ancestor_or_equal(
+            &root,
+            &root.join("sub").join("..").join("evil")
+        ));
+        // The `root` side too — a discovery entry's `root` is file-supplied
+        // (decision 30) and reaches `select_answering` unfiltered.
+        assert!(!is_ancestor_or_equal(
+            &root.join(".."),
+            &proj_path("proj/a/deep")
+        ));
+
+        // Windows: the same escape with the verbatim prefix supplied by the
+        // caller, which is what `canon` produces for the root side. This is the
+        // spelling that actually matched before the refusal landed.
+        if cfg!(windows) {
+            assert!(!is_ancestor_or_equal(
+                Path::new(r"\\?\P:\proj"),
+                Path::new(r"\\?\P:\proj\..\..\evil")
+            ));
+            // Control: the same pair without the `..` still matches, so the
+            // assertion above is about `..` and not about the prefix.
+            assert!(is_ancestor_or_equal(
+                Path::new(r"\\?\P:\proj"),
+                Path::new(r"\\?\P:\proj\src")
+            ));
+        }
+    }
+
+    /// **V33: `/audit/run`'s step 3 gets the `..` refusal from the shared
+    /// helper, not from a copy of `/context/post_edit`'s check.**
+    ///
+    /// The two routes answer a miss differently (a readable tool error here, an
+    /// empty-text fail-safe there) but they must agree on what a miss IS. This
+    /// asserts the agreement at the route, so deleting the shared refusal fails
+    /// here as well as at [`admitted_hook_root`]'s own test.
+    ///
+    /// **What this deliberately does NOT claim.** Step 3 is a wrong-instance
+    /// guard, not a boundary: `cwd` is optional on the wire, so a body that
+    /// omits it skips the check entirely — and gains nothing by it, since the
+    /// scan root is `served_root` either way. The property pinned here is
+    /// consistency between the two path checks, not containment.
+    #[test]
+    fn audit_run_refuses_a_traversal_cwd_like_post_edit_does() {
+        // A REAL directory on both sides, deliberately: `canon` then SUCCEEDS
+        // for the served root and for the control cwd, so on Windows both carry
+        // the `\\?\` prefix and the escape below is decided by the component
+        // walk rather than by the prefix accident this fix exists to stop
+        // relying on. A synthetic `P:\proj` would test the accident instead.
+        let served = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("the crate's own directory exists");
+        let body = |cwd: &str| AuditRunBody {
+            category: crate::audit::adapters::Category::Security,
+            consumer: Some("claude".into()),
+            cwd: Some(cwd.to_string()),
+            tab: Some("tab-1".into()),
+        };
+        let admit = |b: &AuditRunBody| {
+            audit_admit(
+                &LatchRegistry::default(),
+                b,
+                &served,
+                |_| true,
+                |_, _| LatchScoping::Anonymous,
+                |_| ON,
+            )
+        };
+
+        // Control: a cwd inside the served root is admitted.
+        let inside = served.join("src").to_string_lossy().into_owned();
+        assert!(admit(&body(&inside)).is_ok(), "{inside}");
+
+        // The traversal — spelled from the canonicalized root, i.e. WITH the
+        // verbatim prefix on Windows — takes the wrong-instance refusal.
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let escape = format!("{}{sep}..{sep}..{sep}evil", served.display());
+        let err = admit(&body(&escape)).expect_err(&escape);
+        assert!(
+            err.contains("this cImp instance serves"),
+            "{escape} must take the wrong-instance refusal, got: {err}"
+        );
     }
 
     #[test]

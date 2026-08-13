@@ -181,11 +181,16 @@ pub const LEDGER: &[SpawnSite] = &[
         count: 1,
         reason: "NOT a `Command::new` — the `open` crate behind `tauri-plugin-opener` does \
                  the spawning, which is why the ledger's needle set has to cover more than \
-                 one mechanism. Fires when a user clicks an external link in a Preview tab; \
-                 the URL is screened by `is_allowed_preview_host` first. Note that \
-                 `opener:allow-open-url` is also granted to both windows in \
-                 `capabilities/default.json`, so the frontend can reach the same handler \
-                 directly — that grant is outside `src/` and outside this scan.",
+                 one mechanism. Fires when a user clicks an external link in a Preview tab. \
+                 The screen is `preview::is_externally_openable` (scheme allowlist: http/https \
+                 only, the V14 Follina-class fix) and NOT `is_allowed_preview_host`, which \
+                 gates the embedded webview's navigation — this call is that check's REJECT \
+                 path. The IPC twin is inert: `capabilities/default.json` grants \
+                 `opener:allow-open-url`, which enables the command with NO url scope, and \
+                 the plugin's own `is_url_allowed` is `allowed.any(..)` over an empty list — \
+                 every frontend `plugin:opener|open_url` is refused `ForbiddenUrl`. Enforced \
+                 by `the_opener_grant_stays_scopeless`, because that is a property of a JSON \
+                 file this scan cannot see.",
     },
     SpawnSite {
         file: "procutil.rs",
@@ -811,6 +816,82 @@ mod tests {
                 site.file
             );
         }
+    }
+
+    /// **The one spawn seam whose reachability is decided outside `src/`.**
+    ///
+    /// `preview/mod.rs`'s row spawns through `tauri-plugin-opener`, and that
+    /// plugin also exposes `open_url` to the WEBVIEW over IPC. Whether the
+    /// frontend can reach it is settled entirely by `capabilities/default.json`
+    /// — a file no source scan in this module reads — so the ledger's claim
+    /// about it is asserted here rather than believed.
+    ///
+    /// **What makes it safe today, measured against the plugin's source**
+    /// (`tauri-plugin-opener-2.5.4`):
+    ///
+    /// * `commands::open_url` runs `scope.is_url_allowed(&url, with)` before
+    ///   `app.opener().open_url(..)`, and `Scope::is_url_allowed` is
+    ///   `self.allowed.iter().any(..)` — **an empty allow list denies
+    ///   everything**, it does not mean "unrestricted".
+    /// * The granted permission is `allow-open-url`, whose own description is
+    ///   "Enables the open_url command **without any pre-configured scope**".
+    ///   It carries no `scope` key, and the crate ships no plugin `global_scope`
+    ///   (both confirmed in `gen/schemas/acl-manifests.json`). So the allow list
+    ///   really is empty and every IPC call returns `ForbiddenUrl`.
+    /// * The URL scope lives in the SEPARATE `allow-default-urls` permission
+    ///   (`http://*`, `https://*`, `mailto:*`, `tel:*`), which the `opener:default`
+    ///   set pulls in. cImp grants neither.
+    ///
+    /// **Which is why this is a test and not a comment.** The safety is a
+    /// property of what is ABSENT from a JSON file, and the single most likely
+    /// future edit — swapping in `opener:default` to make the two
+    /// `target="_blank"` links in `SettingsApp.svelte` work again (the plugin's
+    /// injected click handler `preventDefault`s them and then invokes the
+    /// forbidden command, so they currently do nothing) — would hand the
+    /// webview an unscreened OS opener as a side effect, and would widen it past
+    /// what `preview::is_externally_openable` allows on the Rust side, since the
+    /// default scope includes `mailto:`/`tel:`. That is a decision worth taking
+    /// deliberately; this test makes it impossible to take by accident.
+    #[test]
+    fn the_opener_grant_stays_scopeless() {
+        // The two capability files, read as text: a `scope` on the grant is what
+        // makes it reachable, and it can only arrive by editing one of them.
+        for (name, json) in [
+            ("default.json", include_str!("../capabilities/default.json")),
+            ("main.json", include_str!("../capabilities/main.json")),
+        ] {
+            let cap: serde_json::Value =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let perms = cap["permissions"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} has no permissions array"));
+            for p in perms {
+                // A scope-bearing grant is an object (`{"identifier": .., "allow": [..]}`);
+                // a plain grant is a string. Any object naming the opener is a
+                // scope, whatever its shape.
+                if let Some(s) = p.as_str() {
+                    assert!(
+                        !matches!(s, "opener:default" | "opener:allow-default-urls"),
+                        "{name} grants {s}, which carries the http/https/mailto/tel URL scope: \
+                         the webview can now reach the OS opener over IPC, bypassing \
+                         preview::is_externally_openable. Re-read this test's doc before \
+                         deciding that is what you want, and update preview/mod.rs's ledger row."
+                    );
+                } else {
+                    assert!(
+                        !p.to_string().contains("opener"),
+                        "{name} gives the opener plugin an inline scope ({p}) — see this test's doc"
+                    );
+                }
+            }
+        }
+        // …and the grant the ledger row names is still the scope-less one, so
+        // "the frontend cannot reach it" keeps meaning what the row says.
+        let default_json = include_str!("../capabilities/default.json");
+        assert!(
+            default_json.contains("opener:allow-open-url"),
+            "preview/mod.rs's ledger row describes a grant that is no longer there"
+        );
     }
 
     // ── positive controls ──────────────────────────────────────────────────

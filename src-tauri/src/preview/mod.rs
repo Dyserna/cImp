@@ -211,6 +211,15 @@ pub fn is_externally_openable(url: &str) -> bool {
 /// before; anything else (a custom/registered protocol handler, `file:`,
 /// `javascript:`, `data:`, ...) is silently dropped rather than handed to
 /// the OS — see that function's doc comment for why.
+///
+/// **This is the only path to the OS opener.** The plugin also exposes
+/// `open_url` to the webviews over IPC, but `capabilities/default.json` grants
+/// the scope-less `opener:allow-open-url`, and the plugin refuses a URL that
+/// matches no scope entry — with an empty allow list that is every URL. So the
+/// frontend cannot route around this scheme gate. That is a property of a JSON
+/// file rather than of this module, so it is enforced by
+/// `spawn_ledger::tests::the_opener_grant_stays_scopeless`, whose doc carries
+/// the evidence.
 fn open_external(app: &AppHandle, url: &str) {
     if !is_externally_openable(url) {
         tracing::debug!(

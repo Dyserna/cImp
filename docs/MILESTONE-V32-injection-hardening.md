@@ -2836,6 +2836,70 @@ declares its class AND its mutation capability in one reviewed place.
     and `offload::mcp::ProxyMiss::report` (keyed `http-status:{code}`, bounded by u16,
     child-process stderr only).
 
+43. **The identity-less scope gets a ROW LEDGER but deliberately no FETCH BUDGET
+    (F-40, raised and fixed 2026-08-13 during the rc.4 retest).** Decision 42 bounded
+    what a caller *supplies*; this bounds what a caller *is*. A call whose `tab` names
+    no configured AI tab — absent, unknown, or one of the **shell** tabs — has no
+    registry entry, so `LatchRegistry::claim` fell back to a **constant**
+    `DoublingRow::Write { total: 0, .. }`. Every such caller therefore wrote **one row
+    per event** into a capped lane, which is decision 42's own eviction primitive
+    arriving through the door that decision left open.
+
+    **Measured on the live rc.4 install before any code was written** (the F-33 lesson:
+    measure the finding, do not implement its prose): ~72 SSRF denials on
+    `claude:(no tab identity)` produced **~64 rows**, while 20 on `claude:opencode`
+    produced **4**, landing on denials 2, 4, 8, 16. The budget diverged the same way —
+    ~75 external calls with no refusal on the identity-less scope, against a trip at
+    ~40 on the attributed one.
+
+    **The two halves are NOT symmetric, and only one is fixed:**
+
+    - **Rows: BOUNDED.** `outbound::UnscopedAudit`, a process-global `AuditClaims` per
+      agent, reusing `Doubling` exactly as decision 42 did. F-32's stated bar —
+      *"cannot exceed log2(n) in its own lane"* — now holds on **every** path rather
+      than on every path that happens to have a tab. Being wrong here is cheap:
+      a suppressed row loses nothing silently, because the next row written still
+      names the true total.
+    - **Budget: STILL FAIL-OPEN, deliberately.** A process-global 40-call cap would
+      fail **closed** on legitimate callers with no reset short of an app restart, and
+      the budget's job — bounding one runaway *task* — is already done wherever a task
+      exists (`TaskAudit` for the worker, `Budget` for a tab). *Accepted consequence:*
+      an identity-less caller still has unbounded egress through the proxy. It is
+      **not** a privilege boundary either way — the launch token is readable by any
+      process running as this user, as `handle_discovery_skipped`'s own auth note says,
+      so that caller can already write rows directly.
+
+    **Why a process-global here, when `AuditClaims`' own doc rejects one.** That
+    rejection is about *scoped* callers: a global `HashSet<scope>` would suppress a
+    real tab's rows permanently, across every session it holds, because `agent:tab` is
+    stable while conversations are not. **This scope has no session to rotate**, so
+    there is no reset to lose and process lifetime is the only lifetime available.
+
+    **The key space is structural, not checked** — the F-37 discipline, applied to the
+    fix for its sibling so the fix is not a fresh instance of it. The ledger is a
+    fixed 2-slot array indexed by a `usize` derived from one boolean test, so **no
+    caller-supplied string can create a slot**; a map keyed on the agent *name* would
+    have been F-37's exact shape. Per-agent rather than one shared counter because
+    each row's detail says *"denial #N for this scope"*, and a shared counter would
+    make that sentence a statement about two scopes.
+
+    ⚠ **The old assertion pinned the DEFECT by name and was SPLIT, not loosened** —
+    the same treatment decision 34 required of
+    `flip_local_reopens_local_tools_and_closes_the_external_side`.
+    `ssrf_denial_rows_are_bounded_per_session_and_reset_on_rotation` ended with
+    `matches!(TabAudit(None).claim_ssrf(), Write { .. })` under the comment *"it
+    reports — the same fail-open the latch and the budget take"*, and it stayed green
+    for exactly the behaviour measured above. Both halves are still asserted, now as
+    two claims in `an_identity_less_call_reports_but_is_still_ledgered`: it still
+    reports, **and** it is bounded. Its assertions are bounds rather than exact totals
+    because the ledger is process-global — a test that fails when its neighbours run
+    is worse than no test.
+
+    **`DoublingRow::Write { total: 0 }` is now unreachable**, and its doc says so:
+    a `total: 0` arriving at `ssrf_flag_detail` is the signature of a producer that
+    has slipped back out of a ledger. The dangling `[`UnscopedAudit`]` rustdoc link
+    that named this type before it existed now resolves.
+
 ## Phases
 
 - **A — taxonomy + worker latch.** `offload/toolclass.rs` class table;

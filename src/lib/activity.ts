@@ -81,8 +81,15 @@ export interface ActivityEntry {
   /// call (`<server>__<tool>` through the warm host); `injection_flag` = one
   /// V32 injection-containment event (SSRF screen, external-fetch budget,
   /// canary hit, taint-latch refusal, a memory-quarantine hold, or a
-  /// surface-only detection flag).
-  kind: 'graph' | 'offload' | 'audit' | 'mcp' | 'injection_flag';
+  /// surface-only detection flag); `offload_server` = one local offload
+  /// **server process** transition — spawned, healthy, stopped, or failed.
+  ///
+  /// `offload` and `offload_server` are different feeds on purpose: the first
+  /// is one *task* a server ran, the second is the server itself. A backend
+  /// that is failing produces no task rows at all, which is exactly why its
+  /// process history could not share their retention window (`OFFLOAD_SERVER_CAP`
+  /// backend-side).
+  kind: 'graph' | 'offload' | 'offload_server' | 'audit' | 'mcp' | 'injection_flag';
   /// The project this row belongs to, canonicalized backend-side
   /// (`activity::root_key`). Lets a per-project consumer filter out other
   /// projects' activity.
@@ -210,10 +217,25 @@ export const CANARY_SOURCES = new Set(['read_advisor', 'harness']);
 /// - `recorded` — an `injection_flag` source this build has no category for.
 ///   Deliberately NOT folded into `blocked` or `flagged`: a future screen must
 ///   render as "we do not have a word for this" rather than inherit a claim.
+///
+/// …and four `offload_server` outcomes. `stopped` and `down` are the pair that
+/// must not merge, for the same reason `denied` and `granted` must not: cImp
+/// killing a server on purpose and a server failing to come up are opposite
+/// facts that both end with no process running, and only one of them is
+/// something going wrong.
+/// - `started` — the process was spawned. Says nothing about health yet.
+/// - `ready` — it answered `/health`; the window and slot count were read.
+/// - `stopped` — cImp stopped it deliberately (see the row's target for which
+///   intent: user, restart, or app shutdown). Not a failure.
+/// - `down` — it never came up, or it ended without cImp stopping it.
 export type RowStatus =
   | 'ok'
   | 'failed'
   | 'signal'
+  | 'started'
+  | 'ready'
+  | 'stopped'
+  | 'down'
   | 'denied'
   | 'flagged'
   | 'unscreened'
@@ -234,6 +256,26 @@ export type RowStatus =
 /// blocked tool call, which is the same collapse this function exists to undo,
 /// so `updater` is matched on `source` before `ok` is consulted at all.
 export function rowStatus(e: ActivityEntry): RowStatus {
+  if (e.kind === 'offload_server') {
+    // Keyed on `tool` (the transition), never on `ok` alone: `ok` is true for
+    // BOTH a healthy start and a deliberate stop, so reading it by itself
+    // would render "the server is gone" and "the server is up" as one word.
+    switch (e.tool) {
+      case 'start':
+        return 'started';
+      case 'ready':
+        return 'ready';
+      case 'stop':
+        return 'stopped';
+      case 'fail':
+        return 'down';
+      default:
+        // A transition added backend-side that this build predates. `ok` is
+        // documented as the transition's outcome, which is a claim we can
+        // still make; the verb it belongs to is not.
+        return e.ok ? 'ok' : 'down';
+    }
+  }
   if (e.kind === 'injection_flag') {
     switch (e.source) {
       // Checked first: its `ok` is an outcome, not a denial (see above).
@@ -274,6 +316,13 @@ export function rowStatus(e: ActivityEntry): RowStatus {
 export const STATUS_TITLE: Record<RowStatus, string> = {
   ok: 'Call succeeded',
   failed: 'Call failed',
+  started:
+    'The offload server process was spawned. It is not healthy yet — the `ready` row is what says it came up, and the gap between them is the model load.',
+  ready:
+    'The offload server answered /health. Its duration is time-to-healthy, model load included.',
+  stopped:
+    'cImp stopped this offload server deliberately — the row says which (user, restart, or app shutdown), and its duration is how long the server had been up. Not a failure.',
+  down: 'The offload server did not come up, or it ended without cImp stopping it. Open the row for the reason.',
   denied: 'Blocked by an injection-containment screen',
   flagged: 'Delivered, but a detection screen flagged it — nothing was blocked',
   signal: 'A telemetry signal fired — not a failure',

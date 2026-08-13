@@ -28,7 +28,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::sync::{oneshot, Mutex as TokioMutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Cap on the per-backend captured-output ring buffer (model-load progress +
@@ -101,6 +101,143 @@ pub struct BackendStatus {
 struct Running {
     child: Child,
     server: Arc<LlamaServer>,
+    /// When this process was spawned (epoch millis). Only the lifecycle feed
+    /// reads it: it turns the `ready` row's `ms` into time-to-healthy (model
+    /// load included) and the `stop` row's into uptime, which are the two
+    /// numbers you actually want when a backend is behaving badly.
+    started_ms: u64,
+}
+
+/// One transition in a local server's life, as it appears in the Events tab's
+/// `tool` column.
+///
+/// A closed enum for the same reason [`crate::activity::ActivityKind`] is: the
+/// frontend switches on these strings to pick a status word, and a typo'd
+/// free-form verb would render as the no-category fallback instead of failing
+/// to compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerEvent {
+    /// The child process was spawned. Not yet healthy — `Ready` is a separate
+    /// row precisely because the gap between them is where a model load (or a
+    /// silent failure to load) lives.
+    Start,
+    /// `/health` came back and the window/slot accounting was read.
+    Ready,
+    /// The child was killed. An intentional stop, so `ok` stays true — see
+    /// [`StopCause`] for which kind of intent.
+    Stop,
+    /// The backend never got to `Ready`: the command was missing or unparseable,
+    /// the spawn failed, or the readiness probe errored or timed out.
+    Fail,
+}
+
+impl ServerEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ServerEvent::Start => "start",
+            ServerEvent::Ready => "ready",
+            ServerEvent::Stop => "stop",
+            ServerEvent::Fail => "fail",
+        }
+    }
+}
+
+/// Who asked for a start. Recorded because "the server started" is not the
+/// interesting half — a start the *user* clicked and a start some code path
+/// triggered on its own are different events, and the on-demand one
+/// ([`StartCause::Lazy`]) is the one that surprises people: an `offload_task`
+/// can load a multi-GB model with nobody having pressed anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartCause {
+    /// `autostart_all` at app launch.
+    Autostart,
+    /// A user pressed Start (or the legacy single-server control) in Settings.
+    Ipc,
+    /// Warmed by the first `offload_task` that wanted this backend
+    /// (`OffloadService`'s "start on first offload").
+    Lazy,
+    /// The start half of a Restart.
+    Restart,
+}
+
+impl StartCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            StartCause::Autostart => "autostart",
+            StartCause::Ipc => "user",
+            StartCause::Lazy => "on first offload",
+            StartCause::Restart => "restart",
+        }
+    }
+}
+
+/// Why a server was stopped. Without this a `stop` row is unreadable: the app
+/// quitting, a user pressing Stop, and the teardown half of a Restart all kill
+/// the same child, and only one of them means anything went wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopCause {
+    /// A user pressed Stop (or the legacy single-server control).
+    Ipc,
+    /// The stop half of a Restart — a `start` row follows immediately.
+    Restart,
+    /// `stop_all` from the graceful-exit path, or offload being disabled.
+    Shutdown,
+}
+
+impl StopCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            StopCause::Ipc => "user",
+            StopCause::Restart => "restart",
+            StopCause::Shutdown => "app shutdown",
+        }
+    }
+}
+
+/// Build the `offload_server` activity row for one lifecycle transition.
+///
+/// Separate from the recording so the row a transition produces is assertable
+/// without spawning a process — the supervisor's paths are otherwise only
+/// reachable with a real `llama-server` on the other end, which is how this
+/// feed would have ended up tested by re-deriving it beside itself.
+///
+/// Column conventions, which the frontend mirrors:
+/// * `source` — the backend name, matching the `offload` task rows, so
+///   filtering the feed by a backend shows its tasks and its process history
+///   together.
+/// * `tool` — the [`ServerEvent`].
+/// * `target` — the human-readable *why*/*what*: the cause for a start or stop,
+///   the discovered window for a ready, the failure reason for a fail.
+/// * `root` — always empty. A server process is genuinely not about a project,
+///   which is one of the two things the empty sentinel is documented to mean
+///   (`ActivityEntry::root`); the project-scoped views correctly do not show it.
+/// * `tab` — always [`Attribution::Headless`]. cImp's own process management has
+///   no tab behind it even when a user pressed the button, and inventing one
+///   would be a worse lie than the honest "no tab".
+fn lifecycle_record(
+    backend: &str,
+    event: ServerEvent,
+    target: String,
+    detail: String,
+    ms: u64,
+) -> crate::activity::ActivityRecord {
+    crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::OffloadServer,
+            crate::activity::now_ms(),
+            String::new(),
+            backend.to_string(),
+            event.as_str().to_string(),
+            target,
+            0,
+            ms,
+            event != ServerEvent::Fail,
+            crate::activity::Attribution::Headless,
+            None,
+        ),
+        request: String::new(),
+        response: detail,
+    }
 }
 
 /// App-owned supervisor. Held in `AppState` behind an `Arc`.
@@ -334,11 +471,11 @@ impl OffloadSupervisor {
     }
 
     /// Start the **primary** local backend (legacy single-server control).
-    pub async fn start(self: &Arc<Self>) -> AppResult<()> {
+    pub async fn start(self: &Arc<Self>, cause: StartCause) -> AppResult<()> {
         let name = self
             .primary_name()
             .ok_or_else(|| AppError::Offload("no local backend configured".into()))?;
-        self.start_backend(&name, None).await
+        self.start_backend(&name, None, cause).await
     }
 
     /// Start one named Local backend if not already running. Idempotent —
@@ -350,10 +487,38 @@ impl OffloadSupervisor {
     /// popup) replaces the backend's configured `server_command` for this
     /// launch only — it is never persisted, and goes through the exact same
     /// parse/validation as the configured command.
+    /// `cause` names who asked; it is recorded on the `start` (or `fail`) row
+    /// and is the difference between a readable process history and a list of
+    /// starts with no explanation.
     pub async fn start_backend(
         self: &Arc<Self>,
         name: &str,
         command_override: Option<String>,
+        cause: StartCause,
+    ) -> AppResult<()> {
+        // One funnel for the failure feed: every way a start can fail before a
+        // healthy server exists returns `Err` from `start_inner`, so a new
+        // early return cannot quietly skip the `fail` row the way it would if
+        // each site recorded for itself.
+        let started = crate::activity::now_ms();
+        let result = self.start_inner(name, command_override, cause).await;
+        if let Err(e) = &result {
+            crate::activity::record_bg(lifecycle_record(
+                name,
+                ServerEvent::Fail,
+                format!("start ({}) failed", cause.as_str()),
+                e.to_string(),
+                crate::activity::now_ms().saturating_sub(started),
+            ));
+        }
+        result
+    }
+
+    async fn start_inner(
+        self: &Arc<Self>,
+        name: &str,
+        command_override: Option<String>,
+        cause: StartCause,
     ) -> AppResult<()> {
         let snap = self.settings.current().offload;
         if !snap.enabled {
@@ -389,18 +554,20 @@ impl OffloadSupervisor {
         let cmd = ServerCommand::parse(&command)?;
         // Fresh capture buffer per (re)start so the panel shows this load.
         self.logs.lock().unwrap().remove(name);
-        let child = spawn_child(&cmd, &self.app, name, self.logs.clone())?;
+        let (child, exited) = spawn_child(&cmd, &self.app, name, self.logs.clone())?;
         let server = Arc::new(LlamaServer::with_config(
             &backend.name,
             &command,
             backend.tier,
             backend.tool_scope.clone(),
         )?);
+        let started_ms = crate::activity::now_ms();
         guard.insert(
             name.to_string(),
             Running {
                 child,
                 server: server.clone(),
+                started_ms,
             },
         );
         drop(guard);
@@ -410,12 +577,89 @@ impl OffloadSupervisor {
             self.set_state(OffloadState::Starting).await;
         }
         info!(backend = name, base_url = %server.base_url(), "offload: server starting");
+        // The command is the row's payload, not its target: with a
+        // `command_override` this is the ONLY durable record of what actually
+        // ran (the override is deliberately never persisted to settings).
+        crate::activity::record_bg(lifecycle_record(
+            name,
+            ServerEvent::Start,
+            format!("{} · {}", cause.as_str(), server.base_url()),
+            command.clone(),
+            0,
+        ));
+
+        // Unexpected-exit watcher. Without it a server that dies on its own
+        // leaves a `start`/`ready` pair with no terminator, and a feed of runs
+        // that never end reads as "still running" — the run history would be
+        // silently wrong in exactly the case it exists for.
+        //
+        // Two conditions keep it from crying wolf, and both are necessary:
+        // * still the SAME run — `stop_backend` removes the entry before it
+        //   kills, so an intentional stop finds nothing here; and matching
+        //   `started_ms` means a restart that got in first is not mistaken for
+        //   this process dying.
+        // * it had reached ready — a death during model load already produces
+        //   the readiness probe's "never became ready" row below, and one death
+        //   must not report as two.
+        {
+            let this = self.clone();
+            let name_owned = name.to_string();
+            tauri::async_runtime::spawn(async move {
+                if exited.await.is_err() {
+                    return; // no exit edge available (see `spawn_child`)
+                }
+                let still_this_run = {
+                    let running = this.running.lock().await;
+                    running
+                        .get(&name_owned)
+                        .is_some_and(|r| r.started_ms == started_ms && r.server.is_ready())
+                };
+                if !still_this_run {
+                    return;
+                }
+                warn!(backend = %name_owned, "offload: server exited unexpectedly");
+                crate::activity::record_bg(lifecycle_record(
+                    &name_owned,
+                    ServerEvent::Fail,
+                    "exited unexpectedly".to_string(),
+                    "The server process ended without cImp stopping it. Its captured output is \
+                     in Settings → Offload task tools → the backend's log panel, until the \
+                     next start clears it."
+                        .to_string(),
+                    crate::activity::now_ms().saturating_sub(started_ms),
+                ));
+            });
+        }
 
         // Readiness probe — does not block the caller.
         let this = self.clone();
         let name_owned = name.to_string();
         tauri::async_runtime::spawn(async move {
             let result = server.poll_until_ready(Duration::from_secs(600)).await;
+            let ms = crate::activity::now_ms().saturating_sub(started_ms);
+            // Recorded for EVERY backend, primary or not. `set_state` below is
+            // still primary-only — it drives the single aggregate `offload-state`
+            // event — but that asymmetry is exactly why a non-primary backend
+            // failing to load used to leave nothing but a `warn!` in the log.
+            match &result {
+                Ok(()) => crate::activity::record_bg(lifecycle_record(
+                    &name_owned,
+                    ServerEvent::Ready,
+                    match server.n_ctx() {
+                        Some(n) => format!("n_ctx {n} · {} slots", server.slots()),
+                        None => format!("{} slots · window not reported", server.slots()),
+                    },
+                    String::new(),
+                    ms,
+                )),
+                Err(e) => crate::activity::record_bg(lifecycle_record(
+                    &name_owned,
+                    ServerEvent::Fail,
+                    "never became ready".to_string(),
+                    e.to_string(),
+                    ms,
+                )),
+            }
             if !is_primary {
                 if let Err(e) = &result {
                     warn!(backend = %name_owned, error = %e, "offload: backend failed to become ready");
@@ -453,7 +697,10 @@ impl OffloadSupervisor {
         }
         for b in local_backends(&snap) {
             if let Some((_, true)) = local_command(&b) {
-                if let Err(e) = self.start_backend(&b.name, None).await {
+                if let Err(e) = self
+                    .start_backend(&b.name, None, StartCause::Autostart)
+                    .await
+                {
                     warn!(backend = %b.name, error = %e, "offload: autostart failed");
                 }
             }
@@ -461,14 +708,18 @@ impl OffloadSupervisor {
     }
 
     /// Stop the **primary** local backend (legacy control).
-    pub async fn stop(&self) {
+    pub async fn stop(&self, cause: StopCause) {
         if let Some(name) = self.primary_name() {
-            self.stop_backend(&name).await;
+            self.stop_backend(&name, cause).await;
         }
     }
 
     /// Stop one named Local backend (kill the child) if running. Idempotent.
-    pub async fn stop_backend(&self, name: &str) {
+    ///
+    /// `cause` names the intent. It is the whole readability of the `stop` row:
+    /// the app quitting, a user pressing Stop and the teardown half of a Restart
+    /// all arrive here as the same `kill()`.
+    pub async fn stop_backend(&self, name: &str, cause: StopCause) {
         // Remove under the lock, then release it BEFORE the kill().await — a
         // slow child kill must not block start/stop of other backends.
         let removed = {
@@ -477,10 +728,27 @@ impl OffloadSupervisor {
         };
         if let Some(mut running) = removed {
             running.server.mark_stopped();
-            if let Err(e) = running.child.kill().await {
+            let killed = running.child.kill().await;
+            if let Err(e) = &killed {
                 warn!(backend = name, error = %e, "offload: failed to kill server child");
             }
             debug!(backend = name, "offload: server stopped");
+            // Idempotent by design: only the call that actually removed a live
+            // entry writes a row, so the second `stop_all` sweep and a repeated
+            // Stop click add nothing.
+            crate::activity::record_bg(lifecycle_record(
+                name,
+                ServerEvent::Stop,
+                cause.as_str().to_string(),
+                match killed {
+                    Ok(()) => String::new(),
+                    // The child is dropped either way (`kill_on_drop`), so the
+                    // server IS gone — but "we could not kill it cleanly" is a
+                    // fact worth keeping next to a stop that misbehaved.
+                    Err(e) => format!("kill failed: {e}"),
+                },
+                crate::activity::now_ms().saturating_sub(running.started_ms),
+            ));
         }
         if self.primary_name().as_deref() == Some(name) {
             let next = if self.settings.current().offload.enabled {
@@ -504,7 +772,7 @@ impl OffloadSupervisor {
                 break;
             }
             for name in names {
-                self.stop_backend(&name).await;
+                self.stop_backend(&name, StopCause::Shutdown).await;
             }
         }
     }
@@ -518,9 +786,13 @@ impl OffloadSupervisor {
     }
 
     /// Restart one named Local backend (Reset): stop, then start.
+    ///
+    /// Deliberately two rows in the feed, not one `restart`: the stop can
+    /// succeed and the start fail, and a single row would have to pick one
+    /// outcome for both halves.
     pub async fn restart_backend(self: &Arc<Self>, name: &str) -> AppResult<()> {
-        self.stop_backend(name).await;
-        self.start_backend(name, None).await
+        self.stop_backend(name, StopCause::Restart).await;
+        self.start_backend(name, None, StartCause::Restart).await
     }
 
     /// Run one offload task against a ready **local** backend (used by the
@@ -775,7 +1047,7 @@ fn spawn_child(
     app: &AppHandle,
     backend: &str,
     logs: Arc<StdMutex<HashMap<String, VecDeque<String>>>>,
-) -> AppResult<Child> {
+) -> AppResult<(Child, oneshot::Receiver<()>)> {
     let binary = crate::pty::resolve_command(&cmd.program)?;
     let mut command = tokio::process::Command::new(&binary);
     command
@@ -800,14 +1072,28 @@ fn spawn_child(
 
     // Drain stdout/stderr into the log + capture buffer so they don't fill
     // the OS pipe buffer and stall the server, and so the panel can show them.
+    //
+    // stdout's drain doubles as the **process-exit signal**: the child holds the
+    // write end, so the read end reaching EOF means the process is gone. That is
+    // the only exit edge available without moving the `Child` out of `Running`
+    // (which is where `stop_backend`'s `kill()` needs it), and it fires for a
+    // crash exactly as it does for a kill — telling the two apart is the
+    // caller's job, not this signal's. `stdout` only, so an exit produces one
+    // notification rather than one per stream.
+    let (exited_tx, exited_rx) = oneshot::channel();
+    let mut exited_tx = Some(exited_tx);
     if let Some(out) = child.stdout.take() {
-        tauri::async_runtime::spawn(log_stream(
-            out,
-            "stdout",
-            app.clone(),
-            backend.to_string(),
-            logs.clone(),
-        ));
+        let app = app.clone();
+        let backend = backend.to_string();
+        let logs = logs.clone();
+        let tx = exited_tx.take();
+        tauri::async_runtime::spawn(async move {
+            log_stream(out, "stdout", app, backend, logs).await;
+            // A dropped receiver (nobody is watching) is not an error.
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+        });
     }
     if let Some(err) = child.stderr.take() {
         tauri::async_runtime::spawn(log_stream(
@@ -818,7 +1104,12 @@ fn spawn_child(
             logs,
         ));
     }
-    Ok(child)
+    // stdio was requested as `piped()` just above, so `stdout` is `Some` on
+    // every real spawn. If that ever stops holding, a sender dropped here
+    // closes the channel and the watcher exits quietly rather than waiting
+    // forever on an edge that will never come.
+    drop(exited_tx);
+    Ok((child, exited_rx))
 }
 
 async fn log_stream<R>(
@@ -850,5 +1141,70 @@ async fn log_stream<R>(
                 line,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::ActivityKind;
+
+    /// The four transitions must not collapse into "ok / not ok". A `stop` is
+    /// an intended shutdown and a `fail` is not, and the Events tab picks its
+    /// status word from `tool` — so a verb renamed here without the frontend
+    /// following is a row that silently falls back to the no-category word.
+    #[test]
+    fn a_stop_is_not_a_failure_and_a_fail_is() {
+        let stop = lifecycle_record("big-local", ServerEvent::Stop, "user".into(), String::new(), 90_000);
+        assert!(stop.entry.ok, "an intentional stop must not read as a failure");
+        assert_eq!(stop.entry.tool, "stop");
+        assert_eq!(stop.entry.ms, 90_000, "a stop's duration is the run's uptime");
+
+        for e in [ServerEvent::Start, ServerEvent::Ready] {
+            assert!(lifecycle_record("b", e, String::new(), String::new(), 0).entry.ok);
+        }
+        let fail = lifecycle_record("b", ServerEvent::Fail, "never became ready".into(), "timed out".into(), 600_000);
+        assert!(!fail.entry.ok);
+        assert_eq!(fail.response, "timed out", "the reason must survive into the detail popup");
+    }
+
+    /// Every lifecycle row lands in the lane that was chosen for it, is
+    /// attributed to the backend, and claims neither a project nor a tab.
+    #[test]
+    fn lifecycle_rows_are_headless_rootless_and_backend_sourced() {
+        let r = lifecycle_record("big-local", ServerEvent::Ready, "n_ctx 32768 · 4 slots".into(), String::new(), 12_000);
+        assert_eq!(r.entry.kind, ActivityKind::OffloadServer.as_str());
+        assert_eq!(r.entry.source, "big-local");
+        assert_eq!(r.entry.target, "n_ctx 32768 · 4 slots");
+        assert_eq!(
+            r.entry.root, "",
+            "a server process is not about a project — see ActivityEntry::root"
+        );
+        assert!(
+            matches!(r.entry.tab, crate::activity::Attribution::Headless),
+            "process management has no tab behind it, even when a user pressed Start"
+        );
+        assert!(r.entry.session.is_none());
+    }
+
+    /// The causes exist to make a `stop` readable; two of them collapsing into
+    /// the same word would put us back where we started.
+    #[test]
+    fn every_cause_has_its_own_word() {
+        let starts = [
+            StartCause::Autostart,
+            StartCause::Ipc,
+            StartCause::Lazy,
+            StartCause::Restart,
+        ]
+        .map(StartCause::as_str);
+        let stops = [StopCause::Ipc, StopCause::Restart, StopCause::Shutdown].map(StopCause::as_str);
+        for set in [&starts[..], &stops[..]] {
+            let mut seen = std::collections::HashSet::new();
+            for w in set {
+                assert!(!w.is_empty());
+                assert!(seen.insert(*w), "duplicate cause word `{w}`");
+            }
+        }
     }
 }

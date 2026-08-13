@@ -1710,7 +1710,10 @@ impl OffloadService {
             let supervisor = self.supervisor.clone();
             let name = b.name.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = supervisor.start_backend(&name, None).await {
+                if let Err(e) = supervisor
+                    .start_backend(&name, None, super::supervisor::StartCause::Lazy)
+                    .await
+                {
                     debug!(backend = %name, error = %e, "offload: lazy start failed");
                 }
             });

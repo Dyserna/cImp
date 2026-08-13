@@ -504,9 +504,19 @@
   function rowMeta(e: ActivityEntry): string {
     const dur = e.ms >= 10_000 ? `${(e.ms / 1000).toFixed(1)}s` : `${e.ms}ms`;
     // For audit entries `chars` carries the finding count, not a payload size.
-    return e.kind === 'audit'
-      ? `${dur} · ${e.chars} findings`
-      : `${dur} · ${fmtTok(e.chars)} chars`;
+    if (e.kind === 'audit') return `${dur} · ${e.chars} findings`;
+    // A server lifecycle row has no payload — `chars` is always 0, and printing
+    // "0 chars" would dress a structural zero up as a measurement. What its
+    // duration MEANS also varies by transition, so it says so rather than
+    // leaving a bare number to be read as latency.
+    if (e.kind === 'offload_server') {
+      if (e.tool === 'ready') return `${dur} to healthy`;
+      if (e.tool === 'stop' || (e.tool === 'fail' && e.target === 'exited unexpectedly')) {
+        return `up ${dur}`;
+      }
+      return e.ms > 0 ? dur : '';
+    }
+    return `${dur} · ${fmtTok(e.chars)} chars`;
   }
 
   // The attribution cell. Each of the four states gets its OWN label and its
@@ -670,8 +680,8 @@
     </div>
     {#if totalCount === 0}
       <div class="empty">
-        No events recorded yet — query the graph from a Claude tab or run an
-        offload_task and it shows up here.
+        No events recorded yet — query the graph from a Claude tab, run an
+        offload_task, or start a local offload server, and it shows up here.
       </div>
     {:else if shownRows.length === 0}
       <div class="empty">No events match the current filters.</div>
@@ -1052,6 +1062,13 @@
   }
   .ekind.offload {
     color: var(--text-success, #3fb950);
+  }
+  /* Server lifecycle rows sit beside the offload task rows they explain, so
+     they take the same green at lower saturation: same family (this is the
+     offload backend), plainly not the same feed (this is the process, not a
+     task it ran). */
+  .ekind.offload_server {
+    color: color-mix(in srgb, var(--text-success, #3fb950) 55%, var(--text-tertiary, #9aa0aa));
   }
   .ekind.audit {
     color: color-mix(in srgb, var(--warning, #f0a020) 60%, var(--danger, #f06080));

@@ -117,4 +117,29 @@
     background: var(--surface-info-faint, rgba(216, 184, 255, 0.12));
     border-color: var(--border-info, #6f42a8);
   }
+
+  /* ── Offload server lifecycle ──────────────────────────────────────────
+     `started`/`ready` are the healthy path and stay quiet, like `ok`: a server
+     coming up is the expected case and must not compete with a containment row
+     for attention. `stopped` is quiet too — cImp stopped it on purpose.
+
+     `down` is the one that is NOT quiet, and it is deliberately not red: red is
+     spent on `denied`, the one word meaning "we blocked something", and a
+     backend that fell over is a failure to report, not a threat we contained.
+     It borrows the `failed` treatment, plus a dotted underline that says the
+     row carries a reason worth opening. */
+  .schip.started,
+  .schip.ready {
+    color: var(--text-success, #3fb950);
+    opacity: 0.7;
+  }
+  .schip.stopped {
+    color: var(--text-tertiary, #9aa0aa);
+    opacity: 0.8;
+  }
+  .schip.down {
+    color: var(--text-danger-soft, #ffb0c0);
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+  }
 </style>

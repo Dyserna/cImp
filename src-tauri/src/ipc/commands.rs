@@ -1070,7 +1070,11 @@ pub async fn offload_backend_start(
 ) -> AppResult<()> {
     supervisor
         .inner()
-        .start_backend(&name, command_override)
+        .start_backend(
+            &name,
+            command_override,
+            crate::offload::supervisor::StartCause::Ipc,
+        )
         .await
 }
 
@@ -1080,7 +1084,9 @@ pub async fn offload_backend_stop(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
     name: String,
 ) -> AppResult<()> {
-    supervisor.stop_backend(&name).await;
+    supervisor
+        .stop_backend(&name, crate::offload::supervisor::StopCause::Ipc)
+        .await;
     Ok(())
 }
 
@@ -1098,7 +1104,10 @@ pub async fn offload_backend_restart(
 pub async fn offload_server_start(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<()> {
-    supervisor.inner().start().await
+    supervisor
+        .inner()
+        .start(crate::offload::supervisor::StartCause::Ipc)
+        .await
 }
 
 /// Stop the offload `llama-server` (idempotent).
@@ -1106,7 +1115,9 @@ pub async fn offload_server_start(
 pub async fn offload_server_stop(
     supervisor: State<'_, std::sync::Arc<crate::offload::OffloadSupervisor>>,
 ) -> AppResult<()> {
-    supervisor.stop().await;
+    supervisor
+        .stop(crate::offload::supervisor::StopCause::Ipc)
+        .await;
     Ok(())
 }
 

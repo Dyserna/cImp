@@ -70,6 +70,19 @@ const AUDIT_CAP: usize = 100;
 /// between the chatty graph calls and the rare offload runs in volume — their
 /// own window so neither feed crowds the other out.
 const MCP_CAP: usize = 200;
+/// Offload **server process** lifecycle rows — spawned / ready / stopped /
+/// failed, one per transition per backend (see
+/// [`ActivityKind::OffloadServer`]).
+///
+/// Its own window rather than a share of `OFFLOAD_CAP`, and the reason is H-9's
+/// in miniature: a backend that crashes is *also* a backend that runs no tasks,
+/// so the rows explaining a bad session are the rare ones, and the busy period
+/// either side of it is what would evict them. Sized for depth for the same
+/// reason the forensic screens are — a healthy app run emits ~3 rows per local
+/// backend (start, ready, stop at exit), so 200 is on the order of dozens of
+/// app runs, while a crash-restart loop still cannot reach back and delete the
+/// task history that shows what the server was doing when it died.
+const OFFLOAD_SERVER_CAP: usize = 200;
 /// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
 /// refusals, quarantines, detection flags). Retained **per screen**, not per
 /// kind — this is the window ONE screen's rows get.
@@ -106,8 +119,12 @@ const RESPONSE_CAP_CHARS: usize = 24_000;
 const FILE_NAME: &str = "tool-activity.jsonl";
 /// Every row the store can hold with every lane full — the ring's size, and
 /// the floor under [`FILE_COMPACT_LINES`].
-const TOTAL_CAPACITY: usize =
-    GRAPH_CAP + OFFLOAD_CAP + AUDIT_CAP + MCP_CAP + INJECTION_FLAG_TOTAL_CAP;
+const TOTAL_CAPACITY: usize = GRAPH_CAP
+    + OFFLOAD_CAP
+    + OFFLOAD_SERVER_CAP
+    + AUDIT_CAP
+    + MCP_CAP
+    + INJECTION_FLAG_TOTAL_CAP;
 /// Appends between compactions once the ring is full. Compaction rewrites the
 /// whole file (and re-reads it first, to merge a child's lines), so this is the
 /// amount of cheap appending bought per expensive rewrite.
@@ -150,6 +167,18 @@ pub enum ActivityKind {
     /// via the loopback `/mcp/call` route or from the offload worker's
     /// in-process router (recorded by `McpHost::call_recorded`).
     Mcp,
+    /// One offload **server process** lifecycle transition: a local backend
+    /// spawned, became healthy, was stopped, or failed to start. Recorded by
+    /// [`offload::supervisor::lifecycle_record`](crate::offload::supervisor).
+    ///
+    /// Distinct from [`ActivityKind::Offload`], which is one *task* the server
+    /// ran. Before this, the only trace of a server dying was the Settings log
+    /// ring buffer — which `start_backend` clears on every (re)start, so a
+    /// crash-restart erased its own evidence — plus an `offload-state` event
+    /// nothing persisted. `ok` is the transition's outcome, and a `stop` is
+    /// `true`: an intentional shutdown is not a failure. Which transition it
+    /// was lives in `tool`, and *why* in `target`.
+    OffloadServer,
     /// V32: one injection-containment denial — an SSRF-screened URL, an
     /// exhausted per-scope fetch budget, a canary hit, or a taint-latch
     /// refusal. Recorded by
@@ -164,6 +193,7 @@ impl ActivityKind {
         match self {
             ActivityKind::Graph => "graph",
             ActivityKind::Offload => "offload",
+            ActivityKind::OffloadServer => "offload_server",
             ActivityKind::Audit => "audit",
             ActivityKind::Mcp => "mcp",
             ActivityKind::InjectionFlag => "injection_flag",
@@ -187,6 +217,8 @@ impl ActivityKind {
 fn kind_cap(kind: &str) -> usize {
     if kind == ActivityKind::Offload.as_str() {
         OFFLOAD_CAP
+    } else if kind == ActivityKind::OffloadServer.as_str() {
+        OFFLOAD_SERVER_CAP
     } else if kind == ActivityKind::Audit.as_str() {
         AUDIT_CAP
     } else if kind == ActivityKind::Mcp.as_str() {
@@ -1225,6 +1257,56 @@ mod tests {
             "offload entry was evicted by graph traffic"
         );
         assert_eq!(snap.iter().filter(|e| e.kind == "graph").count(), GRAPH_CAP);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn a_server_lifecycle_row_survives_both_floods() {
+        // The reason `offload_server` is its own lane: the rows that explain a
+        // bad session (a backend failing, dying, being restarted) are written
+        // by a backend that is BY DEFINITION not producing task rows, so both
+        // the chatty graph feed and the offload task feed are the traffic that
+        // would bury them.
+        let store = temp_store("server-lane");
+        store.record(rec_kind(ActivityKind::OffloadServer, "exited unexpectedly"));
+        for i in 0..(GRAPH_CAP + 50) {
+            store.record(rec(&format!("g{i}")));
+        }
+        for i in 0..(OFFLOAD_CAP + 50) {
+            store.record(rec_kind(ActivityKind::Offload, &format!("run {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        let rows: Vec<_> = snap
+            .iter()
+            .filter(|e| e.kind == "offload_server")
+            .collect();
+        assert_eq!(rows.len(), 1, "lifecycle row was evicted by other feeds");
+        assert_eq!(rows[0].target, "exited unexpectedly");
+        assert_eq!(snap.iter().filter(|e| e.kind == "offload").count(), OFFLOAD_CAP);
+        let _ = fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn server_lifecycle_rows_are_capped_at_their_own_window() {
+        // A crash-restart loop is the flood this lane must bound: it writes
+        // lifecycle rows as fast as the process can die, and must still not be
+        // able to grow the store without limit.
+        let store = temp_store("server-cap");
+        for i in 0..(OFFLOAD_SERVER_CAP + 40) {
+            store.record(rec_kind(ActivityKind::OffloadServer, &format!("boot {i}")));
+        }
+        let snap = store.snapshot_since(0);
+        assert_eq!(
+            snap.iter().filter(|e| e.kind == "offload_server").count(),
+            OFFLOAD_SERVER_CAP
+        );
+        // Newest kept, oldest evicted.
+        assert_eq!(
+            snap.iter()
+                .find(|e| e.kind == "offload_server")
+                .map(|e| e.target.as_str()),
+            Some(format!("boot {}", OFFLOAD_SERVER_CAP + 39).as_str())
+        );
         let _ = fs::remove_file(&store.path);
     }
 

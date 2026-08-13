@@ -349,7 +349,73 @@ describe('rowStatus', () => {
       'update',
       'rejected',
       'recorded',
+      'started',
+      'ready',
+      'stopped',
+      'down',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
+  });
+});
+
+// ── offload_server lifecycle rows ─────────────────────────────────────────
+//
+// Mirror of the injection_flag discipline above, for the feed added with the
+// server-lifecycle events. The trap here is `ok`: it is true for a healthy
+// start AND for a deliberate stop, so any classifier that consults it before
+// the transition renders "the server is up" and "the server is gone" as the
+// same word.
+
+/// One `offload_server` row for transition `tool`.
+function srv(tool: string, ok = true, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(1, { kind: 'offload_server', source: 'big-local', tool, ok, ...over });
+}
+
+describe('rowStatus — offload server lifecycle', () => {
+  it('gives every transition its own status', () => {
+    const seen = [
+      rowStatus(srv('start')),
+      rowStatus(srv('ready')),
+      rowStatus(srv('stop')),
+      rowStatus(srv('fail', false)),
+    ];
+    expect(seen).toEqual(['started', 'ready', 'stopped', 'down']);
+    expect(new Set(seen).size).toBe(4);
+  });
+
+  it('never reads a deliberate stop as a failure', () => {
+    // The backend records a stop as ok:true precisely so this holds; pinned
+    // here because the frontend must not re-derive it from `ok` either way.
+    expect(rowStatus(srv('stop'))).toBe('stopped');
+    expect(rowStatus(srv('stop'))).not.toBe('down');
+    expect(rowStatus(srv('stop'))).not.toBe('failed');
+  });
+
+  it('does not let a healthy start and a stop collapse via ok', () => {
+    // Both are ok:true. A classifier keyed on `ok` would return one word here.
+    expect(rowStatus(srv('start'))).not.toBe(rowStatus(srv('stop')));
+  });
+
+  it('separates a server failure from a failed tool call', () => {
+    // `failed` is a call that errored; `down` is a backend that is not running.
+    // Sharing a word would put a crashed llama-server in the same bucket as a
+    // graph query that threw.
+    expect(rowStatus(srv('fail', false))).toBe('down');
+    expect(rowStatus(entry(1, { ok: false }))).toBe('failed');
+  });
+
+  it('degrades an unknown transition without inventing a claim', () => {
+    // A verb added backend-side that this build predates.
+    expect(rowStatus(srv('paused'))).toBe('ok');
+    expect(rowStatus(srv('paused', false))).toBe('down');
+  });
+
+  it('does not misclassify an offload TASK row as a lifecycle row', () => {
+    // The two kinds are one underscore apart and both carry a backend name in
+    // `source`; a prefix match instead of an equality check would swallow the
+    // task feed whole.
+    expect(rowStatus(entry(1, { kind: 'offload', source: 'big-local', tool: 'offload_task' }))).toBe(
+      'ok'
+    );
   });
 });

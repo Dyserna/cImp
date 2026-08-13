@@ -806,7 +806,13 @@
         {
           name: uniqueBackendName('local'),
           enabled: true,
-          kind: { type: 'local', server_command: '', autostart: false, show_command_on_start: false },
+          kind: {
+            type: 'local',
+            server_command: '',
+            autostart: false,
+            show_command_on_start: false,
+            auth_token: '',
+          },
           declared_context: null,
           declared_model: '',
           tier: 'quality',
@@ -843,6 +849,9 @@
             server_command: s.offload.server_command,
             autostart: s.offload.autostart,
             show_command_on_start: false,
+            // The legacy single-server fields never had a token; adopting one
+            // is an "no auth" backend until the user fills the field in.
+            auth_token: '',
           },
           declared_context: null,
           declared_model: '',
@@ -1058,6 +1067,7 @@
           claude_access: false,
           offload_access: true,
           opencode_access: false,
+          auth_token: '',
         },
       ];
     });
@@ -4158,6 +4168,32 @@
                     placeholder="llama-server --model … --port 8080 --jinja -ngl 99 --ctx-size 150000"
                   ></textarea>
                 </label>
+                <label>
+                  <span>Auth token (optional)</span>
+                  <!-- V33: a Local backend is only "local" in the sense that
+                       cImp owns the process — the server still listens on a
+                       socket, and `--host 0.0.0.0` puts it on the LAN. Same
+                       `type="password"`, cleartext-on-disk treatment as the
+                       Remote token below; `?? ''` because a settings file
+                       written before V33 has no key here and an `undefined`
+                       must render as an empty field, never blank the card. -->
+                  <input
+                    type="password"
+                    value={backend.kind.auth_token ?? ''}
+                    oninput={(e) =>
+                      updateBackend(i, (b) => {
+                        if (b.kind.type === 'local') b.kind.auth_token = (e.currentTarget as HTMLInputElement).value;
+                      })}
+                    placeholder="Matches --api-key in the command above"
+                  />
+                  <small class="hint">
+                    Sent as a <code>Bearer</code> header to this server. Leave
+                    empty for no auth. Set it when the command above passes
+                    <code>--api-key</code> — the two must match, and a server
+                    bound to <code>--host 0.0.0.0</code> is reachable by
+                    anything on your LAN without one.
+                  </small>
+                </label>
                 <label class="checkbox">
                   <input
                     type="checkbox"
@@ -4216,6 +4252,10 @@
                       {#if templateError}
                         <small class="error">{templateError}</small>
                       {/if}
+                      <!-- Said out loud because the Remote popup's counterpart
+                           DOES save its token, so silence here would read as
+                           "the same, plus the token". -->
+                      <small class="hint">Saves the server command only — not the auth token.</small>
                     {:else if templatePopup.mode === 'load'}
                       {#if templates.length === 0}
                         <small class="hint">No saved commands yet.</small>
@@ -5585,6 +5625,25 @@
                   onchange={commitMcpEdits}
                 />
               </label>
+              <!-- V33: the token belongs on this row, not in settings.json with
+                   command/args/env, because it is an HTTP concern — it becomes
+                   an `Authorization` header on the URL above, and this editor
+                   IS the HTTP editor. stdio servers pass secrets through `env`
+                   and are unaffected. Same commit path as name/url: keystrokes
+                   update the snapshot only, `onchange` persists AND reloads the
+                   warm host — the token is part of the Rust `config_sig`, so
+                   without that reload an edit here would never reconnect. -->
+              <label class="mcp-field">
+                <span>Auth token (HTTP, optional)</span>
+                <input
+                  type="password"
+                  placeholder="Bearer token — leave empty for no auth"
+                  value={srv.auth_token ?? ''}
+                  oninput={(e) =>
+                    setMcpServer(i, (m) => (m.auth_token = (e.currentTarget as HTMLInputElement).value))}
+                  onchange={commitMcpEdits}
+                />
+              </label>
               <div class="mcp-enable-row">
                 <label class="mcp-enable" title="Expose this server's tools to Claude Code">
                   <input
@@ -5939,6 +5998,30 @@
                         ).value.trim()),
                     )}
                 />
+              </label>
+              <label>
+                <span>Auth token (optional)</span>
+                <!-- V33: the embedding server is usually a llama-server on a
+                     spare box, i.e. on the LAN. `?? ''` guards the pre-V33
+                     settings file that has no such key. Not `.trim()`-ed on
+                     write like the endpoint above: a token is opaque and
+                     trimming it would silently alter a credential. -->
+                <input
+                  type="password"
+                  value={snapshot.graph.embedding_auth_token ?? ''}
+                  onchange={(e) =>
+                    patch(
+                      (s) =>
+                        (s.graph.embedding_auth_token = (
+                          e.currentTarget as HTMLInputElement
+                        ).value),
+                    )}
+                />
+                <small class="hint">
+                  Sent as a <code>Bearer</code> header to the endpoint above.
+                  Leave empty for no auth. Stored cleartext in
+                  <code>settings.json</code>.
+                </small>
               </label>
               <label>
                 <span>Embedding model</span>

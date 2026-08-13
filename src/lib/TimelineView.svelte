@@ -48,6 +48,7 @@
     clearedLine,
     rowIcon,
     rowTitle,
+    checkpointSource,
     latchAlsoHoldsMemory,
     type ContaminationEvent,
     type TimelineRow,
@@ -412,6 +413,7 @@
       {#each rows as row (row.key)}
         {#if row.kind === 'checkpoint'}
           {@const cp = row.checkpoint}
+          {@const src = checkpointSource(cp.source)}
           <div class="row" data-cp={cp.id} class:flash={highlightId === cp.id}>
             <div class="row-main">
               <span class="trigger" title={rowTitle(row)}>{rowIcon(row)}</span>
@@ -422,6 +424,15 @@
                 title="Files changed since the PREVIOUS checkpoint — what this one newly captured when it was taken. It is not the difference from your current tree (that is what &quot;Diff vs now&quot; shows), so the two counts rarely agree. A project's first checkpoint counts every file, since everything is new to it."
                 >{cp.files_changed} file{cp.files_changed === 1 ? '' : 's'}</span
               >
+              <!-- V33 (C8): the tool this checkpoint was taken in FRONT of.
+                   Rendered only when present — a tool checkpoint is the rare
+                   one, so an always-there "—" would add a column of dashes to
+                   every row for the sake of a handful. It sits next to the
+                   agent because together they read as "claude · Bash": who,
+                   then what they were about to run. -->
+              {#if src}
+                <span class="source" title={src.title}>{src.text}</span>
+              {/if}
               <span class="agent">{cp.agent ?? '—'}</span>
               <span class="actions">
                 <button type="button" onclick={() => void toggleDiff(cp.id)}>
@@ -681,6 +692,25 @@
     font-variant-numeric: tabular-nums;
     /* The count's meaning lives in its title (it is NOT the diff-vs-now
        size) — same "hover me" affordance as .note-icon. */
+    cursor: help;
+  }
+  /* The tool a checkpoint was taken in front of. Monospace and boxed so it
+     reads as an identifier rather than as more prose, and `cursor: help`
+     because the sentence that explains what it means lives in its title —
+     same affordance as `.files`. No `min-width`: the element is absent on
+     almost every row, so it must not reserve a column. */
+  .source {
+    flex: 0 0 auto;
+    color: var(--text-secondary, #bbb);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: var(--font-size-xs, 11px);
+    border: 1px solid var(--border-subtle, #444);
+    border-radius: var(--radius-sm, 4px);
+    padding: 0 4px;
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     cursor: help;
   }
   .agent {

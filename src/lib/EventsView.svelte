@@ -140,9 +140,14 @@
   /// renders as a tab. Absent splits on trigger: burst/manual/pre-restore
   /// positively have no conversation behind them (headless), while a prompt
   /// checkpoint without one predates the identity fields (unattributed).
+  ///
+  /// V33 (C8): `tool` joins `prompt` on the unattributed side. A tool
+  /// checkpoint is fired from inside a harness turn, so it always HAS a
+  /// conversation — a missing tab means the id was not recorded, which is the
+  /// definition of unattributed, not of headless.
   function cpAttribution(cp: Checkpoint): Attribution {
     if (cp.tab) return { tab: cp.tab };
-    return cp.trigger === 'prompt' ? 'unattributed' : 'headless';
+    return cp.trigger === 'prompt' || cp.trigger === 'tool' ? 'unattributed' : 'headless';
   }
 
   const shownCps = $derived(
@@ -849,6 +854,15 @@
             <span>{cp.label}</span>
             <span class="cplabel">Trigger</span>
             <span>{cp.trigger}</span>
+            {#if cp.source}
+              <!-- V33 (C8). Labelled "Tool", NOT "Source": this feed's Source
+                   column already means the harness (`cpSource`), and reusing
+                   the word for `harness:tool_name` would make two different
+                   things read as one. Conditional because the field is absent
+                   on every non-tool checkpoint, which is nearly all of them. -->
+              <span class="cplabel">Tool</span>
+              <span class="cpmono">{cp.source}</span>
+            {/if}
             <span class="cplabel">Taken</span>
             <span>{fmtDate(cpTs)} · {fmtTime(cpTs)}</span>
             <span class="cplabel">Files changed</span>

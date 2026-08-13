@@ -11,6 +11,7 @@ import {
   rowTitle,
   triggerIcon,
   triggerTitle,
+  checkpointSource,
   evidenceNotices,
   latchAlsoHoldsMemory,
   evidenceOffNotice,
@@ -517,5 +518,66 @@ describe('row rendering', () => {
       checkpoint: cp({ trigger: unknown }),
     };
     expect(rowIcon(row)).toBeTruthy();
+  });
+
+  /// V33 (contract C8). The `tool` trigger's whole reason to exist is that it
+  /// is NOT the other four, so its icon and its sentence both have to be
+  /// distinguishable — an icon shared with `burst` would make "before the
+  /// write" and "after the write" the same row at a glance.
+  it('gives the tool trigger an icon and a title distinct from every other trigger', () => {
+    const others: Checkpoint['trigger'][] = ['prompt', 'burst', 'manual', 'pre-restore'];
+    for (const t of others) {
+      expect(triggerIcon('tool')).not.toBe(triggerIcon(t));
+      expect(triggerTitle('tool')).not.toBe(triggerTitle(t));
+    }
+    // It must not fall through to the unknown-trigger arm either.
+    expect(triggerTitle('tool')).not.toContain('this build knows');
+    // The claim the trigger makes: restoring recovers the state from before
+    // that one call.
+    expect(triggerTitle('tool')).toMatch(/before/i);
+  });
+});
+
+describe('checkpoint source (C8 provenance)', () => {
+  /// Absent is the NORMAL case — nearly every checkpoint has no tool behind
+  /// it, and until the Rust half lands none do. All three flavours of absent
+  /// must collapse to "render nothing", including the empty string: "empty is
+  /// not absent" is exactly how a blank badge reaches a row.
+  it('treats undefined, null and empty/whitespace alike as nothing to show', () => {
+    expect(checkpointSource(undefined)).toBeNull();
+    expect(checkpointSource(null)).toBeNull();
+    expect(checkpointSource('')).toBeNull();
+    expect(checkpointSource('   ')).toBeNull();
+    // …and a checkpoint from a backend that predates the field is one that
+    // simply has no such key.
+    expect(checkpointSource(cp().source)).toBeNull();
+  });
+
+  it('shows the tool name and names the harness in the explanation', () => {
+    for (const [raw, tool, harness] of [
+      ['claude:Bash', 'Bash', 'claude'],
+      ['offload:run_command', 'run_command', 'offload'],
+      ['opencode:edit', 'edit', 'opencode'],
+    ] as const) {
+      const s = checkpointSource(raw)!;
+      expect(s.text).toBe(tool);
+      expect(s.harness).toBe(harness);
+      expect(s.title).toContain(harness);
+      expect(s.title).toContain(tool);
+    }
+  });
+
+  /// Hand-mirrored data with no codegen: a provenance string in some other
+  /// shape is a thing the user should still see, not a thing to hide. Same
+  /// reasoning as `triggerIcon`'s `default:` arm.
+  it('shows an unrecognized shape verbatim rather than dropping it', () => {
+    const bare = checkpointSource('mystery_tool')!;
+    expect(bare.text).toBe('mystery_tool');
+    expect(bare.harness).toBeNull();
+    expect(bare.title).toContain('mystery_tool');
+    // A colon with nothing after it is not a tool name — fall back to the raw
+    // value instead of rendering an empty badge.
+    const empty = checkpointSource('claude:')!;
+    expect(empty.text).toBe('claude:');
   });
 });

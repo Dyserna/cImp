@@ -326,6 +326,12 @@ export function triggerIcon(trigger: Checkpoint['trigger']): string {
       return '📌';
     case 'pre-restore':
       return '⏮';
+    /// V33 (C8). A wrench, not another lightning bolt: the point of this
+    /// trigger is that a specific TOOL is about to run, and it has to be
+    /// tellable apart from `burst` (which fires *after* writes land) at a
+    /// glance, in a column one character wide.
+    case 'tool':
+      return '🔧';
     default:
       return '•';
   }
@@ -341,9 +347,44 @@ export function triggerTitle(trigger: Checkpoint['trigger']): string {
       return 'Manual — "Checkpoint now"';
     case 'pre-restore':
       return 'Automatic safety net taken right before a restore';
+    case 'tool':
+      return 'Automatic — taken immediately before a file-changing tool call; restoring here undoes that one call';
     default:
       return `Checkpoint (trigger "${String(trigger)}" is not one this build knows)`;
   }
+}
+
+/// A checkpoint's `source` (`harness:tool_name`) rendered for a Timeline row,
+/// or `null` when there is nothing to show.
+///
+/// **Absent is the normal case, not a gap.** `undefined` (a backend older than
+/// contract C8), `null` (no tool behind this checkpoint) and `''` (present but
+/// empty — "empty is not absent" would otherwise let a blank badge through)
+/// all collapse to `null` so the caller renders nothing at all rather than a
+/// placeholder on every prompt/burst/manual row.
+///
+/// A value that is not in `harness:tool` shape is shown verbatim rather than
+/// dropped: this is hand-mirrored data with no codegen, and silently hiding an
+/// unrecognized provenance string is exactly the failure `triggerIcon`'s
+/// `default:` arm exists to avoid.
+export function checkpointSource(
+  source: string | null | undefined,
+): { harness: string | null; text: string; title: string } | null {
+  const raw = (source ?? '').trim();
+  if (raw === '') return null;
+  const cut = raw.indexOf(':');
+  const tool = cut > 0 ? raw.slice(cut + 1).trim() : '';
+  // A colon with nothing usable after it is not `harness:tool` — fall back to
+  // the whole value rather than render an empty badge with a confident title.
+  const harness = tool === '' ? null : raw.slice(0, cut);
+  const text = tool === '' ? raw : tool;
+  return {
+    harness,
+    text,
+    title: harness
+      ? `Taken immediately before this tab's ${harness} "${text}" tool call — restoring here undoes that call`
+      : `Taken immediately before the "${text}" tool call — restoring here undoes that call`,
+  };
 }
 
 /// How a contamination bit was released, in the user's words.

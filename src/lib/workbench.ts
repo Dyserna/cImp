@@ -122,7 +122,12 @@ export function workbenchSendHunk(path: string, hunkIndex: number, root?: string
 // ── Phase C: checkpoints (shadow repo) ──────────────────────────────────
 
 /// Mirror of Rust `workbench::shadow::Trigger`.
-export type CheckpointTrigger = 'prompt' | 'burst' | 'manual' | 'pre-restore';
+///
+/// V33 (contract C8) adds `'tool'`: taken *immediately before* a
+/// filesystem-mutating tool call, so restoring to it recovers the tree as it
+/// was just before that one call. That is what separates it from `'prompt'`
+/// (a whole turn ago) and `'burst'` (after the writes already landed).
+export type CheckpointTrigger = 'prompt' | 'burst' | 'manual' | 'pre-restore' | 'tool';
 
 /// Mirror of Rust `workbench::shadow::Checkpoint` — one Timeline row.
 ///
@@ -150,6 +155,18 @@ export interface Checkpoint {
   /// what a contamination row is joined against. `null` on the same terms as
   /// `session`.
   tab: string | null;
+  /// V33 (contract C8): which tool call this checkpoint was taken in front of,
+  /// as `harness:tool_name` — `claude:Bash`, `offload:run_command`,
+  /// `opencode:edit`.
+  ///
+  /// Optional AND nullable, deliberately, and they mean different things at the
+  /// same point in a rollout: `undefined` = a backend that predates the field
+  /// (the key is simply absent from the payload), `null` = a backend that has
+  /// it but this checkpoint has no tool behind it — which is every
+  /// prompt/burst/manual/pre-restore checkpoint, i.e. almost all of them.
+  /// Neither is an error; every consumer must render "absent" as the normal
+  /// case rather than as a gap.
+  source?: string | null;
 }
 
 /// Mirror of Rust `workbench::shadow::RestoreReport` — the

@@ -711,18 +711,24 @@ export interface LayoutPreset {
   tree: LayoutNode;
 }
 
-/// Latest on-disk schema version. Mirrors `CURRENT_SCHEMA_VERSION` in
-/// `src-tauri/src/settings/schema.rs`. Bumped on every backend migration
-/// step. Frontend doesn't read it for any logic — it round-trips as a
-/// bare integer through the IPC bridge.
-export const CURRENT_SCHEMA_VERSION = 21;
+/// Placeholder stamped into `defaultSettings()` before the backend's first
+/// `settings-changed` broadcast arrives. Deliberately NOT the real version.
+///
+/// There used to be a `CURRENT_SCHEMA_VERSION = 21` here, described as
+/// mirroring `src-tauri/src/settings/schema.rs`. It drifted to nine versions
+/// behind (the Rust constant reached 31 in V33 Phase E) without anything
+/// noticing — which is the proof that no frontend logic depends on it. A
+/// mirror that nothing checks does not stay a mirror, and a number that is
+/// confidently wrong is worse than an obviously absent one, so the mirror is
+/// gone rather than corrected: **the backend is the sole authority on schema
+/// version.** Deleted by user decision, 2026-08-13.
+const SCHEMA_VERSION_UNKNOWN = 0;
 
 export interface Settings {
-  /// On-disk schema version. The backend stamps `CURRENT_SCHEMA_VERSION`
-  /// on fresh installs and via the v1.9 → v1.10 migration; the frontend
-  /// receives it as a bare integer and includes it in `defaultSettings`
-  /// so a manually-constructed Settings (test fixtures, fallback paths)
-  /// matches the on-disk shape.
+  /// On-disk schema version, stamped and migrated exclusively by the backend.
+  /// The frontend only round-trips it as a bare integer and must never author
+  /// a real value: `defaultSettings()` uses `SCHEMA_VERSION_UNKNOWN` so a
+  /// placeholder can never be mistaken for a genuine on-disk version.
   schema_version: number;
   tts: TtsSettings;
   /// V6-01 offline speech-to-text. Additive; old files default it disabled.
@@ -1106,6 +1112,11 @@ export interface GraphSettings {
   allow_remote_worker_access: boolean;
   semantic_search: boolean;
   embedding_endpoint: string;
+  /// V33 (contract C7): bearer token for `embedding_endpoint`. Empty = no auth
+  /// (the safe default, and what a pre-V33 settings file deserializes to).
+  /// Stored cleartext in settings.json like every other token here; the Rust
+  /// side hand-rolls `Debug` for `GraphSettings` so it is redacted in logs.
+  embedding_auth_token: string;
   embedding_model: string;
   embedding_dims: number;
   embed_code_bodies: boolean;
@@ -1354,6 +1365,13 @@ export interface McpServerConfig {
   /// V19: expose this server's tools to OpenCode (proxied through the
   /// `--consumer opencode` child). Off by default.
   opencode_access: boolean;
+  /// V33 (contract C7): bearer token for an **HTTP** server (`url`). Attached
+  /// as an `Authorization` header on every request/notification the warm MCP
+  /// host sends; ignored by stdio servers, which carry their secrets in `env`.
+  /// Empty = no auth (the safe default, and what a pre-V33 settings file
+  /// deserializes to). It is part of the Rust `config_sig`, so editing it
+  /// reconnects the server — the UI must persist it through `commitMcpEdits`.
+  auth_token: string;
 }
 
 /// V8-02: which capability tier a backend serves (mirror of Rust
@@ -1435,6 +1453,14 @@ export type OffloadBackendKind =
       /// When true, the Offload server dashboard's Start button opens an editable
       /// confirm popup with the command; edits apply to that launch only.
       show_command_on_start: boolean;
+      /// V33 (contract C7): bearer token sent to this locally-owned server —
+      /// the counterpart of the `--api-key` in `server_command`. Empty string =
+      /// no auth, which is the safe default and what every settings file
+      /// written before V33 deserializes to (the Rust variant carries a
+      /// field-level `#[serde(default)]`). Never `null`/`undefined`: a Local
+      /// backend a pre-V33 backend wrote arrives here without the key, so every
+      /// reader must fall back to `''` rather than blank the form.
+      auth_token: string;
     }
   | { type: 'remote'; base_url: string; auth_token: string; is_cloud: boolean; cloud_consent: boolean };
 
@@ -1635,7 +1661,7 @@ export function findTabIndex(settings: Settings, id: string): number {
 // re-broadcasts on init so this value is short-lived in practice.
 export function defaultSettings(): Settings {
   return {
-    schema_version: CURRENT_SCHEMA_VERSION,
+    schema_version: SCHEMA_VERSION_UNKNOWN,
     tts: {
       enabled: true,
       device: 'gpu',
@@ -1988,6 +2014,7 @@ export function defaultSettings(): Settings {
       allow_remote_worker_access: false,
       semantic_search: false,
       embedding_endpoint: '',
+      embedding_auth_token: '',
       embedding_model: '',
       embedding_dims: 0,
       embed_code_bodies: false,

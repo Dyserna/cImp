@@ -3960,21 +3960,31 @@ impl LatchRegistry {
     /// [`outbound::AuditClaims`]. Locks for exactly the length of the claim, so
     /// nothing is held across the SSRF screen's DNS `await`.
     ///
-    /// Without a registry entry (no tab identity, or `gate` has not run) the
-    /// call reports: there is no session to attribute a repeat to, which is the
-    /// same fail-open the latch and the budget take.
+    /// Without a registry entry (no tab identity, or `gate` has not run) there
+    /// is no session to attribute a repeat to, so the claim falls back to
+    /// `unscoped` — which since #48 F-40 is the identity-less scope's own
+    /// process-global ledger ([`outbound::UnscopedAudit`]) and **not** a
+    /// constant. The latch and the budget still fail open here; the ROWS no
+    /// longer do, because "no session" was never a reason for a caller to be
+    /// able to write one row per event into a capped lane.
+    ///
+    /// `unscoped` is a closure so the fallback ledger is touched only when it is
+    /// actually reached, and — load-bearing — so its lock is never taken while
+    /// this one is held. The early `return` inside the `if let` is what ends the
+    /// registry borrow before that call.
     fn claim<T>(
         &self,
         scope: Option<&LatchScope>,
         claim: impl FnOnce(&mut outbound::Budget) -> T,
-        unscoped: T,
+        unscoped: impl FnOnce() -> T,
     ) -> T {
-        let Some(scope) = scope else { return unscoped };
+        let Some(scope) = scope else { return unscoped() };
         let mut tabs = self.tabs.lock().unwrap_or_else(PoisonError::into_inner);
-        match tabs.get_mut(&scope.key()) {
-            Some(entry) => claim(&mut entry.budget),
-            None => unscoped,
+        if let Some(entry) = tabs.get_mut(&scope.key()) {
+            return claim(&mut entry.budget);
         }
+        drop(tabs);
+        unscoped()
     }
 
     /// The `/status` view: one row per tab the proxy has served, sorted so the
@@ -4057,21 +4067,32 @@ fn latches() -> &'static LatchRegistry {
 ///
 /// A handle rather than a borrow because the ledger sits behind the registry
 /// mutex, which must not be held across the SSRF screen's DNS `await`.
-struct TabAudit<'a>(Option<&'a LatchScope>);
+///
+/// The second field is the agent whose identity-less ledger a call **without** a
+/// scope claims against ([`outbound::UnscopedAudit`], #48 F-40). It is carried
+/// rather than derived because at the one construction site the agent is already
+/// resolved through `graph::source_for_consumer` — the same normalisation that
+/// builds the `agent:(no tab identity)` label the resulting row shows, so the
+/// ledger and the label cannot name different things.
+struct TabAudit<'a>(Option<&'a LatchScope>, &'static str);
+
+impl TabAudit<'_> {
+    /// This call's fallback ledger. One place, so both claims agree on it.
+    fn unscoped(&self) -> outbound::UnscopedAudit {
+        outbound::UnscopedAudit::for_agent(self.0.map(|s| s.agent).unwrap_or(self.1))
+    }
+}
 
 impl outbound::ScopeAudit for TabAudit<'_> {
     fn claim_ssrf(&self) -> outbound::DoublingRow {
-        latches().claim(
-            self.0,
-            outbound::Budget::claim_ssrf_flag,
-            outbound::DoublingRow::Write {
-                total: 0,
-                suppressed: 0,
-            },
-        )
+        latches().claim(self.0, outbound::Budget::claim_ssrf_flag, || {
+            self.unscoped().claim_ssrf()
+        })
     }
     fn claim_unscreened(&self) -> bool {
-        latches().claim(self.0, outbound::Budget::claim_unscreened_flag, true)
+        latches().claim(self.0, outbound::Budget::claim_unscreened_flag, || {
+            self.unscoped().claim_unscreened()
+        })
     }
 }
 
@@ -6929,7 +6950,7 @@ async fn handle_mcp_call(
     // #48: the tab session's audit-row claim ledger, threaded to the SSRF
     // chokepoint and to the detection boundary so neither can flood a capped
     // feed on a loop. See `TabAudit`.
-    let audit = TabAudit(scope.as_ref());
+    let audit = TabAudit(scope.as_ref(), agent);
     let called = service
         .mcp_call(
             consumer_of(req),
@@ -11024,7 +11045,7 @@ mod tests {
     /// the tab's `Budget`.
     #[test]
     fn ssrf_denial_rows_are_bounded_per_session_and_reset_on_rotation() {
-        use outbound::{ScopeAudit, DoublingRow};
+        use outbound::DoublingRow;
         let reg = LatchRegistry::default();
         let s = scope("claude-1", Some("sess-a"));
         assert!(reg
@@ -11041,7 +11062,7 @@ mod tests {
             reg.claim(
                 Some(&s),
                 outbound::Budget::claim_ssrf_flag,
-                DoublingRow::Suppress,
+                || DoublingRow::Suppress,
             )
         };
         let written: Vec<u32> = (0..200)
@@ -11066,7 +11087,7 @@ mod tests {
             fresh.claim(
                 Some(&f),
                 outbound::Budget::claim_ssrf_flag,
-                DoublingRow::Suppress
+                || DoublingRow::Suppress
             ),
             DoublingRow::Write { total: 1, .. }
         ));
@@ -11087,16 +11108,75 @@ mod tests {
             reg.claim(
                 Some(&rotated),
                 outbound::Budget::claim_ssrf_flag,
-                DoublingRow::Suppress
+                || DoublingRow::Suppress
             ),
             DoublingRow::Write { total: 1, .. }
         ));
 
-        // A call with no tab identity has no session to attribute a repeat to,
-        // so it reports — the same fail-open the latch and the budget take.
-        let unscoped = TabAudit(None);
-        assert!(matches!(unscoped.claim_ssrf(), DoublingRow::Write { .. }));
-        assert!(unscoped.claim_unscreened());
+    }
+
+    /// #48 finding F-40 — the identity-less scope is LEDGERED, and this is the
+    /// split half of the assertion that used to live at the end of
+    /// `ssrf_denial_rows_are_bounded_per_session_and_reset_on_rotation`.
+    ///
+    /// **Do not merge it back.** The old assertion was
+    /// `matches!(TabAudit(None).claim_ssrf(), Write { .. })` under the comment
+    /// *"it reports — the same fail-open the latch and the budget take"*, and it
+    /// stayed green for exactly the behaviour F-40 measured in the field: a
+    /// caller with no tab wrote **one row per denial** (~72 denials → ~64 rows)
+    /// where an attributed scope wrote `log2(n)` (20 → 4). Both halves of that
+    /// old line are still asserted here — it still reports, and it is now
+    /// bounded — but as two claims, so loosening one cannot hide behind the other.
+    ///
+    /// Assertions are stated as **bounds, not exact totals**, because the ledger
+    /// is process-global by design ([`outbound::UnscopedAudit`]): any other test
+    /// in this binary that claims unscoped shifts the starting point, and a test
+    /// that would fail when its neighbours run is worse than no test.
+    #[test]
+    fn an_identity_less_call_reports_but_is_still_ledgered() {
+        use outbound::{DoublingRow, ScopeAudit};
+
+        // `gate` has never run for this one, so it takes the no-entry path —
+        // the same fallback an absent, unknown or shell `tab` reaches.
+        let unscoped = TabAudit(None, "claude");
+
+        // It still REPORTS: a lone denial behaves as it always did.
+        let first = unscoped.claim_ssrf();
+        assert!(
+            matches!(first, DoublingRow::Write { .. }),
+            "an identity-less denial must still be able to write a row: {first:?}"
+        );
+
+        // It is now LEDGERED. `total: 0` was the wire-visible signature of the
+        // unledgered fallback this finding removed, and it is what
+        // `ssrf_flag_detail` would have to render as "denial #0".
+        for _ in 0..64 {
+            if let DoublingRow::Write { total, .. } = unscoped.claim_ssrf() {
+                assert!(total >= 1, "a written row must count itself");
+            }
+        }
+
+        // And it is BOUNDED: 128 further denials cost the capped `Ssrf` lane at
+        // most a handful of rows, not 128. `log2(128) + 1 = 8` is the ceiling
+        // even from a counter starting at zero, so this holds wherever the
+        // shared ledger happens to be.
+        let written = (0..128)
+            .filter(|_| matches!(unscoped.claim_ssrf(), DoublingRow::Write { .. }))
+            .count();
+        assert!(
+            written <= 8,
+            "128 identity-less denials wrote {written} rows; the doubling bounds it to 8"
+        );
+
+        // The unscreened bit is a hard one-per-scope claim, not a doubling, and
+        // the identity-less scope is one scope — so across many calls it is
+        // claimable at most once. (It may already be spent by an earlier test;
+        // "never twice" is the property, and it is the one that matters.)
+        let claims = (0..16).filter(|_| unscoped.claim_unscreened()).count();
+        assert!(
+            claims <= 1,
+            "the one unscreened row per scope was claimed {claims} times"
+        );
     }
 
     /// #48 (finding A-1, proxy side) — restated as the shared rule the worker

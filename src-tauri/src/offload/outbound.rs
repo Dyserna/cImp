@@ -1219,9 +1219,16 @@ impl Budget {
 /// the one place this codebase keeps being bitten by them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoublingRow {
-    /// Write the row. `total` is how many events this ledger has counted
-    /// (`0` = an unledgered scope, see [`UnscopedAudit`]), and `suppressed` how
-    /// many were folded into this one since the last row was written.
+    /// Write the row. `total` is how many events this ledger has counted and
+    /// `suppressed` how many were folded into this one since the last row was
+    /// written.
+    ///
+    /// `total` is always `>= 1`: every caller now claims against a real ledger,
+    /// including the identity-less one ([`UnscopedAudit`]). It used to be able
+    /// to arrive as `0`, meaning *"this scope keeps no ledger, so this row
+    /// stands only for itself"* — which is what #48 finding F-40 closed, and a
+    /// `total: 0` reaching [`ssrf_flag_detail`] is now the signature of a
+    /// producer that has slipped back out of a ledger.
     Write { total: u32, suppressed: u32 },
     /// Counted, not written.
     Suppress,
@@ -1287,6 +1294,16 @@ pub struct AuditClaims {
 }
 
 impl AuditClaims {
+    /// An empty ledger, usable in a `static`. `Default` cannot be, and
+    /// [`UNSCOPED`] must be initialised at compile time.
+    const EMPTY: Self = Self {
+        ssrf: Doubling {
+            seen: 0,
+            reported: 0,
+        },
+        unscreened: false,
+    };
+
     /// Count one SSRF denial and decide whether it gets a row — the doubling
     /// discipline, delegated to [`Doubling::claim`] since #48 F-32 gave it a
     /// second consumer.
@@ -1344,6 +1361,92 @@ impl ScopeAudit for TaskAudit {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim_unscreened()
+    }
+}
+
+/// Every ledger [`UnscopedAudit`] can reach, one slot per agent, indexed by
+/// [`UnscopedAudit::slot`].
+///
+/// **The key space is structural, not checked** (the discipline #48 F-37 was
+/// closed with): the index is a `usize` the constructor derives from a single
+/// boolean test, so the array has exactly as many slots as there are agents and
+/// **no caller-supplied string can create one**. A map keyed on the agent name
+/// would have been the same shape as F-37's defect, in the fix for its sibling.
+static UNSCOPED: std::sync::Mutex<[AuditClaims; 2]> =
+    std::sync::Mutex::new([AuditClaims::EMPTY; 2]);
+
+/// The ledger for a call that reaches a screen with **no scope of its own** —
+/// the `agent:(no tab identity)` case (#48 finding F-40).
+///
+/// # What it is for
+///
+/// The proxy's ledger rides the tab's [`Budget`], so a call whose `tab` names no
+/// configured AI tab — an absent id, an unknown one, or a *shell* tab — has
+/// nowhere to keep one, and until F-40 every such call was therefore
+/// `DoublingRow::Write { total: 0, .. }`: **unledgered, so a loop of refused
+/// URLs wrote one row per denial** where an attributed scope wrote `log2(n)`.
+/// Measured on v0.51.0-rc.4: ~72 denials produced ~64 rows on
+/// `claude:(no tab identity)` while 20 on `claude:opencode` produced 4.
+///
+/// Those callers are not anonymous to the *feed* — they all share one honest
+/// scope label — so they get one honest ledger, and the bound F-32's own bar
+/// demands (*"cannot exceed log2(n) in its own lane"*) now holds on every path
+/// rather than on every path that happens to have a tab.
+///
+/// # Why a process-global, when [`AuditClaims`]' own doc rejects one
+///
+/// That rejection is about **scoped** callers: a process-global
+/// `HashSet<scope>` would suppress a real tab's rows permanently, across every
+/// session it ever holds, because `agent:tab` is stable while conversations are
+/// not. It does not apply here — this scope has no session to rotate, so there
+/// is no reset to lose. Process lifetime is the only lifetime available, and
+/// picking it costs nothing that existed.
+///
+/// # What is deliberately NOT bounded
+///
+/// The **fetch budget**. An identity-less caller still gets none, and that stays
+/// a fail-open: a process-global 40-call cap would fail *closed* on legitimate
+/// callers with no reset short of an app restart, and the budget's job — bounding
+/// one runaway *task* — is already done where a task exists ([`TaskAudit`] for
+/// the worker, [`Budget`] for a tab). Rows are the half where being wrong is
+/// cheap: a suppressed row loses nothing silently, because the next row written
+/// still names the true total. See the F-40 block in
+/// `docs/reviews/V32-live-verify-checklist-2026-08-10.md`.
+pub struct UnscopedAudit(usize);
+
+impl UnscopedAudit {
+    /// The ledger for one agent's identity-less calls.
+    pub fn for_agent(agent: &str) -> Self {
+        Self(Self::slot(agent))
+    }
+
+    /// Agent name → slot. The whole of the key derivation, in one place, so the
+    /// "no string can become a key" claim is checkable by reading it.
+    ///
+    /// Matches `graph::source_for_consumer`'s two-value vocabulary, which is
+    /// what every caller of this type has already normalised through — an
+    /// unrecognised name lands on the same slot that vocabulary would give it.
+    const fn slot(agent: &str) -> usize {
+        // `eq_ignore_ascii_case` is not const; this is the same test.
+        match agent.as_bytes() {
+            b"opencode" | b"OpenCode" | b"OPENCODE" => 1,
+            _ => 0,
+        }
+    }
+}
+
+impl ScopeAudit for UnscopedAudit {
+    fn claim_ssrf(&self) -> DoublingRow {
+        UNSCOPED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[self.0]
+            .claim_ssrf()
+    }
+    fn claim_unscreened(&self) -> bool {
+        UNSCOPED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[self.0]
             .claim_unscreened()
     }
 }
@@ -2537,6 +2640,51 @@ mod tests {
                 screen_urls(&json!({ "q": arg }), &policy).await.is_ok(),
                 "{arg:?} is prose and must pass"
             );
+        }
+    }
+
+    /// #48 finding F-40 — the identity-less ledger's key space is **structural**.
+    ///
+    /// This is the property that keeps the fix for F-40 from being a fresh
+    /// instance of F-37: a caller-supplied string must not be able to create a
+    /// ledger slot. It cannot, because the key is not a string at all — it is an
+    /// index derived by [`UnscopedAudit::slot`] from one boolean test, so the
+    /// key space is the array's length and nothing else.
+    ///
+    /// Asserted as a pure function so it holds regardless of what any other test
+    /// in this binary has claimed against the shared ledger.
+    #[test]
+    fn the_identity_less_ledger_cannot_be_keyed_by_a_caller() {
+        // The two agents are separated — a shared counter would make each row's
+        // "denial #N for this scope" a statement about two scopes.
+        assert_ne!(
+            UnscopedAudit::slot("claude"),
+            UnscopedAudit::slot("opencode")
+        );
+        // And nothing else can add a slot. Anything unrecognised folds onto the
+        // same slot `graph::source_for_consumer` would give it, which is the
+        // vocabulary every caller of this type has already normalised through.
+        for forged in [
+            "",
+            "claude",
+            "CLAUDE",
+            "attacker",
+            "opencode-2",
+            "../../etc",
+            "opencodex",
+        ] {
+            let slot = UnscopedAudit::slot(forged);
+            assert!(
+                slot < UNSCOPED.lock().unwrap().len(),
+                "`{forged}` produced slot {slot}, outside the fixed array"
+            );
+            if forged != "opencode" {
+                assert_eq!(
+                    slot,
+                    UnscopedAudit::slot("claude"),
+                    "`{forged}` must fold onto the default agent, not open a slot"
+                );
+            }
         }
     }
 

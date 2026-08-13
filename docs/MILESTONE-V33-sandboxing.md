@@ -7,7 +7,8 @@ six-agent investigation verified this spec against the live tree and found
 several of its load-bearing claims false**; each correction is dated in place
 under the claim it corrects — the "Builds on" line below, decision 1, decision 7,
 decision 11, Phase D and Phase F — with the original left standing above it. The
-four user decisions taken the same day are **locked decisions 12–15**, and the
+four user decisions taken the same day are **locked decisions 12–15**; **2026-08-14
+added decisions 16–17 (Settings placement and the master off switch)**, and the
 implementation contracts derived from that pass live in
 [IMPL-PLAN-V33-sandboxing.md](IMPL-PLAN-V33-sandboxing.md): that file is the
 source of truth for the build, this one for the design. **Locked decisions now
@@ -355,6 +356,108 @@ Settings → Workbench toggle is the only action needed).
     *Rejected:* gating the code on the deployment. Client and server key are
     independent changes, and the ordering that costs least is the one that leaves
     nothing to build when the decision to deploy is taken.
+
+16. **Every sandboxing setting goes in ONE top-level Settings category of its
+    own (user decision 2026-08-14).** Decided before any such setting exists, so
+    that none is ever placed by default.
+
+    As of 2026-08-14 **there is no sandboxing setting in the schema** — verified,
+    not assumed: no `sandbox`, `paranoia`, `unsandboxed`, `landlock`,
+    `appcontainer` or `job_object` key exists. Stage 1's containment (the seam
+    ledger, the `run_command` env allowlist, job-object coverage, the Linux
+    process-group backstop) is entirely code with no user-facing switch, and
+    stage 3b's compile limits are constants, not settings.
+
+    The settings that are coming, and would otherwise scatter across three
+    unrelated sections: the **UNSANDBOXED** degradation state (decision 5, Phase
+    A), the **engine selection** (decision 2, Phase B), the **hardened Claude
+    `sandbox.*` profile** (decision 6, Phase B), and the per-tab **Max Paranoia**
+    toggle (decision 9, Phase C — which this spec already requires be named
+    exactly that in the UI). Left to land where each phase happens to touch, they
+    would go to Tabs, Local task offload and Per-tab overrides respectively.
+
+    This is **F-18's lesson applied before the fact rather than after it.** V32
+    shipped its injection controls scattered across sections, discovered that 36
+    pointers and 15 user-visible strings named a "Tools" section that did not
+    exist, and had to consolidate them into a top-level `Injection protection`
+    category (`SettingsApp.svelte:4955`) as a fix. Sandboxing is the same shape
+    of feature — a posture the user turns on, not an option belonging to any one
+    subsystem — so it gets the same treatment, and gets it first.
+
+    **Explicitly NOT in this category — Phase E's three `auth_token` fields.**
+    They are per-service credentials, not containment controls: a bearer token
+    belongs beside the URL it authenticates (`offload.backends[].kind.auth_token`
+    under *Local task offload*, `graph.embedding_auth_token` under *Code
+    Intelligence*, `offload.mcp_servers[].auth_token` on the MCP row). The
+    category's membership test is *"does this control the boundary the OS
+    enforces?"*, not *"did V33 add it?"*.
+
+    **Also NOT moving: `workbench.checkpoints`.** Phase F depends on it, but it
+    is the shadow-repo master switch shared by the prompt and burst triggers and
+    predates this milestone; it stays under *Workbench*. Named here so its
+    absence from the sandboxing category reads as a decision rather than an
+    oversight.
+
+    *Accepted cost:* a per-tab toggle (Max Paranoia) rendered in a global
+    category needs a tab selector or a per-tab override row, which is more UI
+    than dropping it into *Per-tab overrides* would have been. Judged worth it:
+    a user hardening the app should find every containment control in one place,
+    and V32 has already paid for the alternative.
+    *Rejected:* folding these into `Injection protection`. V32 constrains a
+    compromised model at the tool layer; V33 makes the OS enforce a boundary the
+    model cannot negotiate with. Those are different guarantees with different
+    failure modes, and merging them would let a user reasonably believe that
+    switching one on delivers the other.
+
+17. **Sandboxing has a master off switch, and it governs the OS layer only
+    (user decision 2026-08-14).** The user must be able to turn the whole
+    sandboxing posture off. Off means: no per-spawn OS wrapper (whichever engine
+    decision 2 selects), no Landlock rules, no Max Paranoia, and **the hardened
+    `sandbox.*` profile of decision 6 is not written into the `--settings`
+    overlay at all** — not written-and-disabled, absent, so nothing inside the
+    tab can read a policy that is not in force.
+
+    **What the switch does NOT reach, and why.** Three stage-1 controls stay
+    unconditional, because each is something other than confinement:
+    - **Job-object kill-on-close** (`process_guard`, incl. the PTY coverage added
+      in stage 1b) is process *lifecycle correctness*. Making it switchable would
+      not relax a boundary, it would reintroduce orphaned agent children on hard
+      kill — a bug, not a freedom.
+    - **`run_command`'s minimal environment** (decision 10). A child of an
+      allowlisted command has no business seeing cImp's API keys or loopback
+      token under any posture. This one is the closest call on the list — it *is*
+      a containment control — and it is kept on the ground that the thing it
+      withholds is credentials rather than capability. **If a real build probe is
+      ever found that needs a variable the allowlist withholds, the answer is to
+      add that variable to the table with a recorded reason, not to switch the
+      table off.**
+    - The loopback root allowlist, the `(consumer, tab)` predicate and the
+      plugin's `fetch` binding are injection-layer fixes that predate any OS
+      boundary; they are governed by V32's own settings, not this switch.
+
+    So the switch's membership test is the same as decision 16's category test:
+    *does this control the boundary the OS enforces?*
+
+    **Off is a distinct state from unavailable.** Decision 5 already requires a
+    visible `UNSANDBOXED` surface when a prerequisite is missing. That surface
+    now carries **two** states, and consumers must not collapse them: *off by
+    user choice* and *unavailable — a prerequisite is missing*. Conflating them
+    is precisely how a broken prerequisite hides behind a deliberate setting, and
+    it is the failure decision 5 exists to prevent. Neither state nags and
+    neither blocks a spawn; no surface may ever claim containment it is not
+    delivering.
+
+    *Accepted cost:* an extra state threaded through every consumer of the
+    sandbox status (tab badge, `/status`, the Tool Activity row), and a switch
+    that a compromised model would very much like flipped — mitigated only by it
+    being a settings write, which the model cannot perform through any tool cImp
+    exposes. **Whoever implements this must verify that claim rather than
+    inherit it**; the V32 run found a comment standing in for a check six times.
+    *Rejected:* a fail-closed posture with no off switch. This is a hardening
+    layer over a working product, not a gate that bricks tabs — the same argument
+    decision 5 already makes for the unavailable case, and the same one V32's
+    decision 16 makes about a control that gets answered by switching the whole
+    feature off.
 
 ## Carried V32 findings — corrected filing (2026-08-13)
 

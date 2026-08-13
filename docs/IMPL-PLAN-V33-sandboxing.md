@@ -175,6 +175,46 @@ population question is entangled with F-31's default-off gate; recorded as owed.
   both already have `default:` arms, so an un-updated frontend degrades rather
   than breaks.
 
+### C10 — Settings placement and the master off switch (decisions 16–17)
+Taken 2026-08-14, **before any sandboxing setting exists** — verified: the
+schema today has no `sandbox`, `paranoia`, `unsandboxed`, `landlock`,
+`appcontainer` or `job_object` key. Stage 1's containment is code with no
+switch; stage 3b's compile limits are constants.
+
+- **One top-level Settings category holds every sandboxing setting.** Not
+  scattered into Tabs / Local task offload / Per-tab overrides, which is where
+  the four coming settings would otherwise land (UNSANDBOXED state — Phase A;
+  engine selection — Phase B; hardened Claude profile — Phase B; Max Paranoia
+  per-tab toggle — Phase C). This is F-18's consolidation applied *before* the
+  scatter instead of after it. Sibling to `Injection protection`
+  (`SettingsApp.svelte:4955`), **not merged into it** — V32 constrains a
+  compromised model at the tool layer, V33 makes the OS enforce a boundary the
+  model cannot negotiate with; merging would let a user believe one delivers
+  the other.
+- **Phase E's three `auth_token` fields do NOT move.** They are per-service
+  credentials and belong beside the URL they authenticate. `workbench.checkpoints`
+  does not move either — it is the shadow-repo master switch shared with the
+  prompt and burst triggers, and predates this milestone.
+- **Membership test for both the category and the switch:** *does this control
+  the boundary the OS enforces?* — not *did V33 add it?*
+- **The master off switch reaches the OS layer only.** Off ⇒ no per-spawn
+  wrapper, no Landlock, no Max Paranoia, and decision 6's `sandbox.*` profile is
+  **absent from the `--settings` overlay**, not present-and-false.
+  **Unconditional regardless of the switch:** job-object kill-on-close
+  (lifecycle correctness — switching it off reintroduces orphans, a bug not a
+  freedom), `run_command`'s minimal env (it withholds credentials, not
+  capability — if a build probe genuinely needs a withheld variable, add it to
+  the table with a reason rather than switching the table off), and the
+  injection-layer fixes from stage 1c.
+- **Two distinct states, never collapsed: `off (user choice)` and
+  `unavailable (prerequisite missing)`.** Decision 5's surface (tab badge,
+  `/status`, Tool Activity row) carries both. Collapsing them is how a broken
+  prerequisite hides behind a deliberate setting.
+- ⚠ **Verify, do not inherit, the claim that a compromised model cannot flip
+  this switch.** It rests on the switch being a settings write with no
+  tool-exposed path. The V32 run found a comment standing in for a check six
+  times; this is exactly that shape.
+
 ### C9 — yara-x local rules
 `rules.d/local/*.yar` are user-authored and run under a wasm sandbox the V32
 review states "is not the boundary", against 16 open wasmtime advisories. The

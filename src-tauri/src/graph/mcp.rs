@@ -1747,8 +1747,11 @@ async fn semantic_query(
         Ok(Some(e)) => e,
         _ => return fallback(idx),
     };
-    let Some(mut embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
-    else {
+    let Some(mut embedder) = super::embed::Embedder::new(
+        &g.embedding_endpoint,
+        &g.embedding_model,
+        &g.embedding_auth_token,
+    ) else {
         return fallback(idx);
     };
     // Apply the token budget WITHOUT probing: a pathological long query must
@@ -1810,8 +1813,11 @@ async fn semantic_code_query(
         Ok(Some(e)) => e,
         _ => return unavailable(),
     };
-    let Some(mut embedder) = super::embed::Embedder::new(&g.embedding_endpoint, &g.embedding_model)
-    else {
+    let Some(mut embedder) = super::embed::Embedder::new(
+        &g.embedding_endpoint,
+        &g.embedding_model,
+        &g.embedding_auth_token,
+    ) else {
         return unavailable();
     };
     // Same fit guarantee as the doc query path, still probe-free.

@@ -97,6 +97,94 @@ fn flag_value(inline: Option<&str>, args: &[String], i: &mut usize) -> Option<St
     args.get(*i).cloned()
 }
 
+/// The `--api-key` / `--api_key` value in an already-tokenized `llama-server`
+/// argument list, or `""` when there is none. Last occurrence wins, as in
+/// llama.cpp's own parser and as in every other flag this module reads.
+///
+/// **The single definition of "where the key is in a server command".** Two
+/// callers need it and they must not disagree: [`derive_opencode_provider`]
+/// (OpenCode's `local-llama` provider) and [`resolve_local_auth`] (cImp's own
+/// bearer for the same server). A second parser is how the two would drift.
+fn api_key_from_args(args: &[String]) -> String {
+    let mut key = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        let (flag, inline) = split_flag(&args[i]);
+        if matches!(flag, "--api-key" | "--api_key") {
+            if let Some(v) = flag_value(inline, args, &mut i) {
+                key = v;
+            }
+        }
+        i += 1;
+    }
+    key
+}
+
+/// The `--api-key` a `server_command` carries, or `""`. Tolerant by design:
+/// an unparseable command (unbalanced quotes) yields no key rather than an
+/// error, because every caller's fallback for "no key" is already correct.
+pub fn api_key_from_command(command: &str) -> String {
+    let Some(tokens) = shlex::split(command) else {
+        return String::new();
+    };
+    // Skip the program; flags live after it.
+    match tokens.split_first() {
+        Some((_program, args)) => api_key_from_args(args),
+        None => String::new(),
+    }
+}
+
+/// The bearer token cImp actually sends to a Local backend, and where it came
+/// from.
+///
+/// # Why the token has two sources (V33 stage 3)
+///
+/// `OffloadBackendKind::Local::auth_token` is *configured*; `--api-key` in the
+/// same backend's `server_command` is what makes the server DEMAND a token, and
+/// it is already parsed out for OpenCode's `local-llama` provider
+/// (`opencode_provider.api_key`, [`derive_opencode_provider`]). So a user
+/// securing a cImp-launched llama-server had to write the same secret in two
+/// places, and getting it wrong in one of them made offload and OpenCode
+/// disagree about a server they both talk to — with the symptom landing on
+/// whichever one the user was not testing.
+///
+/// **Decision (2026-08-13): an empty `auth_token` falls back to the `--api-key`
+/// already in the command.** The command is the stronger evidence of intent —
+/// it is what the server will actually enforce — and the field stays available
+/// to override it, which is the case that matters when cImp does not launch the
+/// server (`autostart` off, an externally started keyed llama-server, no
+/// `--api-key` for cImp to read).
+///
+/// Precedence, and the reason it runs this way round: an explicitly configured
+/// token WINS. A user who typed a value into the field meant it, and silently
+/// preferring the command string would make the field unable to correct a stale
+/// key. Empty means "I did not choose", not "send nothing".
+pub struct ResolvedAuth {
+    /// The token to send; empty for none.
+    pub token: String,
+    /// True when [`Self::token`] came from `--api-key` rather than from the
+    /// configured field. Carried so the "unauthorized" message can name the
+    /// right place to fix — a user told to check a Settings field they left
+    /// blank is being sent to the wrong screen.
+    pub from_command: bool,
+}
+
+/// Resolve a Local backend's effective bearer — see [`ResolvedAuth`].
+pub fn resolve_local_auth(configured: &str, server_command: &str) -> ResolvedAuth {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return ResolvedAuth {
+            token: configured.to_string(),
+            from_command: false,
+        };
+    }
+    let derived = api_key_from_command(server_command);
+    ResolvedAuth {
+        from_command: !derived.is_empty(),
+        token: derived,
+    }
+}
+
 /// Map a bind-all address to a loopback connect address.
 fn normalize_host(host: &str) -> String {
     match host {
@@ -198,7 +286,8 @@ pub fn derive_opencode_provider(command: &str) -> AppResult<OpencodeLocalProvide
     let mut port: Option<u16> = None;
     let mut alias: Option<String> = None;
     let mut model_path: Option<String> = None;
-    let mut api_key = String::new();
+    // One definition of "where the key is", shared with `resolve_local_auth`.
+    let api_key = api_key_from_args(&args);
 
     let mut i = 0;
     while i < args.len() {
@@ -230,10 +319,11 @@ pub fn derive_opencode_provider(command: &str) -> AppResult<OpencodeLocalProvide
                     }
                 }
             }
+            // `--api-key` is read by `api_key_from_args` above, not here — one
+            // parser, two callers. It must still be *skipped* correctly so its
+            // value cannot be mistaken for a positional model path.
             "--api-key" | "--api_key" => {
-                if let Some(v) = flag_value(inline, &args, &mut i) {
-                    api_key = v;
-                }
+                let _ = flag_value(inline, &args, &mut i);
             }
             _ => {}
         }
@@ -294,6 +384,21 @@ pub struct LlamaServer {
     gate: Arc<Semaphore>,
     /// Short-timeout client for `/health` + `/props` probes.
     client: reqwest::Client,
+    /// V33 Phase E: bearer token for this backend, or empty for none. Set on
+    /// the probes below; the agent loop gets it separately, through
+    /// `PoolEntry::auth_token` → `AgentConfig::auth_token`, because the chat
+    /// call uses the service's own long-timeout client rather than this one.
+    /// Never logged, never in an error string — see [`Self::auth_token`].
+    ///
+    /// **This is the EFFECTIVE token, not the configured field.** V33 stage 3:
+    /// an empty configured token falls back to the `--api-key` in the same
+    /// backend's `server_command` — see [`resolve_local_auth`].
+    auth_token: String,
+    /// Whether [`Self::auth_token`] was inherited from `--api-key` rather than
+    /// typed into the backend's Auth token field. Reporting-only, and it exists
+    /// for exactly one consumer: [`Self::unauthorized_message`], which would
+    /// otherwise send a user to a Settings field they deliberately left blank.
+    auth_from_command: bool,
     /// Last readiness failure reason (e.g. a non-llama.cpp server squatting
     /// on the port), surfaced to the Settings status row. `None` when ready
     /// or never probed.
@@ -313,6 +418,13 @@ enum HealthProbe {
     /// Reachable + 2xx but NOT llama.cpp (no `status` field) — another app
     /// owns this port. A hard error, not worth waiting on.
     NotLlama,
+    /// V33 Phase E: the server answered `401`/`403`. The endpoint is up and
+    /// talking; cImp's credential is wrong or missing. Classified separately
+    /// because it is otherwise indistinguishable from "down" (no `status`
+    /// field, non-2xx) — and a user who has just turned on `--api-key` would
+    /// be told their server never came up, which sends them debugging the
+    /// wrong thing entirely.
+    Unauthorized,
     /// Unreachable / transport error / non-2xx without a llama status.
     Down,
 }
@@ -323,7 +435,7 @@ impl LlamaServer {
     /// [`Self::with_config`] used by tests and any single-local caller.
     #[allow(dead_code)]
     pub fn new(command: &str) -> AppResult<Self> {
-        Self::with_config("local", command, BackendTier::Quality, ToolScope::All)
+        Self::with_config("local", command, "", BackendTier::Quality, ToolScope::All)
     }
 
     /// Build a Local backend with an explicit name/tier/tool-scope (one
@@ -335,6 +447,7 @@ impl LlamaServer {
     pub fn with_config(
         name: &str,
         command: &str,
+        auth_token: &str,
         tier: BackendTier,
         tool_scope: ToolScope,
     ) -> AppResult<Self> {
@@ -352,6 +465,11 @@ impl LlamaServer {
             .build()
             .map_err(|e| AppError::Offload(format!("failed to build HTTP client: {e}")))?;
         let parallel = cmd.parallel.max(1) as usize;
+        // V33 stage 3: `auth_token` here is the CONFIGURED field. An empty one
+        // inherits the `--api-key` already in `command` — the flag that makes
+        // this very server demand a token, and the one OpenCode's provider
+        // reads for the same server. See `resolve_local_auth`.
+        let auth = resolve_local_auth(auth_token, command);
         Ok(Self {
             name: name.to_string(),
             tier,
@@ -361,8 +479,32 @@ impl LlamaServer {
             n_ctx: AtomicU32::new(0),
             gate: Arc::new(Semaphore::new(parallel)),
             client,
+            auth_token: auth.token,
+            auth_from_command: auth.from_command,
             last_error: StdMutex::new(None),
         })
+    }
+
+    /// The effective bearer token, or `None` when there is none. Empty is
+    /// treated as absent on purpose: sending a bare `Authorization: Bearer `
+    /// is worse than sending nothing — some servers reject it outright, and it
+    /// would break every existing unauthenticated setup.
+    pub fn auth_token(&self) -> Option<&str> {
+        if self.auth_token.is_empty() {
+            None
+        } else {
+            Some(&self.auth_token)
+        }
+    }
+
+    /// Attach the bearer token when there is one. Mirrors
+    /// [`RemoteBackend::with_auth`](super::remote::RemoteBackend), which has
+    /// carried the Remote half of this since V8-02.
+    fn with_auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.auth_token() {
+            Some(t) => rb.bearer_auth(t),
+            None => rb,
+        }
     }
 
     /// The last readiness failure reason (e.g. a non-llama.cpp server on the
@@ -375,11 +517,15 @@ impl LlamaServer {
     /// impostor on the port vs. down).
     async fn probe_health(&self) -> HealthProbe {
         let url = format!("{}/health", self.cmd.base_url());
-        let resp = match self.client.get(&url).send().await {
+        let resp = match self.with_auth(self.client.get(&url)).send().await {
             Ok(r) => r,
             Err(_) => return HealthProbe::Down,
         };
-        let is_2xx = resp.status().is_success();
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return HealthProbe::Unauthorized;
+        }
+        let is_2xx = status.is_success();
         let body = resp.text().await.unwrap_or_default();
         let llama_status = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -432,6 +578,11 @@ impl LlamaServer {
                 *self.last_error.lock().unwrap() = Some(self.not_llama_message());
                 false
             }
+            HealthProbe::Unauthorized => {
+                self.ready.store(false, Ordering::Relaxed);
+                *self.last_error.lock().unwrap() = Some(self.unauthorized_message());
+                false
+            }
             HealthProbe::Loading | HealthProbe::Down => {
                 self.ready.store(false, Ordering::Relaxed);
                 false
@@ -445,6 +596,34 @@ impl LlamaServer {
             "{} answered /health but is NOT a llama.cpp server. Another app is serving this port \
              (e.g. LM Studio / Ollama / vLLM). Free the port or point this Local backend at a real \
              llama-server — or add that server as a Remote backend instead.",
+            self.cmd.base_url()
+        )
+    }
+
+    /// The error shown when the server rejected cImp's credential. Names which
+    /// of the **three** states cImp is in, because the fix differs in each —
+    /// but never the token itself: this string reaches the Settings status row
+    /// and the logs.
+    ///
+    /// The third state is V33 stage 3's: a token inherited from `--api-key`
+    /// rather than typed into the Auth token field. That case has to say so, or
+    /// it sends the user to a blank field to compare against a value that is not
+    /// there — this is the surface that reports the backend's auth state, so it
+    /// is where the fallback has to be visible.
+    fn unauthorized_message(&self) -> String {
+        let half = if self.auth_from_command {
+            "cImp sent the `--api-key` from this backend's server command and it was rejected — \
+             either that flag's value no longer matches what the server enforces, or set this \
+             backend's Auth token explicitly to override it"
+        } else if self.auth_token().is_some() {
+            "cImp sent a bearer token and it was rejected — check that the backend's Auth token \
+             matches the server's `--api-key`"
+        } else {
+            "cImp sent no bearer token — set this backend's Auth token to the server's \
+             `--api-key`, or put `--api-key <token>` in its server command and cImp will use it"
+        };
+        format!(
+            "{} rejected the request as unauthorized. {half}.",
             self.cmd.base_url()
         )
     }
@@ -471,6 +650,14 @@ impl LlamaServer {
                     *self.last_error.lock().unwrap() = Some(msg.clone());
                     return Err(AppError::Offload(msg));
                 }
+                // Also a hard error: waiting cannot make a wrong credential
+                // right, and the timeout message would blame the wrong thing.
+                HealthProbe::Unauthorized => {
+                    self.ready.store(false, Ordering::Relaxed);
+                    let msg = self.unauthorized_message();
+                    *self.last_error.lock().unwrap() = Some(msg.clone());
+                    return Err(AppError::Offload(msg));
+                }
                 HealthProbe::Loading | HealthProbe::Down => {
                     self.ready.store(false, Ordering::Relaxed);
                     if Instant::now() >= deadline {
@@ -493,8 +680,7 @@ impl LlamaServer {
     pub async fn refresh_props(&self) -> AppResult<()> {
         let url = format!("{}/props", self.cmd.base_url());
         let resp = self
-            .client
-            .get(&url)
+            .with_auth(self.client.get(&url))
             .send()
             .await
             .map_err(|e| AppError::Offload(format!("/props request failed: {e}")))?;
@@ -654,6 +840,189 @@ mod tests {
         // 40000 * 80% = 32000.
         s.n_ctx.store(40_000, Ordering::Relaxed);
         assert_eq!(s.per_slot_budget(80), Some(32_000));
+    }
+
+    /// V33 Phase E. The Local backend's `/health` and `/props` probes carry
+    /// `Authorization: Bearer …` when a token is configured — and, just as
+    /// importantly, **carry no such header at all when one is not**. The whole
+    /// installed base is unauthenticated, and an empty bearer is a credential
+    /// some servers reject outright.
+    #[test]
+    fn probes_send_a_bearer_only_when_a_token_is_configured() {
+        let header_of = |token: &str| -> Option<String> {
+            let s = LlamaServer::with_config(
+                "local",
+                "llama-server --port 12344 --jinja",
+                token,
+                BackendTier::Quality,
+                ToolScope::All,
+            )
+            .expect("parses");
+            s.with_auth(s.client.get(format!("{}/health", s.cmd.base_url())))
+                .build()
+                .expect("a buildable request")
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .map(|v| v.to_str().expect("ascii").to_string())
+        };
+        assert_eq!(header_of(""), None, "no token ⇒ no header");
+        assert_eq!(header_of("sk-local"), Some("Bearer sk-local".to_string()));
+    }
+
+    /// A rejected credential must not read as "the server never came up", and
+    /// the message that says so must not quote the token — it lands in the
+    /// Settings status row and the rolling log.
+    #[test]
+    fn the_unauthorized_message_names_the_cause_without_leaking_the_token() {
+        let with = LlamaServer::with_config(
+            "local",
+            "llama-server --port 12344",
+            "sk-local-secret",
+            BackendTier::Quality,
+            ToolScope::All,
+        )
+        .expect("parses");
+        let msg = with.unauthorized_message();
+        assert!(!msg.contains("sk-local-secret"), "{msg}");
+        assert!(msg.contains("unauthorized"), "{msg}");
+        assert!(msg.contains("rejected"), "{msg}");
+
+        let without = LlamaServer::new("llama-server --port 12344").expect("parses");
+        let msg = without.unauthorized_message();
+        assert!(msg.contains("sent no bearer token"), "{msg}");
+
+        // V33 stage 3 — the third state. A token inherited from `--api-key`
+        // must NOT tell the user to check an Auth token field they left blank:
+        // this is the surface that reports the backend's auth state, so the
+        // fallback has to be visible in it.
+        let inherited = LlamaServer::new("llama-server --port 12344 --api-key sk-from-cmd")
+            .expect("parses");
+        let msg = inherited.unauthorized_message();
+        assert!(!msg.contains("sk-from-cmd"), "the token must not leak: {msg}");
+        assert!(msg.contains("server command"), "{msg}");
+        assert!(
+            !msg.contains("check that the backend's Auth token matches"),
+            "an inherited token must not send the user to a blank field: {msg}"
+        );
+    }
+
+    // ── V33 stage 3 — `auth_token` falls back to the parsed `--api-key` ──────
+
+    /// The three directions of the decision, at the resolver, in one place:
+    /// an explicit token wins, an empty one inherits, neither means no header.
+    /// Provenance is carried alongside, because the message the user reads
+    /// depends on it.
+    #[test]
+    fn an_empty_auth_token_inherits_the_commands_api_key() {
+        let cmd = "llama-server --port 12344 --api-key sk-from-cmd";
+
+        let explicit = resolve_local_auth("sk-configured", cmd);
+        assert_eq!(explicit.token, "sk-configured", "the field wins");
+        assert!(!explicit.from_command);
+
+        let inherited = resolve_local_auth("", cmd);
+        assert_eq!(inherited.token, "sk-from-cmd", "empty inherits");
+        assert!(inherited.from_command);
+
+        // Whitespace is not a credential — otherwise a stray space in the field
+        // would silently disable the fallback it was meant to leave alone.
+        let blank = resolve_local_auth("   ", cmd);
+        assert_eq!(blank.token, "sk-from-cmd");
+        assert!(blank.from_command);
+
+        let neither = resolve_local_auth("", "llama-server --port 12344");
+        assert!(neither.token.is_empty(), "neither ⇒ no header at all");
+        assert!(!neither.from_command);
+    }
+
+    /// The same three directions where they are actually observable: the
+    /// `Authorization` header the probes send.
+    #[test]
+    fn the_probe_header_follows_the_resolved_token() {
+        let header_of = |token: &str, cmd: &str| -> Option<String> {
+            let s = LlamaServer::with_config(
+                "local",
+                cmd,
+                token,
+                BackendTier::Quality,
+                ToolScope::All,
+            )
+            .expect("parses");
+            s.with_auth(s.client.get(format!("{}/health", s.cmd.base_url())))
+                .build()
+                .expect("a buildable request")
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .map(|v| v.to_str().expect("ascii").to_string())
+        };
+        let keyed = "llama-server --port 12344 --api-key sk-from-cmd";
+        assert_eq!(
+            header_of("sk-configured", keyed),
+            Some("Bearer sk-configured".to_string()),
+            "an explicit token must not be overridden by the command"
+        );
+        assert_eq!(
+            header_of("", keyed),
+            Some("Bearer sk-from-cmd".to_string()),
+            "an empty token inherits the command's --api-key"
+        );
+        assert_eq!(
+            header_of("", "llama-server --port 12344"),
+            None,
+            "neither ⇒ no Authorization header (an empty bearer is worse than none)"
+        );
+        // Every spelling and form the one parser accepts, since OpenCode's
+        // provider has always read them and the two must not diverge.
+        for form in [
+            "llama-server --port 12344 --api_key sk-from-cmd",
+            "llama-server --port 12344 --api-key=sk-from-cmd",
+            "llama-server --port 12344 --api-key sk-first --api-key sk-from-cmd",
+        ] {
+            assert_eq!(
+                header_of("", form),
+                Some("Bearer sk-from-cmd".to_string()),
+                "form not handled: {form}"
+            );
+        }
+    }
+
+    /// The extracted parser is the SAME one OpenCode's provider uses — that is
+    /// the point of extracting it. If these two ever disagree, offload and
+    /// OpenCode authenticate differently against one server, which is the exact
+    /// defect the fallback exists to remove.
+    #[test]
+    fn the_provider_and_the_backend_read_the_same_api_key() {
+        for cmd in [
+            "llama-server -a m --port 12344 --api-key sk-shared",
+            "llama-server -a m --port 12344 --api_key=sk-shared",
+            "llama-server -a m --port 12344",
+        ] {
+            let provider = derive_opencode_provider(cmd).expect("derives");
+            assert_eq!(
+                provider.api_key,
+                api_key_from_command(cmd),
+                "the two readers disagree for: {cmd}"
+            );
+            assert_eq!(
+                resolve_local_auth("", cmd).token,
+                provider.api_key,
+                "the backend's inherited token must equal OpenCode's: {cmd}"
+            );
+        }
+    }
+
+    /// `--api-key`'s value must not be mistaken for something else by the
+    /// provider's own walk now that its arm no longer consumes it explicitly.
+    /// A model path is the one that would actually break (a positional read of
+    /// the token as `-m`'s value), so it is the one pinned.
+    #[test]
+    fn the_api_key_value_is_not_read_as_another_flags_value() {
+        let p = derive_opencode_provider(
+            "llama-server --api-key /models/not-a-model.gguf --port 12344 -m /models/real.gguf",
+        )
+        .expect("derives");
+        assert_eq!(p.model, "real", "the key's value is not the model");
+        assert_eq!(p.api_key, "/models/not-a-model.gguf");
     }
 
     #[test]

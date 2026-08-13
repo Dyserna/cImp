@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -1006,6 +1006,14 @@ impl OffloadService {
         // so an offload from a session in repo A reads repo A — not the app's
         // own launch directory. `None` falls back to the app's cwd.
         session_cwd: Option<PathBuf>,
+        // V33 Phase F: the cImp TAB this offload was requested from, as the
+        // `/run` body asserted it. Used for ONE thing — attributing the
+        // pre-mutation checkpoint the worker takes before `run_command` — and
+        // deliberately not for routing, budgets or gating, all of which resolve
+        // the tab through `latch_scope` at the loopback instead. `None` (an
+        // older MCP child, a tab-less caller) records a checkpoint with no tab,
+        // which is the honest answer and the pre-V33 row.
+        tab: Option<&str>,
         // V21 F9: optional JSON Schema — when set, the worker's final-synthesis
         // turn is grammar-constrained to matching JSON (threaded to `run_on` →
         // `OffloadTask::schema`). `None` leaves the answer free-form.
@@ -1143,6 +1151,7 @@ impl OffloadService {
                 context.clone(),
                 thinking,
                 session_cwd.clone(),
+                tab,
                 schema.clone(),
                 profile,
                 overall_deadline,
@@ -1180,6 +1189,7 @@ impl OffloadService {
                             context.clone(),
                             thinking,
                             session_cwd.clone(),
+                            tab,
                             schema.clone(),
                             profile,
                             overall_deadline,
@@ -1221,6 +1231,7 @@ impl OffloadService {
                     context.clone(),
                     ThinkingMode::Auto,
                     session_cwd.clone(),
+                    tab,
                     schema.clone(),
                     profile,
                     retry_deadline,
@@ -1277,6 +1288,7 @@ impl OffloadService {
                         context.clone(),
                         thinking,
                         session_cwd.clone(),
+                        tab,
                         schema.clone(),
                         profile,
                         esc_deadline,
@@ -1458,6 +1470,9 @@ impl OffloadService {
         context: Option<String>,
         thinking: ThinkingMode,
         session_cwd: Option<PathBuf>,
+        // V33 Phase F: the requesting tab, for the pre-mutation checkpoint's
+        // attribution only. See [`Self::run`]'s parameter of the same name.
+        tab: Option<&str>,
         schema: Option<serde_json::Value>,
         // V32 Phase A: pre-applies the agent loop's taint latch (see
         // `agent::OffloadTask::profile`).
@@ -1482,12 +1497,30 @@ impl OffloadService {
         } else {
             snap.allowed_roots.clone()
         };
+        // V33 Phase F: this is the ONE in-app worker path, so it is the one
+        // that can reach `WorkbenchService` and take a pre-mutation checkpoint
+        // before `run_command` (the only routed tool with `mutates_fs: true`).
+        // The root is `cwd` — the CALLING session's directory when it forwarded
+        // one, which is the repo whose shadow repo must hold the rewind point,
+        // not the app's launch dir. `try_state` because the service is
+        // constructed unconditionally at startup but this code also runs in
+        // contexts (tests) where it is not registered; `None` there simply
+        // means "no checkpoint", never a failed tool call.
+        let checkpoint = self
+            .app
+            .try_state::<std::sync::Arc<crate::workbench::WorkbenchService>>()
+            .map(|w| tools::ToolCheckpoint {
+                root: cwd.clone(),
+                tab: tab.map(str::to_string),
+                workbench: w.inner().clone(),
+            });
         let ctx = ToolCtx::new(
             roots,
             snap.command_allowlist.clone(),
             snap.command_policies.clone(),
             &cwd,
-        );
+        )
+        .with_checkpoint(checkpoint);
         let mut native_defs = tools::enabled_defs(&snap.tools);
         // One settings snapshot for both feature gates below.
         let cur = self.settings.current();
@@ -1620,8 +1653,15 @@ impl OffloadService {
         let mut entries = Vec::with_capacity(backends.len());
         for b in &backends {
             match &b.kind {
-                OffloadBackendKind::Local { server_command, .. } => {
-                    if let Some(e) = self.resolve_local(b, server_command, lazy_start).await {
+                OffloadBackendKind::Local {
+                    server_command,
+                    auth_token,
+                    ..
+                } => {
+                    if let Some(e) = self
+                        .resolve_local(b, server_command, auth_token, lazy_start)
+                        .await
+                    {
                         entries.push(e);
                     }
                 }
@@ -1667,8 +1707,15 @@ impl OffloadService {
         &self,
         b: &OffloadBackend,
         server_command: &str,
+        auth_token: &str,
         lazy_start: bool,
     ) -> Option<PoolEntry> {
+        // V33 Phase E. Read from the LIVE config on every resolve, not from the
+        // handle: the supervisor's warm `LlamaServer` baked its probe token at
+        // start, and the chat call must use whatever the user has configured
+        // now. Empty ⇒ `None` ⇒ no `Authorization` header at all (an empty
+        // bearer is worse than none).
+        let chat_auth = (!auth_token.is_empty()).then(|| auth_token.to_string());
         if let Some(server) = self.supervisor.running_server(&b.name).await {
             // Refresh health/props on the warm handle. Checked before parsing
             // the configured command so a server launched via the Start
@@ -1682,7 +1729,7 @@ impl OffloadService {
             return Some(PoolEntry {
                 name: b.name.clone(),
                 base_url: server.base_url(),
-                auth_token: None,
+                auth_token: chat_auth,
                 cloud_blocked: false,
                 tier: b.tier,
                 tool_scope: b.tool_scope.clone(),
@@ -1723,9 +1770,15 @@ impl OffloadService {
         // name (reused while the base URL is unchanged) so its slot gate — and
         // thus `in_flight` — persists across calls; a fresh handle each time
         // would always report 0 in-flight and the router would never throttle.
+        //
+        // V33 Phase E: the reuse predicate also fingerprints the token, for the
+        // reason `resolve_remote` spells out — a rotated credential must force a
+        // rebuild, or the cached handle keeps probing with the stale one.
         let transient = {
             let mut pool = self.local_pool.lock().await;
-            let reuse = pool.get(&b.name).filter(|h| h.base_url() == base_url);
+            let reuse = pool.get(&b.name).filter(|h| {
+                h.base_url() == base_url && h.auth_token().unwrap_or("") == auth_token
+            });
             match reuse {
                 Some(h) => h.clone(),
                 None => {
@@ -1733,6 +1786,7 @@ impl OffloadService {
                         LlamaServer::with_config(
                             &b.name,
                             server_command,
+                            auth_token,
                             b.tier,
                             b.tool_scope.clone(),
                         )
@@ -1750,7 +1804,7 @@ impl OffloadService {
         Some(PoolEntry {
             name: b.name.clone(),
             base_url,
-            auth_token: None,
+            auth_token: chat_auth,
             cloud_blocked: false,
             tier: b.tier,
             tool_scope: b.tool_scope.clone(),
@@ -1951,6 +2005,14 @@ impl OffloadService {
     ) -> BackendDashboard {
         match &b.kind {
             OffloadBackendKind::Local { .. } => {
+                // V33 Phase E: the poller hits `/slots` + `/metrics` + `/props`
+                // on the SAME server the probes do, so it needs the same
+                // credential. It passed `None` before the Local backend had a
+                // token — leaving it would make the dashboard silently read
+                // "offline" on a keyed server that the router is happily using.
+                // V33 stage 3: resolved through `effective_auth_token`, so it
+                // inherits the `--api-key` fallback rather than re-deciding.
+                let auth_token = b.kind.effective_auth_token();
                 let (state, metrics) = match self.supervisor.running_server(&b.name).await {
                     Some(server) if server.is_ready() => {
                         let poller = pollers
@@ -1959,7 +2021,7 @@ impl OffloadService {
                         let m = poller
                             .poll(
                                 &server.base_url(),
-                                None,
+                                (!auth_token.is_empty()).then_some(auth_token.as_str()),
                                 server.slots(),
                                 server.n_ctx(),
                                 in_flight,
@@ -2239,6 +2301,7 @@ mod tests {
                 server_command: format!("llama-server --jinja -np {np}"),
                 autostart: false,
                 show_command_on_start: false,
+                auth_token: String::new(),
             },
             ..Default::default()
         }

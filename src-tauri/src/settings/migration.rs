@@ -316,6 +316,11 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
         detect: looks_v29,
         transform: migrate_v29_to_v30_step,
     },
+    MigrationStep {
+        from_version: "v30",
+        detect: looks_v30,
+        transform: migrate_v30_to_v31_step,
+    },
 ];
 
 // --- Uniform-signature wrappers -------------------------------------------
@@ -2396,10 +2401,54 @@ fn migrate_v29_to_v30(value: &mut Value) {
         }
     }
 
-    // Final cascade step ⇒ stamp CURRENT (30).
+    // Stamps a *literal* 30 (not `CURRENT_SCHEMA_VERSION`): the v30 → v31 step
+    // runs next in the same cascade pass and gates on `schema_version == 30`.
     root.insert(
         "schema_version".to_string(),
         Value::Number(serde_json::Number::from(30u8)),
+    );
+}
+
+fn looks_v30(value: &Value) -> bool {
+    value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|v| v == 30)
+}
+
+fn migrate_v30_to_v31_step(value: &mut Value, _shell: &ShellSpec) {
+    migrate_v30_to_v31(value)
+}
+
+/// V30 → V31: pure version stamp for the V33 Phase E LAN-auth fields.
+///
+/// V33 Phase E added three additive string fields, all defaulting to `""`:
+/// `graph.embedding_auth_token`, `offload.mcp_servers[].auth_token`, and
+/// `auth_token` on `OffloadBackendKind::Local`. Empty means "send no
+/// `Authorization` header", which is byte-for-byte the pre-V33 request, so an
+/// existing v30 file round-trips with every LAN client behaving exactly as
+/// before and **no data transform is needed** (see the schema tests
+/// `local_backend_kind_defaults_auth_token`,
+/// `mcp_server_config_defaults_and_redacts_auth_token`).
+///
+/// It is stamped anyway, following the v23 → v24 and v28 → v29 precedent for
+/// additive-only changes, and for one forward-looking reason of its own: this
+/// is the release after which a settings file may contain **cleartext bearer
+/// tokens for LAN services**. `docs/FUTURE-FEATURES-keyring.md` plans moving
+/// house secrets to the OS keychain; that migration needs a version boundary to
+/// gate on ("could this file carry one?"), and an un-versioned addition leaves
+/// it with nothing to test but the presence of the keys themselves.
+///
+/// Idempotent: a second pass finds `schema_version == 31` so `looks_v30` is
+/// false.
+fn migrate_v30_to_v31(value: &mut Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    // Final cascade step ⇒ stamp CURRENT (31).
+    root.insert(
+        "schema_version".to_string(),
+        Value::Number(serde_json::Number::from(31u8)),
     );
 }
 
@@ -3364,6 +3413,33 @@ mod tests {
         migrate_v29_to_v30(&mut v);
         assert_eq!(v, once);
         assert!(!looks_v29(&v));
+    }
+
+    /// V33 Phase E's step is a pure stamp: it must advance the marker and touch
+    /// **nothing else**. A v30 file's LAN endpoints keep whatever auth they had
+    /// (none), because the new fields default to `""` = no header.
+    #[test]
+    fn v30_to_v31_only_stamps_the_version() {
+        let mut v = json!({
+            "schema_version": 30,
+            "graph": { "embedding_endpoint": "http://172.21.1.11:12344" },
+            "offload": {
+                "backends": [{ "kind": { "type": "local", "server_command": "llama-server" } }],
+                "mcp_servers": [{ "name": "ddg", "url": "http://172.21.1.11:17201/mcp" }],
+            },
+        });
+        let before = v.clone();
+        migrate_v30_to_v31(&mut v);
+        assert_eq!(v["schema_version"], json!(31));
+        assert!(!looks_v30(&v));
+        // Everything but the marker is byte-identical.
+        let mut stripped = v.clone();
+        stripped["schema_version"] = json!(30);
+        assert_eq!(stripped, before);
+        // Idempotent.
+        let once = v.clone();
+        migrate_v30_to_v31(&mut v);
+        assert_eq!(v, once);
     }
 
     /// The cascade's last step must land exactly on `CURRENT_SCHEMA_VERSION` —

@@ -161,9 +161,14 @@ pub struct ClassRow {
     /// Whether this tool can change files on disk. Consumed by V33 Phase F
     /// (a tool-sourced checkpoint fires before any `mutates_fs` call), which is
     /// why it lives here: a future tool declares its class AND its mutation
-    /// capability in one reviewed place. Read only by [`mutates_fs`] and the
-    /// tests until that consumer lands.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// capability in one reviewed place.
+    ///
+    /// **V33 Phase F landed that consumer**, so the `allow(dead_code)` this
+    /// field carried through V32 is gone. It is read by
+    /// [`offload::tools::dispatch`](crate::offload::tools::dispatch) (the worker
+    /// seam) and by the loopback's `/workbench/tool_checkpoint` route, which
+    /// re-checks a harness-reported tool name against this table rather than
+    /// trusting the shim's own matcher.
     pub mutates_fs: bool,
     /// **#48, finding M-2 — whether a MODEL-SUPPLIED occurrence of this name
     /// reaches an executor.** `true` for every row a name-keyed native
@@ -194,7 +199,7 @@ const fn row(name: &'static str, class: ToolClass, mutates_fs: bool) -> ClassRow
 /// A row for a name that is classified but that **no name-keyed dispatcher
 /// serves** — the deliberate exceptions to "everything in this table is a tool
 /// you can call". Using this constructor is the reviewed act; see
-/// `classified_but_unrouted_rows_are_the_documented_six` for the membership
+/// `classified_but_unrouted_rows_are_the_documented_seven` for the membership
 /// rationale and the tripwire that checks each claim against the source.
 const fn unrouted(name: &'static str, class: ToolClass, mutates_fs: bool) -> ClassRow {
     ClassRow {
@@ -371,6 +376,13 @@ pub const TABLE: &[ClassRow] = &[
     unrouted("Edit", ToolClass::LocalCapability, true),
     unrouted("Write", ToolClass::LocalCapability, true),
     unrouted("Bash", ToolClass::LocalCapability, true),
+    // V33 Phase F. `MultiEdit` had no row at all, so [`mutates_fs`] answered
+    // `false` for it — while `tabs::config`'s PostToolUse auto-check matcher has
+    // named it (`"Edit|Write|MultiEdit"`) since V12, i.e. cImp already treats it
+    // as an edit everywhere except here. Without this row the Phase F
+    // pre-tool checkpoint route would refuse the one Claude tool that rewrites
+    // several files in a single call — the case a checkpoint is worth most.
+    unrouted("MultiEdit", ToolClass::LocalCapability, true),
 ];
 
 // ── V32 Phase H — OpenCode's OWN native tool names ─────────────────────────
@@ -401,22 +413,29 @@ pub const TABLE: &[ClassRow] = &[
 /// load-bearing: it *replaces* `edit`/`write` on OpenAI-provider models, so a
 /// list naming only `edit`/`write` would leave the whole mutation surface open
 /// on exactly those tabs.
-pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass)] = &[
+/// **V33 Phase F added the third element, `mutates_fs`** — the same axis
+/// [`ClassRow::mutates_fs`] carries in [`TABLE`], for the same consumer (the
+/// pre-tool checkpoint). It is a THIRD element rather than a second table
+/// because the class and the mutation capability of one name must be declared
+/// in one place; `read`/`glob`/`grep` are local capability without being
+/// mutations, and `bash` is both.
+pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
     // Local capability: private data + process execution + mutation.
-    ("bash", ToolClass::LocalCapability),
-    ("read", ToolClass::LocalCapability),
-    ("glob", ToolClass::LocalCapability),
-    ("grep", ToolClass::LocalCapability),
-    ("edit", ToolClass::LocalCapability),
-    ("write", ToolClass::LocalCapability),
+    ("bash", ToolClass::LocalCapability, true),
+    ("read", ToolClass::LocalCapability, false),
+    ("glob", ToolClass::LocalCapability, false),
+    ("grep", ToolClass::LocalCapability, false),
+    ("edit", ToolClass::LocalCapability, true),
+    ("write", ToolClass::LocalCapability, true),
     // Not in the 1.18.13 registry, but the plugin's own `CIMP_EDIT_TOOLS` has
     // carried it since V12 and the milestone's locked list names it. Gating a
     // name the harness does not serve costs nothing and closes it in advance.
-    ("patch", ToolClass::LocalCapability),
-    ("apply_patch", ToolClass::LocalCapability),
+    ("patch", ToolClass::LocalCapability, true),
+    ("apply_patch", ToolClass::LocalCapability, true),
     // The harness's own web tools — the EXTERNAL side of the same boundary.
-    ("webfetch", ToolClass::External),
-    ("websearch", ToolClass::External),
+    // Neither writes to the project tree, so neither checkpoints.
+    ("webfetch", ToolClass::External, false),
+    ("websearch", ToolClass::External, false),
     // Deliberately ABSENT, and each for a stated reason:
     // - `task` (sub-agent spawn): orchestration, not a capability of its own.
     //   The E2 spike confirmed a sub-agent's tool calls fire this same hook in
@@ -435,7 +454,7 @@ pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass)] = &[
 /// `None` (not `External`) for an unknown name is the whole difference from
 /// [`classify`] — see [`OPENCODE_NATIVE_TABLE`].
 ///
-/// Test-only today, like [`mutates_fs`]: production reads the table through
+/// Test-only today: production reads the table through
 /// [`opencode_native_names`], because the *lookup* happens in the generated
 /// plugin's JS rather than in Rust. It stays because the unknown-⇒-`None`
 /// contract is the whole reason this table is separate, and a contract with no
@@ -444,8 +463,8 @@ pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass)] = &[
 pub fn opencode_native_class(name: &str) -> Option<ToolClass> {
     OPENCODE_NATIVE_TABLE
         .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, c)| *c)
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, c, _)| *c)
 }
 
 /// Every OpenCode native name in one class, in table order — the input the
@@ -454,9 +473,43 @@ pub fn opencode_native_class(name: &str) -> Option<ToolClass> {
 pub fn opencode_native_names(class: ToolClass) -> Vec<&'static str> {
     OPENCODE_NATIVE_TABLE
         .iter()
-        .filter(|(_, c)| *c == class)
-        .map(|(n, _)| *n)
+        .filter(|(_, c, _)| *c == class)
+        .map(|(n, _, _)| *n)
         .collect()
+}
+
+/// V33 Phase F: every OpenCode native name that can change files on disk, in
+/// table order — the sibling of [`opencode_native_names`], baked into the
+/// generated plugin's `CIMP_MUTATING_TOOLS` set so the JS that decides whether
+/// to checkpoint reads the same reviewed table Rust does.
+///
+/// Cuts ACROSS the class axis rather than along it: `bash` is
+/// local-capability AND mutating, `read` is local-capability and not.
+pub fn opencode_native_mutating_names() -> Vec<&'static str> {
+    OPENCODE_NATIVE_TABLE
+        .iter()
+        .filter(|(_, _, m)| *m)
+        .map(|(n, _, _)| *n)
+        .collect()
+}
+
+/// V33 Phase F: whether an OpenCode native `name` can change files on disk.
+///
+/// **Unknown ⇒ `false`**, deliberately, and NOT for [`mutates_fs`]'s reason.
+/// There the default is a safety floor; here it is the same allowlist-only
+/// posture the rest of this table has — a name with no row is a name cImp makes
+/// no claim about, and minting a checkpoint for it would be inventing one.
+///
+/// The consumer is the loopback's `/workbench/tool_checkpoint` route, which
+/// must not read an OpenCode tool id (`edit`) through [`mutates_fs`]: that
+/// function answers for cImp's own vocabulary, where `edit` is an unknown name.
+/// Two vocabularies, two lookups — the drift this second table exists to
+/// prevent.
+pub fn opencode_native_mutates_fs(name: &str) -> bool {
+    OPENCODE_NATIVE_TABLE
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .is_some_and(|(_, _, m)| *m)
 }
 
 /// The class of `name`. **Unknown ⇒ [`ToolClass::External`]** — the locked
@@ -496,10 +549,17 @@ pub fn dispatchable(name: &str) -> bool {
 /// server's tools are outside our filesystem, and V33's checkpoint consumer
 /// must not checkpoint on every web fetch.
 ///
-/// Its consumer is V33 Phase F (tool-sourced checkpoints), which is a separate
-/// milestone — the attribute is defined and tested here now so that the class
-/// table stays the one place a new tool declares both facts, per the V32 spec.
-#[cfg_attr(not(test), allow(dead_code))]
+/// **V33 Phase F is that consumer, and it has landed.** Two call sites read it:
+/// [`offload::tools::dispatch`](crate::offload::tools::dispatch), which
+/// checkpoints before routing a mutating native tool, and the loopback's
+/// `/workbench/tool_checkpoint` route, which re-checks the tool name a Claude
+/// `PreToolUse` shim reported. The shim's `Edit|Write|MultiEdit|Bash` matcher is
+/// a cheap pre-filter on the harness's side; THIS table is the authority, so a
+/// forged or drifted POST cannot mint a checkpoint for a name cImp does not
+/// classify as mutating.
+///
+/// **Claude's vocabulary only.** OpenCode's native ids are a separate namespace
+/// with a separate table — see [`opencode_native_mutates_fs`].
 pub fn mutates_fs(name: &str) -> bool {
     TABLE
         .iter()
@@ -1198,9 +1258,16 @@ mod tests {
         }
         // `mutates_fs`: true only for `run_command` and the harness natives.
         assert!(mutates_fs("run_command"));
-        for n in ["Edit", "Write", "Bash"] {
+        for n in ["Edit", "Write", "MultiEdit", "Bash"] {
             assert!(mutates_fs(n), "{n}");
         }
+        // V33 Phase F: OpenCode's ids are a SECOND vocabulary. `edit` mutates
+        // there and is unknown here, and the two lookups must not be crossed —
+        // reading an OpenCode id through `mutates_fs` would silently answer
+        // "does not mutate" for the whole OpenCode surface.
+        assert!(!mutates_fs("edit"));
+        assert!(opencode_native_mutates_fs("edit"));
+        assert!(!opencode_native_mutates_fs("Edit"));
         for n in ["read_file", "code_search", "graph_snippet", "ddg__search"] {
             assert!(!mutates_fs(n), "{n}");
         }
@@ -1673,6 +1740,38 @@ mod tests {
         assert!(!web.iter().any(|n| local.contains(n)));
     }
 
+    /// **V33 Phase F**: the mutation axis of the OpenCode table cuts ACROSS the
+    /// class axis, and the checkpoint set must be exactly the mutating half —
+    /// not "everything local", which would checkpoint before every `read`/
+    /// `grep`, and not "edit/write", which the E2 spike already showed is
+    /// incomplete (the model routes a blocked write through `bash`, and
+    /// `apply_patch` replaces edit/write on OpenAI-provider models).
+    #[test]
+    fn the_opencode_mutating_set_is_the_write_surface_not_the_local_one() {
+        let mutating = opencode_native_mutating_names();
+        assert_eq!(
+            mutating,
+            vec!["bash", "edit", "write", "patch", "apply_patch"],
+            "the pre-tool checkpoint set changed — every member is a name that \
+             can rewrite the project tree, and every non-member is one that cannot"
+        );
+        // Reads are local capability and do NOT mutate: the two axes are
+        // independent, which is the whole reason `mutates_fs` is a column of
+        // its own rather than being inferred from the class.
+        for n in ["read", "glob", "grep"] {
+            assert_eq!(
+                opencode_native_class(n),
+                Some(ToolClass::LocalCapability),
+                "{n}"
+            );
+            assert!(!opencode_native_mutates_fs(n), "{n} must not checkpoint");
+        }
+        // Neither web tool writes to the tree.
+        for n in opencode_native_names(ToolClass::External) {
+            assert!(!opencode_native_mutating_names().contains(&n), "{n}");
+        }
+    }
+
     /// The reason this is a SECOND table: `classify`'s unknown-⇒-EXTERNAL
     /// invariant is right for cImp's routed vocabulary and wrong for a harness
     /// registry, where an unlisted name must be UNGATED.
@@ -1687,9 +1786,13 @@ mod tests {
             assert_eq!(classify(n), ToolClass::External, "{n}");
         }
         assert_eq!(opencode_native_class("some_future_tool"), None);
+        // …and the mutation axis obeys the same allowlist-only rule: an
+        // unlisted name is not "safe by default", it is simply not claimed.
+        assert!(!opencode_native_mutates_fs("some_future_tool"));
+        assert!(!opencode_native_mutates_fs("task"));
         // The two tables share no rows: `TABLE`'s harness natives are Claude's
         // capitalized names, kept there for V33's `mutates_fs` consumer.
-        for (name, _) in OPENCODE_NATIVE_TABLE {
+        for (name, _, _) in OPENCODE_NATIVE_TABLE {
             assert!(
                 !TABLE.iter().any(|r| r.name == *name),
                 "{name} is in both tables — one lookup, two vocabularies"
@@ -2067,7 +2170,7 @@ mod tests {
     /// reviewed act, and swapping one for another keeps the count but changes
     /// the meaning.
     #[test]
-    fn classified_but_unrouted_rows_are_the_documented_six() {
+    fn classified_but_unrouted_rows_are_the_documented_seven() {
         let unrouted: Vec<&str> = TABLE
             .iter()
             .filter(|r| !r.dispatchable)
@@ -2089,6 +2192,10 @@ mod tests {
                 "Edit",
                 "Write",
                 "Bash",
+                // V33 Phase F added `MultiEdit` on the same footing: the
+                // PostToolUse matcher has named it since V12, and without a row
+                // it answered `mutates_fs == false`.
+                "MultiEdit",
             ],
             "the classified-but-unroutable set changed — each member needs a stated reason \
              (see the rows' own comments), because `unrouted` is what tells the gate not to \
@@ -2097,7 +2204,7 @@ mod tests {
         // Every one of them really is absent from the dispatch surface. This is
         // implied by `table_matches_the_native_dispatch_surface`, and it is
         // asserted separately because that test compares whole sets: naming
-        // these six is what stops a future edit "fixing" a drift by flipping
+        // these seven is what stops a future edit "fixing" a drift by flipping
         // the wrong row's flag.
         let served = served_names();
         for name in &unrouted {

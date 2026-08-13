@@ -151,6 +151,17 @@ mod tests {
         let file_name = candidate_names("demo-tool").remove(0);
         let file = dir.join(&file_name);
         std::fs::write(&file, b"x").unwrap();
+        // …and on Unix it has to be RUNNABLE, not merely present: `fs::write`
+        // creates 0666&~umask, and `is_runnable` (correctly) rejects a bundled
+        // file with no `+x` bit, so without this the lookup below returns
+        // `None` on Linux while passing on Windows. The neighbouring
+        // `non_executable_ebin_file_is_skipped` is the test that owns the
+        // no-`+x` case; this one is about finding the binary at all.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let dirs = vec![dir.clone()];
         assert_eq!(lookup_in_dirs(&dirs, "demo-tool"), Some(file));

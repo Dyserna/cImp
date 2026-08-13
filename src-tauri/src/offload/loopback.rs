@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,7 +71,11 @@ const DISCOVERY_DIR: &str = ".cimp-discovery";
 /// connect returns in microseconds, so this budget is only ever spent against
 /// something that is listening and not answering — which, per the accepted case
 /// against decision 30, means an attacker who has already paid for a listener.
-const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+///
+/// `pub(crate)` since the 2026-08-13 amendment: it is part of the wall-clock a
+/// `PreToolUse` hook can spend, and `checkpoint_beacon` now asserts the whole
+/// worst case against the harness's hook ceiling.
+pub(crate) const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// How many candidates one resolution will probe, across all three preference
 /// steps ([`select_verified`]).
@@ -87,7 +91,9 @@ const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 /// entry already wins and the child goes headless — and headless is governed by
 /// M-8's `--tab` rule, which does not consult the reason. Enforced by
 /// `tests::a_resolution_never_probes_more_than_its_budget`.
-const MAX_DISCOVERY_PROBES: usize = 6;
+///
+/// `pub(crate)` for the same reason as [`DISCOVERY_PROBE_TIMEOUT`].
+pub(crate) const MAX_DISCOVERY_PROBES: usize = 6;
 
 /// The discovery file the child reads to find + authenticate to the app.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1159,6 +1165,7 @@ async fn handle_conn(
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
         ("POST", "/audit/run") => handle_audit_run(&mut stream, &app, &req).await,
         ("POST", "/context/retrieve") => handle_context_retrieve(&mut stream, &app, &req).await,
+        ("POST", "/workbench/tool_checkpoint") => handle_tool_checkpoint(&mut stream, &app, &req).await,
         ("POST", "/context/compaction") => handle_context_compaction(&mut stream, &app, &req).await,
         ("POST", "/context/should_read") => handle_should_read(&mut stream, &app, &req).await,
         ("POST", "/context/post_edit") => handle_post_edit(&mut stream, &app, &req).await,
@@ -1319,6 +1326,22 @@ async fn handle_run(
     }
 
     let session_cwd = body.cwd.map(std::path::PathBuf::from);
+    // V33 Phase F: the requesting tab, for the pre-mutation checkpoint the
+    // worker takes before `run_command`. Read BEFORE the `service.run` call
+    // below, which consumes the rest of `body`, and narrowed through the SAME
+    // `tab_identity` funnel `/context/retrieve`'s prompt-tap checkpoint uses
+    // (V33 C5) — an id naming no configured tab of this consumer is a forged or
+    // stale claim, and a checkpoint is the one record that exists to be trusted
+    // after an incident, so it degrades to "cannot attribute" rather than to
+    // "some other tab".
+    let checkpoint_tab = match tab_identity(
+        &settings,
+        crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude")),
+        body.tab.as_deref(),
+    ) {
+        TabIdentity::Configured(t) => Some(t.to_string()),
+        TabIdentity::Anonymous | TabIdentity::Unknown(_) => None,
+    };
 
     // Cancellation: trip the token if the calling client disconnects while the
     // task runs, so the in-flight chat stream is dropped and llama-server frees
@@ -1333,6 +1356,7 @@ async fn handle_run(
         thinking,
         tier,
         session_cwd,
+        checkpoint_tab.as_deref(),
         body.schema,
         profile,
         cancel.clone(),
@@ -1526,7 +1550,8 @@ impl LatchScope {
     }
 }
 
-/// Whether `tab` names an AI tab the **user has configured** (#45).
+/// Whether `tab` names an AI tab the **user has configured for `agent`** (#45;
+/// consumer-scoped by V33 C5, finding F-4).
 ///
 /// This is the predicate that makes [`latches`]' "bounded by construction"
 /// claim true rather than aspirational. Every registry entry is keyed on a
@@ -1535,29 +1560,58 @@ impl LatchScope {
 /// serialized into every `/status` response and every 4 s `latch_status` poll.
 /// With it, the key space is a subset of the user's own tab list.
 ///
-/// **The check is deliberately "is this a configured tab id", NOT "is this the
-/// tab that owns this connection".** The stricter form would break legitimate
-/// beacons today: the OpenCode plugin is written to
-/// `<working_dir>/.opencode/plugin/cimp-inject.js` — one file per *directory*,
-/// not per tab — so the tab id baked into it may belong to a different tab
-/// sharing the same working dir (the review's unfixed H-2). Whoever fixes H-2
-/// may tighten this; until then, binding a beacon to its connection would
-/// reject real beacons from real tabs.
+/// **V33 C5 — the pair, not the halves.** Until V33 this asked only "is this
+/// *some* configured AI tab id", while every registry key is the PAIR
+/// `(agent, tab)` ([`LatchScope::key`]) and `agent` is caller-asserted on every
+/// route that has one. A caller could therefore key a latch under
+/// `("claude", <an OpenCode tab's id>)` and the pair was verified on no route in
+/// the system. It is now verified here, at the one funnel
+/// ([`latch_scope`]) every entry-creating path resolves through: the id must
+/// name a configured tab **of the asserted consumer**, classified by
+/// [`crate::tabs::tab_consumer`] — the same call the launch path makes when it
+/// decides what to inject into that tab, so the two ends cannot drift.
+///
+/// **Not a live exploit today, a restored invariant.** The V32 review rated the
+/// cross-keyed case harmless on the routes that exist: a latch keyed under the
+/// wrong agent is freshly open, engages a scope nobody reads, and refuses
+/// nothing. What it bought was a registry key space twice the size of the tab
+/// list and a `(consumer, tab)` pair no route checked.
+///
+/// **The check is still "is this a configured tab id of this consumer", NOT "is
+/// this the tab that owns this connection".** The stricter form would break
+/// legitimate beacons today: the OpenCode plugin file is written per *directory*
+/// (one file per tab since #48's H-2 fix, but every tab in a directory still
+/// loads every file), so the tab id baked into it may belong to a different tab
+/// sharing the same working dir. Whoever fixes H-2's remainder may tighten this;
+/// until then, binding a beacon to its connection would reject real beacons from
+/// real tabs.
 ///
 /// **`AiTool` tabs only.** Shell and Preview tabs host no harness, so nothing
 /// legitimate can beacon or gate as one.
 ///
-/// **The empty-list escape.** With no AI tab configured the predicate accepts
-/// everything, because [`live_settings`] falls back to `Settings::default()`
-/// (whose `tabs` is empty) when managed state is not up yet — and a request
-/// arriving in that window must not be rejected on the strength of a list we
-/// could not read. It is an availability floor, not a hole: it costs nothing
-/// an attacker did not already have, and it lapses the moment settings load.
-fn is_configured_tab(settings: &crate::settings::Settings, tab: &str) -> bool {
-    names_a_configured_ai_tab(settings, tab) || ai_tab_ids(settings).next().is_none()
+/// **The empty-list escape**, and why it is keyed on the WHOLE list rather than
+/// on this consumer's slice. With no AI tab configured at all the predicate
+/// accepts everything, because [`live_settings`] falls back to
+/// `Settings::default()` (whose `tabs` is empty) when managed state is not up
+/// yet — and a request arriving in that window must not be rejected on the
+/// strength of a list we could not read. That condition is "settings are
+/// unreadable", which is global; narrowing the *floor* to "this consumer has no
+/// tabs" would have widened it instead, handing every forged id a scope on any
+/// install that runs only Claude tabs or only OpenCode ones — i.e. re-opening
+/// exactly the unbounded key space #45 closed. So the floor keeps its original
+/// trigger and only the positive test is consumer-scoped, which makes this
+/// change a strict tightening of the admitted set.
+fn is_configured_tab(settings: &crate::settings::Settings, agent: &'static str, tab: &str) -> bool {
+    names_a_configured_ai_tab_for(settings, agent, tab) || ai_tab_ids(settings).next().is_none()
 }
 
-/// Every configured AI tab's id, in settings order.
+/// Every configured AI tab's id, in settings order — **every consumer's**.
+///
+/// Two callers, and neither is the latch: [`names_a_configured_ai_tab`] (a
+/// collision check across the whole id space) and [`is_configured_tab`]'s
+/// availability floor (whose condition is "settings are unreadable", not
+/// "this consumer has no tabs"). Identity checks use
+/// [`ai_tab_ids_for`] instead.
 fn ai_tab_ids(settings: &crate::settings::Settings) -> impl Iterator<Item = &str> {
     settings.tabs.iter().filter_map(|t| match t {
         crate::settings::TabConfig::AiTool(c) => Some(c.id.as_str()),
@@ -1565,21 +1619,55 @@ fn ai_tab_ids(settings: &crate::settings::Settings) -> impl Iterator<Item = &str
     })
 }
 
-/// Whether `id` **exactly** names a configured AI tab — [`is_configured_tab`]
-/// without its empty-list escape.
+/// Every configured AI tab id belonging to `agent` (`"claude"` / `"opencode"`),
+/// in settings order — V33 C5's key space.
+fn ai_tab_ids_for<'a>(
+    settings: &'a crate::settings::Settings,
+    agent: &'static str,
+) -> impl Iterator<Item = &'a str> {
+    settings.tabs.iter().filter_map(move |t| match t {
+        crate::settings::TabConfig::AiTool(c) if crate::tabs::tab_consumer(c) == agent => {
+            Some(c.id.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// Whether `id` exactly names a configured AI tab **of `agent`** —
+/// [`is_configured_tab`] without its availability floor.
+fn names_a_configured_ai_tab_for(
+    settings: &crate::settings::Settings,
+    agent: &'static str,
+    id: &str,
+) -> bool {
+    ai_tab_ids_for(settings, agent).any(|t| t == id)
+}
+
+/// Whether `id` **exactly** names a configured AI tab of ANY consumer —
+/// [`is_configured_tab`] without its availability floor and without its
+/// consumer scope.
 ///
-/// The escape is an availability floor for the *latch* (a gate that rejects
+/// The floor is an availability floor for the *latch* (a gate that rejects
 /// every id before settings load would refuse real tool calls). It is the wrong
 /// polarity for a caller that must be REFUSED for naming a tab, where "no tabs
 /// configured yet" must mean "this string collides with nothing" — so that
 /// caller gets this predicate instead of a negated one. See
 /// [`mark_live_session_from_event`], its only consumer.
+///
+/// V33 C5 left the consumer scope off this one deliberately, for the same
+/// polarity reason: it asks "does this session id collide with a TAB id", and a
+/// collision is a collision whichever consumer owns the tab. Narrowing it to one
+/// consumer would let an OpenCode session id equal to a Claude tab id through.
 fn names_a_configured_ai_tab(settings: &crate::settings::Settings, id: &str) -> bool {
     ai_tab_ids(settings).any(|t| t == id)
 }
 
-/// Which of three cases a request body's `tab` falls into, decided **without**
-/// the `AppHandle` [`latch_scope`]'s session lookup needs.
+/// Which of three cases a request body's `(agent, tab)` falls into, decided
+/// **without** the `AppHandle` [`latch_scope`]'s session lookup needs.
+///
+/// V33 C5: `agent` is part of the question, not context carried alongside it —
+/// `Configured` now means "a tab of THIS consumer", which is what the registry
+/// key `(agent, tab)` has always asserted and nothing checked.
 ///
 /// Split out (#48) for two reasons. It is the enforcement point for the
 /// registry bound, and a bound asserted by calling [`is_configured_tab`] beside
@@ -1601,11 +1689,15 @@ enum TabIdentity<'a> {
     Configured(&'a str),
 }
 
-fn tab_identity<'a>(settings: &crate::settings::Settings, tab: Option<&'a str>) -> TabIdentity<'a> {
+fn tab_identity<'a>(
+    settings: &crate::settings::Settings,
+    agent: &'static str,
+    tab: Option<&'a str>,
+) -> TabIdentity<'a> {
     let Some(tab) = tab.map(str::trim).filter(|t| !t.is_empty()) else {
         return TabIdentity::Anonymous;
     };
-    if is_configured_tab(settings, tab) {
+    if is_configured_tab(settings, agent, tab) {
         TabIdentity::Configured(tab)
     } else {
         TabIdentity::Unknown(tab)
@@ -1622,8 +1714,9 @@ fn tab_identity<'a>(settings: &crate::settings::Settings, tab: Option<&'a str>) 
 /// would then latch every consumer at once. Such calls still get the
 /// spotlighting envelope on EXTERNAL results, which needs no identity.
 ///
-/// #45 widened "no identity" to include **an id that is not a configured tab**
-/// ([`is_configured_tab`]). This is the single funnel every entry-creating path
+/// #45 widened "no identity" to include **an id that is not a configured tab**,
+/// and V33 C5 widened it again to **an id that is not a configured tab of the
+/// asserted consumer** ([`is_configured_tab`]). This is the single funnel every entry-creating path
 /// resolves through — `/graph_run` and `/mcp/call` via `gate`, `/latch/beacon`
 /// via `beacon` — so validating here is what bounds the registry, rather than
 /// three route-local checks that can drift apart. An unknown id creates no row
@@ -1644,7 +1737,7 @@ fn latch_scope(
     agent: &'static str,
     tab: Option<&str>,
 ) -> LatchScoping {
-    match tab_identity(settings, tab) {
+    match tab_identity(settings, agent, tab) {
         TabIdentity::Anonymous => LatchScoping::Anonymous,
         TabIdentity::Unknown(tab) => LatchScoping::Unknown(tab.to_string()),
         TabIdentity::Configured(tab) => {
@@ -4025,7 +4118,8 @@ impl LatchStatus {
     ///
     /// Read by the tests (and by anyone holding a snapshot); the wire form goes
     /// through `view`'s flattened `latch` key, so the running app never calls
-    /// this — same `cfg_attr` shape as `toolclass::mutates_fs`.
+    /// this — the same `cfg_attr` shape `toolclass::mutates_fs` carried until
+    /// V33 Phase F landed its consumer and removed it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn latch(&self) -> &'static str {
         self.view.latch
@@ -5031,11 +5125,37 @@ fn checkpoint_origin(
     settings: &crate::settings::Settings,
     body: &ContextRetrieveBody,
 ) -> crate::workbench::shadow::Origin {
-    let tab = match tab_identity(settings, body.tab.as_deref()) {
+    checkpoint_identity(
+        settings,
+        body.agent.as_deref(),
+        body.session_id.as_deref(),
+        body.tab.as_deref(),
+    )
+}
+
+/// The narrowing itself, shared by the prompt-tap trigger above and V33 Phase
+/// F's pre-tool trigger ([`handle_tool_checkpoint`]) — ONE spelling, so the two
+/// checkpoint writers cannot come to disagree about which `tab` claims are
+/// believed.
+fn checkpoint_identity(
+    settings: &crate::settings::Settings,
+    agent: Option<&str>,
+    session_id: Option<&str>,
+    tab: Option<&str>,
+) -> crate::workbench::shadow::Origin {
+    // V33 C5: the id is checked against the tabs of the consumer the body
+    // asserts, normalised through the same `hook_agent` funnel the gated hook
+    // routes use — a `tab` that names another harness's tab is a forged or
+    // stale claim exactly as an invented one is, and lands in the same place.
+    let tab = match tab_identity(settings, hook_agent(agent), tab) {
         TabIdentity::Configured(tab) => Some(tab.to_string()),
         TabIdentity::Anonymous | TabIdentity::Unknown(_) => None,
     };
-    crate::workbench::shadow::Origin::new(body.agent.clone(), body.session_id.clone(), tab)
+    crate::workbench::shadow::Origin::new(
+        agent.map(str::to_string),
+        session_id.map(str::to_string),
+        tab,
+    )
 }
 
 /// `POST /context/retrieve`: rank files for the prompt and return the injectable
@@ -5132,6 +5252,245 @@ async fn handle_context_retrieve(
         stream,
         200,
         &serde_json::json!({ "ok": true, "text": text, "files": r.files_used, "tokens_est": tokens_est }),
+    )
+    .await
+}
+
+/// A `POST /workbench/tool_checkpoint` request body — V33 Phase F's two
+/// out-of-process fire seams: the Claude `PreToolUse` shim
+/// (`crate::checkpoint_beacon`) and the OpenCode `tool.execute.before` plugin
+/// hook. The worker seam does NOT come through here; it calls
+/// `WorkbenchService::on_tool` directly (`offload::tools::dispatch`).
+#[derive(Deserialize)]
+struct ToolCheckpointBody {
+    /// The calling session's working directory — the project root the shadow
+    /// repo lives under. Defaults to `.` like every other hook route.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Which harness is calling: `"claude"` / `"opencode"`. Normalised through
+    /// [`hook_agent`], and it selects WHICH tool vocabulary the name below is
+    /// checked against — the two namespaces are disjoint and must not be
+    /// crossed.
+    #[serde(default)]
+    agent: Option<String>,
+    /// The cImp TAB, baked into the hook command / the plugin file at spawn.
+    /// Narrowed through [`checkpoint_identity`]; an unrecognised id degrades to
+    /// "no tab", never to another tab.
+    #[serde(default)]
+    tab: Option<String>,
+    /// The harness's own session id, recorded as sent.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// The tool about to run, in the CALLER's vocabulary (`Bash`, `edit`).
+    /// Required — a checkpoint with no tool name is not a Phase F checkpoint.
+    #[serde(default)]
+    tool: Option<String>,
+}
+
+/// **The pre-tool checkpoint budget** (2026-08-13 amendment, locked): how long
+/// [`handle_tool_checkpoint`] lets a snapshot run before it abandons it
+/// unwritten.
+///
+/// Deliberately **below** the ~2 s both out-of-process callers wait — the Claude
+/// shim's [`checkpoint_beacon::REPLY_TIMEOUT`](crate::checkpoint_beacon) and the
+/// OpenCode plugin's `AbortSignal.timeout(2000)`. The ordering is the whole
+/// point: the harness starts the tool the instant its hook stops waiting, so if
+/// the caller's timer fired first the app would still be staging *into* the tool
+/// call while believing it had a valid pre-tool checkpoint. Keeping the app's
+/// budget under the caller's makes the app's own answer the one that decides,
+/// and leaves ~200 ms for the reply to be written and read.
+///
+/// Not a per-call latency budget for the *user*: the throttle means most calls
+/// never reach a snapshot at all, and this bound is only reached by a
+/// `git add -A` over a work tree big enough to take seconds.
+/// `pub(crate)` so `checkpoint_beacon`'s
+/// `the_shim_waits_longer_than_the_app_takes_to_give_up` can assert the ordering
+/// against the shim's own timeout. The two constants live in different files and
+/// nothing else keeps them in the right order.
+pub(crate) const TOOL_CHECKPOINT_BUDGET: Duration = Duration::from_millis(1800);
+
+/// V33 Phase F: does `tool` change files on disk, **in `harness`'s own tool
+/// vocabulary**?
+///
+/// Split out of [`handle_tool_checkpoint`] so the namespace selection is
+/// exercised by a test rather than re-implemented in one — a test that owned its
+/// own copy of this `match` would stay green after the handler stopped calling
+/// it. `harness` has already been normalised through [`hook_agent`], so it is
+/// one of the two-word vocabulary and the `_` arm is Claude's.
+fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
+    match harness {
+        "opencode" => crate::offload::toolclass::opencode_native_mutates_fs(tool),
+        _ => crate::offload::toolclass::mutates_fs(tool),
+    }
+}
+
+/// `POST /workbench/tool_checkpoint` (V33 Phase F): take a Workbench checkpoint
+/// **immediately before** a filesystem-mutating tool call, attributed to that
+/// exact call.
+///
+/// # Why the tool name is re-checked here
+///
+/// Both callers pre-filter — Claude's hook is installed with an
+/// `Edit|Write|MultiEdit|Bash` matcher, the plugin consults a baked
+/// `CIMP_MUTATING_TOOLS` set — but neither is the authority. This route resolves
+/// the name against `toolclass`'s reviewed tables, per harness:
+/// [`mutates_fs`](crate::offload::toolclass::mutates_fs) for Claude's
+/// capitalized vocabulary,
+/// [`opencode_native_mutates_fs`](crate::offload::toolclass::opencode_native_mutates_fs)
+/// for OpenCode's. A drifted matcher, a shim from a newer build, or a forged
+/// POST from any local process therefore cannot mint a checkpoint for a tool
+/// cImp does not classify as mutating.
+///
+/// **Crossing the two vocabularies would be silent, not loud**: `mutates_fs`
+/// answers `false` for `edit` (an unknown name in cImp's own table), so reading
+/// OpenCode's ids through it would disable the whole OpenCode seam while every
+/// test that only exercised Claude stayed green.
+///
+/// # Containment posture
+///
+/// Behind the same bearer token as every other route, and **it takes no taint
+/// gate** — deliberately. A checkpoint is a `git add -A` + `commit-tree` into
+/// cImp's OWN shadow repo; it returns no project data to the caller (the reply
+/// is `{ok, checkpointed}`, two booleans) and grants no capability, so there is
+/// nothing for a latch to refuse. The abuse case for a forged POST is a spurious
+/// snapshot, which the per-`(root, tab)` min-gap throttle and the tree-sha dedup
+/// both bound — and which, unlike a refusal, costs the user nothing they wanted.
+/// Gating it would instead mean that a tab which had touched external content
+/// stopped getting checkpoints exactly when they matter most.
+///
+/// # The pre-tool budget (2026-08-13 amendment, locked)
+///
+/// **Both callers of this route stop waiting after ~2 s** — the Claude shim on
+/// its reply-read timeout, the OpenCode plugin on its `AbortSignal.timeout(2000)`
+/// — and the harness runs the tool the moment they do. A snapshot still staging
+/// past that point is racing the very edit it exists to precede, so this route
+/// hands [`WorkbenchService::on_tool`](crate::workbench::WorkbenchService::on_tool)
+/// a deadline of [`TOOL_CHECKPOINT_BUDGET`] and the snapshot writes **nothing**
+/// once it is spent. The alternative — let the caller give up and let the app
+/// commit the row anyway — is the failure this amendment exists to close: a
+/// checkpoint that sometimes contains the change it claims to predate silently
+/// misleads a restore, which is strictly worse than having none.
+///
+/// The budget is deliberately *under* the callers' 2 s so the app's own answer
+/// is what decides, rather than whichever timer happens to fire first.
+///
+/// The worker seam does not come through here and gets no deadline: it is
+/// in-process and waits as long as the snapshot takes.
+///
+/// # The reply, and what it is not
+///
+/// `{ "ok": true, "checkpointed": <bool> }`. `checkpointed` deliberately does
+/// not return a checkpoint id, because on a dedup hit the id would name another
+/// trigger's (possibly another tab's) checkpoint and no caller may claim it (see
+/// [`shadow::SnapshotOutcome`](crate::workbench::shadow::SnapshotOutcome)).
+///
+/// It means *"the trigger settled — nothing about this call is unaccounted
+/// for"*: true for a checkpoint created, for a dedup hit, and for a throttled
+/// call (whose tab already has a checkpoint newer than `checkpoint_min_gap_s`).
+/// **False now also covers the one new case: the snapshot was abandoned against
+/// the budget above**, i.e. exactly when no checkpoint can be said to precede
+/// this call. Neither caller gates anything on it — the Claude shim reads it
+/// only to make its wait mean something, the OpenCode plugin awaits it for the
+/// ordering — so the user-facing report of a miss is the Activity row
+/// `workbench` / `checkpoint_missed`, not this boolean.
+async fn handle_tool_checkpoint(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: ToolCheckpointBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json(
+                stream,
+                400,
+                &serde_json::json!({ "ok": false, "error": format!("bad request body: {e}") }),
+            )
+            .await;
+        }
+    };
+    let Some(tool) = body
+        .tool
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return write_json(
+            stream,
+            400,
+            &serde_json::json!({ "ok": false, "error": "missing `tool`" }),
+        )
+        .await;
+    };
+    let harness = hook_agent(body.agent.as_deref());
+    if !tool_checkpoint_is_mutating(harness, tool) {
+        // 200, not 400: a caller whose matcher is wider than the table is not
+        // malformed, it is over-reporting, and a fail-open sensor must never
+        // learn to treat that as an error. `checkpointed: false` is the whole
+        // answer. No log line either — this is reachable once per non-mutating
+        // matched call and would be unbounded chatter.
+        return write_json(
+            stream,
+            200,
+            &serde_json::json!({ "ok": true, "checkpointed": false }),
+        )
+        .await;
+    }
+
+    let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() else {
+        return write_json(
+            stream,
+            200,
+            &serde_json::json!({ "ok": true, "checkpointed": false }),
+        )
+        .await;
+    };
+    let workbench = workbench.inner().clone();
+    if !workbench.checkpoints_enabled() {
+        return write_json(
+            stream,
+            200,
+            &serde_json::json!({ "ok": true, "checkpointed": false }),
+        )
+        .await;
+    }
+    let root = body
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let origin = checkpoint_identity(
+        &live_settings(app),
+        body.agent.as_deref(),
+        body.session_id.as_deref(),
+        body.tab.as_deref(),
+    );
+    // `harness:tool_name` — the locked value format. `bounded_id` caps the
+    // caller-supplied half before it reaches a commit trailer; `trailer_identity`
+    // rejects the framing hazards at the write boundary, and an over-long value
+    // there would be dropped WHOLE, losing the harness prefix too.
+    let source = format!("{harness}:{}", bounded_id(tool));
+    // AWAITED, unlike the prompt-tap trigger's fire-and-forget spawn: the point
+    // of this trigger is that the snapshot precedes the mutation, and BOTH
+    // callers await this POST (the OpenCode plugin inside
+    // `tool.execute.before`, the Claude shim since the 2026-08-13 amendment).
+    // The wait is bounded twice over — by the throttle, which admits at most one
+    // snapshot per `checkpoint_min_gap_s` per `(root, tab)` and is what makes
+    // the common case free, and by the budget below, which is what stops a slow
+    // one from outliving the caller's patience and minting a row for a tool call
+    // that has already run.
+    let checkpointed = workbench
+        .on_tool(
+            &root,
+            origin,
+            &source,
+            Some(Instant::now() + TOOL_CHECKPOINT_BUDGET),
+        )
+        .await;
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "checkpointed": checkpointed }),
     )
     .await
 }
@@ -5419,14 +5778,21 @@ struct ContractDriftBody {
 ///
 /// Every entry is a literal one of this crate's own shim binaries sends:
 /// `context_hook::report_contract_drift`'s first argument at four call sites,
-/// plus `taint_beacon`'s hand-rolled body (it posts through its own non-blocking
-/// dispatcher rather than through that helper). Spelling is pinned against those
-/// sources by `tests::the_drift_shim_list_is_spelled_the_way_the_shims_spell_it`.
+/// plus the two beacons' hand-rolled bodies (they post through their own
+/// dispatchers rather than through that helper). Spelling is pinned against
+/// those sources by `tests::the_drift_shim_list_is_spelled_the_way_the_shims_spell_it`.
 ///
 /// Drift here fails SAFE in both directions: an unlisted shim shares the
 /// sentinel bucket (fewer rows, never more), and a listed name no shim sends is
 /// a bucket nothing ever claims.
-const DRIFT_SHIMS: [&str; 5] = [
+///
+/// `checkpoint_beacon` was missing when V33 Phase F landed — it ships a shim
+/// that reports drift under its own name, so its reports were folding into
+/// [`DRIFT_SHIM_UNKNOWN`] alongside genuinely forged names and sharing that
+/// bucket's doubling counter. Fail-safe, as documented, but it meant the newest
+/// shim's payload drift was the one hardest to see.
+const DRIFT_SHIMS: [&str; 6] = [
+    "checkpoint_beacon",
     "compact_hook",
     "context_hook",
     "notify_hook",
@@ -5917,7 +6283,7 @@ fn record_discovery_skipped(
         return;
     };
     let agent = crate::graph::source_for_consumer(body.consumer.as_deref().unwrap_or("claude"));
-    let identity = tab_identity(settings, body.tab.as_deref());
+    let identity = tab_identity(settings, agent, body.tab.as_deref());
     // The scope label doubles as the flood key, which is deliberate: both want
     // "the identity this call actually resolved to", and the identity-less cases
     // must collapse onto one bucket rather than onto whatever the caller typed.
@@ -6420,6 +6786,91 @@ struct ContextPostEditBody {
     tab: Option<String>,
 }
 
+/// **V33 C4** — every directory this instance will run the project's configured
+/// CHECK COMMANDS in on a hook's behalf: the **served root** (this app's launch
+/// directory) plus each **configured AI tab's** working directory, and nothing
+/// else. Derived entirely from the app and the settings snapshot; the request
+/// body contributes nothing to this list.
+///
+/// The tab dirs are here because they are not always under the launch root: V13
+/// Phase D's "New tab in worktree…" sets `AiToolTabConfig::cwd` to a freshly
+/// created git worktree, and a hook firing in that tab legitimately names it.
+/// Resolution is [`crate::tabs::ai_tab_dir`], the same call
+/// [`build_ai_tool_spec`](crate::tabs::config) makes when it actually spawns the
+/// tab, so this list is the set of directories cImp itself launches agents in.
+///
+/// Every consumer's tabs, not the caller's: these are the operator's own
+/// directories either way, and scoping the list by the caller's asserted
+/// `agent` would let the assertion move a *capability* boundary — the thing
+/// C5 exists to stop it doing to the identity one.
+///
+/// An empty vec is possible only when managed state is absent AND
+/// `current_dir()` fails (a deleted cwd). It denies everything, which is the
+/// correct answer: a root that cannot be resolved must read as absent, never as
+/// "allow whatever was asked for".
+fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec<PathBuf> {
+    let launch = app
+        .try_state::<crate::ipc::AppState>()
+        .map(|s| s.launch.cwd.clone())
+        .or_else(|| std::env::current_dir().ok());
+    let Some(launch) = launch else {
+        return Vec::new();
+    };
+    let mut roots = vec![launch.clone()];
+    for tab in ai_tab_ids(settings) {
+        if let Some(dir) = crate::tabs::ai_tab_dir(settings, tab, &launch) {
+            if !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
+}
+
+/// **V33 C4** — the working directory `POST /context/post_edit` may execute in,
+/// or `None` to refuse.
+///
+/// This is [`audit_admit`]'s step 3 in a second place, deliberately built from
+/// the same two helpers ([`canon`] + [`is_ancestor_or_equal`]) rather than from
+/// new path logic, so the two routes' notions of "inside a root I serve" cannot
+/// drift. What differs is only the answer to a miss: `/audit/run` returns a
+/// readable tool error, and this route — a hook that must never perturb an edit
+/// — returns its own fail-safe (empty text) with an operator-visible `warn!`.
+///
+/// Three cases:
+///
+/// 1. **No `cwd` on the wire** ⇒ the served root. The pre-V33 default was
+///    `PathBuf::from(".")`, i.e. the app process's cwd; the served root is that
+///    same directory by a route that cannot be moved by a `chdir` and that is
+///    stated rather than implied.
+/// 2. **A `cwd` at or under one of the roots** ⇒ admitted, and passed through
+///    **as written**. The path string keys the single-flight `RootRunner`
+///    bucket and the auto-check baseline downstream, so canonicalizing it here
+///    would silently re-bucket every existing caller.
+/// 3. **Anything else** ⇒ `None`. Including a path containing `..`: a component
+///    walk cannot be relied on to reject one, because [`canon`] falls back to
+///    the raw path when `canonicalize` fails (which on Windows it does for any
+///    path that does not exist), leaving `P:\served\..\..\evil` looking like a
+///    descendant of `P:\served`. Refusing `..` outright costs nothing — every
+///    real caller sends the absolute cwd its harness reported.
+fn admitted_hook_root(roots: &[PathBuf], requested: Option<&str>) -> Option<PathBuf> {
+    let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return roots.first().cloned();
+    };
+    let raw = Path::new(req);
+    if raw
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let hint = canon(raw);
+    roots
+        .iter()
+        .any(|r| is_ancestor_or_equal(&canon(r), &hint))
+        .then(|| PathBuf::from(req))
+}
+
 /// `POST /context/post_edit` (V12 Phase F): debounce this session's edits, run
 /// the project's configured checks single-flight per root, diff against the
 /// session's own baseline, and return only NEW/worsened diagnostics (plus an
@@ -6434,13 +6885,33 @@ struct ContextPostEditBody {
 /// conversation loses its auto-check diagnostics and nothing else; the edit
 /// itself is never perturbed.
 ///
-/// **Not closed by this fix:** the `cwd` those commands run in is still
-/// caller-supplied and unvalidated, so a caller that names an untrusted
-/// directory gets the user's vetted commands executed *there* — and a caller
-/// that omits `tab` is not gated at all. That is finding H-7's territory
-/// (executed configuration in a cloned repo) and is deliberately left to the
-/// decision H-7 is waiting on rather than half-answered here: any narrowing
-/// keyed on the caller's own `tab` is walked around by omitting it.
+/// **V33 C4 closes the directory half.** The `cwd` those commands run in used
+/// to come straight out of the request body (defaulting to `"."`) with no
+/// ancestor check and no allowlist, so anything holding the loopback token could
+/// have the operator's own vetted check commands executed in a directory it
+/// named — a cloned repo's `Makefile`, say, reached through a `cargo`/`npm`
+/// script the operator configured for their own project. It is now resolved through
+/// [`admitted_hook_root`] against [`hook_exec_roots`], which derives from the
+/// served root and the configured tabs and **never from the request**. A refusal
+/// takes the route's own fail-safe (empty text) and logs; it cannot perturb the
+/// edit.
+///
+/// **The identity half is deliberately untouched** (locked V33 decision 2). A
+/// body with no usable `tab` still resolves to no scope and is ADMITTED, exactly
+/// as on `/graph_run` and `/mcp/call` — see the residual note above `hook_admit`.
+/// The two halves are independent: C4's allowlist is app-derived, so omitting
+/// `tab` does not walk around it, which is why the directory half could be
+/// closed without settling the identity one.
+///
+/// **Why the sibling hook routes get no such check** (so the asymmetry is not
+/// later read as an oversight): `/context/should_read` and
+/// `/context/compaction` take the same caller-supplied `cwd` and share the same
+/// identity fail-open, but neither EXECUTES anything with it — it selects which
+/// project's index to read, and what a read can hand back is what their
+/// [`toolclass::TABLE`] rows and their [`hook_admit`] gate already decide. There
+/// is no command to run in a directory a caller names, so there is nothing for
+/// a root allowlist to contain. If either ever grows a spawn, it inherits this
+/// route's treatment.
 async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request) -> AppResult<()> {
     let empty = serde_json::json!({ "ok": true, "text": "" });
     let body: ContextPostEditBody = match serde_json::from_slice(&req.body) {
@@ -6467,14 +6938,24 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
     {
         return write_json(stream, 200, &empty).await;
     }
+    // V33 C4: decide WHERE before deciding whether there is anything to run —
+    // the roots are app-derived, so this cannot be moved by the body.
+    let Some(cwd) = admitted_hook_root(&hook_exec_roots(app, &settings), body.cwd.as_deref()) else {
+        // Bounded: the rejected string is caller-chosen and unbounded on the
+        // wire, and this is the one place it reaches an operator-facing line.
+        warn!(
+            target: "offload",
+            requested = %bounded_id(body.cwd.as_deref().unwrap_or_default()),
+            "loopback: /context/post_edit named a working directory outside this instance's \
+             served root and its configured tabs' directories — the project's configured check \
+             commands were NOT run there (the edit itself is unaffected)"
+        );
+        return write_json(stream, 200, &empty).await;
+    };
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
         return write_json(stream, 200, &empty).await;
     };
     let graph = graph.inner().clone();
-    let cwd = body
-        .cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     let text = graph
         .post_edit(&cwd, body.session_id.as_deref(), &body.file_path)
         .await
@@ -8228,6 +8709,32 @@ mod tests {
         }
     }
 
+    /// A project root or child cwd, spelled the way the host platform spells
+    /// one: `P:\<tail>` on Windows — byte-identical to the literals these
+    /// fixtures used to hard-code — and `/<tail>` everywhere else.
+    ///
+    /// **Why this cannot be a hard-coded literal.** Discovery routing is
+    /// component-wise ([`is_ancestor_or_equal`]), and `Path::new(r"P:\proj\b")`
+    /// is a SINGLE `Component::Normal` on Linux. Every root/hint pair below
+    /// would therefore stop matching, step 1 of [`select_answering`] would rank
+    /// nothing, and the tests would either panic on `.expect("match")` or —
+    /// worse — pass through the sole-entry fallback while asserting nothing
+    /// about the ranking they were written for. The properties being pinned
+    /// here (F-11, F-26, F-28, decision 30's probe budget) are not
+    /// Windows-specific, so their coverage must not be either.
+    fn proj(tail: &str) -> String {
+        if cfg!(windows) {
+            format!(r"P:\{}", tail.replace('/', "\\"))
+        } else {
+            format!("/{tail}")
+        }
+    }
+
+    /// [`proj`] as a `PathBuf`, for the cwd/hint side of the same pairs.
+    fn proj_path(tail: &str) -> PathBuf {
+        PathBuf::from(proj(tail))
+    }
+
     /// The preference ORDER on its own: every candidate answers and there is no
     /// legacy store.
     ///
@@ -8244,21 +8751,29 @@ mod tests {
     fn select_discovery_routes_by_root() {
         // Two instances off one install: a child whose cwd is inside project
         // B must reach B's instance, never last-writer-wins.
-        let entries = vec![disc(1, 1001, "P:\\proj\\a"), disc(2, 1002, "P:\\proj\\b")];
-        let picked = select_all_live(entries, Some(Path::new("P:\\proj\\b\\src"))).expect("match");
+        let entries = vec![
+            disc(1, 1001, &proj("proj/a")),
+            disc(2, 1002, &proj("proj/b")),
+        ];
+        let picked = select_all_live(entries, Some(&proj_path("proj/b/src"))).expect("match");
         assert_eq!(picked.pid, 2);
     }
 
     #[test]
     fn select_discovery_deepest_matching_root_wins() {
         // Nested checkouts: the closest (deepest) serving instance wins.
-        let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
-        let picked =
-            select_all_live(entries, Some(Path::new("P:\\proj\\nested\\src"))).expect("match");
+        let entries = vec![
+            disc(1, 1001, &proj("proj")),
+            disc(2, 1002, &proj("proj/nested")),
+        ];
+        let picked = select_all_live(entries, Some(&proj_path("proj/nested/src"))).expect("match");
         assert_eq!(picked.pid, 2);
         // A hint outside the nested root resolves to the outer instance.
-        let entries = vec![disc(1, 1001, "P:\\proj"), disc(2, 1002, "P:\\proj\\nested")];
-        let picked = select_all_live(entries, Some(Path::new("P:\\proj\\other"))).expect("match");
+        let entries = vec![
+            disc(1, 1001, &proj("proj")),
+            disc(2, 1002, &proj("proj/nested")),
+        ];
+        let picked = select_all_live(entries, Some(&proj_path("proj/other"))).expect("match");
         assert_eq!(picked.pid, 1);
     }
 
@@ -8292,7 +8807,7 @@ mod tests {
     /// needs BOTH stores unusable.
     #[test]
     fn a_corrupt_per_instance_entry_still_resolves_through_the_legacy_file() {
-        let hint = PathBuf::from("P:\\proj\\src");
+        let hint = proj_path("proj/src");
         let legacy = disc(99, 4444, "");
         // The corrupted `<pid>.json` is simply absent from the entry list.
         let picked = select_verified(vec![], Some(&hint), |_| true, || Some(legacy.clone()))
@@ -8302,7 +8817,7 @@ mod tests {
         // And only when the first two preferences produce nothing: a matching
         // per-instance entry must never be overridden by the legacy file.
         let picked = select_verified(
-            vec![disc(1, 1001, "P:\\proj")],
+            vec![disc(1, 1001, &proj("proj"))],
             Some(&hint),
             |_| true,
             || panic!("the legacy store must not be read when a per-instance entry matches"),
@@ -8342,9 +8857,9 @@ mod tests {
     /// *write-only* half — see [`responds`].
     #[test]
     fn a_deeper_entry_outranks_the_running_instance_only_while_it_answers() {
-        let real = disc(10, 4000, "P:\\proj");
-        let planted = disc(11, 1, "P:\\proj\\sub");
-        let hint = PathBuf::from("P:\\proj\\sub\\deeper");
+        let real = disc(10, 4000, &proj("proj"));
+        let planted = disc(11, 1, &proj("proj/sub"));
+        let hint = proj_path("proj/sub/deeper");
         let no_legacy = || panic!("a matching per-instance entry answers");
 
         // Half 1 — a deeper entry that answers is still preferred. Depth, not
@@ -8391,14 +8906,14 @@ mod tests {
         let live = fake_instance("tok-live");
         // The planted file: well-formed, a DEEPER root than the running
         // instance's, and a port nothing is listening on.
-        let planted = disc(4242, dead_port(), "P:\\proj\\sub");
+        let planted = disc(4242, dead_port(), &proj("proj/sub"));
         let real = Discovery {
             port: live,
             token: "tok-live".into(),
             pid: 10,
-            root: "P:\\proj".into(),
+            root: proj("proj"),
         };
-        let cwd = PathBuf::from("P:\\proj\\sub\\pkg");
+        let cwd = proj_path("proj/sub/pkg");
 
         let picked = select_verified(vec![real, planted], Some(&cwd), responds, || None)
             .expect("the beacon still finds the running instance");
@@ -8442,10 +8957,10 @@ mod tests {
     /// not by how many files an attacker wrote.
     #[test]
     fn a_resolution_never_probes_more_than_its_budget() {
-        let hint = PathBuf::from("P:\\proj\\a\\b\\c\\d\\e\\f\\g\\h");
+        let hint = proj_path("proj/a/b/c/d/e/f/g/h");
         // Twenty matching entries, each deeper than the last, none answering.
         let entries: Vec<Discovery> = (0..20)
-            .map(|i| disc(i, 1000 + i as u16, "P:\\proj"))
+            .map(|i| disc(i, 1000 + i as u16, &proj("proj")))
             .collect();
         let probes = std::cell::Cell::new(0usize);
         let picked = select_verified(
@@ -8610,7 +9125,10 @@ mod tests {
             panic!("a 4096-char id is not a tab: {:?}", big.entry.tab);
         };
         assert!(id.chars().count() <= BEACON_TOOL_MAX + 1, "{}", id.len());
-        assert!(!is_configured_tab(&s, id), "truncation is not a forgery");
+        assert!(
+            !is_configured_tab(&s, "claude", id),
+            "truncation is not a forgery"
+        );
 
         // The count is caller-asserted and the row says so, clamped to the probe
         // budget a genuine resolution cannot exceed.
@@ -8985,13 +9503,17 @@ mod tests {
     /// why it needs a tripwire rather than a reader's attention.
     ///
     /// **What this would still pass if the implementation were wrong:** a NEW
-    /// shim that reports drift under a sixth name and is never added to the list.
-    /// That case degrades safely (it shares the sentinel bucket, so it gets fewer
-    /// rows, never more) and cannot be enumerated from here without scanning the
-    /// source tree at test time.
+    /// shim that reports drift under an unlisted name. That case degrades safely
+    /// (it shares the sentinel bucket, so it gets fewer rows, never more) and
+    /// cannot be enumerated from here without scanning the source tree at test
+    /// time. **It happened**: `checkpoint_beacon` shipped with V33 Phase F
+    /// reporting drift under its own name and no entry in the list, which is why
+    /// the length assertion below now names the failure it is guarding rather
+    /// than just pinning a number.
     #[test]
     fn the_drift_shim_list_is_spelled_the_way_the_shims_spell_it() {
         for (shim, src) in [
+            ("checkpoint_beacon", include_str!("../checkpoint_beacon.rs")),
             ("compact_hook", include_str!("../compact_hook.rs")),
             ("context_hook", include_str!("../context_hook.rs")),
             ("notify_hook", include_str!("../notify_hook.rs")),
@@ -9007,7 +9529,13 @@ mod tests {
                 "{shim} is not the name that module sends"
             );
         }
-        assert_eq!(DRIFT_SHIMS.len(), 5, "a sixth entry needs its source pinned here");
+        assert_eq!(
+            DRIFT_SHIMS.len(),
+            6,
+            "a new shim that reports drift needs BOTH an entry here and its source \
+             pinned in the loop above — otherwise its reports fold into the \
+             unrecognized-shim bucket and nothing fails"
+        );
         assert!(!DRIFT_SHIMS.contains(&DRIFT_SHIM_UNKNOWN));
     }
 
@@ -9111,10 +9639,10 @@ mod tests {
             port,
             token: "tok-shim".into(),
             pid: 10,
-            root: "P:\\proj".into(),
+            root: proj("proj"),
         };
-        let planted = disc(4242, dead_port(), "P:\\proj\\sub");
-        let cwd = PathBuf::from("P:\\proj\\sub\\pkg");
+        let planted = disc(4242, dead_port(), &proj("proj/sub"));
+        let cwd = proj_path("proj/sub/pkg");
         let picked = select_verified(vec![live, planted], Some(&cwd), responds, || None)
             .expect("the shim still finds the running instance");
         assert_eq!(picked.port, port);
@@ -9276,20 +9804,27 @@ mod tests {
     #[test]
     fn is_ancestor_or_equal_rejects_prefix_strings_and_unrelated() {
         assert!(is_ancestor_or_equal(
-            Path::new("P:\\proj\\a"),
-            Path::new("P:\\proj\\a")
+            &proj_path("proj/a"),
+            &proj_path("proj/a")
         ));
-        // Component-wise, not string-prefix: `P:\proj\a` is NOT an ancestor
-        // of `P:\proj\ab`.
+        // Ancestry across a real component boundary — the case a hard-coded
+        // `P:\proj\a` literal cannot express off Windows, where the whole
+        // string is one component and this would pass vacuously.
+        assert!(is_ancestor_or_equal(
+            &proj_path("proj"),
+            &proj_path("proj/a/deep")
+        ));
+        // Component-wise, not string-prefix: `<root>/a` is NOT an ancestor
+        // of `<root>/ab`.
         assert!(!is_ancestor_or_equal(
-            Path::new("P:\\proj\\a"),
-            Path::new("P:\\proj\\ab")
+            &proj_path("proj/a"),
+            &proj_path("proj/ab")
         ));
         assert!(!is_ancestor_or_equal(
-            Path::new("P:\\proj\\a\\deep"),
-            Path::new("P:\\proj\\a")
+            &proj_path("proj/a/deep"),
+            &proj_path("proj/a")
         ));
-        assert!(!is_ancestor_or_equal(Path::new(""), Path::new("P:\\proj")));
+        assert!(!is_ancestor_or_equal(Path::new(""), &proj_path("proj")));
     }
 
     #[test]
@@ -10233,11 +10768,14 @@ mod tests {
 
         // (2) The classifier is handed the whole thing, so the suffix counts.
         assert!(
-            matches!(tab_identity(&s, Some(forged.as_str())), TabIdentity::Unknown(_)),
+            matches!(
+                tab_identity(&s, "claude", Some(forged.as_str())),
+                TabIdentity::Unknown(_)
+            ),
             "truncation must not run before `is_configured_tab`"
         );
         assert!(matches!(
-            tab_identity(&s, Some(real.as_str())),
+            tab_identity(&s, "claude", Some(real.as_str())),
             TabIdentity::Configured(_)
         ));
 
@@ -10255,7 +10793,10 @@ mod tests {
         assert!(id.ends_with('…'), "a cut id must say it was cut: {id}");
 
         // (3) …and it is still nobody's tab.
-        assert!(!is_configured_tab(&s, id), "truncation is not a forgery");
+        assert!(
+            !is_configured_tab(&s, "claude", id),
+            "truncation is not a forgery"
+        );
         assert_ne!(*id, real);
         assert!(!attr.is_tab());
 
@@ -12255,10 +12796,22 @@ mod tests {
     /// Settings carrying `ids` as AI tabs, plus one reserved Shell tab (which
     /// hosts no harness and must therefore never be a valid latch scope).
     fn settings_with_tabs(ids: &[&str]) -> crate::settings::Settings {
+        settings_with_consumer_tabs(&ids.iter().map(|id| ("claude", *id)).collect::<Vec<_>>())
+    }
+
+    /// V33 C5: settings carrying `(consumer, id)` AI tabs — `"claude"` builds a
+    /// Claude tab, anything else an OpenCode one — plus the same reserved Shell
+    /// tab. The consumer of a tab is its COMMAND (`tabs::tab_consumer`), so
+    /// these are built from the real defaults rather than by stamping a field.
+    fn settings_with_consumer_tabs(tabs_in: &[(&str, &str)]) -> crate::settings::Settings {
         use crate::settings::{default_ai_tab, default_graph_monitor_tab, AiTabId, TabConfig};
         let mut tabs = vec![default_graph_monitor_tab()];
-        for id in ids {
-            let mut t = default_ai_tab(AiTabId::Claude);
+        for (consumer, id) in tabs_in {
+            let mut t = default_ai_tab(if *consumer == "claude" {
+                AiTabId::Claude
+            } else {
+                AiTabId::OpenCode
+            });
             if let TabConfig::AiTool(c) = &mut t {
                 c.id = (*id).to_string();
             }
@@ -12322,6 +12875,53 @@ mod tests {
         assert_eq!(origin, crate::workbench::shadow::Origin::default());
     }
 
+    /// **V33 Phase F: `/workbench/tool_checkpoint` narrows the tab exactly as
+    /// the prompt tap does, and reads the tool name in the CALLER's
+    /// vocabulary.**
+    ///
+    /// The vocabulary half is the subtle one. `toolclass::TABLE` is cImp's own
+    /// namespace, where `edit` is an unknown name and `mutates_fs` therefore
+    /// answers `false`; `OPENCODE_NATIVE_TABLE` is the harness's, where `Edit`
+    /// is unknown for the mirror reason. Crossing them would not fail loudly —
+    /// it would silently disable one harness's entire seam while every test that
+    /// only exercised the other stayed green. Both directions are asserted.
+    #[test]
+    fn the_tool_checkpoint_route_narrows_the_tab_and_reads_the_right_vocabulary() {
+        let s = settings_with_tabs(&["claude", "claude-2"]);
+
+        // Identity: same funnel, same answers as the prompt tap.
+        let origin = checkpoint_identity(&s, Some("claude"), Some("sess-1"), Some("claude-2"));
+        assert_eq!(origin.tab.as_deref(), Some("claude-2"));
+        assert_eq!(origin.session.as_deref(), Some("sess-1"));
+        assert_eq!(
+            checkpoint_identity(&s, Some("claude"), Some("sess-1"), Some("claude-99")).tab,
+            None,
+            "a forged or stale tab id must degrade to `cannot attribute`"
+        );
+        // The route composes `source` itself and never takes one from the wire,
+        // so `Origin::with_source` is the only way a checkpoint gets one.
+        assert_eq!(origin.source, None);
+
+        // Vocabulary: Claude's capitalized natives.
+        for tool in ["Edit", "Write", "MultiEdit", "Bash"] {
+            assert!(tool_checkpoint_is_mutating("claude", tool), "{tool}");
+        }
+        for tool in ["Read", "Grep", "WebFetch", "edit"] {
+            assert!(!tool_checkpoint_is_mutating("claude", tool), "{tool}");
+        }
+        // …and OpenCode's lowercase ids, which are a DIFFERENT table.
+        for tool in ["edit", "write", "patch", "apply_patch", "bash"] {
+            assert!(tool_checkpoint_is_mutating("opencode", tool), "{tool}");
+        }
+        for tool in ["read", "grep", "glob", "webfetch", "task", "Edit"] {
+            assert!(!tool_checkpoint_is_mutating("opencode", tool), "{tool}");
+        }
+        // An unrecognised harness normalises to Claude (`hook_agent`'s own
+        // default), so it reads Claude's table rather than nothing at all.
+        assert!(tool_checkpoint_is_mutating(hook_agent(None), "Bash"));
+        assert!(tool_checkpoint_is_mutating(hook_agent(Some("nonsense")), "Bash"));
+    }
+
     /// **The registry's bound, made real.** `latches()`'s doc claimed the map
     /// was "bounded by construction — tab ids are config-derived"; they are
     /// request-derived, and the claim was asserted only in that comment. The
@@ -12339,20 +12939,20 @@ mod tests {
     /// through the registry itself.
     #[test]
     fn only_configured_ai_tab_ids_can_ever_key_a_latch() {
-        let s = settings_with_tabs(&["claude", "opencode-2"]);
+        let s = settings_with_tabs(&["claude", "claude-2"]);
         assert_eq!(
-            tab_identity(&s, Some("claude")),
+            tab_identity(&s, "claude", Some("claude")),
             TabIdentity::Configured("claude")
         );
         assert_eq!(
-            tab_identity(&s, Some(" opencode-2 ")),
-            TabIdentity::Configured("opencode-2"),
+            tab_identity(&s, "claude", Some(" claude-2 ")),
+            TabIdentity::Configured("claude-2"),
             "surrounding whitespace is trimmed, not treated as a different tab"
         );
 
         for forged in ["claude-1", "Claude", "../claude", "graph-monitor"] {
             assert_eq!(
-                tab_identity(&s, Some(forged)),
+                tab_identity(&s, "claude", Some(forged)),
                 TabIdentity::Unknown(forged),
                 "{forged:?} is not a configured AI tab and must not key a latch"
             );
@@ -12360,37 +12960,42 @@ mod tests {
         // The two identity-less shapes are distinct (#48): "no tab id" is not
         // "an id I do not recognize", and `handle_latch_state` reads them apart.
         for anon in [None, Some(""), Some("   ")] {
-            assert_eq!(tab_identity(&s, anon), TabIdentity::Anonymous, "{anon:?}");
+            assert_eq!(
+                tab_identity(&s, "claude", anon),
+                TabIdentity::Anonymous,
+                "{anon:?}"
+            );
         }
 
         // The bound stated as a bound: whatever a caller sends, the set of ids
         // that get through is a subset of the configured AI tabs.
         let attempts = [
             "claude",
-            "opencode-2",
-            "claude-1",
             "claude-2",
+            "claude-1",
+            "claude-3",
             "tab-9999",
             "graph-monitor",
         ];
         let admitted: Vec<&str> = attempts
             .iter()
             .copied()
-            .filter(|t| matches!(tab_identity(&s, Some(t)), TabIdentity::Configured(_)))
+            .filter(|t| matches!(tab_identity(&s, "claude", Some(t)), TabIdentity::Configured(_)))
             .collect();
-        assert_eq!(admitted, ["claude", "opencode-2"]);
+        assert_eq!(admitted, ["claude", "claude-2"]);
 
         // And the bound where it is actually load-bearing: the registry. A
         // forged id resolves to no scope, and the two methods that insert are
         // the only ones that ever receive one — so `/status` and the 4 s
         // `latch_status` poll cannot be grown by a caller inventing ids.
         let reg = LatchRegistry::default();
-        for forged in attempts
-            .iter()
-            .copied()
-            .filter(|t| !matches!(tab_identity(&s, Some(t)), TabIdentity::Configured(_)))
-        {
-            let scope = match tab_identity(&s, Some(forged)) {
+        for forged in attempts.iter().copied().filter(|t| {
+            !matches!(
+                tab_identity(&s, "claude", Some(t)),
+                TabIdentity::Configured(_)
+            )
+        }) {
+            let scope = match tab_identity(&s, "claude", Some(forged)) {
                 TabIdentity::Configured(t) => Some(LatchScope {
                     agent: "claude",
                     tab: t.to_string(),
@@ -12421,19 +13026,123 @@ mod tests {
         );
     }
 
-    /// The empty-list escape, stated as a test so it is a decision rather than
+    /// The availability floor, stated as a test so it is a decision rather than
     /// an accident: with no AI tab in the snapshot the predicate accepts
     /// everything, because `live_settings` falls back to `Settings::default()`
     /// (empty `tabs`) before managed state is up, and a request in that window
     /// must not be rejected on the strength of a list we could not read.
+    ///
+    /// **V33 C5 keeps its trigger on the WHOLE list.** The plan's wording was
+    /// "narrow the floor to the asserted consumer"; doing that literally would
+    /// have *widened* it — on the ordinary install that runs only Claude tabs,
+    /// "opencode has zero tabs" would be true forever and every forged id
+    /// asserting `consumer: opencode` would get a scope, i.e. the unbounded key
+    /// space #45 closed. The condition the floor encodes is "settings are
+    /// unreadable", which is global, so only the positive test is
+    /// consumer-scoped. The last assertion is the one that would fail if a
+    /// future edit moved the floor into `ai_tab_ids_for`.
     #[test]
     fn an_unreadable_tab_list_accepts_rather_than_rejects() {
         let empty = crate::settings::Settings::default();
         assert!(empty.tabs.is_empty(), "the fallback snapshot has no tabs");
-        assert!(is_configured_tab(&empty, "claude-1"));
+        assert!(is_configured_tab(&empty, "claude", "claude-1"));
+        assert!(is_configured_tab(&empty, "opencode", "anything"));
         // A snapshot with only reserved Shell tabs is the same case: no AI tab
         // means no list to validate against.
-        assert!(is_configured_tab(&settings_with_tabs(&[]), "anything"));
+        assert!(is_configured_tab(&settings_with_tabs(&[]), "claude", "anything"));
+
+        // …and a snapshot that HAS tabs is a readable list, for every consumer —
+        // including the ones that own none of them.
+        let claude_only = settings_with_tabs(&["claude"]);
+        assert!(
+            !is_configured_tab(&claude_only, "opencode", "claude"),
+            "a per-consumer floor would hand every forged id a scope here"
+        );
+        assert!(
+            !is_configured_tab(&claude_only, "opencode", "invented"),
+            "a per-consumer floor would hand every forged id a scope here"
+        );
+    }
+
+    /// **V33 C5 (finding F-4): the `(consumer, tab)` pair is verified.**
+    ///
+    /// The registry key is the pair ([`LatchScope::key`]) and `agent` is
+    /// caller-asserted on every route that has one, but until V33
+    /// [`is_configured_tab`] asked only "is this *some* configured AI tab id".
+    /// A caller could therefore key a latch under `("claude", <an OpenCode
+    /// tab's id>)`, and the pair was checked on no route in the system.
+    ///
+    /// The review rated the cross-keyed case harmless on `/audit/run` as it
+    /// stands — the resulting latch is freshly open and engages a scope nobody
+    /// reads — so this pins a restored invariant, not a live exploit.
+    ///
+    /// **What this would still pass with:** a check that compared the asserted
+    /// consumer against a field on the tab config would pass the first two
+    /// assertions and fail the third, because there is no such field: the
+    /// consumer of a tab is its COMMAND, which is what the launch path splits on
+    /// when it decides what to inject (`tabs::tab_consumer`). And a check that
+    /// merely rejected mismatches would pass without the `Configured` cases,
+    /// which is why both directions are asserted for both consumers.
+    #[test]
+    fn a_tab_of_one_consumer_cannot_key_a_latch_under_the_other() {
+        let s = settings_with_consumer_tabs(&[("claude", "claude"), ("opencode", "opencode")]);
+
+        // Each consumer's own tab resolves.
+        assert_eq!(
+            tab_identity(&s, "claude", Some("claude")),
+            TabIdentity::Configured("claude")
+        );
+        assert_eq!(
+            tab_identity(&s, "opencode", Some("opencode")),
+            TabIdentity::Configured("opencode")
+        );
+
+        // Cross-keyed, both directions: a real tab id of the OTHER harness is
+        // exactly as unrecognized as an invented string, and keys nothing.
+        assert_eq!(
+            tab_identity(&s, "claude", Some("opencode")),
+            TabIdentity::Unknown("opencode"),
+            "a caller asserting `claude` must not key a latch under an OpenCode tab"
+        );
+        assert_eq!(
+            tab_identity(&s, "opencode", Some("claude")),
+            TabIdentity::Unknown("claude"),
+            "…and the reverse"
+        );
+
+        // The consumer of a tab is its command, not a stored label — a Claude
+        // tab renamed to an OpenCode-looking id is still a Claude tab.
+        let renamed = settings_with_consumer_tabs(&[("claude", "opencode-7")]);
+        assert_eq!(
+            tab_identity(&renamed, "claude", Some("opencode-7")),
+            TabIdentity::Configured("opencode-7")
+        );
+        assert_eq!(
+            tab_identity(&renamed, "opencode", Some("opencode-7")),
+            TabIdentity::Unknown("opencode-7")
+        );
+
+        // And the bound where it is load-bearing: neither cross-keyed attempt
+        // reaches the registry, so `/status` cannot be grown by asserting the
+        // other consumer's name over a real tab id.
+        let reg = LatchRegistry::default();
+        for (agent, tab) in [("claude", "opencode"), ("opencode", "claude")] {
+            let scope = match tab_identity(&s, agent, Some(tab)) {
+                TabIdentity::Configured(t) => Some(LatchScope {
+                    agent,
+                    tab: t.to_string(),
+                    session: None,
+                    root: TEST_ROOT.to_string(),
+                }),
+                _ => None,
+            };
+            let _ = reg.beacon(scope.as_ref(), "WebFetch", ON, BEACON_PROV);
+        }
+        assert!(
+            reg.snapshot().is_empty(),
+            "a cross-keyed beacon created {:?}",
+            reg.snapshot()
+        );
     }
 
     // ── V32 C-2 / H-2 — a session rotation must not clear contamination ─────
@@ -12693,7 +13402,7 @@ mod tests {
             "the availability floor belongs to the latch, not to this route"
         );
         assert!(
-            is_configured_tab(&empty, "claude"),
+            is_configured_tab(&empty, "claude", "claude"),
             "…and the latch's own predicate keeps it"
         );
     }
@@ -14154,6 +14863,23 @@ mod tests {
                 "auto-injection; contained by the spotlight/quarantine envelope, not by refusal",
             ),
         ),
+        // V33 Phase F. Takes a Workbench checkpoint before a mutating tool
+        // call. Ungated on purpose, and the reason is not "nobody got round to
+        // it": it returns two booleans, grants no capability and hands back no
+        // project data, so a latch would have nothing to refuse — while a
+        // refusal would remove checkpoints from a tab that had touched external
+        // content, i.e. exactly the tab most likely to need a rewind. It is
+        // still token-gated, tab-narrowed, throttled per `(root, tab)` and
+        // re-checked against the class table for `mutates_fs`.
+        route(
+            "/workbench/tool_checkpoint",
+            "POST",
+            "handle_tool_checkpoint",
+            Containment::NoRegistry(
+                "snapshots the work tree into cImp's own shadow repo; returns no local data \
+                 and grants no capability",
+            ),
+        ),
         route(
             "/context/compaction",
             "POST",
@@ -14634,6 +15360,130 @@ mod tests {
                 "only the contaminated tab is keyed"
             );
         }
+    }
+
+    /// **V33 C4 (finding F-5's directory half): `/context/post_edit` executes
+    /// the project's configured check commands, and it will only do so in a
+    /// directory this instance serves.**
+    ///
+    /// The `cwd` used to come straight out of the request body (defaulting to
+    /// `"."`) with no ancestor check and no allowlist, so a token-holder could
+    /// have the operator's own vetted commands run in a directory it named.
+    ///
+    /// This exercises the decision function, which is pure so the property is
+    /// assertable without a `TcpStream` or an `AppHandle` — the [`audit_admit`]
+    /// shape, and the same two path helpers that route's step 3 uses.
+    ///
+    /// **What this would still pass with, and the guards:** a check that only
+    /// compared string prefixes (`P:\projx` is asserted to be refused — it is a
+    /// prefix of neither root component-wise, which is the trap
+    /// [`is_ancestor_or_equal`] exists for); a check that canonicalized and
+    /// therefore silently re-bucketed every existing caller (the admitted path
+    /// is asserted to come back byte-for-byte as written, because it keys the
+    /// single-flight runner downstream); and a component walk that trusted
+    /// [`canon`] to resolve `..` (it cannot for a path that does not exist, so
+    /// `..` is refused outright and that case is asserted).
+    #[test]
+    fn post_edit_runs_only_in_a_directory_this_instance_serves() {
+        // Built with `join` rather than written with separators so the component
+        // walk means the same thing on both platforms.
+        let served = PathBuf::from("P:\\proj");
+        let worktree = PathBuf::from("P:\\worktrees").join("feature-a");
+        let roots = vec![served.clone(), worktree.clone()];
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+
+        // 1. No `cwd` on the wire ⇒ the served root, never the process cwd.
+        for absent in [None, Some(""), Some("   "), Some("\t")] {
+            assert_eq!(
+                admitted_hook_root(&roots, absent),
+                Some(served.clone()),
+                "{absent:?}"
+            );
+        }
+
+        // 2. Inside a served root — the root itself, a subdirectory, and the
+        //    same for a tab that lives in a worktree outside the launch root.
+        for ok in [
+            served.clone(),
+            served.join("src"),
+            served.join("src").join("deep"),
+            worktree.clone(),
+            worktree.join("src"),
+        ] {
+            let asked = s(&ok);
+            assert_eq!(
+                admitted_hook_root(&roots, Some(asked.as_str())),
+                Some(PathBuf::from(&asked)),
+                "{asked} is served and must come back exactly as written"
+            );
+        }
+
+        // 3. Outside every root — including the string-prefix near miss, and a
+        //    traversal that `canon` cannot resolve because the path does not
+        //    exist (which is precisely when a component walk would be fooled).
+        for bad in [
+            PathBuf::from("Q:\\evil"),
+            PathBuf::from("P:\\projx"),
+            PathBuf::from("P:\\projx").join("src"),
+            PathBuf::from("P:\\worktrees"),
+            served.join("..").join("..").join("evil"),
+            PathBuf::from("..").join("evil"),
+        ] {
+            let asked = s(&bad);
+            assert_eq!(
+                admitted_hook_root(&roots, Some(asked.as_str())),
+                None,
+                "{asked} is not served and the checks must not run there"
+            );
+        }
+
+        // 4. No resolvable root at all ⇒ deny, including the absent-`cwd` case.
+        //    A root that cannot be resolved reads as absent, never as "allow".
+        assert_eq!(admitted_hook_root(&[], None), None);
+        assert_eq!(admitted_hook_root(&[], Some(&s(&served))), None);
+
+        // 5. Windows only: on-disk casing and an agent-reported cwd routinely
+        //    disagree, which is why `is_ancestor_or_equal` folds case there.
+        if cfg!(windows) {
+            let shouty = s(&served).to_uppercase();
+            assert_eq!(
+                admitted_hook_root(&roots, Some(shouty.as_str())),
+                Some(PathBuf::from(&shouty))
+            );
+        }
+    }
+
+    /// **V33 C4's other half, checked against the source rather than believed:
+    /// the roots cannot come from the request.**
+    ///
+    /// The allowlist above is only as good as what feeds it, and "roots derive
+    /// from configured tabs and the served root, never from the request" is the
+    /// kind of claim that survives its own violation if it lives only in prose.
+    /// Two structural assertions:
+    ///
+    /// 1. The handler resolves its working directory through the pair, so the
+    ///    check cannot be deleted while the route keeps running commands.
+    /// 2. [`hook_exec_roots`] takes the `AppHandle` and the settings snapshot
+    ///    and NOTHING ELSE — the request is not in scope, so no future edit can
+    ///    let a body widen the allowlist without changing this signature.
+    #[test]
+    fn post_edit_takes_its_working_directory_from_the_app_not_from_the_body() {
+        let src = include_str!("loopback.rs");
+        let body = handler_body(src, "handle_post_edit");
+        assert!(
+            body.contains("admitted_hook_root(&hook_exec_roots(app, &settings), body.cwd.as_deref())"),
+            "the route must resolve its cwd through the C4 allowlist: {body}"
+        );
+        assert!(
+            !body.contains("PathBuf::from(\".\")"),
+            "the pre-V33 caller-supplied default is back: {body}"
+        );
+        assert!(
+            src.contains(
+                "fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec<PathBuf>"
+            ),
+            "the roots must derive from the app and the settings, never from a request body"
+        );
     }
 
     /// `agent` is caller-asserted and absent on a pre-#48 shim. Absent ⇒

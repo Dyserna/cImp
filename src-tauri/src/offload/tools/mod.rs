@@ -25,6 +25,41 @@ pub mod read_file;
 pub mod run_check;
 pub mod run_command;
 
+/// V33 Phase F: everything the worker seam needs to take a Workbench checkpoint
+/// before a filesystem-mutating tool call.
+///
+/// **Why this is a struct on [`ToolCtx`] and not three loose fields.** `ToolCtx`
+/// carried no project root, no tab and no service handle at all — the worker
+/// never needed to reach outside its allowed roots. Adding the capability as one
+/// `Option` makes the "this dispatch cannot checkpoint" case a single
+///, greppable state (the headless MCP child, every unit test) instead of three
+/// independently-`None` fields whose combinations nobody enumerated.
+#[derive(Clone)]
+pub struct ToolCheckpoint {
+    /// The project root whose shadow repo the checkpoint lands in — the calling
+    /// session's cwd, the same value that seeds `allowed_roots`' fallback.
+    pub root: PathBuf,
+    /// The cImp tab this offload task was requested from, if the request
+    /// carried one. `None` keys the tab-less throttle bucket (shared with the
+    /// burst trigger) and records a checkpoint with no tab — honest, since the
+    /// worker is not a tab.
+    pub tab: Option<String>,
+    /// The Workbench service. Present only in-process; see this type's doc.
+    pub workbench: std::sync::Arc<crate::workbench::WorkbenchService>,
+}
+
+/// `WorkbenchService` is not `Debug` (it owns a Tauri `AppHandle`), and
+/// `ToolCtx` derives `Debug` — so the handle is rendered as a marker rather than
+/// dropping `Debug` from the whole context, which several error paths format.
+impl std::fmt::Debug for ToolCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCheckpoint")
+            .field("root", &self.root)
+            .field("tab", &self.tab)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Shared execution context for native tools: the roots file access is
 /// confined to and the allowlist `run_command` is gated by.
 #[derive(Clone, Debug)]
@@ -39,6 +74,17 @@ pub struct ToolCtx {
     /// Per-program security policies `run_command` enforces on top of the
     /// allowlist (denied flags/subcommands + spawn env). See [`CommandPolicy`].
     pub command_policies: Vec<CommandPolicy>,
+    /// V33 Phase F: the pre-mutation checkpoint capability, or `None` when this
+    /// dispatch cannot take one.
+    ///
+    /// `None` is not a failure mode to fix — it is the honest answer on the two
+    /// paths that have no app to snapshot into: the headless `--offload-mcp`
+    /// child (a separate process, which runs the agent loop only when no app
+    /// instance is serving the loopback) and unit tests. [`ToolCtx::new`]
+    /// therefore builds it `None` and callers opt in with
+    /// [`with_checkpoint`](Self::with_checkpoint), so a new construction site
+    /// silently gets the safe shape rather than a wrong one.
+    pub checkpoint: Option<ToolCheckpoint>,
 }
 
 impl ToolCtx {
@@ -57,7 +103,16 @@ impl ToolCtx {
             allowed_roots,
             command_allowlist,
             command_policies,
+            checkpoint: None,
         }
+    }
+
+    /// V33 Phase F: opt this context in to pre-mutation checkpoints. A named
+    /// builder rather than a fifth positional argument to [`Self::new`] — the
+    /// three existing ones are already two `Vec<String>`-shaped neighbours.
+    pub fn with_checkpoint(mut self, checkpoint: Option<ToolCheckpoint>) -> Self {
+        self.checkpoint = checkpoint;
+        self
     }
 
     /// Resolve a model-supplied path and confine it to `allowed_roots`.
@@ -170,12 +225,69 @@ fn enabled_defs_inner(toggles: &OffloadToolToggles, checks_configured: bool) -> 
 /// native route an EXTERNAL classification is waved past the latch — so
 /// `table_matches_the_native_dispatch_surface` scans this function's own source
 /// and fails the build for a missing row.
+///
+/// # V33 Phase F — the pre-mutation checkpoint fires HERE
+///
+/// The `mutates_fs` column of that same table decides it, so a future mutating
+/// tool declares its class and its need for a checkpoint in one reviewed place
+/// and this function needs no edit. Today exactly one routed tool qualifies
+/// (`run_command`); the check is written against the table rather than against
+/// that name so it does not have to be remembered.
+///
+/// This is the ONE Phase F seam where the "immediately before" ordering is
+/// exact: nothing has been spawned yet when the checkpoint is awaited, and the
+/// await is inside the same task. The Claude `PreToolUse` shim cannot make that
+/// promise (its fail-open contract forbids waiting on the app — see
+/// `checkpoint_beacon`'s module doc).
+///
+/// **`/graph_run` and `/mcp/call` are deliberately NOT wired**, and this is the
+/// note that records why so it is not re-raised as an omission: neither route
+/// serves a tool with `mutates_fs: true`. `/graph_run` serves the read-only
+/// `graph_*` surface, and `/mcp/call` serves proxied MCP servers whose tools are
+/// outside this filesystem by construction (`mutates_fs` answers `false` for
+/// every unknown name, which is exactly the right answer there). Wiring them
+/// would add a `mutates_fs` lookup to two hot routes that would fire zero
+/// checkpoints. If a mutating tool is ever added to either surface, its `TABLE`
+/// row is what makes that visible — and the fire seam is what would then need
+/// adding, not the row.
 pub async fn dispatch(
     pass: GatePass<'_>,
     args: serde_json::Value,
     ctx: &ToolCtx,
 ) -> Result<String, String> {
     let name = pass.name();
+    // Before ANY executor runs, and after the gate has admitted the call (the
+    // pass is proof of that): a refused call must leave no checkpoint blaming
+    // a tool that never ran.
+    if crate::offload::toolclass::mutates_fs(name) {
+        if let Some(cp) = &ctx.checkpoint {
+            // Awaited: see this function's doc. Infallible by construction —
+            // `on_tool` swallows its own errors so a shadow-repo problem can
+            // never fail a tool call the user asked for.
+            //
+            // `None` deadline, unlike the two out-of-process seams: this one is
+            // in-process and nothing here gives up waiting, so the snapshot has
+            // no reason to abandon itself — the executor below simply does not
+            // start until it is done. The pre-tool budget exists only where a
+            // caller stops waiting while the agent's tool runs anyway
+            // (`loopback::TOOL_CHECKPOINT_BUDGET`). The returned "did it settle"
+            // flag has no consumer here for the same reason: there is no miss
+            // this seam can produce.
+            let _ = cp
+                .workbench
+                .on_tool(
+                    &cp.root,
+                    crate::workbench::shadow::Origin::new(
+                        Some("offload".to_string()),
+                        None,
+                        cp.tab.clone(),
+                    ),
+                    &format!("offload:{name}"),
+                    None,
+                )
+                .await;
+        }
+    }
     match name {
         "read_file" => read_file::execute(args, ctx).await,
         "list_dir" => list_dir::execute(args, ctx).await,

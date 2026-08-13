@@ -213,6 +213,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ── platform-shaped path fixtures ──────────────────────────────────────
+    //
+    // The behaviour under test is platform-NEUTRAL: an absolute shell path is
+    // passed through untouched, a relative one is joined against the payload
+    // cwd. `Path::is_absolute()` — the branch `plan_request` actually takes —
+    // is not: `C:\proj\a.rs` is a *relative* path on Linux, so a hard-coded
+    // Windows literal silently flips these tests onto the other branch and
+    // fails (`C:/other/C:\proj\a.rs`) rather than testing anything.
+    //
+    // Native-shaped fixtures keep the assertions byte-identical on both
+    // targets. A `#[cfg(windows)]` gate would have been the cheaper fix and is
+    // deliberately NOT what happened here: `read_hook.rs:191` is production
+    // code that runs on Linux too, so its two branches must stay covered by
+    // the Linux CI job rather than being skipped there.
+
+    /// The hook payload's cwd — absolute on the host platform.
+    #[cfg(windows)]
+    const CWD: &str = "C:/proj";
+    #[cfg(not(windows))]
+    const CWD: &str = "/proj";
+
+    /// An absolute path as a shell command would spell it, natively.
+    #[cfg(windows)]
+    const ABS_FILE: &str = "C:\\proj\\a.rs";
+    #[cfg(not(windows))]
+    const ABS_FILE: &str = "/proj/a.rs";
+
+    /// A cwd the absolute-path test must NOT be resolved against.
+    #[cfg(windows)]
+    const OTHER_CWD: &str = "C:/other";
+    #[cfg(not(windows))]
+    const OTHER_CWD: &str = "/other";
+
     #[test]
     fn read_payload_forwards_offset_and_limit_no_prefix() {
         let input = json!({ "file_path": "C:/proj/big.rs", "offset": 40, "limit": 80 });
@@ -231,12 +264,8 @@ mod tests {
 
     #[test]
     fn bash_whole_file_read_resolves_relative_path_against_cwd() {
-        let r = plan_request(
-            Some("Bash"),
-            &json!({ "command": "cat foo.txt" }),
-            "C:/proj",
-        )
-        .expect("bash request");
+        let r = plan_request(Some("Bash"), &json!({ "command": "cat foo.txt" }), CWD)
+            .expect("bash request");
         // Absolutized against cwd (not left bare-relative), offset/limit cleared,
         // and carries the shell deny prefix.
         assert!(
@@ -258,11 +287,11 @@ mod tests {
     fn bash_absolute_path_is_left_as_is() {
         let r = plan_request(
             Some("Bash"),
-            &json!({ "command": "cat C:\\proj\\a.rs" }),
-            "C:/other",
+            &json!({ "command": format!("cat {ABS_FILE}") }),
+            OTHER_CWD,
         )
         .expect("bash request");
-        assert_eq!(r.file_path, "C:\\proj\\a.rs");
+        assert_eq!(r.file_path, ABS_FILE);
     }
 
     #[test]
@@ -289,16 +318,12 @@ mod tests {
     /// (same file_path/offset/limit) — the only difference is the deny prefix.
     #[test]
     fn read_and_cat_yield_identical_body_modulo_prefix() {
-        let bash = plan_request(
-            Some("Bash"),
-            &json!({ "command": "cat foo.txt" }),
-            "C:/proj",
-        )
-        .expect("bash");
+        let bash = plan_request(Some("Bash"), &json!({ "command": "cat foo.txt" }), CWD)
+            .expect("bash");
         let read = plan_request(
             Some("Read"),
             &json!({ "file_path": bash.file_path.clone() }),
-            "C:/proj",
+            CWD,
         )
         .expect("read");
         assert_eq!(bash.file_path, read.file_path);

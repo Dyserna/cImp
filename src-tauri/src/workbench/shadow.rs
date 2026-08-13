@@ -31,7 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -119,6 +119,15 @@ pub enum Trigger {
     Burst,
     Manual,
     PreRestore,
+    /// **V33 Phase F** — taken immediately before a filesystem-mutating TOOL
+    /// call, attributed to that exact call via [`Origin::source`]. Composes
+    /// with `Prompt`/`Burst` rather than replacing either: a prompt checkpoint
+    /// answers "what did this turn start from", a tool checkpoint answers
+    /// "what did *this edit* start from".
+    ///
+    /// An older build reading a `tool` checkpoint sees `Manual` (see
+    /// [`Trigger::parse`]) — the accepted degradation, not a bug.
+    Tool,
 }
 
 impl Trigger {
@@ -128,6 +137,7 @@ impl Trigger {
             Trigger::Burst => "burst",
             Trigger::Manual => "manual",
             Trigger::PreRestore => "pre-restore",
+            Trigger::Tool => "tool",
         }
     }
 
@@ -140,6 +150,7 @@ impl Trigger {
             "prompt" => Trigger::Prompt,
             "burst" => Trigger::Burst,
             "pre-restore" => Trigger::PreRestore,
+            "tool" => Trigger::Tool,
             _ => Trigger::Manual,
         }
     }
@@ -192,6 +203,16 @@ pub struct Origin {
     /// The cImp TAB id. The one field that tells two same-agent tabs on one
     /// project root apart.
     pub tab: Option<String>,
+    /// **V33 Phase F** — the TOOL CALL this checkpoint was taken immediately
+    /// before, as `harness:tool_name` (`claude:Bash`, `offload:run_command`,
+    /// `opencode:edit`). `None` for every other trigger.
+    ///
+    /// **A NAMED field, set through [`Origin::with_source`] — deliberately NOT
+    /// a fourth positional argument to [`Origin::new`].** This struct exists
+    /// because four optional same-typed strings in a row is exactly the shape a
+    /// call site transposes silently (see the type doc above); adding a fourth
+    /// positional would have made the hazard worse, not the same.
+    pub source: Option<String>,
 }
 
 impl Origin {
@@ -200,16 +221,32 @@ impl Origin {
     /// *not* sanitized here — that happens at the write boundary
     /// ([`trailer_identity`]), which is where the framing they could break
     /// lives.
+    ///
+    /// Still THREE arguments after V33 Phase F: `source` rides
+    /// [`Self::with_source`] instead — see that field's doc.
     pub fn new(agent: Option<String>, session: Option<String>, tab: Option<String>) -> Self {
-        fn norm(v: Option<String>) -> Option<String> {
-            v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-        }
         Self {
-            agent: norm(agent),
-            session: norm(session),
-            tab: norm(tab),
+            agent: norm_identity(agent),
+            session: norm_identity(session),
+            tab: norm_identity(tab),
+            source: None,
         }
     }
+
+    /// V33 Phase F: attach the `harness:tool_name` this checkpoint was taken
+    /// before. Normalized on the same terms as the other three fields, so a
+    /// blank source reads as "no tool behind this checkpoint" rather than as an
+    /// empty tool name.
+    pub fn with_source(mut self, source: Option<String>) -> Self {
+        self.source = norm_identity(source);
+        self
+    }
+}
+
+/// Blank/absent ⇒ `None`, shared by [`Origin::new`] and
+/// [`Origin::with_source`] so the four fields can never normalize differently.
+fn norm_identity(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// One row of the Timeline section (`workbench_checkpoints`).
@@ -238,6 +275,21 @@ pub struct Checkpoint {
     /// makes two same-agent tabs on one root distinguishable in the Timeline.
     /// `None` on the same terms as `session`.
     pub tab: Option<String>,
+    /// **V33 Phase F** — the tool call this checkpoint was taken immediately
+    /// before, `harness:tool_name` ([`Origin::source`]). `None` for every
+    /// non-`Tool` trigger.
+    ///
+    /// **The frontend distinguishes two absences and this field must preserve
+    /// that.** `Checkpoint.source?: string | null` in `src/lib/workbench.ts`:
+    /// `undefined` means "the backend predates this field", `null` means "no
+    /// tool behind this checkpoint". This struct derives plain `Serialize` with
+    /// no `skip_serializing_if`, so an `Option::None` is emitted as JSON `null`
+    /// — the second reading, which is the correct one for every checkpoint THIS
+    /// build writes. The `undefined` reading is produced by an older backend not
+    /// emitting the key at all, which is exactly what it means. Adding
+    /// `skip_serializing_if = "Option::is_none"` here would collapse the two
+    /// and must not be done.
+    pub source: Option<String>,
     // TODO(C5, soft-dep on V12 Phase A `run_check`): an optional
     // `check_summary: Option<HashMap<String, u32>>` (check name → error
     // count), captured from the most recent `CheckReport` when the checks
@@ -678,8 +730,8 @@ async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
 /// `WorkbenchService::maybe_snapshot`'s min-gap throttle (it is keyed per
 /// `(root, tab)`), so a second tab reaching this function moments after the
 /// first is now the ORDINARY case rather than one the throttle mostly
-/// prevented. The existing checkpoint's `Session`/`Tab` trailers are left
-/// **exactly as they were written**: they are a record of who took *that*
+/// prevented. The existing checkpoint's `Session`/`Tab`/`Source` trailers are
+/// left **exactly as they were written**: they are a record of who took *that*
 /// snapshot, and retro-writing the current caller's identity onto it would be
 /// the "silently mislabel an existing checkpoint" failure — it would also
 /// rewrite the commit (changing the `commit` sha every consumer displays) for
@@ -688,6 +740,11 @@ async fn resolve_commit(ctx: &GitCtx, id: &str) -> AppResult<String> {
 /// the returned id names a tree state, and that tree state is identical no
 /// matter which tab observed it. Callers must therefore not assume the id they
 /// get back carries their own identity.
+///
+/// **V33 Phase F made that "must not" checkable** — see [`SnapshotOutcome`] and
+/// [`snapshot_detailed`]. This function keeps returning the bare id for the
+/// callers that legitimately do not care (they want a restorable tree state,
+/// not an attribution).
 pub async fn snapshot(
     root: &Path,
     label: &str,
@@ -696,9 +753,151 @@ pub async fn snapshot(
     extra_ignore: &[String],
     max_file_bytes: u64,
 ) -> AppResult<CheckpointId> {
+    require_id(
+        snapshot_detailed(
+            root,
+            label,
+            trigger,
+            origin,
+            extra_ignore,
+            max_file_bytes,
+            None,
+        )
+        .await?,
+    )
+}
+
+/// The id out of an outcome taken **without** a deadline, where
+/// [`SnapshotOutcome::Abandoned`] is unreachable by construction.
+///
+/// One shared place rather than an `unreachable!()` at each of the two
+/// deadline-less call sites ([`snapshot`] and [`restore`]'s invariant-C
+/// pre-restore snapshot): if a future edit ever hands one of them a deadline,
+/// this degrades to a plain error on a path that already returns `AppResult`,
+/// instead of panicking inside a background task.
+fn require_id(outcome: SnapshotOutcome) -> AppResult<CheckpointId> {
+    match outcome {
+        SnapshotOutcome::Created(id) | SnapshotOutcome::Deduped(id) => Ok(id),
+        SnapshotOutcome::Abandoned => Err(AppError::Workbench(
+            "shadow snapshot abandoned against a deadline this caller never set".to_string(),
+        )),
+    }
+}
+
+/// What [`snapshot_detailed`] answers: **which of the three things happened**,
+/// and the checkpoint id in the two cases where there is one.
+///
+/// # Why this is an enum (V33 Phase F, locked contract)
+///
+/// [`snapshot`]'s dedup returns an EXISTING checkpoint when the tree is
+/// unchanged, and deliberately does not relabel it (see [`snapshot`]'s doc).
+/// For the prompt/burst/manual triggers that is invisible — nobody reports the
+/// id anywhere identity-bearing. For the Phase F **tool** trigger it is a
+/// correctness hazard: a pre-tool checkpoint over an unchanged tree gets back an
+/// id belonging to another trigger and possibly another TAB, and a caller that
+/// then said "this tool call's checkpoint is cp-7" would be attributing another
+/// conversation's snapshot to this tool call — a fabricated causal claim in the
+/// one record the Timeline exists to be trusted on after an incident.
+///
+/// **The locked rule: a caller must not claim a checkpoint it did not create,
+/// and must never relabel another trigger's checkpoint.** [`Deduped`] is how a
+/// caller honours it. Nothing about the git storage needs to change for this —
+/// a dedup hit writes no commit, so no `Source:`/`Tab:` trailer of the current
+/// caller's ever exists on disk. The variant closes the *reporting* half.
+///
+/// [`Abandoned`] is the 2026-08-13 amendment's half of the same rule, one step
+/// further out: the caller's pre-tool budget expired, so this call refuses to
+/// write a `Trigger::Tool` commit **at all**. See [`snapshot_detailed`]'s
+/// `deadline`.
+///
+/// [`Deduped`]: SnapshotOutcome::Deduped
+/// [`Abandoned`]: SnapshotOutcome::Abandoned
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotOutcome {
+    /// This call wrote a new commit and tagged it. The id is the caller's own.
+    Created(CheckpointId),
+    /// The tree was byte-identical to the latest checkpoint, so nothing was
+    /// written. The id names an EXISTING checkpoint with someone else's
+    /// identity on it — a caller may restore it, and may not claim it.
+    Deduped(CheckpointId),
+    /// The `deadline` expired before a commit could be written, so **nothing
+    /// was written and there is no id**. See [`snapshot_detailed`].
+    Abandoned,
+}
+
+impl SnapshotOutcome {
+    /// The checkpoint id, for the two outcomes that name one.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Created(id) | Self::Deduped(id) => Some(id.as_str()),
+            Self::Abandoned => None,
+        }
+    }
+
+    /// Whether THIS call is the one that wrote the checkpoint — the predicate an
+    /// identity-bearing caller must pass before naming an id as its own.
+    pub fn created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
+/// [`snapshot`], plus which of the three [`SnapshotOutcome`]s happened — the
+/// entry point every identity-bearing caller must use.
+///
+/// # `deadline` — the pre-tool budget (2026-08-13 amendment, locked)
+///
+/// `None` for every trigger whose caller waits indefinitely: the prompt tap and
+/// the burst tap (both fire-and-forget), the manual button, `restore`'s
+/// invariant-C snapshot, and the offload worker's own `dispatch` (which has not
+/// spawned anything yet and can simply wait).
+///
+/// `Some(instant)` for the two **out-of-process** Phase F seams — the Claude
+/// `PreToolUse` shim and the OpenCode `tool.execute.before` plugin hook — whose
+/// wait on the app is bounded (~2 s) because the agent's tool runs the moment
+/// they stop waiting. Past that instant, a `Trigger::Tool` checkpoint would be
+/// a checkpoint whose staging **overlapped the very tool call it names**, and a
+/// row that sometimes contains the change it claims to predate is worse than no
+/// row: it silently misleads a restore. So the deadline is enforced HERE, at
+/// the one place that decides whether a commit is written, rather than in the
+/// caller — a caller that merely stops waiting does not stop this function from
+/// minting the row.
+///
+/// The deadline bounds the *decision*, not git: an already-running `git add -A`
+/// is left to finish (killing it would leave the shadow index locked behind a
+/// detached child). Overlap therefore still happens — what cannot happen is a
+/// checkpoint being *claimed* for it.
+pub async fn snapshot_detailed(
+    root: &Path,
+    label: &str,
+    trigger: Trigger,
+    origin: &Origin,
+    extra_ignore: &[String],
+    max_file_bytes: u64,
+    deadline: Option<Instant>,
+) -> AppResult<SnapshotOutcome> {
     let lock = shadow_lock(root);
+    // Deliberately inside the budget: contending for another trigger's shadow
+    // lock is one of the two real ways a pre-tool snapshot runs long (the other
+    // is a large `git add -A`), and a caller that waited out its budget on a
+    // lock is in exactly the position the deadline exists to detect.
     let _guard = lock.lock().await;
-    snapshot_inner(root, label, trigger, origin, extra_ignore, max_file_bytes).await
+    snapshot_inner(
+        root,
+        label,
+        trigger,
+        origin,
+        extra_ignore,
+        max_file_bytes,
+        deadline,
+    )
+    .await
+}
+
+/// Whether a pre-tool budget has run out. `None` (no budget) is never expired —
+/// that is the whole of the pre-2026-08-13 behaviour, preserved by construction
+/// rather than by a branch at each call site.
+fn past_deadline(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
 }
 
 /// The body of [`snapshot`], WITHOUT acquiring the per-root shadow lock — so
@@ -713,7 +912,15 @@ async fn snapshot_inner(
     origin: &Origin,
     extra_ignore: &[String],
     max_file_bytes: u64,
-) -> AppResult<CheckpointId> {
+    deadline: Option<Instant>,
+) -> AppResult<SnapshotOutcome> {
+    // Cheapest possible abandonment: the budget was already gone before any git
+    // ran (a long wait on the shadow lock, or a caller that arrived late). Doing
+    // the `git add -A` first and *then* discarding it would cost the user the
+    // same work for the same nothing.
+    if past_deadline(deadline) {
+        return Ok(SnapshotOutcome::Abandoned);
+    }
     ensure(root, extra_ignore).await?;
     let ctx = shadow_ctx(root);
 
@@ -727,31 +934,52 @@ async fn snapshot_inner(
     // dedup check returned early) — see the doc comment above for why.
     let current_tree = stage_and_write_tree(&ctx, root, max_file_bytes).await?;
 
+    // **The load-bearing check.** Staging is the expensive step and the one that
+    // races the tool call: if it did not finish inside the caller's budget, the
+    // tree just written may already contain the edit this checkpoint exists to
+    // precede. Checked BEFORE the dedup arm on purpose — a dedup hit past the
+    // budget would report "nothing changed", which reads as a fact about the
+    // tree when all we actually know is that we ran out of time to have an
+    // opinion about it.
+    if past_deadline(deadline) {
+        return Ok(SnapshotOutcome::Abandoned);
+    }
+
     if let Some(last_tag) = latest_checkpoint_tag(&ctx).await? {
         let spec = format!("{last_tag}^{{tree}}");
         let last_tree = git::run(&ctx, &["rev-parse", "-q", "--verify", &spec], None).await?;
         if last_tree.success() && last_tree.stdout.trim() == current_tree {
-            return Ok(last_tag);
+            // NOTHING is written here — not a commit, not a relabel of the
+            // existing tag's trailers. `Deduped` is what tells the caller the id
+            // it is holding is someone else's (see [`SnapshotOutcome`]).
+            return Ok(SnapshotOutcome::Deduped(last_tag));
         }
     }
 
     let seq = next_seq(&ctx).await?;
     let tag = format!("cp-{seq}");
-    // Identity trailers go LAST, after the three Phase C ones. That ordering is
-    // load-bearing for [`list`]'s backward compatibility — see its note — and it
-    // keeps the message a checkpoint with no identity produces byte-identical to
-    // the old one apart from two appended placeholder lines.
+    // Identity trailers go LAST, after the three Phase C ones, and each new one
+    // is APPENDED at the tail. That ordering is load-bearing for [`list`]'s
+    // backward compatibility — see its note — and it keeps the message a
+    // checkpoint with no identity produces byte-identical to the old one apart
+    // from appended placeholder lines.
+    //
+    // V33 Phase F appends `Source:` after `Tab:` under exactly that rule.
     //
     // Every value goes through [`trailer_identity`]: nothing caller-asserted
-    // reaches this commit message without passing the framing check.
+    // reaches this commit message without passing the framing check. `source` is
+    // composed by cImp (`harness:tool_name`) rather than asserted by a caller,
+    // but it still carries a harness-supplied tool NAME, so it goes through the
+    // same boundary as the rest — the hazard is in the value, not in who sent it.
     let message = format!(
-        "{}\n\nTrigger: {}\nAgent: {}\nFiles-Changed: {}\nSession: {}\nTab: {}\n",
+        "{}\n\nTrigger: {}\nAgent: {}\nFiles-Changed: {}\nSession: {}\nTab: {}\nSource: {}\n",
         truncate_label(label),
         trigger.as_str(),
         trailer_identity(origin.agent.as_deref()),
         changed.len(),
         trailer_identity(origin.session.as_deref()),
         trailer_identity(origin.tab.as_deref()),
+        trailer_identity(origin.source.as_deref()),
     );
     let commit = git::run_with_stdin(
         &ctx,
@@ -774,7 +1002,7 @@ async fn snapshot_inner(
             tag_out.stderr.trim()
         )));
     }
-    Ok(tag)
+    Ok(SnapshotOutcome::Created(tag))
 }
 
 /// Every checkpoint, oldest first, read back from `refs/tags/cp-*` via
@@ -801,9 +1029,9 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
     // end-of-line newline trailing the RS), which the whole-record `.trim()`
     // and per-field `.trim()` below both strip.
     const REC_SEP: char = '\u{1e}';
-    // The `Session`/`Tab` identity fields are APPENDED after `%(refname:short)`
-    // rather than slotted in beside `Agent`, and the guard below is `<
-    // CORE_FIELDS` rather than an exact count. Both are the same
+    // The `Session`/`Tab`/`Source` identity fields are APPENDED after
+    // `%(refname:short)` rather than slotted in beside `Agent`, and the guard
+    // below is `< CORE_FIELDS` rather than an exact count. Both are the same
     // backward-compatibility decision, and it is a mandatory one: a user's
     // `.cimp/shadow.git` is full of checkpoints whose commit messages carry
     // only the three Phase C trailers, and an upgrade that emptied their
@@ -811,7 +1039,7 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
     //
     // `%(trailers:key=…)` expands to nothing for a key the commit does not
     // have, while the literal separators around it are printed regardless — so
-    // an old checkpoint yields a full-width record with two EMPTY trailing
+    // an old checkpoint yields a full-width record with EMPTY trailing
     // fields, which [`identity_field`] reads as `None`. That is asserted
     // against a real repo of hand-built old-format commits by
     // `tests::old_eight_field_checkpoints_still_list_after_the_identity_fields`
@@ -824,7 +1052,7 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
     // field the old format defined would still be at its old index, and the row
     // would list with the identity absent instead of vanishing.
     let format = format!(
-        "%(objectname){sep}%(creatordate:unix){sep}%(creatordate:iso-strict){sep}%(contents:subject){sep}%(trailers:key=Trigger,valueonly){sep}%(trailers:key=Agent,valueonly){sep}%(trailers:key=Files-Changed,valueonly){sep}%(refname:short){sep}%(trailers:key=Session,valueonly){sep}%(trailers:key=Tab,valueonly){rec_sep}",
+        "%(objectname){sep}%(creatordate:unix){sep}%(creatordate:iso-strict){sep}%(contents:subject){sep}%(trailers:key=Trigger,valueonly){sep}%(trailers:key=Agent,valueonly){sep}%(trailers:key=Files-Changed,valueonly){sep}%(refname:short){sep}%(trailers:key=Session,valueonly){sep}%(trailers:key=Tab,valueonly){sep}%(trailers:key=Source,valueonly){rec_sep}",
         sep = FIELD_SEP,
         rec_sep = REC_SEP
     );
@@ -879,6 +1107,11 @@ pub async fn list(root: &Path) -> AppResult<Vec<Checkpoint>> {
             files_changed: fields[6].trim().parse().unwrap_or(0),
             session: identity_field(fields.get(8).copied()),
             tab: identity_field(fields.get(9).copied()),
+            // V33 Phase F, index 10 — the tail slot, read through `get` like
+            // its two neighbours. `CORE_FIELDS` stays 8 and the guard stays
+            // `<`: a checkpoint written before this field existed is a
+            // 10-field record and must still list, with `source: None`.
+            source: identity_field(fields.get(10).copied()),
         });
     }
     checkpoints.sort_by_key(|c| c.seq);
@@ -987,15 +1220,24 @@ pub async fn restore(
     // `Origin::default()`: a pre-restore safety snapshot belongs to the restore
     // action, not to any conversation — the same "no identity" answer the
     // manual and burst triggers give.
-    let pre_restore_id = snapshot_inner(
-        root,
-        "pre-restore",
-        Trigger::PreRestore,
-        &Origin::default(),
-        extra_ignore,
-        max_file_bytes,
-    )
-    .await?;
+    // `Created` vs `Deduped` is deliberately ignored here: a pre-restore
+    // snapshot over an unchanged tree legitimately reuses the existing
+    // checkpoint (that tree state IS the undo point, whoever recorded it), and
+    // `Origin::default()` means there is no identity to mis-attribute in the
+    // first place. `None` deadline — a restore is a user action that waits for
+    // its own safety net, so `Abandoned` is unreachable ([`require_id`]).
+    let pre_restore_id = require_id(
+        snapshot_inner(
+            root,
+            "pre-restore",
+            Trigger::PreRestore,
+            &Origin::default(),
+            extra_ignore,
+            max_file_bytes,
+            None,
+        )
+        .await?,
+    )?;
     let pre_sha = resolve_commit(&ctx, &pre_restore_id).await?;
 
     let added = git::run(
@@ -1799,6 +2041,269 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── V33 Phase F: the tool trigger + its `Source:` trailer ───────────────
+
+    /// A `Trigger::Tool` checkpoint round-trips its wire value AND its
+    /// `harness:tool_name` source, alongside the identity fields — i.e. the
+    /// tail-appended `Source:` trailer lands in slot 10 and comes back out of
+    /// slot 10, with the nine fields before it unmoved.
+    ///
+    /// **What it would still pass with:** a reader that took `Source` from the
+    /// wrong index would still produce *a* string, so every neighbouring field
+    /// is asserted for its exact value rather than for being non-empty — a
+    /// shifted format shows up as `tab == Some("claude:Edit")`, not as a bare
+    /// `None`.
+    #[tokio::test]
+    async fn a_tool_checkpoint_records_the_call_it_was_taken_before() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("tool-source");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        snapshot(
+            &dir,
+            "tool: claude:Edit",
+            Trigger::Tool,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-aaa".into()),
+                Some("claude-2".into()),
+            )
+            .with_source(Some("claude:Edit".into())),
+            &[],
+            0,
+        )
+        .await
+        .expect("tool snapshot");
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 1);
+        let cp = &cps[0];
+        assert_eq!(cp.trigger, Trigger::Tool, "the `tool` wire value must parse");
+        assert_eq!(cp.source, Some("claude:Edit".to_string()));
+        // The nine fields ahead of `Source` are exactly where they were.
+        assert_eq!(cp.label, "tool: claude:Edit");
+        assert_eq!(cp.agent, Some("claude".to_string()));
+        assert_eq!(cp.session, Some("sess-aaa".to_string()));
+        assert_eq!(cp.tab, Some("claude-2".to_string()));
+        assert_eq!(cp.id, "cp-1");
+        assert_eq!(cp.files_changed, 1);
+
+        // And a checkpoint from any OTHER trigger reports `source: None` — the
+        // frontend's "no tool behind this checkpoint" reading, which must stay
+        // distinct from "this backend predates the field".
+        std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+        snapshot(&dir, "manual", Trigger::Manual, &Origin::default(), &[], 0)
+            .await
+            .expect("manual snapshot");
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps[1].trigger, Trigger::Manual);
+        assert_eq!(cps[1].source, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The locked V33 Phase F dedupe contract, executed.** A pre-tool
+    /// checkpoint over an UNCHANGED tree gets back a checkpoint belonging to
+    /// another trigger and another tab. The caller must be able to tell, and the
+    /// existing checkpoint must not be relabelled with the tool's identity.
+    ///
+    /// The two halves are separate claims and both are asserted:
+    ///   * `created == false` — the caller can honour "do not claim it";
+    ///   * the existing row still reads `trigger: prompt`, `tab: claude`,
+    ///     `source: None` — nothing retro-labelled it `tool` / `claude:Bash`.
+    ///
+    /// **What it would still pass with:** if `snapshot_detailed` always answered
+    /// `created: true`, the trailer assertions alone would still pass (nothing
+    /// is written either way) — so the flag is asserted in BOTH directions, with
+    /// a real file change proving `created: true` is reachable at all.
+    #[tokio::test]
+    async fn a_deduped_tool_checkpoint_reports_that_it_created_nothing() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("tool-dedup");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let first = snapshot_detailed(
+            &dir,
+            "prompt: tab one",
+            Trigger::Prompt,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-aaa".into()),
+                Some("claude".into()),
+            ),
+            &[],
+            0,
+            None,
+        )
+        .await
+        .expect("prompt snapshot");
+        assert!(first.created(), "the first snapshot really creates one");
+
+        // A DIFFERENT tab is about to run `Bash`, and nothing has changed on
+        // disk since tab one's prompt checkpoint.
+        let tool = snapshot_detailed(
+            &dir,
+            "tool: claude:Bash",
+            Trigger::Tool,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-bbb".into()),
+                Some("claude-2".into()),
+            )
+            .with_source(Some("claude:Bash".into())),
+            &[],
+            0,
+            None,
+        )
+        .await
+        .expect("tool snapshot");
+        assert_eq!(tool.id(), first.id(), "dedup returns the existing checkpoint");
+        assert!(
+            !tool.created(),
+            "a dedup hit must report that it created nothing — the caller may not \
+             claim a checkpoint it did not take"
+        );
+
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 1, "a dedup hit must not mint a checkpoint");
+        assert_eq!(
+            cps[0].trigger,
+            Trigger::Prompt,
+            "the existing checkpoint must not be relabelled `tool`"
+        );
+        assert_eq!(cps[0].tab, Some("claude".to_string()));
+        assert_eq!(
+            cps[0].source, None,
+            "the existing checkpoint must not gain the tool call's `Source`"
+        );
+
+        // …and with a real change, the tool trigger does create its own.
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        let tool2 = snapshot_detailed(
+            &dir,
+            "tool: claude:Bash",
+            Trigger::Tool,
+            &Origin::new(
+                Some("claude".into()),
+                Some("sess-bbb".into()),
+                Some("claude-2".into()),
+            )
+            .with_source(Some("claude:Bash".into())),
+            &[],
+            0,
+            None,
+        )
+        .await
+        .expect("second tool snapshot");
+        assert!(tool2.created());
+        assert_ne!(tool2.id(), first.id());
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps[1].source, Some("claude:Bash".to_string()));
+        assert_eq!(cps[1].tab, Some("claude-2".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The 2026-08-13 amendment, executed: past its budget a pre-tool
+    /// snapshot writes NOTHING.**
+    ///
+    /// The claim under test is not "it returns `Abandoned`" — that alone would
+    /// be satisfied by a function that returned the variant *after* tagging the
+    /// commit, which is the exact failure being prevented (a row claiming to
+    /// predate an edit it may contain). So the shadow repo itself is asserted:
+    /// no new checkpoint, and the tree the earlier checkpoint recorded is
+    /// untouched even though the working tree has since changed.
+    ///
+    /// **What it would still pass with:** a deadline check that ran only at
+    /// function entry would also pass here, since the budget is already spent on
+    /// arrival — so the second half drives a deadline that expires *during* the
+    /// call (`Instant::now()`, checked again after staging) and asserts the same
+    /// nothing. And a `None` deadline must still create, or the whole feature
+    /// would be off rather than bounded.
+    #[tokio::test]
+    async fn a_pre_tool_snapshot_past_its_budget_writes_nothing() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempdir("tool-deadline");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let base = snapshot(&dir, "prompt", Trigger::Prompt, &Origin::default(), &[], 0)
+            .await
+            .expect("base snapshot");
+
+        let tool_origin = Origin::new(
+            Some("claude".into()),
+            Some("sess-1".into()),
+            Some("claude".into()),
+        )
+        .with_source(Some("claude:Edit".into()));
+
+        // The work tree HAS changed, so nothing but the deadline can stop a
+        // checkpoint being written here.
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        for spent in [
+            // Gone before any git ran — the entry check.
+            Instant::now() - Duration::from_secs(1),
+            // Still in the future at the entry check and gone by the one after
+            // staging, so a build that only checked at entry would create a
+            // checkpoint here. Not a race: reaching the second check costs at
+            // least three spawned `git` processes (`ensure`, the changed-files
+            // read, `add -A` + `write-tree`), which is orders of magnitude past
+            // a millisecond on any machine that can run this suite.
+            Instant::now() + Duration::from_millis(1),
+        ] {
+            let out = snapshot_detailed(
+                &dir,
+                "tool: claude:Edit",
+                Trigger::Tool,
+                &tool_origin,
+                &[],
+                0,
+                Some(spent),
+            )
+            .await
+            .expect("an expired budget is not an error");
+            assert_eq!(out, SnapshotOutcome::Abandoned);
+            assert_eq!(out.id(), None, "an abandoned snapshot names no checkpoint");
+            assert!(!out.created());
+
+            let cps = list(&dir).await.expect("list");
+            assert_eq!(
+                cps.len(),
+                1,
+                "abandonment must leave the shadow repo exactly as it found it: {cps:?}"
+            );
+            assert_eq!(cps[0].id, base);
+            assert_eq!(cps[0].trigger, Trigger::Prompt);
+            assert_eq!(cps[0].source, None);
+        }
+
+        // …and the same call with no budget still creates one, so the test
+        // above is measuring the deadline and not a broken snapshot path.
+        let ok = snapshot_detailed(
+            &dir,
+            "tool: claude:Edit",
+            Trigger::Tool,
+            &tool_origin,
+            &[],
+            0,
+            None,
+        )
+        .await
+        .expect("unbudgeted tool snapshot");
+        assert!(ok.created());
+        let cps = list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[1].source, Some("claude:Edit".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A session id or tab id carrying a newline, a `\u{1f}` field separator or
     /// a `\u{1e}` record separator cannot corrupt the record, drop the row, or
     /// bleed into an adjacent field.
@@ -1937,7 +2442,16 @@ mod tests {
         assert_eq!(o.agent, None);
         assert_eq!(o.session, None);
         assert_eq!(o.tab, Some("tab".to_string()));
+        assert_eq!(o.source, None, "`new` never invents a source");
         assert_eq!(Origin::new(None, None, None), Origin::default());
+        // V33 Phase F: `with_source` normalizes on the same terms, so a blank
+        // source reads as "no tool behind this checkpoint" and never as an
+        // empty tool name — which `checkpointSource()` on the frontend also
+        // collapses to null, so the two ends agree.
+        let s = Origin::default().with_source(Some("  claude:Bash ".into()));
+        assert_eq!(s.source, Some("claude:Bash".to_string()));
+        assert_eq!(Origin::default().with_source(Some("   ".into())).source, None);
+        assert_eq!(Origin::default().with_source(None), Origin::default());
     }
 
     // ── restore: round trip, CRLF-faithful, invariant D, invariant C ────

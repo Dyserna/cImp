@@ -1231,6 +1231,10 @@ async fn spawn_and_capture(
     // Don't flash a console window per spawned scanner on Windows.
     #[cfg(windows)]
     cmd.creation_flags(crate::procutil::CREATE_NO_WINDOW);
+    // V33 C3: Unix-only — own process group, so the cancel/timeout `kill_tree`
+    // below reaps semgrep's forked workers the same way `taskkill /T` does on
+    // Windows. This is the seam the whole-tree kill was written for.
+    crate::procutil::own_process_group(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

@@ -160,7 +160,7 @@ pub const SHELL_BROOT_TAB_ID: &str = "shell-broot";
 /// Files that pre-date V1.10 lack the field entirely; the cascade still
 /// uses the `looks_v1_X` predicates for those, falling through to a final
 /// step that stamps the field with the current value.
-pub const CURRENT_SCHEMA_VERSION: u8 = 30;
+pub const CURRENT_SCHEMA_VERSION: u8 = 31;
 
 fn current_schema_version() -> u8 {
     CURRENT_SCHEMA_VERSION
@@ -2165,10 +2165,17 @@ impl Default for OffloadSettings {
 /// V9-01: per-project code knowledge graph configuration. The structural
 /// graph (symbols/refs/calls/imports/full-text docs) needs no embedding
 /// model; the `semantic_*` fields drive the optional Phase-G semantic search
-/// over a remote `/v1/embeddings` endpoint. No secrets here, so `Debug` is
-/// derived (unlike [`OffloadSettings`]). Additive `#[serde(default)]` — old
+/// over a remote `/v1/embeddings` endpoint. Additive `#[serde(default)]` — old
 /// settings files round-trip with the feature disabled.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+///
+/// **V33 Phase E: this block now holds a secret** — `embedding_auth_token` —
+/// so `Debug` is hand-rolled and redacts it, exactly like [`OffloadSettings`]
+/// and [`ClaudeLocalSettings`]. (It read "No secrets here, so `Debug` is
+/// derived" until the token landed; a derived `Debug` would print the bearer
+/// token into the rolling log the first time anyone logs a settings snapshot.)
+/// `graph_settings_debug_covers_every_field_and_redacts_the_token` keeps the
+/// hand-rolled impl from silently omitting a future field.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphSettings {
     /// Master switch. Off = no indexing, no `graph_*` tools, no monitor tab.
@@ -2213,6 +2220,17 @@ pub struct GraphSettings {
     /// OpenAI-compatible `/v1/embeddings` endpoint (e.g. a `llama-server
     /// --embedding` on a spare GPU box).
     pub embedding_endpoint: String,
+    /// V33 Phase E: bearer token sent on every request to
+    /// [`embedding_endpoint`](Self::embedding_endpoint) — the embeddings POST
+    /// and the `/props`, `/tokenize`, `/detokenize` helpers alike. Empty (the
+    /// default, and every pre-V33 settings file) = no `Authorization` header,
+    /// i.e. exactly the pre-V33 behaviour.
+    ///
+    /// Why this one matters most: the embedding endpoint is the only LAN
+    /// service whose corruption is **silent**. A poisoned `/health` fails
+    /// loudly; poisoned vectors just make semantic search quietly wrong, for
+    /// as long as the epoch lives. Redacted in `Debug` (see the type doc).
+    pub embedding_auth_token: String,
     /// Embedding model id requested from the endpoint. Baked into the vector
     /// "epoch"; changing it forces a re-embed.
     pub embedding_model: String,
@@ -2438,6 +2456,100 @@ pub struct GraphSettings {
     pub usage_color_agent: String,
 }
 
+impl std::fmt::Debug for GraphSettings {
+    /// Hand-rolled since V33 Phase E purely to redact
+    /// [`embedding_auth_token`](GraphSettings::embedding_auth_token); every
+    /// other field prints exactly as the derive would.
+    ///
+    /// The hazard a hand-rolled `Debug` on a struct this wide introduces is
+    /// *silent omission* — a field added later, never listed here, simply
+    /// vanishes from every debug line. That is what
+    /// `graph_settings_debug_covers_every_field_and_redacts_the_token` pins:
+    /// it walks the serialized key set and requires each name to appear below.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphSettings")
+            .field("enabled", &self.enabled)
+            .field("languages", &self.languages)
+            .field("ignore", &self.ignore)
+            .field("index_docs", &self.index_docs)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("watch_debounce_ms", &self.watch_debounce_ms)
+            .field("max_rows_per_query", &self.max_rows_per_query)
+            .field("max_snippet_bytes", &self.max_snippet_bytes)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("db_subdir", &self.db_subdir)
+            .field("allow_remote_worker_access", &self.allow_remote_worker_access)
+            .field("semantic_search", &self.semantic_search)
+            .field("embedding_endpoint", &self.embedding_endpoint)
+            // The one reason this impl exists.
+            .field(
+                "embedding_auth_token",
+                &if self.embedding_auth_token.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_dims", &self.embedding_dims)
+            .field("embed_code_bodies", &self.embed_code_bodies)
+            .field("embedding_batch", &self.embedding_batch)
+            .field("embedding_max_tokens", &self.embedding_max_tokens)
+            .field("semantic_code_max_chunks", &self.semantic_code_max_chunks)
+            .field("context_injection", &self.context_injection)
+            .field("context_per_file_chars", &self.context_per_file_chars)
+            .field("context_turn_budget_chars", &self.context_turn_budget_chars)
+            .field("context_include_session", &self.context_include_session)
+            .field("context_min_score", &self.context_min_score)
+            .field("repo_map_budget_chars", &self.repo_map_budget_chars)
+            .field("repo_map_on_session_start", &self.repo_map_on_session_start)
+            .field("context_dedup_ttl_turns", &self.context_dedup_ttl_turns)
+            .field("compaction_context", &self.compaction_context)
+            .field("read_advisor", &self.read_advisor)
+            .field("read_advisor_min_lines", &self.read_advisor_min_lines)
+            .field("read_advisor_mode", &self.read_advisor_mode)
+            .field("read_advisor_ttl_turns", &self.read_advisor_ttl_turns)
+            .field("read_advisor_diffs", &self.read_advisor_diffs)
+            .field("read_advisor_shell", &self.read_advisor_shell)
+            .field("read_advisor_first_read_kb", &self.read_advisor_first_read_kb)
+            .field("lean_tools", &self.lean_tools)
+            .field("context_llm_digests", &self.context_llm_digests)
+            .field("memory_distillation", &self.memory_distillation)
+            .field("promote_pinned_facts", &self.promote_pinned_facts)
+            .field("auto_check", &self.auto_check)
+            .field("auto_check_debounce_s", &self.auto_check_debounce_s)
+            .field(
+                "auto_impact_min_dependents",
+                &self.auto_impact_min_dependents,
+            )
+            .field("analyses_auto", &self.analyses_auto)
+            .field("path_max_hops", &self.path_max_hops)
+            .field("arch_max_communities", &self.arch_max_communities)
+            .field("arch_min_community_size", &self.arch_min_community_size)
+            .field("graph_viz", &self.graph_viz)
+            .field("graph_viz_max_nodes", &self.graph_viz_max_nodes)
+            .field("graph_viz_node_scale", &self.graph_viz_node_scale)
+            .field("graph_viz_dir_scale", &self.graph_viz_dir_scale)
+            .field("graph_viz_edge_width", &self.graph_viz_edge_width)
+            .field("graph_viz_node_spacing", &self.graph_viz_node_spacing)
+            .field("graph_viz_cluster_spacing", &self.graph_viz_cluster_spacing)
+            .field(
+                "graph_viz_cluster_strength",
+                &self.graph_viz_cluster_strength,
+            )
+            .field("graph_viz_color_call", &self.graph_viz_color_call)
+            .field("graph_viz_color_import", &self.graph_viz_color_import)
+            .field("usage_color_in", &self.usage_color_in)
+            .field("usage_color_cache", &self.usage_color_cache)
+            .field("usage_color_out", &self.usage_color_out)
+            .field("usage_color_tool", &self.usage_color_tool)
+            .field("usage_color_write", &self.usage_color_write)
+            .field("usage_color_session", &self.usage_color_session)
+            .field("usage_color_agent", &self.usage_color_agent)
+            .finish()
+    }
+}
+
 impl GraphSettings {
     /// The per-project db subdirectory, falling back to `.cimp` when unset.
     /// Single source of truth so the service and the MCP child can't open
@@ -2497,6 +2609,7 @@ impl Default for GraphSettings {
             allow_remote_worker_access: false,
             semantic_search: false,
             embedding_endpoint: String::new(),
+            embedding_auth_token: String::new(),
             embedding_model: String::new(),
             embedding_dims: 0,
             embed_code_bodies: false,
@@ -2854,7 +2967,8 @@ impl Default for OffloadToolToggles {
 /// read-class tools from each server are exposed this milestone.
 ///
 /// The hand-rolled `Debug` redacts `env` values, which may carry API
-/// keys, so a stray `?settings` log line cannot leak them.
+/// keys, and (V33 Phase E) the HTTP transport's `auth_token`, so a stray
+/// `?settings` log line cannot leak either.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -2870,6 +2984,19 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
     /// HTTP transport: the server base URL. Empty when `command` is set.
     pub url: String,
+    /// V33 Phase E: bearer token sent on every HTTP request to
+    /// [`url`](Self::url) — `initialize`, `notifications/initialized`,
+    /// `tools/list` and every `tools/call`. Empty (the default, and every
+    /// pre-V33 settings file) = no `Authorization` header, i.e. exactly the
+    /// pre-V33 behaviour, which is also the safe direction. Redacted in
+    /// `Debug`; ignored by the stdio transport, where a secret belongs in
+    /// [`env`](Self::env) instead.
+    ///
+    /// It is part of [`config_sig`](crate::offload::mcp_host::host_config_sig)
+    /// (as a fingerprint, not cleartext) — without that, editing the token in
+    /// Settings would never reconnect the server and the change would silently
+    /// do nothing.
+    pub auth_token: String,
     /// Expose this server's tools to **Claude Code** (proxied through the
     /// per-session `cimp-offload` child). Off by default — a deliberate opt-in.
     pub claude_access: bool,
@@ -2893,6 +3020,14 @@ impl std::fmt::Debug for McpServerConfig {
             // Redact values; show only which keys are present.
             .field("env_keys", &env_keys)
             .field("url", &self.url)
+            .field(
+                "auth_token",
+                &if self.auth_token.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
             .field("claude_access", &self.claude_access)
             .field("offload_access", &self.offload_access)
             .field("opencode_access", &self.opencode_access)
@@ -2908,6 +3043,7 @@ impl Default for McpServerConfig {
             args: Vec::new(),
             env: HashMap::new(),
             url: String::new(),
+            auth_token: String::new(),
             claude_access: false,
             offload_access: true,
             opencode_access: false,
@@ -3036,7 +3172,7 @@ impl ToolScope {
 /// `Local` mirrors V8-01's single-server config (the command cImp owns +
 /// spawns as a read-only tab). `Remote` is a `base_url` cImp only
 /// health-checks and connects to — no process, no tab. The hand-rolled
-/// `Debug` on [`OffloadBackend`] redacts the Remote `auth_token`.
+/// `Debug` on [`OffloadBackend`] redacts **both** variants' `auth_token`.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum OffloadBackendKind {
@@ -3054,6 +3190,42 @@ pub enum OffloadBackendKind {
         /// used for that launch only and never persisted.
         #[serde(default)]
         show_command_on_start: bool,
+        /// V33 Phase E: bearer token sent on every request cImp makes to this
+        /// server — `/health`, `/props` and the agent loop's chat completions.
+        /// Empty (the default, and every pre-V33 settings file) = no
+        /// `Authorization` header at all, i.e. exactly the pre-V33 behaviour.
+        /// Redacted in `Debug`; stored cleartext in `settings.json` like every
+        /// other house secret (`ClaudeLocalSettings::auth_token` is the model).
+        ///
+        /// This is the CLIENT half only. A `llama-server` ignores auth unless it
+        /// was launched with `--api-key`, so for a backend cImp itself spawns
+        /// the same value must also appear as `--api-key <token>` in
+        /// `server_command` — that is what makes the server demand it, and it is
+        /// also where [`crate::offload::server::derive_opencode_provider`]
+        /// already reads the key from for OpenCode's `local-llama` provider.
+        ///
+        /// **The effective token may come from the command rather than from
+        /// this field** (V33 stage 3). Because the two halves above are the same
+        /// secret, requiring it in both places was a trap: get one wrong and
+        /// offload and OpenCode disagree about a server they both talk to. So an
+        /// EMPTY value here falls back to the `--api-key` already parsed out of
+        /// `server_command`. A non-empty value still wins — the field is how you
+        /// override a stale or absent flag, which is the case that matters when
+        /// cImp does not launch the server itself.
+        ///
+        /// **Do not read this field directly to decide what to send.**
+        /// [`OffloadBackendKind::effective_auth_token`] is the resolver, and
+        /// `crate::offload::server::resolve_local_auth` is what it and
+        /// `LlamaServer::with_config` share.
+        ///
+        /// **`#[serde(default)]` is load-bearing and must stay.** Serde's
+        /// container-level default does NOT apply to enum variants (this enum is
+        /// `#[serde(tag = "type")]` with no container default), so without it
+        /// every existing settings file — none of which carries the key — would
+        /// fail to deserialize the whole `backends` array. Same reason
+        /// `show_command_on_start` above carries its own.
+        #[serde(default)]
+        auth_token: String,
     },
     /// cImp holds a `base_url` (+ optional auth) and health-checks it; it
     /// cannot start/stop the process. A LAN box or a cloud API.
@@ -3072,6 +3244,35 @@ pub enum OffloadBackendKind {
         /// party. A cloud backend is unusable until this is `true`.
         cloud_consent: bool,
     },
+}
+
+impl OffloadBackendKind {
+    /// The bearer token cImp actually sends to this backend, or `""` for none.
+    ///
+    /// **The one resolver.** Three call sites read a Local backend's credential
+    /// and they must not disagree — the supervised pool
+    /// (`offload::server::LlamaServer`, which reaches the same answer through
+    /// `resolve_local_auth` because it also needs to know *where* the token came
+    /// from), the Offload server dashboard's `/slots`+`/metrics` poller, and the
+    /// headless `cimp --offload-mcp` child that runs its own agent loop when the
+    /// app is unreachable. A backend authenticated in two of the three is a
+    /// credential bug that only shows up on whichever path the user is not
+    /// looking at.
+    ///
+    /// For `Local`, an empty configured token inherits the `--api-key` in
+    /// `server_command` — see the field doc above and
+    /// [`crate::offload::server::resolve_local_auth`]. For `Remote` there is no
+    /// command to inherit from, so it is the configured token verbatim.
+    pub fn effective_auth_token(&self) -> String {
+        match self {
+            OffloadBackendKind::Local {
+                auth_token,
+                server_command,
+                ..
+            } => crate::offload::server::resolve_local_auth(auth_token, server_command).token,
+            OffloadBackendKind::Remote { auth_token, .. } => auth_token.clone(),
+        }
+    }
 }
 
 /// V8-02: one backend in the offload pool.
@@ -3098,14 +3299,19 @@ pub struct OffloadBackend {
 
 impl std::fmt::Debug for OffloadBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Redact the Remote auth_token so a stray `?settings` log can't leak it.
+        // Redact both variants' auth_token so a stray `?settings` log can't
+        // leak one. (`server_command` is printed verbatim — it is a command
+        // line, and a user who puts `--api-key` in it has already put the
+        // secret somewhere argv-visible; see the Local `auth_token` doc.)
         let kind_dbg: String = match &self.kind {
             OffloadBackendKind::Local {
                 server_command,
                 autostart,
                 show_command_on_start,
+                auth_token,
             } => format!(
-                "Local {{ server_command: {server_command:?}, autostart: {autostart}, show_command_on_start: {show_command_on_start} }}"
+                "Local {{ server_command: {server_command:?}, autostart: {autostart}, show_command_on_start: {show_command_on_start}, auth_token: {} }}",
+                if auth_token.is_empty() { "<none>" } else { "<redacted>" }
             ),
             OffloadBackendKind::Remote {
                 base_url,
@@ -3135,6 +3341,7 @@ impl Default for OffloadBackendKind {
             server_command: String::new(),
             autostart: false,
             show_command_on_start: false,
+            auth_token: String::new(),
         }
     }
 }
@@ -3188,6 +3395,9 @@ impl OffloadSettings {
                 server_command: self.server_command.clone(),
                 autostart: self.autostart,
                 show_command_on_start: false,
+                // The legacy V8-01 fields never had a token; a user who wants
+                // one configures a real backend entry.
+                auth_token: String::new(),
             },
             declared_context: None,
             declared_model: String::new(),
@@ -4878,6 +5088,7 @@ mod tests {
                 server_command: cmd.to_string(),
                 autostart: false,
                 show_command_on_start: false,
+                auth_token: String::new(),
             },
             ..Default::default()
         }
@@ -5218,6 +5429,154 @@ mod tests {
             ),
             _ => panic!("expected Local kind"),
         }
+    }
+
+    #[test]
+    fn local_backend_kind_defaults_auth_token() {
+        // V33 Phase E, the trap this test exists for: `OffloadBackendKind` is
+        // `#[serde(tag = "type")]` with NO container-level `#[serde(default)]`,
+        // and serde's container default would not apply to enum variants even
+        // if it had one. Without the FIELD-level `#[serde(default)]` on
+        // `auth_token`, this deserialize fails — and since `backends` is a plain
+        // `Vec<OffloadBackend>`, that failure takes the WHOLE settings file with
+        // it, for every install in existence.
+        let kind: OffloadBackendKind = serde_json::from_value(json!({
+            "type": "local",
+            "server_command": "llama-server --port 12344 --jinja",
+            "autostart": true,
+            "show_command_on_start": false,
+        }))
+        .expect("a pre-V33 local kind (no auth_token) must still deserialize");
+        match kind {
+            OffloadBackendKind::Local { auth_token, .. } => assert!(
+                auth_token.is_empty(),
+                "missing field must default to no token = no Authorization header"
+            ),
+            _ => panic!("expected Local kind"),
+        }
+        // …and the whole enclosing backend list, which is how it is really read.
+        let backends: Vec<OffloadBackend> = serde_json::from_value(json!([{
+            "name": "local",
+            "enabled": true,
+            "kind": { "type": "local", "server_command": "llama-server", "autostart": false },
+        }]))
+        .expect("a pre-V33 backends array must still deserialize");
+        assert_eq!(backends.len(), 1);
+    }
+
+    /// V33 stage 3 — the resolver the dashboard poller and the headless
+    /// `--offload-mcp` child both read, in all three directions.
+    ///
+    /// It matters that this is tested at the *settings* seam and not only in
+    /// `offload::server`: those two call sites used to read the raw field, and a
+    /// backend authenticated on the supervised path but not on the dashboard or
+    /// the headless one is a credential bug that only shows up where nobody is
+    /// looking.
+    #[test]
+    fn effective_auth_token_falls_back_to_the_commands_api_key() {
+        let local = |token: &str, cmd: &str| OffloadBackendKind::Local {
+            server_command: cmd.to_string(),
+            autostart: false,
+            show_command_on_start: false,
+            auth_token: token.to_string(),
+        };
+        let keyed = "llama-server --port 12344 --api-key sk-from-cmd";
+        assert_eq!(
+            local("sk-configured", keyed).effective_auth_token(),
+            "sk-configured",
+            "an explicitly configured token wins"
+        );
+        assert_eq!(
+            local("", keyed).effective_auth_token(),
+            "sk-from-cmd",
+            "an empty token inherits the command's --api-key"
+        );
+        assert_eq!(
+            local("", "llama-server --port 12344").effective_auth_token(),
+            "",
+            "neither ⇒ no token, which is no Authorization header"
+        );
+        // Remote has no command to inherit from — the configured value, verbatim.
+        let remote = OffloadBackendKind::Remote {
+            base_url: "https://api.example.com".into(),
+            auth_token: "sk-remote".into(),
+            is_cloud: true,
+            cloud_consent: true,
+        };
+        assert_eq!(remote.effective_auth_token(), "sk-remote");
+    }
+
+    #[test]
+    fn offload_backend_debug_redacts_both_kinds_auth_token() {
+        let local = OffloadBackend {
+            kind: OffloadBackendKind::Local {
+                server_command: "llama-server".into(),
+                autostart: false,
+                show_command_on_start: false,
+                auth_token: "sk-local-secret".into(),
+            },
+            ..Default::default()
+        };
+        let dbg = format!("{local:?}");
+        assert!(!dbg.contains("sk-local-secret"), "{dbg}");
+        assert!(dbg.contains("auth_token: <redacted>"), "{dbg}");
+        // An absent token says so rather than reading as a hidden one.
+        let none = OffloadBackend::default();
+        assert!(format!("{none:?}").contains("auth_token: <none>"));
+    }
+
+    #[test]
+    fn graph_settings_debug_covers_every_field_and_redacts_the_token() {
+        // V33 Phase E. Two properties in one test because they share a cause:
+        // `GraphSettings` had a DERIVED `Debug` and a doc saying "No secrets
+        // here" until it gained `embedding_auth_token`.
+        let g = GraphSettings {
+            embedding_auth_token: "sk-embed-secret".into(),
+            ..GraphSettings::default()
+        };
+        let dbg = format!("{g:?}");
+        assert!(
+            !dbg.contains("sk-embed-secret"),
+            "the embedding bearer token reached a Debug line: {dbg}"
+        );
+        assert!(dbg.contains("embedding_auth_token: \"<redacted>\""), "{dbg}");
+        assert!(format!("{:?}", GraphSettings::default())
+            .contains("embedding_auth_token: \"<empty>\""));
+
+        // The cost of hand-rolling `Debug` on a struct this wide is that a
+        // field added later is silently dropped from every debug line. Walk the
+        // serialized key set — the same names, no serde renames in this block —
+        // and require each to appear.
+        let json = serde_json::to_value(&g).expect("GraphSettings serializes");
+        for key in json.as_object().expect("a JSON object").keys() {
+            assert!(
+                dbg.contains(&format!("{key}:")),
+                "the hand-rolled GraphSettings Debug omits `{key}` — add a \
+                 `.field(\"{key}\", &self.{key})` line"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_server_config_defaults_and_redacts_auth_token() {
+        // Additive over the container-level `#[serde(default)]`: a pre-V33
+        // entry loads with no token, which is no `Authorization` header, which
+        // is today's behaviour.
+        let cfg: McpServerConfig = serde_json::from_value(json!({
+            "name": "ddg",
+            "url": "http://172.21.1.11:17201/mcp",
+            "offload_access": true,
+        }))
+        .expect("a pre-V33 mcp server entry deserializes");
+        assert!(cfg.auth_token.is_empty());
+
+        let with_token = McpServerConfig {
+            auth_token: "sk-mcp-secret".into(),
+            ..cfg
+        };
+        let dbg = format!("{with_token:?}");
+        assert!(!dbg.contains("sk-mcp-secret"), "{dbg}");
+        assert!(dbg.contains("auth_token: \"<redacted>\""), "{dbg}");
     }
 
     #[test]

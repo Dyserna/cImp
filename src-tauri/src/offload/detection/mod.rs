@@ -938,8 +938,29 @@ fn unscreened_notice(name: &str, verdict: &Verdict, ctx: &ResultCtx<'_>) -> Opti
 }
 
 /// Compile the rules and report classifier availability, once at app start.
-/// Cheap and infallible: both layers degrade to inert rather than erroring, so
-/// there is nothing for the caller to handle.
+/// Infallible: both layers degrade to inert rather than erroring, so there is
+/// nothing for the caller to handle.
+///
+/// # Returns immediately (V33 stage 3)
+///
+/// This ran inline on the launch thread until V33, and it was **not** cheap in
+/// the case that mattered. `rules.d/local/*.yar` is user-authored, any process
+/// running as the user can write it, and `signature::compile_sources` had no
+/// ceiling of any kind — so one crafted file was a launch that hung or OOMed on
+/// every start, forever, before the window existed. `Config::any_enabled` did
+/// not help: it gates *scanning*, and this compile is gated on nothing.
+///
+/// The compile is now bounded (`signature::CompileLimits`) **and** off the
+/// launch thread, because bounding alone still leaves a 20 s ceiling in front of
+/// the window on a directory that is not even in use.
+///
+/// What that costs, and what it does not: a fetch arriving before the compile
+/// lands finds an empty rule slot and takes `signature::ensure_loaded`'s path,
+/// which **waits on the same compile** rather than starting a second one or
+/// returning a false `Clean`. So the property the inline call bought — "the
+/// first fetched page is screened by a ready layer" — is kept; what changes is
+/// who pays for it. A broken rules file is still a startup WARN, logged from
+/// this thread instead of the launch thread.
 pub fn init() {
     // #48, M-12 — BEFORE the compile, and gated on nothing. A crash mid-swap
     // leaves `rules.d` short; recovery used to live only inside a scheduler
@@ -947,9 +968,29 @@ pub fn init() {
     // so turning the feature off after a crash stranded the short set
     // permanently. "Never degrade to no rules" is not a preference, so its
     // repair is not gated on one.
-    updater::recover_on_launch();
-    signature::reload();
-    classifier::log_availability();
+    //
+    // It rides this thread rather than staying inline so the ordering contract
+    // it documents (`recover_on_launch` before the first `signature::reload`)
+    // stays a statement about one sequence instead of a race between two.
+    let spawned = std::thread::Builder::new()
+        .name("detection-init".to_string())
+        .spawn(|| {
+            updater::recover_on_launch();
+            signature::reload();
+            classifier::log_availability();
+        });
+    if let Err(e) = spawned {
+        warn!(
+            target: "offload",
+            error = %e,
+            "detection: could not spawn the startup init thread; running it inline on the launch \
+             thread instead (pre-V33 behaviour — a pathological rules file delays the window by \
+             up to the compile budget)"
+        );
+        updater::recover_on_launch();
+        signature::reload();
+        classifier::log_availability();
+    }
 }
 
 /// Recompile the rules from disk and return the fresh combined status. The

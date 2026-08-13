@@ -730,6 +730,12 @@ async fn spawn_capture(
     // (offload's `llama-server`, MCP host, `run_command`).
     #[cfg(windows)]
     command.creation_flags(crate::procutil::CREATE_NO_WINDOW);
+    // V33 C3: Unix-only — give the shell its own process group so the timeout
+    // path below can `killpg` the whole thing. A check command is a shell
+    // string, so the process cImp holds is `sh`, and everything the check
+    // actually runs is its child; without the group, killing `sh` leaves the
+    // real work running and holding the pipe write ends.
+    crate::procutil::own_process_group(&mut command);
 
     let mut child = command
         .spawn()

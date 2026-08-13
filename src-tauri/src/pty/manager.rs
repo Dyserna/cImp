@@ -205,6 +205,24 @@ impl PtyManager {
         };
         let killer = child.clone_killer();
 
+        // V33 contract C3: put the tab's process into the process-lifetime
+        // kill-on-job-close job. Everything else cImp spawns has been in it
+        // since the job existed; this one was not, because `guard_child` is
+        // typed to a `tokio::process::Child` and portable-pty hands back its
+        // own `Child`. That made the widest agent seam in the app — the tab
+        // process, whose descendants are everything the agent runs — the one
+        // thing a hard cImp death (panic=abort, OOM kill, `cargo tauri dev`'s
+        // hot-reload TerminateProcess) left orphaned.
+        //
+        // Naming the child by pid is safe here and only here: `child` is still
+        // alive in this scope and holds the process handle, which is what pins
+        // the pid against reuse (see `guard_pid`'s contract). Hardening, never
+        // a gate — a failure is logged and the tab still launches.
+        match child.process_id() {
+            Some(pid) => crate::process_guard::guard_pid(pid),
+            None => tracing::debug!(?tab, "pty child reported no pid; cannot job-guard it"),
+        }
+
         // Drop the slave end in the parent; the child inherits its own reference.
         drop(pair.slave);
 

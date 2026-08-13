@@ -47,11 +47,30 @@
 //! The budget is **per pass and not shared** (#48, F-9): a single budget split
 //! `total - elapsed` let pass 1 starve pass 2, and pass 2 is the obfuscation
 //! defence, i.e. the layer whose input the attacker chooses.
+//!
+//! # Bounded *compilation* too (V33 stage 3)
+//!
+//! Scanning was bounded from the start; **compiling was not**, and that was the
+//! larger hole. [`compile_sources`] had no time limit, no source-size limit and
+//! no rule-count limit, and `detection::init` ran it on the launch thread before
+//! the window existed — with no predicate, so it ran even with detection
+//! switched off app-wide (`Config::any_enabled` gates *scanning*). yara-x's
+//! compile does regex-automaton construction and Aho-Corasick atom extraction,
+//! both superlinear in adversarial input, so **one crafted file in
+//! `rules.d/local/` was a permanent startup hang or OOM** — and `install`'s
+//! "never trade a live rule set for nothing" cannot help, because the process
+//! never reaches it.
+//!
+//! [`CompileLimits`] is the answer: a per-attempt and a whole-call wall clock, a
+//! per-file source-size cap and a total-rule cap. The startup compile also moved
+//! off the launch thread (`detection::init`). Read [`CompileLimits`]' own docs
+//! before touching any of it — the wall clock is bought with a **detached
+//! thread that cannot be killed**, which is a real cost, not a free one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -166,6 +185,142 @@ const _: () = assert!(SCAN_PASS_TIMEOUT.as_secs() > SCAN_HEARTBEAT.as_secs());
 /// Extensions treated as rule files. Both spellings are in the wild and the
 /// updater's bundles may use either.
 const RULE_EXTENSIONS: [&str; 2] = ["yar", "yara"];
+
+/// Hard wall-clock ceiling on **one** compiler attempt (see
+/// [`CompileLimits::attempt`]).
+pub const COMPILE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hard wall-clock ceiling on a whole [`compile_sources`] call (see
+/// [`CompileLimits::total`]).
+pub const COMPILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Largest single rule file offered to the compiler (see
+/// [`CompileLimits::max_source_bytes`]).
+pub const MAX_RULE_SOURCE_BYTES: usize = 1024 * 1024;
+
+/// Largest rule set that may go live (see [`CompileLimits::max_rules`]).
+pub const MAX_TOTAL_RULES: usize = 5_000;
+
+/// The attempt ceiling must be strictly inside the call ceiling, or the
+/// whole-call budget is decorative: a single attempt could consume it and the
+/// incremental salvage pass below would never run.
+const _: () = assert!(COMPILE_ATTEMPT_TIMEOUT.as_secs() < COMPILE_TOTAL_TIMEOUT.as_secs());
+
+/// What bounds a rule compile. **A struct rather than four bare constants** so
+/// the caps are reachable from a test without generating a 5 000-rule fixture
+/// or waiting 20 s for a deadline — the same reason `validate.rs` takes its
+/// corpus as a value.
+///
+/// # Why this exists at all (V33 stage 3)
+///
+/// See the module header. In one line: `rules.d/local/*.yar` is user-authored,
+/// any process running as the user can write it, and until this landed every
+/// file in it was parsed, IR'd, codegen'd to wasm and Cranelift-JIT'd on **every
+/// launch**, unbounded, on the launch thread, with detection switched off.
+///
+/// # The cost, stated rather than glossed
+///
+/// yara-x 1.12 exposes **no compile deadline** — no epoch interrupt, no fuel, no
+/// cancellation token; the epoch clock at `scanner/context.rs:557` bounds
+/// *scanning* only. The only way to put a clock on a compile is to run it
+/// somewhere else and stop waiting. So [`compile_sources`] hands each attempt to
+/// a **detached thread** and gives up on it after [`Self::attempt`].
+///
+/// **That thread is not killed. It cannot be.** It keeps burning a core until
+/// yara-x returns on its own, and nobody ever joins it. `updater/validate.rs`
+/// declined exactly this shape for exactly this reason ("would leave a runaway
+/// compile burning a core with nobody to join it") and settled for measuring the
+/// compile after the fact — which is sound for an *update*, where the fallback
+/// is "keep the bundle you have", and useless at *startup*, where the fallback
+/// was "the app never opens". That asymmetry is the whole argument: at startup
+/// the alternative to a leaked core is no application, so the trade is taken
+/// here and the leak is written down.
+///
+/// The leak is bounded in count, not in lifetime: an attempt is only abandoned
+/// when it overruns [`Self::attempt`], and [`Self::total`] stops the call from
+/// starting more, so a call abandons at most `total / attempt` (4) threads. Each
+/// one holds only its own copy of the source text.
+///
+/// # What is *not* bounded, and why
+///
+/// **Memory.** There is no allocator hook to hang a per-compile ceiling on, and
+/// a global one would fail the app rather than the rule. [`Self::max_source_bytes`]
+/// and [`Self::max_rules`] are the proxies: they bound the compiler's input and
+/// its output, which is as close as this can get without a custom allocator. A
+/// file inside the size cap that still OOMs the process is a residual, and it
+/// is the reason the size cap is 1 MiB rather than something generous.
+///
+/// **Panics.** A compile that panics on a detached thread would ordinarily
+/// disconnect the channel and be reported as "this file does not compile" — but
+/// the release profile sets `panic = "abort"` (`Cargo.toml`), so a panic inside
+/// yara-x still takes the process down in a shipped build. The `Disconnected`
+/// arm is honest in debug/test builds only; it is not a containment claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompileLimits {
+    /// Wall clock for one compiler attempt, after which the attempt is
+    /// abandoned (see the type doc for what "abandoned" costs).
+    ///
+    /// Deliberately **per attempt and not only per call** — the F-9 lesson from
+    /// [`SCAN_PASS_TIMEOUT`], applied to a different pipeline. `read_sources`
+    /// reads the shipped bundle first and the user's `local/` overlay second,
+    /// but the all-at-once fast path compiles them *together*: with only a
+    /// whole-call budget, one pathological `local/` file would eat it inside
+    /// that first attempt and every shipped rule would then be reported failed
+    /// for want of budget. That is detection blinding by a file that never had
+    /// to compile at all. A per-attempt slice guarantees the salvage pass still
+    /// has budget to reach the bundle.
+    pub attempt: Duration,
+    /// Wall clock for the whole [`compile_sources`] call. The incremental
+    /// salvage pass is O(files) attempts, so without this a directory of 200
+    /// slow-but-legal files would still be a startup hang. Files not reached
+    /// before it expires are reported failed, never silently dropped.
+    pub total: Duration,
+    /// Largest single source that is offered to the compiler at all. Checked
+    /// **before** any parsing, so it is the one cap an adversary cannot spend
+    /// CPU getting past. 1 MiB is ~100× the largest file in the shipped bundle.
+    pub max_source_bytes: usize,
+    /// Largest number of rules that may go live. Enforced after a build, so it
+    /// bounds *scan* cost and resident set rather than compile cost (the two
+    /// clocks above do that). On breach the fast path is discarded and the
+    /// incremental pass re-runs, accepting files until the cap and naming the
+    /// rest — so the answer is "these files were left out", not "no rules".
+    pub max_rules: usize,
+}
+
+impl Default for CompileLimits {
+    fn default() -> Self {
+        Self {
+            attempt: COMPILE_ATTEMPT_TIMEOUT,
+            total: COMPILE_TOTAL_TIMEOUT,
+            max_source_bytes: MAX_RULE_SOURCE_BYTES,
+            max_rules: MAX_TOTAL_RULES,
+        }
+    }
+}
+
+/// How one bounded compiler attempt ended. `TimedOut` is kept distinct from
+/// `Rejected` because they are different facts about the input — one file is
+/// malformed, the other is *expensive* — and the WARN each produces has to say
+/// which, or the `local/` author cannot tell a typo from a runaway.
+enum Attempt {
+    /// `Arc` rather than the bare `Rules`: it is what every consumer of a
+    /// finished compile already holds (the live slot, [`compile_sources`]'
+    /// return type), and a `Rules` inline would make this enum ~488 bytes for
+    /// the sake of two unit variants.
+    Built(Arc<yara_x::Rules>),
+    Rejected,
+    TimedOut,
+}
+
+/// Whatever is left of `deadline`, clamped to one attempt's slice. `ZERO` when
+/// the call's budget is spent, which [`try_compile_within`] turns into an
+/// immediate `TimedOut` **without spawning anything** — that is also the seam
+/// tests drive, since a zero budget is the one timeout that is deterministic.
+fn attempt_budget(deadline: Instant, limits: &CompileLimits) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(limits.attempt)
+}
 
 /// The prefix [`read_sources`] gives a file it read from the user-owned
 /// `local/` overlay, and therefore the test for "this file is the user's, not
@@ -348,6 +503,29 @@ fn slot() -> &'static RwLock<Option<Loaded>> {
     SLOT.get_or_init(|| RwLock::new(None))
 }
 
+/// Held for the whole of a compile-and-install, so **at most one rule compile
+/// runs in this process at a time** (V33 stage 3).
+///
+/// It became load-bearing when the startup compile moved off the launch thread.
+/// Before that, `detection::init` finished before anything could scan; now a
+/// fetch can arrive while the background compile is still running, find the slot
+/// empty, and — via the lazy paths in [`scan`] and [`status`] — start a *second*
+/// compile of the same directory. Two concurrent compiles of a pathological set
+/// is two burning cores instead of one, which is exactly the thing this stage
+/// exists to bound.
+///
+/// The waiter does not recompile: [`ensure_loaded`] re-checks the slot after
+/// taking the gate, so the cost of arriving early is a wait bounded by
+/// [`CompileLimits::total`], and the "the first fetched page is screened by a
+/// ready layer" property that the launch-thread compile bought is **kept** — it
+/// is just paid by whoever gets there first instead of by every launch.
+///
+/// Lock order is always gate-then-slot, never the reverse.
+fn compile_gate() -> &'static Mutex<()> {
+    static GATE: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
 /// `<exe-dir>/detection/rules.d`. Same `exe.parent()` convention as
 /// `theming::themes_dir` (NOT the TTS `models/` grandparent form — rules ship
 /// beside the binary, weights ship in the portable root's `models/`). `None`
@@ -433,8 +611,21 @@ pub fn read_sources(dir: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Compile `sources` into one rule set, dropping only the files that cannot be
-/// part of it.
+/// Compile `sources` into one rule set under the default [`CompileLimits`],
+/// dropping only the files that cannot be part of it.
+///
+/// Every rule source in the process reaches the compiler through here — the
+/// shipped bundle, the C3 channel's *staged and not-yet-trusted* bundle
+/// (`updater::validate::validate_rules`), the user's `local/` overlay, and
+/// `graph::secrets`' embedded screen — so this is the one place a ceiling has
+/// to be, and putting it here is what extends it to all four.
+pub fn compile_sources(sources: &[(String, String)]) -> (Option<Arc<yara_x::Rules>>, Vec<String>) {
+    compile_sources_within(sources, &CompileLimits::default())
+}
+
+/// [`compile_sources`] with explicit limits — the seam tests drive, and the
+/// only way to exercise the ceilings without a 5 000-rule fixture or a 20 s
+/// wait.
 ///
 /// Two passes on purpose. The fast path compiles everything at once — the
 /// normal case, one compile. Only when that fails does the slow path rebuild
@@ -442,25 +633,111 @@ pub fn read_sources(dir: &Path) -> Vec<(String, String)> {
 /// ones already accepted*. That second condition is why per-file validation in
 /// isolation would not do: two files can each be valid and still collide on a
 /// rule identifier, and YARA rejects the set, not the file.
-pub fn compile_sources(sources: &[(String, String)]) -> (Option<Arc<yara_x::Rules>>, Vec<String>) {
+///
+/// # What the limits change about that shape
+///
+/// Nothing structural, and that is deliberate — the incremental fallback is
+/// what makes one bad file cost one file, and it keeps working the same way for
+/// a file that is *slow* as for one that is malformed. Three additions:
+///
+/// - a file over [`CompileLimits::max_source_bytes`] is never offered to the
+///   compiler and goes straight into `failed`;
+/// - an attempt that overruns its slice of the budget is `failed` for that
+///   file, with the WARN saying "timed out" rather than "does not compile";
+/// - a set over [`CompileLimits::max_rules`] makes the fast path fall through
+///   to the incremental pass, which stops accepting at the cap.
+///
+/// The incremental pass keeps the rule set built by its **last accepted file**
+/// rather than recompiling the accepted set at the end. The two are the same
+/// set by construction, and not paying for one more compile matters most in
+/// precisely the case that got us here: the one where compiles are expensive.
+pub fn compile_sources_within(
+    sources: &[(String, String)],
+    limits: &CompileLimits,
+) -> (Option<Arc<yara_x::Rules>>, Vec<String>) {
     if sources.is_empty() {
         return (None, Vec::new());
     }
-    if let Some(rules) = try_compile(sources.iter().map(|(_, s)| s.as_str())) {
-        return (Some(Arc::new(rules)), Vec::new());
+    let deadline = Instant::now() + limits.total;
+    let oversize = |src: &String| src.len() > limits.max_source_bytes;
+
+    // The size cap first: it costs a length compare and it is the only gate an
+    // adversary cannot spend CPU getting past.
+    let too_big: Vec<String> = sources
+        .iter()
+        .filter(|(_, s)| oversize(s))
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in &too_big {
+        warn!(
+            target: "offload",
+            file = %name,
+            limit = limits.max_source_bytes,
+            "detection: a rules file is larger than the source-size cap and was NOT compiled; it \
+             is reported as a rejected file"
+        );
     }
+    let usable: Vec<&str> = sources
+        .iter()
+        .filter(|(_, s)| !oversize(s))
+        .map(|(_, s)| s.as_str())
+        .collect();
+    if usable.is_empty() {
+        return (None, too_big);
+    }
+
+    // Fast path — everything at once.
+    if let Attempt::Built(rules) = try_compile_within(&usable, attempt_budget(deadline, limits)) {
+        let count = rules.iter().count();
+        if count <= limits.max_rules {
+            return (Some(rules), too_big);
+        }
+        warn!(
+            target: "offload",
+            rules = count,
+            limit = limits.max_rules,
+            "detection: the rules directory defines more rules than the cap allows; falling back \
+             to the incremental pass, which accepts files up to the cap and reports the rest"
+        );
+    }
+
     let mut accepted: Vec<&str> = Vec::new();
+    let mut built: Option<Arc<yara_x::Rules>> = None;
     let mut failed: Vec<String> = Vec::new();
     for (name, src) in sources {
-        let candidate: Vec<&str> = accepted
-            .iter()
-            .copied()
-            .chain(std::iter::once(src.as_str()))
-            .collect();
-        if try_compile(candidate.into_iter()).is_some() {
-            accepted.push(src.as_str());
-        } else {
+        if oversize(src) {
+            // Already warned above; keep `failed` in source order.
             failed.push(name.clone());
+            continue;
+        }
+        let mut candidate: Vec<&str> = accepted.clone();
+        candidate.push(src.as_str());
+        match try_compile_within(&candidate, attempt_budget(deadline, limits)) {
+            Attempt::Built(r) if r.iter().count() <= limits.max_rules => {
+                accepted.push(src.as_str());
+                built = Some(r);
+            }
+            Attempt::Built(_) => {
+                warn!(
+                    target: "offload",
+                    file = %name,
+                    limit = limits.max_rules,
+                    "detection: adding this rules file would take the set past the rule cap; it \
+                     is left out and reported as rejected"
+                );
+                failed.push(name.clone());
+            }
+            Attempt::TimedOut => {
+                warn!(
+                    target: "offload",
+                    file = %name,
+                    "detection: compiling this rules file did not finish inside the compile \
+                     budget; it is left out and reported as rejected (the abandoned compile keeps \
+                     running until yara-x returns — see CompileLimits)"
+                );
+                failed.push(name.clone());
+            }
+            Attempt::Rejected => failed.push(name.clone()),
         }
     }
     if accepted.is_empty() {
@@ -470,13 +747,67 @@ pub fn compile_sources(sources: &[(String, String)]) -> (Option<Arc<yara_x::Rule
         // the Settings block show 0 loaded.
         return (None, failed);
     }
-    let rules = try_compile(accepted.into_iter()).map(Arc::new);
-    (rules, failed)
+    // `built` is `Some` whenever `accepted` is non-empty: it is set on every
+    // acceptance and never cleared, so it holds exactly the accepted set.
+    (built, failed)
+}
+
+/// One compile attempt with a wall clock on it.
+///
+/// The clock is bought by running the compile on a **detached thread** and
+/// giving up on the result — see [`CompileLimits`] for what that costs and why
+/// it is nonetheless the right trade at startup. A `budget` of zero returns
+/// `TimedOut` without spawning anything.
+///
+/// Failing to spawn is not a reason to lose the signature layer, so it falls
+/// back to compiling inline, unbounded — the pre-V33 behaviour, which is worse
+/// than this function and much better than no detection. It is also
+/// unreachable in practice: a process that cannot spawn a thread has larger
+/// problems than its rules directory.
+fn try_compile_within(sources: &[&str], budget: Duration) -> Attempt {
+    if budget.is_zero() {
+        return Attempt::TimedOut;
+    }
+    let owned: Vec<String> = sources.iter().map(|s| (*s).to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Option<yara_x::Rules>>(1);
+    let spawned = std::thread::Builder::new()
+        .name("yara-compile".to_string())
+        .spawn(move || {
+            let built = try_compile(owned.iter().map(String::as_str));
+            // The receiver is gone on a timeout; that send is the abandoned
+            // result and dropping it is the point.
+            let _ = tx.send(built);
+        });
+    if let Err(e) = spawned {
+        warn!(
+            target: "offload",
+            error = %e,
+            "detection: could not spawn the bounded compile thread; compiling inline WITHOUT a \
+             time limit rather than losing the rule set"
+        );
+        return match try_compile(sources.iter().copied()) {
+            Some(r) => Attempt::Built(Arc::new(r)),
+            None => Attempt::Rejected,
+        };
+    }
+    match rx.recv_timeout(budget) {
+        Ok(Some(rules)) => Attempt::Built(Arc::new(rules)),
+        Ok(None) => Attempt::Rejected,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Attempt::TimedOut,
+        // The compile thread died without sending — a panic inside yara-x.
+        // Reported as "this file does not compile", which is the honest answer
+        // in a debug/test build. In a release build `panic = "abort"` means the
+        // process is already gone and this arm never runs; see `CompileLimits`.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Attempt::Rejected,
+    }
 }
 
 /// One all-or-nothing compile attempt. Errors are reported by the caller (which
 /// knows which file is being blamed); warnings are logged here because they are
 /// per-rule advice ("this pattern is slow") that no caller can act on.
+///
+/// **Unbounded** — every caller reaches it through [`try_compile_within`],
+/// which is what puts a clock on it.
 fn try_compile<'a>(sources: impl Iterator<Item = &'a str>) -> Option<yara_x::Rules> {
     let mut compiler = yara_x::Compiler::new();
     for src in sources {
@@ -492,22 +823,29 @@ fn try_compile<'a>(sources: impl Iterator<Item = &'a str>) -> Option<yara_x::Rul
 }
 
 /// The rule identifiers a single source declares, or `None` if it does not
-/// compile on its own.
+/// compile on its own **within `budget`**.
 ///
 /// Asked of the compiler rather than of a parser of ours: `Rules::iter` is the
 /// authority on what a source defines (including `private` rules, which never
 /// appear in a scan result and collide exactly like any other), so the set this
 /// returns cannot drift from the set YARA will refuse a duplicate of.
-fn rule_identifiers(src: &str) -> Option<Vec<String>> {
-    let mut compiler = yara_x::Compiler::new();
-    compiler.add_source(src).ok()?;
-    Some(
-        compiler
-            .build()
-            .iter()
-            .map(|r| r.identifier().to_string())
-            .collect(),
-    )
+///
+/// # This is the second compile path over user input (V33 stage 3)
+///
+/// It used to call `Compiler::new`/`add_source`/`build` directly, i.e.
+/// unbounded — and it is reached from [`rename_colliding_local_rules`] with the
+/// *original* sources, including a `local/` file that [`compile_sources`] just
+/// timed out on. Bounding only `compile_sources` would therefore have left the
+/// hang fully open one function further down the same call.
+///
+/// A timeout degrades to `None`, which is the shape this function already had
+/// for a file that will not compile: the file is passed through untouched, and
+/// `compile_sources`/`broken_local_rules` report it. Never a new failure mode.
+fn rule_identifiers(src: &str, budget: Duration) -> Option<Vec<String>> {
+    match try_compile_within(&[src], budget) {
+        Attempt::Built(rules) => Some(rules.iter().map(|r| r.identifier().to_string()).collect()),
+        Attempt::Rejected | Attempt::TimedOut => None,
+    }
 }
 
 /// What [`rename_colliding_local_rules`] produces: the sources to compile
@@ -573,12 +911,21 @@ pub fn rename_colliding_local_rules(sources: &[(String, String)]) -> Option<Rena
     if !sources.iter().any(|(n, _)| n.starts_with(LOCAL_PREFIX)) {
         return None;
     }
+    // V33 stage 3: this pass is O(files) compiles of untrusted text, so it gets
+    // the same whole-call ceiling `compile_sources` has. A source not reached
+    // before the budget expires resolves to `None`, which is the same "declares
+    // nothing this can reason about" answer a non-compiling file already gave —
+    // the file is passed through untouched and reported, never dropped.
+    let limits = CompileLimits::default();
+    let deadline = Instant::now() + limits.total;
     // What each source declares, computed once. `None` for a source that does
     // not compile alone: it declares nothing this can reason about, and its
     // failure is not a collision — `compile_sources` skips it and
     // `broken_local_rules` reports it, exactly as before.
-    let declared: Vec<Option<Vec<String>>> =
-        sources.iter().map(|(_, s)| rule_identifiers(s)).collect();
+    let declared: Vec<Option<Vec<String>>> = sources
+        .iter()
+        .map(|(_, s)| rule_identifiers(s, attempt_budget(deadline, &limits)))
+        .collect();
     // **Every identifier the user wrote anywhere in `local/`, reserved up
     // front.** A rename must never take a name the user chose deliberately: a
     // set where `a.yar` declares `Foo` and `b.yar` declares `custom_Foo` must
@@ -649,7 +996,7 @@ pub fn rename_colliding_local_rules(sources: &[(String, String)]) -> Option<Rena
             .collect();
         expect.sort();
         let rewritten = rewrite_rule_declarations(src, &plan).filter(|s| {
-            let mut got = rule_identifiers(s).unwrap_or_default();
+            let mut got = rule_identifiers(s, attempt_budget(deadline, &limits)).unwrap_or_default();
             got.sort();
             got == expect
         });
@@ -851,6 +1198,14 @@ pub fn compile_report(dir: Option<&Path>) -> (Option<Arc<yara_x::Rules>>, Status
 /// broken; `detection.signature_down.v1` (in `advisor.rs`, fed by
 /// [`advisor_signal`]) is the consumer that says so out loud.
 pub fn reload() -> Status {
+    let _gate = compile_gate().lock().unwrap_or_else(PoisonError::into_inner);
+    reload_locked()
+}
+
+/// [`reload`]'s body, with [`compile_gate`] already held. Split out so
+/// [`ensure_loaded`] can re-check the slot under the same gate without
+/// deadlocking on a re-entrant `reload`.
+fn reload_locked() -> Status {
     let dir = rules_dir();
     let (rules, status) = compile_report(dir.as_deref());
 
@@ -935,7 +1290,27 @@ pub fn status() -> Status {
     {
         return l.status.clone();
     }
-    reload()
+    ensure_loaded()
+}
+
+/// Populate the slot **once**, waiting for a compile already in flight rather
+/// than starting a second one.
+///
+/// The lazy half of [`status`] and [`scan`]. Since V33 stage 3 the startup
+/// compile runs on a background thread (`detection::init`), so "the slot is
+/// empty" no longer means "nobody is compiling" — it usually means the
+/// background compile has not finished yet. Taking [`compile_gate`] and
+/// re-checking is what turns a duplicate compile into a wait.
+fn ensure_loaded() -> Status {
+    let _gate = compile_gate().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(l) = slot()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        return l.status.clone();
+    }
+    reload_locked()
 }
 
 /// The signature layer reporting itself disarmed — the consumer half of the
@@ -1058,7 +1433,8 @@ impl ScanOutcome {
     ///
     /// The running app takes the owned [`hits`](Self::hits) (through
     /// [`scan_with`]) or matches the variants directly, so this is a test-only
-    /// accessor — same `cfg_attr` shape as `toolclass::mutates_fs`.
+    /// accessor — same `cfg_attr` shape `toolclass::mutates_fs` carried until
+    /// V33 Phase F landed its consumer and removed it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn matched(&self) -> &[String] {
         match self {
@@ -1176,7 +1552,9 @@ pub fn scan(text: &str) -> ScanOutcome {
             Some(l) => l.rules.clone(),
             None => {
                 drop(guard);
-                reload();
+                // Waits for a startup compile still in flight instead of racing
+                // it with a second one — see `ensure_loaded`.
+                ensure_loaded();
                 slot()
                     .read()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -2024,6 +2402,178 @@ anything automatically.\n";
         );
     }
 
+    // ── V33 stage 3 — the compile is bounded ───────────────────────────────
+
+    /// The default limits must be internally coherent: an attempt slice strictly
+    /// inside the call budget (a `const _` assertion already pins the ordering,
+    /// this pins that `Default` actually uses those constants), and caps far
+    /// enough above the shipped bundle that no ordinary install ever meets one.
+    #[test]
+    fn compile_limits_default_to_the_published_constants() {
+        let l = CompileLimits::default();
+        assert_eq!(l.attempt, COMPILE_ATTEMPT_TIMEOUT);
+        assert_eq!(l.total, COMPILE_TOTAL_TIMEOUT);
+        assert_eq!(l.max_source_bytes, MAX_RULE_SOURCE_BYTES);
+        assert_eq!(l.max_rules, MAX_TOTAL_RULES);
+        assert!(l.attempt < l.total, "an attempt must fit inside a call");
+    }
+
+    /// A file over the source-size cap is **never handed to the compiler** and
+    /// is reported as a rejected file — the one gate an adversary cannot spend
+    /// CPU getting past, since it is a length compare before any parsing.
+    ///
+    /// The rest of the directory still loads: that is the whole failure
+    /// discipline of this module, and a size cap that took the layer down with
+    /// the oversized file would be a worse bug than the one it closes.
+    #[test]
+    fn a_source_over_the_size_cap_is_rejected_and_the_rest_still_loads() {
+        let big = format!(
+            "rule Too_Big {{ strings: $a = \"{}\" condition: $a }}",
+            "x".repeat(4096)
+        );
+        let sources = vec![
+            ("shipped.yar".to_string(), marker_rule("Small", "keeps_me")),
+            ("local/huge.yar".to_string(), big),
+        ];
+        let limits = CompileLimits {
+            max_source_bytes: 512,
+            ..CompileLimits::default()
+        };
+        let (rules, failed) = compile_sources_within(&sources, &limits);
+        assert_eq!(failed, vec!["local/huge.yar".to_string()]);
+        let rules = rules.expect("the file inside the cap still compiles");
+        assert_eq!(
+            scan_outcome_with(&rules, "xx keeps_me xx").matched(),
+            ["Small"]
+        );
+    }
+
+    /// Every file over the cap ⇒ no rule set at all, and every one of them
+    /// named. `None` rather than an empty-but-valid set is what makes `scan`
+    /// report `DidNotComplete` and `install` keep the previous rules live —
+    /// "empty is not absent", the D-2 rule, reached through a new door.
+    #[test]
+    fn all_sources_over_the_size_cap_yield_no_rules_and_name_every_file() {
+        let sources = vec![
+            ("a.yar".to_string(), marker_rule("A", "aaa")),
+            ("local/b.yar".to_string(), marker_rule("B", "bbb")),
+        ];
+        let limits = CompileLimits {
+            max_source_bytes: 1,
+            ..CompileLimits::default()
+        };
+        let (rules, failed) = compile_sources_within(&sources, &limits);
+        assert!(rules.is_none(), "nothing was compilable");
+        assert_eq!(
+            failed,
+            vec!["a.yar".to_string(), "local/b.yar".to_string()],
+            "in source order, so the Settings tooltip names stable files"
+        );
+    }
+
+    /// The rule cap stops the set growing, and it stops it **by leaving files
+    /// out and saying which** rather than by refusing everything.
+    ///
+    /// One rule per file, cap of one: the first file is accepted, the second is
+    /// reported. This also exercises the fast-path fall-through — the
+    /// all-at-once compile succeeds and is discarded for being over the cap,
+    /// which is the only way the incremental pass runs on input that is
+    /// otherwise perfectly valid.
+    #[test]
+    fn the_rule_cap_leaves_files_out_and_names_them() {
+        let sources = vec![
+            ("shipped.yar".to_string(), marker_rule("First", "first_hit")),
+            (
+                "local/mine.yar".to_string(),
+                marker_rule("Second", "second_hit"),
+            ),
+        ];
+        let limits = CompileLimits {
+            max_rules: 1,
+            ..CompileLimits::default()
+        };
+        let (rules, failed) = compile_sources_within(&sources, &limits);
+        assert_eq!(failed, vec!["local/mine.yar".to_string()]);
+        let rules = rules.expect("the set up to the cap is live");
+        assert_eq!(rules.iter().count(), 1);
+        assert_eq!(
+            scan_outcome_with(&rules, "xx first_hit xx").matched(),
+            ["First"]
+        );
+        assert_eq!(
+            scan_outcome_with(&rules, "xx second_hit xx"),
+            ScanOutcome::Clean
+        );
+    }
+
+    /// **The finding this stage exists for:** an exhausted wall clock ends the
+    /// compile instead of hanging the process.
+    ///
+    /// Driven with a zero budget rather than a pathological rule, deliberately:
+    /// a real timeout depends on how long yara-x takes on a machine under test
+    /// contention, which is exactly the shape of the two `audit::runner` tests
+    /// that flake (F-17). Zero is the one budget whose outcome is a fact rather
+    /// than a race — `attempt_budget` returns `ZERO` and `try_compile_within`
+    /// answers `TimedOut` without spawning anything.
+    ///
+    /// What it pins: budget exhaustion reports every unreached file by name and
+    /// returns no rule set, so the caller degrades through `install`'s
+    /// keep-the-old-rules path. It must never return a partial set silently.
+    #[test]
+    fn an_exhausted_compile_budget_rejects_every_file_by_name() {
+        let sources = vec![
+            ("shipped.yar".to_string(), marker_rule("A", "aaa")),
+            ("local/mine.yar".to_string(), marker_rule("B", "bbb")),
+        ];
+        let limits = CompileLimits {
+            total: Duration::ZERO,
+            ..CompileLimits::default()
+        };
+        let (rules, failed) = compile_sources_within(&sources, &limits);
+        assert!(rules.is_none(), "no rule set can be built with no budget");
+        assert_eq!(
+            failed,
+            vec!["shipped.yar".to_string(), "local/mine.yar".to_string()],
+            "a timed-out file is REPORTED, never silently dropped"
+        );
+    }
+
+    /// The bounded path is the only path: an ordinary directory compiles to
+    /// exactly what it did before the limits landed, through the same
+    /// `compile_sources` entry point every caller uses (the live loader, the
+    /// updater's staged-bundle gauntlet, `graph::secrets`).
+    #[test]
+    fn the_default_limits_do_not_change_an_ordinary_compile() {
+        let sources = vec![
+            ("shipped.yar".to_string(), marker_rule("A", "aaa")),
+            ("local/mine.yar".to_string(), marker_rule("B", "bbb")),
+        ];
+        let (rules, failed) = compile_sources(&sources);
+        assert!(failed.is_empty(), "{failed:?}");
+        let rules = rules.expect("both files compile");
+        assert_eq!(rules.iter().count(), 2);
+        assert_eq!(scan_outcome_with(&rules, "xx aaa xx").matched(), ["A"]);
+        assert_eq!(scan_outcome_with(&rules, "xx bbb xx").matched(), ["B"]);
+    }
+
+    /// `rule_identifiers` is the **second** compile path over user text — the
+    /// rename pass reaches it with the original sources, including one
+    /// `compile_sources` just timed out on. A spent budget must degrade to
+    /// `None` (= "declares nothing this can reason about"), which is the answer
+    /// a non-compiling file already gave, and never to a hang or a panic.
+    #[test]
+    fn rule_identifiers_degrades_to_none_when_its_budget_is_spent() {
+        let src = marker_rule("Fine", "marker");
+        assert_eq!(
+            rule_identifiers(&src, COMPILE_ATTEMPT_TIMEOUT),
+            Some(vec!["Fine".to_string()])
+        );
+        assert!(
+            rule_identifiers(&src, Duration::ZERO).is_none(),
+            "a spent budget must read as `declares nothing`, not as a hang"
+        );
+    }
+
     // ── #48/M-13 — a collision renames the user's rule ─────────────────────
 
     /// A rules directory with `bundle` at the top level and `local` under
@@ -2304,7 +2854,7 @@ anything automatically.\n";
         // Precondition: the file really is valid YARA on its own, so this is
         // testing the rewriter's refusal and not a broken fixture.
         assert!(
-            rule_identifiers(unrewritable).is_some(),
+            rule_identifiers(unrewritable, COMPILE_ATTEMPT_TIMEOUT).is_some(),
             "the fixture must compile alone, or it proves nothing"
         );
         assert!(status.renamed.is_empty(), "{status:?}");

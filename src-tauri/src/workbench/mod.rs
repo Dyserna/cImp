@@ -134,6 +134,24 @@ struct BurstState {
 /// mint an unbounded stream of new buckets over a long-lived tab — a slow
 /// throttle leak, and unnecessary: sessions within one tab are sequential, so
 /// the tab already names the concurrency the owner asked to separate.
+///
+/// **V33 Phase F: the TOOL trigger keeps this exact bucket — locked, and not a
+/// default.** The milestone's 2026-08-09 amendment posed "should a tool-sourced
+/// checkpoint throttle per tab, or per tool call?" as an open question; the
+/// answer is *keep the tab bucket*, for the reason the bucket exists at all.
+/// Per-tab attribution IS the feature: the Timeline has to answer "which
+/// checkpoint was live when THIS tab went bad", and a bucket shared across tabs
+/// lets a busy tab starve a quiet one's pre-tool checkpoint — the tool call that
+/// broke the tree then has no snapshot of its own to rewind to. Per-CALL (no
+/// throttle) was the other candidate and is rejected: `checkpoint_min_gap_s`
+/// exists because a shadow-repo snapshot is a `git add -A` over the whole work
+/// tree, and an agent's edit bursts arrive several per second.
+///
+/// The accepted cost is stated rather than hidden: inside one min-gap window a
+/// tab gets ONE checkpoint whichever trigger claimed it, so a tool call
+/// following its own turn's prompt checkpoint by less than the gap takes none —
+/// and correctly so, because [`shadow::snapshot`]'s dedup would have handed it
+/// that same tree anyway whenever nothing had changed in between.
 type CheckpointKey = (PathBuf, Option<String>);
 
 /// Everything one snapshot job needs out of settings, read once by
@@ -152,6 +170,12 @@ struct SnapshotParams {
     checkpoint_max: u32,
     /// `workbench.checkpoint_max_age_days`, likewise.
     checkpoint_max_age_days: u32,
+    /// **The pre-tool budget** (2026-08-13 amendment), forwarded to
+    /// [`shadow::snapshot_detailed`]'s `deadline`. `None` for every trigger
+    /// whose caller waits indefinitely; `Some` only for the two out-of-process
+    /// Phase F seams, whose wait on the app is bounded because the agent's tool
+    /// runs the moment they stop waiting. See [`WorkbenchService::on_tool`].
+    deadline: Option<Instant>,
 }
 
 /// The automatic-checkpoint min-gap gate and the background snapshot it
@@ -222,6 +246,12 @@ impl CheckpointScheduler {
     /// production drops (fire-and-forget — a dropped tauri `JoinHandle`
     /// detaches, it does not abort) and the tests await so they can assert on
     /// the shadow repo afterwards deterministically.
+    ///
+    /// **The task resolves to whether the trigger RAN TO COMPLETION** — `true`
+    /// for a checkpoint created and for a dedup hit (both are settled answers
+    /// about the tree), `false` when the snapshot was abandoned against a
+    /// pre-tool budget or failed outright. Only [`WorkbenchService::on_tool`]
+    /// reads it; every other caller drops the handle exactly as before.
     fn spawn_if_due(
         &self,
         root: &Path,
@@ -229,7 +259,7 @@ impl CheckpointScheduler {
         trigger: shadow::Trigger,
         origin: shadow::Origin,
         params: SnapshotParams,
-    ) -> Option<tauri::async_runtime::JoinHandle<()>> {
+    ) -> Option<tauri::async_runtime::JoinHandle<bool>> {
         let key = Self::key(root, &origin);
         if !self.admit(key.clone(), params.min_gap) {
             return None;
@@ -238,29 +268,145 @@ impl CheckpointScheduler {
         // spelling the gate keyed on.
         let root = key.0;
         Some(tauri::async_runtime::spawn(async move {
-            match shadow::snapshot(
+            let started = Instant::now();
+            match shadow::snapshot_detailed(
                 &root,
                 &label,
                 trigger,
                 &origin,
                 &params.extra_ignore,
                 params.max_file_bytes,
+                params.deadline,
             )
             .await
             {
-                Ok(_) => {
+                // The pre-tool budget expired, so NOTHING was written and there
+                // is no id — see `shadow::SnapshotOutcome::Abandoned`. This is
+                // the one outcome with no trace of its own in the shadow repo,
+                // which is exactly why it gets a row: "the checkpoint that
+                // should precede this edit does not exist" is a fact the user
+                // needs at the moment they go looking for it, and its absence
+                // is otherwise indistinguishable from the seam never firing.
+                Ok(shadow::SnapshotOutcome::Abandoned) => {
+                    warn!(
+                        root = %root.display(),
+                        source = origin.source.as_deref().unwrap_or("(none)"),
+                        ms = started.elapsed().as_millis() as u64,
+                        "workbench: pre-tool checkpoint abandoned — the snapshot could not finish \
+                         inside the caller's budget, so no checkpoint claims to precede this call"
+                    );
+                    crate::activity::record_bg(checkpoint_miss_row(
+                        &root,
+                        &origin,
+                        started.elapsed(),
+                    ));
+                    false
+                }
+                Ok(outcome) => {
+                    // V33 Phase F: a dedup hit hands back a checkpoint this
+                    // caller did not create — possibly another tab's. Logged at
+                    // debug so a live-verify can tell "the tool trigger fired
+                    // and there was nothing new to capture" apart from "the tool
+                    // trigger never fired", which used to look identical from
+                    // outside. NOTHING here claims the id.
+                    if !outcome.created() {
+                        tracing::debug!(
+                            root = %root.display(),
+                            trigger = ?trigger,
+                            existing = outcome.id().unwrap_or("(none)"),
+                            "workbench: checkpoint deduped — work tree unchanged, nothing created"
+                        );
+                    }
                     if let Err(e) =
                         shadow::gc(&root, params.checkpoint_max, params.checkpoint_max_age_days)
                             .await
                     {
                         warn!(root = %root.display(), error = %e, "workbench: checkpoint gc failed");
                     }
+                    true
                 }
                 Err(e) => {
-                    warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed")
+                    warn!(root = %root.display(), error = %e, "workbench: automatic checkpoint failed");
+                    false
                 }
             }
         }))
+    }
+}
+
+/// The Activity row an abandoned pre-tool checkpoint writes — **the consumer of
+/// the 2026-08-13 amendment's "the miss is surfaced" half.**
+///
+/// # Why an Activity row, and why this one
+///
+/// It is the mechanism this codebase already uses for a degraded-but-not-fatal
+/// harness-side fact: `loopback::contract_drift_row` writes a hook shim's
+/// payload drift the same way — [`ActivityKind::Graph`](crate::activity::ActivityKind),
+/// a distinctive `source`/`tool` pair, `ok: false` so the Events feed flags it,
+/// and no root when the fact is not about a project. The alternatives were
+/// considered and rejected: a `tracing::warn!` alone has no user-visible
+/// consumer that survives (the same reasoning that gave `offload_server` its own
+/// kind — a log ring that a restart clears is not a record), and an
+/// `injection_flag` [`Screen`](crate::offload::outbound::Screen) would be the
+/// wrong vocabulary — nothing was screened, refused or detected.
+///
+/// # Volume
+///
+/// Bounded by the checkpoint throttle itself: at most one snapshot per
+/// `checkpoint_min_gap_s` per `(root, tab)` can even be attempted, so at most
+/// one miss per window per tab. It is additionally self-limiting — a miss
+/// requires a snapshot that overran a ~2 s budget — so unlike the drift report
+/// (which one broken payload fires on every hook invocation) this needs no
+/// doubling ledger of its own.
+///
+/// A pure function, returning the record rather than recording it, for the
+/// reason `contract_drift_row` documents: `activity::record_bg` has no
+/// `cfg(test)` diversion, so a row written inside the task is unobservable to
+/// the suite.
+fn checkpoint_miss_row(
+    root: &Path,
+    origin: &shadow::Origin,
+    waited: Duration,
+) -> crate::activity::ActivityRecord {
+    // The tool call the missing checkpoint would have preceded. Composed
+    // app-side as `harness:tool_name` (`loopback::handle_tool_checkpoint`), so
+    // it is not a caller-supplied string; `(unknown)` can only mean a
+    // non-tool trigger reached here, which no `None` deadline can produce.
+    let source = origin.source.as_deref().unwrap_or("(unknown)");
+    let ms = waited.as_millis() as u64;
+    crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            crate::activity::ActivityKind::Graph,
+            crate::activity::now_ms(),
+            crate::activity::root_key(root),
+            "workbench".to_string(),
+            "checkpoint_missed".to_string(),
+            source.to_string(),
+            0,
+            ms,
+            // Never "ok": the whole point of the row is that a guarantee this
+            // feature advertises was not met for this call.
+            false,
+            match origin.tab.as_deref() {
+                // The tab has already been narrowed to a CONFIGURED one by
+                // `loopback::checkpoint_identity` (an unrecognised id degrades
+                // to `None` there, never to another tab), so `Tab` is a fact
+                // here rather than a caller's claim.
+                Some(tab) => crate::activity::Attribution::Tab(tab.to_string()),
+                // Not `Headless`: `None` collapses "a worker task with no tab"
+                // together with "the id named no configured tab", and this
+                // writer cannot tell those apart — so it says it does not know.
+                None => crate::activity::Attribution::Unattributed,
+            },
+            origin.session.clone(),
+        ),
+        request: format!(
+            "pre-tool checkpoint for {source} abandoned after {ms} ms — the shadow-repo snapshot \
+             did not finish inside the calling hook's budget, so no checkpoint is claimed to \
+             precede this call (a checkpoint that might contain the change it claims to predate \
+             would silently mislead a restore). The tool call itself was never blocked."
+        ),
+        response: String::new(),
     }
 }
 
@@ -412,13 +558,16 @@ impl WorkbenchService {
         if fire {
             // No origin: a burst is filesystem activity, with no conversation
             // behind it — this handler sees an `FsBatch`, not a prompt.
-            self.maybe_snapshot(
-                &root,
-                "activity".to_string(),
-                shadow::Trigger::Burst,
-                shadow::Origin::default(),
-            )
-            .await;
+            let _ = self
+                .maybe_snapshot(
+                    &root,
+                    "activity".to_string(),
+                    shadow::Trigger::Burst,
+                    shadow::Origin::default(),
+                    // No budget: nothing is waiting on a burst snapshot.
+                    None,
+                )
+                .await;
         }
     }
 
@@ -461,15 +610,25 @@ impl WorkbenchService {
     /// gets its own labelled checkpoint, even inside another tab's cooldown.**
     /// That is correct rather than a gap: a checkpoint names a tree STATE, and
     /// an identical tree needs no second snapshot to be restorable.
+    ///
+    /// **Returns the spawned task's handle** (`None` when checkpoints are off
+    /// or the gate throttled this trigger). Every pre-V33 caller drops it —
+    /// fire-and-forget is the contract on the prompt path. V33 Phase F's tool
+    /// trigger AWAITS it; see [`on_tool`](Self::on_tool) for why that one
+    /// caller is different.
+    ///
+    /// `deadline` is the caller's pre-tool budget — `None` for every trigger
+    /// that nothing is waiting on. See [`SnapshotParams::deadline`].
     async fn maybe_snapshot(
         &self,
         root: &Path,
         label: String,
         trigger: shadow::Trigger,
         origin: shadow::Origin,
-    ) {
+        deadline: Option<Instant>,
+    ) -> Option<tauri::async_runtime::JoinHandle<bool>> {
         if !self.checkpoints_enabled() {
-            return;
+            return None;
         }
         let cfg = self.settings.current();
         let params = SnapshotParams {
@@ -478,13 +637,13 @@ impl WorkbenchService {
             max_file_bytes: cfg.graph.max_file_bytes,
             checkpoint_max: cfg.workbench.checkpoint_max,
             checkpoint_max_age_days: cfg.workbench.checkpoint_max_age_days,
+            deadline,
         };
-        // Fire-and-forget: the handle is deliberately dropped (a dropped tauri
-        // `JoinHandle` detaches rather than aborting), so this returns as soon
-        // as the gate has been consulted.
-        let _ = self
-            .checkpoints
-            .spawn_if_due(root, label, trigger, origin, params);
+        // The handle is returned, not awaited: a dropped tauri `JoinHandle`
+        // detaches rather than aborting, so a caller that drops it gets exactly
+        // the pre-V33 fire-and-forget behaviour.
+        self.checkpoints
+            .spawn_if_due(root, label, trigger, origin, params)
     }
 
     /// Phase C §C3 prompt-tap trigger: called from `offload/loopback.rs`'s
@@ -515,8 +674,80 @@ impl WorkbenchService {
     /// prompt path.
     pub async fn on_prompt(&self, root: &Path, origin: shadow::Origin, prompt_head: &str) {
         let label = format!("prompt: {prompt_head}");
-        self.maybe_snapshot(root, label, shadow::Trigger::Prompt, origin)
+        let _ = self
+            .maybe_snapshot(root, label, shadow::Trigger::Prompt, origin, None)
             .await;
+    }
+
+    /// **V33 Phase F — the pre-tool checkpoint trigger.** Called immediately
+    /// before a filesystem-mutating tool call, from the three fire seams:
+    /// the offload worker's own dispatch
+    /// ([`offload::tools::dispatch`](crate::offload::tools::dispatch)), the
+    /// Claude `PreToolUse` shim and the OpenCode `tool.execute.before` plugin
+    /// hook — the last two arriving over the loopback's
+    /// `/workbench/tool_checkpoint` route.
+    ///
+    /// `source` is `harness:tool_name` (`claude:Bash`, `offload:run_command`,
+    /// `opencode:edit`). It is recorded on the checkpoint as its own trailer so
+    /// the Timeline can attribute damage to the exact call and rewind to just
+    /// before it, and it becomes the label as well so a row reads meaningfully
+    /// in a build whose frontend does not know the field.
+    ///
+    /// **This one AWAITS the snapshot**, unlike [`on_prompt`](Self::on_prompt).
+    /// The whole value of the trigger is the ORDERING — a checkpoint taken
+    /// after the edit has landed is a checkpoint of the damage. All three seams
+    /// wait for it: the worker's `dispatch` has not spawned anything yet, the
+    /// OpenCode plugin awaits its POST inside `tool.execute.before`, and (since
+    /// the 2026-08-13 amendment) the Claude `PreToolUse` shim reads its reply
+    /// instead of firing and forgetting. It is still bounded by the same
+    /// throttle, so the cost is at most one `git add -A` per
+    /// `checkpoint_min_gap_s` per tab, and still `None` (instant) when
+    /// checkpoints are off or the gate throttles.
+    ///
+    /// # `deadline` — and why the app enforces the caller's budget
+    ///
+    /// `None` from the worker seam: it is in-process and waits as long as it
+    /// takes. `Some(instant)` from the loopback route, for both out-of-process
+    /// seams, because **both of them stop waiting after ~2 s** — the Claude
+    /// shim on its reply-read timeout, the OpenCode plugin on its
+    /// `AbortSignal.timeout(2000)` — and the harness runs the tool the moment
+    /// they do. A snapshot still staging past that point is racing the very
+    /// edit it is supposed to precede.
+    ///
+    /// A caller that merely stops waiting does not stop this side from writing
+    /// the row, which is why the budget is enforced down in
+    /// [`shadow::snapshot_detailed`] rather than with a `timeout` around this
+    /// call: past the deadline nothing is committed at all, and the miss gets
+    /// its own Activity row ([`checkpoint_miss_row`]).
+    ///
+    /// # Return
+    ///
+    /// `true` when the trigger ran to completion — a checkpoint was created, a
+    /// dedup hit settled it, or the throttle legitimately declined it. `false`
+    /// **only** when the snapshot was abandoned against `deadline` or failed,
+    /// i.e. exactly when no checkpoint can be said to precede this call. The
+    /// route reports it as `checkpointed`; nothing gates a tool call on it.
+    pub async fn on_tool(
+        &self,
+        root: &Path,
+        origin: shadow::Origin,
+        source: &str,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let label = format!("tool: {source}");
+        let origin = origin.with_source(Some(source.to_string()));
+        match self
+            .maybe_snapshot(root, label, shadow::Trigger::Tool, origin, deadline)
+            .await
+        {
+            // A task that panicked joins as `Err`; treat it as the failure it
+            // is rather than as a completed trigger.
+            Some(handle) => handle.await.unwrap_or(false),
+            // Throttled, or checkpoints are off. Neither is a missed guarantee:
+            // the throttle means this tab already has a checkpoint newer than
+            // `checkpoint_min_gap_s`, and "off" means the user asked for none.
+            None => true,
+        }
     }
 
     /// Phase C `workbench_checkpoint_now`: the manual trigger. Unlike the
@@ -1170,7 +1401,8 @@ mod tests {
     }
 
     /// `min_gap_s` is the only knob any of these tests vary; the rest are the
-    /// shipped defaults.
+    /// shipped defaults. No pre-tool budget — the one test that wants one sets
+    /// it explicitly, so every other test keeps measuring the gate alone.
     fn gate_params(min_gap_s: u64) -> SnapshotParams {
         SnapshotParams {
             min_gap: Duration::from_secs(min_gap_s),
@@ -1178,6 +1410,7 @@ mod tests {
             max_file_bytes: 1_000_000,
             checkpoint_max: 100,
             checkpoint_max_age_days: 7,
+            deadline: None,
         }
     }
 
@@ -1320,6 +1553,212 @@ mod tests {
         assert_eq!(cps.len(), 1, "throttled prompt must not snapshot: {cps:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **V33 Phase F: the tool trigger shares the tab's bucket — locked.**
+    ///
+    /// Two claims, and both matter:
+    ///   * a tool call from tab B is NOT throttled by a prompt in tab A, so the
+    ///     per-tab attribution the feature exists for survives (the locked
+    ///     answer to the 2026-08-09 amendment's open question);
+    ///   * a tool call from tab A INSIDE tab A's own prompt window IS throttled,
+    ///     i.e. "keep the tab bucket" was not quietly implemented as "the tool
+    ///     trigger gets its own bucket", which would have made every edit burst
+    ///     a `git add -A` storm.
+    ///
+    /// The file writes between fires are load-bearing: with an unchanged tree
+    /// `snapshot`'s dedup would return the previous checkpoint and both halves
+    /// would pass on the dedup path, proving nothing about the gate.
+    #[tokio::test]
+    async fn a_tool_trigger_shares_its_tabs_bucket_and_no_other_tabs() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("tool-bucket");
+        let sched = CheckpointScheduler::default();
+        let params = gate_params(3600);
+
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "prompt: from tab a",
+                shadow::Trigger::Prompt,
+                tab_origin("claude"),
+                &params
+            )
+            .await
+        );
+
+        // Tab A is about to run `Bash`, still inside its own gap window.
+        std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
+        assert!(
+            !fire(
+                &sched,
+                &dir,
+                "tool: claude:Bash",
+                shadow::Trigger::Tool,
+                tab_origin("claude").with_source(Some("claude:Bash".into())),
+                &params
+            )
+            .await,
+            "the tool trigger keeps the per-(root, tab) bucket — it must not get \
+             a bucket of its own"
+        );
+
+        // Tab B's tool call is a different bucket and must be admitted.
+        assert!(
+            fire(
+                &sched,
+                &dir,
+                "tool: opencode:edit",
+                shadow::Trigger::Tool,
+                tab_origin("opencode").with_source(Some("opencode:edit".into())),
+                &params
+            )
+            .await,
+            "another TAB's tool call must not be throttled by tab A's prompt"
+        );
+
+        let cps = shadow::list(&dir).await.expect("list");
+        assert_eq!(cps.len(), 2, "one per admitted trigger: {cps:?}");
+        assert_eq!(cps[0].trigger, shadow::Trigger::Prompt);
+        assert_eq!(cps[0].source, None);
+        assert_eq!(cps[1].trigger, shadow::Trigger::Tool);
+        assert_eq!(cps[1].source, Some("opencode:edit".to_string()));
+        assert_eq!(cps[1].tab, Some("opencode".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The 2026-08-13 amendment at the scheduler seam: the throttle is what
+    /// makes waiting cheap, and a blown budget reports itself.**
+    ///
+    /// Three claims, measured rather than asserted:
+    ///   * a tool trigger inside its tab's own gap window resolves **without
+    ///     touching git at all** — no task is spawned, so the `on_tool` wait a
+    ///     Claude `Edit` now pays is a `HashMap` lookup in the common case. This
+    ///     is the claim the "every edit now waits for a `git`
+    ///     stage-and-write-tree" cost rests on, and it is the DEDUP that does
+    ///     *not* buy it: a dedup hit still pays the whole `git add -A`.
+    ///   * an admitted trigger whose budget is already spent resolves `false`
+    ///     and writes no checkpoint;
+    ///   * the same trigger with no budget resolves `true` and writes one, so
+    ///     the case above is measuring the deadline.
+    #[tokio::test]
+    async fn a_blown_pre_tool_budget_reports_itself_and_the_throttle_costs_no_git() {
+        if !has_git() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = scratch_dir("tool-budget");
+        let sched = CheckpointScheduler::default();
+
+        // Admitted, unbudgeted: a real checkpoint, and the trigger reports
+        // completion.
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        let handle = sched
+            .spawn_if_due(
+                &dir,
+                "tool: claude:Edit".to_string(),
+                shadow::Trigger::Tool,
+                tab_origin("claude").with_source(Some("claude:Edit".into())),
+                gate_params(3600),
+            )
+            .expect("first tool trigger is admitted");
+        assert!(handle.await.expect("task"), "a completed trigger reports true");
+        assert_eq!(shadow::list(&dir).await.expect("list").len(), 1);
+
+        // Throttled: no task at all. Timed, because "the throttle is why the
+        // wait is affordable" is a latency claim and a spawned-and-deduped
+        // snapshot would still take git-process time here.
+        let t0 = Instant::now();
+        assert!(
+            sched
+                .spawn_if_due(
+                    &dir,
+                    "tool: claude:Write".to_string(),
+                    shadow::Trigger::Tool,
+                    tab_origin("claude").with_source(Some("claude:Write".into())),
+                    gate_params(3600),
+                )
+                .is_none(),
+            "a tool call inside its own tab's gap window must not spawn a snapshot"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "the throttled path must not touch git — took {:?}",
+            t0.elapsed()
+        );
+
+        // Admitted (a different tab's bucket) but out of budget: nothing is
+        // written and the trigger reports the miss.
+        std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
+        let mut params = gate_params(3600);
+        params.deadline = Some(Instant::now() - Duration::from_secs(1));
+        let handle = sched
+            .spawn_if_due(
+                &dir,
+                "tool: claude:Edit".to_string(),
+                shadow::Trigger::Tool,
+                tab_origin("claude-2").with_source(Some("claude:Edit".into())),
+                params,
+            )
+            .expect("another tab's bucket is admitted");
+        assert!(
+            !handle.await.expect("task"),
+            "an abandoned pre-tool snapshot must NOT report completion — the route \
+             reports that as `checkpointed: false`"
+        );
+        assert_eq!(
+            shadow::list(&dir).await.expect("list").len(),
+            1,
+            "abandonment must write no checkpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The miss row names the call whose checkpoint is missing, is flagged in
+    /// the feed, and attributes itself to the tab — the three things a user
+    /// looking for "why is there no checkpoint before this edit" needs.
+    ///
+    /// **What it would still pass with:** a row that said `ok: true` would read
+    /// as ordinary traffic in the Events feed and be invisible at a glance, so
+    /// the flag is asserted; and a row whose `target` dropped the `harness:tool`
+    /// source would be a miss report that names no call, so that is asserted for
+    /// its exact value rather than for being non-empty.
+    #[test]
+    fn a_checkpoint_miss_row_names_the_call_and_flags_itself() {
+        let row = checkpoint_miss_row(
+            Path::new("."),
+            &tab_origin("claude-2").with_source(Some("claude:Edit".into())),
+            Duration::from_millis(2400),
+        );
+        assert_eq!(row.entry.kind, crate::activity::ActivityKind::Graph.as_str());
+        assert_eq!(row.entry.source, "workbench");
+        assert_eq!(row.entry.tool, "checkpoint_missed");
+        assert_eq!(row.entry.target, "claude:Edit");
+        assert!(!row.entry.ok, "a miss must be flagged, not read as traffic");
+        assert_eq!(row.entry.ms, 2400);
+        assert_eq!(
+            row.entry.tab,
+            crate::activity::Attribution::Tab("claude-2".to_string())
+        );
+        assert_eq!(row.entry.session.as_deref(), Some("session-of-claude-2"));
+        assert!(row.request.contains("claude:Edit"));
+
+        // No tab ⇒ "this writer does not know", never `Headless` (which would
+        // claim the call came from a headless consumer) and never another tab.
+        let anon = checkpoint_miss_row(
+            Path::new("."),
+            &shadow::Origin::default().with_source(Some("offload:run_command".into())),
+            Duration::ZERO,
+        );
+        assert_eq!(anon.entry.tab, crate::activity::Attribution::Unattributed);
+        assert_eq!(anon.entry.target, "offload:run_command");
     }
 
     /// The tab-less bucket, asserted in both directions (see [`CheckpointKey`]

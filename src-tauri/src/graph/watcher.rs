@@ -182,8 +182,22 @@ fn collect(res: notify::Result<notify::Event>, into: &mut HashSet<PathBuf>) {
 mod tests {
     use super::*;
 
-    fn p(s: &str) -> PathBuf {
-        PathBuf::from(s)
+    /// A watched path under a project root, spelled the way the host platform
+    /// spells one: `P:\proj\<tail>` on Windows, `/proj/<tail>` elsewhere.
+    ///
+    /// This has to be platform-shaped because [`all_paths_skippable`] works on
+    /// `Path::components()`, and a hard-coded `P:\proj\.cimp\graph.db` is a
+    /// SINGLE `Normal` component on Linux — no `.cimp` component exists in it,
+    /// so every `assert!(all_paths_skippable(..))` below would invert while the
+    /// `assert!(!...)` ones passed vacuously. The bug the assertions guard
+    /// (store writes re-triggering their own rebuild forever) is not
+    /// platform-specific, so the coverage should not be either.
+    fn p(tail: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"P:\proj\{}", tail.replace('/', "\\")))
+        } else {
+            PathBuf::from(format!("/proj/{tail}"))
+        }
     }
 
     /// Regression (2026-07-14): the graph store's own writes must be dropped at
@@ -193,32 +207,23 @@ mod tests {
     #[test]
     fn store_subdir_events_are_skippable() {
         assert!(all_paths_skippable(
-            &[
-                p(r"P:\proj\.cimp\graph.db"),
-                p(r"P:\proj\.cimp\graph.db-journal")
-            ],
+            &[p(".cimp/graph.db"), p(".cimp/graph.db-journal")],
             ".cimp"
         ));
         // A renamed subdir setting is honored.
-        assert!(all_paths_skippable(
-            &[p(r"P:\proj\.mygraph\graph.db")],
-            ".mygraph"
-        ));
+        assert!(all_paths_skippable(&[p(".mygraph/graph.db")], ".mygraph"));
         // ...and the default name is NOT special-cased once renamed.
-        assert!(!all_paths_skippable(
-            &[p(r"P:\proj\.cimp\graph.db")],
-            ".mygraph"
-        ));
+        assert!(!all_paths_skippable(&[p(".cimp/graph.db")], ".mygraph"));
     }
 
     #[test]
     fn source_and_mixed_events_are_kept() {
         // Plain source edit: must reach the channel.
-        assert!(!all_paths_skippable(&[p(r"P:\proj\src\main.rs")], ".cimp"));
+        assert!(!all_paths_skippable(&[p("src/main.rs")], ".cimp"));
         // Mixed event (rename across a skip boundary): keep it — one indexable
         // path makes the event relevant.
         assert!(!all_paths_skippable(
-            &[p(r"P:\proj\.cimp\graph.db"), p(r"P:\proj\src\lib.rs")],
+            &[p(".cimp/graph.db"), p("src/lib.rs")],
             ".cimp"
         ));
         // Empty path list carries no skippable evidence.
@@ -227,19 +232,10 @@ mod tests {
 
     #[test]
     fn hot_path_skip_dirs_still_apply() {
-        assert!(all_paths_skippable(
-            &[p(r"P:\proj\.git\objects\ab\cd")],
-            ".cimp"
-        ));
-        assert!(all_paths_skippable(
-            &[p(r"P:\proj\target\debug\foo.d")],
-            ".cimp"
-        ));
-        assert!(all_paths_skippable(
-            &[p(r"P:\proj\node_modules\x\y.js")],
-            ".cimp"
-        ));
+        assert!(all_paths_skippable(&[p(".git/objects/ab/cd")], ".cimp"));
+        assert!(all_paths_skippable(&[p("target/debug/foo.d")], ".cimp"));
+        assert!(all_paths_skippable(&[p("node_modules/x/y.js")], ".cimp"));
         // The broad SKIP_DIRS entries deliberately do NOT apply here.
-        assert!(!all_paths_skippable(&[p(r"P:\proj\dist\app.js")], ".cimp"));
+        assert!(!all_paths_skippable(&[p("dist/app.js")], ".cimp"));
     }
 }

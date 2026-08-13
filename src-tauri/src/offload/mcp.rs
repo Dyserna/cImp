@@ -1840,10 +1840,19 @@ impl ResolvedBackend {
                     return None;
                 }
                 let cmd = ServerCommand::parse(server_command).ok()?;
+                // V33 Phase E. This is the DEGRADED path (the per-call child
+                // running its own agent loop because the app is unreachable),
+                // and it must authenticate exactly like the app-side pool does —
+                // otherwise turning on `--api-key` silently breaks offload only
+                // when the app is down, which is the hardest possible time to
+                // notice. V33 stage 3: through `effective_auth_token`, so it
+                // also inherits the `--api-key` fallback the pool has. Reading
+                // the raw field here is exactly how the two paths would drift.
+                let token = b.kind.effective_auth_token();
                 Some(Self {
                     name: b.name.clone(),
                     base_url: cmd.base_url(),
-                    auth_token: None,
+                    auth_token: (!token.is_empty()).then_some(token),
                     cloud_blocked: false,
                     is_cloud: false,
                     is_remote: false,
@@ -2191,6 +2200,15 @@ async fn run_on_backend(
     schema: Option<serde_json::Value>,
     profile: Option<Profile>,
 ) -> Result<String, String> {
+    // V33 Phase F: NO pre-mutation checkpoint on this path, and that is the
+    // correct answer rather than a gap. This is the HEADLESS child — a separate
+    // `cimp --offload-mcp` process that runs the agent loop only when the app is
+    // unreachable (see this module's header). There is no `WorkbenchService` in
+    // it and no `AppHandle` to reach one through, and reproducing the Workbench
+    // in a short-lived stdio child would mean two writers on one `.cimp/
+    // shadow.git` with no shared per-root lock — the exact `cp-<seq>` collision
+    // `shadow::SHADOW_LOCKS` exists to prevent. `ToolCtx::new` therefore leaves
+    // `checkpoint: None`, which is a documented state, not a missing field.
     let ctx = ToolCtx::new(
         settings.allowed_roots.clone(),
         settings.command_allowlist.clone(),

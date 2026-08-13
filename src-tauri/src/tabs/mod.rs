@@ -19,6 +19,10 @@ pub(crate) use config::claude_tab_dirs;
 /// #48 (F-3): one AI tab's launch directory, for the project root V32
 /// containment rows are recorded under — see [`config::ai_tab_dir`].
 pub(crate) use config::ai_tab_dir;
+/// V33 (C5, finding F-4): which consumer a configured AI tab belongs to, for
+/// `loopback::is_configured_tab`'s `(consumer, tab)` check — see
+/// [`config::tab_consumer`] for why both ends must classify through one call.
+pub(crate) use config::tab_consumer;
 /// The advertised-MCP-server signature, re-exported for the Settings save
 /// path's restart-hint edge detector (`ipc::commands::settings_update`).
 pub(crate) use config::spawn_inject_sig;

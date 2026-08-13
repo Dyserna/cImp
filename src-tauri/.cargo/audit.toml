@@ -30,4 +30,87 @@
 # runtime exposure on any shipped platform. Accepted-risk.
 # Revisit: clears itself when the transitive consumer moves to quick-xml
 # >=0.40; check `cargo tree -i quick-xml@0.39.4` on each maintenance run.
-ignore = ["RUSTSEC-2026-0041", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+#
+# ── wasmtime 38.0.4 via yara-x — the 16 below ─────────────────────────────────
+# Decision V33 stage 3, 2026-08-13. This closes code review V32's open question
+# 4 ("Open questions needing a decision", item 4) as an ACCEPT.
+#
+# WHY IT IS AN ACCEPT AND NOT A LAUNDERED DEFERRAL. The review's objection to
+# putting these here was precise and correct at the time: two of the sixteen
+# (RUSTSEC-2026-0006 and -0087) were "not clearly excluded", and moving an
+# UNDECIDED exposure into an accept list is laundering. That objection is gone
+# because both were since traced to a specific guest instruction:
+#   * -0006 fires on `f64.copysign`;
+#   * -0087 fires on `f64x2.splat`.
+# A `.yar` author does not choose the instruction stream — yara-x's codegen
+# does, and it emits neither. The complete f64 repertoire in
+# `yara-x-1.12.0/src/compiler/emit.rs` is F64ConvertSI / F64Mul / F64Div /
+# F64Ceil / F64Ne / F64Neg, and there is no `Copysign`, no `V128`, no `Splat`
+# and no SIMD op anywhere under its `src/`. Every one of the sixteen therefore
+# has a STATED exclusion, which is what makes this a decision rather than a mute
+# button. Reachability, per advisory:
+#
+#   RUSTSEC-2026-0006          guest `f64.copysign`, Cranelift x86-64  NOT EMITTED
+#   RUSTSEC-2026-0087          guest `f64x2.splat`, Cranelift x86-64   NO SIMD EMITTED
+#   RUSTSEC-2026-0096          Cranelift **aarch64**                   x86-64 only
+#   RUSTSEC-2026-0086/0089/    **Winch** backend                       feature off
+#              0094/0095
+#   RUSTSEC-2026-0085/0091/    **component model** string/flags lift   feature off
+#              0092/0093
+#   RUSTSEC-2026-0020/0021     **WASI** / `wasi:http`                  feature off
+#   RUSTSEC-2026-0088          **pooling allocator**                   feature off
+#   RUSTSEC-2026-0114          table exceeding host address space      shape fixed by codegen
+#   RUSTSEC-2026-0222          type indices mixed BETWEEN engines      one process-global Engine
+#
+# The four "feature off" rows are `src-tauri/Cargo.toml`'s yara-x dependency
+# (`default-features = false`) meeting `yara-x-1.12.0/Cargo.toml:372-378`, which
+# takes wasmtime with `features = ["cranelift","runtime"]` — Winch, the
+# component model, WASI and the pooling allocator are all absent. x86-64-only is
+# `.github/workflows/release.yml` (windows-latest + ubuntu-24.04). The single
+# `Engine` is `yara-x-1.12.0/src/wasm/mod.rs:782-792`.
+#
+# There is also no upgrade to take: yara-x 1.12.0 pins wasmtime 38.0.4 and no
+# patched 38.x line exists, so "fix it" means a yara-x major move, i.e. giving
+# up the rule format (locked decision 7).
+#
+# The residual, stated: this accepts a **tail risk of an unknown Cranelift
+# codegen bug** reachable through yara-x's small fixed instruction repertoire
+# (i32/i64 arithmetic, structured control flow, `br_table`, calls to a fixed
+# host set, the six f64 ops above). None of the sixteen qualifies. That risk is
+# not driven to zero by anything short of dropping yara-x. What V33 stage 3 DID
+# do about the same directory is bound the compile — see
+# `offload/detection/signature.rs`'s `CompileLimits` — because the verified
+# worst case there was a permanent startup hang, not code execution.
+#
+# Revisit — TWO triggers, either one is sufficient:
+#   1. **any `yara-x` upgrade.** The whole argument rests on what THIS version's
+#      codegen emits and on the feature set it asks wasmtime for. The dependency
+#      is pinned `=1.12.0` in `src-tauri/Cargo.toml` so the bump cannot happen
+#      without someone editing that line and finding this note.
+#   2. **any NEW wasmtime advisory whose trigger instruction or feature is in
+#      yara-x's emitted repertoire.** `.github/workflows/advisories.yml` is the
+#      automated half of this one: with these sixteen ignored, `cargo audit`
+#      reports zero, and a seventeenth turns that job RED.
+ignore = [
+    "RUSTSEC-2026-0041",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # wasmtime 38.0.4 via yara-x — see the block above for the per-advisory
+    # reachability argument. Do NOT remove one of these without re-reading it.
+    "RUSTSEC-2026-0006",
+    "RUSTSEC-2026-0020",
+    "RUSTSEC-2026-0021",
+    "RUSTSEC-2026-0085",
+    "RUSTSEC-2026-0086",
+    "RUSTSEC-2026-0087",
+    "RUSTSEC-2026-0088",
+    "RUSTSEC-2026-0089",
+    "RUSTSEC-2026-0091",
+    "RUSTSEC-2026-0092",
+    "RUSTSEC-2026-0093",
+    "RUSTSEC-2026-0094",
+    "RUSTSEC-2026-0095",
+    "RUSTSEC-2026-0096",
+    "RUSTSEC-2026-0114",
+    "RUSTSEC-2026-0222",
+]

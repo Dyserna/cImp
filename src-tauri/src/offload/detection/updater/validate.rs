@@ -53,13 +53,36 @@ use super::manifest::Component;
 
 /// Wall-clock ceiling on compiling a whole staged bundle.
 ///
-/// Measured around the compile rather than enforced inside it: yara-x exposes
-/// no compile deadline, and spawning a killable thread to impose one would
-/// leave a runaway compile burning a core with nobody to join it. Measuring
-/// after is enough for the property that matters — a pathological bundle is
-/// **rejected, never activated** — and the compile runs on the blocking pool in
-/// a background task, so the cost of catching it late is the updater's own
-/// latency, not the fetch path's.
+/// # It is now a bound with a measurement on top, not a measurement alone
+///
+/// This read "measured around the compile rather than enforced inside it" until
+/// V33 stage 3, and it was right about the mechanism: yara-x exposes no compile
+/// deadline, so the only way to impose one is a thread you stop waiting for and
+/// can never kill. That is a bad trade for an *update* — the fallback there is
+/// "keep the bundle you already have" — and it was declined here.
+///
+/// It was the wrong trade to decline for **startup**, where the fallback was
+/// "the app never opens", and [`signature::compile_sources`] took it: every
+/// compile in the process now runs under [`signature::CompileLimits`], this one
+/// included. Since [`validate_rules`] compiles **staged, not-yet-trusted**
+/// sources in-process to gate them, that is the ceiling that matters here — the
+/// un-validated bundle is still JIT-compiled as part of validating it, but it
+/// can no longer take the process with it.
+///
+/// So the two are layered, and deliberately not the same number:
+///
+/// - `CompileLimits` (20 s per call, 5 s per attempt) is the **hard backstop**.
+///   A bundle that trips it comes back with its files in `failed` and is
+///   rejected by gate 1 below, as a bundle that "does not compile".
+/// - this 5 s **measurement** is the tighter *curation* gate, and it is what
+///   produces the accurate message for the ordinary case — a bundle that
+///   compiles fine and is simply too expensive to ship. Keeping it above the
+///   backstop's floor and below its ceiling is what keeps that message reachable
+///   instead of every slow bundle being mislabelled as broken.
+///
+/// The compile still runs on the blocking pool in a background task, so the cost
+/// of catching a slow bundle late is the updater's own latency, not the fetch
+/// path's.
 pub const COMPILE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Per-document ceiling on the smoke scan: a bundle that needs longer than the

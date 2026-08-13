@@ -1079,8 +1079,11 @@ impl GraphService {
                     .into(),
             };
         }
-        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model)
-        else {
+        let Some(mut embedder) = Embedder::new(
+            &snap.embedding_endpoint,
+            &snap.embedding_model,
+            &snap.embedding_auth_token,
+        ) else {
             return EmbedderProbe {
                 ok: false,
                 dim: None,
@@ -4107,8 +4110,11 @@ impl GraphService {
             s.semantic_enabled = true;
             s.embedder_configured = configured;
         });
-        let Some(mut embedder) = Embedder::new(&snap.embedding_endpoint, &snap.embedding_model)
-        else {
+        let Some(mut embedder) = Embedder::new(
+            &snap.embedding_endpoint,
+            &snap.embedding_model,
+            &snap.embedding_auth_token,
+        ) else {
             self.patch_status(root, |s| {
                 s.embed_state = "degraded".into();
                 s.embedder_ready = false;
@@ -5200,12 +5206,25 @@ mod tests {
         let indices = StdMutex::new(HashMap::new());
         let sub = ".ckg-test";
 
-        // The plain spelling, then the canonicalized one (which on Windows is
-        // the verbatim `\\?\` form — a different `PathBuf`, same directory).
+        // The plain spelling, then a second `PathBuf` that names the SAME
+        // directory. On Windows that second spelling is the canonicalized
+        // verbatim `\\?\P:\…` form — the production case in the doc above.
+        //
+        // It cannot be `canonicalize` everywhere: on Linux `temp_dir()` is
+        // `/tmp`, a real directory with no symlinks to resolve, so
+        // `canonicalize` returns the path UNCHANGED and the `assert_ne!` below
+        // fails on the fixture rather than on the behaviour. A redundant `.`
+        // component is an equally different `PathBuf` that `warm_index`'s own
+        // `canonicalize` folds back to the same key, which is the property
+        // under test.
         let (plain, _) = warm_index(&indices, &dir, sub).expect("open plain");
-        let canon = std::fs::canonicalize(&dir).expect("canonicalize");
-        assert_ne!(canon, dir, "the two spellings must actually differ");
-        let (verbatim, _) = warm_index(&indices, &canon, sub).expect("open canonical");
+        let other_spelling = if cfg!(windows) {
+            std::fs::canonicalize(&dir).expect("canonicalize")
+        } else {
+            dir.join(".")
+        };
+        assert_ne!(other_spelling, dir, "the two spellings must actually differ");
+        let (verbatim, _) = warm_index(&indices, &other_spelling, sub).expect("open canonical");
 
         assert!(Arc::ptr_eq(&plain, &verbatim), "one file, one handle");
         assert_eq!(indices.lock().unwrap().len(), 1, "one cache entry");

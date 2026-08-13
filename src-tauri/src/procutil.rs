@@ -51,12 +51,54 @@ pub async fn read_capped<R: AsyncRead + Unpin>(reader: Option<R>, cap: usize) ->
     (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }
 
-/// Kill `child` and, on Windows, its whole process tree. `start_kill`
-/// (TerminateProcess) reaches only the direct child; tools like semgrep fork
-/// workers that inherit the stdio pipe write ends — left alive they keep
-/// running AND prevent the capture tasks from ever seeing EOF. The
-/// process_guard job object is no help here: it reaps on *cImp* exit, not on a
-/// per-run kill.
+/// V33 contract C3 — the Unix half of the tree kill, applied at **spawn** time.
+///
+/// Windows can reap a tree after the fact (`taskkill /T`, and the
+/// [`crate::process_guard`] job object for the hard-death case). Unix has
+/// neither: `start_kill` is `kill(pid, SIGKILL)` and reaches the direct child
+/// only, so a checker or scanner that forked workers leaves them running —
+/// still burning CPU, and still holding the stdio pipe write ends, which is
+/// what makes [`drain_capture`] time out instead of EOF-ing. Before this
+/// existed, `docs/completedMilestones/MILESTONE-linux-support.md` tracked it as
+/// an accepted Linux-only orphan hazard.
+///
+/// The Unix answer has to be set up before the child exists: make the child its
+/// own **process-group leader** (`setpgid(0, 0)`, which is what
+/// `process_group(0)` compiles to) so that later a single `killpg` reaps it and
+/// every descendant that did not deliberately leave the group. Call this on
+/// every agent-initiated spawn whose kill path is [`kill_tree`].
+///
+/// No-op on Windows — job/tree membership there is inherited automatically and
+/// `process_group` is a Unix-only API.
+///
+/// The PTY seam deliberately does **not** call this: portable-pty's unix
+/// backend already `setsid()`s the child (`portable-pty/src/unix.rs`), which
+/// makes it a session AND group leader, and gives it a controlling terminal on
+/// top — so closing the master fd hangs up the whole session for free.
+pub fn own_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        // `0` = "use the child's own pid as the new group id", i.e. the child
+        // becomes the leader of a brand-new group containing only it (and,
+        // by inheritance, everything it goes on to spawn).
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Kill `child` and its whole process tree. `start_kill` (TerminateProcess /
+/// `kill(pid)`) reaches only the direct child; tools like semgrep fork workers
+/// that inherit the stdio pipe write ends — left alive they keep running AND
+/// prevent the capture tasks from ever seeing EOF. The process_guard job object
+/// is no help here: it reaps on *cImp* exit, not on a per-run kill.
+///
+/// Two mechanisms, one per platform: `taskkill /T /F` walks the Windows parent
+/// pid chain, and `killpg` signals the Unix process group that
+/// [`own_process_group`] established at spawn. Both are best-effort and are
+/// followed by the direct kill regardless.
 pub async fn kill_tree(child: &mut tokio::process::Child) {
     #[cfg(windows)]
     if let Some(pid) = child.id() {
@@ -70,10 +112,59 @@ pub async fn kill_tree(child: &mut tokio::process::Child) {
             let _ = tk.wait().await;
         }
     }
-    // Direct kill regardless — the fallback when taskkill is unavailable/failed,
-    // and the whole mechanism on non-Windows.
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        kill_process_group(pid);
+    }
+    // Direct kill regardless — the fallback when taskkill/killpg was
+    // unavailable or the child was never group-detached.
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// `killpg` the group `pid` leads — but **only** if it actually leads one.
+///
+/// Why the check is not paranoia. `killpg` takes a process-GROUP id, and
+/// passing a pid that is not a group id is not merely useless: if it ever named
+/// a group cImp did not create, this would signal a set of processes chosen by
+/// accident. The guard makes that impossible rather than improbable:
+///
+/// * `getpgid(pid) == pid` is true exactly when the child is its own group
+///   leader, which is exactly what [`own_process_group`] arranges. If a caller
+///   forgot to call it, we skip and fall back to the direct kill.
+/// * The pid itself is unambiguous because the caller holds an unreaped
+///   `Child`: Unix does not recycle a pid until it is waited on, and
+///   [`kill_tree`] runs before its own `wait()`. (`Child::id()` already returns
+///   `None` once tokio has reaped it.)
+///
+/// `SIGKILL`, not `SIGTERM`: this is the Unix counterpart of `taskkill /F`, and
+/// its callers reach it only after a timeout or an explicit cancel — the point
+/// at which a process that has not exited has already declined to.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let pid = pid as libc::pid_t;
+    // SAFETY: `getpgid` is a pure query on a pid the caller still holds
+    // unreaped; it returns -1 on failure, which fails the equality below.
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid != pid {
+        tracing::debug!(
+            pid,
+            pgid,
+            "kill_tree: child is not its own process-group leader; killing it directly only \
+             (its descendants, if any, will survive — the spawn site should call \
+             `own_process_group`)"
+        );
+        return;
+    }
+    // SAFETY: `pgid` is a process-group id we just proved the child leads.
+    let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if rc != 0 {
+        tracing::debug!(
+            pgid,
+            error = %std::io::Error::last_os_error(),
+            "kill_tree: killpg failed; falling back to the direct kill"
+        );
+    }
 }
 
 /// Await a [`read_capped`] capture task, bounded by [`DRAIN_TIMEOUT`]. If the

@@ -277,6 +277,27 @@ fn local_command(b: &OffloadBackend) -> Option<(String, bool)> {
     }
 }
 
+/// V33 Phase E: a Local backend's **configured** bearer token, or `""` for none.
+///
+/// Kept separate from [`local_command`] rather than widening its tuple: that
+/// one is also matched positionally (`Some((_, true))` in the autostart pass),
+/// and a secret is not something to add to a tuple people destructure by
+/// position.
+///
+/// Deliberately NOT `OffloadBackendKind::effective_auth_token` (V33 stage 3):
+/// its one caller hands this to `LlamaServer::with_config` **together with the
+/// command actually being launched**, and that is where the `--api-key`
+/// fallback belongs — `with_config` needs to know whether the token was
+/// inherited or configured so `unauthorized_message` can name the right fix,
+/// and the command it should read is the override, not the persisted one.
+/// Resolving here would drop the provenance and read the wrong command string.
+fn local_auth_token(b: &OffloadBackend) -> String {
+    match &b.kind {
+        OffloadBackendKind::Local { auth_token, .. } => auth_token.clone(),
+        _ => String::new(),
+    }
+}
+
 impl OffloadSupervisor {
     pub fn new(app: AppHandle, settings: SettingsHandle) -> Arc<Self> {
         let initial = if settings.current().offload.enabled {
@@ -555,9 +576,24 @@ impl OffloadSupervisor {
         // Fresh capture buffer per (re)start so the panel shows this load.
         self.logs.lock().unwrap().remove(name);
         let (child, exited) = spawn_child(&cmd, &self.app, name, self.logs.clone())?;
+        // V33 Phase E: the probe credential comes from the backend's CONFIGURED
+        // `auth_token`. A `command_override` edits the launch command for one
+        // start and is deliberately not a credential *editor*: a configured
+        // token always wins, so an override can never replace one.
+        //
+        // V33 stage 3 REFINES that, and the earlier "never from `command`" is
+        // now too strong: when the configured token is EMPTY,
+        // `LlamaServer::with_config` inherits the `--api-key` out of the command
+        // it was handed — which here is the override when there is one. That is
+        // the right end of the trade. The server that is actually running was
+        // just spawned from THIS command string, so its `--api-key` is the key
+        // it will enforce; the alternative is a probe that reports
+        // `unauthorized` against a server cImp itself started one line above,
+        // with a credential it was holding the whole time.
         let server = Arc::new(LlamaServer::with_config(
             &backend.name,
             &command,
+            &local_auth_token(&backend),
             backend.tier,
             backend.tool_scope.clone(),
         )?);
@@ -828,6 +864,14 @@ impl OffloadSupervisor {
         let _permit = server.acquire_slot(timeout).await?;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // V33 Phase F: no pre-mutation checkpoint here either, deliberately.
+        // This is the Settings "Test offload" self-test — a fixed instruction
+        // the USER pressed a button to run, from the app's own launch directory
+        // rather than any session's cwd, with no tab behind it. A checkpoint
+        // taken for it would land on whatever project the app happens to have
+        // been launched in and would be attributable to nothing, which is the
+        // fabricated-attribution failure the whole phase is built to avoid.
+        // `ToolCtx::new` leaves `checkpoint: None`.
         let ctx = super::tools::ToolCtx::new(
             snap.allowed_roots.clone(),
             snap.command_allowlist.clone(),

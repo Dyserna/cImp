@@ -540,6 +540,10 @@ enum Conn {
         /// [`negotiated_version`]), echoed as `MCP-Protocol-Version` on every
         /// post-handshake request.
         protocol_version: String,
+        /// V33 Phase E: the configured bearer token, or `None` for none.
+        /// Carried on the connection so every later `tools/call` sends it, not
+        /// just the handshake. `None` ⇒ no `Authorization` header at all.
+        auth_token: Option<String>,
     },
 }
 
@@ -697,6 +701,7 @@ impl McpServer {
                 client,
                 session_id,
                 protocol_version,
+                auth_token,
             }) => {
                 let current = session_id.lock().unwrap().clone();
                 match http_request(
@@ -704,8 +709,11 @@ impl McpServer {
                     url,
                     "tools/call",
                     params,
-                    current.as_deref(),
-                    Some(protocol_version.as_str()),
+                    HttpHeaders {
+                        session_id: current.as_deref(),
+                        protocol_version: Some(protocol_version.as_str()),
+                        auth_token: auth_token.as_deref(),
+                    },
                     REQUEST_TIMEOUT,
                 )
                 .await
@@ -1139,10 +1147,41 @@ fn config_sig(c: &McpServerConfig) -> String {
     // Include all access flags: a per-consumer toggle (Claude / offload /
     // OpenCode) must still re-key the signature so `warm_host` reconciles and
     // re-emits a capability pulse.
+    //
+    // V33 Phase E — `auth_token` is connection-relevant and MUST be here. This
+    // list is explicit, and it feeds `host_config_sig`, which `warm_host`
+    // compares to decide whether to reconnect at all: a token omitted here
+    // means the user edits the key in Settings, the signature does not move,
+    // no server is reconnected, and the old credential keeps being sent. The
+    // edit would appear to do nothing, with no error anywhere.
+    //
+    // As a FINGERPRINT, not cleartext: unlike `env` (whose values this line has
+    // always carried, and which is the stdio transport's own secret channel),
+    // there is no reason for the token's plaintext to sit in a `String` held
+    // for the process lifetime on every `McpServer`. `token_fp`'s rationale in
+    // `service.rs` is the same one — the signature only ever needs to detect
+    // *change*.
     format!(
-        "{}|{}|{:?}|{}|{}|{}|{:?}",
-        c.command, c.url, c.args, c.claude_access, c.offload_access, c.opencode_access, env
+        "{}|{}|{:?}|{}|{}|{}|{:?}|{}",
+        c.command,
+        c.url,
+        c.args,
+        c.claude_access,
+        c.offload_access,
+        c.opencode_access,
+        env,
+        token_fp(&c.auth_token)
     )
+}
+
+/// Non-cryptographic fingerprint of a token, for change detection only — never
+/// stored, logged or transmitted. Twin of `offload::service::token_fp`; kept
+/// local so `config_sig` has no cross-module dependency for one hash.
+fn token_fp(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    h.finish()
 }
 
 /// A stable signature of the *whole* desired host configuration (every
@@ -1336,6 +1375,10 @@ async fn connect_stdio(
 /// — all carrying the session id. Calls POST per request; no warm channel.
 async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), String> {
     let url = cfg.url.trim_end_matches('/').to_string();
+    // V33 Phase E: read once here and carried on the `Conn` below, so the
+    // handshake and every later `tools/call` present the same credential.
+    // Empty ⇒ `None` ⇒ no `Authorization` header (pre-V33 behaviour).
+    let auth_token = (!cfg.auth_token.is_empty()).then(|| cfg.auth_token.clone());
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         // Bound the connection phase tightly so an unreachable host (a LAN box
@@ -1359,11 +1402,14 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         &url,
         "initialize",
         init,
-        None,
-        // The handshake itself predates the negotiation, so it carries no
-        // `MCP-Protocol-Version` header — the body's `protocolVersion` is the
-        // request.
-        None,
+        HttpHeaders {
+            session_id: None,
+            // The handshake itself predates the negotiation, so it carries no
+            // `MCP-Protocol-Version` header — the body's `protocolVersion` is
+            // the request.
+            protocol_version: None,
+            auth_token: auth_token.as_deref(),
+        },
         CONNECT_TIMEOUT,
     )
     .await
@@ -1388,8 +1434,11 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         &url,
         "notifications/initialized",
         json!({}),
-        session_id.as_deref(),
-        Some(protocol_version.as_str()),
+        HttpHeaders {
+            session_id: session_id.as_deref(),
+            protocol_version: Some(protocol_version.as_str()),
+            auth_token: auth_token.as_deref(),
+        },
     )
     .await;
     let (list_session, list) = http_request(
@@ -1397,8 +1446,11 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
         &url,
         "tools/list",
         json!({}),
-        session_id.as_deref(),
-        Some(protocol_version.as_str()),
+        HttpHeaders {
+            session_id: session_id.as_deref(),
+            protocol_version: Some(protocol_version.as_str()),
+            auth_token: auth_token.as_deref(),
+        },
         CONNECT_TIMEOUT,
     )
     .await
@@ -1415,6 +1467,7 @@ async fn connect_http(cfg: &McpServerConfig) -> Result<(Conn, Vec<HostTool>), St
             client,
             session_id: StdMutex::new(session_id),
             protocol_version,
+            auth_token,
         },
         tools,
     ))
@@ -1496,6 +1549,26 @@ fn http_error(status: u16, method: &str, body: &str) -> HostError {
     HostError::with_remote(format!("http status {status}"), body)
 }
 
+/// The three transport headers a Streamable-HTTP call carries beside its
+/// JSON-RPC body. A struct rather than three positional parameters because
+/// they are all `Option<&str>`: transposing two of them compiles cleanly and
+/// fails only against a live server (the same hazard `shadow::Origin::new`
+/// documents), and V33 Phase E's `auth_token` took `http_request` over
+/// clippy's argument-count bar anyway.
+///
+/// Every field is "omit the header entirely" when `None`:
+/// * `session_id` — a stateless server assigns none; absence is normal.
+/// * `protocol_version` — the `initialize` handshake predates negotiation.
+/// * `auth_token` — **an empty bearer is worse than no bearer**, so an empty
+///   string is treated as absent at the two send sites, and an unauthenticated
+///   server keeps seeing exactly the pre-V33 request.
+#[derive(Clone, Copy, Default)]
+struct HttpHeaders<'a> {
+    session_id: Option<&'a str>,
+    protocol_version: Option<&'a str>,
+    auth_token: Option<&'a str>,
+}
+
 /// Core Streamable-HTTP request: POST one JSON-RPC frame and return the
 /// `Mcp-Session-Id` the server assigned (if any) plus the JSON-RPC `result`.
 /// Sends the dual `Accept` the 2025 transport mandates (a server rejects a
@@ -1510,15 +1583,24 @@ fn http_error(status: u16, method: &str, body: &str) -> HostError {
 /// gated on the negotiated `protocol_version` — cImp still requests
 /// [`PROTOCOL_VERSION`], so a modern-only server is *detected*
 /// ([`ERR_UNSUPPORTED_REVISION`]) rather than spoken to.
+///
+/// No header value ever reaches an error string: the two failure renderers
+/// ([`http_error`] and the transport `map_err` below) carry only the status,
+/// the method name and the server's own body, so the bearer token cannot land
+/// in a log line, a Settings health row or an activity row.
 async fn http_request(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: Value,
-    session_id: Option<&str>,
-    protocol_version: Option<&str>,
+    headers: HttpHeaders<'_>,
     timeout: Duration,
 ) -> Result<(Option<String>, Value), HostError> {
+    let HttpHeaders {
+        session_id,
+        protocol_version,
+        auth_token,
+    } = headers;
     // Unique per-call id (JSON-RPC ids must be unique within a session; some
     // servers reject a repeated id even on a stateless POST).
     static HTTP_RPC_ID: AtomicU64 = AtomicU64::new(1);
@@ -1536,6 +1618,9 @@ async fn http_request(
     }
     if let Some(v) = protocol_version {
         req = req.header("MCP-Protocol-Version", v);
+    }
+    if let Some(t) = auth_token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(t);
     }
     // reqwest's `e` is cImp/reqwest-composed, not server-authored: a transport
     // failure means no server bytes arrived at all.
@@ -1586,9 +1671,13 @@ async fn http_notify(
     url: &str,
     method: &str,
     params: Value,
-    session_id: Option<&str>,
-    protocol_version: Option<&str>,
+    headers: HttpHeaders<'_>,
 ) {
+    let HttpHeaders {
+        session_id,
+        protocol_version,
+        auth_token,
+    } = headers;
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
     let mut req = client
         .post(url)
@@ -1600,6 +1689,12 @@ async fn http_notify(
     }
     if let Some(v) = protocol_version {
         req = req.header("MCP-Protocol-Version", v);
+    }
+    // Same rule as `http_request`: a server that requires auth would answer
+    // this notification with a 401, and since the result is discarded the
+    // failure would be invisible — so it authenticates too.
+    if let Some(t) = auth_token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(t);
     }
     let _ = req.send().await;
 }
@@ -2395,5 +2490,41 @@ mod tests {
             s1,
             host_config_sig(std::slice::from_ref(&a), &[PathBuf::from("/other")])
         );
+    }
+
+    /// **V33 Phase E, the trap.** `config_sig` lists its fields explicitly and
+    /// feeds `host_config_sig`, which `warm_host` compares to decide whether to
+    /// reconnect. A token missing from that list means editing the key in
+    /// Settings changes nothing observable: no reconnect, the stale credential
+    /// keeps going out, and there is no error to notice.
+    #[test]
+    fn an_auth_token_change_moves_the_host_config_sig() {
+        let none = McpServerConfig {
+            name: "ddg".into(),
+            url: "http://172.21.1.11:17201/mcp".into(),
+            offload_access: true,
+            ..Default::default()
+        };
+        let roots = vec![PathBuf::from("/work")];
+        let sig = |c: &McpServerConfig| host_config_sig(std::slice::from_ref(c), &roots);
+
+        let first = McpServerConfig {
+            auth_token: "sk-first".into(),
+            ..none.clone()
+        };
+        let rotated = McpServerConfig {
+            auth_token: "sk-second".into(),
+            ..none.clone()
+        };
+        // Adding a token, and rotating one non-empty value to another (the
+        // real-world key-rotation case), both move the signature.
+        assert_ne!(sig(&none), sig(&first));
+        assert_ne!(sig(&first), sig(&rotated));
+        // …and it is still stable for identical input.
+        assert_eq!(sig(&first), sig(&first.clone()));
+
+        // The signature carries a fingerprint, never the secret itself — it is
+        // held per-server for the process lifetime.
+        assert!(!sig(&first).contains("sk-first"), "{}", sig(&first));
     }
 }

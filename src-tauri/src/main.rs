@@ -5,6 +5,7 @@ mod advisor;
 mod attach;
 mod audio;
 mod audit;
+mod checkpoint_beacon;
 mod checks;
 mod compact_hook;
 mod content;
@@ -28,6 +29,7 @@ mod pty;
 mod read_hook;
 mod settings;
 mod shell;
+mod spawn_ledger;
 mod state;
 mod statusline;
 mod stt;
@@ -131,6 +133,7 @@ SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --postedit-hook                        PostToolUse checks hook shim
   --notify-hook                          Notification / PermissionDenied hook shim
   --taint-beacon --tab <id>              PreToolUse native-web beacon shim (report-only)
+  --checkpoint-beacon --tab <id>         PreToolUse pre-mutation checkpoint shim (report-only)
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>] [--tab <id>]
@@ -266,6 +269,25 @@ fn main() {
     // it cannot deny a tool call however badly the app is behaving.
     if std::env::args().skip(1).any(|a| a == "--taint-beacon") {
         taint_beacon::run();
+        return;
+    }
+
+    // V33 Phase F: Claude Code invokes `cimp --checkpoint-beacon --tab <id>` as
+    // a `PreToolUse` hook matched on `Edit|Write|MultiEdit|Bash`. It POSTs to
+    // the app's loopback `/workbench/tool_checkpoint`, which takes a Workbench
+    // checkpoint attributed to that exact call so the Timeline can rewind to
+    // just before it. Report-only: GUI-free, never writes to stdout/stderr and
+    // always returns normally, so it cannot deny an edit however badly the app
+    // is behaving.
+    //
+    // It does DIVERGE from `--taint-beacon` in one deliberate way: it waits for
+    // the app's reply (2 s) instead of firing and forgetting, because Claude
+    // starts the tool the moment the hook exits and a checkpoint taken
+    // concurrently with the edit is a checkpoint of the damage. Past the
+    // deadline the app writes nothing and records the miss. See
+    // `checkpoint_beacon`'s module doc.
+    if std::env::args().skip(1).any(|a| a == "--checkpoint-beacon") {
+        checkpoint_beacon::run();
         return;
     }
 
@@ -407,11 +429,16 @@ fn main() {
 
     // V32 Phase C: compile the injection-detection signature rules from
     // `<exe-dir>/detection/rules.d/` and report whether the classifier's
-    // weights are installed. Done here, on the launch thread and before any
-    // tool call can happen, so the very first fetched page is screened by a
-    // ready layer instead of paying the compile inline — and so a broken rules
-    // file is a startup WARN the user can act on rather than a surprise later.
-    // Infallible: both layers degrade to inert (see `detection::init`).
+    // weights are installed. Started here, before any tool call can happen, so
+    // the very first fetched page is screened by a ready layer — and so a broken
+    // rules file is a startup WARN the user can act on rather than a surprise
+    // later. Infallible: both layers degrade to inert (see `detection::init`).
+    //
+    // V33 stage 3: this **returns immediately** and the compile runs on its own
+    // thread. It used to run inline right here, which made one crafted file in
+    // the user-writable `rules.d/local/` a permanent launch hang. A fetch that
+    // beats the compile waits for it rather than screening nothing, so the
+    // ordering property above survives the move — see `detection::init`.
     offload::detection::init();
 
     // TTS / audio pipeline. Failures are non-fatal — the app launches with

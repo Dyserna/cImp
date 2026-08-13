@@ -32,11 +32,25 @@ const PROPS_TOKEN_MARGIN: usize = 16;
 pub const MIN_TOKEN_LIMIT: usize = 64;
 
 /// A reachable, configured embedder. Cheap to clone (just config + a client).
+///
+/// No `Debug`, derived or otherwise — it holds `auth_token`. If one is ever
+/// wanted, hand-roll it and redact that field (the house pattern:
+/// `settings::schema::ClaudeLocalSettings`).
 #[derive(Clone)]
 pub struct Embedder {
     client: reqwest::Client,
     endpoint: String,
     model: String,
+    /// V33 Phase E: bearer token for the embedding endpoint, or empty for
+    /// none. Set on ALL FOUR request sites — the embeddings POST plus the
+    /// `/props`, `/tokenize` and `/detokenize` helpers — because they all hit
+    /// the same server, and a `--api-key` llama-server gates them all.
+    ///
+    /// Deliberately part of the handle rather than a per-call argument: the
+    /// `Embedder` is cloned and re-derived all over the backfill (adaptive
+    /// shrink, per-item isolation), and a per-call token is a thing one of
+    /// those paths eventually forgets to pass.
+    auth_token: String,
     /// The dimension the vector store was sized to, once known. `embed`
     /// rejects any response whose vectors don't match it — so a remote
     /// `llama-server` silently restarted with a different-dimension model
@@ -93,8 +107,13 @@ struct DetokenizeResponse {
 
 impl Embedder {
     /// Build an embedder for `endpoint` (the base, e.g. `http://host:8081` or a
-    /// full `.../v1/embeddings`) + `model`. Returns `None` when unconfigured.
-    pub fn new(endpoint: &str, model: &str) -> Option<Embedder> {
+    /// full `.../v1/embeddings`) + `model` + `auth_token` (empty = no auth).
+    /// Returns `None` when unconfigured.
+    ///
+    /// V33 Phase E: this is the single injection point for the bearer token —
+    /// every one of the four request sites reads it off the handle, so a new
+    /// endpoint call added later authenticates by construction.
+    pub fn new(endpoint: &str, model: &str, auth_token: &str) -> Option<Embedder> {
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
             return None;
@@ -103,9 +122,21 @@ impl Embedder {
             client: shared_client(),
             endpoint: normalize_endpoint(endpoint),
             model: model.trim().to_string(),
+            auth_token: auth_token.trim().to_string(),
             expected_dim: None,
             max_tokens: None,
         })
+    }
+
+    /// Attach the bearer token when there is one. An empty token sends NO
+    /// `Authorization` header — a bare `Bearer ` is worse than none, and every
+    /// pre-V33 (unauthenticated) endpoint must keep working untouched.
+    fn with_auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.auth_token.is_empty() {
+            rb
+        } else {
+            rb.bearer_auth(&self.auth_token)
+        }
     }
 
     /// Pin the dimension every subsequent `embed`/`embed_one` must return —
@@ -194,8 +225,7 @@ impl Embedder {
         // best-effort and runs BEFORE the dimension probe, so an unreachable
         // host must not stack two 30s stalls onto a degrading backfill.
         let resp = self
-            .client
-            .get(format!("{base}/props"))
+            .with_auth(self.client.get(format!("{base}/props")))
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -252,8 +282,7 @@ impl Embedder {
     async fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
         let base = server_base(&self.endpoint).ok_or("no server base")?;
         let resp = self
-            .client
-            .post(format!("{base}/tokenize"))
+            .with_auth(self.client.post(format!("{base}/tokenize")))
             .json(&TokenizeRequest { content: text })
             .send()
             .await
@@ -274,8 +303,7 @@ impl Embedder {
     async fn detokenize(&self, tokens: &[u32]) -> Result<String, String> {
         let base = server_base(&self.endpoint).ok_or("no server base")?;
         let resp = self
-            .client
-            .post(format!("{base}/detokenize"))
+            .with_auth(self.client.post(format!("{base}/detokenize")))
             .json(&DetokenizeRequest { tokens })
             .send()
             .await
@@ -306,8 +334,7 @@ impl Embedder {
             input: texts,
         };
         let resp = self
-            .client
-            .post(&self.endpoint)
+            .with_auth(self.client.post(&self.endpoint))
             .json(&req)
             .send()
             .await
@@ -536,9 +563,29 @@ mod tests {
 
     #[test]
     fn unconfigured_endpoint_is_none() {
-        assert!(Embedder::new("", "m").is_none());
-        assert!(Embedder::new("   ", "m").is_none());
-        assert!(Embedder::new("http://x", "m").is_some());
+        assert!(Embedder::new("", "m", "").is_none());
+        assert!(Embedder::new("   ", "m", "").is_none());
+        assert!(Embedder::new("http://x", "m", "").is_some());
+    }
+
+    /// V33 Phase E: the token is optional and its ABSENCE must send no header
+    /// at all — an `Authorization: Bearer ` with an empty value is worse than
+    /// none, and every existing unauthenticated endpoint depends on this.
+    #[test]
+    fn an_absent_or_blank_embedding_token_sends_no_authorization_header() {
+        let client = reqwest::Client::new();
+        let header_of = |token: &str| -> Option<String> {
+            let e = Embedder::new("http://auth-test.invalid", "m", token).expect("configured");
+            e.with_auth(client.get("http://auth-test.invalid"))
+                .build()
+                .expect("a buildable request")
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .map(|v| v.to_str().expect("ascii").to_string())
+        };
+        assert_eq!(header_of(""), None, "no token ⇒ no header");
+        assert_eq!(header_of("   "), None, "a blank token is not a token");
+        assert_eq!(header_of("sk-x"), Some("Bearer sk-x".to_string()));
     }
 
     fn datum(index: usize, tag: f32) -> EmbedDatum {
@@ -668,7 +715,7 @@ mod tests {
 
     #[test]
     fn token_limit_helpers_only_ever_lower() {
-        let mut e = Embedder::new("http://limit-test.invalid", "m").unwrap();
+        let mut e = Embedder::new("http://limit-test.invalid", "m", "").unwrap();
         assert_eq!(e.max_tokens(), None);
 
         // Manual override wins and needs no probe.
@@ -684,7 +731,7 @@ mod tests {
 
         // A fresh handle on the same endpoint with NO override inherits the
         // cached bound without touching the network.
-        let mut fresh = Embedder::new("http://limit-test.invalid", "m").unwrap();
+        let mut fresh = Embedder::new("http://limit-test.invalid", "m", "").unwrap();
         fresh.apply_token_limit(0);
         assert_eq!(fresh.max_tokens(), Some(256));
 
@@ -695,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn fit_inputs_is_a_no_op_without_a_limit_or_within_budget() {
-        let mut e = Embedder::new("http://fit-test.invalid", "m").unwrap();
+        let mut e = Embedder::new("http://fit-test.invalid", "m", "").unwrap();
         let texts = vec!["short".to_string(), "also short".to_string()];
         // No limit known → nothing rewritten (pre-V31 behavior preserved).
         assert!(e.fit_inputs(&texts).await.is_none());
@@ -708,7 +755,7 @@ mod tests {
     async fn fit_inputs_falls_back_to_byte_truncation_when_tokenize_is_unreachable() {
         // No server behind this endpoint: /tokenize fails, so the guaranteed
         // byte-truncation fallback must still bring the text under budget.
-        let mut e = Embedder::new("http://127.0.0.1:1/fit", "m").unwrap();
+        let mut e = Embedder::new("http://127.0.0.1:1/fit", "m", "").unwrap();
         e.apply_token_limit(8);
         let texts = vec!["x".repeat(64), "fits".to_string()];
         let out = e.fit_inputs(&texts).await.expect("oversized input rewritten");

@@ -292,7 +292,20 @@ sha2 = "0.10"
 # turning it off changes how the (empty) module set is wired, not what we ship.
 # Version tracks the MSRV: 1.12 is the newest release whose own `rust-version`
 # is <= this crate's 1.88 (resolver v3 enforces that; see the header comment).
-yara-x = { version = "1.12", default-features = false, features = [
+# PINNED EXACT, not a caret range (code review V32, asked twice; done V33
+# stage 3). Two things depend on this being 1.12.0 specifically and neither
+# would fail loudly on a bump:
+#  * `offload/detection/signature.rs`'s `SCAN_PASS_TIMEOUT` is sized against
+#    yara-x's INTERNAL 1 Hz heartbeat clock (`scanner/context.rs:549-587`), not
+#    against an API contract. An upstream move to a real deadline would make the
+#    sizing wrong in one direction; a change in the other would break it
+#    silently. That doc says "re-check this on every yara-x upgrade" — the pin
+#    is what makes an upgrade a visible event.
+#  * `src-tauri/.cargo/audit.toml` accepts 16 `wasmtime 38.0.4` advisories on a
+#    per-advisory argument about what THIS version's codegen emits and which
+#    wasmtime features it asks for. Revisit trigger #1 there is literally "any
+#    yara-x upgrade"; the pin is how that trigger gets noticed.
+yara-x = { version = "=1.12.0", default-features = false, features = [
     "constant-folding",
     "fast-regexp",
     "linkme",
@@ -341,6 +354,23 @@ webview2-com = "0.38"
 # `webview2-com` 0.38.2 itself depends on (see its Cargo.toml), keeping
 # `IStream`/`PCWSTR`/etc. type-identical between the two crates.
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+
+# Unix-only (V33 contract C3): the Linux/macOS half of the process-tree kill.
+#
+# Windows gets its tree kill from `taskkill /T /F` and its hard-death backstop
+# from the Job Object above. Neither exists on Unix, where the equivalent is
+# "spawn each agent child as its own process-group leader, then signal the
+# GROUP" — `std`/`tokio` give us the first half (`Command::process_group`) but
+# there is no `killpg` in `std`, which is the entire reason this section exists.
+#
+# `libc` rather than `nix`: the surface used is three calls (`getpgid`,
+# `killpg`, `SIGKILL`), `libc` is the smaller and more universal of the two,
+# and BOTH are already resolved in `Cargo.lock` transitively (libc 0.2.186 via
+# ~everything; nix 0.28 via portable-pty's unix backend), so this adds zero new
+# entries to the dependency tree — the same promotion rationale as `url` and
+# `sha2` above. This is the project's first `cfg(unix)` dependency section.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # V14 Phase B: backdating a directory's mtime in `attach::tests` (to exercise

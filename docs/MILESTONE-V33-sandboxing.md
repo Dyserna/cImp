@@ -2,7 +2,16 @@
 
 **Status:** SPEC — not yet coded (2026-08-06). GitHub: milestone 6, umbrella #30.
 **Amendments:** 2026-08-09 — Phase F's throttling note, made false by V32's
-`946d7d1` (checkpoint throttle re-keyed per `(root, tab)`). Amendments are
+`946d7d1` (checkpoint throttle re-keyed per `(root, tab)`). **2026-08-13 — a
+six-agent investigation verified this spec against the live tree and found
+several of its load-bearing claims false**; each correction is dated in place
+under the claim it corrects — the "Builds on" line below, decision 1, decision 7,
+decision 11, Phase D and Phase F — with the original left standing above it. The
+four user decisions taken the same day are **locked decisions 12–15**, and the
+implementation contracts derived from that pass live in
+[IMPL-PLAN-V33-sandboxing.md](IMPL-PLAN-V33-sandboxing.md): that file is the
+source of truth for the build, this one for the design. **Locked decisions now
+run 1–15.** Amendments are
 dated in place rather than edited silently, matching the V32 spec's convention.
 **Builds on:** the two spawn seams cImp owns — `pty/manager.rs::PtyLaunchSpec:20`
 (every AI tab: Claude, OpenCode, future harnesses) and the offload worker's
@@ -10,6 +19,24 @@ dated in place rather than edited silently, matching the V32 spec's convention.
 spawns) — plus the `--settings` overlay injection mechanism
 (`tabs/config.rs`, same seam as the statusline overlay) and the Linux
 milestone (`docs/MILESTONE-linux-support.md`).
+
+**Amendment 2026-08-13 (investigation, verified against the live tree) — two
+claims in the "Builds on" line above are false.** Corrected here rather than
+overwritten, because both are load-bearing elsewhere in this document:
+
+- **"the two spawn seams cImp owns" is FOUR.** Beyond `pty/manager.rs:199`
+  (every AI tab) and `offload/tools/run_command.rs:258`, agent-initiated process
+  execution also happens at **`checks/mod.rs:734`** — `run_check`, which runs its
+  command through a *shell* — and at **`audit/runner.rs:1235`**
+  (`security_audit`/`quality_audit`). Those last two are reachable both from the
+  offload worker and from Claude/OpenCode over MCP, so they carry exactly the
+  exposure decision 1 exists to bound. `offload/mcp_host.rs:1230` is a fifth,
+  agent-*serving* rather than agent-initiated. See the amendment under decision 1
+  for what this does to that decision's tripwire.
+- **The Linux milestone link is dead, and the milestone shipped.** The file is
+  `docs/completedMilestones/MILESTONE-linux-support.md`. See the amendment under
+  Phase D.
+
 **Companion milestone:** [MILESTONE-V32-injection-hardening.md](MILESTONE-V32-injection-hardening.md)
 — V32 constrains a compromised model at the tool layer; V33 makes the OS
 enforce boundaries the model cannot negotiate with. V32's tool classes inform
@@ -100,6 +127,30 @@ Settings → Workbench toggle is the only action needed).
    spawns get the same wrapper. No third seam may spawn agent work without
    going through one of these (tripwire test: grep-level assertion on spawn
    call sites, same spirit as `spawn_inject_sig`).
+
+   **Amendment 2026-08-13 (investigation) — the seam count is wrong, and the
+   tripwire this decision proposes would have failed its own premise on the day
+   it was written.** "The two seams cImp owns" is four — `pty/manager.rs:199`,
+   `offload/tools/run_command.rs:258`, `checks/mod.rs:734` (`run_check`, executed
+   through a *shell*) and `audit/runner.rs:1235`
+   (`security_audit`/`quality_audit`), with `offload/mcp_host.rs:1230` a fifth,
+   agent-serving one. The *shape* of the decision survives intact: sandbox at the
+   seams cImp owns, never the host. What does not survive is the sentence "no
+   third seam may spawn agent work without going through one of these" — a third
+   and a fourth already did, and both are reachable from an agent over MCP, which
+   is the reachability this milestone assumes is hostile.
+
+   The assertion is therefore retained and **promoted from a guard to a ledger**:
+   an exhaustive `(file, reason)` table in code, `include_str!`-asserted, in which
+   every spawn site is classified `AgentSpawn` or `HostSpawn` with its reason
+   recorded. A grep that merely counts call sites cannot express the distinction
+   that matters — host spawns which must **never** be sandboxed are as much a part
+   of the contract as agent spawns which must always be, and the
+   shadow-checkpoint repo (`workbench/git.rs:247`) is the sharp case: sandboxing
+   it breaks restore, i.e. breaks the recovery layer this milestone is paired
+   with. The ledger's contract, including the `#[cfg(test)]` exclusion the
+   assertion needs to avoid tripping on ~15 files' test-only `Command::new`, is
+   `IMPL-PLAN-V33-sandboxing.md` §C1.
 2. **Windows tier 2 engine is decided by spike, AppContainer vs srt-alpha,
    on `run_command` children first** (no ConPTY involved, output captured —
    the cheap, high-value case). Selection criteria: confinement correctness
@@ -145,6 +196,27 @@ Settings → Workbench toggle is the only action needed).
    regardless of which sandbox engine wins: process-tree kill-on-close,
    child-count and memory ceilings. Cheap, orthogonal, closes the runaway /
    orphan cleanup gap.
+
+   **Amendment 2026-08-13 (investigation) — the Windows half already exists; the
+   gap is not that job objects are missing but WHERE they do not reach.**
+   `process_guard.rs` creates the job (`CreateJobObjectW:89`) with
+   `KILL_ON_JOB_CLOSE:95`, and four spawn sites already call `guard_child` —
+   `run_command:263`, `checks:739`, `audit/runner:1247`, `mcp_host:1233`. So the
+   claim to keep from this decision is the **coverage** claim, not the capability
+   claim, and the hole it hides is the one that matters most here:
+   **`guard_child` is typed to `tokio::process::Child`, so the PTY child — every
+   AI tab — is outside the job entirely.** The remedy is a pid-taking entry point
+   beside `guard_child`, assigning `portable_pty::Child`'s `process_id()`; the
+   assign-after-spawn race window that this opens is to be **documented, not
+   hidden** (decision 5's stance applied to our own layer).
+
+   On Linux the decision is unimplemented rather than partial: `process_guard.rs:46`
+   is a no-op and `procutil.rs:61-73` kills only the direct child, so there is no
+   process-tree kill at all. "cgroups (Linux)" is restated as the cheaper backstop
+   actually wanted at this seam — process-group spawn plus `killpg` in
+   `procutil::kill_tree`, and `PR_SET_PDEATHSIG` via `pre_exec` if it fits the
+   existing spawn sites without restructuring them. That is also what introduces
+   this project's first `[target.'cfg(unix)'.dependencies]`.
 8. **Linux tier 2 is Landlock-first, applied `pre_exec` in our own spawn
    path** — no external binaries, no setuid, inherited and irrevocable.
    Filesystem rules per decision 3's grant table; TCP port rules on ABI ≥ v4,
@@ -181,6 +253,168 @@ Settings → Workbench toggle is the only action needed).
     tunnel) is documented but not required by this milestone. The trust
     statement — "the LAN segment is not a trust boundary once keys are in
     place" — goes into ARCHITECTURE.md.
+
+    **Amendment 2026-08-13 (investigation) — true, and larger than stated: all
+    four LAN services in use are unauthenticated, and the only backend that
+    supports auth is the one not in use.** Bearer auth exists today on exactly one
+    thing, `OffloadBackendKind::Remote` (`schema.rs:3065`) — which this install has
+    configured **empty**. The active backend is `local`, which launches
+    `llama-server --host 0.0.0.0 --port 12344` with no `--api-key`, and the
+    `Local` variant carries no token field at all. The embedding endpoint
+    (`172.21.1.11:12344`) and both HTTP MCP endpoints (`:17201`/`:17202`) are
+    likewise unauthenticated. Phase E is therefore not "send a key from a client
+    that already has one": it adds the field to `Local`, to `GraphSettings` and to
+    `McpServerConfig`, and each of the three carries a trap that fails
+    *silently* — a variant-level `#[serde(default)]` (serde's container default
+    does not reach enum variants, so omitting it makes every existing settings
+    file fail to deserialize), a hand-rolled `Debug` for a struct whose doc
+    currently promises "No secrets here", and a `config_sig` entry without which
+    editing the token in Settings never reconnects the server. All three are
+    enumerated as `IMPL-PLAN-V33-sandboxing.md` §C7.
+
+    Two adjacent corrections from the same pass, recorded here because briefs
+    around Phase E carry them even though this document never states them: the
+    settings schema constant is **`CURRENT_SCHEMA_VERSION`** (`schema.rs:163`),
+    not `settings_version`; and there is **no `/v1/models` call and no
+    non-streaming chat path anywhere in the tree**, so neither is a site that
+    needs a bearer header attached to it.
+
+12. **Stages 1–3 — everything with no OS dependency — are built NOW; spikes
+    S1/S2 run after (user decision 2026-08-13).** The work that depends on no
+    unanswered platform question is the majority of this milestone's surface: the
+    decision-1 seam ledger, the decision-10 minimal environment, decision 7's Job
+    Object coverage including the PTY child, Phase E's client side, Phase F end to
+    end, and the app-layer half of the carried V32 findings below. None of it
+    changes shape depending on whether AppContainer or srt-alpha wins.
+
+    *Accepted cost, and it is the whole of the argument against:* **decision 2
+    stays open, so Phases A and B cannot close.** A `run_command` child gets a
+    minimal environment and a job object but no OS confinement; a tab gets a job
+    object and nothing more. A green stage-3 tree read as "Phase A done" would be
+    a misreading, and the tier ladder above still places every one of these
+    deliverables at tier 0–1.
+    *Rejected:* running S1/S2 first. They gate two phases and nothing else, and
+    holding six work-streams behind a spike whose verdict changes none of them
+    buys ordering certainty with idleness.
+
+13. **F-5's fail-open STAYS; only the `cwd` half of the M-7 residual is fixed
+    (user decision 2026-08-13).** V32's locked posture — a tool call must never
+    fail for lack of identity — is unchanged. What is fixed is narrower and is a
+    real execution primitive rather than a reporting one: `/context/post_edit`
+    runs the project's user-vetted check commands in a directory named by the
+    **request body**, with no ancestor check (`loopback.rs:6474-6479`).
+    `/audit/run` already carries the pattern to copy (`:4709-4718`) — roots derive
+    from the configured tabs and the served root, **never from the request**. The
+    siblings `/context/should_read` (`:5286`) and `/context/compaction` (`:5372`)
+    execute nothing and are deliberately left alone; that is recorded rather than
+    left implicit, so the next reader does not mistake their absence for an
+    oversight.
+
+    *Accepted cost:* an identity-less caller is still **admitted** to the route.
+    The hole becomes "may run the vetted checks, but only inside a root cImp
+    already serves" — narrowed, not closed.
+    *Rejected:* fail-closed everywhere. Four live behaviours currently rest on
+    that fail-open — `loopback.rs:3076`, `graph/mcp.rs:752`, M-8's residual and
+    M-7's second residual — so flipping it is not a hardening increment but a
+    behaviour change across four surfaces, taken in the same tree that is about to
+    grow three stages of new code.
+
+14. **The yara-x/wasmtime exposure is V33 WORK, not an accepted residual (user
+    decision 2026-08-13).** User-authored `rules.d/local/*.yar` files are compiled
+    and executed under a wasm sandbox that V32's own review states **"is not the
+    boundary"**, against 16 open wasmtime advisories. The bar is binary and either
+    half discharges it: **either that sentence stops being true, or the capability
+    becomes opt-in with a user-visible signal.** Investigate and propose before
+    implementing — this decision fixes that there is to be a fix, not what it is
+    (`IMPL-PLAN-V33-sandboxing.md` §C9).
+
+    *Rejected:* recording it as an accepted risk. The review that raised it warned
+    in the terms this decision adopts verbatim — folding it into an unrelated
+    acceptance would be **"laundering a deferral into an acceptance"**, which is
+    the shape global principle 10 names: a finding sitting in a backlog while its
+    symptom is live is a process failure, not a detection failure.
+    *Accepted cost:* it is scope this milestone did not previously carry, and it
+    is the one stage-3 item whose size is genuinely unknown before the
+    investigation returns.
+
+15. **No prerequisite user actions are planned around; the code lands first (user
+    decision 2026-08-13).** Windows Sandbox stays disabled, `srt` is not
+    installed, and the LAN servers keep running with no `--api-key` for now. This
+    milestone is written as though those states persist, and nothing in stages 1–3
+    asks the user to change a machine.
+
+    *Accepted cost, in three parts:* **Phase C cannot start** (no Windows Sandbox
+    means no `.wsb` to generate against, and S5 has nothing to bootstrap),
+    **spike S2 cannot run** (`srt` absent, so decision 2's comparison is
+    one-sided), and **Phase E's live verification — item 8 below — is not
+    meaningful until the servers hold keys**: a client that sends a bearer token
+    to a server which ignores it proves nothing. Phase E's client side lands
+    regardless and is inert against a keyless server by contract (§C7: an empty
+    token field sends no header), so the day keys are deployed is a settings edit
+    rather than a release.
+    *Rejected:* gating the code on the deployment. Client and server key are
+    independent changes, and the ordering that costs least is the one that leaves
+    nothing to build when the decision to deploy is taken.
+
+## Carried V32 findings — corrected filing (2026-08-13)
+
+The 2026-08-08 V32 review's disposition parked **H-7 and F-4…F-8** in "V33 /
+OS-containment territory"
+(`docs/reviews/code-review-V32-2026-08-08.md:139-140`). The 2026-08-13
+investigation contradicts that filing — and so, on inspection, does the review:
+its own disposition section names **only H-7 and M-16** as properly V33 (`:1455`).
+**Five of the six need no OS sandboxing at all.** They were filed by adjacency to
+this milestone rather than by mechanism, and left there they would sit behind
+spikes that have no bearing on them.
+
+Per finding, what each actually is:
+
+- **F-4 — `(consumer, tab)` is verified nowhere.** An app-layer predicate:
+  `is_configured_tab` (`loopback.rs:1556`) is agent-agnostic. It becomes
+  consumer-scoped, and the empty-list availability floor is **preserved but
+  narrowed** — it applies when the *asserted consumer* has zero configured tabs,
+  not when any consumer does. No OS layer appears anywhere in that fix.
+- **F-5 — `/graph_run` and `/mcp/call` share H-8's tab half.** The review filed
+  it as "a decision, not a bug", and it was exactly that; the decision is now
+  taken as **locked decision 13** above. Nothing carries forward except that
+  decision's `cwd` half.
+- **F-6 — H-2's decode proof degrades silently if the CLI drops `sessionId`.** A
+  drift canary, which is a detection concern and not a containment one.
+  Sandboxing the process it watches would not make its silence louder; the
+  deliverable is a consumer for the signal, per global principle 3.
+- **F-7 — auto-injection still pushes source signatures into a contaminated
+  tab. DECIDED NOT TO FIX, and that decision is not reopened here.** Injection is
+  a **push** channel keyed on the *user's* prompt: the model cannot request it,
+  cannot steer which file it names, and it crosses no gate by construction.
+  Cutting it would degrade auto-injection for every clean session in order to
+  close a channel the attacker does not control. Planning it as V33 work would
+  re-litigate a recorded decision. What the row is for is the inference it
+  blocks — *"after H-1 a contaminated tab never sees a source line again"* is
+  **false** — and that value is preserved by leaving it recorded, not by
+  scheduling it.
+- **F-8 — a denied URL still leaks its hostname to DNS.** Inherent rather than
+  introduced: deciding whether a *name* points into a denied *address* range
+  requires resolving the name, so resolution necessarily precedes the verdict. No
+  sandbox removes that ordering, and no phase here would. The deliverable is
+  **honesty in the wording** — the activity row and the user-facing story both say
+  *denied* without qualifying what already left the machine — plus, optionally, a
+  literal-IP fast path that skips resolution when there is no name to resolve.
+  That fast path optimises the honest case; it does not fix the named one.
+- **H-7 — a cloned repo's `opencode.json` is executed configuration.** The one
+  finding the review's disposition line does place here, and it splits. The
+  **cheap, app-layer half lands now**: the OpenCode plugin template binds `fetch`
+  into a private module-scope constant at load, so a later `globalThis.fetch`
+  swap cannot neuter the beacon or the gate, and the additive-posture doc at
+  `tabs/config.rs:2302-2308` is corrected to stop presenting that posture as
+  benign. **`OPENCODE_DISABLE_PROJECT_CONFIG` is NOT shipped in this run** — its
+  population question is entangled with F-31's default-off gate, so shipping it
+  alone would imply containment the gate does not deliver. It is recorded as
+  **owed**, which is the reason for writing this list down rather than absorbing
+  it into a phase.
+
+Net effect on scope: F-4, F-5's `cwd` residual and H-7's cheap half are stage-1/2
+work in this milestone; F-6 and F-8 need no phase here and are gated by none;
+F-7 is closed and stays closed.
 
 ## Max Paranoia Mode — platform designs
 
@@ -248,6 +482,26 @@ Settings → Workbench toggle is the only action needed).
 - **Phase D — Linux tier 2 + Max Paranoia** (rides the Linux milestone):
   Landlock `pre_exec` + grant table; podman mode; nesting spike (Claude's
   bwrap starting under our Landlock wrapper — expected fine, unverified).
+
+  > **Amendment 2026-08-13 (investigation) — "rides the Linux milestone" is
+  > stale: the Linux port SHIPPED.** Full GPU parity on Ubuntu 24.04, a
+  > `build-linux` job in `release.yml:762`, tarballs published; the spec moved to
+  > `docs/completedMilestones/MILESTONE-linux-support.md`, which is why the link
+  > in the header block above resolves to nothing. There is no longer a milestone
+  > for this phase to ride, so its gating is restated as three concrete items:
+  >
+  > - **(a) a Linux `cargo test` CI job.** `tests.yml:63` and `clippy.yml:57` are
+  >   `windows-latest` only, so a Linux-only break surfaces at **tag** time — the
+  >   same fail-late shape V32's locked decision 40 exists to prevent, arriving
+  >   through a different door.
+  > - **(b) the `process_guard`/`procutil` Linux backstop**, per decision 7's
+  >   amendment: today there is no process-tree kill on Linux at all, so
+  >   Landlock would confine a tree that nothing reliably reaps.
+  > - **(c) `docs/LINUX-VALIDATION.md`**, the hardware runbook, which stands at
+  >   **0 of 12 items ticked**.
+  >
+  > Phase D is blocked on exactly those three and on nothing about the platform
+  > itself.
 - **Phase E — LAN service authentication (decision 11).** Independent of
   every spike; can ship first. `--api-key` on both llama-servers + key
   fields in cImp settings + client wiring (warm pool, embedder, MCP host);
@@ -296,6 +550,51 @@ Settings → Workbench toggle is the only action needed).
   Metadata-format care: the fields parser must tolerate a missing `source`
   (old checkpoints) — and old readers parse `"tool"` as `Manual`, an
   accepted degradation. Timeline UI renders the source on the row.
+
+  > **Amendment 2026-08-13 (investigation) — four of this phase's premises are
+  > already satisfied, and one of its two loopback fire seams would fire
+  > nothing.** Phase F was specified as more work than it is, and in one place as
+  > less certain than it is. In the order the paragraphs above raise them:
+  >
+  > - **"the V32 class table gaining a `mutates_fs` attribute" already landed in
+  >   V32.** It is `toolclass.rs:157-179`, its accessor sits at `:502-508` behind
+  >   `allow(dead_code)`, and its doc comment `:161-166` names *this phase* as the
+  >   consumer that will retire that attribute. Four rows are already true —
+  >   `run_command:217`, `Edit:371`, `Write:372`, `Bash:373`. The single source of
+  >   truth this phase asks for is a table to **read**, not one to build; what
+  >   remains is extending it to the OpenCode native table and giving `MultiEdit`
+  >   the row it never had.
+  > - **The loopback fire seams would fire ZERO checkpoints.** No tool served by
+  >   either `/graph_run` or `/mcp/call` carries `mutates_fs: true`; the one
+  >   routed mutating tool, `run_command`, is reached solely through worker
+  >   dispatch (`tools/mod.rs:183`). They are therefore **deliberately not wired
+  >   in this run**, and the reason is recorded here so their absence is not
+  >   re-raised later as an omission: wiring them would add two call sites whose
+  >   only observable behaviour is a branch never taken, and an untaken branch is
+  >   a claim of coverage nothing tests. The seams that do get wired are worker
+  >   dispatch, a Claude `PreToolUse` shim and the OpenCode report-only half.
+  >   **If a proxied tool is ever marked `mutates_fs: true`, this paragraph is the
+  >   one that becomes wrong** — that is the tripwire, stated in prose because the
+  >   condition is a data change, not a code change.
+  > - **The OpenCode hook is not unverified, and V32 spike E2 is answered
+  >   positively.** `tool.execute.before` is implemented and shipped at
+  >   `tabs/config.rs:1938-2064`, where it is load-bearing for V32's native gate,
+  >   with tests at `:4844-4859`. The contingency attached to it above — "one
+  >   spike answers both; negative ⇒ OpenCode keeps prompt+burst coverage only,
+  >   documented" — does not arise, and OpenCode is in scope for tool-sourced
+  >   checkpoints from the start.
+  > - **"the fields parser must tolerate a missing `source`" is already satisfied
+  >   by construction.** `CORE_FIELDS = 8` is compared with a `<` guard
+  >   (`shadow.rs:861-863`) and every field past it is read through `fields.get()`
+  >   (`:878-881`), a rule the module states outright at `:806-825`. Nothing has to
+  >   be *made* tolerant. The companion sentence is likewise already true rather
+  >   than aspirational: `Trigger::parse` maps any unknown wire value to `Manual`
+  >   (`:138-145`), so "old readers parse `"tool"` as `Manual`, an accepted
+  >   degradation" describes shipped behaviour, and it is the accepted degradation
+  >   this phase asks for. What stays real in that paragraph is the placement
+  >   discipline it implies — the new `Source:` trailer appends **after `Tab:` at
+  >   the tail**, read at index 10; `CORE_FIELDS` stays `8`; the guard stays `<`
+  >   (`IMPL-PLAN-V33-sandboxing.md` §C8).
 
 ## Non-goals
 

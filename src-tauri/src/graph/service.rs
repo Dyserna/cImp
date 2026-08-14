@@ -5213,15 +5213,24 @@ mod tests {
         // It cannot be `canonicalize` everywhere: on Linux `temp_dir()` is
         // `/tmp`, a real directory with no symlinks to resolve, so
         // `canonicalize` returns the path UNCHANGED and the `assert_ne!` below
-        // fails on the fixture rather than on the behaviour. A redundant `.`
-        // component is an equally different `PathBuf` that `warm_index`'s own
-        // `canonicalize` folds back to the same key, which is the property
-        // under test.
+        // fails on the fixture rather than on the behaviour.
+        //
+        // Nor can the second spelling be `dir.join(".")`: `Path`'s `PartialEq`
+        // compares `components()`, and `Components` DISCARDS `CurDir`, so
+        // `/tmp/x/.` compares EQUAL to `/tmp/x` and the precondition fails.
+        // (That spelling was the first Linux fix here and CI caught it — the
+        // trap is that the same normalization makes it look right in a REPL.)
+        // A `..` step off a real subdirectory is preserved by `components()`,
+        // so the two `PathBuf`s genuinely differ, and `warm_index`'s own
+        // `canonicalize` folds it back to `dir` — which is the property under
+        // test. The subdirectory must EXIST: `canonicalize` resolves the whole
+        // prefix, so `..` off a missing component fails outright.
         let (plain, _) = warm_index(&indices, &dir, sub).expect("open plain");
         let other_spelling = if cfg!(windows) {
             std::fs::canonicalize(&dir).expect("canonicalize")
         } else {
-            dir.join(".")
+            std::fs::create_dir_all(dir.join("step")).unwrap();
+            dir.join("step").join("..")
         };
         assert_ne!(other_spelling, dir, "the two spellings must actually differ");
         let (verbatim, _) = warm_index(&indices, &other_spelling, sub).expect("open canonical");

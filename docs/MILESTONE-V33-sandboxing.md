@@ -559,6 +559,21 @@ F-7 is closed and stays closed.
 - **S1 (gate for Phase A):** AppContainer wrapper on a `run_command` child —
   read denial outside root, loopback exemption workflow, git/npm breakage
   inventory.
+
+  > **Amendment 2026-08-15 (spike run) — S1 is DONE, verdict POSITIVE:**
+  > `docs/reviews/SPIKE-S1-appcontainer-2026-08-15.md`. Read denial outside
+  > root confirmed; **no elevation at any step** — profile creation is
+  > unelevated and, on build 26200, profile-created AppContainers are **not
+  > loopback-blocked**, so the `CheckNetIsolation` step decision 2 priced in
+  > does not exist here (probe at runtime, per decision 5). git/cargo/node/npm
+  > all work, git via a `subst`-drive mitigation for the one real gotcha
+  > (ancestor-chain canonicalization: `GetLongPathNameW`/
+  > `GetFinalPathNameByHandleW`/node `realpathSync` walk ancestors and die on
+  > unlistable `C:\`). `windows-sys 0.59` + two added features suffice — the
+  > `windows 0.61` pin is untouched. Decision 4's per-host egress scoping is
+  > confirmed to need WFP (S4): capabilities are class-granular and this LAN
+  > falls under `internetClient` on a Public-profile NIC. Decision 2 stays
+  > open only until S2 runs; the report states what srt-alpha must beat.
 - **S2 (gate for Phase A):** srt-alpha on the same child — `windows-install`
   UX, config-actually-loaded verification, WFP egress behavior. S1 vs S2
   verdict picks the Windows engine (decision 2).

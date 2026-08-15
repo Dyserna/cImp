@@ -152,7 +152,22 @@ Settings → Workbench toggle is the only action needed).
    with. The ledger's contract, including the `#[cfg(test)]` exclusion the
    assertion needs to avoid tripping on ~15 files' test-only `Command::new`, is
    `IMPL-PLAN-V33-sandboxing.md` §C1.
-2. **Windows tier 2 engine is decided by spike, AppContainer vs srt-alpha,
+2. **DECIDED 2026-08-15: the Windows engine is AppContainer.** Closed by the
+   user on spike S1's evidence
+   (`docs/reviews/SPIKE-S1-appcontainer-2026-08-15.md`) without running S2:
+   S1 met every selection criterion below — read denial outside root, a full
+   toolchain inventory with working mitigations, **zero elevation at any
+   step**, no new dependency (`windows-sys 0.59` + two features), and the
+   engine is ours to own. S2 (srt-alpha) is not run: it needs a UAC
+   `windows-install` the user has not performed, it is alpha-external where
+   this is first-party, and its verdict could only change the answer by
+   beating a bar S1 already cleared. **If srt is ever installed, the report's
+   "What S2 must beat" section is the scorecard to re-open this with.**
+   Phase A is IMPLEMENTED on this engine (see the phase entry below).
+
+   *Original text, retained because the criteria it names are what the
+   decision was measured against:*
+   **Windows tier 2 engine is decided by spike, AppContainer vs srt-alpha,
    on `run_command` children first** (no ConPTY involved, output captured —
    the cheap, high-value case). Selection criteria: confinement correctness
    (read denial outside root — low-integrity-only approaches are REJECTED
@@ -591,6 +606,50 @@ F-7 is closed and stays closed.
   loud degradation + the decision-10 minimal env, which lands here even if
   the engine spikes drag — it has no OS dependency). Ships alone; immediate
   value composing with V32's latch.
+
+  > **Amendment 2026-08-15 — IMPLEMENTED on AppContainer.** `src-tauri/src/
+  > sandbox/` (`mod.rs` platform-neutral, `windows.rs` the engine), wired at
+  > the `run_command` seam, opted in from `Settings::sandbox` by the in-app
+  > worker. **Default off** — the grant ladder needs to soak on real machines
+  > before it can be on by default, the same posture
+  > `workbench.checkpoints` shipped with. What landed:
+  >
+  > - **Profile:** one *stable* `cimp.worker` AppContainer (grants are ACL
+  >   entries keyed to its SID, so a per-spawn profile would re-ACL toolchain
+  >   dirs on every call and leak registrations). Created unelevated.
+  > - **Grant-on-first-use, three tiers** (decision 3): Program Files/Windows
+  >   need nothing (`ALL APPLICATION PACKAGES` pre-exists); user-owned dirs
+  >   get a one-time inheritable ACE via `SetEntriesInAclW` +
+  >   `SetNamedSecurityInfoW`; a dir cImp lacks `WRITE_DAC` on fails the whole
+  >   prepare, so the child runs **unsandboxed and loud** rather than
+  >   half-confined. Each first grant is recorded — it durably changes the
+  >   user's machine.
+  > - **Drive mapping:** a refcounted `DefineDosDeviceW` per sandbox root, so
+  >   the child's cwd is a drive root and the ancestor-canonicalization
+  >   gotcha (git's `mingw_getcwd`, node's `realpathSync`) never fires.
+  > - **Spawn:** bespoke `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_SECURITY_
+  >   CAPABILITIES`, piped stdio drained on two threads, timeout, and
+  >   `guard_pid` for job membership — so decision 7's kill-on-close holds on
+  >   the sandboxed path exactly as on the plain one.
+  > - **Decision 17 enforced structurally:** `SandboxCfg` carries *only*
+  >   OS-boundary knobs, so the master switch has no reach into the job
+  >   object, the C2 minimal environment or the injection-layer controls; a
+  >   test destructures the struct so a future field that violates this is a
+  >   review event.
+  > - **Decision 5's surface:** a new `sandbox` activity kind with its own
+  >   retention lane, carrying both negative states distinctly, deduplicated
+  >   by reason per session.
+  > - **Decision 16's category:** one new top-level `Sandboxing` section in
+  >   Settings, sibling to `Injection protection`.
+  >
+  > **Still open in Phase A, deliberately:** the layer covers `run_command`
+  > only — the `run_check` (`checks/mod.rs`) and audit (`audit/runner.rs`)
+  > agent seams still spawn plain, and both are reachable from a model over
+  > MCP. They run through a *shell*, so they need the grant table to cover the
+  > shell plus whatever it invokes; that is the next increment, not a
+  > forgotten row (their ledger entries remain `AgentSpawn`). Also unproven
+  > live: whether a real `git`/`cargo` probe survives the sandbox on a machine
+  > other than the spike's fixture — the live-verify item below.
 - **Phase B — tab spawns sandboxed** (S3-gated) + hardened Claude profile in
   the overlay (decision 6 — can ship with Phase A since it is
   platform-gated config).

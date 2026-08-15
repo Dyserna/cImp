@@ -100,6 +100,29 @@ ACEs on drive roots must use a non-propagating API — an `icacls` attempt on
 6. `HOME`/`USERPROFILE` for the child should point inside the sandbox root
    (C2's env table already carries them) — git then reads no global config
    and the `~/.config/git/ignore` warnings disappear.
+7. **Grant-on-first-use, with a three-tier treatment of tool state**
+   (2026-08-15 discussion). `run_command` already resolves the top-level
+   program before spawning; at that point: Program Files/Windows ⇒ nothing
+   to do (AAP RX pre-exists); user-owned install dir ⇒ cImp stamps a
+   one-time RX ACE for the stable container SID, unelevated (verified:
+   cargo, nvm, python); `WRITE_DAC` refused (Administrators-owned custom
+   dirs, e.g. a `P:\WorkSync` JDK) ⇒ one elevated grant pass, or
+   copy-into-root, or unsandboxed-with-badge — the user picks, loudly
+   (decision 5). Tool state splits three ways, not two:
+   **(a) binaries+libs — grant RX; (b) operational config and caches —
+   grant, wherever they live** (withholding them breaks the tool in ways
+   indistinguishable from sandbox bugs; git degrades gracefully without
+   global config, a private-registry `npm install` does not — this is
+   decision 3's "own state dir is not a hole" extended to config);
+   **(c) the short known list of pure-credential files** (`~/.ssh`,
+   `~/.aws`, `.git-credentials`, `.cargo/credentials.toml`) — explicit
+   per-file **deny ACEs keyed to the container SID**, which cost normal
+   processes nothing and beat any inherited allow. A workflow that needs
+   one of these inside the sandbox (publishing from a child) is a named,
+   surfaced, per-tool accepted residual — never a silent grant. The honest
+   boundary statement: *writes nowhere but the root; reads = root + system
+   + each tool's own code/config/caches; credentials and everything
+   ungranted stay dark.*
 
 ## Addendum (same day): the general-toolchain matrix — javac, go, dotnet, clang, python
 

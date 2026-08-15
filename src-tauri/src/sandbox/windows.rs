@@ -1,0 +1,961 @@
+//! V33 Phase A — the Windows AppContainer engine (spike S1 productionized).
+//!
+//! Everything Win32 in the sandbox lives here so the platform-neutral `mod.rs`
+//! stays readable. The three moving parts, in the order [`prepare`] uses them:
+//!
+//! 1. **Profile** — one *stable* AppContainer profile (`cimp.worker`). Stable
+//!    because every grant is an ACL entry keyed to the container SID; an
+//!    ephemeral per-spawn profile would re-ACL the toolchain dirs on every
+//!    spawn and leak registered profiles. Created unelevated; re-derived on
+//!    `ERROR_ALREADY_EXISTS`.
+//! 2. **Grants** (decision 3, three tiers) — the program's install dir is made
+//!    readable+executable to the container SID unless it already is (Program
+//!    Files / Windows carry `ALL APPLICATION PACKAGES` by Windows convention).
+//!    User-owned dirs get a one-time inheritable ACE via `SetEntriesInAclW` +
+//!    `SetNamedSecurityInfoW`; a dir we lack `WRITE_DAC` on (Administrators-owned)
+//!    fails the *whole* prepare, so the child runs unsandboxed and loud rather
+//!    than half-confined. The project root gets full access the same way.
+//! 3. **Drive mapping** — a free drive letter is `DefineDosDevice`-mapped to the
+//!    root and the child's cwd is the drive root, so the ancestor-chain
+//!    canonicalization quirk (git's `mingw_getcwd`, node's `realpathSync` — S1
+//!    §"the gotcha") never sees the unlistable `C:\`. Refcounted across
+//!    concurrent spawns on the same root; unmapped on last release.
+//!
+//! The spawn itself is a bespoke `CreateProcessW` with a
+//! `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list — std/tokio
+//! `Command` cannot attach one on stable Rust, which is the whole reason this
+//! path is hand-rolled. Job-object membership composes on top via
+//! `process_guard::guard_pid` (assign-after-spawn, same documented race as the
+//! PTY child).
+
+use std::ffi::{c_void, OsStr, OsString};
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
+use std::sync::Mutex;
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::Authorization::{
+    SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
+    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+};
+use windows_sys::Win32::Security::Isolation::{
+    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+};
+use windows_sys::Win32::Security::{
+    CreateWellKnownSid, IsValidSid, SECURITY_CAPABILITIES,
+    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, WinCapabilityInternetClientSid,
+    DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    DefineDosDeviceW, GetLogicalDrives, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+};
+use windows_sys::Win32::System::Pipes::CreatePipe;
+
+/// The one stable profile name (see module header, point 1).
+const PROFILE_NAME: &str = "cimp.worker";
+/// `SE_GROUP_ENABLED` — not re-exported by this `windows-sys` surface, so the
+/// documented constant value, guarded by a test that a capability SID built
+/// with it is valid.
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+/// `ProcThreadAttributeSecurityCapabilities` (9) with `PROC_THREAD_ATTRIBUTE_INPUT`
+/// (0x0002_0000). windows-sys exposes neither symbol at this surface; the value
+/// is stable Win32 ABI and asserted against a successful spawn in tests.
+const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
+/// `SE_GROUP_ENABLED` sanity: a capability SID must validate.
+const _: () = assert!(SE_GROUP_ENABLED == 4);
+
+fn wide(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+fn wide_str(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn last_error() -> u32 {
+    // SAFETY: GetLastError reads thread-local state, no args.
+    unsafe { GetLastError() }
+}
+
+// ── SIDs ────────────────────────────────────────────────────────────────────
+
+/// A SID we own, stored as **bytes** rather than as a Win32 pointer.
+///
+/// Copying the SID into a `Vec<u8>` at construction (rather than holding the
+/// allocator's pointer) buys three things at the cost of one `memcpy`: no
+/// leaked `LocalAlloc`/`FreeSid` bookkeeping, and — the load-bearing one —
+/// `Send + Sync` without an `unsafe impl`, which a raw pointer field would
+/// deny. [`Prepared`] is held across an `.await` in `run_command`'s dispatch,
+/// so a non-`Sync` field here makes the whole tool future non-`Send` and the
+/// agent loop stops compiling.
+#[derive(Clone)]
+struct OwnedSid {
+    bytes: Vec<u8>,
+}
+
+impl OwnedSid {
+    /// The SID as Win32 wants it. Valid for as long as `self` is; every call
+    /// site passes it straight into a Win32 call that does not retain it.
+    fn as_psid(&self) -> *mut c_void {
+        self.bytes.as_ptr() as *mut c_void
+    }
+
+    /// Copy `len` bytes of a Win32-owned PSID into an owned buffer.
+    ///
+    /// # Safety
+    /// `psid` must point to a valid SID for the duration of this call.
+    unsafe fn copy_from(psid: *mut c_void) -> Result<Self, String> {
+        use windows_sys::Win32::Security::GetLengthSid;
+        if psid.is_null() || IsValidSid(psid) == 0 {
+            return Err("SID is invalid".into());
+        }
+        let len = GetLengthSid(psid) as usize;
+        if len == 0 {
+            return Err("SID has zero length".into());
+        }
+        let bytes = std::slice::from_raw_parts(psid as *const u8, len).to_vec();
+        Ok(Self { bytes })
+    }
+}
+
+/// The container SID for `PROFILE_NAME`, creating the profile if it does not
+/// exist. Buffer-backed: the SID bytes live in `_buf` for the value's lifetime.
+fn container_sid() -> Result<OwnedSid, String> {
+    let name = wide_str(PROFILE_NAME);
+    let display = wide_str("cImp worker sandbox");
+    let desc = wide_str("V33 Phase A: agent-initiated run_command children");
+    let mut sid: *mut c_void = null_mut();
+    // SAFETY: all pointers are valid null-terminated wide strings / out-params.
+    let hr = unsafe {
+        CreateAppContainerProfile(
+            name.as_ptr(),
+            display.as_ptr(),
+            desc.as_ptr(),
+            null(),
+            0,
+            &mut sid,
+        )
+    };
+    let sid = if hr == 0 {
+        sid
+    } else if hr as u32 == 0x8007_0000 | ERROR_ALREADY_EXISTS {
+        let mut derived: *mut c_void = null_mut();
+        // SAFETY: name is a valid wide string; derived is a valid out-param.
+        let dhr = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut derived) };
+        if dhr != 0 {
+            return Err(format!(
+                "AppContainer SID derivation failed (0x{:08x}) — profile exists but is unreadable",
+                dhr as u32
+            ));
+        }
+        derived
+    } else {
+        return Err(format!(
+            "AppContainer profile creation failed (0x{:08x})",
+            hr as u32
+        ));
+    };
+    // Copy out of the Win32 allocation immediately, then free it: the owned
+    // form is what everything downstream uses (see [`OwnedSid`]).
+    // SAFETY: `sid` is a valid PSID from the calls above.
+    let owned = unsafe { OwnedSid::copy_from(sid) };
+    // SAFETY: both APIs above return a `LocalAlloc`-family block the caller
+    // owns; we are done reading it whether the copy succeeded or not.
+    unsafe { LocalFree(sid) };
+    owned.map_err(|e| format!("AppContainer SID unusable: {e}"))
+}
+
+/// A well-known capability SID (e.g. internetClient), backed by an owned buffer.
+fn capability_sid(kind: i32) -> Result<OwnedSid, String> {
+    let mut buf = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut cb = buf.len() as u32;
+    // SAFETY: buf is sized to SECURITY_MAX_SID_SIZE; cb is its length in/out.
+    let ok = unsafe {
+        CreateWellKnownSid(
+            kind,
+            null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut cb,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("CreateWellKnownSid failed ({})", last_error()));
+    }
+    // `cb` now holds the real length; trim the SECURITY_MAX_SID_SIZE scratch
+    // down to it so `OwnedSid::bytes` is exactly the SID.
+    buf.truncate(cb as usize);
+    Ok(OwnedSid { bytes: buf })
+}
+
+// ── grants (decision 3) ───────────────────────────────────────────────────────
+
+/// Dirs already granted this session, so repeated spawns of the same toolchain
+/// don't re-walk it. The ACE itself is idempotent on disk; this just skips the
+/// write.
+static GRANTED: Mutex<Option<std::collections::HashSet<PathBuf>>> = Mutex::new(None);
+
+/// True if `dir` is under a location Windows already grants
+/// `ALL APPLICATION PACKAGES` read+execute (Program Files, Windows). Checked by
+/// prefix on the canonical path — cheap and correct for the standard installs
+/// (S1 verified go/dotnet/clang/git need no grant there).
+fn is_app_package_readable(dir: &Path) -> bool {
+    let lower = dir.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    for env in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"] {
+        if let Some(base) = std::env::var_os(env) {
+            let base = base.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+            if !base.is_empty() && lower.starts_with(&base) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Access mask meaning read+execute (traverse) — tier (a)+(b) for toolchain
+/// dirs.
+const RX: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+/// Full access — the project root only.
+const FULL: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+
+/// Add one inheritable GRANT ACE for `sid` on `dir`, merging into the existing
+/// DACL. Idempotent: `SetEntriesInAclW` with the same trustee+mask replaces
+/// rather than stacks. Returns a user-facing reason on failure — most often
+/// `WRITE_DAC` denial on an Administrators-owned dir, which is the signal to
+/// run unsandboxed (module header, tier c of the ladder).
+/// Returns `Ok(true)` when an ACE was actually written (first grant of this
+/// (dir, mask) in this session), `Ok(false)` when nothing needed doing — the
+/// caller records the former, so the Events feed shows a machine being
+/// prepared exactly once rather than on every spawn.
+fn grant_dir(dir: &Path, sid: *mut c_void, mask: u32) -> Result<bool, String> {
+    if is_app_package_readable(dir) && mask == RX {
+        return Ok(false);
+    }
+    {
+        let mut g = GRANTED.lock().map_err(|_| "grant lock poisoned".to_string())?;
+        let set = g.get_or_insert_with(std::collections::HashSet::new);
+        // Key on (dir, mask) so a later FULL grant on a dir RX-granted earlier
+        // still applies. Cheap: only run_command roots and toolchain dirs land
+        // here.
+        let key = dir.join(format!("\u{1}{mask}"));
+        if set.contains(&key) {
+            return Ok(false);
+        }
+        // Record optimistically; a failure below removes it so a retry re-runs.
+        set.insert(key.clone());
+    }
+    match grant_dir_uncached(dir, sid, mask) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            // Un-record so a later attempt retries rather than trusting a
+            // grant that never landed.
+            if let Ok(mut g) = GRANTED.lock() {
+                if let Some(set) = g.as_mut() {
+                    set.remove(&dir.join(format!("\u{1}{mask}")));
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+fn grant_dir_uncached(dir: &Path, sid: *mut c_void, mask: u32) -> Result<(), String> {
+    let mut path_w = wide(dir.as_os_str());
+
+    // Read the current DACL.
+    let mut psd: *mut c_void = null_mut();
+    let mut old_dacl: *mut windows_sys::Win32::Security::ACL = null_mut();
+    // SAFETY: path_w is a valid wide string; out-params are valid.
+    let rc = unsafe {
+        windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut old_dacl,
+            null_mut(),
+            &mut psd,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("read DACL of {} failed ({rc})", dir.display()));
+    }
+    struct SdGuard(*mut c_void);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: psd came from GetNamedSecurityInfoW, freed with LocalFree.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+    let _sd = SdGuard(psd);
+
+    // Build one EXPLICIT_ACCESS granting `mask`, inheritable to subdirs/files.
+    let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+    ea.grfAccessPermissions = mask;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    ea.Trustee = TRUSTEE_W {
+        pMultipleTrustee: null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+        ptstrName: sid as *mut u16,
+    };
+
+    let mut new_dacl: *mut windows_sys::Win32::Security::ACL = null_mut();
+    // SAFETY: one valid EXPLICIT_ACCESS; old_dacl may be null (treated as empty).
+    let rc = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
+    if rc != 0 {
+        return Err(format!("build DACL for {} failed ({rc})", dir.display()));
+    }
+    struct AclGuard(*mut windows_sys::Win32::Security::ACL);
+    impl Drop for AclGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: new_dacl came from SetEntriesInAclW, freed with LocalFree.
+                unsafe { LocalFree(self.0 as *mut c_void) };
+            }
+        }
+    }
+    let _acl = AclGuard(new_dacl);
+
+    // SAFETY: path_w valid; new_dacl valid; other handles null as documented.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            new_dacl,
+            null_mut(),
+        )
+    };
+    if rc != 0 {
+        // 5 = ERROR_ACCESS_DENIED — the WRITE_DAC case the ladder names.
+        return Err(if rc == 5 {
+            format!(
+                "cannot grant sandbox access to {} (owned by another principal; \
+                 needs an elevated one-time grant or copy-into-root)",
+                dir.display()
+            )
+        } else {
+            format!("apply DACL to {} failed ({rc})", dir.display())
+        });
+    }
+    Ok(())
+}
+
+// ── drive mapping (the canonicalization gotcha) ───────────────────────────────
+
+/// root → (drive letter e.g. "S:", refcount). One mapping per distinct root,
+/// shared by concurrent spawns; removed when the last guard drops.
+static DRIVES: Mutex<Option<std::collections::HashMap<PathBuf, (String, u32)>>> =
+    Mutex::new(None);
+
+/// A live `subst` mapping. Dropping it decrements the root's refcount and
+/// unmaps on zero.
+pub struct DriveGuard {
+    root: PathBuf,
+    letter: String,
+}
+
+impl DriveGuard {
+    /// The drive-root path the child should use as cwd (e.g. `S:\`).
+    fn drive_root(&self) -> PathBuf {
+        PathBuf::from(format!("{}\\", self.letter))
+    }
+}
+
+impl Drop for DriveGuard {
+    fn drop(&mut self) {
+        let mut map = match DRIVES.lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let Some(m) = map.as_mut() else { return };
+        let remove = if let Some((_, rc)) = m.get_mut(&self.root) {
+            *rc = rc.saturating_sub(1);
+            *rc == 0
+        } else {
+            false
+        };
+        if remove {
+            m.remove(&self.root);
+            let target = wide(self.root.as_os_str());
+            let letter = wide_str(&self.letter);
+            // SAFETY: both valid wide strings; DDD_REMOVE_DEFINITION with an
+            // exact target removes just this mapping.
+            unsafe {
+                DefineDosDeviceW(
+                    DDD_REMOVE_DEFINITION | DDD_RAW_TARGET_PATH,
+                    letter.as_ptr(),
+                    target.as_ptr(),
+                );
+            }
+        }
+    }
+}
+
+/// The first free drive letter D..=Z not in use, as "X:".
+fn free_drive_letter() -> Option<String> {
+    // SAFETY: no args, returns a bitmask.
+    let mask = unsafe { GetLogicalDrives() };
+    // Also avoid letters we've already handed out but whose subst the OS may
+    // not have reflected in the bitmask yet.
+    let taken: std::collections::HashSet<String> = DRIVES
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().map(|m| m.values().map(|(l, _)| l.clone()).collect()))
+        .unwrap_or_default();
+    for i in 3..26u32 {
+        if mask & (1 << i) == 0 {
+            let letter = format!("{}:", (b'A' + i as u8) as char);
+            if !taken.contains(&letter) {
+                return Some(letter);
+            }
+        }
+    }
+    None
+}
+
+/// Map (or reuse a mapping of) `root` to a drive letter.
+fn map_drive(root: &Path) -> Result<DriveGuard, String> {
+    let mut map = DRIVES.lock().map_err(|_| "drive lock poisoned".to_string())?;
+    let m = map.get_or_insert_with(std::collections::HashMap::new);
+    if let Some((letter, rc)) = m.get_mut(root) {
+        *rc += 1;
+        return Ok(DriveGuard {
+            root: root.to_path_buf(),
+            letter: letter.clone(),
+        });
+    }
+    let letter = free_drive_letter().ok_or("no free drive letter for the sandbox root")?;
+    let letter_w = wide_str(&letter);
+    let target = wide(root.as_os_str());
+    // SAFETY: both valid wide strings; RAW_TARGET_PATH maps the letter to the
+    // exact NT path of `root`.
+    let ok = unsafe {
+        DefineDosDeviceW(DDD_RAW_TARGET_PATH, letter_w.as_ptr(), target.as_ptr())
+    };
+    if ok == 0 {
+        return Err(format!(
+            "drive mapping of {} failed ({})",
+            root.display(),
+            last_error()
+        ));
+    }
+    m.insert(root.to_path_buf(), (letter.clone(), 1));
+    Ok(DriveGuard {
+        root: root.to_path_buf(),
+        letter,
+    })
+}
+
+// ── the prepared spawn ────────────────────────────────────────────────────────
+
+/// Everything a sandboxed spawn needs, assembled by [`prepare`]. Holds the
+/// drive guard, so dropping a `Prepared` releases the mapping.
+pub struct Prepared {
+    container: OwnedSid,
+    caps: Vec<OwnedSid>,
+    drive: DriveGuard,
+    /// Env names→values to add/override for the child (TEMP/TMP/HOME/USERPROFILE
+    /// pointed inside the mapped root).
+    pub env_overrides: Vec<(String, OsString)>,
+}
+
+impl Prepared {
+    /// The cwd the child runs in (the drive-root, so getcwd never walks `C:\`).
+    pub fn cwd(&self) -> PathBuf {
+        self.drive.drive_root()
+    }
+}
+
+/// Do all sandbox preparation for one `run_command` child, or return a
+/// user-facing reason the caller records and then runs the child plain.
+pub async fn prepare(
+    cfg: &super::SandboxCfg,
+    program: &Path,
+    root: &Path,
+    _env: &[(&str, OsString)],
+) -> Result<Prepared, String> {
+    // Blocking Win32 (ACL walks, profile creation) off the async worker.
+    let cfg = cfg.clone();
+    let program = program.to_path_buf();
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || prepare_blocking(&cfg, &program, &root))
+        .await
+        .map_err(|e| format!("sandbox prepare task failed: {e}"))?
+}
+
+fn prepare_blocking(
+    cfg: &super::SandboxCfg,
+    program: &Path,
+    root: &Path,
+) -> Result<Prepared, String> {
+    let container = container_sid()?;
+
+    // Grant the project root full access, and the program's install dir R+X.
+    //
+    // Each first-time grant is recorded (decision 5's surface applied to the
+    // preparation, not just the failure): stamping an ACE on a toolchain
+    // directory is a durable change to the user's machine, so it says so once,
+    // in the same lane that reports an unsandboxed run.
+    let mut granted: Vec<String> = Vec::new();
+    if grant_dir(root, container.as_psid(), FULL)? {
+        granted.push(format!("{} (read+write)", root.display()));
+    }
+    if let Some(install) = program.parent() {
+        if grant_dir(install, container.as_psid(), RX)? {
+            granted.push(format!("{} (read+execute)", install.display()));
+        }
+    }
+    for extra in &cfg.extra_grant_dirs {
+        if grant_dir(extra, container.as_psid(), RX)? {
+            granted.push(format!("{} (read+execute, from settings)", extra.display()));
+        }
+    }
+    if !granted.is_empty() {
+        super::record_event(
+            root,
+            "grant",
+            format!("{} sandbox grant(s) applied", granted.len()),
+            granted.join("\n"),
+            true,
+        );
+    }
+
+    // Capabilities (module header, point network scoping is all/none today).
+    let mut caps = Vec::new();
+    if cfg.allow_network {
+        caps.push(capability_sid(WinCapabilityInternetClientSid)?);
+    }
+
+    let drive = map_drive(root)?;
+    let drive_root = drive.drive_root();
+
+    // Redirect scratch + home inside the mapped root so a child that writes
+    // config/temp lands in the one writable place (and getcwd stays shallow).
+    let mut env_overrides = Vec::new();
+    for name in ["TEMP", "TMP"] {
+        env_overrides.push((name.to_string(), drive_root.as_os_str().to_os_string()));
+    }
+    for name in ["HOME", "USERPROFILE"] {
+        env_overrides.push((name.to_string(), drive_root.as_os_str().to_os_string()));
+    }
+
+    Ok(Prepared {
+        container,
+        caps,
+        drive,
+        env_overrides,
+    })
+}
+
+/// The captured result of a sandboxed run, matching what `run_command` formats.
+pub struct CapturedRun {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_capped: bool,
+    pub stderr_capped: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
+/// Spawn `program args…` inside the container with the given final environment
+/// and capture output, bounded by `cap` bytes per stream and `timeout`.
+///
+/// Runs the whole synchronous Win32 dance on a blocking thread: two reader
+/// threads drain stdout/stderr (so neither pipe deadlocks the other), the main
+/// path waits with a deadline, assigns the pid to the kill-on-close job, and
+/// terminates on timeout.
+pub async fn spawn_and_capture(
+    prepared: &Prepared,
+    program: &Path,
+    args: &[String],
+    env: &[(OsString, OsString)],
+    cwd: &Path,
+    cap: usize,
+    timeout: std::time::Duration,
+) -> Result<CapturedRun, String> {
+    // Command line: quote the program and each arg. cImp resolved `program` to
+    // an absolute path already; args come from the model and may contain spaces.
+    let mut cmdline = quote_arg(&program.to_string_lossy());
+    for a in args {
+        cmdline.push(' ');
+        cmdline.push_str(&quote_arg(a));
+    }
+
+    // Environment block: NUL-separated "K=V" pairs, double-NUL terminated,
+    // sorted case-insensitively as Windows requires.
+    let mut pairs: Vec<(OsString, OsString)> = env.to_vec();
+    pairs.sort_by(|a, b| {
+        a.0.to_string_lossy()
+            .to_ascii_uppercase()
+            .cmp(&b.0.to_string_lossy().to_ascii_uppercase())
+    });
+    let mut env_block: Vec<u16> = Vec::new();
+    for (k, v) in &pairs {
+        env_block.extend(k.encode_wide());
+        env_block.push('=' as u16);
+        env_block.extend(v.encode_wide());
+        env_block.push(0);
+    }
+    env_block.push(0);
+
+    // Snapshot the security capabilities into a heap-stable form the blocking
+    // closure owns.
+    let container_psid = prepared.container.as_psid() as usize;
+    let cap_psids: Vec<usize> = prepared.caps.iter().map(|c| c.as_psid() as usize).collect();
+    let cmdline_w: Vec<u16> = wide_str(&cmdline);
+    let cwd_w: Vec<u16> = wide(cwd.as_os_str());
+
+    tokio::task::spawn_blocking(move || {
+        spawn_blocking_inner(
+            container_psid,
+            &cap_psids,
+            cmdline_w,
+            env_block,
+            cwd_w,
+            cap,
+            timeout,
+        )
+    })
+    .await
+    .map_err(|e| format!("sandbox spawn task failed: {e}"))?
+}
+
+fn spawn_blocking_inner(
+    container_psid: usize,
+    cap_psids: &[usize],
+    mut cmdline_w: Vec<u16>,
+    env_block: Vec<u16>,
+    cwd_w: Vec<u16>,
+    cap: usize,
+    timeout: std::time::Duration,
+) -> Result<CapturedRun, String> {
+    // ── pipes ──
+    let (out_rd, out_wr) = make_pipe()?;
+    let (err_rd, err_wr) = make_pipe()?;
+    // Read ends must NOT be inherited; write ends must be.
+    set_inherit(out_rd, false);
+    set_inherit(err_rd, false);
+    set_inherit(out_wr, true);
+    set_inherit(err_wr, true);
+
+    // ── security capabilities + attribute list ──
+    let mut cap_attrs: Vec<SID_AND_ATTRIBUTES> = cap_psids
+        .iter()
+        .map(|p| SID_AND_ATTRIBUTES {
+            Sid: *p as *mut c_void,
+            Attributes: SE_GROUP_ENABLED,
+        })
+        .collect();
+    let mut sec_caps = SECURITY_CAPABILITIES {
+        AppContainerSid: container_psid as *mut c_void,
+        Capabilities: if cap_attrs.is_empty() {
+            null_mut()
+        } else {
+            cap_attrs.as_mut_ptr()
+        },
+        CapabilityCount: cap_attrs.len() as u32,
+        Reserved: 0,
+    };
+
+    let mut size: usize = 0;
+    // SAFETY: first call just sizes the list.
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
+    let mut list_buf = vec![0u8; size];
+    let attr_list = list_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    // SAFETY: list_buf is sized by the call above; count 1.
+    if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut size) } == 0 {
+        close_all(&[out_rd, out_wr, err_rd, err_wr]);
+        return Err(format!("InitializeProcThreadAttributeList failed ({})", last_error()));
+    }
+    struct AttrGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for AttrGuard {
+        fn drop(&mut self) {
+            // SAFETY: initialized above; deleted exactly once.
+            unsafe { DeleteProcThreadAttributeList(self.0) };
+        }
+    }
+    let _attr_guard = AttrGuard(attr_list);
+    // SAFETY: attr_list initialized; sec_caps outlives CreateProcess below.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            &mut sec_caps as *mut _ as *const c_void,
+            std::mem::size_of::<SECURITY_CAPABILITIES>(),
+            null_mut(),
+            null(),
+        )
+    } == 0
+    {
+        close_all(&[out_rd, out_wr, err_rd, err_wr]);
+        return Err(format!("UpdateProcThreadAttribute failed ({})", last_error()));
+    }
+
+    // ── startup info ──
+    let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    siex.StartupInfo.hStdInput = INVALID_HANDLE_VALUE; // no stdin (matches Stdio::null)
+    siex.StartupInfo.hStdOutput = out_wr;
+    siex.StartupInfo.hStdError = err_wr;
+    siex.lpAttributeList = attr_list;
+
+    let mut env_block = env_block; // owned, mutable pointer below
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // CREATE_UNICODE_ENVIRONMENT (0x400) | EXTENDED_STARTUPINFO_PRESENT |
+    // CREATE_NO_WINDOW (0x0800_0000).
+    let flags = EXTENDED_STARTUPINFO_PRESENT | 0x0000_0400 | 0x0800_0000;
+    // SAFETY: cmdline_w is a mutable, null-terminated wide buffer (CreateProcessW
+    // may write to it); env/cwd are valid; startup info and attribute list are
+    // populated; handle inheritance is on.
+    let ok = unsafe {
+        CreateProcessW(
+            null(),
+            cmdline_w.as_mut_ptr(),
+            null(),
+            null(),
+            1,
+            flags,
+            env_block.as_mut_ptr() as *mut c_void,
+            cwd_w.as_ptr(),
+            &siex.StartupInfo,
+            &mut pi,
+        )
+    };
+    // The child owns the write ends now; close ours so EOF arrives when it exits.
+    close_all(&[out_wr, err_wr]);
+    if ok == 0 {
+        close_all(&[out_rd, err_rd]);
+        return Err(format!("CreateProcessW failed ({})", last_error()));
+    }
+
+    // Kill-on-close job membership (assign-after-spawn; hProcess pins the pid).
+    crate::process_guard::guard_pid(pi.dwProcessId);
+
+    // ── drain both pipes on their own threads ──
+    let out_rd_val = out_rd as usize;
+    let err_rd_val = err_rd as usize;
+    let t_out = std::thread::spawn(move || drain_pipe(out_rd_val as HANDLE, cap));
+    let t_err = std::thread::spawn(move || drain_pipe(err_rd_val as HANDLE, cap));
+
+    // ── wait with deadline ──
+    let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    // SAFETY: pi.hProcess is a live process handle from CreateProcess.
+    let wait = unsafe { WaitForSingleObject(pi.hProcess, ms) };
+    let mut timed_out = false;
+    let exit_code;
+    if wait == WAIT_TIMEOUT {
+        timed_out = true;
+        // SAFETY: live handle; 124 is our timeout sentinel.
+        unsafe { TerminateProcess(pi.hProcess, 124) };
+        // The job object also reaps the tree; give the child a moment then read.
+        // SAFETY: live handle.
+        unsafe { WaitForSingleObject(pi.hProcess, 2000) };
+        exit_code = Some(124);
+    } else if wait == WAIT_OBJECT_0 {
+        let mut code: u32 = 0;
+        // SAFETY: live handle; code is a valid out-param.
+        unsafe { GetExitCodeProcess(pi.hProcess, &mut code) };
+        exit_code = Some(code as i32);
+    } else {
+        exit_code = None;
+    }
+
+    let (stdout, stdout_capped) = t_out.join().unwrap_or((Vec::new(), false));
+    let (stderr, stderr_capped) = t_err.join().unwrap_or((Vec::new(), false));
+
+    // SAFETY: handles from CreateProcess, closed exactly once here.
+    unsafe {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    close_all(&[out_rd, err_rd]);
+
+    Ok(CapturedRun {
+        stdout,
+        stderr,
+        stdout_capped,
+        stderr_capped,
+        exit_code,
+        timed_out,
+    })
+}
+
+// ── small Win32 helpers ───────────────────────────────────────────────────────
+
+fn make_pipe() -> Result<(HANDLE, HANDLE), String> {
+    let mut rd: HANDLE = INVALID_HANDLE_VALUE;
+    let mut wr: HANDLE = INVALID_HANDLE_VALUE;
+    // SAFETY: out-params valid; default security; default buffer size.
+    let ok = unsafe { CreatePipe(&mut rd, &mut wr, null(), 0) };
+    if ok == 0 {
+        return Err(format!("CreatePipe failed ({})", last_error()));
+    }
+    Ok((rd, wr))
+}
+
+fn set_inherit(h: HANDLE, inherit: bool) {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    // SAFETY: h is a valid handle; flag mask constant.
+    unsafe {
+        SetHandleInformation(
+            h,
+            HANDLE_FLAG_INHERIT,
+            if inherit { HANDLE_FLAG_INHERIT } else { 0 },
+        );
+    }
+}
+
+fn close_all(handles: &[HANDLE]) {
+    for &h in handles {
+        if h != INVALID_HANDLE_VALUE && !h.is_null() {
+            // SAFETY: each is a valid handle we own; closed once (callers pass
+            // disjoint sets).
+            unsafe { CloseHandle(h) };
+        }
+    }
+}
+
+/// Read `h` to EOF, keeping at most `cap` bytes but draining the rest so the
+/// child never blocks on a full pipe. Returns (bytes, capped?).
+fn drain_pipe(h: HANDLE, cap: usize) -> (Vec<u8>, bool) {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    let mut out: Vec<u8> = Vec::new();
+    let mut capped = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut read: u32 = 0;
+        // SAFETY: h is a valid read handle; chunk/read are valid buffers.
+        let ok = unsafe {
+            ReadFile(
+                h,
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                &mut read,
+                null_mut(),
+            )
+        };
+        if ok == 0 || read == 0 {
+            break; // broken pipe on child exit, or EOF
+        }
+        let n = read as usize;
+        if out.len() < cap {
+            let take = n.min(cap - out.len());
+            out.extend_from_slice(&chunk[..take]);
+            if take < n {
+                capped = true;
+            }
+        } else {
+            capped = true;
+        }
+    }
+    (out, capped)
+}
+
+/// Quote one command-line argument per the Windows CRT rules (backslashes
+/// before a quote double; the whole thing wrapped in quotes if it has spaces
+/// or quotes). Absolute program paths and model args both pass through here.
+fn quote_arg(s: &str) -> String {
+    if !s.is_empty() && !s.contains([' ', '\t', '"']) {
+        return s.to_string();
+    }
+    let mut q = String::from("\"");
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+            }
+            '"' => {
+                q.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                backslashes = 0;
+                q.push('"');
+            }
+            _ => {
+                q.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                q.push(c);
+            }
+        }
+    }
+    q.extend(std::iter::repeat_n('\\', backslashes * 2));
+    q.push('"');
+    q
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_arg_rules() {
+        assert_eq!(quote_arg("simple"), "simple");
+        assert_eq!(quote_arg("has space"), "\"has space\"");
+        assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
+        // No spaces or quotes ⇒ no quoting, and a trailing backslash is only
+        // special when a closing quote would follow it.
+        assert_eq!(quote_arg(r"C:\path\"), r"C:\path\");
+        // With a space the arg IS quoted, so the trailing backslashes must
+        // double or they would escape the closing quote.
+        assert_eq!(quote_arg(r"C:\my path\"), "\"C:\\my path\\\\\"");
+        assert_eq!(quote_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn app_package_readable_covers_program_files() {
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            let git = PathBuf::from(pf).join("Git").join("cmd");
+            assert!(is_app_package_readable(&git));
+        }
+        // A user-profile dir is never app-package readable.
+        assert!(!is_app_package_readable(Path::new(
+            r"C:\Users\someone\.cargo\bin"
+        )));
+    }
+
+    #[test]
+    fn free_drive_letter_is_plausible() {
+        // Whatever it returns must be an unused X: form in D..=Z.
+        if let Some(l) = free_drive_letter() {
+            assert_eq!(l.len(), 2);
+            assert!(l.ends_with(':'));
+            let c = l.as_bytes()[0];
+            assert!((b'D'..=b'Z').contains(&c), "got {l}");
+        }
+    }
+
+    #[test]
+    fn container_sid_creates_unelevated() {
+        // The S1 headline claim, as a regression: profile creation needs no
+        // elevation. Skips cleanly if the environment forbids it.
+        match container_sid() {
+            Ok(sid) => {
+                // SAFETY: valid PSID from container_sid.
+                assert!(unsafe { IsValidSid(sid.as_psid()) } != 0);
+            }
+            Err(e) => {
+                // Only tolerate a genuine environment refusal, not a logic bug.
+                assert!(e.contains("failed"), "unexpected error shape: {e}");
+            }
+        }
+    }
+}

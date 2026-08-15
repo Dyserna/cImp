@@ -85,6 +85,15 @@ pub struct ToolCtx {
     /// [`with_checkpoint`](Self::with_checkpoint), so a new construction site
     /// silently gets the safe shape rather than a wrong one.
     pub checkpoint: Option<ToolCheckpoint>,
+    /// V33 Phase A: the OS-sandbox configuration `run_command` spawns under.
+    ///
+    /// Carried here rather than read from a global for the same reason
+    /// `command_allowlist` is: the headless `--offload-mcp` child and every
+    /// unit test get exactly what their constructor passed. [`ToolCtx::new`]
+    /// builds it disabled — the safe, honest shape — and the in-app path opts
+    /// in from settings via [`with_sandbox`](Self::with_sandbox), so a new
+    /// construction site cannot silently claim to be sandboxing.
+    pub sandbox: crate::sandbox::SandboxCfg,
 }
 
 impl ToolCtx {
@@ -104,6 +113,7 @@ impl ToolCtx {
             command_allowlist,
             command_policies,
             checkpoint: None,
+            sandbox: crate::sandbox::SandboxCfg::disabled(),
         }
     }
 
@@ -112,6 +122,14 @@ impl ToolCtx {
     /// three existing ones are already two `Vec<String>`-shaped neighbours.
     pub fn with_checkpoint(mut self, checkpoint: Option<ToolCheckpoint>) -> Self {
         self.checkpoint = checkpoint;
+        self
+    }
+
+    /// V33 Phase A: opt this context in to OS sandboxing. Same named-builder
+    /// discipline as [`with_checkpoint`](Self::with_checkpoint), and the same
+    /// reason: the default must be the honest one.
+    pub fn with_sandbox(mut self, sandbox: crate::sandbox::SandboxCfg) -> Self {
+        self.sandbox = sandbox;
         self
     }
 

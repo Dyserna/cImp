@@ -276,6 +276,10 @@ pub struct Settings {
     /// see `WorkbenchSettings`). Additive — old settings files load with the
     /// tab present but checkpoints off.
     pub workbench: WorkbenchSettings,
+    /// V33 Phase A: OS-level sandboxing of agent-initiated children (locked
+    /// decisions 16-17). Off by default; additive `#[serde(default)]` at the
+    /// container level, so old settings files load with the layer off.
+    pub sandbox: SandboxSettings,
     /// V12 Phase A: project checker commands (`cargo check`, `tsc`, `eslint`,
     /// `pytest`, …) the `run_check` MCP tool can run. Lives at the root, not
     /// inside `GraphSettings` — it's project tooling, independent of the code
@@ -464,6 +468,7 @@ impl Default for Settings {
             offload: OffloadSettings::default(),
             graph: GraphSettings::default(),
             workbench: WorkbenchSettings::default(),
+            sandbox: SandboxSettings::default(),
             checks: Vec::new(),
             checks_auto_configure: false,
             checks_suggestion_dismissed: false,
@@ -2710,6 +2715,69 @@ pub struct WorkbenchSettings {
     /// volume scales with the number of active tabs on a project.
     pub checkpoint_min_gap_s: u32,
 }
+
+/// V33 Phase A — OS-level sandboxing of agent-initiated child processes.
+///
+/// **Locked decision 16: one top-level category holds every sandboxing
+/// setting.** Not scattered into Tabs / Local task offload / Per-tab overrides.
+/// Sibling to `Injection protection`, deliberately **not merged into it**: V32
+/// constrains a compromised model at the tool layer, V33 makes the OS enforce a
+/// boundary the model cannot negotiate with, and merging them would let a user
+/// believe one delivers the other. Membership test for anything added here:
+/// *does this control the boundary the OS enforces?* — not *did V33 add it?*
+///
+/// **Locked decision 17: [`enabled`](Self::enabled) reaches the OS layer
+/// ONLY.** Off ⇒ no per-spawn AppContainer wrapper (and, when they land, no
+/// Landlock and no Max Paranoia). Unconditional regardless of this switch, and
+/// therefore absent from this struct: job-object kill-on-close (lifecycle
+/// correctness — switching it off reintroduces orphans, a bug not a freedom),
+/// `run_command`'s minimal environment (it withholds credentials, not
+/// capability), and the V32/V33 injection-layer fixes.
+///
+/// The two negative states — `off (user choice)` and `unavailable (prerequisite
+/// missing)` — are **distinct and never collapsed**; see
+/// [`sandbox::SkipReason`](crate::sandbox::SkipReason). This struct only
+/// carries the first; the second is discovered at spawn time.
+///
+/// ⚠ **A compromised model must not be able to flip this switch.** That rests
+/// on it being a settings write with no tool-exposed path: `run_command` cannot
+/// reach `settings.json` (it is outside every `allowed_root` and the sandbox
+/// itself denies the write), and no MCP tool writes settings. Verified rather
+/// than inherited — the V32 run found a comment standing in for a check six
+/// times.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct SandboxSettings {
+    /// Master switch for the OS sandbox layer (decision 17).
+    ///
+    /// Default **false**: Phase A ships the engine, and the grant ladder can
+    /// still surprise a machine whose toolchains live in Administrators-owned
+    /// directories. Opt-in first, default-on proposed once the live-verify
+    /// items in `docs/reviews/SPIKE-S1-appcontainer-2026-08-15.md` have soaked
+    /// — the same posture `workbench.checkpoints` shipped with.
+    pub enabled: bool,
+    /// Give sandboxed children the `internetClient` capability.
+    ///
+    /// Default **false** — a read-only probe needs no egress. Spike S1
+    /// measured that on a Public-profile NIC this single capability opens the
+    /// LAN as well as the internet (capabilities are class-granular), so the
+    /// honest choice today is all-or-nothing; per-host scoping per locked
+    /// decision 4 is WFP work (spike S4).
+    pub allow_network: bool,
+    /// Extra directories granted read+execute inside the sandbox — the
+    /// user-curated rows of decision 3's grant table.
+    ///
+    /// The spawn path already grants the resolved program's own install
+    /// directory, which covers the common case; this is for a toolchain that
+    /// reaches sideways (a compiler in one tree calling a linker in another).
+    /// Empty by default.
+    pub extra_grant_dirs: Vec<String>,
+}
+
+// `Default` is derived: every field's "off / empty" is exactly the milestone
+// default (sandbox off until the grant ladder soaks, no network capability, no
+// extra grants), so a hand-written impl would only be a place for the two to
+// drift apart.
 
 impl Default for WorkbenchSettings {
     fn default() -> Self {

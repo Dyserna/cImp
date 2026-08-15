@@ -775,6 +775,11 @@ export interface Settings {
   /// V13 Phase A: the Workbench feature (live diff / checkpoints /
   /// worktrees). The tab itself defaults on; checkpoints default off.
   workbench: WorkbenchSettings;
+  /// V33 Phase A: OS-level sandboxing of agent-started child processes
+  /// (locked decisions 16-17). Off by default; the master switch reaches the
+  /// OS layer ONLY — job objects, the minimal environment and the
+  /// injection-layer controls stay on regardless.
+  sandbox: SandboxSettings;
   /// V12 Phase A: project checker commands the `run_check` MCP tool can run
   /// (mirror of Rust `Vec<CheckDef>`). Lives at the root, not inside
   /// `GraphSettings` — independent of the code graph. Empty by default. Edited
@@ -1215,6 +1220,25 @@ export interface GraphSettings {
   // bars' outline).
   usage_color_session: string;
   usage_color_agent: string;
+}
+
+/// V33 Phase A: OS-level sandboxing. Mirror of Rust `SandboxSettings`.
+///
+/// Locked decision 17 — `enabled` reaches the OS layer ONLY. Everything that
+/// is containment rather than OS boundary (job-object kill-on-close, the
+/// `run_command` minimal environment, the injection-layer controls) is
+/// deliberately NOT representable here, so switching this off cannot turn any
+/// of it off.
+export interface SandboxSettings {
+  /// Master switch for the OS sandbox layer. Off by default until the grant
+  /// ladder has soaked on real machines.
+  enabled: boolean;
+  /// Give sandboxed children network access. Off by default; on, it reaches
+  /// the internet AND the LAN — Windows capabilities cannot separate them.
+  allow_network: boolean;
+  /// Extra directories granted read+execute inside the sandbox (decision 3's
+  /// user-curated grant rows). The program's own directory is automatic.
+  extra_grant_dirs: string[];
 }
 
 /// V13 §0.4: the Workbench feature's settings. Mirror of Rust
@@ -2074,6 +2098,11 @@ export function defaultSettings(): Settings {
       checkpoint_burst_files: 5,
       checkpoint_burst_window_s: 60,
       checkpoint_min_gap_s: 120,
+    },
+    sandbox: {
+      enabled: false,
+      allow_network: false,
+      extra_grant_dirs: [],
     },
     checks: [],
     checks_auto_configure: false,

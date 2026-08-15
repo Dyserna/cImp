@@ -332,8 +332,22 @@ winreg = "0.52"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # V33 Phase A (`sandbox::windows`): AppContainer profile + SID
+    # (`Win32_Security_Isolation`) and the DACL grant path
+    # (`Win32_Security_Authorization`). Spike S1 established these two feature
+    # names are the WHOLE Win32 surface Phase A needs — the ergonomic `windows`
+    # crate below is deliberately NOT touched, keeping its 0.61 pin
+    # type-identical to `webview2-com` 0.38.
+    "Win32_Security_Isolation",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    # `ReadFile` (draining the sandboxed child's pipes) is declared behind this
+    # feature because its signature names `OVERLAPPED` — we pass null and read
+    # synchronously, but the symbol is still gated on it.
+    "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 # V14 Phase F (Preview tab, `preview::capture`): the single COM call this

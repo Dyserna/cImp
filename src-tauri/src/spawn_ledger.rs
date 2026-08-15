@@ -174,6 +174,28 @@ pub const LEDGER: &[SpawnSite] = &[
                  the only one with a minimal environment.",
     },
     SpawnSite {
+        file: "sandbox/windows.rs",
+        symbol: "spawn_blocking_inner",
+        spawns: "the SAME allowlisted program as `run_command`, inside an AppContainer",
+        class: AgentSpawn,
+        // Two occurrences, one spawn: the `use` import and the call itself. The
+        // count is defined as spawn-constructor occurrences in the file's
+        // source text (see [`SpawnSite::count`]), and a Win32 import is one —
+        // unlike the `Command::new` sites, whose constructor is never imported
+        // by that name.
+        count: 2,
+        reason: "V33 Phase A. Not a new capability — it is the `run_command` seam above \
+                 running through a different OS mechanism: a bespoke `CreateProcessW` with a \
+                 `SECURITY_CAPABILITIES` attribute list, because neither `std` nor `tokio` \
+                 `Command` can attach one on stable Rust. Every constraint of that seam is \
+                 applied BEFORE this function is reached (allowlist, bare-name resolution, \
+                 `CommandPolicy`, minimal env, timeout, output cap), so this row is \
+                 AgentSpawn for the same reason and must stay classified with it: if the two \
+                 ever diverge, the sandboxed path is the one a model actually reaches. \
+                 Sandboxing this is the POINT rather than a hazard — the inverse of the \
+                 `workbench/git.rs` row.",
+    },
+    SpawnSite {
         file: "preview/mod.rs",
         symbol: "open_external",
         spawns: "the OS default handler for a URL (browser), via tauri-plugin-opener",
@@ -271,17 +293,27 @@ mod tests {
     /// this file does not trip its own scan — the house style from
     /// `offload/agent.rs`'s admission-rule tripwire.
     ///
-    /// Four mechanisms, not one: `Command::new` covers `std::process`,
+    /// Five mechanisms, not one: `Command::new` covers `std::process`,
     /// `tokio::process` and the `StdCommand`-style aliases (the needle is a
     /// suffix of all of them); `spawn_command` is portable-pty's; `open_url` /
     /// `open_path` are tauri-plugin-opener handing a target to the OS shell.
     /// `open_path` has no call site today and is listed so that adding one
     /// fails this test.
+    ///
+    /// **`CreateProcessW` was added by V33 Phase A, and its absence was a real
+    /// hole rather than a formality.** The sandboxed spawn calls Win32
+    /// directly (no `std`/`tokio` `Command` can attach an AppContainer
+    /// attribute list), so until this needle existed the scanner would have
+    /// reported "no spawn here" for a file that spawns processes — and every
+    /// future direct-Win32 spawn would have been invisible to the exhaustiveness
+    /// check that is this module's entire purpose. The row and the needle land
+    /// together, which is the contract C1 asks of any new mechanism.
     const SPAWN_NEEDLES: &[&str] = &[
         concat!("Command::", "new"),
         concat!("spawn_", "command"),
         concat!("open_", "url"),
         concat!("open_", "path"),
+        concat!("CreateProcess", "W"),
     ];
 
     fn utf8_len(b: u8) -> usize {
@@ -680,6 +712,7 @@ mod tests {
                 include_str!("offload/tools/run_command.rs"),
             ),
             ("preview/mod.rs", include_str!("preview/mod.rs")),
+            ("sandbox/windows.rs", include_str!("sandbox/windows.rs")),
             ("procutil.rs", include_str!("procutil.rs")),
             ("pty/manager.rs", include_str!("pty/manager.rs")),
             ("tabs/config.rs", include_str!("tabs/config.rs")),

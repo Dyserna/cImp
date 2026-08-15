@@ -1213,6 +1213,12 @@
     border-radius: 3px;
     padding: 0 3px;
   }
+  /* V33 Phase A sandbox rows: warning-toned but unfilled, so they sit between
+     the ordinary feeds and the filled red `injection_flag` treatment — these
+     rows report the state of a boundary, not a blocked call. */
+  .ekind.sandbox {
+    color: var(--warning, #f0a020);
+  }
   /* Synthetic checkpoint rows (#51): teal, so they read as neither the graph
      blue nor the offload green next to them. */
   .ekind.checkpoint {

@@ -1520,7 +1520,14 @@ impl OffloadService {
             snap.command_policies.clone(),
             &cwd,
         )
-        .with_checkpoint(checkpoint);
+        .with_checkpoint(checkpoint)
+        // V33 Phase A: the in-app worker is the one path that both knows the
+        // live settings and spawns `run_command` children, so it is where the
+        // OS sandbox is opted in. The headless `--offload-mcp` child keeps
+        // `SandboxCfg::disabled()` and says so out loud at spawn time
+        // (`SkipReason::Unavailable`), rather than claiming a boundary it has
+        // no settings snapshot to configure.
+        .with_sandbox(sandbox_cfg(&self.settings.current()));
         let mut native_defs = tools::enabled_defs(&snap.tools);
         // One settings snapshot for both feature gates below.
         let cur = self.settings.current();
@@ -2204,6 +2211,27 @@ fn token_fp(token: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     token.hash(&mut h);
     h.finish()
+}
+
+/// V33 Phase A: translate the persisted [`SandboxSettings`] into the runtime
+/// [`SandboxCfg`](crate::sandbox::SandboxCfg) the spawn seam consumes.
+///
+/// A function rather than a `From` impl because the two types are deliberately
+/// not 1:1 — settings hold user-facing strings (`extra_grant_dirs`), the
+/// runtime wants `PathBuf`s, and a future engine-selection field will resolve
+/// here rather than widening the settings struct.
+pub(crate) fn sandbox_cfg(s: &crate::settings::Settings) -> crate::sandbox::SandboxCfg {
+    crate::sandbox::SandboxCfg {
+        enabled: s.sandbox.enabled,
+        allow_network: s.sandbox.allow_network,
+        extra_grant_dirs: s
+            .sandbox
+            .extra_grant_dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .collect(),
+    }
 }
 
 /// The offload `allowed_roots`, falling back to the launch project root when

@@ -89,7 +89,21 @@ export interface ActivityEntry {
   /// that is failing produces no task rows at all, which is exactly why its
   /// process history could not share their retention window (`OFFLOAD_SERVER_CAP`
   /// backend-side).
-  kind: 'graph' | 'offload' | 'offload_server' | 'audit' | 'mcp' | 'injection_flag';
+  ///
+  /// `sandbox` = one OS-sandbox fact (V33 Phase A): a child that ran
+  /// UNSANDBOXED and why, or a grant/drive-mapping event. Its own kind rather
+  /// than an `injection_flag` source because the two answer different
+  /// questions — V32's screens say a model was refused something, this says
+  /// the OS boundary was or was not in place — and because it carries its own
+  /// retention lane (`SANDBOX_CAP` backend-side).
+  kind:
+    | 'graph'
+    | 'offload'
+    | 'offload_server'
+    | 'audit'
+    | 'mcp'
+    | 'injection_flag'
+    | 'sandbox';
   /// The project this row belongs to, canonicalized backend-side
   /// (`activity::root_key`). Lets a per-project consumer filter out other
   /// projects' activity.
@@ -244,7 +258,11 @@ export type RowStatus =
   | 'granted'
   | 'update'
   | 'rejected'
-  | 'recorded';
+  | 'recorded'
+  /// V33 Phase A: a child ran outside the OS sandbox. Distinct from `denied`
+  /// (a model was refused) and from `failed` (the command itself broke) — the
+  /// command ran fine, the boundary was absent.
+  | 'unsandboxed';
 
 /// Classify one row.
 ///
@@ -275,6 +293,14 @@ export function rowStatus(e: ActivityEntry): RowStatus {
         // still make; the verb it belongs to is not.
         return e.ok ? 'ok' : 'down';
     }
+  }
+  if (e.kind === 'sandbox') {
+    // Keyed on `tool`, like `offload_server` and for the same reason: `ok`
+    // here distinguishes a CHOSEN unsandboxed state (the switch is off) from
+    // an unavailable one, so it cannot also carry the verb. Locked decision
+    // 17 requires those two to stay visibly distinct, which the row's
+    // `target` text spells out ("off (user choice)" / "unavailable").
+    return e.tool === 'unsandboxed' ? 'unsandboxed' : e.ok ? 'ok' : 'failed';
   }
   if (e.kind === 'injection_flag') {
     switch (e.source) {
@@ -339,6 +365,8 @@ export const STATUS_TITLE: Record<RowStatus, string> = {
     'The detection auto-updater REFUSED a rules/classifier bundle. Not a screen over a tool call, and not a blocked call.',
   recorded:
     'A containment event this build has no category for. Open the row for the detail.',
+  unsandboxed:
+    'This command ran WITHOUT the OS sandbox — the row says whether that was your choice (the Sandboxing switch is off) or a missing prerequisite. The command itself ran normally; only the OS boundary was absent.',
 };
 
 /// The feed (graph + offload), newest first, payload-free. Pass `sinceTs` to

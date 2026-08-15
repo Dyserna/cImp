@@ -27,6 +27,7 @@ mod processing;
 mod procutil;
 mod pty;
 mod read_hook;
+mod sandbox;
 mod settings;
 mod shell;
 mod spawn_ledger;

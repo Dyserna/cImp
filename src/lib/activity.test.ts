@@ -419,3 +419,47 @@ describe('rowStatus — offload server lifecycle', () => {
     );
   });
 });
+
+// ── sandbox rows (V33 Phase A) ─────────────────────────────────────────────
+//
+// Locked decision 17 requires "off (user choice)" and "unavailable
+// (prerequisite missing)" to stay DISTINCT states — collapsing them is how a
+// broken prerequisite hides behind a deliberate setting. The frontend half of
+// that guarantee is here: both render as `unsandboxed`, and the row's own text
+// carries which one, so nothing about the chip may start reading `ok` as the
+// verb.
+
+/// One `sandbox` row. `ok` mirrors "was this state chosen?" — true for the
+/// user's switch being off, false for a missing prerequisite.
+function sbx(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(1, { kind: 'sandbox', source: 'run_command', tool, ok, ...over });
+}
+
+describe('rowStatus — sandbox', () => {
+  it('reports both negative states as unsandboxed, never as a blocked call', () => {
+    const off = sbx('unsandboxed', true, { target: 'off (user choice) — git.exe' });
+    const unavailable = sbx('unsandboxed', false, { target: 'unavailable — git.exe' });
+    expect(rowStatus(off)).toBe('unsandboxed');
+    expect(rowStatus(unavailable)).toBe('unsandboxed');
+    // The command ran fine in both cases: this must never wear the words that
+    // mean "we stopped something" or "the call errored".
+    expect(rowStatus(off)).not.toBe('denied');
+    expect(rowStatus(unavailable)).not.toBe('failed');
+  });
+
+  it('keeps the two states distinguishable in the row itself', () => {
+    // The chip is one word by design; decision 17's distinctness lives in
+    // `target`, which the detail popup shows. If a future change moves the
+    // distinction into the chip, this test is where that gets noticed.
+    const off = sbx('unsandboxed', true, { target: 'off (user choice) — git.exe' });
+    const unavailable = sbx('unsandboxed', false, { target: 'unavailable — git.exe' });
+    expect(off.target).not.toEqual(unavailable.target);
+    expect(off.ok).not.toEqual(unavailable.ok);
+  });
+
+  it('does not read a grant event as an unsandboxed run', () => {
+    // Other tools in this lane (grants, drive mappings) are ordinary rows.
+    expect(rowStatus(sbx('grant', true, { target: 'C:/tools' }))).toBe('ok');
+    expect(rowStatus(sbx('grant', false, { target: 'C:/tools' }))).toBe('failed');
+  });
+});

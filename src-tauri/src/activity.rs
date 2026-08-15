@@ -83,6 +83,18 @@ const MCP_CAP: usize = 200;
 /// app runs, while a crash-restart loop still cannot reach back and delete the
 /// task history that shows what the server was doing when it died.
 const OFFLOAD_SERVER_CAP: usize = 200;
+/// V33 Phase A: OS-sandbox rows — an unsandboxed degradation (with its distinct
+/// `off (user choice)` / `unavailable` reason) or a grant/mapping event.
+///
+/// Its own window, chosen on purpose per #51 rather than left on the graph
+/// fallback, and for the same reason `offload_server` has one: these rows are
+/// rare and explanatory, while the feed around them is chatty. The row that
+/// says "this tool call ran OUTSIDE the sandbox, because a prerequisite was
+/// missing" is exactly the one a graph-heavy session would evict — and it is
+/// the row decision 5 exists to guarantee. Small (60) because
+/// `sandbox::record_skip` deduplicates by reason per session: a whole run of
+/// unsandboxed spawns produces one row, not thousands.
+const SANDBOX_CAP: usize = 60;
 /// V32: security denials (SSRF screen, fetch budgets, canary hits, taint-latch
 /// refusals, quarantines, detection flags). Retained **per screen**, not per
 /// kind — this is the window ONE screen's rows get.
@@ -124,6 +136,7 @@ const TOTAL_CAPACITY: usize = GRAPH_CAP
     + OFFLOAD_SERVER_CAP
     + AUDIT_CAP
     + MCP_CAP
+    + SANDBOX_CAP
     + INJECTION_FLAG_TOTAL_CAP;
 /// Appends between compactions once the ring is full. Compaction rewrites the
 /// whole file (and re-reads it first, to merge a child's lines), so this is the
@@ -186,6 +199,12 @@ pub enum ActivityKind {
     /// which screen fired is carried in the row's `source` field and (with the
     /// full detail) in its request payload.
     InjectionFlag,
+    /// V33 Phase A: one OS-sandbox fact — a child that ran UNSANDBOXED and why
+    /// (the distinct `off (user choice)` / `unavailable` states of locked
+    /// decision 17), or a grant/drive-mapping event. Recorded by
+    /// [`sandbox::record_skip`](crate::sandbox::record_skip) and
+    /// [`sandbox::record_event`](crate::sandbox::record_event).
+    Sandbox,
 }
 
 impl ActivityKind {
@@ -197,6 +216,7 @@ impl ActivityKind {
             ActivityKind::Audit => "audit",
             ActivityKind::Mcp => "mcp",
             ActivityKind::InjectionFlag => "injection_flag",
+            ActivityKind::Sandbox => "sandbox",
         }
     }
 }
@@ -223,6 +243,8 @@ fn kind_cap(kind: &str) -> usize {
         AUDIT_CAP
     } else if kind == ActivityKind::Mcp.as_str() {
         MCP_CAP
+    } else if kind == ActivityKind::Sandbox.as_str() {
+        SANDBOX_CAP
     } else {
         GRAPH_CAP
     }

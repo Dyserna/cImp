@@ -1169,6 +1169,7 @@
     | 'compose'
     | 'offload'
     | 'injection'
+    | 'sandboxing'
     | 'mcp'
     | 'graph'
     | 'checks'
@@ -1196,6 +1197,15 @@
     // offload worker. Adjacent to `offload` deliberately: that is where anyone
     // who remembers the old layout, or read an older pointer, starts looking.
     { id: 'injection', label: 'Injection protection' },
+    // V33 locked decision 16: ONE top-level category holds every sandboxing
+    // setting, created before the settings scattered rather than consolidated
+    // after (F-18's lesson applied ahead of the mess). Sibling to Injection
+    // protection and deliberately NOT merged into it: V32 constrains a
+    // compromised model at the tool layer; V33 makes the OS enforce a boundary
+    // the model cannot negotiate with. Merging would let a user believe one
+    // delivers the other. Membership test for anything added here: does it
+    // control the boundary the OS enforces?
+    { id: 'sandboxing', label: 'Sandboxing' },
     { id: 'mcp', label: 'MCP servers' },
     { id: 'graph', label: 'Code Intelligence' },
     { id: 'checks', label: 'Checks' },
@@ -6990,6 +7000,100 @@
               <small class="error">{llmPricingError}</small>
             {/if}
           {/if}
+        </section>
+      {:else if activeSection === 'sandboxing'}
+        <section>
+          <!--
+            V33 Phase A. Locked decisions 16 (one category) and 17 (the master
+            switch reaches the OS layer ONLY) — see
+            `docs/MILESTONE-V33-sandboxing.md` and the S1 spike report for what
+            the boundary actually is.
+          -->
+          <h2>Sandboxing</h2>
+          <small class="hint top">
+            An OS-enforced boundary around the child processes an agent starts —
+            today the commands the offload worker runs through
+            <code>run_command</code>. Injection protection (above) constrains a
+            compromised model at the tool layer; this makes the operating system
+            enforce a boundary the model cannot negotiate with. They are separate
+            categories because neither delivers the other.
+          </small>
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              checked={snapshot.sandbox.enabled}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.sandbox.enabled = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Sandbox agent-started processes (master switch)</span>
+          </label>
+          <small class="hint down">
+            On Windows each allowlisted command runs inside an
+            <strong>AppContainer</strong>: it can read and write the project root
+            and read the operating system plus the tool's own program files — and
+            nothing else. Your credentials, other projects and cImp's own tokens
+            are unreadable to it. Off, the command still gets the minimal
+            environment, the process-tree kill and every injection-layer control:
+            this switch governs the OS boundary only, never the containment
+            underneath it.
+          </small>
+          {#if !snapshot.sandbox.enabled}
+            <small class="hint down">
+              Sandboxing is <strong>off by user choice</strong>. Commands run with
+              your full file access. This state and “unavailable — a prerequisite
+              is missing” are recorded distinctly in the Events tab, so a failed
+              prerequisite can never hide behind this setting.
+            </small>
+          {/if}
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              disabled={!snapshot.sandbox.enabled}
+              checked={snapshot.sandbox.allow_network}
+              onchange={(e) =>
+                patch(
+                  (s) =>
+                    (s.sandbox.allow_network = (
+                      e.currentTarget as HTMLInputElement
+                    ).checked),
+                )}
+            />
+            <span>Allow network access from sandboxed processes</span>
+          </label>
+          <small class="hint down">
+            Off, a sandboxed command reaches no network at all — the right default
+            for build and test probes. On, it reaches the internet <em>and</em>
+            your LAN: Windows capabilities cannot separate the two on this
+            network, so per-host allowlisting is not yet offered rather than
+            offered and untrue.
+          </small>
+          <label class="field">
+            <span>Extra readable tool directories</span>
+            <textarea
+              rows="3"
+              disabled={!snapshot.sandbox.enabled}
+              value={snapshot.sandbox.extra_grant_dirs.join('\n')}
+              onchange={(e) =>
+                patch((s) => {
+                  s.sandbox.extra_grant_dirs = (e.currentTarget as HTMLTextAreaElement).value
+                    .split('\n')
+                    .map((l) => l.trim())
+                    .filter((l) => l.length > 0);
+                })}
+            ></textarea>
+          </label>
+          <small class="hint down">
+            One path per line. The command's own program directory is granted
+            automatically, which covers most tools; add a directory here when a
+            toolchain reaches sideways into another (a compiler calling a linker
+            from a different tree). Tools installed under Program Files need no
+            entry. If a directory cannot be granted — typically one owned by
+            Administrators — the command runs unsandboxed and says so in Events
+            rather than failing.
+          </small>
         </section>
       {:else if activeSection === 'workbench'}
         <section>

@@ -104,6 +104,15 @@
     border-color: var(--border-default, #3f4554);
   }
 
+  /* V33 Phase A: the OS boundary was absent for this call. OUTLINE warning,
+     not dashed and not red: this IS a confident claim (we know the sandbox did
+     not apply, and why), but nothing was blocked and the command ran normally —
+     so it must not wear `denied`'s red or `unscreened`'s "we didn't look". */
+  .schip.unsandboxed {
+    color: var(--warning, #f0a020);
+    border-color: color-mix(in srgb, var(--warning, #f0a020) 45%, transparent);
+  }
+
   /* Containment came on (beacon / contamination). */
   .schip.engaged {
     color: var(--text-info, #d8b8ff);

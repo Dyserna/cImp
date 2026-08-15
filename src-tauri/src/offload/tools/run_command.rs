@@ -5,6 +5,8 @@
 //! and — since V33 contract C2 — with an environment built up from an explicit
 //! allowlist ([`CHILD_ENV`]) rather than inherited from cImp.
 
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
@@ -480,6 +482,43 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .first()
         .cloned()
         .ok_or_else(|| "run_command has no allowed root to execute in".to_string())?;
+    // V33 Phase A: decide whether this child runs inside the OS sandbox before
+    // building the plain command, because the sandboxed path is a different
+    // spawn mechanism (a bespoke `CreateProcessW` — std/tokio cannot attach the
+    // AppContainer attribute list) rather than a flag on this one.
+    //
+    // The environment is composed ONCE, here, and both paths consume it: the
+    // minimal-env table (contract C2) is unconditional per decision 17, so a
+    // sandbox that is off or unavailable changes the OS boundary and nothing
+    // about which variables the child sees.
+    let base_env = minimal_env(&|key| std::env::var_os(key));
+    let policy_env: Vec<(String, OsString)> = policy_for(&args.command, &ctx.command_policies)
+        .map(|p| {
+            p.env
+                .iter()
+                .map(|ev| (ev.key.clone(), OsString::from(&ev.value)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan = crate::sandbox::plan(&ctx.sandbox, &program, &cwd, &base_env).await;
+    #[cfg(windows)]
+    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
+        return run_sandboxed(
+            prepared,
+            &program,
+            &args,
+            &base_env,
+            &policy_env,
+            ctx,
+            &cwd,
+        )
+        .await;
+    }
+    if let crate::sandbox::Plan::Plain(reason) = &plan {
+        // Decision 5: degradation is loud, never silent. Deduplicated by reason
+        // per session inside `record_skip`, so this cannot flood its lane.
+        crate::sandbox::record_skip(reason, &program, &cwd);
+    }
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args.args)
         .current_dir(&cwd)
@@ -560,22 +599,41 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     };
     let status = status.map_err(|e| format!("`{}` failed: {e}", args.command))?;
 
-    let mut truncated = out.capped || err.capped;
+    Ok(format_run_output(
+        &out.bytes,
+        &err.bytes,
+        out.capped || err.capped,
+        status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into()),
+    ))
+}
+
+/// Render one finished run the way the model sees it: `(exit N)` then stdout,
+/// then stderr under a marker, with a single truncation notice if anything was
+/// cut — either by a per-stream cap or by the combined ceiling.
+///
+/// Shared by the plain and sandboxed paths so the two cannot drift in what a
+/// model is shown; V33 Phase A added the second caller and this function with
+/// it (the logic is unchanged from the single-path original).
+fn format_run_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    capped: bool,
+    status: String,
+) -> String {
+    let mut truncated = capped;
     let mut combined = String::new();
-    if !out.bytes.is_empty() {
-        combined.push_str(&String::from_utf8_lossy(&out.bytes));
+    if !stdout.is_empty() {
+        combined.push_str(&String::from_utf8_lossy(stdout));
     }
-    if !err.bytes.is_empty() {
+    if !stderr.is_empty() {
         if !combined.is_empty() {
             combined.push_str("\n--- stderr ---\n");
         }
-        combined.push_str(&String::from_utf8_lossy(&err.bytes));
+        combined.push_str(&String::from_utf8_lossy(stderr));
     }
-    let status = status
-        .code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "signal".into());
-
     if combined.len() > MAX_OUTPUT_BYTES {
         let cut = combined
             .char_indices()
@@ -589,7 +647,74 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     if truncated {
         combined.push_str("\n[output truncated]");
     }
-    Ok(format!("(exit {status})\n{combined}"))
+    format!("(exit {status})\n{combined}")
+}
+
+/// V33 Phase A — run one allowlisted child INSIDE the AppContainer.
+///
+/// Mirrors the plain path's contract exactly (same env, same caps, same
+/// timeout, same rendering) and differs only in the OS boundary: the child's
+/// cwd is the sandbox root's mapped drive (so `getcwd` never walks the
+/// unlistable `C:\` — spike S1's canonicalization gotcha), and TEMP/HOME are
+/// redirected inside the root so a tool that writes state has one writable
+/// place to write it.
+///
+/// The kill-on-close job assignment happens inside `spawn_and_capture` (the
+/// same `guard_pid` the PTY child uses), so a hard cImp death still reaps this
+/// child — decision 17's "job objects stay unconditional" holds on both paths.
+#[cfg(windows)]
+async fn run_sandboxed(
+    prepared: &crate::sandbox::windows::Prepared,
+    program: &std::path::Path,
+    args: &Args,
+    base_env: &[(&str, OsString)],
+    policy_env: &[(String, OsString)],
+    _ctx: &ToolCtx,
+    root: &std::path::Path,
+) -> Result<String, String> {
+    // Same composition order as the plain path: minimal env first, then the
+    // program's policy env, then the sandbox's own redirections last — those
+    // point at the mapped drive and must win over an inherited TEMP/HOME.
+    let mut env: Vec<(OsString, OsString)> = base_env
+        .iter()
+        .map(|(k, v)| (OsString::from(*k), v.clone()))
+        .collect();
+    for (k, v) in policy_env {
+        env.retain(|(ek, _)| ek != OsStr::new(k.as_str()));
+        env.push((OsString::from(k), v.clone()));
+    }
+    for (k, v) in &prepared.env_overrides {
+        env.retain(|(ek, _)| ek != OsStr::new(k.as_str()));
+        env.push((OsString::from(k), v.clone()));
+    }
+
+    let run = crate::sandbox::windows::spawn_and_capture(
+        prepared,
+        program,
+        &args.args,
+        &env,
+        &prepared.cwd(),
+        MAX_OUTPUT_BYTES,
+        TIMEOUT,
+    )
+    .await?;
+
+    if run.timed_out {
+        return Err(format!(
+            "`{}` timed out after {}s",
+            args.command,
+            TIMEOUT.as_secs()
+        ));
+    }
+    let _ = root;
+    Ok(format_run_output(
+        &run.stdout,
+        &run.stderr,
+        run.stdout_capped || run.stderr_capped,
+        run.exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+    ))
 }
 
 /// Bytes captured from one stream, plus whether more was produced than the cap.
@@ -1059,6 +1184,12 @@ mod tests {
             // V33 Phase F: no Workbench service in a unit test, and this test is
             // about the minimal environment, not about checkpoints.
             checkpoint: None,
+            // V33 Phase A: deliberately UNsandboxed. This test asserts the C2
+            // minimal environment still lets `git log` and a `cargo` probe run;
+            // routing it through the AppContainer would test the sandbox's grant
+            // ladder instead, and would ACL-stamp the developer's real toolchain
+            // dirs as a side effect of running the suite.
+            sandbox: crate::sandbox::SandboxCfg::disabled(),
         };
 
         if crate::pty::resolve_command("git").is_ok() {

@@ -101,6 +101,35 @@ ACEs on drive roots must use a non-propagating API — an `icacls` attempt on
    (C2's env table already carries them) — git then reads no global config
    and the `~/.config/git/ignore` warnings disappear.
 
+## Addendum (same day): the general-toolchain matrix — javac, go, dotnet, clang, python
+
+cImp is not a rust/npm shop; the same session extended the inventory to every
+other toolchain present on this machine. Every result generalizes to two
+rules — (a) **install location decides the grant**, (b) **state dirs get
+env-redirected into the root** — plus per-tool quirks:
+
+| Toolchain | Location | Result |
+|---|---|---|
+| go 1.26 | `C:\Program Files\Go` | **Works out of the box** (AAP RX pre-exists). Full `go build` + run verified with `GOCACHE`/`GOPATH`/`GOTMPDIR` redirected inside the root. |
+| javac/java (JDK 21) | `P:\WorkSync\JavaJDK` | Executes, compiles and runs — **but the grant itself was refused unelevated**: the dir is Administrators-owned and `Authenticated Users:(M)` carries no `WRITE_DAC`. Zero-elevation fallback verified: **copy the JDK into the root** (317 MB, 1.4 s) — works completely. The modern JVM is notably robust: a classpath entry whose ancestors are unlistable still loads (`java -cp C:\<granted-but-C:-blocked-chain>` ran fine). |
+| dotnet 8 | `C:\Program Files\dotnet` | **Works** with `DOTNET_CLI_HOME` redirected inside the root (+ telemetry opt-out). |
+| clang 22 | `C:\Program Files\LLVM` | Executes; **MSVC/SDK header auto-discovery fails in-container only** (host control compiles). Explicit `INCLUDE` env (the vcvars-style paths a build harness sets anyway) → compiles clean. Windows Kits headers under `Program Files (x86)` are AAP-readable. |
+| python 3.14 | real install in profile | **Works** with an RX grant on the install dir (same class as cargo/nvm). Emits a benign "Failed to find real location of python.exe" — realpath hitting the ancestor wall, tolerated. pip/site-packages would need cache redirects, untested. |
+| python (Store alias) | `…\Microsoft\WindowsApps` | **Broken and not worth fixing** — the appExecutionAlias dir is unlistable profile territory and the alias is a reparse point; PATH search never sees it. Users with only Store Python get a documented failure, not a workaround. |
+
+Two additions to the grant-table design from this pass:
+
+- **Granting needs `WRITE_DAC` on the toolchain dir.** Anything installed
+  elevated (or synced with Administrators ownership) refuses an unelevated
+  `icacls` grant. The fallback ladder is: AAP already present (Program
+  Files) → nothing to do; user-owned dir → grant once; Administrators-owned
+  dir → one elevated grant pass **or** copy the toolchain into the sandbox
+  root (fast, and the copy inherits the root's ACE).
+- **cmd's bare-name resolution of a cwd-relative exe** (e.g. running a
+  freshly built `hello-go.exe`) hits the canonicalization quirk even inside
+  the subst root; invoking it as `S:\hello-go.exe` works. Same family as the
+  absolute-path cmd gotcha, same mitigation.
+
 ## What S2 must beat
 
 Zero elevation, zero new deps, ~350-line wrapper, confinement verified by

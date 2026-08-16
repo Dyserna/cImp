@@ -436,16 +436,58 @@ pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
     // Neither writes to the project tree, so neither checkpoints.
     ("webfetch", ToolClass::External, false),
     ("websearch", ToolClass::External, false),
-    // Deliberately ABSENT, and each for a stated reason:
-    // - `task` (sub-agent spawn): orchestration, not a capability of its own.
-    //   The E2 spike confirmed a sub-agent's tool calls fire this same hook in
-    //   the child session, and the plugin's tab identity is process-wide
-    //   (`CIMP_TAB_ID`), so the child's `bash`/`read`/`webfetch` are gated at
-    //   the same latch. Gating the spawn itself would refuse an orchestration
-    //   primitive whose dangerous leaves are already closed.
-    // - `skill`, `todowrite`, `question`, `invalid`: no file access, no process
-    //   execution, no egress. Denying them would buy nothing and would make the
-    //   gate look arbitrary to the model it is talking to.
+    // Ids deliberately left out of this table are NOT undeclared — they are
+    // listed, with their reasons, in [`OPENCODE_NATIVE_REVIEWED_UNGATED`].
+];
+
+/// Upstream tool ids that `GET /experimental/tool/ids` serves and
+/// [`OPENCODE_NATIVE_TABLE`] deliberately does **not** gate, each with the
+/// reason it was left out.
+///
+/// This is the prose that used to sit as a trailing comment inside the table,
+/// made machine-readable in V35 Phase D — because the live probe
+/// (`harness/probe.rs`, capability `opencode.tool_registry`) has to distinguish
+/// two things a bare table diff cannot:
+///
+/// * an id nobody has ever looked at — **UNCLASSIFIED**, and a failure, because
+///   the table is allowlist-only so it ships ungated; and
+/// * an id a human looked at and consciously left ungated — a **recorded
+///   decision**, which must not turn the probe permanently red. (Milestone
+///   locked decision 8: a probe that cries wolf gets ignored, which is the
+///   exact fate of the version tripwire this milestone exists to fix.)
+///
+/// All five entries were already reviewed and written down; moving them here
+/// changes no gating behavior whatsoever (the plugin builder reads
+/// [`opencode_native_names`] / [`opencode_native_mutating_names`], neither of
+/// which consults this list). Adding a row here IS a security decision and
+/// belongs in review, exactly like adding one to the table.
+pub const OPENCODE_NATIVE_REVIEWED_UNGATED: &[(&str, &str)] = &[
+    (
+        "task",
+        "sub-agent spawn: orchestration, not a capability of its own. The E2 spike confirmed a \
+         sub-agent's tool calls fire this same hook in the child session, and the plugin's tab \
+         identity is process-wide (`CIMP_TAB_ID`), so the child's `bash`/`read`/`webfetch` are \
+         gated at the same latch. Gating the spawn itself would refuse an orchestration primitive \
+         whose dangerous leaves are already closed.",
+    ),
+    (
+        "skill",
+        "no file access, no process execution, no egress. Denying it would buy nothing and would \
+         make the gate look arbitrary to the model it is talking to.",
+    ),
+    (
+        "todowrite",
+        "no file access, no process execution, no egress — see `skill`.",
+    ),
+    (
+        "question",
+        "no file access, no process execution, no egress — see `skill`.",
+    ),
+    (
+        "invalid",
+        "no file access, no process execution, no egress — see `skill`. (The harness's own \
+         placeholder for an unresolvable tool call.)",
+    ),
 ];
 
 /// The class of one OpenCode native tool name, or `None` when the gate does not
@@ -1778,7 +1820,9 @@ mod tests {
     #[test]
     fn unknown_opencode_natives_are_ungated_not_external() {
         // Orchestration + bookkeeping: no capability of their own, so no row.
-        for n in ["task", "skill", "todowrite", "question", "invalid"] {
+        // Driven from the reviewed-ungated list rather than a literal, so the
+        // list the V35 probe trusts is the same one this test proves ungated.
+        for (n, _) in OPENCODE_NATIVE_REVIEWED_UNGATED {
             assert_eq!(opencode_native_class(n), None, "{n} must be ungated");
             // …and this is exactly where `classify` would have said EXTERNAL,
             // i.e. "deny under a LOCAL latch" — the misclassification the
@@ -1798,6 +1842,37 @@ mod tests {
                 "{name} is in both tables — one lookup, two vocabularies"
             );
         }
+    }
+
+    /// V35 Phase D: the gated table and the reviewed-but-ungated list are two
+    /// disjoint halves of ONE claim — "every upstream tool id cImp has looked
+    /// at". The live probe subtracts their union from
+    /// `GET /experimental/tool/ids` and fails on what is left, so an id in both
+    /// (is it gated or not?) or an entry with a blank reason (reviewed by
+    /// whom, on what grounds?) would quietly weaken that subtraction instead of
+    /// breaking it.
+    #[test]
+    fn the_reviewed_ungated_list_is_disjoint_from_the_gated_table() {
+        for (name, reason) in OPENCODE_NATIVE_REVIEWED_UNGATED {
+            assert!(
+                !OPENCODE_NATIVE_TABLE.iter().any(|(n, _, _)| n == name),
+                "`{name}` is both gated and recorded as deliberately ungated — pick one"
+            );
+            // Global principle 5: `Some("")` would satisfy a bare
+            // is-it-listed check while recording nothing a reviewer can weigh.
+            assert!(
+                reason.trim().len() > 20,
+                "`{name}`: the reason must say why gating it would buy nothing, not merely exist"
+            );
+        }
+        let mut names: Vec<&str> = OPENCODE_NATIVE_REVIEWED_UNGATED
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate id in the reviewed list");
     }
 
     /// The Phase H refusals share the V32 vocabulary, carry no dynamic content,

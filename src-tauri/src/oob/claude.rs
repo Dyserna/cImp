@@ -584,7 +584,11 @@ struct Drained {
 ///   `"sessionId":""`.
 /// * **Untyped `get`**, per the module's format-tolerance discipline — a
 ///   non-object line (`3`, `[]`) answers `false` rather than panicking.
-fn record_names_session(obj: &Value, session_id: &str) -> bool {
+///
+/// `pub(crate)` for the V35 Phase D live probe (`harness/probe.rs`), which
+/// proves `claude.transcript.identity` through this exact predicate rather than
+/// re-deriving "does a line name its own session".
+pub(crate) fn record_names_session(obj: &Value, session_id: &str) -> bool {
     !session_id.is_empty() && obj.get("sessionId").and_then(Value::as_str) == Some(session_id)
 }
 
@@ -658,6 +662,23 @@ async fn drain_new_lines(
     Drained { offset, own_record }
 }
 
+/// The CLI build that wrote a transcript line — the top-level `version` field,
+/// trimmed, and `None` when absent OR blank (global principle 5: an empty
+/// version string is not a version).
+///
+/// One reader, two consumers: [`note_cli_version`] feeds the V16
+/// `harness_versions` tripwire from it, and the V35 Phase D live probe reads it
+/// to prove `claude.transcript.identity` still carries a build stamp — the row
+/// whose loss *silences* the tripwire rather than firing it, so the probe must
+/// not go through the recording path (it must never write).
+/// `pub(crate)` for `harness/probe.rs`.
+pub(crate) fn cli_version_of(obj: &Value) -> Option<&str> {
+    obj.get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 /// V16 Feature 1: record the Claude Code CLI version from a transcript entry's
 /// top-level `version` field into the global `harness_versions` tripwire state.
 /// Once per session file (`noted` flips on the first line that carries one);
@@ -668,13 +689,9 @@ fn note_cli_version(obj: &Value, noted: &mut bool) {
     if *noted {
         return;
     }
-    let Some(v) = obj.get("version").and_then(Value::as_str) else {
+    let Some(v) = cli_version_of(obj) else {
         return;
     };
-    let v = v.trim();
-    if v.is_empty() {
-        return;
-    }
     *noted = true;
     let v = v.to_string();
     tokio::task::spawn_blocking(move || crate::settings::note_harness_version("claude", &v));
@@ -1715,14 +1732,22 @@ fn read_complete_lines(path: &Path, offset: u64) -> Option<(String, u64)> {
     Some((buf, new_offset))
 }
 
+/// `~/.claude/projects/` — the root every per-project transcript directory
+/// hangs off. `None` if no home dir.
+///
+/// Split out of [`project_root`] for the V35 Phase D live probe, which has no
+/// project scope: it looks for the newest transcript ANYWHERE under this root
+/// (`harness/probe.rs`). One definition of where Claude Code keeps transcripts,
+/// so the probe cannot verify a layout the tap does not actually read.
+pub(crate) fn projects_root() -> Option<PathBuf> {
+    Some(home_dir()?.join(".claude").join("projects"))
+}
+
 /// `~/.claude/projects/<slug>/` for `project_dir`. `None` if no home dir.
-fn project_root(project_dir: &Path) -> Option<PathBuf> {
-    let home = home_dir()?;
-    Some(
-        home.join(".claude")
-            .join("projects")
-            .join(slug_for(project_dir)),
-    )
+/// `pub(crate)` for the same probe, which prefers the transcript of the
+/// directory it was run in before falling back to the newest anywhere.
+pub(crate) fn project_root(project_dir: &Path) -> Option<PathBuf> {
+    Some(projects_root()?.join(slug_for(project_dir)))
 }
 
 /// Claude Code's project-dir slug: every path separator and `:` becomes `-`.
@@ -1740,8 +1765,6 @@ fn slug_for(dir: &Path) -> String {
         .collect()
 }
 
-/// Newest `*.jsonl` (by mtime) under `root`, or `None` if the dir is missing
-/// or empty.
 /// What a tap holding a `--session-id` pin should do this tick. Pure so the
 /// decision is unit-testable without a filesystem or a clock.
 ///
@@ -1787,7 +1810,13 @@ pub(crate) fn pin_step(pinned_present: bool) -> PinStep {
     }
 }
 
-fn newest_jsonl(root: &Path) -> Option<PathBuf> {
+/// Newest `*.jsonl` (by mtime) under `root`, or `None` if the dir is missing
+/// or empty. (The doc comment had drifted onto [`PinStep`] above; restored
+/// here in V35 Phase D.)
+///
+/// `pub(crate)` for the V35 Phase D live probe — same "newest wins" rule the
+/// tap itself uses, so the probe reads the file the tap would have read.
+pub(crate) fn newest_jsonl(root: &Path) -> Option<PathBuf> {
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(root).ok()?.flatten() {
         let path = entry.path();

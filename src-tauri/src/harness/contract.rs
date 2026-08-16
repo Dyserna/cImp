@@ -39,23 +39,31 @@
 //!   OpenCode-veto spike) stay countable rather than living as `TODO`s.
 //! - [`Capability::degradation`] says what cImp does when the row is
 //!   known-broken. [`Degradation::Silent`] is the dangerous one, which is why
-//!   every `Silent` row must carry a canary or an explicit
-//!   [`Capability::waiver`] ([`tests::every_silent_degradation_has_a_canary_or_a_waiver`]).
+//!   every `Silent` row must carry a canary, a live probe or an explicit
+//!   [`Capability::waiver`]
+//!   ([`tests::every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver`]).
+//! - [`Capability::probe`] is the L2 half of that coverage: the L1 canary asks
+//!   "do we still parse the shape we recorded", the probe asks "is the recorded
+//!   shape still real". Set only where [`crate::harness::probe`] actually
+//!   drives the installed CLI.
 //! - [`Capability::controls`] is the **TCB column** (milestone locked decision
 //!   10): a row marked with a control id does not merely *carry data* for a
 //!   security control, it *is* where the control executes. Documentation, not
 //!   a gate — but a reviewer changing such a row is changing the trusted
 //!   computing base.
 //!
-//! # Phase A has no runtime consumer, on purpose
+//! # The first runtime consumer arrived in Phase D
 //!
-//! The three tests below are the Phase A consumers. Advisor wiring is Phase E;
-//! nothing here reads Settings or reaches the frontend yet.
+//! Phases A–C had none on purpose — the tests below and in
+//! [`crate::harness::canary`] were the consumers. V35 Phase D adds the first
+//! real one: [`crate::harness::probe`], reached from `cimp --harness-canary`,
+//! reads [`CAPABILITIES`] to decide what to drive and what to enumerate as
+//! `unknown`. Advisor wiring is still Phase E; nothing here reads Settings or
+//! reaches the frontend yet.
 
-// The registry is declaration-only in Phase A: the canary suite (B–D), the
-// Advisor + gating rewrite (E) and the Harness-health panel (G) are the
-// consumers it is being seeded for, and the test module below is the only one
-// that exists today. Same pattern (and same reason) as `graph/model.rs`.
+// Most of the registry is still declaration-only: the Advisor + gating rewrite
+// (E) and the Harness-health panel (G) are the remaining consumers it was
+// seeded for. Same pattern (and same reason) as `graph/model.rs`.
 #![allow(dead_code)]
 
 use crate::advisor::{
@@ -147,6 +155,17 @@ pub struct Capability {
     /// [`crate::harness::canary`] and the Advisor all join on one key. Phase B
     /// filled in the four Tier-C readers; the rest land in Phases C–D.
     pub canary: Option<&'static str>,
+    /// The **L2 live probe** that drives this row against the installed CLI, if
+    /// any (V35 Phase D). Same join-key rule as [`Capability::canary`]: a probe
+    /// id IS the capability id, never a third namespace.
+    ///
+    /// Set only for rows [`crate::harness::probe`] actually *drives*. A row the
+    /// probe merely enumerates as a permanent `Unknown` (the scripted-turn
+    /// class, and the Tier-D behaviors no probe can settle) stays `None` and
+    /// lives in `probe::DECLARED_UNPROBED` instead — counting a
+    /// permanent-`Unknown` emitter as coverage is exactly the "quality signal
+    /// with no consumer" this registry exists to prevent.
+    pub probe: Option<&'static str>,
     /// An accepted-residual note: why this row has no canary *yet*, and what
     /// covers it meanwhile. Every [`Degradation::Silent`] row needs one until
     /// its canary exists — that is what lets the enforcement test run from day
@@ -198,6 +217,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_INJECTION_UNSEEN, RULE_DRIFT_PAYLOAD],
         canary: None,
+        probe: None,
         waiver: Some(
             "V16 lags both halves: `drift.injection_unseen.v1` watches the follow-rate collapse, \
              and the `context_hook` shim reports a payload missing `session_id`/`cwd` as \
@@ -229,6 +249,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
+        probe: None,
         waiver: Some(
             "The payload half is covered by the `compact_hook` shim's `drift.payload.v1` reports. \
              The behavior half is spike D0 and stays manual by milestone decision 7 — no payload \
@@ -269,6 +290,7 @@ pub const CAPABILITIES: &[Capability] = &[
             RULE_DRIFT_PAYLOAD,
         ],
         canary: None,
+        probe: None,
         waiver: None,
         controls: &[],
     },
@@ -292,6 +314,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
+        probe: None,
         waiver: Some(
             "GAP, recorded rather than assumed: `postedit_hook.rs` is the ONE shim that never \
              calls `report_contract_drift`, so `drift.payload.v1` does NOT lag this row and no \
@@ -337,6 +360,7 @@ pub const CAPABILITIES: &[Capability] = &[
         },
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
+        probe: None,
         waiver: None,
         controls: &[],
     },
@@ -370,6 +394,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
+        probe: None,
         waiver: Some(
             "Tier D by construction — a scrape of rendered chrome that no payload canary can \
              prove. Mitigated instead of canaried: it is only the FALLBACK for \
@@ -400,6 +425,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_USAGE_FIELDS],
         canary: Some("claude.transcript.usage"),
+        probe: Some("claude.transcript.usage"),
         waiver: None,
         controls: &[],
     },
@@ -426,6 +452,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.transcript.tool_result"),
+        probe: Some("claude.transcript.tool_result"),
         waiver: None,
         controls: &[],
     },
@@ -447,11 +474,15 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
+        probe: Some("claude.transcript.identity"),
         waiver: Some(
-            "Canary lands in V35 Phase B (fixture L1). Deliberately NOT linked to \
-             `drift.harness_version.v1`: that rule is *fed* by `version`, so losing the field \
-             silences the tripwire instead of firing it — the inverse of a lagging indicator, \
-             and the reason this row needs a leading check more than most.",
+            "No L1 fixture canary (Phase B covered the four readers with a *function* to drive; \
+             these four fields have no single reader). The V35 Phase D LIVE probe covers it \
+             instead, reading `sessionId` through `oob::claude::record_names_session` and \
+             `version` through `cli_version_of` on a real transcript tail. Deliberately NOT \
+             linked to `drift.harness_version.v1`: that rule is *fed* by `version`, so losing the \
+             field silences the tripwire instead of firing it — the inverse of a lagging \
+             indicator, and the reason this row needs a leading check more than most.",
         ),
         controls: &[],
     },
@@ -473,6 +504,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_SUBAGENT],
         canary: None,
+        probe: None,
         waiver: Some(
             "Canary lands in V35 Phase B (fixture L1 — a directory fixture, not a single file). \
              `drift.subagent_transcripts.v1` already lags it and has fired once for real (the \
@@ -534,6 +566,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.statusline.stdin"),
+        probe: None,
         waiver: None,
         controls: &[],
     },
@@ -558,6 +591,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
+        probe: Some("claude.flag.settings_overlay"),
         waiver: Some(
             "Known live gap, recorded as a V32 accepted residual and re-raised by the V35 \
              milestone: there is NO test that the installed CLI still honors these keys, only \
@@ -590,6 +624,7 @@ pub const CAPABILITIES: &[Capability] = &[
         },
         drift_rule: &[],
         canary: None,
+        probe: Some("claude.flag.session_id"),
         waiver: None,
         controls: &[],
     },
@@ -626,6 +661,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("opencode.sse.events"),
+        probe: None,
         waiver: None,
         controls: &[],
     },
@@ -645,11 +681,15 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
+        probe: None,
         waiver: Some(
-            "Deferred to V35 Phase D (the live probe), not Phase B: a push is fire-and-forget, \
-             so a 4xx is logged and dropped. The dangerous half is `noReply` losing its meaning \
-             rather than the route disappearing — that would turn every V30 fanout into a real \
-             agent turn, which no fixture can show and only a live probe can.",
+            "Deferred past V35 Phase D, with the reason now measured rather than assumed: a push \
+             is fire-and-forget, so a 4xx is logged and dropped, and the dangerous half is \
+             `noReply` losing its meaning rather than the route disappearing — that would turn \
+             every V30 fanout into a real agent turn. Proving it needs a real session to push \
+             INTO plus an assertion that no turn started, i.e. the scripted-turn probe class \
+             Phase D deliberately did not fake. The probe enumerates this row as a permanent \
+             `unknown` (`probe::DECLARED_UNPROBED`) so it is counted rather than omitted.",
         ),
         controls: &[],
     },
@@ -675,6 +715,7 @@ pub const CAPABILITIES: &[Capability] = &[
         },
         drift_rule: &[],
         canary: None,
+        probe: Some("opencode.route.noauth"),
         waiver: None,
         controls: &[],
     },
@@ -694,13 +735,20 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
-        waiver: Some(
-            "SECURITY-RELEVANT and knowingly unautomated today: nothing in cImp calls this route \
-             — detection is a human remembering to diff it each maintenance run \
-             (`docs/MAINTENANCE.md`, `docs/HARNESS-NATIVE-TOOLS.md` §3). A new upstream \
-             file/shell/web tool therefore ships ungated and nothing fails. This is V35 Phase \
-             D's FIRST probe; the waiver expires there, not in Phase B.",
-        ),
+        probe: Some("opencode.tool_registry"),
+        // WAIVER EXPIRED in V35 Phase D, as its text promised. `cimp
+        // --harness-canary` now spawns `opencode serve` on a free loopback
+        // port, calls this route, and FAILS on any live id present in neither
+        // `OPENCODE_NATIVE_TABLE` nor `OPENCODE_NATIVE_REVIEWED_UNGATED` — so
+        // "a human remembering to run a diff" is no longer the detection
+        // mechanism, and Phase A finding 4 (the route cImp declares but never
+        // calls) is closed: it is called, by the probe.
+        //
+        // Still NOT covered, and deliberately not waived here because it is a
+        // different row: whether a gated id is gated *correctly*. The probe
+        // proves every served id has been classified, not that its class is
+        // right — that is `opencode.plugin.load_all`'s TCB waiver.
+        waiver: None,
         controls: &[],
     },
     Capability {
@@ -731,6 +779,7 @@ pub const CAPABILITIES: &[Capability] = &[
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
+        probe: None,
         waiver: Some(
             "Tier D **and inside the TCB** (milestone decision 10): nothing outside a harness can \
              verify that a control inside it ran, so no canary cImp can write proves this row. A \
@@ -872,24 +921,33 @@ mod tests {
         );
     }
 
-    /// A `Silent` capability with neither a canary nor an explicit waiver is
-    /// exactly the fragile-dependency-entering-unrecorded case this registry
-    /// exists to stop. In Phase A every canary is `None`, so this asserts the
-    /// waivers; as Phase B–D canaries land, rows swap a waiver for a canary and
-    /// this test tightens on its own.
+    /// A `Silent` capability with no canary, no live probe and no explicit
+    /// waiver is exactly the fragile-dependency-entering-unrecorded case this
+    /// registry exists to stop. In Phase A every canary was `None`, so this
+    /// asserted the waivers; Phase B–C swapped four waivers for canaries and
+    /// Phase D widened it to accept an **L2 probe** as coverage in its own
+    /// right — which is what let `opencode.tool_registry` drop its waiver
+    /// rather than merely reword it. The test tightens on its own as coverage
+    /// lands.
+    ///
+    /// L1 and L2 are deliberately alternatives here, not a conjunction: they
+    /// answer different questions (see [`Capability::probe`]), and several rows
+    /// are structurally reachable by only one of them — a CLI flag has no
+    /// fixture to canary, and the four transcript fields of
+    /// `claude.transcript.identity` have no single reader to drive one through.
     #[test]
-    fn every_silent_degradation_has_a_canary_or_a_waiver() {
+    fn every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver() {
         let naked: Vec<&str> = CAPABILITIES
             .iter()
             .filter(|c| c.degradation == Degradation::Silent)
-            .filter(|c| c.canary.is_none() && c.waiver.is_none())
+            .filter(|c| c.canary.is_none() && c.probe.is_none() && c.waiver.is_none())
             .map(|c| c.id)
             .collect();
         assert!(
             naked.is_empty(),
-            "these capabilities degrade SILENTLY with neither a canary nor an accepted-residual \
-             waiver: {naked:?}. Add a canary (preferred) or state, in `waiver`, what covers the \
-             row meanwhile and who owns closing it."
+            "these capabilities degrade SILENTLY with no canary, no live probe and no \
+             accepted-residual waiver: {naked:?}. Add a canary or a probe (preferred) or state, \
+             in `waiver`, what covers the row meanwhile and who owns closing it."
         );
 
         // Non-empty prose, not merely `Some("")` — global principle 5: a blank
@@ -937,6 +995,85 @@ mod tests {
         assert!(
             missing.is_empty(),
             "these `wired_in` paths do not resolve to a file under the repo root: {missing:#?}"
+        );
+    }
+
+    /// V35 Phase D: the registry's `probe` column and the live probe's own
+    /// declaration of what it drives must name the same capabilities, in both
+    /// directions — the L2 twin of
+    /// [`crate::harness::canary`]'s `canaries_and_the_matrix_agree`.
+    ///
+    /// The interesting half is the SECOND set. `probe::DECLARED_UNPROBED` holds
+    /// the rows the probe enumerates as a permanent `unknown` (the
+    /// scripted-turn class, and the Tier-D behaviors no probe can settle).
+    /// Those are honest reporting, not coverage, so a row appearing in both
+    /// lists — or carrying `probe: Some(..)` while only ever emitting
+    /// `unknown` — would let a row look covered while nothing ever drives it.
+    /// That is the "quality signal with no consumer" failure this milestone is
+    /// built to avoid, so it is a build failure here.
+    #[test]
+    fn probes_and_the_matrix_agree() {
+        let declared: BTreeSet<&str> = CAPABILITIES
+            .iter()
+            .filter_map(|c| {
+                c.probe.inspect(|p| {
+                    assert_eq!(
+                        *p, c.id,
+                        "capability `{}` declares probe `{p}` — a probe id IS the capability id, \
+                         never a third namespace",
+                        c.id
+                    );
+                })
+            })
+            .collect();
+        let implemented: BTreeSet<&str> = crate::harness::probe::implemented_probes()
+            .iter()
+            .copied()
+            .collect();
+
+        let unimplemented: Vec<&str> = declared.difference(&implemented).copied().collect();
+        assert!(
+            unimplemented.is_empty(),
+            "declared probe has no implementation: {unimplemented:?} carry `probe: Some(..)` but \
+             `harness::probe::implemented_probes()` does not list them. Implement the probe, or \
+             put the waiver back."
+        );
+        let undeclared: Vec<&str> = implemented.difference(&declared).copied().collect();
+        assert!(
+            undeclared.is_empty(),
+            "probe exists outside the matrix: {undeclared:?} are run by harness/probe.rs but no \
+             registry row declares them. Add the row (or set `probe: Some(..)` on it)."
+        );
+
+        // The permanent-`unknown` list: real rows, and NOT counted as coverage.
+        for id in crate::harness::probe::declared_unprobed() {
+            let cap = get(id).unwrap_or_else(|| {
+                panic!("`probe::DECLARED_UNPROBED` names `{id}`, which is not a capability id")
+            });
+            assert!(
+                cap.probe.is_none(),
+                "`{id}` is both declared probed and enumerated as a permanent `unknown` — a row \
+                 the probe never drives must not carry `probe: Some(..)`"
+            );
+        }
+
+        // Every row is accounted for one way or the other: driven, or named as
+        // a residual with a reason. A row in neither list is one the probe
+        // silently omits from its report, which is how a dependency stops being
+        // counted without anyone deciding to stop counting it.
+        let unprobed: BTreeSet<&str> = crate::harness::probe::declared_unprobed()
+            .iter()
+            .copied()
+            .collect();
+        let orphans: Vec<&str> = CAPABILITIES
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| !declared.contains(id) && !unprobed.contains(id))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "the live probe neither drives nor enumerates: {orphans:?}. Add a probe, or add the \
+             row to `probe::DECLARED_UNPROBED` with the reason it cannot be driven."
         );
     }
 

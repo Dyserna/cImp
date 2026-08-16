@@ -126,6 +126,21 @@ pub const LEDGER: &[SpawnSite] = &[
                  and watcher threads, never by a tool call.",
     },
     SpawnSite {
+        file: "harness/probe.rs",
+        symbol: "start_opencode_serve / claude_help",
+        spawns: "opencode serve --port <free> --hostname 127.0.0.1  |  claude --help",
+        class: HostSpawn,
+        count: 2,
+        reason: "V35 Phase D's L2 live probe, reached only from `cimp --harness-canary` — a \
+                 maintenance command a human (or a scheduled script) runs, never a tool call, \
+                 and it exits before any Tauri/app init. Both programs are FIXED names resolved \
+                 through `pty::resolve_command`, both argv are literals in code, and no model \
+                 input reaches either. Sandboxing them would be self-defeating: the entire point \
+                 is to observe what the user's REAL installed harness does. The `serve` child \
+                 also gets a free loopback port and is reaped through `kill_tree_blocking` on \
+                 drop, because it forks its own children.",
+    },
+    SpawnSite {
         file: "ipc/commands.rs",
         symbol: "detection_open_rules_folder / content_open_folder",
         spawns: "explorer | open | xdg-open <fixed cImp directory>",
@@ -216,15 +231,16 @@ pub const LEDGER: &[SpawnSite] = &[
     },
     SpawnSite {
         file: "procutil.rs",
-        symbol: "kill_tree",
+        symbol: "kill_tree / kill_tree_blocking",
         spawns: "taskkill /T /F /PID <pid of a child cImp already owns>",
         class: HostSpawn,
-        count: 1,
+        count: 2,
         reason: "The process-tree reaper. It is the mechanism that ENFORCES the timeout/cancel \
                  contract on the agent seams; sandboxing it would defeat the containment it \
-                 provides. Its only argument is a pid cImp holds. The spawn counted here is the \
-                 Windows arm; the Unix arm signals a process group directly (`killpg`, V33 C3) \
-                 and spawns nothing.",
+                 provides. Its only argument is a pid cImp holds. The spawns counted here are \
+                 both Windows arms — one per reaper, `kill_tree` for tokio children and \
+                 `kill_tree_blocking` for the V35 probe's `std` child; the Unix arms signal a \
+                 process group directly (`killpg`, V33 C3) and spawn nothing.",
     },
     SpawnSite {
         file: "pty/manager.rs",
@@ -701,6 +717,7 @@ mod tests {
             ("checks/gitls.rs", include_str!("checks/gitls.rs")),
             ("checks/mod.rs", include_str!("checks/mod.rs")),
             ("graph/gitcmd.rs", include_str!("graph/gitcmd.rs")),
+            ("harness/probe.rs", include_str!("harness/probe.rs")),
             ("ipc/commands.rs", include_str!("ipc/commands.rs")),
             ("offload/mcp_host.rs", include_str!("offload/mcp_host.rs")),
             (

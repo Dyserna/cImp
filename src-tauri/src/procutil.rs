@@ -122,6 +122,60 @@ pub async fn kill_tree(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
+/// The blocking sibling of [`kill_tree`], for the one caller that has no async
+/// runtime: the V35 Phase D live probe (`harness/probe.rs`), which runs from
+/// `cimp --harness-canary` before any Tauri/tokio init, exactly like the hook
+/// shims.
+///
+/// Same two mechanisms and the same reason — `opencode serve` is a Bun binary
+/// that forks children (observed: two grandchildren per server), so a bare
+/// `Child::kill` leaves a live HTTP server bound to the probe's loopback port
+/// after the probe has exited. Kept here rather than in `probe.rs` so the
+/// "how cImp reaps a tree" idiom has exactly one home.
+///
+/// The Unix leg is `killpg` via the same guarded [`kill_process_group`], so the
+/// blocking spawn site must set its own process group the way
+/// [`own_process_group`] does for `tokio::process` — [`own_process_group_std`]
+/// is that, for `std::process::Command`.
+pub fn kill_tree_blocking(child: &mut std::process::Child) {
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        if let Ok(mut tk) = cmd.spawn() {
+            let _ = tk.wait();
+        }
+    }
+    #[cfg(unix)]
+    kill_process_group(pid);
+    #[cfg(not(any(windows, unix)))]
+    let _ = pid;
+    // Direct kill regardless — same fallback contract as `kill_tree`.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// [`own_process_group`] for a blocking `std::process::Command`. Same contract,
+/// same no-op on Windows; separate only because the two `Command` types share
+/// no trait.
+pub fn own_process_group_std(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// `killpg` the group `pid` leads — but **only** if it actually leads one.
 ///
 /// Why the check is not paranoia. `killpg` takes a process-GROUP id, and

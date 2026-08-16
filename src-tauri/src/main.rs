@@ -127,6 +127,14 @@ INFO:
   -h, --help              print this help and exit
   -V, --version           print the cimp version and exit
 
+MAINTENANCE:
+  --harness-canary [--json]
+                          probe the INSTALLED Claude Code / OpenCode CLIs against
+                          cImp's harness capability registry and print one line per
+                          capability. Needs no running cImp. Exits non-zero ONLY on
+                          real drift — an absent CLI or an upstream improvement
+                          reports `unknown` / `transition` and exits 0.
+
 SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --statusline                           Claude Code status-line renderer
   --context-hook                         UserPromptSubmit hook shim
@@ -192,6 +200,23 @@ fn main() {
             attach_parent_console();
             println!("cimp {}", env!("CARGO_PKG_VERSION"));
             return;
+        }
+        // V35 Phase D: the L2 harness live probe. Drives the INSTALLED Claude
+        // Code / OpenCode CLIs and reports one line per capability from the
+        // `harness::contract` registry. Handled here, GUI-free like the service
+        // shims, because it deliberately needs no app instance, no loopback
+        // server and no settings file — a maintenance script (or Phase F's
+        // auto-run on a CLI version change) must be able to run it on a machine
+        // where cImp is not running at all.
+        //
+        // It is the ONE early-dispatch branch that sets an exit code:
+        // **non-zero iff a probe found real drift**. `unknown` (CLI absent, no
+        // session to tail) and `transition` (upstream improved) are never
+        // failures — milestone locked decision 8, which is what keeps this from
+        // becoming the version tripwire that cried wolf.
+        if early.iter().any(|a| a == "--harness-canary") {
+            attach_parent_console();
+            std::process::exit(harness::probe::run(&early));
         }
     }
 

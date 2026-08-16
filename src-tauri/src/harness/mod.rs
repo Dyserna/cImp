@@ -13,12 +13,18 @@
 //! every one of those readers is deliberately lenient and answers a rename with
 //! zeros and empty strings rather than an error.
 //!
-//! There is still deliberately **no runtime consumer** — the live probe (Phase
-//! D), the Advisor and feature gating (Phase E) and the Settings *Harness
-//! health* panel (Phase G) are what the registry is being seeded for. Until
-//! they land, the tests in `contract.rs` and `canary.rs` are the consumers:
-//! they are what makes an unrecorded fragile dependency, or a silently
-//! regressed reader, a build failure instead of a comment.
+//! Phase D adds [`probe`], the registry's **first runtime consumer**: the L2
+//! live probe behind `cimp --harness-canary`, which drives the *installed*
+//! CLIs instead of committed fixtures. L1 asks "do we still parse the shape we
+//! recorded"; L2 asks "is the recorded shape still real". Neither subsumes the
+//! other — a fixture keeps L1 green forever while upstream moves, and L2 cannot
+//! run in CI nor tell a reader regression from an upstream change.
+//!
+//! Still to come: the Advisor and feature gating (Phase E) and the Settings
+//! *Harness health* panel (Phase G). Until they land, the tests in
+//! `contract.rs` and `canary.rs` remain the consumers that make an unrecorded
+//! fragile dependency, or a silently regressed reader, a build failure instead
+//! of a comment.
 //!
 //! Design: `docs/MILESTONE-V35-harness-resilience.md` (the why and the locked
 //! decisions), `docs/DESIGN-harness-capability-matrix.md` (the types and the
@@ -27,3 +33,4 @@
 #[cfg(test)]
 mod canary;
 pub mod contract;
+pub mod probe;

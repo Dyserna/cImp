@@ -1,9 +1,11 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phases A–C implemented 2026-08-16 (`82c0da2`,
-`7a4262a`, `7610255`); Phase D underway. GitHub milestone 8, issues #54–#71
-(one per phase; #55/#56/#57 closed by those commits; #63/#64 track the two
-pre-milestone gaps).
+**Status:** IN PROGRESS — Phases A–D implemented 2026-08-16 (`82c0da2`,
+`7a4262a`, `7610255`, `ee3ac18`); the A+B+D value core is landed and
+live-verified. GitHub milestone 8, issues #54–#71 (one per phase;
+#55/#56/#57/#58 closed by those commits; #63 closed by Phase D's probe;
+#64 stays open — the overlay round-trip needs the scripted-turn probe
+class).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -309,6 +311,43 @@ Decisions:
   renamed, the push **still returns `Some` and looks healthy** via
   `rate_limits` — the loss is partial, which is exactly the silent-partial
   degradation class the canaries exist to catch.
+
+**Phase D (`ee3ac18`, 2026-08-16).** `cimp --harness-canary [--json]` in
+`harness/probe.rs`; outcome model Pass / Fail / Unknown / Transition, exit
+non-zero iff ≥1 Fail. Probed live on claude 2.1.232 / opencode 1.18.13:
+**7 pass, 0 fail, 11 unknown (declared, each with a why), exit 0**; negative
+leg (an id removed from the table) flipped the exit to 1 naming the id;
+recipe 5's no-CLI leg gave all-unknown, exit 0. Decisions:
+
+- **`OPENCODE_NATIVE_REVIEWED_UNGATED`** (orchestrator-accepted): the five
+  deliberately-unclassified ids (`task`, `skill`, `todowrite`, `question`,
+  `invalid`) moved from a trailing comment into a reviewed list with
+  reasons; the probe fails on `live − (gated ∪ reviewed)`. "Unclassified"
+  means *nobody looked*, not *not gated* — a probe permanently red on
+  unchanged upstream is the alarm-fatigue failure mode decision 8 forbids.
+  Adding a row to that list remains a security decision. Gating behavior
+  unchanged; a disjointness test keeps the lists honest.
+- **Failure needs an independent witness** — a missing shape in a bounded
+  transcript tail is Unknown; usage fails only when assistant lines exist
+  and none is substantive. Cache counters and `is_error` are reported, not
+  asserted.
+- Probe spawns `opencode serve` on an **OS-allocated port** (upstream drift
+  observation: `--port 0` binds 4096, the fixed default, not an ephemeral
+  port), readiness = the route answering, kill via new
+  `procutil::kill_tree_blocking` from `Drop`; serve cwd = temp dir.
+- Transcript probes reuse `oob::claude` path discovery; details carry
+  counts and field names only, never payload values (tested).
+- Registry: `probe: Option<&str>` column on seven rows; enforcement test is
+  now `every_silent_degradation_has_a_canary_or_a_probe_or_a_waiver`;
+  `probes_and_the_matrix_agree` cross-checks `implemented_probes()` (and
+  `declared_unprobed()` is a separate list so a permanent-Unknown emitter
+  is never counted as coverage).
+- Findings: gap 1 below is CLOSED (#63) — the diff is automated and ran
+  green. **OpenCode has opt-in auth already** (`OPENCODE_SERVER_PASSWORD`,
+  warns "unsecured" when unset) — the MAINTENANCE security-watch row's
+  trigger is closer than "a future release"; wiring the token is tracked as
+  its own issue. `GET /session/<unknown>` answers 500, not 404. Phase A
+  finding 4 closed (the route is now actually called).
 
 ## Two gaps to fix ahead of the milestone
 

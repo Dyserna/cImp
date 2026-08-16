@@ -1,11 +1,10 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phases A–D implemented 2026-08-16 (`82c0da2`,
-`7a4262a`, `7610255`, `ee3ac18`); the A+B+D value core is landed and
-live-verified. GitHub milestone 8, issues #54–#71 (one per phase;
-#55/#56/#57/#58 closed by those commits; #63 closed by Phase D's probe;
-#64 stays open — the overlay round-trip needs the scripted-turn probe
-class).
+**Status:** IN PROGRESS — Phases A–E implemented 2026-08-16 (`82c0da2`,
+`7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`); the A+B+D value core is landed
+and live-verified. GitHub milestone 8, issues #54–#71 (one per phase;
+#55–#59 + #63 closed; #64 stays open — the overlay round-trip needs the
+scripted-turn probe class; #73 filed from Phase D's auth observation).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -348,6 +347,42 @@ recipe 5's no-CLI leg gave all-unknown, exit 0. Decisions:
   trigger is closer than "a future release"; wiring the token is tracked as
   its own issue. `GET /session/<unknown>` answers 500, not 404. Phase A
   finding 4 closed (the route is now actually called).
+
+**Phase E (`d5eb95d`, 2026-08-16).** The registry's first runtime consumers.
+`contract::gate(id, &settings)` owns the E1 fail-closed logic (byte-for-byte,
+pinned); `e1_blocked()` deleted; the two `tabs/config.rs` call sites go
+through the gate; `harness_versions_get` returns
+`HarnessStatus { versions, capability_gates }` (the substrate Phase G
+renders); `harnessStatusBlocks` deleted from types.ts, Svelte reads the
+Rust-computed gate. Drift-class notices consolidate to `drift.capability.v1`.
+All four gates green (cargo 2123/0/6, clippy, vitest 643, svelte-check 0/0).
+Decisions:
+
+- **F2 distinction preserved** — the strict `== "pass"` checks untouched.
+- **One notice per capability** (dismissing one symptom must not silence a
+  sibling — pinned by test).
+- **Signature is 3-part** `<capability>:<evidence>:<detector signature>` —
+  2 parts would have dropped every rule's re-fire key, converting drift
+  dismissals into permanent ones.
+- **Warn-only proposals exempt from the Apply cooldown** — `AppliedRule` is
+  keyed by rule_id alone, so the shared `drift.capability.v1` id would have
+  let one Apply mute every capability's warn-only card; warn-only rows can
+  never accrue an Apply record, so the filter was vacuous for them anyway.
+- **`rule_id` is no longer unique in a payload** — frontend keys/busy/drop
+  now use `(rule_id, signature)`.
+- **`claude.flag.session_id` downgraded VisibleOff → FailClosed** on
+  evidence (spawn pushes the flag unconditionally; a vanished flag kills
+  the tab loudly). Phase A finding 5 closed.
+- **Deploy notes:** previously-dismissed per-rule drift notices re-fire
+  once under the new id (accepted); no Rust↔TS diff test existed for
+  `harnessStatusBlocks` (the deploy-trap premise was wrong) — the
+  replacement tripwire `the_gated_capability_ids_reach_the_frontend` now
+  pins the shared id.
+- **Accepted residual (orchestrator):** `drift.payload.v1` survives as the
+  channel for the two beacon reporters (`taint_beacon`,
+  `checkpoint_beacon`) which have no registry row; they get rows in
+  **Phase I** when CHP names that route surface. "One notice source" holds
+  for every matrix-covered drift signal.
 
 ## Two gaps to fix ahead of the milestone
 

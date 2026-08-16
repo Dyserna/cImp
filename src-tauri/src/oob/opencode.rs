@@ -739,8 +739,9 @@ async fn forward_push(
 /// that distinguishes them is the part's `type` (`reasoning` vs `text`), which
 /// comes from `message.part.updated`. So we key text by part, learn each part's
 /// type, and at flush time speak only the non-reasoning parts of the message.
+/// `pub(crate)` for the V35 canary suite (harness/canary.rs).
 #[derive(Default)]
-struct Tracker {
+pub(crate) struct Tracker {
     /// partID -> accumulated delta text.
     part_text: HashMap<String, String>,
     /// partID -> latest full-text snapshot (from `message.part.updated`),
@@ -784,7 +785,8 @@ impl Tracker {
         }
     }
 
-    async fn handle(&mut self, ev: &Value, ctx: &OobContext) {
+    /// `pub(crate)` for the V35 canary suite (harness/canary.rs).
+    pub(crate) async fn handle(&mut self, ev: &Value, ctx: &OobContext) {
         let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
         let props = ev.get("properties").unwrap_or(&Value::Null);
         // V28: bind this TAB to the session it is currently driving, before the
@@ -929,8 +931,9 @@ impl Tracker {
     /// sub-agent is mid-run still goes to the tab's MAIN conversation. `None`
     /// until the tab has seen its first session-scoped event (ever — not just on
     /// this connection).
+    /// `pub(crate)` for the V35 canary suite (harness/canary.rs).
     #[cfg(test)]
-    fn current_session(&self) -> Option<String> {
+    pub(crate) fn current_session(&self) -> Option<String> {
         lock_sessions(&self.sessions).main.clone()
     }
 

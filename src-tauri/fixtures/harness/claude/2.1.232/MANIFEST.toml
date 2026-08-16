@@ -1,0 +1,23 @@
+# V35 Phase B — provenance for the Claude Code fixtures in this directory.
+#
+# Required keys (all four): `captured_from`, `date`, `method`, `redaction`.
+# A version directory missing this file, or any of those keys, fails
+# `harness::canary::every_fixture_version_dir_has_a_manifest` —
+# an anonymous fixture is indistinguishable from a guess (milestone
+# locked decision 4).
+#
+# Files here, and the reader each one pins:
+#   transcript.assistant-usage.jsonl  claude.transcript.usage
+#                                     oob/claude.rs::parse_usage_line
+#   transcript.tool-result.jsonl      claude.transcript.tool_result
+#                                     oob/claude.rs::extract_tool_results,
+#                                     oob/claude.rs::tool_result_is_error
+#   statusline-stdin.json             claude.statusline.stdin
+#                                     statusline/mod.rs::render,
+#                                     ::extract_push / ::extract_rate_limits
+#                                     / ::extract_context
+
+captured_from = "Claude Code 2.1.232"
+date = "2026-08-16"
+method = "synthetic, hand-authored from reader contract (src-tauri/src/oob/claude.rs, src-tauri/src/statusline/mod.rs), modelled on Claude Code 2.1.232 — the version installed when these were written. Not a capture: no transcript, session or status-line payload was read to produce them."
+redaction = "not applicable — nothing was captured, so there was nothing to redact. Every id, model name, token count and timestamp below is invented; the fixtures deliberately contain no user prompt, file content, tool output, path or credential-shaped string."

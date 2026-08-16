@@ -1,0 +1,22 @@
+# V35 Phase B — provenance for the OpenCode fixtures in this directory.
+#
+# Required keys (all four): `captured_from`, `date`, `method`, `redaction`.
+# A version directory missing this file, or any of those keys, fails
+# `harness::canary::every_fixture_version_dir_has_a_manifest` —
+# an anonymous fixture is indistinguishable from a guess (milestone
+# locked decision 4).
+#
+# Files here, and the reader each one pins:
+#   sse.assistant-turn.jsonl  opencode.sse.events
+#                             oob/opencode.rs::Tracker::handle
+#
+# One file rather than the per-event files the canaries draft sketches
+# (`sse.message-updated.json`, `sse.message-part-delta.json`,
+# `sse.session-idle.json`): `Tracker` is a state machine, so only an ORDERED
+# turn proves it still produces text. The draft's individual shapes are all
+# present, one per line, in the order `GET /event` delivers them.
+
+captured_from = "OpenCode 1.18.13"
+date = "2026-08-16"
+method = "synthetic, hand-authored from reader contract (src-tauri/src/oob/opencode.rs), modelled on OpenCode 1.18.13 — the version installed when this was written. Not a capture: no live `GET /event` stream was recorded to produce it."
+redaction = "not applicable — nothing was captured, so there was nothing to redact. Every session id, message id, part id and text string below is invented; the fixture deliberately contains no user prompt, assistant answer, file content, path or credential-shaped string."

@@ -693,7 +693,8 @@ const AGENT_TOOL_NAMES: &[&str] = &["Task", "Agent"];
 /// line has no array content (a plain-string user prompt, or a non-message
 /// line). Shared by `assistant_texts` and `update_agents` so the
 /// `message.content[]` shape is unwrapped in exactly one place.
-fn message_parts(obj: &Value) -> Option<&Vec<Value>> {
+/// `pub(crate)` for the V35 canary suite (harness/canary.rs).
+pub(crate) fn message_parts(obj: &Value) -> Option<&Vec<Value>> {
     obj.get("message")
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array)
@@ -1022,7 +1023,8 @@ fn usage_origin(obj: &Value, base_origin: crate::graph::UsageOrigin) -> crate::g
 /// we cannot tell an inflated row from a genuinely large turn after the fact,
 /// and the CLI version that wrote a session is only known globally (the
 /// `harness_versions` tripwire fed by [`note_cli_version`]), not per row.
-fn parse_usage_line(
+/// `pub(crate)` for the V35 canary suite (harness/canary.rs).
+pub(crate) fn parse_usage_line(
     obj: &Value,
     origin: crate::graph::UsageOrigin,
 ) -> Option<crate::graph::UsageEvent> {
@@ -1057,7 +1059,8 @@ fn parse_usage_line(
 /// user-role transcript line (the carrier for one or more parallel tool
 /// results). `chars` is an estimated-token proxy for the result's size — no
 /// exact token count exists for tool output, only for assistant messages.
-fn extract_tool_results(obj: &Value) -> Vec<(String, usize)> {
+/// `pub(crate)` for the V35 canary suite (harness/canary.rs).
+pub(crate) fn extract_tool_results(obj: &Value) -> Vec<(String, usize)> {
     if obj.get("type").and_then(Value::as_str) != Some("user") {
         return Vec::new();
     }
@@ -1117,7 +1120,8 @@ fn tool_result_text(content: &Value) -> String {
 /// True when `content` marks its `tool_result` as an error (the API's
 /// `is_error` flag) — a failed command's output must never be mined for
 /// commit hashes (hook noise from an ABORTED commit could match the shape).
-fn tool_result_is_error(part: &Value) -> bool {
+/// `pub(crate)` for the V35 canary suite (harness/canary.rs).
+pub(crate) fn tool_result_is_error(part: &Value) -> bool {
     part.get("is_error").and_then(Value::as_bool) == Some(true)
 }
 

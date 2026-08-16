@@ -87,12 +87,15 @@ pub enum Seam {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dep {
     /// A JSON path in an emitted artifact, e.g. `message.usage.input_tokens`.
-    ///
-    /// Also carries the *file layout* of an emitted artifact tree (the
-    /// `subagents/*.jsonl` row) — the enum has no `Path` variant, and a layout
-    /// is fixture-checkable in exactly the way [`Dep::Behavior`] is not, so it
-    /// belongs on this side of the line rather than that one.
     JsonPath(&'static str),
+    /// The on-disk *layout* of an emitted artifact tree, e.g.
+    /// `<session_id>/subagents/agent-*.jsonl`. Split out of [`Dep::JsonPath`]
+    /// in V35 Phase B: a layout is fixture-checkable in exactly the way
+    /// [`Dep::Behavior`] is not, so it stays on this side of the line — but it
+    /// is a *path in a filesystem*, not a path into a JSON document, and a
+    /// canary asserts it by walking a directory rather than by indexing a
+    /// `Value`.
+    FilePath(&'static str),
     /// A CLI flag that must still exist, e.g. `--session-id`.
     Flag(&'static str),
     /// A settings/overlay/plugin key we write, e.g. `hooks`, `statusLine`.
@@ -139,8 +142,10 @@ pub struct Capability {
     /// `crate::advisor::RULE_DRIFT_*` constants — never a duplicated literal,
     /// since those constants are the ids the Advisor actually emits.
     pub drift_rule: &'static [&'static str],
-    /// The leading canary that proves it, if any. **All `None` in Phase A** —
-    /// canaries land in Phases B–D.
+    /// The leading canary that proves it, if any. **A canary id IS the
+    /// capability id** — never a third namespace, so the registry, the suite in
+    /// [`crate::harness::canary`] and the Advisor all join on one key. Phase B
+    /// filled in the four Tier-C readers; the rest land in Phases C–D.
     pub canary: Option<&'static str>,
     /// An accepted-residual note: why this row has no canary *yet*, and what
     /// covers it meanwhile. Every [`Degradation::Silent`] row needs one until
@@ -394,12 +399,8 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &["src-tauri/src/oob/claude.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_USAGE_FIELDS],
-        canary: None,
-        waiver: Some(
-            "Canary lands in V35 Phase B (fixture L1) — one of the four Tier-C readers. Until \
-             then only the lagging `drift.usage_fields_gone.v1` covers it: `parse_usage_line`'s \
-             `unwrap_or(0)` turns a rename into zeros, never an error (milestone decision 3).",
-        ),
+        canary: Some("claude.transcript.usage"),
+        waiver: None,
         controls: &[],
     },
     Capability {
@@ -421,12 +422,8 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &["src-tauri/src/oob/claude.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
-        canary: None,
-        waiver: Some(
-            "Canary lands in V35 Phase B (fixture L1) — one of the four Tier-C readers. No V16 \
-             rule lags this one: a rename yields empty result sets, which is indistinguishable \
-             from a session that simply ran no tools.",
-        ),
+        canary: Some("claude.transcript.tool_result"),
+        waiver: None,
         controls: &[],
     },
     Capability {
@@ -465,7 +462,7 @@ pub const CAPABILITIES: &[Capability] = &[
                    `tool_use` block named `Task` (1.x) or `Agent` (2.x).",
         depends_on: &[
             Dep::JsonPath("isSidechain"),
-            Dep::JsonPath("<session_id>/subagents/agent-*.jsonl"),
+            Dep::FilePath("<session_id>/subagents/agent-*.jsonl"),
             Dep::JsonPath("message.content[].type == \"tool_use\""),
             Dep::JsonPath("message.content[].name in {Task, Agent}"),
         ],
@@ -502,13 +499,8 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &["src-tauri/src/statusline/mod.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
-        canary: None,
-        waiver: Some(
-            "Canary lands in V35 Phase B (fixture L1) — one of the four Tier-C readers. No V16 \
-             rule lags it at all: a parse failure yields `Input::default()` and every field is \
-             an `Option`, so a rename renders a blank context bar and writes no usage push, \
-             never an error.",
-        ),
+        canary: Some("claude.statusline.stdin"),
+        waiver: None,
         controls: &[],
     },
     // ── Claude Code: spawn flags (Tier B) ───────────────────────────────────
@@ -599,12 +591,8 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &["src-tauri/src/oob/opencode.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
-        canary: None,
-        waiver: Some(
-            "Canary lands in V35 Phase B (fixture L1) — one of the four Tier-C readers. No V16 \
-             rule lags it: every handler `match`es on the event `type` and ignores unknown \
-             kinds, so a rename produces silence — no TTS, no Memory rows, no \"live now\".",
-        ),
+        canary: Some("opencode.sse.events"),
+        waiver: None,
         controls: &[],
     },
     // ── OpenCode: HTTP routes (Tiers B and D) ───────────────────────────────

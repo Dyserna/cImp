@@ -200,7 +200,8 @@ const BAR_CELLS: usize = 10;
 
 /// Build the status line string from raw stdin JSON. Pure (no IO) so it is
 /// unit-testable; `run` handles the stdin/stdout edges.
-fn render(input: &str) -> String {
+/// `pub(crate)` for the V35 canary suite (harness/canary.rs).
+pub(crate) fn render(input: &str) -> String {
     let data: Input = serde_json::from_str(input).unwrap_or_default();
     let pct = data.context_window.used_percentage.clamp(0.0, 100.0);
     let size = data.context_window.context_window_size;
@@ -252,7 +253,7 @@ fn render(input: &str) -> String {
 /// [`Input`] — and every field is optional, so a reshaped or partial payload
 /// costs fields rather than failing the parse and taking the bar down with it.
 /// It also runs strictly after the bar has been written to stdout.
-fn extract_push(input: &str) -> Option<crate::usage::UsageSnapshot> {
+pub(crate) fn extract_push(input: &str) -> Option<crate::usage::UsageSnapshot> {
     let v: serde_json::Value = serde_json::from_str(input).ok()?;
     let (five_hour, seven_day) = extract_rate_limits(&v);
     let context = extract_context(&v);
@@ -309,7 +310,7 @@ fn extract_push_meta(input: &str) -> crate::usage::PushMeta {
 /// Pull the subscription quota out of the payload's `rate_limits` object
 /// (documented shape: `used_percentage` 0–100, `resets_at` Unix epoch
 /// seconds; either window independently absent).
-fn extract_rate_limits(
+pub(crate) fn extract_rate_limits(
     v: &serde_json::Value,
 ) -> (
     Option<crate::usage::UsageWindow>,
@@ -352,7 +353,7 @@ fn extract_rate_limits(
 /// ```
 /// Missing pieces stay `None` (the UI renders "unknown", never 0). `None`
 /// overall only when there is no metadata *and* no `context_window` object.
-fn extract_context(v: &serde_json::Value) -> Option<crate::usage::ContextSnapshot> {
+pub(crate) fn extract_context(v: &serde_json::Value) -> Option<crate::usage::ContextSnapshot> {
     let cw = v.get("context_window");
     // `current_usage` holds the cache split; tolerate it having been hoisted
     // to the `context_window` level, which costs one `or` and survives that

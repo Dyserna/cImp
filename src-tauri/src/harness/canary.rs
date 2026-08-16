@@ -32,17 +32,36 @@
 //! [`every_fixture_version_dir_has_a_manifest`] fails the suite for a directory
 //! without one — an anonymous fixture is indistinguishable from a guess.
 //!
+//! The Phase C drift models live beside the version directories in
+//! `<harness>/_synthetic/` and carry a manifest under the *same* rule plus one
+//! extra key (`models_version`, which must name a real sibling version
+//! directory). `_synthetic` is deliberately **not** exempted from the walker:
+//! an exemption is exactly the silent hole through which undated fixtures
+//! would accumulate.
+//!
 //! # One module, one naming rule
 //!
 //! Every canary lives here and is named `canary_<capability id with dots as
-//! underscores>`, and [`row`] re-asserts on every run that the registry row it
-//! claims points back at it. **A canary id IS a capability id** — never a third
-//! namespace. That is what lets Phase C's matrix↔canary cross-check be
-//! mechanical instead of a hand-maintained list.
+//! underscores>`, its negative twin `negative_canary_<same>`, and [`row`]
+//! re-asserts on every run that the registry row it claims points back at it.
+//! **A canary id IS a capability id** — never a third namespace. That is what
+//! lets [`canaries_and_the_matrix_agree`] cross-check the suite against the
+//! registry mechanically instead of against a hand-maintained list.
 //!
-//! Negative canaries (a fixture with the field renamed, proving the assertion
-//! actually runs) are Phase C and deliberately absent here.
+//! # Negative canaries (Phase C)
+//!
+//! A positive canary that never actually ran passes just as green as one that
+//! did. So each covered capability also gets a **drift model**: the same
+//! fixture with one load-bearing field renamed, and a test asserting the reader
+//! answers with its degraded default — zero, empty, `None`, no speech. Phase B
+//! established this by hand-mutating fixtures once; Phase C makes it permanent.
+//! Every one of them is a `guard: this fixture models the drift case` assertion
+//! (design doc § 3.4): it does not describe desired behavior, it pins today's
+//! silent-degradation behavior so the positive canary's assertion is proven to
+//! be load-bearing. Each also asserts the *untouched* half of the same fixture
+//! still works, so a broken fixture cannot masquerade as a proven mechanism.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -150,6 +169,47 @@ fn canary_claude_transcript_usage() {
     assert_eq!(origin, crate::graph::UsageOrigin::Session);
 }
 
+/// Negative twin: `message.usage.input_tokens` renamed to `inputTokens`.
+///
+/// `parse_usage_line` still returns a `Turn` — same message id, same model,
+/// three of four counters intact — and the fourth silently reads 0. That is
+/// the production failure verbatim: a row is UPSERTed claiming the turn spent
+/// no input tokens, and nothing anywhere errors. If this ever stops being
+/// true, the positive canary above is no longer proving what it claims.
+#[test]
+fn negative_canary_claude_transcript_usage() {
+    row("claude.transcript.usage");
+
+    let raw = fixture("claude/_synthetic/usage-renamed-input-tokens.jsonl");
+    let lines = json_lines(&raw);
+    assert_eq!(lines.len(), 1, "fixture guard: expected one assistant line");
+
+    let ev = crate::oob::claude::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
+        .expect("guard: this fixture models the drift case — a renamed token field must NOT stop the line parsing, that is precisely why it is silent");
+
+    let crate::graph::UsageEvent::Turn {
+        in_tok,
+        out_tok,
+        cache_read,
+        cache_make,
+        ..
+    } = ev
+    else {
+        panic!("guard: this fixture models the drift case — it must still be a Turn");
+    };
+
+    assert_eq!(
+        in_tok, 0,
+        "guard: this fixture models the drift case — `inputTokens` must read as 0 via \
+         `unwrap_or(0)`. A non-zero here means the reader grew an alias and the positive canary \
+         can no longer detect this rename."
+    );
+    // The rest of the line is untouched, so the loss is ONE number in an
+    // otherwise healthy-looking row — and a fixture that broke wholesale would
+    // pass the assertion above while proving nothing.
+    assert!(out_tok > 0 && cache_read > 0 && cache_make > 0);
+}
+
 // ── claude.transcript.tool_result ───────────────────────────────────────────
 
 /// `oob/claude.rs::extract_tool_results` still finds both `tool_result` content
@@ -204,6 +264,44 @@ fn canary_claude_transcript_tool_result() {
         "claude.transcript.tool_result: `message.content[].is_error` no longer round-trips — a \
          failed tool result reading as success is what lets an ABORTED commit be mined for hashes"
     );
+}
+
+/// Negative twin: `message.content[].tool_use_id` renamed to `toolUseId` on
+/// both blocks.
+///
+/// `extract_tool_results` `continue`s past a block with no `tool_use_id`, so
+/// the whole line yields an EMPTY result set — and an empty result set is
+/// indistinguishable from a user turn that simply ran no tools. This is the row
+/// with no V16 rule lagging it at all, which is why the empty case matters more
+/// here than anywhere else.
+#[test]
+fn negative_canary_claude_transcript_tool_result() {
+    row("claude.transcript.tool_result");
+
+    let raw = fixture("claude/_synthetic/tool-result-renamed-tool-use-id.jsonl");
+    let lines = json_lines(&raw);
+    assert_eq!(lines.len(), 1, "fixture guard: expected one user line");
+    let line = &lines[0];
+
+    let results = crate::oob::claude::extract_tool_results(line);
+    assert!(
+        results.is_empty(),
+        "guard: this fixture models the drift case — a renamed `tool_use_id` must yield NO \
+         results, silently. Got {results:?}, which means the reader grew an alias and the \
+         positive canary can no longer detect this rename."
+    );
+
+    // The line itself is otherwise intact: both blocks are still there, still
+    // `tool_result`, and `is_error` still round-trips. Without this the test
+    // would also pass on a fixture that was merely malformed.
+    let parts = crate::oob::claude::message_parts(line)
+        .expect("guard: the drift fixture must still be a well-formed user line");
+    assert_eq!(parts.len(), 2, "guard: both tool_result blocks are still present");
+    let flags: Vec<bool> = parts
+        .iter()
+        .map(crate::oob::claude::tool_result_is_error)
+        .collect();
+    assert_eq!(flags, vec![false, true], "guard: only `tool_use_id` was renamed");
 }
 
 // ── claude.statusline.stdin ─────────────────────────────────────────────────
@@ -268,10 +366,11 @@ fn canary_claude_statusline_stdin() {
         ctx.context_window_size.is_some_and(|s| s > 0),
         "context_window.context_window_size gone"
     );
-    // Read by `extract_context` but NOT named in the registry row's
-    // `depends_on` (recorded in the Phase B report for Phase C to reconcile —
-    // the canary asserts what the code reads, not what the row happens to
-    // list). Each one renders as its own number in the context bar.
+    // The rest of what `extract_context` reads. Phase B found these asserted
+    // here but undeclared on the registry row; Phase C declared them (the
+    // canary asserts what the code reads, and the row now says the same). Each
+    // renders as its own number in the context bar, and each one alone is
+    // enough to make the snapshot substantive — so losing one is invisible.
     assert!(
         ctx.remaining_percentage.is_some_and(|p| p > 0.0),
         "context_window.remaining_percentage gone"
@@ -304,6 +403,56 @@ fn canary_claude_statusline_stdin() {
         "push lost the context reading (NC-3)"
     );
     assert!(push.is_substantive());
+}
+
+/// Negative twin: the whole `context_window` block renamed to `contextWindow`
+/// — the exact reshape live-verify recipe 3 exercises by hand.
+///
+/// Three degraded defaults at once, and the third is the nasty one:
+///   * `extract_context` returns `None` (no numbers, and this payload carries
+///     none of the session metadata that would keep it `Some`);
+///   * `render` draws a bar with no token pair at all — `size == 0` suppresses
+///     the "(used/size)" suffix, so the bar looks *deliberate* rather than
+///     broken, and the model name still renders beside it;
+///   * `extract_push` still returns `Some` and still reports `has_rate_limits`,
+///     because `rate_limits` is a sibling of the renamed block. The push keeps
+///     flowing and keeps looking healthy while the context slot goes dark.
+#[test]
+fn negative_canary_claude_statusline_stdin() {
+    row("claude.statusline.stdin");
+
+    let payload = fixture("claude/_synthetic/statusline-renamed-context-window.json");
+    let v = json(&payload);
+
+    assert!(
+        crate::statusline::extract_context(&v).is_none(),
+        "guard: this fixture models the drift case — with `context_window` renamed and no session \
+         metadata beside it, the whole context reading must vanish. A `Some` here means the reader \
+         grew an alias and the positive canary can no longer detect this reshape."
+    );
+
+    let bar = crate::statusline::render(&payload);
+    assert!(
+        !bar.contains("25k") && !bar.contains("200k"),
+        "guard: this fixture models the drift case — the token pair must be gone from the bar, \
+         got {bar:?}"
+    );
+    // The half that survives, which is what makes the loss hard to notice.
+    assert!(
+        bar.contains("Canary Sonnet 4.5"),
+        "guard: only `context_window` was renamed — the model name must still render"
+    );
+
+    let push = crate::statusline::extract_push(&payload)
+        .expect("guard: the push must still be written — `rate_limits` is untouched");
+    assert!(
+        push.context.is_none(),
+        "guard: this fixture models the drift case — the push must lose its context reading"
+    );
+    assert!(
+        push.has_rate_limits(),
+        "guard: only `context_window` was renamed — the quota half must still push"
+    );
 }
 
 // ── opencode.sse.events ─────────────────────────────────────────────────────
@@ -386,6 +535,45 @@ async fn canary_opencode_sse_events() {
     );
 }
 
+/// Negative twin: `properties.partID` renamed to `partId` on the
+/// `message.part.delta` event.
+///
+/// `Tracker::handle` destructures `partID`/`messageID`/`delta` as one tuple, so
+/// the delta is dropped whole; the part's only other text source is the empty
+/// `message.part.updated` snapshot, and `flush` speaks nothing when the joined
+/// text is blank. Result: the turn completes, the tab stays bound to its
+/// session, `session.idle` arrives — and the assistant's answer is never
+/// spoken. No error, no log, no unknown-event branch: the reader `match`es on
+/// the event `type`, which did not change.
+#[tokio::test]
+async fn negative_canary_opencode_sse_events() {
+    row("opencode.sse.events");
+
+    let raw = fixture("opencode/_synthetic/sse-renamed-part-id.jsonl");
+    let events = json_lines(&raw);
+    assert!(events.len() >= 4, "fixture guard: the whole turn must be present");
+
+    let (ctx, mut tts_rx, _signals) = opencode_ctx();
+    let mut tracker = crate::oob::opencode::Tracker::default();
+    for ev in &events {
+        tracker.handle(ev, &ctx).await;
+    }
+
+    assert!(
+        tts_rx.try_recv().is_err(),
+        "guard: this fixture models the drift case — a renamed `partID` must produce SILENCE. \
+         Speech here means the reader grew an alias (or started falling back to the part \
+         snapshot) and the positive canary can no longer detect this rename."
+    );
+    // Everything else about the stream still worked, which is exactly why this
+    // degradation is invisible in production: the tab looks live and bound.
+    assert_eq!(
+        tracker.current_session().as_deref(),
+        Some("ses_canary_main_0001"),
+        "guard: only `partID` was renamed — the session binding must survive"
+    );
+}
+
 /// A tap context wired to the built-in OpenCode tab, so the per-tab TTS gate is
 /// satisfied and `ctx.speak` actually delivers. Mirrors `oob::opencode`'s own
 /// `ctx_with`; kept local rather than hoisted so this module can be read (and
@@ -418,13 +606,136 @@ fn opencode_ctx() -> (
     (ctx, tts_rx, sig_rx)
 }
 
+// ── the suite ↔ the matrix ──────────────────────────────────────────────────
+
+/// This module's own source, read at compile time. The cross-check below needs
+/// the *call sites*, and a hand-kept list of them is precisely the drift the
+/// check exists to prevent — so the list is derived from the text instead.
+/// Test-only (`canary` is `#[cfg(test)]`), so nothing lands in a release
+/// binary; the fixtures stay file-loaded for that reason, this does not.
+const THIS_SOURCE: &str = include_str!("canary.rs");
+
+/// Every capability id passed to [`row`] anywhere in this file.
+///
+/// The needle is assembled from pieces on purpose: written as one literal it
+/// would appear in this function's own source and the scan would match itself,
+/// which is how an extractor ends up "finding" ids nobody wrote.
+fn canaried_ids(src: &'static str) -> BTreeSet<&'static str> {
+    let needle = concat!("row", "(\"");
+    let mut out = BTreeSet::new();
+    let mut rest = src;
+    while let Some(at) = rest.find(needle) {
+        let after = &rest[at + needle.len()..];
+        let Some(end) = after.find('"') else { break };
+        let (id, tail) = after.split_at(end);
+        // A call site, not prose: ids are `[a-z0-9_.]` and the string literal
+        // closes immediately before the `)`.
+        if !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
+            && tail.starts_with("\")")
+        {
+            out.insert(id);
+        }
+        rest = tail;
+    }
+    out
+}
+
+/// The suite and the registry name the same capabilities, in both directions
+/// (design doc § 6).
+///
+/// A canary id **is** a capability id, so this is a set comparison rather than
+/// a mapping: the ids the registry declares canaried must be exactly the ids
+/// this file drives through [`row`]. A declared canary with no test is a row
+/// that traded a waiver for nothing; a test whose id no row declares is the
+/// suite drifting into checking things nobody wrote down. Positive and negative
+/// twins both call [`row`], and the comparison is over ids, so the duplication
+/// is free.
+///
+/// Deliberately **not** checked here: that every declared canary also has a
+/// negative twin. The four Tier-C readers have one, but Phase D's live-probe
+/// canaries cover `Behavior` deps where a "renamed field" fixture is
+/// meaningless — recorded rather than assumed, so the omission is a decision
+/// and not an oversight.
+#[test]
+fn canaries_and_the_matrix_agree() {
+    let tested = canaried_ids(THIS_SOURCE);
+    // A silently-empty extraction would make everything below vacuously true.
+    assert!(
+        tested.len() >= 4,
+        "the canary-call-site scan found only {tested:?} — it has stopped matching this file's \
+         own call sites, and every assertion below is now vacuous"
+    );
+
+    let mut declared: BTreeSet<&str> = BTreeSet::new();
+    for c in contract::all() {
+        if let Some(canary) = c.canary {
+            // The join key, asserted for EVERY row rather than only for the
+            // ones with a test: `row` cannot catch a row whose canary names
+            // some other capability, because nothing would call it.
+            assert_eq!(
+                canary, c.id,
+                "capability `{}` declares canary `{canary}` — a canary id IS the capability id, \
+                 never a third namespace",
+                c.id
+            );
+            declared.insert(canary);
+        }
+    }
+
+    let untested: Vec<&str> = declared.difference(&tested).copied().collect();
+    assert!(
+        untested.is_empty(),
+        "declared canary has no test: {untested:?} carry `canary: Some(..)` in \
+         `harness::contract::CAPABILITIES` but nothing in harness/canary.rs drives them. Write \
+         the canary, or put the waiver back."
+    );
+
+    let undeclared: Vec<&str> = tested.difference(&declared).copied().collect();
+    assert!(
+        undeclared.is_empty(),
+        "canary exists outside the matrix: {undeclared:?} are driven by harness/canary.rs but no \
+         registry row declares them. Add the row (or set `canary: Some(..)` on it) — the suite \
+         must not test dependencies the matrix has not recorded."
+    );
+}
+
 // ── the corpus itself ───────────────────────────────────────────────────────
 
 /// The four keys every `MANIFEST.toml` must carry.
 const MANIFEST_KEYS: [&str; 4] = ["captured_from", "date", "method", "redaction"];
 
+/// The one directory under a harness that is not a CLI version: the Phase C
+/// drift models. It is checked by the SAME walker rather than skipped by it —
+/// an exemption is how a corpus grows an undated corner — and additionally
+/// must declare [`MODELS_VERSION_KEY`].
+const SYNTHETIC_DIR: &str = "_synthetic";
+
+/// The fifth key a `_synthetic/` manifest carries: the sibling version
+/// directory whose fixtures it mutates. Checked to be a real directory, so a
+/// drift model cannot outlive the fixture it was derived from — the two must
+/// stay byte-identical apart from the renamed field, and that claim is
+/// unverifiable once the twin is gone.
+const MODELS_VERSION_KEY: &str = "models_version";
+
+/// `manifest[key]`, trimmed of quotes and whitespace. `""` when the key is
+/// absent — present-but-blank and absent are treated alike by the callers,
+/// which is the point (global principle 5).
+fn manifest_value(manifest: &str, key: &str) -> String {
+    manifest
+        .lines()
+        .map(str::trim_start)
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
+        .map(|rest| rest.trim().trim_matches('"').trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Every `<harness>/<version>/` directory carries a `MANIFEST.toml` with all
-/// four provenance keys, and at least one fixture beside it.
+/// four provenance keys, and at least one fixture beside it. `_synthetic/`
+/// (the drift models) is held to the same rule plus `models_version`.
 ///
 /// Locked decision 4: an anonymous fixture is indistinguishable from a guess.
 /// Without this the corpus silently accumulates files nobody can date, and the
@@ -459,17 +770,25 @@ fn every_fixture_version_dir_has_a_manifest() {
                 )
             });
             for key in MANIFEST_KEYS {
-                let value = manifest
-                    .lines()
-                    .map(str::trim_start)
-                    .find_map(|l| l.strip_prefix(key))
-                    .and_then(|rest| rest.trim_start().strip_prefix('='))
-                    .map(|rest| rest.trim().trim_matches('"').trim())
-                    .unwrap_or("");
                 // Present-but-blank is absent with extra steps.
                 assert!(
-                    value.len() > 3,
+                    manifest_value(&manifest, key).len() > 3,
                     "{}: MANIFEST.toml key `{key}` is missing or blank",
+                    manifest_path.display()
+                );
+            }
+            // The drift models are not a CLI version, so they answer one extra
+            // question instead: which version's fixtures did you mutate?
+            if version.file_name().is_some_and(|n| n == SYNTHETIC_DIR) {
+                let models = manifest_value(&manifest, MODELS_VERSION_KEY);
+                assert!(
+                    !models.is_empty()
+                        && version
+                            .parent()
+                            .is_some_and(|p| p.join(&models).is_dir()),
+                    "{}: `{MODELS_VERSION_KEY}` must name a sibling version directory that still \
+                     exists (got {models:?}) — a drift model whose twin is gone can no longer be \
+                     shown to differ from it in exactly one field",
                     manifest_path.display()
                 );
             }

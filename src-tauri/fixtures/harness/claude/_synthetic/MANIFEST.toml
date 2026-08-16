@@ -1,0 +1,32 @@
+# V35 Phase C — provenance for the Claude Code NEGATIVE canary fixtures here.
+#
+# `_synthetic/` is not a version directory: it holds drift MODELS, one per
+# covered capability, each a byte-for-byte copy of the fixture in
+# `models_version` with exactly ONE load-bearing field renamed. It carries a
+# manifest for the same reason every version directory does — the rule stays
+# uniform, so `_synthetic` cannot become the hole where undated fixtures
+# accumulate. `harness::canary::every_fixture_version_dir_has_a_manifest`
+# checks the same four keys here as everywhere else, PLUS the fifth key below,
+# which only a `_synthetic` directory carries.
+#
+# Files here, the capability each models drifting, and the field renamed:
+#   usage-renamed-input-tokens.jsonl        claude.transcript.usage
+#       message.usage.input_tokens -> inputTokens
+#       degraded default: `parse_usage_line`'s `unwrap_or(0)` yields in_tok = 0
+#   tool-result-renamed-tool-use-id.jsonl   claude.transcript.tool_result
+#       message.content[].tool_use_id -> toolUseId
+#       degraded default: `extract_tool_results` skips the block; empty Vec
+#   statusline-renamed-context-window.json  claude.statusline.stdin
+#       context_window -> contextWindow (the whole block; live-verify recipe 3)
+#       degraded default: `extract_context` -> None, blank context bar, and a
+#       push that still looks healthy because `rate_limits` survived
+#
+# Every negative fixture must stay otherwise IDENTICAL to its positive twin:
+# the negative canary asserts that the untouched fields are still substantive,
+# so a second accidental difference would make the test prove nothing.
+
+captured_from = "Claude Code 2.1.232 (drift models of the 2.1.232 fixtures, not of any observed release)"
+models_version = "2.1.232"
+date = "2026-08-16"
+method = "synthetic drift model — each file is the same-named fixture from ../2.1.232/ with exactly one load-bearing field renamed by hand, to prove the positive canary's substantiveness assertion actually fires. No upstream release has ever sent these shapes; they are deliberate forgeries of the drift case (design doc DESIGN-harness-drift-canaries.md 3.4)."
+redaction = "not applicable — nothing was captured, so there was nothing to redact. Every id, model name, token count and timestamp is invented, exactly as in the positive fixtures these are derived from."

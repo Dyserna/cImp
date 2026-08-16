@@ -1,0 +1,29 @@
+# V35 Phase C — provenance for the OpenCode NEGATIVE canary fixture here.
+#
+# `_synthetic/` is not a version directory: it holds drift MODELS, one per
+# covered capability, each a byte-for-byte copy of the fixture in
+# `models_version` with exactly ONE load-bearing field renamed. It carries a
+# manifest for the same reason every version directory does — the rule stays
+# uniform, so `_synthetic` cannot become the hole where undated fixtures
+# accumulate. `harness::canary::every_fixture_version_dir_has_a_manifest`
+# checks the same four keys here as everywhere else, PLUS the fifth key below,
+# which only a `_synthetic` directory carries.
+#
+# Files here, the capability each models drifting, and the field renamed:
+#   sse-renamed-part-id.jsonl   opencode.sse.events
+#       properties.partID -> partId on the `message.part.delta` event
+#       degraded default: the delta is dropped whole (the reader destructures
+#       partID/messageID/delta together), the part's only other text source is
+#       the empty `message.part.updated` snapshot, so the completed message
+#       flushes NOTHING — no speech, no error, and the tab is still bound to
+#       its session, which is what makes the loss invisible.
+#
+# The negative fixture must stay otherwise IDENTICAL to its positive twin: the
+# negative canary asserts that the untouched half (session binding) still
+# works, so a second accidental difference would make the test prove nothing.
+
+captured_from = "OpenCode 1.18.13 (drift model of the 1.18.13 fixture, not of any observed release)"
+models_version = "1.18.13"
+date = "2026-08-16"
+method = "synthetic drift model — the file is ../1.18.13/sse.assistant-turn.jsonl with exactly one load-bearing field renamed by hand, to prove the positive canary's substantiveness assertion actually fires. No upstream release has ever sent this shape; it is a deliberate forgery of the drift case (design doc DESIGN-harness-drift-canaries.md 3.4)."
+redaction = "not applicable — nothing was captured, so there was nothing to redact. Every session id, message id, part id and text string is invented, exactly as in the positive fixture this is derived from."

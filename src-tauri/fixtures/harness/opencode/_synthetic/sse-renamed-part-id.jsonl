@@ -1,0 +1,6 @@
+{"type":"session.created","properties":{"sessionID":"ses_canary_main_0001","info":{"id":"ses_canary_main_0001","title":"canary turn"}}}
+{"type":"message.updated","properties":{"sessionID":"ses_canary_main_0001","info":{"id":"msg_canary_assistant_0001","role":"assistant","time":{"created":1755300000}}}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_canary_main_0001","part":{"id":"prt_canary_text_0001","type":"text","messageID":"msg_canary_assistant_0001","text":""}}}
+{"type":"message.part.delta","properties":{"sessionID":"ses_canary_main_0001","messageID":"msg_canary_assistant_0001","partId":"prt_canary_text_0001","field":"text","delta":"The canary still sings."}}
+{"type":"message.updated","properties":{"sessionID":"ses_canary_main_0001","info":{"id":"msg_canary_assistant_0001","role":"assistant","time":{"created":1755300000,"completed":1755300004}}}}
+{"type":"session.idle","properties":{"sessionID":"ses_canary_main_0001"}}

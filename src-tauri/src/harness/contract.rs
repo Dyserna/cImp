@@ -410,7 +410,10 @@ pub const CAPABILITIES: &[Capability] = &[
         contract: "User-role transcript lines carry the preceding turn's tool results as \
                    `message.content[]` blocks with `type == \"tool_result\"`, `tool_use_id` and \
                    `is_error`, whose `content` is either a plain string or an array of \
-                   `{type:\"text\", text}` blocks.",
+                   `{type:\"text\", text}` blocks. Two readers, not one: \
+                   `extract_tool_results` (usage accounting) never looks at `is_error` — that \
+                   flag is read by `tool_result_is_error`, which keeps a FAILED tool result from \
+                   being mined for commit hashes by the session→commit provenance tap.",
         depends_on: &[
             Dep::JsonPath("type"),
             Dep::JsonPath("message.content[].type"),
@@ -478,19 +481,50 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
     },
     // ── Claude Code: statusline stdin (Tier C) ──────────────────────────────
+    //
+    // `depends_on` was reconciled against the readers in V35 Phase C (Phase B
+    // found the canary asserting fields the row never declared). Deliberately
+    // still NOT declared, having been checked rather than assumed:
+    //   * `extract_push_meta`'s `session_id` / `transcript_path` /
+    //     `session_name` / `cost.total_api_duration_ms` / `cost.total_cost_usd`
+    //     — attribution enrichment, not data. Losing every one of them leaves
+    //     the push writing the same numbers; only the M14 multi-tab ownership
+    //     of the shared context slot degrades to last-writer-wins, which
+    //     `usage::merge_push` handles by design (`unwrap_or_default()` on the
+    //     key) rather than by breaking.
+    //   * `extract_context`'s `session_name` / `agent.name` / `effort` /
+    //     `thinking` / `fast_mode` — display chips. They cannot make a snapshot
+    //     substantive (`ContextSnapshot::is_substantive` ignores them) and
+    //     `merge_push` drops a metadata-only snapshot, so their absence costs
+    //     labels, never a reading.
+    // Both are one honest step from load-bearing: if a later milestone makes
+    // per-tab attribution or an agent-scoped reading depend on them, they move
+    // into `depends_on` and the canary grows an assertion.
     Capability {
         id: "claude.statusline.stdin",
         harness: Harness::Claude,
         tier: Seam::C,
-        contract: "The `statusLine` command's stdin JSON carries `model.display_name`, a \
-                   `context_window` block (`used_percentage`, `total_input_tokens`, \
-                   `context_window_size`) and a `rate_limits` object whose `five_hour` / \
-                   `seven_day` windows carry `used_percentage` and `resets_at`.",
+        contract: "The `statusLine` command's stdin JSON carries `model.display_name` (with \
+                   `model.id` as the rendered fallback), a `context_window` block \
+                   (`used_percentage`, `remaining_percentage`, `total_input_tokens`, \
+                   `context_window_size`, plus a `current_usage` sub-block holding the four \
+                   per-turn counters — tolerated hoisted to the block level, and the cache pair \
+                   accepted under either the `*_input_tokens` or the shorter `*_tokens` \
+                   spelling) and a `rate_limits` object whose `five_hour` / `seven_day` windows \
+                   carry `used_percentage` and `resets_at`.",
         depends_on: &[
             Dep::JsonPath("model.display_name"),
+            Dep::JsonPath("model.id"),
             Dep::JsonPath("context_window.used_percentage"),
+            Dep::JsonPath("context_window.remaining_percentage"),
             Dep::JsonPath("context_window.total_input_tokens"),
             Dep::JsonPath("context_window.context_window_size"),
+            Dep::JsonPath("context_window.current_usage.input_tokens"),
+            Dep::JsonPath("context_window.current_usage.output_tokens"),
+            Dep::JsonPath("context_window.current_usage.cache_read_input_tokens"),
+            Dep::JsonPath("context_window.current_usage.cache_read_tokens"),
+            Dep::JsonPath("context_window.current_usage.cache_creation_input_tokens"),
+            Dep::JsonPath("context_window.current_usage.cache_creation_tokens"),
             Dep::JsonPath("rate_limits.five_hour.used_percentage"),
             Dep::JsonPath("rate_limits.five_hour.resets_at"),
             Dep::JsonPath("rate_limits.seven_day.used_percentage"),

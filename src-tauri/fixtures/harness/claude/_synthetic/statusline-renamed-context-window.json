@@ -1,0 +1,28 @@
+{
+  "model": {
+    "display_name": "Canary Sonnet 4.5",
+    "id": "claude-sonnet-4-5-20250929"
+  },
+  "contextWindow": {
+    "used_percentage": 12.5,
+    "remaining_percentage": 87.5,
+    "total_input_tokens": 25004,
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 4,
+      "output_tokens": 1,
+      "cache_read_input_tokens": 20000,
+      "cache_creation_input_tokens": 5000
+    }
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 37.5,
+      "resets_at": 1755360000
+    },
+    "seven_day": {
+      "used_percentage": 61.25,
+      "resets_at": 1755878400
+    }
+  }
+}

@@ -1,12 +1,13 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** PHASES A–H IMPLEMENTED 2026-08-16 (`82c0da2`, `7a4262a`,
-`7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`, `4e1c519`, `347c938`) — the
-matrix/canary/probe consolidation is complete. Phases I–M (the plugin
-architecture) not started. GitHub milestone 8: #55–#62 + #63 closed; #64
-open (overlay round-trip needs the scripted-turn probe class); #71 open;
-#73 filed from Phase D's auth observation. Remaining live-verify recipes
-below: 2 (app-level leg), 3, 6 (user leg), 7–10.
+**Status:** PHASES A–I IMPLEMENTED (A–H 2026-08-16, I 2026-08-17:
+`82c0da2`, `7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`,
+`4e1c519`, `347c938`, `27b6241`). The matrix/canary/probe consolidation is
+complete and CHP is declared; Phases J–M remain. GitHub milestone 8:
+#55–#62 + #63 + #66 closed; #64 open (overlay round-trip needs the
+scripted-turn probe class); #71 open; #73 filed from Phase D's auth
+observation. Remaining live-verify recipes below: 2 (app-level leg), 3, 6
+(user leg), 7–10 (8 is now drivable).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -482,6 +483,40 @@ cargo 2162/0/6, clippy clean. Findings + rulings:
 - Stated residual: scrubbing removes credentials, not context — which is
   why the corpus is bounded (3 lines per capability), machine-local, and
   promotion to a committed fixture stays a manual reviewed step.
+
+**Phase I (`27b6241`, 2026-08-17).** CHP declared: `docs/CHP.md` (the
+versioned wire contract, documenting the REAL bodies — see finding below),
+`harness/chp.rs` (`CHP_VERSION = 1`, hello registry, staleness
+classification), `/session/hello` route, `chp` baked into every generated
+OpenCode plugin body from the one const, stale-plugin surfacing in the
+Harness health headers ("Out-of-step tabs"). Phase E's residual closed:
+the two beacon reporters have registry rows and attribute to themselves.
+cargo 2176/0/6, clippy clean, vitest 643, svelte-check 0/0; the six
+ignored node-driven plugin tests were also run green. Findings + rulings:
+
+- **FINDING (corrects decision 10's phrasing): the taint beacon and
+  checkpoint trigger are Claude `PreToolUse` shim binaries**
+  (`taint_beacon.rs`, `checkpoint_beacon.rs`), not OpenCode-plugin code —
+  the plugin merely posts to the same routes (that half belongs to
+  `opencode.plugin.load_all`). Rows: `claude.hook.taint_beacon`,
+  `claude.hook.checkpoint_beacon`, Tier D (their load-bearing deps are
+  genuinely undocumented — orchestrator kept D over B+Behavior), waivered,
+  declared-unprobed. Control ids name a *place* enforcement executes, so
+  the Claude sites get their own (`taint.beacon.claude`,
+  `checkpoint.pre_mutation.claude`); `tool.gate` stays OpenCode-only (V32
+  decision 14: Claude side is report-only).
+- **FINDING: the wire was never uniform** — `/latch/*` say `consumer` not
+  `agent`; `/permission/event` carries neither agent nor tab;
+  `/memory/event` is two bodies discriminated by `kind`. CHP.md documents
+  reality; the tab-less routes contribute no chp observation (harmless —
+  their tabs also post `/context/retrieve`).
+- OpenCode's hello omits `harness_version` (no honest producer at plugin
+  module scope — self-attestation rejected, same grounds as decision 5's
+  no-fake-Claude-hello); that staleness arm is implemented but has no
+  producer until Phase J.
+- Hello events reuse the Graph activity lane (`source:"harness"`,
+  `tool:"chp_hello"`), beside `contract_drift` — no new retention lane for
+  a once-per-tab-launch row.
 
 ## Two gaps to fix ahead of the milestone
 

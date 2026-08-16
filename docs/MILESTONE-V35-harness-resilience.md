@@ -1,10 +1,10 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phases A–F implemented 2026-08-16 (`82c0da2`,
-`7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`). GitHub milestone 8,
-issues #54–#71 (one per phase; #55–#60 + #63 closed; #64 stays open — the
-overlay round-trip needs the scripted-turn probe class; #73 filed from
-Phase D's auth observation).
+**Status:** IN PROGRESS — Phases A–G implemented 2026-08-16 (`82c0da2`,
+`7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`, `4e1c519`).
+GitHub milestone 8, issues #54–#71 (one per phase; #55–#61 + #63 closed;
+#64 stays open — the overlay round-trip needs the scripted-turn probe
+class; #73 filed from Phase D's auth observation).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -415,6 +415,31 @@ vitest 643, svelte-check 0/0. Decisions:
   recipes" — the first post-ship launch will auto-advance nearly every
   install, and an unreachable CLI advances on L1 evidence alone. The Tier-D
   spike statuses (`e1_status`/`d0_status`) remain human-owned and untouched.
+
+**Phase G (`4e1c519`, 2026-08-16).** Settings → **Harness health**:
+`harness/health.rs` read-model rendered by a new sidebar category (the V33
+Sandboxing registration pattern), grouped by harness, tier D first, showing
+per row: id (verbatim — matches Advisor cards by eye), tier badge, contract
+sentence, coverage marks (waiver-only Silent rows visibly weaker), gate
+state + reason, last verify outcome + age, TCB controls marked distinctly.
+Per-harness header: seen/verified versions + auto-verify record + **Run
+checks now** (same single-flight `run_once` path; both harnesses).
+cargo 2150/0/6, clippy clean, vitest 643, svelte-check 0/0. Decisions:
+
+- Payload grouped by harness in Rust (headers carry per-harness computed
+  state) — the one deviation from the flat-list wording, accepted.
+- **Silence is not a pass**: the Phase F record stores failures only, so a
+  row the record doesn't name renders as `no_failure` (neutral badge, with
+  the limitation stated), never as a pass; an undriven row
+  (no canary, no probe) shows nothing at all.
+- OpenCode's visible result comes from an **in-memory** per-harness
+  `RunSummary` (full four-value answers, lost on restart) — no new stored
+  state, per the schema-bump trap.
+- Guard: a run with empty `claude_last_seen` writes **no** record (an
+  `AutoVerify` stamped `""` could let an all-pass advance overwrite a real
+  verified version with `""`).
+- The F-18 tripwire (`every_settings_pointer_names_a_real_sidebar_section`)
+  caught a markdown-emphasis pointer during this phase — it works.
 
 ## Two gaps to fix ahead of the milestone
 

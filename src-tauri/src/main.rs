@@ -13,6 +13,7 @@ mod context_hook;
 mod error;
 mod fsutil;
 mod graph;
+mod harness;
 mod ipc;
 mod logging;
 mod mcp_stdio;

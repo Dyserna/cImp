@@ -202,12 +202,25 @@ pub struct Capability {
 /// V32 Phase H native-tool containment: the enforcement `throw` in the
 /// generated OpenCode plugin's `tool.execute.before`
 /// (`tabs/config.rs`, ~line 2205). cImp only *computes* the verdict.
+///
+/// OpenCode-only, and that is a fact rather than a gap: Claude Code has no
+/// equivalent site: its `PreToolUse` shims are report-only by locked decision 14
+/// and are structurally incapable of denying.
 pub const CONTROL_TOOL_GATE: &str = "tool.gate";
 /// V33 Phase F: the pre-mutation checkpoint trigger, taken inside the same
-/// `tool.execute.before` handler, after the gate.
+/// `tool.execute.before` handler, after the gate. **The OpenCode instance** —
+/// see [`CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE`] for the other one.
 pub const CONTROL_CHECKPOINT_PRE_MUTATION: &str = "checkpoint.pre_mutation";
-/// V32: the taint beacon the plugin posts for native web tools.
+/// V32: the taint beacon the OpenCode plugin posts for native web tools.
+/// **The OpenCode instance** — see [`CONTROL_TAINT_BEACON_CLAUDE`].
 pub const CONTROL_TAINT_BEACON: &str = "taint.beacon";
+/// V32 Phase F: the taint beacon as it executes on the **Claude** side — the
+/// `cimp --taint-beacon` `PreToolUse` shim (`taint_beacon.rs`).
+pub const CONTROL_TAINT_BEACON_CLAUDE: &str = "taint.beacon.claude";
+/// V33 Phase F: the pre-mutation checkpoint as it executes on the **Claude**
+/// side — the `cimp --checkpoint-beacon` `PreToolUse` shim
+/// (`checkpoint_beacon.rs`).
+pub const CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE: &str = "checkpoint.pre_mutation.claude";
 
 /// The capability behind the read advisor's PreToolUse deny, spelled once.
 ///
@@ -221,6 +234,17 @@ pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 
 /// Every control id that is declared somewhere in [`CAPABILITIES`]. Each must
 /// appear exactly once — see [`tests::tcb_controls_are_declared_exactly_once`].
+///
+/// **A control id names one PLACE enforcement executes, not one concept.** That
+/// is what the exactly-once test is actually asserting, and V35 Phase I is where
+/// the distinction became load-bearing: the taint beacon and the pre-mutation
+/// checkpoint each run in *two* enforcement sites — inside the generated
+/// OpenCode plugin's `tool.execute.before`, and inside a Claude `PreToolUse`
+/// shim binary — on two harnesses, in two source files, with two different
+/// failure modes (the Claude checkpoint shim waits for the app's reply; the
+/// OpenCode one is bounded by its own abort signal). Folding them onto one id
+/// would have made the column say "enforcement lives here", singular, about a
+/// row that is only half of it.
 // Documentation, not a gate (milestone locked decision 10): the enforcement
 // test IS its consumer, so it has no runtime reader by design.
 #[allow(dead_code)]
@@ -228,6 +252,8 @@ pub const CONTROLS: &[&str] = &[
     CONTROL_TOOL_GATE,
     CONTROL_CHECKPOINT_PRE_MUTATION,
     CONTROL_TAINT_BEACON,
+    CONTROL_TAINT_BEACON_CLAUDE,
+    CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE,
 ];
 
 /// The registry. Extracted from the code on `develop`, not invented.
@@ -398,6 +424,111 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: None,
         waiver: None,
         controls: &[],
+    },
+    // ── Claude Code: the two beacon shims (Tier D — V35 Phase I) ────────────
+    //
+    // These two close V35 Phase E's accepted residual. `drift.payload.v1`
+    // survived Phase E's consolidation *solely* as the channel for their
+    // reports, because they post to `/activity/contract_drift` under their own
+    // shim names and neither had a registry row — so their reports could not be
+    // attributed to a capability and their drift landed in the un-consolidated
+    // channel. With these rows, [`capability_for_payload_shim`] resolves both
+    // through `wired_in` like every other shim, and "one notice source" holds
+    // for the whole matrix.
+    //
+    // **They are CLAUDE shims, not OpenCode plugin code.** `cimp --taint-beacon`
+    // and `cimp --checkpoint-beacon` are `PreToolUse` hook binaries
+    // (`taint_beacon.rs`, `checkpoint_beacon.rs`); the OpenCode plugin reaches
+    // the same two loopback routes from inside `tool.execute.before`, and THAT
+    // half is `opencode.plugin.load_all`'s. Two harnesses, two enforcement
+    // sites, two rows — which is also why the TCB column carries a distinct
+    // control id per site (see [`CONTROLS`]).
+    Capability {
+        id: "claude.hook.taint_beacon",
+        harness: Harness::Claude,
+        tier: Seam::D,
+        contract: "A `PreToolUse` hook with matcher `WebFetch|WebSearch` fires BEFORE the tool \
+                   runs, carrying `{session_id, cwd, tool_name}`, and a hook that writes nothing \
+                   to stdout/stderr and exits 0 is NON-BLOCKING — including when it times out, \
+                   which the hooks reference does not document at all. That undocumented \
+                   timeout semantic is why the shim never waits on anything it does not control.",
+        depends_on: &[
+            Dep::ConfigKey("hooks.PreToolUse"),
+            Dep::ConfigKey("WebFetch|WebSearch"),
+            Dep::JsonPath("session_id"),
+            Dep::JsonPath("cwd"),
+            Dep::JsonPath("tool_name"),
+            Dep::Behavior(
+                "a silent exit-0 hook never blocks or perturbs the tool call — and a TIMED-OUT \
+                 hook does not either, which is undocumented (verified against the hooks \
+                 reference 2026-08-07) and is the D-component this row is tiered on",
+            ),
+        ],
+        wired_in: &[
+            "src-tauri/src/taint_beacon.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tabs/config.rs",
+        ],
+        degradation: Degradation::Silent,
+        drift_rule: &[RULE_DRIFT_PAYLOAD],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "No canary and no probe yet, and the gap is structural rather than unowned: proving \
+             this row needs a real Claude turn that reaches for `WebFetch` and an assertion that \
+             the beacon landed — the scripted-turn probe class V35 Phase D deliberately did not \
+             fake. Two things cover it meanwhile: `drift.payload.v1` lags it (the shim reports its \
+             own missing fields, and Phase I is what makes that report resolve to THIS row), and \
+             a beacon that stops arriving leaves the tab's EXTERNAL latch unengaged, which the \
+             proxied half of the same latch still catches for anything routed through cImp. \
+             CLOSES WITH: Phase L's push migration, which replaces the shim with an http hook \
+             whose delivery is observable app-side, or a scripted-turn probe — whichever lands \
+             first.",
+        ),
+        controls: &[CONTROL_TAINT_BEACON_CLAUDE],
+    },
+    Capability {
+        id: "claude.hook.checkpoint_beacon",
+        harness: Harness::Claude,
+        tier: Seam::D,
+        contract: "A `PreToolUse` hook with matcher `Edit|Write|MultiEdit|Bash` fires BEFORE the \
+                   tool runs with the same payload, and Claude Code does not start the tool until \
+                   the hook process EXITS — which is what makes \"the checkpoint precedes the \
+                   call\" exact rather than best-effort. The configured `timeout` (5 s) stays a \
+                   ceiling above the shim's own 2 s reply deadline, not the mechanism.",
+        depends_on: &[
+            Dep::ConfigKey("hooks.PreToolUse"),
+            Dep::ConfigKey("Edit|Write|MultiEdit|Bash"),
+            Dep::ConfigKey("timeout"),
+            Dep::JsonPath("session_id"),
+            Dep::JsonPath("cwd"),
+            Dep::JsonPath("tool_name"),
+            Dep::Behavior(
+                "the tool call does not begin until this hook process exits — undocumented, and \
+                 the ordering the whole feature rests on: a checkpoint that can contain the \
+                 change it claims to predate silently misleads a restore",
+            ),
+        ],
+        wired_in: &[
+            "src-tauri/src/checkpoint_beacon.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tabs/config.rs",
+        ],
+        degradation: Degradation::Silent,
+        drift_rule: &[RULE_DRIFT_PAYLOAD],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "Same structural gap as its sibling — a scripted Claude turn that edits a file, plus \
+             an assertion about checkpoint ORDERING, which no fixture can express. What covers it \
+             meanwhile is strictly better than for the taint beacon: `drift.payload.v1` lags the \
+             payload half (resolving to this row from Phase I on), and a blown reply deadline \
+             already surfaces as its own Activity event (`workbench` / `checkpoint_missed`) \
+             instead of being lost — so the failure mode this row is `Silent` for is the hook not \
+             FIRING, not the checkpoint failing. CLOSES WITH: Phase L's push migration or a \
+             scripted-turn probe.",
+        ),
+        controls: &[CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE],
     },
     // ── Claude Code: scraped UI (Tier D) ────────────────────────────────────
     Capability {
@@ -1010,16 +1141,21 @@ pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
 /// when a shim moves — the same test that keeps `wired_in` pointing at real
 /// files keeps this pointing at the right row.
 ///
-/// `None` for a shim no `drift.payload.v1` row names, and that case is REAL,
-/// not defensive: `taint_beacon` and `checkpoint_beacon` both report through
-/// this route and neither has a registry row of its own (their `PreToolUse`
-/// entries ride `claude.flag.settings_overlay`, which declares no payload
-/// contract), and a forged name lands in the loopback's `(unrecognized shim)`
-/// bucket. Those reports keep the un-consolidated `drift.payload.v1` channel
-/// rather than being mis-attributed to a capability that did not report them.
-/// `postedit_hook` is `None` too, for the third reason — Phase A finding 2: it
-/// is the one shim that never calls `report_contract_drift` at all, so its row
-/// names no drift rule and can never appear here.
+/// **V35 Phase I closed Phase E's accepted residual here.** `taint_beacon` and
+/// `checkpoint_beacon` used to resolve to `None` — they report through this
+/// route under their own shim names and had no registry row of their own, so
+/// their drift kept the un-consolidated `drift.payload.v1` channel rather than
+/// being mis-attributed. They now have rows (`claude.hook.taint_beacon`,
+/// `claude.hook.checkpoint_beacon`) and resolve through exactly the same
+/// `wired_in` mechanism as the other four — no second map, no special case: the
+/// rows name `src-tauri/src/{taint,checkpoint}_beacon.rs` and the suffix match
+/// does the rest.
+///
+/// `None` therefore now means one of two things, and both are real rather than
+/// defensive: a **forged** name, which lands in the loopback's
+/// `(unrecognized shim)` bucket; or `postedit_hook` — Phase A finding 2, the one
+/// shim that never calls `report_contract_drift` at all, so its row names no
+/// drift rule and can never appear here.
 pub fn capability_for_payload_shim(shim: &str) -> Option<&'static Capability> {
     if shim.is_empty() {
         return None;
@@ -1494,15 +1630,20 @@ mod tests {
         assert!(capabilities_for_rule("drift.no_such_rule.v1").is_empty());
     }
 
-    /// The four hook shims that report payload drift each resolve to exactly
-    /// one row, through `wired_in` rather than a hand-kept map.
+    /// The six shims that report payload drift each resolve to exactly one row,
+    /// through `wired_in` rather than a hand-kept map.
     ///
-    /// The negative half is the interesting one and is asserted by name:
+    /// **The last two are V35 Phase I**, closing Phase E's accepted residual:
+    /// `taint_beacon` and `checkpoint_beacon` report through the same route and
+    /// used to resolve to nothing, so their drift could not be attributed to a
+    /// capability and kept the un-consolidated `drift.payload.v1` channel. They
+    /// resolve through the identical mechanism now — the rows name the shim
+    /// files, and no code changed to make that work.
+    ///
+    /// The negative half is still the interesting one and is asserted by name:
     /// `postedit_hook` is Phase A finding 2 (the one shim that never reports at
-    /// all, so its row names no rule), while `taint_beacon` and
-    /// `checkpoint_beacon` DO report through the same route and have no row —
-    /// their reports keep the unattributed `drift.payload.v1` channel instead
-    /// of being pinned on a capability that did not report them.
+    /// all, so its row names no rule), and a forged name must never be pinned on
+    /// a capability that did not report it.
     #[test]
     fn every_payload_shim_resolves_to_one_row() {
         for (shim, expect) in [
@@ -1510,19 +1651,14 @@ mod tests {
             ("compact_hook", "claude.hook.precompact"),
             ("read_hook", CAP_PRETOOLUSE_DENY),
             ("notify_hook", "claude.hook.notification"),
+            ("taint_beacon", "claude.hook.taint_beacon"),
+            ("checkpoint_beacon", "claude.hook.checkpoint_beacon"),
         ] {
             let cap = capability_for_payload_shim(shim)
                 .unwrap_or_else(|| panic!("shim `{shim}` resolves to no capability"));
             assert_eq!(cap.id, expect, "shim `{shim}` resolved to the wrong row");
         }
-        for shim in [
-            "postedit_hook",
-            "taint_beacon",
-            "checkpoint_beacon",
-            "(unrecognized shim)",
-            "",
-            "hook",
-        ] {
+        for shim in ["postedit_hook", "(unrecognized shim)", "", "hook", "beacon"] {
             assert!(
                 capability_for_payload_shim(shim).is_none(),
                 "shim `{shim}` must NOT be attributed to a capability"

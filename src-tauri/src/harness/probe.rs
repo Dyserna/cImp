@@ -36,7 +36,7 @@
 //!
 //! [`IMPLEMENTED`] holds the seven rows this phase actually drives — the ones
 //! reachable without scripting a model turn. [`DECLARED_UNPROBED`] holds the
-//! other eleven, each with the reason it cannot be, and they are **printed**
+//! other thirteen, each with the reason it cannot be, and they are **printed**
 //! as `unknown` rather than silently omitted: a dependency that stops being
 //! listed is a dependency that stopped being counted without anyone deciding
 //! to. Neither list is hand-reconciled — `contract.rs`'s
@@ -282,6 +282,17 @@ const DECLARED_UNPROBED: &[(&str, &str)] = &[
         "opencode.route.push",
         "needs a scripted turn (L2 residual): the dangerous half is `noReply` losing its meaning, \
          which is only observable as an agent turn that should not have started",
+    ),
+    (
+        "claude.hook.taint_beacon",
+        "needs a scripted turn (L2 residual): the hook only fires when a real turn reaches for \
+         WebFetch/WebSearch, and the property worth proving is that the beacon LANDED before the \
+         tool ran — an ordering, not a payload shape",
+    ),
+    (
+        "claude.hook.checkpoint_beacon",
+        "needs a scripted turn (L2 residual), and the load-bearing half is an ORDERING no fixture \
+         can express: that the tool call does not begin until this hook process exits",
     ),
     (
         "opencode.plugin.load_all",

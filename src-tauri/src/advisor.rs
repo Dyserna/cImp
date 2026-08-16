@@ -2590,17 +2590,26 @@ mod tests {
     /// un-consolidated `drift.payload.v1` channel rather than being pinned on
     /// a capability that did not report it.
     ///
-    /// `taint_beacon` and `checkpoint_beacon` really do post through
-    /// `/activity/contract_drift` and really have no registry row, so this is
-    /// a live path, not a defensive one. Dropping these reports to make the
-    /// notice-source count come out at one would be discarding a signal about
-    /// a shim nobody has declared — which is the failure V35 exists to remove,
-    /// not an instance of the tidiness it is after.
+    /// **V35 Phase I changed which shims land here, and that is the point.**
+    /// When this test was written, `taint_beacon` and `checkpoint_beacon` were
+    /// the live occupants of the unattributed channel: they really do post
+    /// through `/activity/contract_drift` and really had no registry row. Phase I
+    /// gave them rows (`claude.hook.taint_beacon` / `claude.hook.checkpoint_beacon`),
+    /// so both are now attributed like every other shim — which is Phase E's
+    /// accepted residual closed, and "one notice source" holding for the whole
+    /// matrix.
+    ///
+    /// The channel itself stays, and its remaining occupant is a shim name
+    /// **nobody declared** — a forged one, or a future shim someone added without
+    /// a registry row. Dropping those reports to make the notice-source count
+    /// come out at one would be discarding a signal about a shim nobody has
+    /// declared, which is the failure V35 exists to remove rather than an
+    /// instance of the tidiness it is after.
     #[test]
     fn an_unmatrixed_shim_keeps_the_unattributed_payload_channel() {
         let sig = Signals {
             contract_drift: vec![
-                "taint_beacon: tool_name".to_string(),
+                "mystery_shim: tool_name".to_string(),
                 "read_hook: session_id".to_string(),
             ],
             ..Signals::default()
@@ -2611,16 +2620,45 @@ mod tests {
             .find(|p| is_drift(p, RULE_DRIFT_PAYLOAD))
             .expect("the read_hook report is attributed");
         assert_eq!(attributed.capability, Some("claude.hook.pretooluse_deny"));
-        assert!(!attributed.rationale.contains("taint_beacon"));
+        assert!(!attributed.rationale.contains("mystery_shim"));
 
         let residual = props
             .iter()
             .find(|p| p.rule_id == RULE_DRIFT_PAYLOAD)
-            .expect("the taint_beacon report still surfaces");
+            .expect("the undeclared shim's report still surfaces");
         assert_eq!(residual.capability, None);
-        assert_eq!(residual.signature, "taint_beacon: tool_name");
+        assert_eq!(residual.signature, "mystery_shim: tool_name");
         assert!(residual.warn_only);
         assert!(!residual.rationale.contains("read_hook"));
+    }
+
+    /// **V35 Phase I:** the two beacon shims now resolve to their own
+    /// capabilities instead of the unattributed channel — the concrete closure
+    /// of Phase E's accepted residual, asserted through the Advisor rather than
+    /// only through the registry, because the Advisor card is where the user
+    /// meets it.
+    #[test]
+    fn the_beacon_shims_are_attributed_to_their_own_capabilities() {
+        for (shim, expect) in [
+            ("taint_beacon", "claude.hook.taint_beacon"),
+            ("checkpoint_beacon", "claude.hook.checkpoint_beacon"),
+        ] {
+            let sig = Signals {
+                contract_drift: vec![format!("{shim}: tool_name")],
+                ..Signals::default()
+            };
+            let props = evaluate(&sig);
+            let p = props
+                .iter()
+                .find(|p| is_drift(p, RULE_DRIFT_PAYLOAD))
+                .unwrap_or_else(|| panic!("`{shim}`'s report must reach a capability card"));
+            assert_eq!(p.capability, Some(expect));
+            assert!(p.rationale.contains(shim));
+            assert!(
+                !props.iter().any(|p| p.rule_id == RULE_DRIFT_PAYLOAD),
+                "`{shim}` must no longer land in the un-consolidated channel"
+            );
+        }
     }
 
     #[test]

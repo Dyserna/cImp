@@ -1187,6 +1187,12 @@ async fn handle_conn(
     // Match on the path without its query string (`/mcp/list?consumer=opencode`
     // must route the same as `/mcp/list`); handlers read the query themselves.
     let route = req.path.split('?').next().unwrap_or(&req.path);
+    // V35 Phase I: observe the CHP protocol version this caller speaks, BEFORE
+    // dispatch and beside it rather than inside nine handlers — the routes' own
+    // body types stay byte-identical, which is this phase's exit criterion. It
+    // reads only, answers nothing and cannot reject: a route's behaviour is the
+    // same whether this line runs or not.
+    note_chp(&app, route, &req.body);
     match (req.method.as_str(), route) {
         ("POST", "/run") => handle_run(&mut stream, &service, &app, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
@@ -1202,6 +1208,7 @@ async fn handle_conn(
         ("POST", "/permission/event") => handle_permission_event(&mut stream, &app, &req).await,
         ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
         ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
+        ("POST", "/session/hello") => handle_session_hello(&mut stream, &app, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -6024,6 +6031,296 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
     write_json(stream, 200, &ok).await
 }
 
+// ── V35 Phase I: CHP — the protocol version, and the hello ──────────────────
+
+/// Observe the `chp` version a routed POST carries, for the stale-artifact
+/// report (`harness::chp`, milestone decision 9 / design D5).
+///
+/// Called once per request from the dispatcher, **beside** the route table
+/// rather than inside the handlers. Three properties make that safe, and each is
+/// the reason the phase's "zero behavior change" claim is a fact rather than a
+/// hope:
+///
+/// * it **reads only** — no reply, no early return, no error path a route could
+///   inherit. A malformed body here is ignored; the route's own handler still
+///   owns its 400;
+/// * the routes' body types are **untouched**, so every existing
+///   deserialization test still pins the same shape;
+/// * the tab id is validated against the user's configured AI tabs before
+///   anything is stored, exactly as [`handle_latch_beacon`] validates its own —
+///   so the peer registry's key space is `configured tabs × 2 agents` and not
+///   "whatever a request body said" (#45's rule, one route surface over).
+///
+/// **Cost on the hot path.** Every prompt and every tool call passes here, so
+/// the common case must not clone `Settings`. It does not: the second and every
+/// later message from a tab hits [`crate::harness::chp::already_seen`], a single
+/// map lookup, and returns. Only a *new* `(agent, tab, chp)` triple — i.e. a tab
+/// launching, or a tab's artifact having changed — pays one settings read.
+fn note_chp(app: &AppHandle, route: &str, body: &[u8]) {
+    let Some((env, tab)) = crate::harness::chp::envelope(route, body) else {
+        return;
+    };
+    let chp = env.chp.unwrap_or(crate::harness::chp::PRE_CHP);
+    let agent = crate::graph::source_for_consumer(env.agent_token());
+    if crate::harness::chp::already_seen(agent, &tab, chp) {
+        return;
+    }
+    let settings = live_settings(app);
+    if !is_configured_tab(&settings, agent, &tab) {
+        return;
+    }
+    crate::harness::chp::note_push(agent, &tab, chp, crate::activity::now_ms());
+}
+
+/// A `POST /session/hello` body — V35 Phase I, design D3.
+///
+/// Every field is optional and every one is caller-supplied. The handler bounds
+/// each before it can reach a row or the panel; nothing here is believed beyond
+/// "this local process said so", which is the standard every `Origin::Http`
+/// producer on this listener is held to.
+#[derive(Deserialize)]
+struct SessionHelloBody {
+    /// The protocol version the artifact speaks. Absent ⇒ pre-CHP, never an
+    /// error — a hello is exactly the message an old artifact would not send at
+    /// all, so tolerating its absence here is belt-and-braces rather than a
+    /// live path.
+    #[serde(default)]
+    chp: Option<u32>,
+    /// `claude` / `opencode`, normalized through `source_for_consumer` like
+    /// every other route's discriminator.
+    #[serde(default)]
+    agent: Option<String>,
+    /// The cImp tab this artifact was generated for. Required in practice: a
+    /// hello with no tab has nothing to key, and one naming an unconfigured tab
+    /// is refused (see the handler).
+    #[serde(default)]
+    tab: Option<String>,
+    /// The harness's own version, when it exposes one to its extensions.
+    #[serde(default)]
+    harness_version: Option<String>,
+    /// The CHP events this artifact will actually push, with its per-tab flags
+    /// applied.
+    #[serde(default)]
+    serves: Vec<String>,
+    /// …and the rest, each with a reason.
+    #[serde(default)]
+    cannot: Vec<SessionHelloUnable>,
+}
+
+/// One `cannot` entry: a capability this artifact will not serve, and why.
+#[derive(Deserialize)]
+struct SessionHelloUnable {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    why: String,
+}
+
+/// How many `serves` / `cannot` entries one hello may declare.
+///
+/// The live vocabulary is 17 ids (`harness::chp::EVENTS`), so this is slack for
+/// a future event rather than a limit anything genuine can reach — the same
+/// shape and the same reasoning as [`MAX_DRIFT_MISSING`]. Without it, `serves`
+/// is an unbounded list of unbounded strings that reaches an in-memory registry
+/// and a Settings panel.
+const MAX_HELLO_DECLARATIONS: usize = 32;
+
+/// The doubling ledger for hello rows, keyed on the **resolved** `agent:tab` —
+/// which is only ever reached after [`is_configured_tab`] accepted it, so the
+/// key space is bounded by the user's own tab list exactly as
+/// [`DISCOVERY_REPORTS`]'s is.
+///
+/// Two gates, not one, and they catch different things: the row is written only
+/// when the hello actually CHANGED what cImp knows (a plugin re-loading with the
+/// same declaration is silent), and repeats of a genuinely flip-flopping
+/// declaration cost `log2(n)` rows. Process lifetime, following its two
+/// siblings.
+static HELLO_SEEN: OnceLock<Mutex<HashMap<String, outbound::Doubling>>> = OnceLock::new();
+
+/// Count one hello against the process ledger. See [`HELLO_SEEN`].
+fn claim_hello(key: &str) -> outbound::DoublingRow {
+    let ledger = HELLO_SEEN.get_or_init(Default::default);
+    let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+    claim_in(&mut ledger, key)
+}
+
+/// The caller's declaration list, bounded in both dimensions before it reaches
+/// the peer registry — the [`bounded_missing`] discipline applied to `serves`
+/// and to `cannot`.
+fn bounded_declarations(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .take(MAX_HELLO_DECLARATIONS)
+        .map(|s| bounded_id(s))
+        .collect()
+}
+
+/// The Activity row one hello writes, or `None` when nothing changed.
+///
+/// Split from the handler for the reason [`contract_drift_row`] documents:
+/// `activity::record_bg` has no `cfg(test)` diversion, so a row written inside a
+/// handler is unobservable to the suite. Returning the record makes what a
+/// caller can put in the store assertable without touching the global store.
+fn hello_row(
+    agent: &'static str,
+    tab: &str,
+    chp: u32,
+    version: &str,
+    serves: &[String],
+    cannot: usize,
+    claim: impl FnOnce(&str) -> outbound::DoublingRow,
+) -> Option<crate::activity::ActivityRecord> {
+    let outbound::DoublingRow::Write { total, suppressed } = claim(&format!("{agent}:{tab}")) else {
+        return None;
+    };
+    let version = if version.is_empty() {
+        "version not declared".to_string()
+    } else {
+        format!("v{version}")
+    };
+    let target = format!(
+        "{agent}/{tab}: chp {chp} ({version}) — serves {}, cannot {cannot}",
+        serves.len()
+    );
+    Some(crate::activity::ActivityRecord {
+        entry: crate::activity::ActivityEntry::new(
+            // The lane `contract_drift` already uses for harness-contract facts,
+            // with the same `source: "harness"`. Deliberately NOT a new
+            // retention lane: a hello fires once per tab launch, and the two
+            // rows a reader wants side by side ("this plugin introduced itself"
+            // / "this shim's payload broke") belong in one feed.
+            crate::activity::ActivityKind::Graph,
+            crate::activity::now_ms(),
+            String::new(), // no root — the hello is about a harness, not a project
+            "harness".to_string(),
+            "chp_hello".to_string(),
+            target,
+            serves.len(),
+            0,
+            // A hello is a normal, healthy event — unlike a drift report, which
+            // flags its entry.
+            true,
+            crate::activity::Attribution::Tab(tab.to_string()),
+            None,
+        ),
+        request: format!(
+            "serves: {}",
+            if serves.is_empty() {
+                "(nothing declared)".to_string()
+            } else {
+                serves.join(", ")
+            }
+        ),
+        response: format!(
+            "hello {total} from this tab this app run, {suppressed} folded into it"
+        ),
+    })
+}
+
+/// `POST /session/hello` (V35 Phase I, design D3): a generated harness artifact
+/// introducing itself — the protocol version it speaks, the harness version it
+/// runs under (when the harness exposes one), and what it will and will not
+/// serve.
+///
+/// # Nothing gates on this, and that is the phase's exit criterion
+///
+/// `serves` / `cannot` are RECORDED and DISPLAYED, never consulted by a
+/// capability. Negotiation becomes load-bearing in Phase L; making it so here
+/// would be a behavior change dressed as a declaration — and would hand an
+/// artifact the power to switch cImp features off by lying about itself.
+///
+/// **`serves` is not a trust claim in either direction.** An artifact declaring
+/// `tool.gate` has said nothing cImp relies on: the gate's authority is cImp
+/// computing the verdict at `/latch/state`, and the artifact's only power is to
+/// refuse MORE than it was told to.
+///
+/// # Auth, and the same honesty clause every route here owes
+///
+/// Bearer, inherited from the pre-dispatch [`authorized`] check. The launch
+/// token is readable by any process running as this user, so "authenticated"
+/// means *a local process*, never *cImp's own plugin*. Which is why the tab id
+/// is validated ([`is_configured_tab`]) and every string is bounded before it
+/// reaches the registry or the Settings panel.
+///
+/// # Answers
+///
+/// `200 {ok, chp}` — the ack carries the SERVER's version so a future client can
+/// adapt to an older cImp. `400` on a malformed body or an unconfigured tab,
+/// following [`handle_latch_beacon`]'s discipline rather than
+/// [`handle_discovery_skipped`]'s constant-ack one: this route answers cImp's
+/// own generated artifact, which is fail-open and discards the reply, and a
+/// rejected tab is a fact worth a log line.
+async fn handle_session_hello(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let body: SessionHelloBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!("bad request body: {e}")),
+            };
+            return write_json(stream, 400, &r).await;
+        }
+    };
+    let agent = crate::graph::source_for_consumer(body.agent.as_deref().unwrap_or("claude"));
+    let tab = body.tab.as_deref().map(str::trim).unwrap_or("");
+    let settings = live_settings(app);
+    if tab.is_empty() || !is_configured_tab(&settings, agent, tab) {
+        warn!(
+            target: "offload",
+            agent,
+            tab = %bounded_id(tab),
+            "loopback: /session/hello rejected — not a configured tab id"
+        );
+        let r = RunResult {
+            ok: false,
+            text: None,
+            error: Some(
+                "/session/hello accepts configured AI tabs only — a hello with no tab has \
+                 nothing to key"
+                    .to_string(),
+            ),
+        };
+        return write_json(stream, 400, &r).await;
+    }
+    let chp = body.chp.unwrap_or(crate::harness::chp::PRE_CHP);
+    let version = bounded_id(body.harness_version.as_deref().unwrap_or("").trim());
+    let serves = bounded_declarations(&body.serves);
+    let cannot: Vec<crate::harness::chp::Unable> = body
+        .cannot
+        .iter()
+        .take(MAX_HELLO_DECLARATIONS)
+        .map(|u| crate::harness::chp::Unable {
+            id: bounded_id(&u.id),
+            why: bounded_id(&u.why),
+        })
+        .collect();
+    let changed = crate::harness::chp::note_hello(
+        agent,
+        tab,
+        chp,
+        &version,
+        serves.clone(),
+        cannot.clone(),
+        crate::activity::now_ms(),
+    );
+    if changed {
+        if let Some(record) = hello_row(agent, tab, chp, &version, &serves, cannot.len(), claim_hello)
+        {
+            crate::activity::record_bg(record);
+        }
+    }
+    write_json(
+        stream,
+        200,
+        &serde_json::json!({ "ok": true, "chp": crate::harness::chp::CHP_VERSION }),
+    )
+    .await
+}
+
 // ── #48 F-32 / locked decision 37: a child reports what containment did ──────
 
 /// A `POST /activity/discovery_skipped` request body — a cImp stdio MCP child
@@ -9571,6 +9868,150 @@ mod tests {
              unrecognized-shim bucket and nothing fails"
         );
         assert!(!DRIFT_SHIMS.contains(&DRIFT_SHIM_UNKNOWN));
+    }
+
+    // ── V35 Phase I — CHP: the hello row and the observation seam ────────────
+
+    /// A hello writes ONE row, says what the artifact declared, and a
+    /// flip-flopping caller costs `log2(n)` rows rather than one per hello.
+    ///
+    /// The row shape matters as much as the bound: the target has to name the
+    /// tab, the protocol version and the sizes of the two declaration lists,
+    /// because that is what a reader diffing "before the upgrade / after the
+    /// upgrade" actually compares.
+    #[test]
+    fn a_hello_row_names_the_version_and_costs_log2_rows_under_a_flood() {
+        let mut ledger: HashMap<String, outbound::Doubling> = HashMap::new();
+        let serves = vec!["prompt".to_string(), "tool.gate".to_string()];
+        let first = hello_row(
+            "opencode",
+            "opencode-1",
+            crate::harness::chp::CHP_VERSION,
+            "1.18.13",
+            &serves,
+            1,
+            |k| claim_in(&mut ledger, k),
+        )
+        .expect("the first hello writes a row");
+        assert_eq!(first.entry.source, "harness");
+        assert_eq!(first.entry.tool, "chp_hello");
+        assert_eq!(
+            first.entry.kind,
+            crate::activity::ActivityKind::Graph.as_str(),
+            "the hello rides the lane `contract_drift` already uses for harness facts"
+        );
+        assert!(first.entry.ok, "a hello is a healthy event, not a flag");
+        assert_eq!(
+            first.entry.tab,
+            crate::activity::Attribution::Tab("opencode-1".to_string()),
+            "the tab was validated against the configured list before this point"
+        );
+        assert!(first.entry.target.contains("chp 1"), "{}", first.entry.target);
+        assert!(first.entry.target.contains("v1.18.13"), "{}", first.entry.target);
+        assert!(first.entry.target.contains("serves 2"), "{}", first.entry.target);
+        assert!(first.entry.target.contains("cannot 1"), "{}", first.entry.target);
+        assert!(first.request.contains("tool.gate"));
+        // An undeclared version says so rather than rendering as an empty `v`.
+        let quiet = hello_row("claude", "claude-1", 0, "", &[], 0, |k| {
+            claim_in(&mut ledger, k)
+        })
+        .expect("a second key gets its own counter");
+        assert!(
+            quiet.entry.target.contains("version not declared"),
+            "{}",
+            quiet.entry.target
+        );
+        assert!(quiet.request.contains("(nothing declared)"));
+
+        // The bound: 200 hellos from ONE tab write 8 rows, each stating how many
+        // it stands for. The key is `agent:tab` and the tab is only ever reached
+        // after `is_configured_tab` accepted it, so the key space is the user's
+        // own tab list.
+        let mut flood: HashMap<String, outbound::Doubling> = HashMap::new();
+        let rows = (0..200)
+            .filter(|_| {
+                hello_row("opencode", "opencode-1", 1, "", &[], 0, |k| {
+                    claim_in(&mut flood, k)
+                })
+                .is_some()
+            })
+            .count();
+        assert_eq!(rows, 8, "a re-hellowing plugin must cost log2 rows, not 200");
+        assert_eq!(flood.len(), 1, "one tab, one counter");
+    }
+
+    /// The declaration lists are bounded before they reach the peer registry or
+    /// the Settings panel — the [`bounded_missing`] discipline, one route over.
+    #[test]
+    fn a_hellos_declarations_cannot_choose_how_much_of_the_panel_they_occupy() {
+        let huge: Vec<String> = (0..500).map(|i| format!("{}-{i}", "x".repeat(400))).collect();
+        let bounded = bounded_declarations(&huge);
+        assert_eq!(bounded.len(), MAX_HELLO_DECLARATIONS);
+        assert!(
+            bounded.iter().all(|s| s.chars().count() <= BEACON_TOOL_MAX + 1),
+            "each entry is truncated like every other caller-supplied id"
+        );
+        assert!(bounded_declarations(&[]).is_empty());
+    }
+
+    /// The observation seam, in the two directions that matter for "zero
+    /// behavior change": a pre-CHP body is READ, not rejected, and a route that
+    /// is not CHP is not observed at all.
+    ///
+    /// The handler-side half (tab validation, the settings read) needs an
+    /// `AppHandle` and is covered by the route-surface tests plus
+    /// `harness::chp`'s own suite; what is asserted here is that the loopback's
+    /// pre-dispatch hook agrees with the protocol module about *what counts as a
+    /// CHP message*, which is the seam a new route would silently fall out of.
+    #[test]
+    fn the_chp_observation_reads_every_body_the_routes_actually_send() {
+        // Exactly the body `context_hook.rs` builds today — no `chp`.
+        let (env, tab) = crate::harness::chp::envelope(
+            "/context/retrieve",
+            br#"{"cwd":"P:\\p","prompt":"hi","session_id":"s","agent":"claude","tab":"claude-1"}"#,
+        )
+        .expect("the pre-CHP Claude body is still observable");
+        assert_eq!(env.chp, None);
+        assert_eq!(crate::graph::source_for_consumer(env.agent_token()), "claude");
+        assert_eq!(tab, "claude-1");
+
+        // …and the body the generated plugin now sends.
+        let (env, _) = crate::harness::chp::envelope(
+            "/latch/beacon",
+            br#"{"chp":1,"tab":"opencode-1","consumer":"opencode","tool":"webfetch"}"#,
+        )
+        .expect("the plugin's beacon body");
+        assert_eq!(env.chp, Some(crate::harness::chp::CHP_VERSION));
+        assert_eq!(
+            crate::graph::source_for_consumer(env.agent_token()),
+            "opencode"
+        );
+
+        // Every route the containment table declares as CHP-carrying is one the
+        // protocol module agrees to observe, and none of the non-CHP ones is.
+        for row in ROUTE_CONTAINMENT {
+            let observed = crate::harness::chp::is_push_route(row.path);
+            let expected = matches!(
+                row.path,
+                "/context/retrieve"
+                    | "/context/compaction"
+                    | "/context/should_read"
+                    | "/context/post_edit"
+                    | "/memory/event"
+                    | "/permission/event"
+                    | "/latch/beacon"
+                    | "/latch/state"
+                    | "/workbench/tool_checkpoint"
+                    | "/activity/contract_drift"
+            );
+            assert_eq!(
+                observed, expected,
+                "`{}` disagrees with `harness::chp::EVENTS` about whether it carries CHP — a new \
+                 route either belongs in the vocabulary (with a row in docs/CHP.md) or in this \
+                 list's negative half, deliberately",
+                row.path
+            );
+        }
     }
 
     /// **The positive case, on the wire, and its negative control.** A skipped
@@ -15103,6 +15544,23 @@ mod tests {
             "handle_latch_state",
             Containment::RegistryNoGate(
                 "reads this tab's view for the plugin gate; creates nothing",
+            ),
+        ),
+        // V35 Phase I (CHP). A generated harness artifact declaring its protocol
+        // version and what it will serve. Ungated on purpose and the reason is
+        // not "nobody got round to it": it hands back no project data and grants
+        // no capability, so a latch would have nothing to refuse — while a
+        // refusal would deny cImp the one message that says a tab is running a
+        // STALE plugin, i.e. exactly the tab whose containment behaviour is in
+        // question. It is still token-gated, and its tab id is validated against
+        // the user's configured AI tabs before anything is recorded.
+        route(
+            "/session/hello",
+            "POST",
+            "handle_session_hello",
+            Containment::NoRegistry(
+                "a harness artifact declaring its protocol version and capabilities; returns no \
+                 local data and grants nothing",
             ),
         ),
         route(

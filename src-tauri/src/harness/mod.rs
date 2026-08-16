@@ -48,6 +48,17 @@
 //! known-good capture and today's, rather than reverse-engineering the shape
 //! from symptoms.
 //!
+//! Phase I adds [`chp`] — **CHP, the cImp Harness Protocol**: the name, the
+//! version and the capability handshake for the loopback wire both harnesses
+//! have been speaking since V10. Phases A–H made the dependency surface
+//! *enumerable*; this makes the seam itself *declared*, so everything above L2
+//! types against a protocol instead of against harness-shaped Rust. Its runtime
+//! consumer is stale-artifact detection: a plugin is written to disk at tab
+//! launch and outlives the binary that wrote it, and `chp` is what turns that
+//! mismatch from a mysterious functional failure (V32 hit it four times) into a
+//! line in the *Harness health* panel. The wire contract is `docs/CHP.md`;
+//! handlers stay in `offload/loopback.rs`.
+//!
 //! Design: `docs/MILESTONE-V35-harness-resilience.md` (the why and the locked
 //! decisions), `docs/DESIGN-harness-capability-matrix.md` (the types and the
 //! seed rows), `docs/DESIGN-harness-drift-canaries.md` (the canary layers, § 5
@@ -56,6 +67,7 @@
 
 pub mod canary;
 pub mod capture;
+pub mod chp;
 pub mod contract;
 pub mod health;
 pub mod probe;

@@ -39,6 +39,7 @@
 //! state the Phase G brief rules out, and the schema bump it would cost is the
 //! milestone's own deploy trap.
 
+use crate::harness::chp::{self, StalePlugin};
 use crate::harness::contract::{self, Capability, Degradation, Gate, Harness, Seam, CAPABILITIES};
 use crate::harness::probe::{harness_name, tier_name};
 use crate::harness::verify::{self, RunSummary};
@@ -225,6 +226,14 @@ pub struct HarnessHealth {
     pub auto_verify: Option<AutoVerify>,
     /// The last run made since launch, when there is one.
     pub last_run: Option<RunView>,
+    /// **V35 Phase I:** this harness's tabs whose spawn-baked artifact is out of
+    /// step with the running binary — the consumer of the CHP version field.
+    ///
+    /// Empty is the normal state and renders as nothing. A non-empty list is the
+    /// V32 deploy trap ("needs a FRESH TAB") caught and named instead of met as
+    /// a capability that quietly misbehaves. Nothing is refused on the strength
+    /// of it; it is a report.
+    pub stale_plugins: Vec<StalePlugin>,
     pub capabilities: Vec<CapabilityHealth>,
 }
 
@@ -369,14 +378,21 @@ pub fn health(settings: &Settings) -> Vec<HarnessHealth> {
                     last_verify: last_verify(c, run.as_ref(), record),
                 })
                 .collect();
+            let last_seen = match harness {
+                Harness::Claude => hv.claude_last_seen.clone(),
+                Harness::OpenCode => hv.opencode_last_seen.clone(),
+                Harness::Any => String::new(),
+            };
             HarnessHealth {
                 harness: harness_name(harness),
                 label,
-                last_seen: match harness {
-                    Harness::Claude => hv.claude_last_seen.clone(),
-                    Harness::OpenCode => hv.opencode_last_seen.clone(),
-                    Harness::Any => String::new(),
-                },
+                // V35 Phase I. The version arm of the staleness check compares a
+                // hello's declared harness version against the one cImp has
+                // actually observed, which is this same `last_seen` — passed in
+                // rather than read inside `chp`, so the header's own version
+                // line and its stale-plugin list are one reading of one value.
+                stale_plugins: chp::stale_for(harness_name(harness), &last_seen),
+                last_seen,
                 last_verified: match harness {
                     Harness::Claude => Some(hv.claude_last_verified.clone()),
                     _ => None,
@@ -499,21 +515,78 @@ mod tests {
         assert!(contract::get(notif.degradation.fallback_to.unwrap()).is_some());
     }
 
-    /// The TCB column reaches the panel, and only the row that owns the
-    /// controls carries them (matrix decision 10 — these are security controls
+    /// The TCB column reaches the panel, and only the rows that own the
+    /// controls carry them (matrix decision 10 — these are security controls
     /// that EXECUTE inside the capability, not rows that merely depend on one).
+    ///
+    /// **V35 Phase I widened this from one row to three.** A control id names a
+    /// *place* enforcement executes, and the taint beacon and the pre-mutation
+    /// checkpoint each run in two of them — inside the OpenCode plugin, and
+    /// inside a Claude `PreToolUse` shim binary. The Claude sites now have rows,
+    /// so they carry their own control ids rather than the plugin row standing
+    /// for both harnesses.
     #[test]
     fn the_tcb_column_reaches_the_panel() {
         let health = health(&settings_with(None));
         let plugin = find(&health, "opencode.plugin.load_all");
         assert!(plugin.controls.contains(&contract::CONTROL_TOOL_GATE));
-        let marked: Vec<&str> = health
+        assert!(find(&health, "claude.hook.taint_beacon")
+            .controls
+            .contains(&contract::CONTROL_TAINT_BEACON_CLAUDE));
+        assert!(find(&health, "claude.hook.checkpoint_beacon")
+            .controls
+            .contains(&contract::CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE));
+        let mut marked: Vec<&str> = health
             .iter()
             .flat_map(|p| p.capabilities.iter())
             .filter(|c| !c.controls.is_empty())
             .map(|c| c.id)
             .collect();
-        assert_eq!(marked, vec!["opencode.plugin.load_all"]);
+        marked.sort_unstable();
+        assert_eq!(
+            marked,
+            vec![
+                "claude.hook.checkpoint_beacon",
+                "claude.hook.taint_beacon",
+                "opencode.plugin.load_all",
+            ]
+        );
+    }
+
+    /// **V35 Phase I:** a stale spawn-baked artifact reaches the harness header
+    /// it belongs to, and only that one.
+    ///
+    /// This is the whole consumer side of the `chp` field (milestone locked
+    /// decision 4 / design D5). Without this assertion the version would be a
+    /// number on the wire that nothing reads — a computed-then-discarded signal,
+    /// which is what the milestone exists to stop.
+    ///
+    /// Uses a tab id no other test touches, because the peer registry is
+    /// process-global and the suite runs concurrently.
+    #[test]
+    fn a_stale_plugin_reaches_its_harness_header() {
+        let tab = "opencode-health-stale-test";
+        chp::note_for_test(chp::Peer {
+            agent: "opencode".to_string(),
+            tab: tab.to_string(),
+            chp: chp::PRE_CHP,
+            ..Default::default()
+        });
+        let health = health(&settings_with(None));
+        let oc = health.iter().find(|p| p.harness == "opencode").unwrap();
+        let row = oc
+            .stale_plugins
+            .iter()
+            .find(|s| s.tab == tab)
+            .expect("the stale peer must reach the OpenCode header");
+        assert_eq!(row.kind, chp::STALE_OLD_PLUGIN);
+        assert_eq!(row.seen_chp, chp::PRE_CHP);
+        assert_eq!(row.expected, chp::CHP_VERSION);
+        assert!(!row.note.trim().is_empty(), "a report with no sentence");
+
+        // …and it does NOT leak into the other harness's header.
+        let claude = health.iter().find(|p| p.harness == "claude").unwrap();
+        assert!(claude.stale_plugins.iter().all(|s| s.tab != tab));
     }
 
     /// The Phase E gate verdict is attached to the row it is about, and to no
@@ -647,6 +720,13 @@ mod tests {
             "wired_in",
             "last_run",
             "auto_verify",
+            // V35 Phase I — the CHP staleness report and its three display
+            // fields. `note` is the sentence the panel renders verbatim; a
+            // frontend that re-derived it from `seen_chp`/`expected` would be a
+            // second place for the rule to be wrong.
+            "stale_plugins",
+            "seen_chp",
+            "expected",
         ] {
             assert!(
                 TS_TYPES.contains(field),

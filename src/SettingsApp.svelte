@@ -7353,6 +7353,28 @@
                       </span>
                     </li>
                   {/if}
+                  {#if panel.stale_plugins?.length}
+                    <!--
+                      V35 Phase I. The plugin/overlay a tab runs is baked at
+                      LAUNCH, so upgrading cImp with a tab open leaves an old
+                      artifact talking to new loopback code — V32 met that four
+                      times and each time it read as a mysterious failure. The
+                      `chp` version on the wire is what makes it sayable. The
+                      sentence comes from Rust; this only paints it.
+                    -->
+                    <li>
+                      <span class="fact-key">Out-of-step tabs</span>
+                      <span class="badge warn">{panel.stale_plugins.length}</span>
+                      <span class="fact-detail">
+                        {#each panel.stale_plugins as sp (sp.tab)}
+                          <div>
+                            <code>{sp.tab}</code> — sends CHP {sp.seen_chp}, this build
+                            writes CHP {sp.expected}. {sp.note}
+                          </div>
+                        {/each}
+                      </span>
+                    </li>
+                  {/if}
                   {#if brokenNow(panel).length > 0}
                     <li>
                       <span class="fact-key">Broken now</span>

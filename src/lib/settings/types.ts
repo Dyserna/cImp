@@ -1056,6 +1056,31 @@ export interface RunView {
   capped: boolean;
 }
 
+/// V35 Phase I: one tab whose spawn-baked harness artifact is out of step with
+/// the running cImp build. Mirror of Rust `harness::chp::StalePlugin`.
+///
+/// The generated plugin is written to disk at TAB LAUNCH and outlives the binary
+/// that wrote it, so upgrading cImp with a tab still open leaves an old artifact
+/// talking to new loopback code. V32 met that four times as "needs a FRESH TAB
+/// or it reads as a failure"; the `chp` field on the wire is what turns it into
+/// a report. Nothing is refused on the strength of it.
+///
+/// `note` is the sentence, written once in Rust — never re-derived here from
+/// `kind`/`seen_chp`/`expected`, which would be a second place for the rule to
+/// be wrong.
+export interface StalePlugin {
+  tab: string;
+  agent: string;
+  /// The CHP version this tab's artifact actually sends. `0` = it sends none,
+  /// i.e. it predates CHP entirely.
+  seen_chp: number;
+  /// The CHP version this build writes into a freshly generated artifact.
+  expected: number;
+  /// `'old_plugin' | 'new_plugin' | 'harness_version'`.
+  kind: string;
+  note: string;
+}
+
 /// V35 Phase G: one harness's header plus its rows. Mirror of Rust
 /// `harness::health::HarnessHealth`.
 export interface HarnessHealth {
@@ -1070,6 +1095,9 @@ export interface HarnessHealth {
   auto_verify?: AutoVerify | null;
   /// The last run made since launch, when there is one.
   last_run?: RunView | null;
+  /// V35 Phase I: tabs of this harness running an out-of-step artifact. Empty
+  /// is the normal state and renders as nothing.
+  stale_plugins: StalePlugin[];
   capabilities: CapabilityHealth[];
 }
 

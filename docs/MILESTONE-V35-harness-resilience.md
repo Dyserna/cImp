@@ -1,10 +1,12 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phases A–G implemented 2026-08-16 (`82c0da2`,
-`7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`, `4e1c519`).
-GitHub milestone 8, issues #54–#71 (one per phase; #55–#61 + #63 closed;
-#64 stays open — the overlay round-trip needs the scripted-turn probe
-class; #73 filed from Phase D's auth observation).
+**Status:** PHASES A–H IMPLEMENTED 2026-08-16 (`82c0da2`, `7a4262a`,
+`7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`, `4e1c519`, `347c938`) — the
+matrix/canary/probe consolidation is complete. Phases I–M (the plugin
+architecture) not started. GitHub milestone 8: #55–#62 + #63 closed; #64
+open (overlay round-trip needs the scripted-turn probe class); #71 open;
+#73 filed from Phase D's auth observation. Remaining live-verify recipes
+below: 2 (app-level leg), 3, 6 (user leg), 7–10.
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -440,6 +442,46 @@ cargo 2150/0/6, clippy clean, vitest 643, svelte-check 0/0. Decisions:
   verified version with `""`).
 - The F-18 tripwire (`every_settings_pointer_names_a_real_sidebar_section`)
   caught a markdown-emphasis pointer during this phase — it works.
+
+**Phase H (`347c938`, 2026-08-16).** Capture-on-success corpus in
+`harness/capture.rs`: zero-Fail probe runs (background, panel button, and
+`--harness-canary` alike) write scrubbed, version-stamped observed payloads
+to `%LOCALAPPDATA%\cimp\harness-captures\<harness>\<version>\` with a
+MANIFEST per dir; `cimp --harness-capture [--json]` captures regardless of
+outcome into a separate `-failing` lane. Retention: 8 known-good version
+dirs per harness, 3 failing, swept per lane. Live run verified (both
+harnesses captured; automatic restore-after-delete confirmed).
+cargo 2162/0/6, clippy clean. Findings + rulings:
+
+- **FINDING (real): `processing/sanitize.rs` was a terminal-escape
+  stripper only — it had never removed a credential.** Locked decision 4's
+  "scrubbed through sanitize.rs" was not a redaction guarantee until this
+  phase built one: `scrub_payload` composes the escape strip with
+  credential redaction driven by the already-baked `graph/secrets.yar`
+  ruleset (12 rules, exposed as rule data — the note-store screen stays
+  private and fail-open semantics there are untouched). Redaction unit is
+  a container (JSON string value / whole line), fail-closed on every edge:
+  unlocalizable → whole line dropped; >64 KiB line → omitted never
+  truncated; screen unavailable → nothing written at all.
+- **FINDING: Phase D's probes never obtained CLI versions** (the Phase H
+  brief's premise was wrong). Stamps now come from the transcript's
+  `version` field (Claude — the version that *wrote* the observed lines,
+  which may lag the installed CLI; live run stamped 2.1.221 vs installed
+  2.1.232, semantically correct for a capture) and `GET /global/health`
+  (OpenCode, on the already-spawned serve child; deliberately not a
+  registry row — losing it costs a capture stamp and nothing else).
+- **PRECEDENT (orchestrator-accepted): first OS-app-data path in an
+  otherwise fully portable tree.** Everything else is exe-dir-relative;
+  captures must not ride a synced/portable exe dir, so
+  `%LOCALAPPDATA%`/`$XDG_DATA_HOME` is correct here — and consistent with
+  #71's recommendation for the discovery file. Any future machine-local
+  store should reuse this root.
+- Capture gates on the L2 verdict for that harness, not the whole
+  auto-verify report — an L1 failure is a fact about our fixtures, and the
+  live bytes are exactly what a reader regression needs.
+- Stated residual: scrubbing removes credentials, not context — which is
+  why the corpus is bounded (3 lines per capability), machine-local, and
+  promotion to a committed fixture stays a manual reviewed step.
 
 ## Two gaps to fix ahead of the milestone
 

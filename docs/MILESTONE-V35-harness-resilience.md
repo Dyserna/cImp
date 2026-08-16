@@ -1,8 +1,9 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phase A implemented 2026-08-16 (`82c0da2`); Phase B
-underway. GitHub milestone 8, issues #54–#71 (one per phase; #55 = Phase A
-closed by that commit; #63/#64 track the two pre-milestone gaps).
+**Status:** IN PROGRESS — Phase A implemented 2026-08-16 (`82c0da2`), Phase B
+2026-08-16 (`7a4262a`); Phase C underway. GitHub milestone 8, issues #54–#71
+(one per phase; #55/#56 closed by those commits; #63/#64 track the two
+pre-milestone gaps).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -254,6 +255,32 @@ Findings out of Phase A (close-or-defer decided 2026-08-16):
 5. `claude.flag.session_id`'s `VisibleOff` is **declared intent, not observed
    behavior** (a vanished flag kills the tab loudly instead) — Phase E must
    implement it or downgrade the row.
+
+**Phase B (`7a4262a`, 2026-08-16).** Five tests in `harness/canary.rs`
+(`#[cfg(test)]`): the four Tier-C capability canaries + the
+manifest-required-everywhere walker. Fixtures under
+`src-tauri/fixtures/harness/{claude/2.1.232, opencode/1.18.13}/`, synthetic,
+loaded at test runtime (never `include_str!` — the release bundle is
+unchanged). Registry: the four rows flipped to `canary: Some(id)`,
+`Dep::FilePath` added and `claude.transcript.subagents`'s layout dep moved
+onto it. The stale `perm.tui_scrape` literal in the MAINTENANCE prose was
+corrected. Both canary classes were proven to fire by mutate-observe-revert
+(renamed `input_tokens` and `partID`), pending Phase C's permanent negative
+canaries. Decisions binding later phases:
+
+- **One ordered `sse.assistant-turn.jsonl`** rather than §3.1's per-event
+  files — `Tracker` is a state machine; only an ordered turn proves text
+  still comes out. Recorded in that MANIFEST.
+- **Expectations derive from the fixture** (expected speech = concatenated
+  deltas; guarded non-empty), so fixture-name drift and reader regressions
+  fail with distinct messages.
+- **`row(id)` helper** — every canary fetches its registry row through it and
+  asserts the id join both ways; Phase C's cross-check builds on those call
+  sites.
+- Findings: `is_error` is read by `tool_result_is_error` (commit mining), not
+  `extract_tool_results` — canary drives both; `claude.statusline.stdin`
+  under-declares what `extract_context`/`render` read — reconciled in
+  Phase C.
 
 ## Two gaps to fix ahead of the milestone
 

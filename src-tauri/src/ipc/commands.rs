@@ -2728,6 +2728,21 @@ pub struct HarnessStatus {
     /// Every gated capability's verdict, keyed by capability id — the same
     /// query `tabs/config.rs` asks before installing the hook.
     pub capability_gates: Vec<crate::harness::contract::Gate>,
+    /// V35 Phase G: the whole *Harness health* read-model — every registry row
+    /// with its tier, contract sentence, degradation, coverage marks, TCB
+    /// controls, gate verdict and last check result, grouped by harness and
+    /// ordered riskiest-tier-first.
+    ///
+    /// Served from THIS command rather than a sibling: it is the same fresh
+    /// `harness_versions` read and the same `contract::gates` call the payload
+    /// already makes, the command is called on Settings open (and while a run
+    /// is in flight) rather than on any hot path, and a second command would
+    /// mean two round trips that could disagree about the versions they were
+    /// computed against.
+    pub harness_health: Vec<crate::harness::health::HarnessHealth>,
+    /// A verify run is happening right now, so *Run checks now* is a no-op and
+    /// the panel should keep polling.
+    pub verify_in_flight: bool,
 }
 
 /// V16 Feature 1: the harness version + contract-verification state, read
@@ -2744,8 +2759,40 @@ pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<Harne
     settings.harness_versions = versions.clone();
     Ok(HarnessStatus {
         capability_gates: crate::harness::contract::gates(&settings),
+        // V35 Phase G: computed against the SAME fresh-versions settings as the
+        // gates, so the panel's headers, its gate badges and its last-verified
+        // dates are one consistent reading rather than three.
+        harness_health: crate::harness::health::health(&settings),
+        verify_in_flight: crate::harness::verify::in_flight(),
         versions,
     })
+}
+
+/// V35 Phase G: the *Harness health* panel's one action — run this harness's
+/// L1 canaries and L2 probes now.
+///
+/// Returns whether a run STARTED. `false` means one was already in flight (a
+/// second click, or an automatic run triggered by a version change) and this
+/// request was dropped rather than queued; the panel shows the in-flight state
+/// either way and re-reads `harness_versions_get` when it clears.
+///
+/// Fire-and-forget by construction: the work spawns a blocking OS thread that
+/// drives child processes for up to 90s, so the command returns as soon as the
+/// thread is up. The result arrives through the payload above — for Claude via
+/// the Phase F record (the same write path the automatic run uses), for every
+/// harness via the in-memory run summary.
+#[tauri::command]
+pub async fn harness_run_checks(harness: String) -> AppResult<bool> {
+    // Resolved through the probe's own token table rather than a `match` here:
+    // the panel renders `HarnessHealth::harness`, which IS that table's output,
+    // so round-tripping through it is what keeps the button pointed at the
+    // harness whose header it sits under.
+    let h = crate::harness::probe::harness_from_name(harness.trim()).ok_or_else(|| {
+        AppError::Ipc(format!(
+            "harness_run_checks: {harness:?} is not a harness that can be run"
+        ))
+    })?;
+    Ok(crate::harness::verify::run_now(h))
 }
 
 /// V16 Feature 1: the Advisor card's "Mark verified" action — stamp the

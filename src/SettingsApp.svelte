@@ -14,6 +14,7 @@
     auditToolsLoadGlobal,
     auditToolsSaveGlobal,
     consumeSettingsDeepLink,
+    harnessRunChecks,
     harnessVersionsGet,
     listVoices,
     llmPricingGet,
@@ -27,6 +28,8 @@
     AuditDetectResult,
     AuditToolConfig,
     AuditToolId,
+    CapabilityHealth,
+    HarnessHealth,
     HarnessStatus,
     ProcessingDevice,
     Settings,
@@ -39,6 +42,7 @@
     findTab,
     findTabIndex,
     CAP_PRETOOLUSE_DENY,
+    OUTCOME_NO_FAILURE,
     capabilityBlocked,
     // V32 / #48 F-27: the ONE list of spawn-baked injection features, read by
     // both restart-hint shapes below.
@@ -1165,6 +1169,138 @@
   const e1Gate = $derived(capabilityBlocked(harnessFresh, CAP_PRETOOLUSE_DENY));
   const e1Blocked = $derived(e1Gate !== null);
 
+  // ── V35 Phase G: Harness health ─────────────────────────────────────────
+  //
+  // The panel renders `harnessFresh.harness_health` and decides nothing: the
+  // grouping, the tier ordering, the coverage marks and every verdict were
+  // computed in Rust (`harness::health`). What lives here is display state —
+  // which harness's checks the user just started, and the poll that watches for
+  // the run to finish.
+  //
+  // The poll exists because the run is fire-and-forget across a thread boundary
+  // (up to 90s of child processes) and its answers land in two places the
+  // window is not subscribed to: the physical global settings file and an
+  // in-process cache. Re-reading the same command the window already opened
+  // with is cheaper than inventing an event, and it is the same "fetch fresh,
+  // never trust the startup snapshot" rule `harness_versions` has carried since
+  // V16.
+  const HARNESS_POLL_MS = 2000;
+  let harnessPoll: ReturnType<typeof setInterval> | undefined;
+  /// The harness whose checks this window asked for, until the payload shows a
+  /// run in flight (or the poll gives up). Distinct from `verify_in_flight`:
+  /// that flag is process-wide and can be true because of an automatic
+  /// version-change run nobody clicked for.
+  let harnessStarting = $state<string | null>(null);
+  let harnessRunError = $state<string | null>(null);
+  const harnessBusy = $derived(
+    harnessStarting !== null || (harnessFresh?.verify_in_flight ?? false),
+  );
+
+  async function refreshHarness(): Promise<void> {
+    try {
+      harnessFresh = await harnessVersionsGet();
+    } catch (e) {
+      console.warn('harness_versions_get failed', e);
+    }
+  }
+
+  function stopHarnessPoll(): void {
+    if (harnessPoll !== undefined) {
+      clearInterval(harnessPoll);
+      harnessPoll = undefined;
+    }
+  }
+
+  // Poll only while something is running, and stop the moment it clears — a
+  // permanent timer in a settings window is the "anything periodic in a view
+  // must gate on visibility" trap with extra steps. The round cap is the
+  // belt-and-braces half: a backend run is bounded at ~90s, so five minutes of
+  // polling means the flag is wedged, and a wedged flag must not leave a timer
+  // running for the life of the window.
+  const HARNESS_POLL_MAX_ROUNDS = 150;
+  function startHarnessPoll(): void {
+    if (harnessPoll !== undefined) return;
+    let rounds = 0;
+    harnessPoll = setInterval(async () => {
+      rounds += 1;
+      await refreshHarness();
+      // The optimistic flag is held until the BACKEND says nothing is running:
+      // clearing it as soon as the payload confirms the run would flip the
+      // button's label back to idle while the checks were still going.
+      if (!(harnessFresh?.verify_in_flight ?? false) || rounds >= HARNESS_POLL_MAX_ROUNDS) {
+        harnessStarting = null;
+        stopHarnessPoll();
+      }
+    }, HARNESS_POLL_MS);
+  }
+
+  async function runHarnessChecks(harness: string): Promise<void> {
+    if (harnessBusy) return;
+    harnessRunError = null;
+    harnessStarting = harness;
+    startHarnessPoll();
+    try {
+      const started = await harnessRunChecks(harness);
+      if (!started) {
+        // Single-flight said no: a run was already going. Not an error — the
+        // poll will show its result — but say so rather than pretending this
+        // click did something.
+        harnessRunError =
+          'A verification run was already in progress; this request was dropped. Its result will appear here when it finishes.';
+      }
+    } catch (e) {
+      harnessRunError = String(e);
+      harnessStarting = null;
+      stopHarnessPoll();
+    }
+  }
+
+  /// Coarse age of a timestamp, for "last verified 3 h ago". Display-only: the
+  /// panel needs the shape of the number, not its precision.
+  function ageOf(atMs: number): string {
+    const delta = Date.now() - atMs;
+    if (!Number.isFinite(delta) || delta < 0) return 'just now';
+    const mins = Math.floor(delta / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} h ago`;
+    return `${Math.floor(hours / 24)} d ago`;
+  }
+
+  /// The badge class for one row's last outcome. `no_failure` deliberately does
+  /// NOT get the pass styling — the stored record keeps failures only, so it is
+  /// the weaker statement and must not read as a green tick.
+  function outcomeClass(outcome: string): string {
+    if (outcome === 'fail') return 'bad';
+    if (outcome === 'pass') return 'good';
+    return 'quiet';
+  }
+
+  function outcomeLabel(outcome: string): string {
+    if (outcome === OUTCOME_NO_FAILURE) return 'no failure reported';
+    return outcome;
+  }
+
+  /// The badge class for a stored `AutoVerify.status`. Only the two statuses
+  /// Rust writes get a colour; anything else is a hand edit (or a record from a
+  /// newer cImp) and stays neutral rather than being guessed into "fine" —
+  /// the same direction `harness::verify::tripwire_superseded` takes.
+  function recordClass(status: string): string {
+    if (status === 'fail') return 'bad';
+    if (status === 'pass') return 'good';
+    return 'quiet';
+  }
+
+  /// Rows whose seam is the one that breaks silently on a cosmetic upstream
+  /// change, counted for the header. Display summary only — the rows carry the
+  /// facts.
+  function brokenNow(h: HarnessHealth): CapabilityHealth[] {
+    return h.capabilities.filter(
+      (c) => c.last_verify?.outcome === 'fail' || c.gate?.blocked,
+    );
+  }
+
   // Sidebar nav: which group is visible. The template gates each <section>
   // on this so only one group renders at a time. Default lands on 'theme'
   // (Appearance sits at the top of the nav order).
@@ -1186,6 +1322,7 @@
     | 'code-audit'
     | 'pricing'
     | 'workbench'
+    | 'harness'
     | 'advanced'
     | 'about';
   let activeSection = $state<SectionId>('theme');
@@ -1222,6 +1359,16 @@
     { id: 'code-audit', label: 'Code Audit' },
     { id: 'pricing', label: 'LLM pricing' },
     { id: 'workbench', label: 'Workbench' },
+    // V35 Phase G, following the same rule Sandboxing was created under (V33
+    // decision 16) and for the reason F-18 taught: a top-level category of its
+    // own, named exactly as the milestone and the docs name it, so every
+    // pointer at it is findable. It is deliberately NOT a sub-tab of Code
+    // Intelligence or Tabs — the rows it shows govern the transcript readers,
+    // the statusline, the hooks, the OpenCode tap AND the native-tool gate, so
+    // burying it under any one consumer would misdescribe its scope. Adjacent
+    // to Advanced because it is a status board, not a set of knobs: it is
+    // entirely read-only apart from one button.
+    { id: 'harness', label: 'Harness health' },
     { id: 'advanced', label: 'Advanced' },
     { id: 'about', label: 'About' },
   ];
@@ -1383,9 +1530,13 @@
     auditRefreshCensus()
       .then((s) => (auditCensus = s.census))
       .catch(() => {});
-    harnessVersionsGet()
-      .then((hv) => (harnessFresh = hv))
-      .catch((e) => console.warn('harness_versions_get failed', e));
+    // V35 Phase G: this now also fills the Harness health panel. If a run is
+    // already in flight when the window opens (an automatic version-change
+    // check, say), start watching for it immediately rather than showing a
+    // stale board until the user clicks something.
+    void refreshHarness().then(() => {
+      if (harnessFresh?.verify_in_flight) startHarnessPoll();
+    });
     for (const t of AI_TABS) {
       aiToolTabDefaults(t)
         .then((d) => {
@@ -1447,6 +1598,10 @@
     unlistenDeepLink?.();
     unlistenRestartHint?.();
     if (backendStatusTimer) clearInterval(backendStatusTimer);
+    // V35 Phase G: the harness-verify watcher. The backend run keeps going —
+    // it is a detached thread that writes through the settings file — but this
+    // window stops asking about it.
+    stopHarnessPoll();
   });
 
   /// Mutate the live snapshot via `updater`, then push to the backend.
@@ -7105,6 +7260,218 @@
             rather than failing.
           </small>
         </section>
+      {:else if activeSection === 'harness'}
+        <section>
+          <!--
+            V35 Phase G — the matrix draft's third consumer (§ 3.3): the screen
+            that answers "what is actually broken right now" without reading
+            source. Everything below is RENDERED, not decided: the grouping,
+            the tier order, the coverage marks, the gate verdicts and every
+            outcome come from `harness::health::health()`. The one piece of
+            logic here is display grouping, which is the whole point — a rule
+            about the registry re-implemented in Svelte is a rule with no test.
+          -->
+          <h2>Harness health</h2>
+          <small class="hint top">
+            cImp rides two user-installed CLIs it does not pin, and both
+            self-update. Each row below is one thing cImp depends on from them,
+            ranked by the <strong>seam</strong> it sits in — Tier D (scraped UI,
+            undocumented behavior) breaks silently on a cosmetic upstream change
+            and is listed first; Tier A (MCP) has never broken cImp at all. This
+            page is read-only apart from <em>Run checks now</em>.
+          </small>
+          {#if !harnessFresh}
+            <small class="hint">Reading the capability registry…</small>
+          {:else}
+            {#if harnessRunError}
+              <small class="error">{harnessRunError}</small>
+            {/if}
+            {#if harnessBusy && harnessStarting === null}
+              <small class="hint">
+                A verification run is already in progress — most likely the automatic
+                check that follows a CLI version change. This page updates when it
+                finishes.
+              </small>
+            {/if}
+            {#each harnessFresh.harness_health as panel (panel.harness)}
+              <div class="harness-panel">
+                <div class="harness-head">
+                  <span class="harness-title">{panel.label}</span>
+                  <!--
+                    Every button is disabled while ANY run is in flight — the
+                    single flight is process-wide (one set of `claude --help` /
+                    `opencode serve` children at a time), so a second harness's
+                    click would be dropped rather than queued. Only the harness
+                    actually running says so, and the shared note below covers
+                    the case where the run is an automatic one nobody clicked.
+                  -->
+                  <button
+                    onclick={() => void runHarnessChecks(panel.harness)}
+                    disabled={harnessBusy}
+                  >
+                    {harnessStarting === panel.harness
+                      ? 'Running checks…'
+                      : 'Run checks now'}
+                  </button>
+                </div>
+                <ul class="harness-facts">
+                  <li>
+                    <span class="fact-key">Version seen</span>
+                    <code>{panel.last_seen || 'not observed yet'}</code>
+                  </li>
+                  {#if panel.last_verified != null}
+                    <li>
+                      <span class="fact-key">Contracts verified against</span>
+                      <code>{panel.last_verified || 'never verified'}</code>
+                      {#if panel.last_seen && panel.last_verified && panel.last_seen !== panel.last_verified}
+                        <span class="badge warn">behind the installed build</span>
+                      {/if}
+                    </li>
+                  {/if}
+                  {#if panel.auto_verify}
+                    <li>
+                      <span class="fact-key">Last automatic run</span>
+                      <span class="badge {recordClass(panel.auto_verify.status)}"
+                        >{panel.auto_verify.status}</span
+                      >
+                      <span class="fact-detail">
+                        against <code>{panel.auto_verify.version || 'no version'}</code>,
+                        {ageOf(panel.auto_verify.at_ms)}
+                      </span>
+                    </li>
+                  {/if}
+                  {#if panel.last_run}
+                    <li>
+                      <span class="fact-key">Last run this session</span>
+                      <span class="fact-detail">
+                        {panel.last_run.pass} pass · {panel.last_run.fail} fail ·
+                        {panel.last_run.unknown} unknown · {panel.last_run.transition}
+                        transition, {ageOf(panel.last_run.at_ms)}
+                        {#if panel.last_run.capped}
+                          — the live-probe half was skipped for time
+                        {/if}
+                      </span>
+                    </li>
+                  {/if}
+                  {#if brokenNow(panel).length > 0}
+                    <li>
+                      <span class="fact-key">Broken now</span>
+                      <span class="badge bad">{brokenNow(panel).length}</span>
+                      <span class="fact-detail"
+                        >{brokenNow(panel)
+                          .map((c) => c.id)
+                          .join(', ')}</span
+                      >
+                    </li>
+                  {/if}
+                </ul>
+                <ul class="cap-list">
+                  {#each panel.capabilities as cap (cap.id)}
+                    <li
+                      class="cap"
+                      class:cap-bad={cap.last_verify?.outcome === 'fail' ||
+                        cap.gate?.blocked}
+                    >
+                      <div class="cap-head">
+                        <span class="badge tier tier-{cap.tier}">Tier {cap.tier}</span>
+                        <code class="cap-id">{cap.id}</code>
+                        {#if cap.controls.length > 0}
+                          <!--
+                            Matrix decision 10: a TCB row does not merely carry
+                            data for a security control, the control EXECUTES
+                            inside it. Marked distinctly so a reviewer cannot
+                            read it as another data pipe.
+                          -->
+                          <span class="badge tcb" title="Security control executes here"
+                            >TCB</span
+                          >
+                        {/if}
+                        {#if cap.last_verify}
+                          <span class="badge {outcomeClass(cap.last_verify.outcome)}"
+                            >{outcomeLabel(cap.last_verify.outcome)}</span
+                          >
+                        {:else}
+                          <span class="badge quiet">never checked</span>
+                        {/if}
+                      </div>
+                      <p class="cap-contract">{cap.contract}</p>
+                      <div class="cap-marks">
+                        <span class="mark {cap.degradation.kind === 'silent' ? 'bad' : ''}"
+                          >{cap.degradation.label}</span
+                        >
+                        {#if cap.degradation.user_message}
+                          <span class="mark quiet">“{cap.degradation.user_message}”</span>
+                        {/if}
+                        {#if cap.degradation.fallback_to}
+                          <span class="mark quiet"
+                            >Falls back to <code>{cap.degradation.fallback_to}</code></span
+                          >
+                        {/if}
+                      </div>
+                      <div class="cap-marks">
+                        {#if cap.coverage.canary}
+                          <span class="badge good">canary L1</span>
+                        {/if}
+                        {#if cap.coverage.probe}
+                          <span class="badge good">live probe L2</span>
+                        {/if}
+                        {#if cap.coverage.unproven}
+                          <span class="badge warn">waiver only — nothing checks this</span>
+                        {:else if cap.coverage.waiver}
+                          <span class="badge quiet">waiver</span>
+                        {/if}
+                        {#if !cap.coverage.canary && !cap.coverage.probe && !cap.coverage.waiver}
+                          <span class="badge quiet">no automatic check</span>
+                        {/if}
+                        {#each cap.controls as control (control)}
+                          <span class="badge tcb">{control}</span>
+                        {/each}
+                      </div>
+                      {#if cap.gate?.blocked}
+                        <small class="error">Gated off: {cap.gate.reason}</small>
+                      {/if}
+                      {#if cap.last_verify}
+                        <small class="hint">
+                          {cap.last_verify.detail}
+                          <br />
+                          {ageOf(cap.last_verify.at_ms)}, against
+                          <code>{cap.last_verify.version || 'no recorded version'}</code>
+                          {#if cap.last_verify.evidence}
+                            · <code>{cap.last_verify.evidence}</code>
+                          {/if}
+                        </small>
+                      {/if}
+                      {#if cap.coverage.waiver}
+                        <details class="cap-more">
+                          <summary>Why nothing automatic covers it</summary>
+                          <small class="hint">{cap.coverage.waiver}</small>
+                        </details>
+                      {/if}
+                      <details class="cap-more">
+                        <summary>What breaks if this drifts</summary>
+                        <small class="hint">
+                          {#each cap.wired_in as path (path)}
+                            <code>{path}</code>{' '}
+                          {/each}
+                        </small>
+                      </details>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            {/each}
+            <small class="hint down">
+              <em>Run checks now</em> drives this harness's embedded fixture canaries
+              (L1) and then the installed CLI itself (L2); it takes up to 90 seconds
+              and only one run happens at a time across the whole app. For Claude
+              Code it records the same result an automatic post-update run would, and
+              advances the verified version when nothing failed. Recording a
+              <em>manual</em> contract spike (the D0 / E1 behaviours no payload can
+              reveal) is still the Advisor card's <em>Mark verified</em>, not this
+              button.
+            </small>
+          {/if}
+        </section>
       {:else if activeSection === 'workbench'}
         <section>
           <h2>Workbench</h2>
@@ -7773,6 +8140,135 @@
   .badge.warn {
     color: var(--text-warning, #d08770);
     border-color: var(--border-warning, #d08770);
+  }
+  /* V35 Phase G — Harness health. Deliberately built out of the idiom already
+     here (.badge, the card border/radius of .policy-card, .backend-card's
+     sunken surface) rather than a new visual language: this panel is a status
+     board inside Settings, not a dashboard of its own. */
+  .badge.good {
+    color: var(--accent, #6abf69);
+    border-color: var(--accent, #6abf69);
+  }
+  .badge.bad {
+    color: var(--text-danger-soft, #d06b6b);
+    border-color: var(--text-danger-soft, #d06b6b);
+  }
+  .badge.quiet {
+    color: var(--text-quiet, #999);
+  }
+  /* The TCB mark. Filled rather than outlined so a security control reads
+     differently from a data pipe at a glance (matrix decision 10). */
+  .badge.tcb {
+    color: var(--text-warning, #d08770);
+    border-color: var(--border-warning, #d08770);
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .badge.tier {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Tier D is the riskiest seam and leads each list; the colour repeats the
+     ordering so a scroll past the top still reads. */
+  .badge.tier-D {
+    color: var(--text-danger-soft, #d06b6b);
+    border-color: var(--text-danger-soft, #d06b6b);
+  }
+  .badge.tier-C {
+    color: var(--text-warning, #d08770);
+    border-color: var(--border-warning, #d08770);
+  }
+  .harness-panel {
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin: 0.75rem 0;
+  }
+  .harness-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .harness-title {
+    font-weight: 600;
+  }
+  .harness-facts {
+    list-style: none;
+    margin: 0.5rem 0 0.75rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: var(--font-size-sm);
+  }
+  .harness-facts li {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .fact-key {
+    min-width: 12rem;
+    color: var(--text-quiet, #999);
+  }
+  .fact-detail {
+    color: var(--text-quiet, #999);
+  }
+  .cap-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .cap {
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.5rem 0.6rem;
+    background: var(--surface-sunken);
+  }
+  /* A row that FAILED or is gated off gets a left rule — the panel's whole
+     question is "what is broken right now", so the answer must be findable
+     without reading every row. */
+  .cap-bad {
+    border-left: 3px solid var(--text-danger-soft, #d06b6b);
+  }
+  .cap-head {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .cap-id {
+    font-weight: 600;
+  }
+  .cap-contract {
+    margin: 0.35rem 0 0.25rem;
+    font-size: var(--font-size-sm);
+  }
+  .cap-marks {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: var(--font-size-sm);
+    margin-bottom: 0.2rem;
+  }
+  .cap-marks .mark {
+    color: var(--text-quiet, #999);
+  }
+  .cap-marks .mark.bad {
+    color: var(--text-danger-soft, #d06b6b);
+  }
+  .cap-more {
+    font-size: var(--font-size-sm);
+    margin-top: 0.2rem;
+  }
+  .cap-more summary {
+    cursor: pointer;
+    color: var(--text-quiet, #999);
   }
   /* Multiline, word-wrapping Server command field so every argument of a long
      llama-server invocation stays visible without horizontal scrolling. */

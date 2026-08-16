@@ -32,8 +32,14 @@
 //! cannot-verify fallback; what a user sees instead is a notice naming the
 //! capability that actually broke.
 //!
-//! Still to come: the Settings *Harness health* panel (Phase G) and the
-//! capture-on-success corpus (Phase H).
+//! Phase G adds [`health`], the registry's read-model for the Settings
+//! *Harness health* panel: every row's tier, contract, degradation, coverage
+//! marks and TCB flags, joined against the Phase E gate verdicts, the Phase F
+//! record on disk and the last run made in this process — computed here so the
+//! panel renders an answer instead of re-deriving one, and so "what is broken
+//! right now" stops requiring a source read.
+//!
+//! Still to come: the capture-on-success corpus (Phase H).
 //!
 //! Design: `docs/MILESTONE-V35-harness-resilience.md` (the why and the locked
 //! decisions), `docs/DESIGN-harness-capability-matrix.md` (the types and the
@@ -42,5 +48,6 @@
 
 pub mod canary;
 pub mod contract;
+pub mod health;
 pub mod probe;
 pub mod verify;

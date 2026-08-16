@@ -50,6 +50,7 @@
 //! button mean something again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::harness::contract::{self, Harness};
@@ -258,6 +259,82 @@ fn answer_from_probe(r: ProbeResult) -> Answer {
     }
 }
 
+// ── what the panel reads (V35 Phase G) ──────────────────────────────────────
+
+/// One completed run, kept **in memory only**, per harness.
+///
+/// The persisted [`AutoVerify`] record is failures-only by design (it is what
+/// the Advisor needs, and a per-capability result table would be a growing
+/// Settings field plus the schema bump the milestone's deploy-trap note warns
+/// about). That is enough to raise a card and enough to gate an advance, but it
+/// cannot answer *this* row's question in the Harness health panel: a row the
+/// record does not name might have passed, or might not have been checkable at
+/// all, and the disk cannot tell those apart.
+///
+/// So the full four-value answer lives here, for the life of the process, and
+/// the panel prefers it when present. Losing it on restart is the right
+/// trade — a run is cheap to repeat (*Run checks now*), and the alternative is
+/// storing state whose staleness would be invisible.
+///
+/// It is also the ONLY place an OpenCode run is reported: Phase F persists a
+/// Claude record and nothing else, and inventing an `opencode_auto_verify`
+/// field to make the button symmetric would be exactly the stored state this
+/// phase does not need.
+#[derive(Debug, Clone)]
+pub struct RunSummary {
+    pub harness: Harness,
+    /// The harness version the run was made against — empty when cImp has never
+    /// observed one (a CLI that has not written a transcript yet).
+    pub version: String,
+    /// Wall-clock ms the run finished.
+    pub at_ms: u64,
+    /// The L2 group was skipped for budget. Recorded, never scored.
+    pub capped: bool,
+    /// Every answer, in run order — including the `unknown`s and `transition`s
+    /// the record deliberately drops.
+    pub answers: Vec<Answer>,
+}
+
+/// At most one entry per harness — a short list rather than a map because
+/// [`Harness`] is a two-value enum in practice and a linear scan of two is not
+/// worth a hash. Poisoning is swallowed on both sides: a panicking writer must
+/// degrade the panel to "no run recorded", never take the Settings window down
+/// with it.
+static LAST_RUNS: Mutex<Vec<RunSummary>> = Mutex::new(Vec::new());
+
+/// Record a finished run, replacing this harness's previous one.
+fn remember(report: &Report, version: &str) {
+    let summary = RunSummary {
+        harness: report.harness,
+        version: version.to_string(),
+        at_ms: crate::activity::now_ms(),
+        capped: report.capped,
+        answers: report.answers.clone(),
+    };
+    let Ok(mut runs) = LAST_RUNS.lock() else {
+        return;
+    };
+    runs.retain(|r| r.harness != summary.harness);
+    runs.push(summary);
+}
+
+/// The last run this process made for `harness`, if any.
+pub fn last_run(harness: Harness) -> Option<RunSummary> {
+    LAST_RUNS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|r| r.harness == harness)
+        .cloned()
+}
+
+/// Whether a verify worker is running right now — the panel's in-flight state,
+/// and the reason a second *Run checks now* click is a no-op rather than a
+/// second set of child processes.
+pub fn in_flight() -> bool {
+    IN_FLIGHT.load(Ordering::SeqCst)
+}
+
 // ── the triggers ────────────────────────────────────────────────────────────
 
 /// Set while a verify worker is alive. A second trigger is DROPPED rather than
@@ -313,6 +390,91 @@ pub fn spawn_startup_check() {
     spawn_worker("startup (seen != verified)");
 }
 
+/// Trigger (c), V35 Phase G: the Settings → Harness health panel's **Run
+/// checks now**, for one harness.
+///
+/// The pointer above is deliberately unadorned prose: `settings::
+/// frontend_mirrors::every_settings_pointer_names_a_real_sidebar_section` (the
+/// #48 F-18 tripwire) matches the sidebar label immediately after the arrow, so
+/// wrapping the section name in emphasis makes the pointer resolve to nothing.
+///
+/// Returns whether a run was STARTED. `false` means one was already in flight
+/// and this click was dropped — the panel surfaces that rather than queueing a
+/// second set of `claude --help` / `opencode serve` children, and the single
+/// flight is shared with the automatic triggers on purpose: they do the same
+/// work, and two of them racing would double the child processes to learn the
+/// same thing twice.
+///
+/// Unlike the automatic triggers this does **not** require `seen != verified`.
+/// A user asking for the checks is asking about the build installed right now,
+/// whatever cImp last stamped.
+pub fn run_now(harness: Harness) -> bool {
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        tracing::debug!(?harness, "harness verify already running; Run checks now was a no-op");
+        return false;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("harness-verify-manual".to_string())
+        .spawn(move || {
+            let _guard = InFlight;
+            manual_run(harness);
+        });
+    if let Err(e) = spawned {
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+        tracing::warn!(error = %e, "manual harness verify thread could not be spawned");
+        return false;
+    }
+    true
+}
+
+/// One **Run checks now** click.
+///
+/// The Claude arm goes through [`run_once`] — the same write path Phase F's
+/// automatic run uses, so a manual run records the same `claude_auto_verify`
+/// and advances `claude_last_verified` under the same all-pass rule. A second
+/// spelling of that write is how the button and the worker would come to
+/// disagree about what "verified" means.
+fn manual_run(harness: Harness) {
+    let hv = crate::settings::read_global_harness_versions();
+    match harness {
+        Harness::Claude => {
+            let seen = hv.claude_last_seen.trim().to_string();
+            if seen.is_empty() {
+                // Nothing to stamp a record against: cImp has never observed
+                // this CLI write a transcript. Run the checks anyway — the
+                // per-capability answers are what the panel shows — but write
+                // NO record. An `AutoVerify` stamped with an empty version
+                // would compare equal to every other empty version, and the
+                // all-pass advance would overwrite a real `claude_last_verified`
+                // with "".
+                let report = verify(Harness::Claude);
+                tracing::info!(tally = ?report.tally(), "manual harness verify ran with no known version; not recorded");
+                remember(&report, "");
+                return;
+            }
+            run_once(&seen);
+        }
+        other => {
+            // No persisted record exists for any other harness (see
+            // [`RunSummary`]), so the in-memory summary IS the result.
+            let version = match other {
+                Harness::OpenCode => hv.opencode_last_seen.trim().to_string(),
+                _ => String::new(),
+            };
+            let report = verify(other);
+            let (pass, fail, unknown, transition) = report.tally();
+            tracing::info!(
+                harness = ?other,
+                version = %version,
+                pass, fail, unknown, transition,
+                capped = report.capped,
+                "manual harness verify finished"
+            );
+            remember(&report, &version);
+        }
+    }
+}
+
 fn spawn_worker(why: &'static str) {
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
         tracing::debug!(trigger = why, "harness auto-verify already running; trigger dropped");
@@ -364,6 +526,11 @@ fn run_once(version: &str) {
     let record = report.record(version, crate::activity::now_ms());
     let advance = report.advances();
     let (pass, fail, unknown, transition) = report.tally();
+    // V35 Phase G: keep the FULL answer set in memory too. The record about to
+    // be written keeps failures only, so without this the Harness health panel
+    // could never distinguish "passed" from "could not be checked" for a row
+    // that did not fail.
+    remember(&report, version);
 
     // Both the record and the advance go through `mutate_global_harness_versions`
     // in ONE call. Never `save_settings`, never the overlay path: `harness_versions`
@@ -681,6 +848,71 @@ mod tests {
             vec!["opencode.sse.events"]
         );
         assert!(opencode.advances());
+    }
+
+    /// V35 Phase G: the in-memory run summary, which is what lets the panel
+    /// tell "passed" from "could not be checked" for a row the stored record
+    /// does not name.
+    ///
+    /// Keyed on [`Harness::Any`] deliberately. [`LAST_RUNS`] is process-wide
+    /// and `harness::health` asks it about Claude and OpenCode, so writing a
+    /// real harness here would leak into that module's fixtures depending on
+    /// test order — the neutral marker is invisible to it.
+    #[test]
+    fn a_remembered_run_is_readable_and_replaced_per_harness() {
+        assert!(
+            last_run(Harness::Any).is_none(),
+            "nothing is ever recorded for the neutral harness outside this test"
+        );
+
+        let first = Report {
+            harness: Harness::Any,
+            answers: vec![answer(
+                "a",
+                Outcome::Pass {
+                    detail: "one".to_string(),
+                },
+            )],
+            capped: true,
+        };
+        remember(&first, "1.0.0");
+        let got = last_run(Harness::Any).expect("the run was recorded");
+        assert_eq!(got.version, "1.0.0");
+        assert!(got.capped, "the budget flag survives");
+        assert!(got.at_ms > 0, "a run is stamped so the panel can age it");
+        assert_eq!(got.answers.len(), 1);
+
+        let second = Report {
+            harness: Harness::Any,
+            answers: vec![
+                answer(
+                    "b",
+                    Outcome::Unknown {
+                        why: "two".to_string(),
+                    },
+                ),
+                answer(
+                    "c",
+                    Outcome::Fail {
+                        detail: "three".to_string(),
+                    },
+                ),
+            ],
+            capped: false,
+        };
+        remember(&second, "2.0.0");
+        let got = last_run(Harness::Any).expect("the run was recorded");
+        assert_eq!(got.version, "2.0.0", "the newer run replaces the older one");
+        assert!(!got.capped);
+        assert_eq!(
+            got.answers.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+        // The `unknown` survives, which is the whole point: `Report::record`
+        // drops it, and its silence in the stored record is indistinguishable
+        // from a pass.
+        assert_eq!(got.answers[0].outcome.label(), "unknown");
+        assert_eq!(got.answers[1].outcome.label(), "fail");
     }
 
     /// Single-flight: the second trigger while one is in flight is dropped, and

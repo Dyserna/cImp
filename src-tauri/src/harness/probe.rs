@@ -142,7 +142,12 @@ impl ProbeResult {
     }
 }
 
-fn harness_name(h: Harness) -> &'static str {
+/// The wire token for a harness. `pub(crate)` since V35 Phase G: the *Harness
+/// health* payload speaks the same tokens the `--harness-canary` report and its
+/// `--json` twin print, so a user reading the panel and a user reading the CLI
+/// report are looking at one vocabulary — and the panel's *Run checks now*
+/// passes the token straight back over IPC.
+pub(crate) fn harness_name(h: Harness) -> &'static str {
     match h {
         Harness::Claude => "claude",
         Harness::OpenCode => "opencode",
@@ -150,7 +155,21 @@ fn harness_name(h: Harness) -> &'static str {
     }
 }
 
-fn tier_name(t: Seam) -> &'static str {
+/// The inverse of [`harness_name`], for a token arriving from the frontend.
+/// Lives beside it so the two spellings can never part company, and returns
+/// `None` rather than defaulting — a mistyped token must fail the IPC call, not
+/// silently drive the wrong CLI. [`Harness::Any`] is deliberately not
+/// accepted: it names no installed product, so there is nothing to run.
+pub(crate) fn harness_from_name(s: &str) -> Option<Harness> {
+    match s {
+        "claude" => Some(Harness::Claude),
+        "opencode" => Some(Harness::OpenCode),
+        _ => None,
+    }
+}
+
+/// The wire token for a seam tier — `pub(crate)` for the same reason.
+pub(crate) fn tier_name(t: Seam) -> &'static str {
     match t {
         Seam::A => "A",
         Seam::B => "B",

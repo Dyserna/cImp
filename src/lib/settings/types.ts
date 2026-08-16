@@ -952,12 +952,132 @@ export interface CapabilityGate {
 }
 
 /// The `harness_versions_get` payload. Mirror of Rust
-/// `ipc::commands::HarnessStatus`: the raw out-of-band record plus the
-/// **computed** gate verdicts for every gated capability.
+/// `ipc::commands::HarnessStatus`: the raw out-of-band record, the **computed**
+/// gate verdicts for every gated capability, and (V35 Phase G) the whole
+/// *Harness health* read-model.
 export interface HarnessStatus {
   versions: HarnessVersions;
   capability_gates: CapabilityGate[];
+  /// One entry per harness, in display order, each already ordered
+  /// riskiest-tier-first. Computed in Rust — the panel groups and paints, it
+  /// does not decide.
+  harness_health: HarnessHealth[];
+  /// A verify run is in flight, so "Run checks now" is a no-op and the panel
+  /// keeps polling until it clears.
+  verify_in_flight: boolean;
 }
+
+/// V35 Phase G: what cImp does when a capability is known-broken. Mirror of
+/// Rust `harness::health::DegradationView`.
+///
+/// `label` is the sentence, written once in Rust — never re-derived from
+/// `kind` here, which would be a fifth place for the four variants to be
+/// spelled.
+export interface DegradationView {
+  /// `'silent' | 'visible_off' | 'fail_closed' | 'fallback'`. The dangerous one
+  /// is `'silent'`.
+  kind: string;
+  label: string;
+  /// What the user is told when a `'visible_off'` row breaks.
+  user_message?: string | null;
+  /// The capability id that takes over for a `'fallback'` row — a join key, so
+  /// the panel can point at the row.
+  fallback_to?: string | null;
+}
+
+/// V35 Phase G: what actually checks a capability. Mirror of Rust
+/// `harness::health::Coverage`.
+export interface Coverage {
+  /// The L1 embedded-fixture canary id (which IS the capability id).
+  canary?: string | null;
+  /// The L2 live-probe id (likewise).
+  probe?: string | null;
+  /// The accepted-residual note: why nothing mechanical covers this row yet.
+  waiver?: string | null;
+  /// Degrades SILENTLY and is covered by prose alone — the weakest state on
+  /// the board, and the one the panel must not let look like a canaried row.
+  /// Computed in Rust; never re-derive it from the three fields above.
+  unproven: boolean;
+}
+
+/// V35 Phase G: the last thing any check said about one capability. Mirror of
+/// Rust `harness::health::VerifyView`.
+///
+/// `outcome` is `'pass' | 'fail' | 'unknown' | 'transition'` when `from_run`
+/// (a full answer from a run made since launch), or `'no_failure'` when read
+/// out of the stored record — which keeps FAILURES only, so a row it does not
+/// name might equally have passed or have been uncheckable. Render
+/// `'no_failure'` as the weaker statement it is, never as a pass.
+export interface VerifyView {
+  outcome: string;
+  evidence: string;
+  detail: string;
+  at_ms: number;
+  version: string;
+  from_run: boolean;
+}
+
+/// V35 Phase G: one registry row as the panel shows it. Mirror of Rust
+/// `harness::health::CapabilityHealth`.
+export interface CapabilityHealth {
+  /// The join key, displayed verbatim — it is the vocabulary the Advisor cards
+  /// speak, so a user must be able to match a card to a row by eye.
+  id: string;
+  harness: string;
+  /// `'A'`..`'D'` — the seam, which predicts how it breaks.
+  tier: string;
+  contract: string;
+  degradation: DegradationView;
+  coverage: Coverage;
+  /// The TCB column: security controls that EXECUTE inside this capability.
+  /// Marked distinctly — these rows are not data pipes.
+  controls: string[];
+  /// The modules that break if this drifts.
+  wired_in: string[];
+  /// The Phase E gate verdict, when this capability has one at all. Absent =
+  /// ungated, which is a different statement from "gated and currently fine".
+  gate?: CapabilityGate | null;
+  /// Absent = no check has ever spoken about this row.
+  last_verify?: VerifyView | null;
+}
+
+/// V35 Phase G: the tally of a run made in this process. Mirror of Rust
+/// `harness::health::RunView`. In-memory only — it is the visible consequence
+/// of "Run checks now", and the only place an OpenCode run is reported at all.
+export interface RunView {
+  at_ms: number;
+  version: string;
+  pass: number;
+  fail: number;
+  unknown: number;
+  transition: number;
+  /// The time budget was spent before the L2 probes started, so they did not
+  /// run. Recorded, never scored.
+  capped: boolean;
+}
+
+/// V35 Phase G: one harness's header plus its rows. Mirror of Rust
+/// `harness::health::HarnessHealth`.
+export interface HarnessHealth {
+  /// `'claude' | 'opencode'` — passed straight back to `harness_run_checks`.
+  harness: string;
+  label: string;
+  last_seen: string;
+  /// Absent for a harness with no verified column at all (OpenCode) —
+  /// deliberately not `''`, which would read as "verified against nothing".
+  last_verified?: string | null;
+  /// The persisted Phase F record, when this harness has one.
+  auto_verify?: AutoVerify | null;
+  /// The last run made since launch, when there is one.
+  last_run?: RunView | null;
+  capabilities: CapabilityHealth[];
+}
+
+/// The `VerifyView.outcome` token meaning "the stored record did not name this
+/// capability among its failures" — which is NOT a pass. Spelled here because
+/// `harness::health::tests::the_health_field_names_reach_the_frontend` fails
+/// the Rust build if the panel stops knowing the distinction.
+export const OUTCOME_NO_FAILURE = 'no_failure';
 
 /// The capability id the read advisor's `PreToolUse` deny is gated on — the
 /// join key shared verbatim with Rust's `contract::CAP_PRETOOLUSE_DENY` and

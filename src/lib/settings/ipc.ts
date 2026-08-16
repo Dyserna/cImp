@@ -94,8 +94,24 @@ export async function llmPricingSet(pricing: LlmPricingModel[]): Promise<void> {
 /// V35 Phase E: the payload also carries `capability_gates` — the gate verdicts
 /// computed in Rust against those fresh versions, so the window renders an
 /// answer instead of re-deriving one.
+/// V35 Phase G: the payload also carries `harness_health` — the whole
+/// *Harness health* read-model (every capability's tier, contract, degradation,
+/// coverage, TCB marks, gate verdict and last check result) plus
+/// `verify_in_flight`. Re-called on a short timer while a run is in flight.
 export async function harnessVersionsGet(): Promise<HarnessStatus> {
   return invoke('harness_versions_get');
+}
+
+/// V35 Phase G: the *Harness health* panel's one action — run this harness's
+/// L1 canaries and L2 probes now. `harness` is the token the panel renders
+/// (`HarnessHealth.harness`).
+///
+/// Returns whether a run STARTED; `false` means one was already in flight and
+/// the click was dropped (single-flight, shared with the automatic
+/// version-change trigger). Fire-and-forget: the answers arrive through the
+/// next `harnessVersionsGet`, not from this call.
+export async function harnessRunChecks(harness: string): Promise<boolean> {
+  return invoke('harness_run_checks', { harness });
 }
 
 /// V23 Phase A: resolve one Code Audit tool and probe `<tool> --version`.

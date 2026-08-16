@@ -670,7 +670,7 @@ fn canaries_and_the_matrix_agree() {
     );
 
     let mut declared: BTreeSet<&str> = BTreeSet::new();
-    for c in contract::all() {
+    for c in contract::CAPABILITIES {
         if let Some(canary) = c.canary {
             // The join key, asserted for EVERY row rather than only for the
             // ones with a test: `row` cannot catch a row whose canary names

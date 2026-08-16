@@ -4,7 +4,7 @@ import type {
   AuditDetectResult,
   AuditToolConfig,
   AuditToolId,
-  HarnessVersions,
+  HarnessStatus,
   LlmPricingModel,
   Settings,
 } from './types';
@@ -90,7 +90,11 @@ export async function llmPricingSet(pricing: LlmPricingModel[]): Promise<void> {
 /// startup, but `harness_versions` is written out-of-band (transcript tap,
 /// hand edits per MAINTENANCE.md). Used by the Settings window so the E1
 /// hard block reflects a just-recorded outcome without an app restart.
-export async function harnessVersionsGet(): Promise<HarnessVersions> {
+///
+/// V35 Phase E: the payload also carries `capability_gates` — the gate verdicts
+/// computed in Rust against those fresh versions, so the window renders an
+/// answer instead of re-deriving one.
+export async function harnessVersionsGet(): Promise<HarnessStatus> {
   return invoke('harness_versions_get');
 }
 

@@ -2599,9 +2599,12 @@ fn advisor_snapshot_blocking(
 
     // V17 Phase F1/F2 signals. Redundant re-read pairs per session over the
     // last 10 sessions, sized by the current advisor line floor. `e1_pass` is
-    // STRICTLY the "pass" status (trimmed/lowercased) — NOT `!e1_blocked()`,
-    // so an "unverified" E1 (the default) never auto-graduates a hook we've
-    // never proven works.
+    // STRICTLY the "pass" status (trimmed/lowercased) — NOT "the
+    // `claude.hook.pretooluse_deny` gate is not blocking"
+    // (`harness::contract::gate`, which passes `"unverified"` as well), so an
+    // "unverified" E1 (the default) never auto-graduates a hook we've never
+    // proven works. V35 Phase E retired the gate helper this used to be
+    // contrasted with and left this check untouched.
     let (redundant_reads_per_session, redundant_read_sessions) = match graph
         .redundant_read_candidates(&root, settings.graph.read_advisor_min_lines, 10)
     {
@@ -2703,12 +2706,41 @@ fn advisor_snapshot_blocking(
     }
 }
 
+/// The Settings window's harness payload: the raw spike/version record plus
+/// the **computed** gate verdicts (V35 Phase E).
+///
+/// `capability_gates` is a list of self-describing records rather than one
+/// bespoke boolean per feature, and that is the whole point: before Phase E the
+/// window received `e1_status` and re-implemented the fail-closed reading of it
+/// in TypeScript (`harnessStatusBlocks`), so a change to the rule had to be
+/// made twice or the toggle and the installed hook would disagree. Adding a
+/// second bespoke flag here would have recreated exactly that. Phase G's
+/// *Harness health* panel renders this same list.
+#[derive(serde::Serialize)]
+pub struct HarnessStatus {
+    /// Fresh read of the physical global `harness_versions`.
+    pub versions: crate::settings::HarnessVersions,
+    /// Every gated capability's verdict, keyed by capability id — the same
+    /// query `tabs/config.rs` asks before installing the hook.
+    pub capability_gates: Vec<crate::harness::contract::Gate>,
+}
+
 /// V16 Feature 1: the harness version + contract-verification state, read
 /// from the physical global `settings.json` (fresh — background writers
 /// bypass the live settings snapshot).
+///
+/// V35 Phase E: the gates are computed against the live settings with the FRESH
+/// `harness_versions` layered in, so a hand-recorded spike outcome disables the
+/// toggle without an app restart — the reason this command exists at all.
 #[tauri::command]
-pub async fn harness_versions_get() -> AppResult<crate::settings::HarnessVersions> {
-    Ok(crate::settings::read_global_harness_versions())
+pub async fn harness_versions_get(state: State<'_, AppState>) -> AppResult<HarnessStatus> {
+    let versions = crate::settings::read_global_harness_versions();
+    let mut settings = state.settings.current();
+    settings.harness_versions = versions.clone();
+    Ok(HarnessStatus {
+        capability_gates: crate::harness::contract::gates(&settings),
+        versions,
+    })
 }
 
 /// V16 Feature 1: the Advisor card's "Mark verified" action — stamp the

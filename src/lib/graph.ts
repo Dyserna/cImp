@@ -767,7 +767,13 @@ export function graphSessionUsage(root: string | undefined, sessionId: string): 
 
 /// One budget-tuning proposal. Mirror of Rust `advisor::Proposal`.
 /// `signature` is opaque to the UI — pass it straight through to
-/// `advisorDismiss` unchanged.
+/// `advisorDismiss` unchanged, and never parse it.
+///
+/// `rule_id` is NOT unique within a payload since V35 Phase E: every
+/// harness-capability drift notice speaks as `drift.capability.v1` and is told
+/// apart by `signature` (and named by `capability`). Anything that identifies a
+/// proposal — the `{#each}` key, the busy marker, the local drop after an
+/// action — must use the (rule_id, signature) pair.
 export interface AdvisorProposal {
   setting: string;
   current: string;
@@ -781,6 +787,10 @@ export interface AdvisorProposal {
   /// V16: bespoke card action — currently only `"mark_verified"` (the
   /// harness version tripwire → `harnessMarkVerified`).
   action: string | null;
+  /// V35 Phase E: for a `drift.capability.v1` notice, the harness capability id
+  /// it is about (`harness::contract::Capability::id`) — the same join key the
+  /// Settings window's gate lookup uses. `null` for every other rule.
+  capability: string | null;
 }
 
 /// Mirror of Rust `ipc::commands::AdvisorSnapshot`. `collecting` distinguishes

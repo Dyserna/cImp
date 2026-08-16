@@ -52,26 +52,40 @@
 //!   a gate — but a reviewer changing such a row is changing the trusted
 //!   computing base.
 //!
-//! # The first runtime consumer arrived in Phase D
+//! # The runtime consumers
 //!
 //! Phases A–C had none on purpose — the tests below and in
-//! [`crate::harness::canary`] were the consumers. V35 Phase D adds the first
+//! [`crate::harness::canary`] were the consumers. V35 Phase D added the first
 //! real one: [`crate::harness::probe`], reached from `cimp --harness-canary`,
 //! reads [`CAPABILITIES`] to decide what to drive and what to enumerate as
-//! `unknown`. Advisor wiring is still Phase E; nothing here reads Settings or
-//! reaches the frontend yet.
-
-// Most of the registry is still declaration-only: the Advisor + gating rewrite
-// (E) and the Harness-health panel (G) are the remaining consumers it was
-// seeded for. Same pattern (and same reason) as `graph/model.rs`.
-#![allow(dead_code)]
+//! `unknown`.
+//!
+//! **Phase E added the other two** (matrix draft § 3, consumers 1 and 2):
+//!
+//! 1. **Feature gating** — [`gate`] is the ONE query that answers "is this
+//!    capability blocked, and why". It replaced
+//!    `HarnessVersions::e1_blocked()` and its hand-written frontend mirror
+//!    `harnessStatusBlocks`: a new fail-closed gate is now a [`GATED`] entry
+//!    plus a `match` arm, not a new Settings field plus a second copy of the
+//!    interpretation in TypeScript. [`gates`] serves the whole list over IPC,
+//!    which is also the shape Phase G's *Harness health* panel renders.
+//! 2. **The Advisor** — [`capabilities_for_rule`] and
+//!    [`capability_for_payload_shim`] are the reverse of the
+//!    [`Capability::drift_rule`] link. The eight V16 statistical detectors keep
+//!    their thresholds and sample floors (milestone locked decision 5); what
+//!    consolidated is the notice envelope, which now speaks as
+//!    `advisor::RULE_DRIFT_CAPABILITY` about a named capability.
 
 use crate::advisor::{
     RULE_DRIFT_HOOK_SILENT, RULE_DRIFT_INJECTION_UNSEEN, RULE_DRIFT_PAYLOAD, RULE_DRIFT_READ_BYPASS,
     RULE_DRIFT_READ_REASON, RULE_DRIFT_SUBAGENT, RULE_DRIFT_USAGE_FIELDS,
 };
+use crate::settings::Settings;
 
 /// Which harness serves a capability.
+// `Any` is unconstructed on purpose: no seeded row is harness-neutral yet, and
+// CHP (milestone decision 9) is what will produce the first one.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
     Claude,
@@ -82,6 +96,9 @@ pub enum Harness {
 }
 
 /// The seam a dependency sits in. See the module docs for what each predicts.
+// `A` is unconstructed on purpose: Tier A (MCP) has never broken cImp, so the
+// ladder decision 2 ranks by needs its top rung declared even with no row on it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seam {
     A,
@@ -129,6 +146,11 @@ pub enum Degradation {
 }
 
 /// One thing cImp depends on from a harness it does not control.
+// Six columns (`contract`, `degradation`, `canary`, `probe`, `waiver`,
+// `controls`) are asserted by this module's tests and by `harness::canary` but
+// have no non-test reader yet; Phase G's *Harness health* panel is the one they
+// were seeded for.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Capability {
     /// Stable id, used by the Advisor, the canary suite and the UI. Never
@@ -187,8 +209,21 @@ pub const CONTROL_CHECKPOINT_PRE_MUTATION: &str = "checkpoint.pre_mutation";
 /// V32: the taint beacon the plugin posts for native web tools.
 pub const CONTROL_TAINT_BEACON: &str = "taint.beacon";
 
+/// The capability behind the read advisor's PreToolUse deny, spelled once.
+///
+/// A `&'static str` const rather than a literal because **three** consumers
+/// join on it and a typo in any of them would silently un-gate a feature: the
+/// registry row's own [`Capability::id`], the two `tabs/config.rs` gate call
+/// sites via [`gate`], and the Settings toggle in `SettingsApp.svelte` (which
+/// mirrors the string as `CAP_PRETOOLUSE_DENY` in `src/lib/settings/types.ts`,
+/// pinned by [`tests::the_gated_capability_ids_reach_the_frontend`]).
+pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
+
 /// Every control id that is declared somewhere in [`CAPABILITIES`]. Each must
 /// appear exactly once — see [`tests::tcb_controls_are_declared_exactly_once`].
+// Documentation, not a gate (milestone locked decision 10): the enforcement
+// test IS its consumer, so it has no runtime reader by design.
+#[allow(dead_code)]
 pub const CONTROLS: &[&str] = &[
     CONTROL_TOOL_GATE,
     CONTROL_CHECKPOINT_PRE_MUTATION,
@@ -260,7 +295,7 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
     },
     Capability {
-        id: "claude.hook.pretooluse_deny",
+        id: CAP_PRETOOLUSE_DENY,
         harness: Harness::Claude,
         tier: Seam::B,
         contract: "A `PreToolUse` hook can deny a tool call with \
@@ -617,11 +652,26 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::Flag("--from-pr"),
         ],
         wired_in: &["src-tauri/src/tabs/config.rs", "src-tauri/src/oob/claude.rs"],
-        degradation: Degradation::VisibleOff {
-            user_message: "Per-tab session identity is off: this Claude Code build did not accept \
-                           `--session-id`. Tabs fall back to newest-transcript-wins binding, so \
-                           two tabs on one project cannot be told apart.",
-        },
+        // V35 Phase E, closing Phase A finding 5. The seeded `VisibleOff` was
+        // **declared intent, never observed behavior**: `resolve_oob_source`
+        // (`tabs/config.rs:184-195`) pushes `--session-id <uuid>` onto the
+        // child's argv unconditionally for every Claude tab that does not
+        // already select its own session, and nothing anywhere probes the flag
+        // first, catches a usage error, or renders a message. A vanished flag
+        // therefore kills the tab at spawn — loudly, with the CLI's own
+        // argument error in the pane — rather than degrading to the pre-V34
+        // newest-transcript-wins binding the seeded `user_message` promised.
+        //
+        // The row is DOWNGRADED to what the code truly does rather than
+        // building the speculative UI to match the prose. Building it would
+        // mean probing `--session-id` at every spawn (milestone locked decision
+        // 8's "not at every tab spawn") to serve a message for a flag whose
+        // disappearance the L2 probe already reports as a Fail. The honest
+        // fallback exists and is one line — `pinned_session = None`, the branch
+        // `args_select_session` already takes — so if a future release does
+        // remove the flag this row becomes `VisibleOff` *and* that branch
+        // becomes reachable in the same commit.
+        degradation: Degradation::FailClosed,
         drift_rule: &[],
         canary: None,
         probe: Some("claude.flag.session_id"),
@@ -796,15 +846,199 @@ pub const CAPABILITIES: &[Capability] = &[
     },
 ];
 
-/// The registry, as the Advisor / canary suite / UI will read it.
-pub fn all() -> &'static [Capability] {
-    CAPABILITIES
-}
+// `all()` lived here from Phase A as the accessor the seeded consumers would
+// use. Phase E deleted it rather than carrying it under an allow: every real
+// consumer — the probe, the gate, the Advisor's two reverse lookups — either
+// iterates `CAPABILITIES` directly or asks by id, so it was an alias for a
+// public const that nothing called.
 
-/// One capability by id, or `None`. The Phase E gate (`contract::gate(id)`)
-/// builds on this.
+/// One capability by id, or `None`. [`gate`] builds on this.
 pub fn get(id: &str) -> Option<&'static Capability> {
     CAPABILITIES.iter().find(|c| c.id == id)
+}
+
+// ── Consumer 1: feature gating (V35 Phase E) ────────────────────────────────
+
+/// The runtime verdict for one capability's feature gate.
+///
+/// Serialized straight to the frontend (`CapabilityGate` in
+/// `src/lib/settings/types.ts`) so the Settings window renders a *computed*
+/// answer instead of re-implementing the interpretation — which is exactly what
+/// `harnessStatusBlocks` was, and what V35 Phase E deleted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Gate {
+    /// The capability id — the join key, echoed so a consumer never has to
+    /// pair a verdict with a position in a list.
+    pub id: &'static str,
+    pub blocked: bool,
+    /// Why, in the user's words, ready to render. **Empty iff `!blocked`**
+    /// (global principle 5, and pinned by
+    /// [`tests::a_blocked_gate_always_says_why`]): a block with a blank reason
+    /// is a feature that vanished without explanation.
+    pub reason: String,
+}
+
+impl Gate {
+    fn available(id: &'static str) -> Self {
+        Self {
+            id,
+            blocked: false,
+            reason: String::new(),
+        }
+    }
+}
+
+/// The id [`gate`] echoes when handed a string no registry row claims. Not a
+/// capability id — parenthesized like `loopback::DRIFT_SHIM_UNKNOWN` so it
+/// cannot be mistaken for one in a payload.
+pub const UNKNOWN_CAPABILITY: &str = "(unknown capability)";
+
+/// Every capability that carries a runtime gate — i.e. every id for which
+/// [`gate`] can answer `blocked: true`.
+///
+/// Deliberately a short list and not the whole registry: most rows *degrade*
+/// when they break (that is the [`Capability::degradation`] column) rather than
+/// gating a feature off. [`tests::every_gated_capability_can_actually_block`]
+/// keeps it honest in both directions — an entry here that no `match` arm can
+/// ever block is a gate that does not exist, and a `match` arm not listed here
+/// is a gate no UI can see.
+pub const GATED: &[&str] = &[CAP_PRETOOLUSE_DENY];
+
+/// Whether a recorded spike status BLOCKS its capability.
+///
+/// Moved here verbatim from `HarnessVersions::status_blocks` in V35 Phase E
+/// (which is also when its frontend mirror `harnessStatusBlocks` was deleted).
+/// The statuses are deliberately hand-editable strings, so this is the ONE
+/// comparison allowed to interpret them — never a bare `"fail"` literal at a
+/// call site. Normalizes (trim + case-fold) and fails **CLOSED**: anything that
+/// is not a recognized non-fail value (`"unverified"`, `"pass"`, or
+/// empty/missing) blocks, so a hand-typed `"Fail"`/`"failed"` surfaces as the
+/// disabled toggle + uninstalled hook instead of silently sailing past.
+///
+/// NOTE the deliberate asymmetry with the F2 strict checks
+/// (`advisor::Signals::e1_pass`, `ipc/commands.rs`): those require
+/// `== "pass"` because "verified OK" must mean *proven*. This one passes
+/// `"unverified"` too, because the gate's posture is
+/// opt-in-until-proven-broken, not blocked-until-proven-working. The two are
+/// NOT interchangeable and must never be merged.
+fn spike_status_blocks(status: &str) -> bool {
+    let s = status.trim().to_ascii_lowercase();
+    !(s.is_empty() || s == "unverified" || s == "pass")
+}
+
+/// **The** feature-gate query (matrix draft § 3, consumer 1).
+///
+/// One place that turns a capability id plus the current [`Settings`] into a
+/// renderable verdict, replacing V16's `HarnessVersions::e1_blocked()` and the
+/// hand-kept TypeScript copy of its rule.
+///
+/// An id no row claims answers *available* (with [`UNKNOWN_CAPABILITY`] echoed
+/// back). Fail-open is the right direction for an unknown id — the alternative
+/// would let a typo'd string switch a working feature off — and it is safe here
+/// only because the direction that matters is defended structurally instead:
+/// call sites pass the `CAP_*` consts (a typo is a compile error), and
+/// [`tests::every_gated_capability_can_actually_block`] proves each declared
+/// gate really can block.
+pub fn gate(id: &str, settings: &Settings) -> Gate {
+    // Resolve through the registry so the returned `id` is the row's own
+    // `&'static str` — the join key itself, not a caller-supplied lookalike.
+    let Some(cap) = get(id) else {
+        return Gate::available(UNKNOWN_CAPABILITY);
+    };
+    match cap.id {
+        // V16 Feature 0: a recorded E1 spike FAILURE (the deny reason never
+        // reaches the model, so every read-advisor remind is a bare refusal)
+        // hard-blocks the read advisor regardless of `graph.read_advisor`.
+        CAP_PRETOOLUSE_DENY => {
+            let status = settings.harness_versions.e1_status.trim();
+            if spike_status_blocks(status) {
+                Gate {
+                    id: cap.id,
+                    blocked: true,
+                    reason: format!(
+                        "The E1 contract check is recorded as {status:?}: this Claude Code build \
+                         does not surface a PreToolUse deny reason to the model, so every \
+                         read-advisor reminder would be a bare refusal — worse than no advisor. \
+                         The hook is not installed regardless of the toggle. Re-run the check in \
+                         MAINTENANCE.md → harness contracts after the next Claude Code update, \
+                         and record the outcome in `harness_versions.e1_status`."
+                    ),
+                }
+            } else {
+                Gate::available(cap.id)
+            }
+        }
+        _ => Gate::available(cap.id),
+    }
+}
+
+/// Every [`GATED`] capability's current verdict, in declaration order — the
+/// payload `harness_versions_get` serves and the Settings window reads, and the
+/// list Phase G's *Harness health* panel renders. A `Vec` of self-describing
+/// records rather than one bespoke boolean per feature, precisely so the next
+/// gate costs a [`GATED`] entry instead of a second wire field plus a second
+/// frontend mirror.
+pub fn gates(settings: &Settings) -> Vec<Gate> {
+    GATED.iter().map(|id| gate(id, settings)).collect()
+}
+
+// ── Consumer 2: the Advisor (V35 Phase E) ───────────────────────────────────
+
+/// Every registry row whose [`Capability::drift_rule`] column names `rule`.
+///
+/// The reverse of that link, and the join the Advisor raises its consolidated
+/// `advisor::RULE_DRIFT_CAPABILITY` notices through: a V16 detector fires, this
+/// says which capabilities it is evidence ABOUT, and one notice is raised per
+/// affected capability. One notice per capability (rather than one naming them
+/// all) is deliberate — the capability id is the dismissal key, so a shared
+/// notice would let dismissing a symptom on one capability silence a sibling.
+pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
+    CAPABILITIES
+        .iter()
+        .filter(|c| c.drift_rule.contains(&rule))
+        .collect()
+}
+
+/// The registry row for the hook shim that reported a payload drift under
+/// `shim` — `context_hook::report_contract_drift`'s first argument, which
+/// `loopback::contract_drift_row` records as the leading token of the activity
+/// target (`"<shim>: <missing fields>"`).
+///
+/// Resolved through the [`Capability::wired_in`] column rather than a second
+/// hand-kept map: `read_hook` ⇒ `src-tauri/src/read_hook.rs` ⇒
+/// [`CAP_PRETOOLUSE_DENY`]. That is what keeps the attribution from drifting
+/// when a shim moves — the same test that keeps `wired_in` pointing at real
+/// files keeps this pointing at the right row.
+///
+/// `None` for a shim no `drift.payload.v1` row names, and that case is REAL,
+/// not defensive: `taint_beacon` and `checkpoint_beacon` both report through
+/// this route and neither has a registry row of its own (their `PreToolUse`
+/// entries ride `claude.flag.settings_overlay`, which declares no payload
+/// contract), and a forged name lands in the loopback's `(unrecognized shim)`
+/// bucket. Those reports keep the un-consolidated `drift.payload.v1` channel
+/// rather than being mis-attributed to a capability that did not report them.
+/// `postedit_hook` is `None` too, for the third reason — Phase A finding 2: it
+/// is the one shim that never calls `report_contract_drift` at all, so its row
+/// names no drift rule and can never appear here.
+pub fn capability_for_payload_shim(shim: &str) -> Option<&'static Capability> {
+    if shim.is_empty() {
+        return None;
+    }
+    let suffix = format!("/{shim}.rs");
+    let mut hits = CAPABILITIES.iter().filter(|c| {
+        c.drift_rule.contains(&RULE_DRIFT_PAYLOAD) && c.wired_in.iter().any(|p| p.ends_with(&suffix))
+    });
+    let first = hits.next()?;
+    // Two rows naming one shim is a registry defect, not a runtime condition —
+    // and an arbitrary pick would attribute a real report to the wrong
+    // capability. Fall back to the unattributed channel, which loses the row
+    // but never lies about it. `tests::every_payload_shim_resolves_to_one_row`
+    // is what keeps this branch unreachable.
+    if hits.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 #[cfg(test)]
@@ -1075,6 +1309,248 @@ mod tests {
             "the live probe neither drives nor enumerates: {orphans:?}. Add a probe, or add the \
              row to `probe::DECLARED_UNPROBED` with the reason it cannot be driven."
         );
+    }
+
+    // ── V35 Phase E: the gate query ─────────────────────────────────────
+
+    /// Settings with `e1_status` set, and nothing else touched.
+    fn settings_with_e1(status: &str) -> Settings {
+        let mut s = Settings::default();
+        s.harness_versions.e1_status = status.to_string();
+        s
+    }
+
+    /// Every [`GATED`] id is a real capability, and every one of them can
+    /// actually answer `blocked` for SOME settings.
+    ///
+    /// The second half is the one that matters. A gate that no input can trip
+    /// is a "quality signal with no consumer" wearing a gate's clothes: the UI
+    /// would render a row that is permanently green while nothing enforces
+    /// anything. The probe is per-id and deliberately crude — flip the one
+    /// input each arm reads — so adding a `match` arm without a way to trip it
+    /// fails here rather than shipping as decoration.
+    #[test]
+    fn every_gated_capability_can_actually_block() {
+        assert!(!GATED.is_empty(), "the gate list must not be empty");
+        for id in GATED {
+            let cap = get(id).unwrap_or_else(|| {
+                panic!("`GATED` names `{id}`, which is not a capability id — ids are the join key")
+            });
+            let blocking = match cap.id {
+                CAP_PRETOOLUSE_DENY => settings_with_e1("fail"),
+                other => panic!(
+                    "`{other}` is in `GATED` but this test has no input that trips it. Add one, \
+                     or drop the entry — a gate nothing can trip is not a gate."
+                ),
+            };
+            assert!(
+                gate(cap.id, &blocking).blocked,
+                "`{}` is declared gated but the blocking input does not block it",
+                cap.id
+            );
+        }
+    }
+
+    /// The inverse: every `match` arm in [`gate`] that can block is declared in
+    /// [`GATED`]. Checked by running the whole registry through the gate with
+    /// the same blocking inputs — a row that blocks while absent from `GATED`
+    /// is a feature that switches itself off with no list any UI can render.
+    #[test]
+    fn no_gate_blocks_outside_the_declared_list() {
+        let inputs = [settings_with_e1("fail"), settings_with_e1("nonsense")];
+        for c in CAPABILITIES {
+            for s in &inputs {
+                if gate(c.id, s).blocked {
+                    assert!(
+                        GATED.contains(&c.id),
+                        "`{}` blocks but is not listed in `GATED` — add it, or the Settings \
+                         window and the Harness health panel cannot see the gate",
+                        c.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// The exact fail-closed semantics V16 pinned on
+    /// `HarnessVersions::e1_blocked()`, relocated with the logic in V35 Phase E
+    /// (the `tabs/config.rs` overlay tests pin the same table end to end).
+    ///
+    /// The statuses are hand-editable strings, so the interesting cases are the
+    /// ones nobody meant to type: `"Fail"`, `" fail "` and `"failed"` all block,
+    /// and so does anything else unrecognized. Only empty / `"unverified"` /
+    /// `"pass"` pass, case- and whitespace-insensitively — `"unverified"`
+    /// deliberately among them (see [`spike_status_blocks`]'s note on the F2
+    /// asymmetry).
+    #[test]
+    fn the_e1_gate_fails_closed_on_anything_unrecognized() {
+        for ok in ["", "  ", "unverified", "UNVERIFIED", " pass ", "Pass"] {
+            assert!(
+                !gate(CAP_PRETOOLUSE_DENY, &settings_with_e1(ok)).blocked,
+                "{ok:?} must NOT block the read advisor"
+            );
+        }
+        for bad in ["fail", "Fail", " fail ", "FAILED", "failed", "faill", "ok", "yes", "0"] {
+            let g = gate(CAP_PRETOOLUSE_DENY, &settings_with_e1(bad));
+            assert!(g.blocked, "unrecognized status {bad:?} must fail CLOSED");
+            assert!(
+                g.reason.contains(bad.trim()),
+                "the reason must quote the status actually recorded ({bad:?}), got: {}",
+                g.reason
+            );
+        }
+        // The default install is `"unverified"` and must not block: Feature 0's
+        // posture is opt-in-until-proven-broken, not the reverse.
+        assert!(!gate(CAP_PRETOOLUSE_DENY, &Settings::default()).blocked);
+    }
+
+    /// A gate that blocks always says why, and one that does not never
+    /// pretends there is something to say (global principle 5 — "empty is not
+    /// absent" applied to the reason string).
+    #[test]
+    fn a_blocked_gate_always_says_why() {
+        for s in [
+            Settings::default(),
+            settings_with_e1("fail"),
+            settings_with_e1("wat"),
+        ] {
+            for g in gates(&s) {
+                assert_eq!(
+                    g.blocked,
+                    !g.reason.trim().is_empty(),
+                    "`{}`: blocked and reason must agree — got blocked={}, reason={:?}",
+                    g.id,
+                    g.blocked,
+                    g.reason
+                );
+                assert!(GATED.contains(&g.id), "`gates()` returned an unlisted id");
+            }
+        }
+        assert_eq!(gates(&Settings::default()).len(), GATED.len());
+    }
+
+    /// An id no row claims answers *available* under the sentinel, never a
+    /// capability id it was not handed. Fail-open by design — see [`gate`].
+    #[test]
+    fn an_unknown_capability_id_is_not_a_gate() {
+        let g = gate("claude.hook.pretooluse_denied", &settings_with_e1("fail"));
+        assert!(!g.blocked);
+        assert_eq!(g.id, UNKNOWN_CAPABILITY);
+        assert!(get(UNKNOWN_CAPABILITY).is_none());
+    }
+
+    /// The join key the Settings window uses must be the string Rust gates on.
+    /// This is the tripwire that REPLACED the `harnessStatusBlocks` mirror in
+    /// V35 Phase E: instead of two copies of a rule, there are two copies of an
+    /// id — and this fails the build if they part company.
+    ///
+    /// Same `include_str!` pattern as `settings::frontend_mirrors`, and the
+    /// same self-guard: the const must be FOUND in the TypeScript (a rename or
+    /// a move panics instead of vacuously passing).
+    #[test]
+    fn the_gated_capability_ids_reach_the_frontend() {
+        const TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
+        // The retired mirror must not creep back — the whole point of Phase E
+        // is that the interpretation lives in Rust and the frontend reads a
+        // computed verdict.
+        // The DECLARATION, not the name: types.ts still mentions the retired
+        // mirror in the doc comment that explains where the rule went, and a
+        // note about history must not read as a regression.
+        assert!(
+            !TS_TYPES.contains("function harnessStatusBlocks"),
+            "`harnessStatusBlocks` is back in src/lib/settings/types.ts — the E1 rule must not \
+             be re-implemented in TypeScript; read `CapabilityGate.blocked` instead"
+        );
+        for id in GATED {
+            assert!(
+                TS_TYPES.contains(&format!("'{id}'")),
+                "capability id `{id}` is gated in Rust but is not spelled in \
+                 src/lib/settings/types.ts — the Settings window joins on this exact string"
+            );
+        }
+    }
+
+    // ── V35 Phase E: the Advisor's reverse lookups ──────────────────────
+
+    /// Every drift rule a row names resolves back to that row, and every
+    /// consolidated notice therefore has at least one capability to be about.
+    /// A rule referenced by no row would raise no notice at all — the V16
+    /// detector would keep computing and nothing would ever say it fired.
+    #[test]
+    fn every_declared_drift_rule_resolves_back_to_its_rows() {
+        let mut seen = BTreeSet::new();
+        for c in CAPABILITIES {
+            for rule in c.drift_rule {
+                seen.insert(*rule);
+                let rows: Vec<&str> = capabilities_for_rule(rule).iter().map(|r| r.id).collect();
+                assert!(
+                    rows.contains(&c.id),
+                    "`{}` names `{rule}` but the reverse lookup does not return it",
+                    c.id
+                );
+            }
+        }
+        assert!(!seen.is_empty(), "no row names a drift rule — the join is vacuous");
+        assert!(capabilities_for_rule("drift.no_such_rule.v1").is_empty());
+    }
+
+    /// The four hook shims that report payload drift each resolve to exactly
+    /// one row, through `wired_in` rather than a hand-kept map.
+    ///
+    /// The negative half is the interesting one and is asserted by name:
+    /// `postedit_hook` is Phase A finding 2 (the one shim that never reports at
+    /// all, so its row names no rule), while `taint_beacon` and
+    /// `checkpoint_beacon` DO report through the same route and have no row —
+    /// their reports keep the unattributed `drift.payload.v1` channel instead
+    /// of being pinned on a capability that did not report them.
+    #[test]
+    fn every_payload_shim_resolves_to_one_row() {
+        for (shim, expect) in [
+            ("context_hook", "claude.hook.user_prompt_submit"),
+            ("compact_hook", "claude.hook.precompact"),
+            ("read_hook", CAP_PRETOOLUSE_DENY),
+            ("notify_hook", "claude.hook.notification"),
+        ] {
+            let cap = capability_for_payload_shim(shim)
+                .unwrap_or_else(|| panic!("shim `{shim}` resolves to no capability"));
+            assert_eq!(cap.id, expect, "shim `{shim}` resolved to the wrong row");
+        }
+        for shim in [
+            "postedit_hook",
+            "taint_beacon",
+            "checkpoint_beacon",
+            "(unrecognized shim)",
+            "",
+            "hook",
+        ] {
+            assert!(
+                capability_for_payload_shim(shim).is_none(),
+                "shim `{shim}` must NOT be attributed to a capability"
+            );
+        }
+
+        // Every row that names `drift.payload.v1` must be reachable from some
+        // shim name, or the row claims a lagging indicator that can never
+        // attribute to it.
+        for c in CAPABILITIES {
+            if !c.drift_rule.contains(&RULE_DRIFT_PAYLOAD) {
+                continue;
+            }
+            let reachable = c.wired_in.iter().any(|p| {
+                p.rsplit('/')
+                    .next()
+                    .and_then(|f| f.strip_suffix(".rs"))
+                    .is_some_and(|shim| {
+                        capability_for_payload_shim(shim).is_some_and(|r| r.id == c.id)
+                    })
+            });
+            assert!(
+                reachable,
+                "`{}` names `drift.payload.v1` but no shim name in its `wired_in` resolves back \
+                 to it — the row would never receive an attributed report",
+                c.id
+            );
+        }
     }
 
     /// The TCB column (milestone locked decision 10) is documentation, not a

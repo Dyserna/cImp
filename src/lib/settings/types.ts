@@ -896,24 +896,53 @@ export interface HarnessVersions {
   claude_last_seen: string;
   claude_last_verified: string;
   opencode_last_seen: string;
-  /// E1 spike outcome (`"unverified" | "pass" | "fail"`): a blocking status
-  /// (see `harnessStatusBlocks`) hard blocks the read advisor (Settings
-  /// block disabled, hook not installed).
+  /// E1 spike outcome (`"unverified" | "pass" | "fail"`). Raw INPUT to a gate,
+  /// never interpreted here: read `CapabilityGate.blocked` for
+  /// `CAP_PRETOOLUSE_DENY` instead. V35 Phase E deleted the
+  /// `harnessStatusBlocks` mirror this field used to be read through — the
+  /// fail-closed rule lives once, in Rust
+  /// (`harness::contract::spike_status_blocks`).
   e1_status: string;
   /// D0 spike outcome (informational — the feature degrades to a no-op).
   d0_status: string;
 }
 
-/// Whether a recorded spike status blocks its feature — the ONE comparison
-/// allowed to interpret `e1_status`/`d0_status` (never compare a bare
-/// `'fail'` literal at a call site). Mirror of Rust
-/// `HarnessVersions::status_blocks` (settings/schema.rs) — keep in sync.
-/// Normalizes (trim + case-fold) and fails CLOSED: the statuses are
-/// hand-editable strings, so anything that isn't a recognized non-fail
-/// value blocks rather than silently sailing past the gate.
-export function harnessStatusBlocks(status: string): boolean {
-  const s = status.trim().toLowerCase();
-  return !(s === '' || s === 'unverified' || s === 'pass');
+/// One harness capability's gate verdict, computed in Rust. Mirror of
+/// `harness::contract::Gate`.
+///
+/// `reason` is ready to render and is non-empty exactly when `blocked` — so a
+/// card never has to invent an explanation, and never shows an empty one.
+export interface CapabilityGate {
+  id: string;
+  blocked: boolean;
+  reason: string;
+}
+
+/// The `harness_versions_get` payload. Mirror of Rust
+/// `ipc::commands::HarnessStatus`: the raw out-of-band record plus the
+/// **computed** gate verdicts for every gated capability.
+export interface HarnessStatus {
+  versions: HarnessVersions;
+  capability_gates: CapabilityGate[];
+}
+
+/// The capability id the read advisor's `PreToolUse` deny is gated on — the
+/// join key shared verbatim with Rust's `contract::CAP_PRETOOLUSE_DENY` and
+/// with the registry row's own `id`. Pinned by
+/// `harness::contract::tests::the_gated_capability_ids_reach_the_frontend`,
+/// which fails the Rust build if this string is missing from this file.
+export const CAP_PRETOOLUSE_DENY = 'claude.hook.pretooluse_deny';
+
+/// Whether `status` says a capability is gated off. A lookup, deliberately not
+/// a rule: the verdict was computed by `harness::contract::gate` against the
+/// SAME settings the tab spawn uses, so the Settings toggle and the installed
+/// hook cannot disagree. A capability with no gate (or a payload that has not
+/// arrived yet) is not blocked.
+export function capabilityBlocked(
+  status: HarnessStatus | null | undefined,
+  id: string,
+): CapabilityGate | null {
+  return status?.capability_gates.find((g) => g.id === id && g.blocked) ?? null;
 }
 
 /// V14 Phase D2: one dismissed advisor proposal. Mirror of Rust

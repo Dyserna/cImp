@@ -559,12 +559,28 @@
   /// stick server-side (`advisorMarkApplied` documents itself as one) would
   /// see an unchanged payload next tick, skip the apply, and leave the
   /// proposal hidden forever instead of re-proposing.
-  function dropProposal(ruleId: string): void {
+  ///
+  /// Identified by (rule_id, signature), not by rule_id alone: since V35
+  /// Phase E every harness-capability drift notice shares the one
+  /// `drift.capability.v1` id and is told apart by its signature, so dropping
+  /// by rule id would clear a sibling capability's card along with the one the
+  /// user acted on.
+  function dropProposal(p: AdvisorProposal): void {
     adviceKey = null;
     advice = advice && {
       ...advice,
-      proposals: advice.proposals.filter((x) => x.rule_id !== ruleId),
+      proposals: advice.proposals.filter(
+        (x) => !(x.rule_id === p.rule_id && x.signature === p.signature),
+      ),
     };
+  }
+
+  /// The identity of one proposal within the card — the `{#each}` key, and the
+  /// value `advisorBusy` holds so a spinner marks the row that is working
+  /// rather than every row sharing its rule id. Same (rule_id, signature) pair
+  /// `dropProposal` and the dismiss memory use.
+  function proposalKey(p: AdvisorProposal): string {
+    return `${p.rule_id} ${p.signature}`;
   }
   // When the last usage fetch FINISHED. The gap is measured from completion,
   // not from start, so the effective cadence self-tunes: a fast store polls at
@@ -1027,7 +1043,7 @@
   // the advisor never mutates settings itself (milestone Feature 1b: never
   // silent self-modification).
   async function applyProposal(p: AdvisorProposal): Promise<void> {
-    advisorBusy = p.rule_id;
+    advisorBusy = proposalKey(p);
     try {
       const next = structuredClone($settings);
       const val = Number(p.proposed);
@@ -1077,17 +1093,17 @@
       // means the old always-re-propose behavior for this one apply.
       await advisorMarkApplied(p.rule_id).catch((e) => console.warn('advisor_mark_applied failed', e));
       // Drop the proposal locally rather than waiting for the next poll.
-      dropProposal(p.rule_id);
+      dropProposal(p);
     } finally {
       advisorBusy = null;
     }
   }
 
   async function dismissProposal(p: AdvisorProposal): Promise<void> {
-    advisorBusy = p.rule_id;
+    advisorBusy = proposalKey(p);
     try {
       await advisorDismiss(p.rule_id, p.signature);
-      dropProposal(p.rule_id);
+      dropProposal(p);
     } catch (e) {
       console.error('advisor_dismiss failed', e);
     } finally {
@@ -1475,10 +1491,10 @@
   );
 
   async function markVerified(p: AdvisorProposal): Promise<void> {
-    advisorBusy = p.rule_id;
+    advisorBusy = proposalKey(p);
     try {
       await harnessMarkVerified();
-      dropProposal(p.rule_id);
+      dropProposal(p);
     } catch (e) {
       console.error('harness_mark_verified failed', e);
     } finally {
@@ -2233,10 +2249,10 @@
         <p class="placeholder">No changes suggested — data looks healthy.</p>
       {:else}
         <div class="rows">
-          {#each advice.proposals as p (p.rule_id)}
+          {#each advice.proposals as p (proposalKey(p))}
             <div class="proposal">
               <div class="prop-head">
-                <span class="aname">{p.setting || p.rule_id}</span>
+                <span class="aname">{p.setting || p.capability || p.rule_id}</span>
                 <span class="prop-vals"><code>{p.current}</code> → <code>{p.proposed}</code></span>
               </div>
               <p class="prop-rationale">{p.rationale}</p>
@@ -2247,13 +2263,13 @@
                     disabled={advisorBusy !== null}
                     title="Stamp the currently-seen Claude Code version as verified — do this AFTER re-running the MAINTENANCE.md contract checks"
                     onclick={() => markVerified(p)}
-                  >{advisorBusy === p.rule_id ? 'Marking…' : 'Mark verified'}</button>
+                  >{advisorBusy === proposalKey(p) ? 'Marking…' : 'Mark verified'}</button>
                 {:else if !p.warn_only}
                   <button
                     class="mini"
                     disabled={advisorBusy !== null}
                     onclick={() => applyProposal(p)}
-                  >{advisorBusy === p.rule_id ? 'Applying…' : 'Apply'}</button>
+                  >{advisorBusy === proposalKey(p) ? 'Applying…' : 'Apply'}</button>
                 {/if}
                 <button
                   class="mini secondary"

@@ -523,34 +523,21 @@ pub struct HarnessVersions {
     /// blocks the read advisor — the Settings toggle renders disabled and
     /// `tabs/config.rs` refuses to install the PreToolUse hook regardless of
     /// `graph.read_advisor`.
+    ///
+    /// V35 Phase E: this field is **input to a gate, not a gate**. Nothing may
+    /// interpret it here — the one query that turns it into a verdict is
+    /// [`crate::harness::contract::gate`], keyed by the capability id
+    /// `claude.hook.pretooluse_deny`. (`e1_blocked()` used to live on this
+    /// struct with a hand-kept TypeScript twin; both are gone.) The separate,
+    /// deliberately STRICTER `== "pass"` checks — `advisor::Signals::e1_pass`
+    /// and its reader in `ipc/commands.rs` — mean *proven* rather than *not
+    /// known-broken* and are NOT the same test; see the F2 note on
+    /// `contract::spike_status_blocks`.
     pub e1_status: String,
     /// Outcome of the D0 spike (PreCompact `additionalContext` reaches the
     /// compaction prompt): `"unverified" | "pass" | "fail"`. Informational —
     /// a fail warns (the feature degrades to a no-op, it can't misbehave).
     pub d0_status: String,
-}
-
-impl HarnessVersions {
-    /// Whether a recorded spike status blocks its feature. The statuses are
-    /// deliberately hand-editable strings (see the struct doc), so this is
-    /// the ONE comparison allowed to interpret them — never compare against
-    /// a bare `"fail"` literal at a call site. Normalizes (trim +
-    /// case-fold) and fails CLOSED: anything that isn't a recognized
-    /// non-fail value (`"unverified"`, `"pass"`, or empty/missing) blocks,
-    /// so a hand-typed `"Fail"`/`"failed"` surfaces as the disabled toggle +
-    /// uninstalled hook instead of silently sailing past the gate.
-    /// Mirrored in the frontend as `harnessStatusBlocks`
-    /// (src/lib/settings/types.ts) — keep the two in sync.
-    pub fn status_blocks(status: &str) -> bool {
-        let s = status.trim().to_ascii_lowercase();
-        !(s.is_empty() || s == "unverified" || s == "pass")
-    }
-
-    /// The E1 hard block (PreToolUse deny reason never reaches the model —
-    /// see `tabs/config.rs` and the Settings toggle).
-    pub fn e1_blocked(&self) -> bool {
-        Self::status_blocks(&self.e1_status)
-    }
 }
 
 impl Default for HarnessVersions {

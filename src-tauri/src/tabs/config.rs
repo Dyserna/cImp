@@ -486,6 +486,21 @@ fn opencode_native_gate_for(s: &Settings, tab: &str) -> bool {
     )
 }
 
+/// Whether the harness capability matrix currently BLOCKS the read advisor's
+/// `PreToolUse` deny (V35 Phase E).
+///
+/// One named helper for the two call sites in this file — the overlay builder
+/// that installs the hook, and [`spawn_inject_sig`], which must move whenever
+/// that decision does — so the capability id is spelled once here rather than
+/// twice. It replaced `HarnessVersions::e1_blocked()`: the interpretation of
+/// `e1_status` (fail-closed on anything unrecognized) now lives in
+/// `harness::contract::gate` alongside the row that declares the contract, and
+/// the same query serves the Settings window over IPC instead of the frontend
+/// re-implementing the rule.
+fn read_advisor_gate_blocked(s: &Settings) -> bool {
+    crate::harness::contract::gate(crate::harness::contract::CAP_PRETOOLUSE_DENY, s).blocked
+}
+
 /// Per-consumer spawn-injection signature — `[claude, opencode]`. Captures
 /// every Settings-derived input that reaches an AI tab only at spawn (the
 /// `--mcp-config` server set, the `compose_capability_guidance` gates, the
@@ -509,7 +524,11 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         s.graph.enabled && s.graph.semantic_search,
         s.graph.enabled && s.graph.promote_pinned_facts,
     ]);
-    let read_hook = s.graph.enabled && s.graph.read_advisor && !s.harness_versions.e1_blocked();
+    // V35 Phase E: the E1 hard block is now the capability matrix's gate, asked
+    // by id (`harness::contract::gate`) instead of a bespoke helper on
+    // `HarnessVersions`. Same verdict, same fail-closed semantics — see the
+    // overlay builder below for the full note.
+    let read_hook = s.graph.enabled && s.graph.read_advisor && !read_advisor_gate_blocked(s);
     let post_edit = s.graph.enabled && s.graph.auto_check && !s.checks.is_empty();
     // `claude_local` env vars are synthesized at spawn, but only for Claude
     // tabs that opted in — irrelevant edits shouldn't nag.
@@ -765,15 +784,18 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             // V16 Feature 0: a recorded E1 spike FAILURE (the deny reason
             // never reaches the model — every remind would be a bare
             // refusal) hard-blocks the read advisor regardless of the
-            // toggle; the Settings UI renders the block disabled with the
-            // same condition. `e1_blocked` fails closed on unrecognized
-            // hand-typed values; the registry refreshes `harness_versions`
-            // from the physical global file at spawn, so a hand-recorded
-            // outcome takes effect on the next tab launch, not the next app
-            // restart.
+            // toggle. V35 Phase E made that block the capability matrix's
+            // gate, asked by id: `contract::gate(CAP_PRETOOLUSE_DENY, ..)`
+            // owns the fail-closed reading of unrecognized hand-typed values
+            // that `e1_blocked` used to, and the SAME query now answers the
+            // Settings window over IPC — so the toggle and this hook can no
+            // longer disagree by one of them being re-implemented in
+            // TypeScript. The registry refreshes `harness_versions` from the
+            // physical global file at spawn, so a hand-recorded outcome takes
+            // effect on the next tab launch, not the next app restart.
             if settings.graph.enabled
                 && settings.graph.read_advisor
-                && !settings.harness_versions.e1_blocked()
+                && !read_advisor_gate_blocked(settings)
             {
                 if let Some(command) = crate::statusline::hook_command("--read-hook") {
                     // #48 (M-7): `--tab` baked in, as on every other hook —
@@ -3059,6 +3081,13 @@ mod tests {
     /// and a recorded `e1_status == "fail"` hard-blocks it REGARDLESS of
     /// the toggle (a deny whose reason never reaches the model is a bare
     /// refusal; worse than no advisor).
+    ///
+    /// V35 Phase E moved the decision behind `harness::contract::gate` and this
+    /// test did not change a line — which is the point. It pins the gate's
+    /// fail-closed table END TO END, through the thing that actually installs
+    /// the hook, and it is deliberately kept here rather than folded into the
+    /// unit tests next to the gate: those prove the predicate, this proves the
+    /// overlay the child process is launched with.
     #[test]
     fn read_hook_overlay_gated_on_toggle_and_e1_status() {
         let mut settings = Settings::default();

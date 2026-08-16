@@ -145,14 +145,65 @@ const SUBSTITUTE_MIN_SAMPLES: u64 = 20;
 // shell) is strictly worse than no advisor. Drift rules carry their OWN
 // sample floors — the global `MIN_SESSIONS` floor gates only the tuning
 // rules (a version bump is a fact, not a statistic).
+//
+// V35 Phase E (milestone locked decision 5) changed the ENVELOPE, not the
+// detectors. Every threshold, sample floor and warn-only/Apply choice below is
+// untouched; what changed is that six of the eight now speak as
+// [`RULE_DRIFT_CAPABILITY`] about a **named capability** from
+// `harness::contract`, with the constant that saw the symptom carried as
+// *evidence* rather than as the notice's own id. The two exceptions are stated
+// on their consts.
 
+/// The ONE drift-class notice id (V35 Phase E; matrix draft § 3, consumer 2).
+///
+/// Signature = `<capability>:<evidence rule>:<the detector's own re-fire key>`.
+///
+/// * The first two fields are what makes a dismissal hold per
+///   **(capability, evidence)** pair, so silencing "the usage fields are gone"
+///   never silences "the sub-agent layout moved".
+/// * The third is each detector's ORIGINAL signature, kept verbatim, so every
+///   rule's re-fire boundary survives consolidation unchanged — a bucketed rate
+///   still re-fires on a materially changed rate, a version-keyed rule still
+///   re-fires on the next harness update. Dropping it would have quietly turned
+///   every drift dismissal into a permanent one.
+///
+/// **Deploy note:** notices dismissed under the old per-rule ids re-fire ONCE
+/// under this id after the upgrade. Accepted — a dismissal is keyed to the id
+/// the user dismissed, and re-keying the stored records would be a migration
+/// that guesses at intent.
+pub const RULE_DRIFT_CAPABILITY: &str = "drift.capability.v1";
+
+/// The harness version tripwire. **NOT** consolidated into
+/// [`RULE_DRIFT_CAPABILITY`]: it is not evidence about one capability — it says
+/// the whole harness moved — and V35 Phase F reworks its raising logic
+/// (auto-run L1+L2 on version change, auto-advance on all-pass). Left alone
+/// deliberately; keeps its own `mark_verified` action.
 pub const RULE_DRIFT_VERSION: &str = "drift.harness_version.v1";
+/// Evidence for `claude.hook.pretooluse_deny` (V35 Phase E). Still the id the
+/// detector is *named* by — in `Capability::drift_rule`, in the notice
+/// signature and in `MAINTENANCE.md` — but no longer a notice id of its own.
 pub const RULE_DRIFT_READ_REASON: &str = "drift.read_reason.v1";
+/// Evidence for `claude.hook.pretooluse_deny`.
 pub const RULE_DRIFT_HOOK_SILENT: &str = "drift.read_hook_silent.v1";
+/// Evidence for `claude.hook.user_prompt_submit`.
 pub const RULE_DRIFT_INJECTION_UNSEEN: &str = "drift.injection_unseen.v1";
+/// Evidence for `claude.transcript.usage`.
 pub const RULE_DRIFT_USAGE_FIELDS: &str = "drift.usage_fields_gone.v1";
+/// Evidence for whichever capability's shim reported the malformed payload —
+/// four rows name this rule, and `contract::capability_for_payload_shim`
+/// resolves each report to exactly one of them through `wired_in`.
+///
+/// Also, uniquely, still a **notice id in its own right**: `taint_beacon` and
+/// `checkpoint_beacon` report through the same route and have no registry row,
+/// so their reports keep this un-consolidated channel rather than being
+/// mis-attributed. A report the matrix cannot place is a real signal about a
+/// shim the matrix does not cover, and dropping it to satisfy a
+/// one-notice-source count would be exactly the "computed then discarded"
+/// failure this milestone exists to remove.
 pub const RULE_DRIFT_PAYLOAD: &str = "drift.payload.v1";
+/// Evidence for `claude.hook.pretooluse_deny`.
 pub const RULE_DRIFT_READ_BYPASS: &str = "drift.read_bypass.v1";
+/// Evidence for `claude.transcript.subagents`.
 pub const RULE_DRIFT_SUBAGENT: &str = "drift.subagent_transcripts.v1";
 
 // ── V32 Phase C3 — detection-updater canaries ───────────────────────────
@@ -403,7 +454,10 @@ pub struct Signals {
     /// own sample floor (the rule wants ≥10 sessions of evidence).
     pub redundant_read_sessions: u64,
     /// Phase F2: STRICTLY `harness_versions.e1_status` trimmed+lowercased ==
-    /// `"pass"` — NOT merely `!e1_blocked()`. "Verified OK" must mean *proven*:
+    /// `"pass"` — NOT merely "the gate is not blocking"
+    /// (`harness::contract::gate`, which also passes `"unverified"`). V35
+    /// Phase E retired `e1_blocked()` and deliberately left this check alone;
+    /// the two are not interchangeable. "Verified OK" must mean *proven*:
     /// an `"unverified"` E1 (the default) must never auto-graduate a hook we've
     /// never seen work. Gates `adopt.read_advisor.v1`.
     pub e1_pass: bool,
@@ -478,6 +532,85 @@ pub struct Proposal {
     /// Currently only `"mark_verified"` (Feature 1's tripwire →
     /// `harness_mark_verified` IPC).
     pub action: Option<&'static str>,
+    /// V35 Phase E: for a [`RULE_DRIFT_CAPABILITY`] notice, the harness
+    /// capability it is about (`harness::contract::Capability::id`) — the join
+    /// key shared with the gate query and the Settings window. `None` for every
+    /// rule that is not capability-scoped.
+    ///
+    /// Carried as a field rather than left for the UI to dig out of
+    /// [`Self::signature`], which is documented as opaque: a card that parsed
+    /// the signature would be a second implementation of the signature format,
+    /// which is the class of mirror this phase removed.
+    pub capability: Option<&'static str>,
+}
+
+/// Compose the ONE consolidated drift notice (V35 Phase E).
+///
+/// The V16 detector has already fired by the time this is called — its
+/// threshold, its sample floor and its warn-only/Apply choice are the caller's
+/// and are unchanged. This owns only the envelope: the notice id, the
+/// three-part signature (see [`RULE_DRIFT_CAPABILITY`]) and the fix pointer.
+///
+/// The body names the capability, the evidence, and the registry row's
+/// `wired_in` paths — matrix draft § 3.2. `wired_in` is the useful half: it is
+/// the list of modules that break when this contract moves, which is the
+/// question a user reading a drift card actually has and the one thing the
+/// prose rationale never carried.
+/// `warn_only` is DERIVED from `setting` rather than passed: the two were
+/// always the same fact (`Proposal::warn_only`'s own doc — "a drift canary with
+/// nothing safe to auto-apply renders no Apply button, `setting` is empty"),
+/// and a notice that named a setting while claiming to be warn-only would be a
+/// card with an Apply button the frontend refuses to draw.
+fn capability_notice(
+    cap: &'static crate::harness::contract::Capability,
+    evidence: &'static str,
+    inner_signature: &str,
+    setting: &str,
+    current: String,
+    proposed: &str,
+    rationale: String,
+) -> Proposal {
+    use crate::harness::contract::Harness;
+    let harness = match cap.harness {
+        Harness::Claude => "Claude Code",
+        Harness::OpenCode => "OpenCode",
+        Harness::Any => "any attached harness",
+    };
+    Proposal {
+        setting: setting.to_string(),
+        current,
+        proposed: proposed.to_string(),
+        rationale: format!(
+            "{rationale}\n\nCapability `{}` — {harness}, seam tier {:?}, evidence `{evidence}`. \
+             What breaks if this contract has moved: {}.",
+            cap.id,
+            cap.tier,
+            cap.wired_in.join(", ")
+        ),
+        rule_id: RULE_DRIFT_CAPABILITY,
+        signature: format!("{}:{evidence}:{inner_signature}", cap.id),
+        warn_only: setting.is_empty(),
+        action: None,
+        capability: Some(cap.id),
+    }
+}
+
+/// The single registry row a drift rule is evidence about, or `None` when the
+/// matrix names none.
+///
+/// Every consolidated rule below resolves to exactly one row today; the
+/// multi-row case (`drift.payload.v1`, named by four) is handled by its own
+/// per-shim attribution rather than through here. A rule the matrix stopped
+/// naming would silently stop raising a notice, so
+/// `contract::tests::every_declared_drift_rule_resolves_back_to_its_rows` and
+/// [`tests::every_consolidated_drift_rule_has_a_capability`] are what keep this
+/// from returning `None` in production.
+fn sole_capability(rule: &'static str) -> Option<&'static crate::harness::contract::Capability> {
+    let rows = crate::harness::contract::capabilities_for_rule(rule);
+    match rows.len() {
+        1 => Some(rows[0]),
+        _ => None,
+    }
 }
 
 /// Bucket a `[0, 1]` rate to the nearest 10% and render it as a compact
@@ -507,9 +640,14 @@ fn is_dismissed(dismissed: &[DismissedRule], rule_id: &str, signature: &str) -> 
 /// broken" and "raise its floor" must never appear side by side.
 pub fn evaluate(sig: &Signals) -> Vec<Proposal> {
     let mut out = drift_rules(sig);
+    // V35 Phase E: `out` holds ONLY drift proposals at this point, and the two
+    // that carry an Apply are exactly the two that propose turning the advisor
+    // off. Asked as "does drift propose disabling the advisor" rather than by
+    // listing two rule ids — which is both what the suppression below actually
+    // means and what survived the rule ids consolidating into one.
     let advisor_disable_proposed = out
         .iter()
-        .any(|p| p.rule_id == RULE_DRIFT_READ_REASON || p.rule_id == RULE_DRIFT_READ_BYPASS);
+        .any(|p| p.setting == "graph.read_advisor" && p.proposed == "false");
 
     // Global cold-start floor: no TUNING rule proposes below it, no matter
     // how extreme an individual rate looks.
@@ -529,9 +667,20 @@ pub fn evaluate(sig: &Signals) -> Vec<Proposal> {
     // Apply cooldown, last so it covers every rule class uniformly: a rule
     // the user just applied doesn't speak again until the root has seen
     // APPLY_COOLDOWN_SESSIONS further sessions — the rates it would re-judge
-    // are cumulative and still dominated by pre-apply data. Warn-only rules
-    // have no Apply and thus never accrue a record; they pass untouched.
-    out.retain(|p| !in_apply_cooldown(sig, p.rule_id));
+    // are cumulative and still dominated by pre-apply data.
+    //
+    // Warn-only proposals are exempt, and V35 Phase E is what made the
+    // exemption load-bearing rather than cosmetic. A warn-only rule has no
+    // Apply button, so it can never accrue a cooldown record of its own and
+    // this filter was always a no-op for it. Now that every capability drift
+    // notice shares ONE `rule_id`, it would stop being a no-op: applying the
+    // read advisor's disable proposal writes an `AppliedRule` for
+    // `drift.capability.v1`, which would silence every OTHER capability's
+    // warn-only notice — a transcript-usage break going quiet because the user
+    // acted on an unrelated read-advisor card. `AppliedRule` is keyed by
+    // `rule_id` alone (a Settings wire type), so the exemption is the fix that
+    // needs no migration.
+    out.retain(|p| p.warn_only || !in_apply_cooldown(sig, p.rule_id));
     out
 }
 
@@ -596,6 +745,8 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 signature,
                 warn_only: true,
                 action: Some("mark_verified"),
+                // Not capability-scoped, and not consolidated: see the const.
+                capability: None,
             });
         }
     }
@@ -608,13 +759,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     if sig.graph.read_advisor {
         if let Some(rate) = sig.advisor_reread_rate {
             if sig.advisor_reread_samples >= DRIFT_MIN_REMINDS && rate >= READ_REASON_HIGH {
-                let signature = bucket10(rate);
-                if !is_dismissed(&sig.dismissed, RULE_DRIFT_READ_REASON, &signature) {
-                    out.push(Proposal {
-                        setting: "graph.read_advisor".to_string(),
-                        current: "true".to_string(),
-                        proposed: "false".to_string(),
-                        rationale: format!(
+                if let Some(cap) = sole_capability(RULE_DRIFT_READ_REASON) {
+                    let inner = bucket10(rate);
+                    let p = capability_notice(
+                        cap,
+                        RULE_DRIFT_READ_REASON,
+                        &inner,
+                        "graph.read_advisor",
+                        "true".to_string(),
+                        "false",
+                        format!(
                             "{:.0}% of read-advisor reminders were immediately followed by a \
                              full Read of the same file (n={} reminders) — at ~100% the deny \
                              reason is likely not reaching the model at all (bare refusals), \
@@ -623,11 +777,10 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                             rate * 100.0,
                             sig.advisor_reread_samples
                         ),
-                        rule_id: RULE_DRIFT_READ_REASON,
-                        signature,
-                        warn_only: false,
-                        action: None,
-                    });
+                    );
+                    if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                        out.push(p);
+                    }
                 }
             }
         }
@@ -644,13 +797,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         && sig.large_reread_pairs >= DRIFT_SILENT_MIN_REREADS
         && sig.remind_count == 0
     {
-        let signature = version_signature(&sig.claude_last_seen);
-        if !is_dismissed(&sig.dismissed, RULE_DRIFT_HOOK_SILENT, &signature) {
-            out.push(Proposal {
-                setting: String::new(),
-                current: format!("{} large re-reads (est.)", sig.large_reread_pairs),
-                proposed: "0 reminders".to_string(),
-                rationale: format!(
+        if let Some(cap) = sole_capability(RULE_DRIFT_HOOK_SILENT) {
+            let inner = version_signature(&sig.claude_last_seen);
+            let p = capability_notice(
+                cap,
+                RULE_DRIFT_HOOK_SILENT,
+                &inner,
+                "",
+                format!("{} large re-reads (est.)", sig.large_reread_pairs),
+                "0 reminders",
+                format!(
                     "The read advisor is on and this project re-read {} large files across \
                      {} sessions (est.) — the exact condition it reminds on — yet not one \
                      remind reached the loopback. The PreToolUse hook is likely not firing \
@@ -658,11 +814,10 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                      hook wiring per MAINTENANCE.md → \"harness contracts\".",
                     sig.large_reread_pairs, sig.session_count
                 ),
-                rule_id: RULE_DRIFT_HOOK_SILENT,
-                signature,
-                warn_only: true,
-                action: None,
-            });
+            );
+            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                out.push(p);
+            }
         }
     }
 
@@ -676,13 +831,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 && sig.session_count >= DRIFT_UNSEEN_MIN_SESSIONS
                 && follow <= INJECTION_UNSEEN_LOW
             {
-                let signature = bucket10(follow);
-                if !is_dismissed(&sig.dismissed, RULE_DRIFT_INJECTION_UNSEEN, &signature) {
-                    out.push(Proposal {
-                        setting: String::new(),
-                        current: format!("{:.0}% follow rate", follow * 100.0),
-                        proposed: "injected context reaching the model".to_string(),
-                        rationale: format!(
+                if let Some(cap) = sole_capability(RULE_DRIFT_INJECTION_UNSEEN) {
+                    let inner = bucket10(follow);
+                    let p = capability_notice(
+                        cap,
+                        RULE_DRIFT_INJECTION_UNSEEN,
+                        &inner,
+                        "",
+                        format!("{:.0}% follow rate", follow * 100.0),
+                        "injected context reaching the model",
+                        format!(
                             "Context injection is on and growing, but only {:.1}% of {} \
                              injected files were ever read or edited afterwards across {} \
                              sessions — near-zero follow suggests the injected block never \
@@ -693,11 +851,10 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                             sig.injection_follow_samples,
                             sig.session_count
                         ),
-                        rule_id: RULE_DRIFT_INJECTION_UNSEEN,
-                        signature,
-                        warn_only: true,
-                        action: None,
-                    });
+                    );
+                    if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                        out.push(p);
+                    }
                 }
             }
         }
@@ -710,16 +867,19 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     if sig.claude_sessions >= DRIFT_MIN_TOKENLESS
         && sig.claude_tokenless_sessions == sig.claude_sessions
     {
-        let signature = version_signature(&sig.claude_last_seen);
-        if !is_dismissed(&sig.dismissed, RULE_DRIFT_USAGE_FIELDS, &signature) {
-            out.push(Proposal {
-                setting: String::new(),
-                current: format!(
+        if let Some(cap) = sole_capability(RULE_DRIFT_USAGE_FIELDS) {
+            let inner = version_signature(&sig.claude_last_seen);
+            let p = capability_notice(
+                cap,
+                RULE_DRIFT_USAGE_FIELDS,
+                &inner,
+                "",
+                format!(
                     "{} Claude sessions without token fields",
                     sig.claude_sessions
                 ),
-                proposed: "usage_stat rows with token counts".to_string(),
-                rationale: format!(
+                "usage_stat rows with token counts",
+                format!(
                     "All {} recent Claude sessions recorded zero token-bearing usage rows — \
                      the transcript's `message.usage` shape has likely changed and the Usage \
                      section is now blind (chars-only estimates). The token-efficiency \
@@ -727,40 +887,107 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                      these sessions.",
                     sig.claude_sessions
                 ),
-                rule_id: RULE_DRIFT_USAGE_FIELDS,
-                signature,
-                warn_only: true,
-                action: None,
-            });
+            );
+            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                out.push(p);
+            }
         }
     }
 
-    // Feature 3 — drift.payload.v1: a shim reported a payload missing
-    // required fields. One event is enough — the shims rate-limit
-    // themselves to one report per shim per session, and a malformed
-    // payload is a contract fact.
+    // Feature 3 — payload drift: a shim reported a payload missing required
+    // fields. One event is enough — the shims rate-limit themselves to one
+    // report per shim per session, and a malformed payload is a contract fact.
+    //
+    // V35 Phase E: this is the one rule FOUR registry rows name, so it is also
+    // the one that could have lost precision in consolidation. It does not.
+    // Each report is attributed to the capability whose shim sent it —
+    // `loopback::contract_drift_row` writes the target as
+    // `"<shim>: <missing fields>"`, and `contract::capability_for_payload_shim`
+    // resolves the leading token through the `wired_in` column — so a
+    // `read_hook` payload drift now names `claude.hook.pretooluse_deny` and its
+    // consumers instead of listing four shims in one undifferentiated card,
+    // and dismissing it no longer silences the other three.
+    //
+    // Reports from a shim the matrix does not cover (`taint_beacon`,
+    // `checkpoint_beacon`, a forged name folded into the loopback's
+    // `(unrecognized shim)` bucket) keep the un-consolidated `drift.payload.v1`
+    // channel below rather than being pinned on a capability that did not
+    // report them.
     if !sig.contract_drift.is_empty() {
-        let mut shims = sig.contract_drift.clone();
-        shims.sort();
-        shims.dedup();
-        let signature = shims.join("+");
-        if !is_dismissed(&sig.dismissed, RULE_DRIFT_PAYLOAD, &signature) {
-            out.push(Proposal {
-                setting: String::new(),
-                current: shims.join(", "),
-                proposed: "hook payloads with all required fields".to_string(),
-                rationale: format!(
-                    "Hook shims reported payloads missing required fields this run: {}. The \
-                     shims keep failing open (nothing breaks), but the harness's hook payload \
-                     shape has drifted — verify the contracts per MAINTENANCE.md before \
-                     trusting the features built on them.",
-                    shims.join("; ")
+        let mut reports = sig.contract_drift.clone();
+        reports.sort();
+        reports.dedup();
+
+        // Keyed by capability id (not by the row) so the notice order is
+        // stable and independent of registry declaration order.
+        type Reports = (&'static crate::harness::contract::Capability, Vec<String>);
+        let mut by_capability: std::collections::BTreeMap<&'static str, Reports> =
+            std::collections::BTreeMap::new();
+        let mut unattributed: Vec<String> = Vec::new();
+        for report in reports {
+            let shim = report.split(':').next().unwrap_or("").trim();
+            match crate::harness::contract::capability_for_payload_shim(shim) {
+                Some(cap) => by_capability
+                    .entry(cap.id)
+                    .or_insert_with(|| (cap, Vec::new()))
+                    .1
+                    .push(report),
+                None => unattributed.push(report),
+            }
+        }
+
+        for (_, (cap, what)) in by_capability {
+            // Inner signature = THIS capability's reports (shim + the missing
+            // field list, as recorded), so a dismissal holds for the drift the
+            // user actually looked at and re-fires when a different field goes
+            // missing — the same precision the pre-Phase-E signature carried
+            // across all shims at once.
+            let inner = what.join("+");
+            let p = capability_notice(
+                cap,
+                RULE_DRIFT_PAYLOAD,
+                &inner,
+                "",
+                what.join(", "),
+                "hook payloads with all required fields",
+                format!(
+                    "This capability's hook shim reported payloads missing required fields this \
+                     run: {}. The shim keeps failing open (nothing breaks), but the harness's \
+                     hook payload shape has drifted — verify the contract per MAINTENANCE.md \
+                     before trusting the features built on it.",
+                    what.join("; ")
                 ),
-                rule_id: RULE_DRIFT_PAYLOAD,
-                signature,
-                warn_only: true,
-                action: None,
-            });
+            );
+            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                out.push(p);
+            }
+        }
+
+        if !unattributed.is_empty() {
+            let signature = unattributed.join("+");
+            if !is_dismissed(&sig.dismissed, RULE_DRIFT_PAYLOAD, &signature) {
+                out.push(Proposal {
+                    setting: String::new(),
+                    current: unattributed.join(", "),
+                    proposed: "hook payloads with all required fields".to_string(),
+                    rationale: format!(
+                        "Hook shims reported payloads missing required fields this run: {}. The \
+                         shims keep failing open (nothing breaks), but the harness's hook \
+                         payload shape has drifted — verify the contracts per MAINTENANCE.md \
+                         before trusting the features built on them.\n\nThese reports are NOT \
+                         attributed to a capability: no row in the harness capability matrix \
+                         names the shim that sent them, so the matrix cannot say which \
+                         consumers break. That is itself worth knowing — either the shim \
+                         belongs in the matrix, or the name is not one cImp ships.",
+                        unattributed.join("; ")
+                    ),
+                    rule_id: RULE_DRIFT_PAYLOAD,
+                    signature,
+                    warn_only: true,
+                    action: None,
+                    capability: None,
+                });
+            }
         }
     }
 
@@ -775,25 +1002,26 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
         let mut what = sig.subagent_drift.clone();
         what.sort();
         what.dedup();
-        let signature = version_signature(&sig.claude_last_seen);
-        if !is_dismissed(&sig.dismissed, RULE_DRIFT_SUBAGENT, &signature) {
-            out.push(Proposal {
-                setting: String::new(),
-                current: what.join(", "),
-                proposed: "sub-agent transcripts tailed (usage + agents-active tracked)"
-                    .to_string(),
-                rationale: format!(
+        if let Some(cap) = sole_capability(RULE_DRIFT_SUBAGENT) {
+            let inner = version_signature(&sig.claude_last_seen);
+            let p = capability_notice(
+                cap,
+                RULE_DRIFT_SUBAGENT,
+                &inner,
+                "",
+                what.join(", "),
+                "sub-agent transcripts tailed (usage + agents-active tracked)",
+                format!(
                     "The Claude transcript tap reported sub-agent contract drift this run: \
                      {}. Until the tail is re-pointed, sub-agent token spend may be missing \
                      from the Usage section and/or the agents-active avatar hold may be \
                      dead — verify the transcript layout per MAINTENANCE.md.",
                     what.join("; ")
                 ),
-                rule_id: RULE_DRIFT_SUBAGENT,
-                signature,
-                warn_only: true,
-                action: None,
-            });
+            );
+            if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                out.push(p);
+            }
         }
     }
 
@@ -836,6 +1064,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             signature,
             warn_only: true,
             action: None,
+            capability: None,
         });
     }
 
@@ -872,6 +1101,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             signature,
             warn_only: true,
             action: None,
+            capability: None,
         });
     }
 
@@ -918,6 +1148,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             signature,
             warn_only: true,
             action: None,
+            capability: None,
         });
     }
 
@@ -963,6 +1194,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 signature,
                 warn_only: true,
                 action: None,
+                capability: None,
             });
         }
     }
@@ -1052,6 +1284,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                 signature,
                 warn_only: true,
                 action: None,
+                capability: None,
             });
         }
     }
@@ -1089,6 +1322,7 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
             signature,
             warn_only: true,
             action: None,
+            capability: None,
         });
     }
 
@@ -1099,13 +1333,16 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     if sig.graph.read_advisor {
         if let Some(rate) = sig.bypass_rate {
             if sig.bypass_samples >= DRIFT_MIN_BYPASS_REMINDS && rate >= BYPASS_HIGH {
-                let signature = bucket10(rate);
-                if !is_dismissed(&sig.dismissed, RULE_DRIFT_READ_BYPASS, &signature) {
-                    out.push(Proposal {
-                        setting: "graph.read_advisor".to_string(),
-                        current: "true".to_string(),
-                        proposed: "false".to_string(),
-                        rationale: format!(
+                if let Some(cap) = sole_capability(RULE_DRIFT_READ_BYPASS) {
+                    let inner = bucket10(rate);
+                    let p = capability_notice(
+                        cap,
+                        RULE_DRIFT_READ_BYPASS,
+                        &inner,
+                        "graph.read_advisor",
+                        "true".to_string(),
+                        "false",
+                        format!(
                             "{:.0}% of read-advisor reminders were answered with a shell read \
                              of the same file (est., n={} reminders) — the agent is routing \
                              around the advisor, which costs the same tokens plus the remind \
@@ -1117,11 +1354,10 @@ fn drift_rules(sig: &Signals) -> Vec<Proposal> {
                             rate * 100.0,
                             sig.bypass_samples
                         ),
-                        rule_id: RULE_DRIFT_READ_BYPASS,
-                        signature,
-                        warn_only: false,
-                        action: None,
-                    });
+                    );
+                    if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+                        out.push(p);
+                    }
                 }
             }
         }
@@ -1158,6 +1394,7 @@ fn surface_rules(sig: &Signals) -> Vec<Proposal> {
                 signature,
                 warn_only: false,
                 action: None,
+                capability: None,
             });
         }
     }
@@ -1200,6 +1437,7 @@ fn adopt_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> {
                         signature,
                         warn_only: false,
                         action: None,
+                        capability: None,
                     });
                 }
             }
@@ -1240,6 +1478,7 @@ fn adopt_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> {
                         signature,
                         warn_only: false,
                         action: None,
+                        capability: None,
                     });
                 }
             }
@@ -1279,6 +1518,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
                         signature,
                         warn_only: false,
                         action: None,
+                        capability: None,
                     });
                 }
             }
@@ -1315,6 +1555,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
                     signature,
                     warn_only: false,
                     action: None,
+                    capability: None,
                 });
             }
         }
@@ -1357,6 +1598,7 @@ fn tuning_rules(sig: &Signals, advisor_disable_proposed: bool) -> Vec<Proposal> 
                         signature,
                         warn_only: false,
                         action: None,
+                        capability: None,
                     });
                 }
             }
@@ -1521,13 +1763,16 @@ mod tests {
         // cooldown, the drift rule must not fire again off the same stale rate.
         let mut sig = read_reason_signals();
         sig.applied = vec![AppliedRule {
-            rule_id: RULE_DRIFT_READ_REASON.to_string(),
+            // V35 Phase E: the record the frontend writes is the notice id the
+            // card carried, which for a drift notice is now the consolidated
+            // one.
+            rule_id: RULE_DRIFT_CAPABILITY.to_string(),
             root: String::new(),
             session_count: sig.session_count,
         }];
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+            .any(|p| is_drift(p, RULE_DRIFT_READ_REASON)));
     }
 
     #[test]
@@ -1661,6 +1906,151 @@ mod tests {
 
     // ── V16 drift canary rules ──────────────────────────────────────────
 
+    /// Whether `p` is the consolidated `drift.capability.v1` notice raised on
+    /// `evidence` (V35 Phase E).
+    ///
+    /// The V16 detectors kept their ids — as the EVIDENCE half of the notice
+    /// signature — so the tests below still name the exact rule they exercise;
+    /// they just no longer find it in `rule_id`. The middle signature field is
+    /// unambiguous because neither a capability id nor a rule id contains a
+    /// colon, while the third field (the detector's own re-fire key) may.
+    fn is_drift(p: &Proposal, evidence: &str) -> bool {
+        p.rule_id == RULE_DRIFT_CAPABILITY && p.signature.split(':').nth(1) == Some(evidence)
+    }
+
+    /// The consolidated signature a detector's notice carries:
+    /// `<capability>:<evidence>:<the detector's own key>`.
+    fn drift_signature(capability: &str, evidence: &str, inner: &str) -> String {
+        format!("{capability}:{evidence}:{inner}")
+    }
+
+    /// Every consolidated detector resolves to a capability the notice can be
+    /// about. A rule the matrix stopped naming would keep computing and raise
+    /// nothing — the exact "signal with no consumer" failure V35 exists to
+    /// prevent, and the one that would be invisible from inside these tests
+    /// (they would simply see no proposal and could not tell "healthy" from
+    /// "unwired"). Named explicitly rather than derived from the registry, so
+    /// that dropping a `drift_rule` link fails here with the rule's name.
+    #[test]
+    fn every_consolidated_drift_rule_has_a_capability() {
+        for (rule, expect) in [
+            (RULE_DRIFT_READ_REASON, "claude.hook.pretooluse_deny"),
+            (RULE_DRIFT_HOOK_SILENT, "claude.hook.pretooluse_deny"),
+            (RULE_DRIFT_READ_BYPASS, "claude.hook.pretooluse_deny"),
+            (RULE_DRIFT_INJECTION_UNSEEN, "claude.hook.user_prompt_submit"),
+            (RULE_DRIFT_USAGE_FIELDS, "claude.transcript.usage"),
+            (RULE_DRIFT_SUBAGENT, "claude.transcript.subagents"),
+        ] {
+            let cap = sole_capability(rule)
+                .unwrap_or_else(|| panic!("`{rule}` names no single capability — no notice would \
+                                           ever be raised for it"));
+            assert_eq!(cap.id, expect, "`{rule}` moved to a different capability");
+        }
+        // `drift.payload.v1` is deliberately NOT sole-resolvable: four rows
+        // name it, and each report is attributed by shim instead.
+        assert!(sole_capability(RULE_DRIFT_PAYLOAD).is_none());
+        // The tripwire is not capability-scoped at all (Phase F reworks it).
+        assert!(sole_capability(RULE_DRIFT_VERSION).is_none());
+    }
+
+    /// Every consolidated notice names its capability, its evidence and the
+    /// modules that break — matrix draft § 3.2. The fix pointer is the half
+    /// the prose rationale never carried, and a card that says "the contract
+    /// moved" without saying what breaks is the investigation this milestone
+    /// exists to replace with a diff.
+    #[test]
+    fn a_capability_notice_carries_its_join_key_and_its_fix_pointer() {
+        let props = evaluate(&read_reason_signals());
+        let p = props
+            .iter()
+            .find(|p| is_drift(p, RULE_DRIFT_READ_REASON))
+            .expect("fires");
+        assert_eq!(p.rule_id, RULE_DRIFT_CAPABILITY);
+        assert_eq!(p.capability, Some("claude.hook.pretooluse_deny"));
+        assert!(p.signature.starts_with("claude.hook.pretooluse_deny:drift.read_reason.v1:"));
+        assert!(p.rationale.contains("claude.hook.pretooluse_deny"));
+        assert!(p.rationale.contains(RULE_DRIFT_READ_REASON));
+        // The `wired_in` column, verbatim — this is what makes the card
+        // actionable rather than merely alarming.
+        assert!(p.rationale.contains("src-tauri/src/read_hook.rs"), "{}", p.rationale);
+        assert!(p.rationale.contains("src-tauri/src/tabs/config.rs"));
+    }
+
+    /// A dismissal holds per (capability, evidence) pair and NOWHERE else.
+    ///
+    /// Both halves matter. Dismissing the transcript-usage notice must not
+    /// silence the sub-agent one even though they now share a `rule_id` — that
+    /// is the risk consolidation introduced. And the third signature field
+    /// (each detector's original key) must still be honoured, or every drift
+    /// dismissal would silently have become permanent.
+    #[test]
+    fn a_capability_dismissal_does_not_silence_a_sibling_capability() {
+        let sig = Signals {
+            claude_sessions: 3,
+            claude_tokenless_sessions: 3,
+            subagent_drift: vec!["subagents/*.jsonl vanished".to_string()],
+            claude_last_seen: "2.2.0".to_string(),
+            ..Signals::default()
+        };
+        assert!(evaluate(&sig).iter().any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
+        assert!(evaluate(&sig).iter().any(|p| is_drift(p, RULE_DRIFT_SUBAGENT)));
+
+        let mut dismissed = sig.clone();
+        dismissed.dismissed = vec![DismissedRule {
+            rule_id: RULE_DRIFT_CAPABILITY.to_string(),
+            signature: drift_signature(
+                "claude.transcript.usage",
+                RULE_DRIFT_USAGE_FIELDS,
+                "2.2.0",
+            ),
+        }];
+        let props = evaluate(&dismissed);
+        assert!(
+            !props.iter().any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)),
+            "the dismissed (capability, evidence) pair must be silent"
+        );
+        assert!(
+            props.iter().any(|p| is_drift(p, RULE_DRIFT_SUBAGENT)),
+            "a sibling capability sharing the notice id must still speak"
+        );
+
+        // Same capability, next harness version ⇒ re-fires (the third
+        // signature field is the detector's own re-fire boundary).
+        let mut next = dismissed;
+        next.claude_last_seen = "2.3.0".to_string();
+        assert!(evaluate(&next).iter().any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
+    }
+
+    /// Applying the one drift notice that carries an Apply must not silence
+    /// the warn-only notices that now share its `rule_id`.
+    ///
+    /// `AppliedRule` is keyed by `rule_id` alone (a Settings wire type), so
+    /// consolidation put every capability's warn-only card behind one
+    /// cooldown record. The exemption in `evaluate` is what keeps a
+    /// transcript-usage break from going quiet because the user acted on an
+    /// unrelated read-advisor card.
+    #[test]
+    fn applying_one_capability_notice_does_not_mute_the_others() {
+        let mut sig = read_reason_signals();
+        sig.claude_sessions = 3;
+        sig.claude_tokenless_sessions = 3;
+        sig.claude_last_seen = "2.2.0".to_string();
+        sig.applied = vec![AppliedRule {
+            rule_id: RULE_DRIFT_CAPABILITY.to_string(),
+            root: String::new(),
+            session_count: sig.session_count,
+        }];
+        let props = evaluate(&sig);
+        assert!(
+            !props.iter().any(|p| is_drift(p, RULE_DRIFT_READ_REASON)),
+            "the applied (Apply-bearing) notice stays in cooldown"
+        );
+        assert!(
+            props.iter().any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)),
+            "a warn-only notice has no Apply and must not inherit the cooldown"
+        );
+    }
+
     #[test]
     fn version_tripwire_fires_below_the_global_session_floor() {
         // A version bump is a fact, not a statistic — zero sessions must
@@ -1749,7 +2139,7 @@ mod tests {
         let props = evaluate(&read_reason_signals());
         let p = props
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_READ_REASON)
+            .find(|p| is_drift(p, RULE_DRIFT_READ_REASON))
             .expect("fires");
         assert_eq!(p.setting, "graph.read_advisor");
         assert_eq!(p.proposed, "false");
@@ -1762,19 +2152,19 @@ mod tests {
         sig.graph.read_advisor = false;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+            .any(|p| is_drift(p, RULE_DRIFT_READ_REASON)));
 
         let mut sig = read_reason_signals();
         sig.advisor_reread_samples = DRIFT_MIN_REMINDS - 1;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+            .any(|p| is_drift(p, RULE_DRIFT_READ_REASON)));
 
         let mut sig = read_reason_signals();
         sig.advisor_reread_rate = Some(0.8); // high for tuning, below drift's 0.9
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_READ_REASON));
+            .any(|p| is_drift(p, RULE_DRIFT_READ_REASON)));
     }
 
     #[test]
@@ -1784,10 +2174,10 @@ mod tests {
         let mut sig = read_reason_signals();
         sig.advisor_reread_rate = Some(1.0);
         sig.advisor_reread_samples = MIN_REMINDS; // 20 ≥ both floors
-        let ids: Vec<&str> = evaluate(&sig).iter().map(|p| p.rule_id).collect();
-        assert!(ids.contains(&RULE_DRIFT_READ_REASON));
+        let props = evaluate(&sig);
+        assert!(props.iter().any(|p| is_drift(p, RULE_DRIFT_READ_REASON)));
         assert!(
-            !ids.contains(&RULE_ADVISOR_LINES),
+            !props.iter().any(|p| p.rule_id == RULE_ADVISOR_LINES),
             "tuning rule must be suppressed"
         );
     }
@@ -1809,35 +2199,40 @@ mod tests {
         let props = evaluate(&base);
         let p = props
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT)
+            .find(|p| is_drift(p, RULE_DRIFT_HOOK_SILENT))
             .expect("fires");
         assert!(p.warn_only);
         assert!(p.setting.is_empty());
-        assert_eq!(p.signature, "2.2.0"); // re-fires per harness version
+        // Still re-fires per harness version — the detector's own key is the
+        // third signature field, unchanged by V35 Phase E's consolidation.
+        assert_eq!(
+            p.signature,
+            drift_signature("claude.hook.pretooluse_deny", RULE_DRIFT_HOOK_SILENT, "2.2.0")
+        );
 
         let mut sig = base.clone();
         sig.remind_count = 1; // one remind reached the loopback ⇒ hook alive
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+            .any(|p| is_drift(p, RULE_DRIFT_HOOK_SILENT)));
 
         let mut sig = base.clone();
         sig.large_reread_pairs = DRIFT_SILENT_MIN_REREADS - 1;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+            .any(|p| is_drift(p, RULE_DRIFT_HOOK_SILENT)));
 
         let mut sig = base.clone();
         sig.session_count = DRIFT_SILENT_MIN_SESSIONS - 1;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+            .any(|p| is_drift(p, RULE_DRIFT_HOOK_SILENT)));
 
         let mut sig = base;
         sig.graph.read_advisor = false;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_HOOK_SILENT));
+            .any(|p| is_drift(p, RULE_DRIFT_HOOK_SILENT)));
     }
 
     #[test]
@@ -1856,7 +2251,7 @@ mod tests {
         let props = evaluate(&base);
         let p = props
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN)
+            .find(|p| is_drift(p, RULE_DRIFT_INJECTION_UNSEEN))
             .expect("fires");
         assert!(p.warn_only);
 
@@ -1866,13 +2261,13 @@ mod tests {
         sig.injection_follow_rate = Some(0.10);
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN));
+            .any(|p| is_drift(p, RULE_DRIFT_INJECTION_UNSEEN)));
 
         let mut sig = base;
         sig.graph.context_injection = false;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_INJECTION_UNSEEN));
+            .any(|p| is_drift(p, RULE_DRIFT_INJECTION_UNSEEN)));
     }
 
     #[test]
@@ -1885,7 +2280,7 @@ mod tests {
         };
         assert!(evaluate(&base)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
+            .any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
 
         // One healthy session ⇒ the schema didn't change, that session is
         // just odd.
@@ -1893,7 +2288,7 @@ mod tests {
         sig.claude_tokenless_sessions = 2;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
+            .any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
 
         // Below the floor a single tokenless session could be a fluke.
         let mut sig = base;
@@ -1901,7 +2296,7 @@ mod tests {
         sig.claude_tokenless_sessions = DRIFT_MIN_TOKENLESS - 1;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_USAGE_FIELDS));
+            .any(|p| is_drift(p, RULE_DRIFT_USAGE_FIELDS)));
     }
 
     #[test]
@@ -1913,13 +2308,27 @@ mod tests {
         let props = evaluate(&sig);
         let p = props
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_PAYLOAD)
+            .find(|p| is_drift(p, RULE_DRIFT_PAYLOAD))
             .expect("fires");
         assert!(p.warn_only);
         assert!(p.rationale.contains("read_hook: session_id"));
+        // V35 Phase E: the report is attributed to the capability whose shim
+        // sent it, resolved through the registry's `wired_in` column.
+        assert_eq!(p.capability, Some("claude.hook.pretooluse_deny"));
+        assert_eq!(
+            p.signature,
+            drift_signature(
+                "claude.hook.pretooluse_deny",
+                RULE_DRIFT_PAYLOAD,
+                "read_hook: session_id"
+            )
+        );
 
-        // Signature is the deduped, sorted shim list — a second identical
-        // report doesn't change it (dismissal holds), a NEW shim does.
+        // Reports are deduped and sorted — a second identical report doesn't
+        // change the signature (a dismissal holds), a new missing FIELD does.
+        // Two different shims are now two different capabilities and therefore
+        // two notices: before Phase E they shared one card and one dismissal,
+        // so silencing a `read_hook` drift silenced the `compact_hook` one too.
         let sig2 = Signals {
             contract_drift: vec![
                 "read_hook: session_id".to_string(),
@@ -1928,9 +2337,75 @@ mod tests {
             ],
             ..Signals::default()
         };
-        let p2 = evaluate(&sig2);
-        let p2 = p2.iter().find(|p| p.rule_id == RULE_DRIFT_PAYLOAD).unwrap();
-        assert_eq!(p2.signature, "compact_hook: cwd+read_hook: session_id");
+        let props2 = evaluate(&sig2);
+        let payload: Vec<&Proposal> = props2
+            .iter()
+            .filter(|p| is_drift(p, RULE_DRIFT_PAYLOAD))
+            .collect();
+        assert_eq!(payload.len(), 2, "one notice per affected capability");
+        assert_eq!(
+            payload[0].signature,
+            drift_signature("claude.hook.precompact", RULE_DRIFT_PAYLOAD, "compact_hook: cwd")
+        );
+        assert_eq!(
+            payload[1].signature,
+            drift_signature(
+                "claude.hook.pretooluse_deny",
+                RULE_DRIFT_PAYLOAD,
+                "read_hook: session_id"
+            )
+        );
+        // Dismissing one leaves the other speaking.
+        let mut sig3 = sig2;
+        sig3.dismissed = vec![DismissedRule {
+            rule_id: RULE_DRIFT_CAPABILITY.to_string(),
+            signature: payload[0].signature.clone(),
+        }];
+        let props3 = evaluate(&sig3);
+        assert_eq!(
+            props3
+                .iter()
+                .filter(|p| is_drift(p, RULE_DRIFT_PAYLOAD))
+                .count(),
+            1
+        );
+    }
+
+    /// A payload report from a shim the matrix does not cover keeps the
+    /// un-consolidated `drift.payload.v1` channel rather than being pinned on
+    /// a capability that did not report it.
+    ///
+    /// `taint_beacon` and `checkpoint_beacon` really do post through
+    /// `/activity/contract_drift` and really have no registry row, so this is
+    /// a live path, not a defensive one. Dropping these reports to make the
+    /// notice-source count come out at one would be discarding a signal about
+    /// a shim nobody has declared — which is the failure V35 exists to remove,
+    /// not an instance of the tidiness it is after.
+    #[test]
+    fn an_unmatrixed_shim_keeps_the_unattributed_payload_channel() {
+        let sig = Signals {
+            contract_drift: vec![
+                "taint_beacon: tool_name".to_string(),
+                "read_hook: session_id".to_string(),
+            ],
+            ..Signals::default()
+        };
+        let props = evaluate(&sig);
+        let attributed = props
+            .iter()
+            .find(|p| is_drift(p, RULE_DRIFT_PAYLOAD))
+            .expect("the read_hook report is attributed");
+        assert_eq!(attributed.capability, Some("claude.hook.pretooluse_deny"));
+        assert!(!attributed.rationale.contains("taint_beacon"));
+
+        let residual = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_PAYLOAD)
+            .expect("the taint_beacon report still surfaces");
+        assert_eq!(residual.capability, None);
+        assert_eq!(residual.signature, "taint_beacon: tool_name");
+        assert!(residual.warn_only);
+        assert!(!residual.rationale.contains("read_hook"));
     }
 
     #[test]
@@ -1944,28 +2419,32 @@ mod tests {
         let props = evaluate(&sig);
         let p = props
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_SUBAGENT)
+            .find(|p| is_drift(p, RULE_DRIFT_SUBAGENT))
             .expect("fires");
         assert!(p.warn_only);
         assert!(p.rationale.contains(summary));
         // Version-keyed signature: a dismissal holds until the next harness
-        // update re-fires the rule (same boundary as the version tripwire).
-        assert_eq!(p.signature, "2.2.0");
+        // update re-fires the rule (same boundary as the version tripwire),
+        // now carried as the third field of the consolidated signature.
+        assert_eq!(
+            p.signature,
+            drift_signature("claude.transcript.subagents", RULE_DRIFT_SUBAGENT, "2.2.0")
+        );
 
         // Dismissed for this version ⇒ quiet.
         let mut sig = sig;
         sig.dismissed = vec![DismissedRule {
-            rule_id: RULE_DRIFT_SUBAGENT.to_string(),
-            signature: "2.2.0".to_string(),
+            rule_id: RULE_DRIFT_CAPABILITY.to_string(),
+            signature: p.signature.clone(),
         }];
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
+            .any(|p| is_drift(p, RULE_DRIFT_SUBAGENT)));
 
         // No events ⇒ silent.
         assert!(!evaluate(&Signals::default())
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_SUBAGENT));
+            .any(|p| is_drift(p, RULE_DRIFT_SUBAGENT)));
     }
 
     #[test]
@@ -1983,7 +2462,7 @@ mod tests {
         let p = evaluate(&base);
         let p = p
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_READ_BYPASS)
+            .find(|p| is_drift(p, RULE_DRIFT_READ_BYPASS))
             .expect("fires");
         assert_eq!(p.setting, "graph.read_advisor");
         assert_eq!(p.proposed, "false");
@@ -1992,13 +2471,13 @@ mod tests {
         sig.bypass_rate = Some(0.3); // below BYPASS_HIGH
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_READ_BYPASS));
+            .any(|p| is_drift(p, RULE_DRIFT_READ_BYPASS)));
 
         let mut sig = base;
         sig.bypass_samples = DRIFT_MIN_BYPASS_REMINDS - 1;
         assert!(!evaluate(&sig)
             .iter()
-            .any(|p| p.rule_id == RULE_DRIFT_READ_BYPASS));
+            .any(|p| is_drift(p, RULE_DRIFT_READ_BYPASS)));
     }
 
     #[test]
@@ -2011,7 +2490,7 @@ mod tests {
         let props = evaluate(&sig);
         let p = props
             .iter()
-            .find(|p| p.rule_id == RULE_DRIFT_READ_REASON)
+            .find(|p| is_drift(p, RULE_DRIFT_READ_REASON))
             .unwrap();
         assert_eq!(p.setting, "graph.read_advisor");
         let val: bool = p.proposed.parse().expect("proposed must be a bool string");
@@ -2199,7 +2678,8 @@ mod tests {
     fn adopt_advisor_stays_silent_until_e1_is_proven_pass() {
         // The default (`e1_pass = false`, i.e. "unverified"/"fail") must NOT
         // auto-graduate a hook we've never seen work — the whole point of the
-        // strict `== "pass"` check rather than `!e1_blocked()`.
+        // strict `== "pass"` check rather than "the capability gate is not
+        // blocking", which passes `"unverified"` too.
         let mut sig = adopt_advisor_signals();
         sig.e1_pass = false;
         assert!(!evaluate(&sig)

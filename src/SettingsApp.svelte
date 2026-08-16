@@ -27,7 +27,7 @@
     AuditDetectResult,
     AuditToolConfig,
     AuditToolId,
-    HarnessVersions,
+    HarnessStatus,
     ProcessingDevice,
     Settings,
     ShellTabConfig,
@@ -38,7 +38,8 @@
     defaultSettings,
     findTab,
     findTabIndex,
-    harnessStatusBlocks,
+    CAP_PRETOOLUSE_DENY,
+    capabilityBlocked,
     // V32 / #48 F-27: the ONE list of spawn-baked injection features, read by
     // both restart-hint shapes below.
     spawnBakedInjectionL2,
@@ -1148,12 +1149,21 @@
   // V16: `harness_versions` is out-of-band — written straight to the
   // physical global file by the transcript tap / hand edits — so the
   // settings snapshot only reflects app startup. Fetched fresh once per
-  // Settings-window open; the E1 hard block below prefers it so a
-  // just-recorded outcome disables the toggle without an app restart.
-  let harnessFresh = $state<HarnessVersions | null>(null);
-  const e1Blocked = $derived(
-    harnessStatusBlocks((harnessFresh ?? snapshot?.harness_versions)?.e1_status ?? ''),
-  );
+  // Settings-window open, and the payload carries the gate verdicts Rust
+  // computed against those fresh versions, so a just-recorded outcome
+  // disables the toggle without an app restart.
+  //
+  // V35 Phase E: this used to read `harness_versions.e1_status` and apply a
+  // hand-kept TypeScript copy of the fail-closed rule (`harnessStatusBlocks`).
+  // It now reads the verdict for a capability id — the same id
+  // `tabs/config.rs` asks the gate about before installing the hook — so the
+  // toggle and the hook cannot disagree by one of them being re-implemented
+  // here. Before the fetch resolves nothing is blocked, which is exactly the
+  // pre-Phase-E behaviour: `snapshot` is null then too, and the old
+  // expression read an empty status as "not blocked".
+  let harnessFresh = $state<HarnessStatus | null>(null);
+  const e1Gate = $derived(capabilityBlocked(harnessFresh, CAP_PRETOOLUSE_DENY));
+  const e1Blocked = $derived(e1Gate !== null);
 
   // Sidebar nav: which group is visible. The template gates each <section>
   // on this so only one group renders at a time. Default lands on 'theme'
@@ -6243,15 +6253,15 @@
               />
               <span>Redundant-read advisor (Claude tabs)</span>
             </label>
-            {#if e1Blocked}
-              <small class="hint">
-                Blocked: the E1 contract check recorded that Claude Code does
-                <strong>not</strong> surface a deny reason to the model on this
-                version — every reminder would be a bare refusal, worse than no
-                advisor. The hook is not installed regardless of this toggle.
-                Re-run the check in <code>MAINTENANCE.md</code> → harness
-                contracts after the next Claude Code update.
-              </small>
+            {#if e1Gate}
+              <!--
+                V35 Phase E: the sentence comes from the gate itself
+                (`harness::contract::gate`) rather than being written out again
+                here. The rule and the explanation of the rule were two things
+                to keep in sync; now the code that decides is the code that
+                says why, and a new gate arrives with its own wording.
+              -->
+              <small class="hint">Blocked: {e1Gate.reason}</small>
             {:else}
               <small class="hint">
                 Intercepts a <code>Read</code> of a file already read unchanged this

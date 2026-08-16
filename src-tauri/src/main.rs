@@ -947,6 +947,17 @@ fn main() {
             // worker is doing.
             offload::detection::updater::spawn_scheduler(settings_for_setup.clone());
 
+            // V35 Phase F, trigger (b): if the installed Claude Code moved
+            // while cImp was closed — the common case, since the CLI
+            // self-updates on its own schedule — nothing observed the change,
+            // so the in-session trigger cannot fire. Run the canaries once now
+            // and let a clean result advance `claude_last_verified` by itself.
+            // Cheap and self-gating: two string comparisons against a
+            // mtime-cached read, no thread at all when the versions already
+            // match, and the work itself is a detached OS thread so startup
+            // never waits on it.
+            harness::verify::spawn_startup_check();
+
             // Apply the project-derived window title. The hardcoded
             // "cImp" from tauri.conf.json is what the OS sees before
             // this fires; this overwrite happens during setup so the

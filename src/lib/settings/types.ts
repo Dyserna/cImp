@@ -905,6 +905,39 @@ export interface HarnessVersions {
   e1_status: string;
   /// D0 spike outcome (informational — the feature degrades to a no-op).
   d0_status: string;
+  /// V35 Phase F: the last automatic verification run for Claude Code — the
+  /// embedded L1 canaries plus the L2 live probes, run in the background when
+  /// `claude_last_seen` changes. Absent until the first run completes, which is
+  /// a different state from "ran and passed" (it is what keeps the version
+  /// tripwire speaking as the cannot-verify fallback).
+  ///
+  /// Optional here on purpose: it is serialized only when a run has been
+  /// recorded, and no UI reads it yet — the *Harness health* panel (Phase G) is
+  /// what renders it. Never written from the frontend: `harness_versions` is
+  /// out-of-band on both sides.
+  claude_auto_verify?: AutoVerify | null;
+}
+
+/// V35 Phase F: one recorded auto-verify run. Mirror of Rust
+/// `settings::AutoVerify`. `status` is `'pass' | 'fail'`, and is `'fail'`
+/// exactly when `failures` is non-empty (a run that cannot reach a verdict
+/// records nothing at all rather than a third status).
+export interface AutoVerify {
+  version: string;
+  at_ms: number;
+  status: string;
+  failures: AutoVerifyFailure[];
+}
+
+/// One failing capability inside an `AutoVerify`. Mirror of Rust
+/// `settings::AutoVerifyFailure`. `capability` is a
+/// `harness::contract::Capability` id — the same join key as `CapabilityGate.id`
+/// and `AdvisorProposal.capability`; `evidence` says which layer saw it
+/// (`'harness.canary.l1'` or `'harness.probe.l2'`).
+export interface AutoVerifyFailure {
+  capability: string;
+  evidence: string;
+  detail: string;
 }
 
 /// One harness capability's gate verdict, computed in Rust. Mirror of

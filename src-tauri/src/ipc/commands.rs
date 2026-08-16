@@ -2667,6 +2667,11 @@ fn advisor_snapshot_blocking(
         applied,
         claude_last_seen: hv.claude_last_seen,
         claude_last_verified: hv.claude_last_verified,
+        // V35 Phase F: read from the same fresh physical-global snapshot as the
+        // two versions above — the auto-verify worker writes all three
+        // out-of-band, so a record only a second old must be visible to the
+        // very next 2s advisor poll without a restart.
+        claude_auto_verify: hv.claude_auto_verify,
         remind_count,
         large_reread_pairs,
         claude_sessions,

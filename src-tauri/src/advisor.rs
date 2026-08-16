@@ -175,9 +175,18 @@ pub const RULE_DRIFT_CAPABILITY: &str = "drift.capability.v1";
 
 /// The harness version tripwire. **NOT** consolidated into
 /// [`RULE_DRIFT_CAPABILITY`]: it is not evidence about one capability — it says
-/// the whole harness moved — and V35 Phase F reworks its raising logic
-/// (auto-run L1+L2 on version change, auto-advance on all-pass). Left alone
-/// deliberately; keeps its own `mark_verified` action.
+/// the whole harness moved — and it keeps its own `mark_verified` action.
+///
+/// **V35 Phase F made it the cannot-verify fallback.** Before, it fired on
+/// every Claude Code auto-update whether or not anything broke, which trained
+/// the reflexive *Mark verified* that disarmed it. Now the update triggers
+/// `harness::verify`: all-pass advances `claude_last_verified` by itself (this
+/// rule's condition is then false), and failures raise a
+/// [`RULE_DRIFT_CAPABILITY`] notice per broken capability (this rule is
+/// suppressed by `verify::tripwire_superseded`, since a second card naming the
+/// same event is noise). What is left for it is the case nothing else can
+/// speak for: no auto-verify record for this build at all, or one that could
+/// not reach a verdict.
 pub const RULE_DRIFT_VERSION: &str = "drift.harness_version.v1";
 /// Evidence for `claude.hook.pretooluse_deny` (V35 Phase E). Still the id the
 /// detector is *named* by — in `Capability::drift_rule`, in the notice
@@ -400,6 +409,22 @@ pub struct Signals {
     /// last verified against (`HarnessVersions` in global settings).
     pub claude_last_seen: String,
     pub claude_last_verified: String,
+    /// V35 Phase F: the last automatic verification run for Claude
+    /// (`HarnessVersions::claude_auto_verify`), as recorded by
+    /// [`crate::harness::verify`]. Two rules read it, both of them through that
+    /// module so the interpretation lives once:
+    ///
+    /// * [`RULE_DRIFT_VERSION`] is now the **cannot-verify fallback** — it
+    ///   fires only when this record cannot speak for the seen version
+    ///   (`verify::tripwire_superseded`);
+    /// * each recorded failure raises its own [`RULE_DRIFT_CAPABILITY`] notice
+    ///   naming the capability, the layer that saw it and the `wired_in`
+    ///   modules (`verify::notifiable_failures`).
+    ///
+    /// `None` on a machine where auto-verify has never completed — which is a
+    /// genuinely different state from "ran and passed" and is exactly when the
+    /// fallback is wanted.
+    pub claude_auto_verify: Option<crate::settings::AutoVerify>,
     /// Feature 2 (`drift.read_hook_silent.v1`): total read-advisor remind
     /// events recorded for this root's sessions (mem_event `remind` rows —
     /// written server-side, so a dead hook means exactly zero).
@@ -713,11 +738,68 @@ fn version_signature(seen: &str) -> String {
 fn drift_rules(sig: &Signals) -> Vec<Proposal> {
     let mut out = Vec::new();
 
+    // V35 Phase F — one notice per capability that auto-verify found BROKEN on
+    // the currently-installed build. Raised before the tripwire because it is
+    // what replaces it: a fact-trigger (no sample floor — a failed canary is a
+    // fact, not a statistic), naming the capability, the layer that saw it and
+    // the modules that break, instead of "the version moved, go check by hand".
+    for failure in crate::harness::verify::notifiable_failures(
+        sig.claude_auto_verify.as_ref(),
+        &sig.claude_last_seen,
+        &sig.claude_last_verified,
+    ) {
+        // A capability the registry no longer carries: skip rather than invent
+        // a card with no `wired_in` pointer. Unreachable while the record is
+        // written by this build (the ids come from the registry), and the
+        // honest answer for a hand-edited or newer-build record.
+        let Some(cap) = crate::harness::contract::get(&failure.capability) else {
+            continue;
+        };
+        let p = capability_notice(
+            cap,
+            crate::harness::verify::evidence_const(&failure.evidence),
+            // Keyed by the version verified against: a dismissal holds for this
+            // build and re-fires when the next update reproduces the failure,
+            // the same re-fire boundary the tripwire it replaces had.
+            &version_signature(&sig.claude_last_seen),
+            "",
+            failure.detail.clone(),
+            "the recorded contract holding again",
+            format!(
+                "Claude Code updated to {} and the automatic contract check FAILED for this \
+                 capability, so the version was NOT auto-verified: {}\n\nThis ran by itself when \
+                 the update was observed — no session had to degrade first. Fix the reader (or \
+                 re-record the shape) and the next check passes silently; if you have verified \
+                 this build by hand, use Mark verified on the harness card.",
+                sig.claude_last_seen, failure.detail
+            ),
+        );
+        if !is_dismissed(&sig.dismissed, p.rule_id, &p.signature) {
+            out.push(p);
+        }
+    }
+
     // Feature 1 — harness version tripwire. Signature = the SEEN version,
     // so a dismissal suppresses this exact version but re-fires on the next
     // update. Fires on a never-verified install too (that's what drives the
     // initial Phase-0 verification pass).
-    if !sig.claude_last_seen.is_empty() && sig.claude_last_seen != sig.claude_last_verified {
+    //
+    // V35 Phase F demoted it to the **cannot-verify fallback**. The routine
+    // case — an auto-update that broke nothing — no longer reaches here at all:
+    // auto-verify advances `claude_last_verified` on its own, so the versions
+    // match and the condition is false. What remains are the cases nothing else
+    // can speak for: auto-verify has not run yet (a fresh install, a version
+    // observed while the check was in flight), it errored, or it passed and the
+    // advance did not land. When it ran and FOUND failures, the loop above is
+    // already naming them and a second card would be the noise this phase
+    // exists to remove.
+    if !sig.claude_last_seen.is_empty()
+        && sig.claude_last_seen != sig.claude_last_verified
+        && !crate::harness::verify::tripwire_superseded(
+            sig.claude_auto_verify.as_ref(),
+            &sig.claude_last_seen,
+        )
+    {
         let signature = sig.claude_last_seen.clone();
         if !is_dismissed(&sig.dismissed, RULE_DRIFT_VERSION, &signature) {
             let current = if sig.claude_last_verified.is_empty() {
@@ -2115,6 +2197,139 @@ mod tests {
         assert!(evaluate(&sig)
             .iter()
             .any(|p| p.rule_id == RULE_DRIFT_VERSION));
+    }
+
+    // ── V35 Phase F — the tripwire as cannot-verify fallback ────────────
+    //
+    // The three tests above keep passing unchanged, and that is the point:
+    // with `claude_auto_verify == None` (auto-verify has never completed on
+    // this machine) the tripwire behaves exactly as V16 built it. They now pin
+    // the FALLBACK case. The four below pin the cases Phase F added.
+
+    /// The auto-verify record for the currently-seen build, with one failing
+    /// capability.
+    fn auto_verify_failed(version: &str, capability: &str) -> crate::settings::AutoVerify {
+        crate::settings::AutoVerify {
+            version: version.to_string(),
+            at_ms: 42,
+            status: crate::settings::AutoVerify::FAIL.to_string(),
+            failures: vec![crate::settings::AutoVerifyFailure {
+                capability: capability.to_string(),
+                evidence: crate::harness::verify::EVIDENCE_CANARY.to_string(),
+                detail: "context_window.used_percentage gone".to_string(),
+            }],
+        }
+    }
+
+    /// A failed auto-verify replaces the tripwire with a notice that NAMES the
+    /// capability — the exit criterion of Phase F's other half.
+    ///
+    /// Two cards for one event would be exactly the noise this phase removes,
+    /// and the one that survives has to be the specific one: "the version
+    /// moved, go re-run ten minutes of recipes" is the card that trained the
+    /// reflex, "`claude.statusline.stdin` broke, see statusline/mod.rs" is the
+    /// one worth reading.
+    #[test]
+    fn a_failed_auto_verify_replaces_the_tripwire_with_a_named_capability() {
+        let sig = Signals {
+            claude_last_seen: "2.2.0".to_string(),
+            claude_last_verified: "2.1.14".to_string(),
+            claude_auto_verify: Some(auto_verify_failed("2.2.0", "claude.statusline.stdin")),
+            ..Signals::default()
+        };
+        let props = evaluate(&sig);
+        assert!(
+            !props.iter().any(|p| p.rule_id == RULE_DRIFT_VERSION),
+            "the tripwire is superseded — the capability notice below says the same thing, \
+             precisely"
+        );
+        let p = props
+            .iter()
+            .find(|p| p.rule_id == RULE_DRIFT_CAPABILITY)
+            .expect("the failing capability speaks");
+        assert_eq!(p.capability, Some("claude.statusline.stdin"));
+        assert!(p.warn_only, "there is nothing safe to auto-apply");
+        assert_eq!(p.action, None, "Mark verified stays on the tripwire card");
+        assert_eq!(
+            p.signature,
+            format!(
+                "claude.statusline.stdin:{}:2.2.0",
+                crate::harness::verify::EVIDENCE_CANARY
+            ),
+            "signature = <capability>:<evidence>:<version>, so a dismissal holds for this build \
+             and re-fires on the next one"
+        );
+        // The card must be actionable: the assertion that failed, and the file
+        // that breaks.
+        assert!(p.rationale.contains("context_window.used_percentage gone"));
+        assert!(p.rationale.contains("src-tauri/src/statusline/mod.rs"));
+        assert!(p.rationale.contains("2.2.0"));
+    }
+
+    /// A record that PASSED but left the versions apart keeps the tripwire.
+    ///
+    /// This is the "the advance did not land" case (a failed settings write).
+    /// Suppressing here would be the worst outcome available: a harness moved,
+    /// nothing verified it, and no card anywhere.
+    #[test]
+    fn a_passing_record_that_did_not_advance_keeps_the_fallback() {
+        let sig = Signals {
+            claude_last_seen: "2.2.0".to_string(),
+            claude_last_verified: "2.1.14".to_string(),
+            claude_auto_verify: Some(crate::settings::AutoVerify {
+                version: "2.2.0".to_string(),
+                at_ms: 42,
+                status: crate::settings::AutoVerify::PASS.to_string(),
+                failures: Vec::new(),
+            }),
+            ..Signals::default()
+        };
+        let props = evaluate(&sig);
+        assert!(props.iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(!props.iter().any(|p| p.rule_id == RULE_DRIFT_CAPABILITY));
+    }
+
+    /// A record for the PREVIOUS build says nothing about this one: the
+    /// tripwire speaks (nothing has verified the new version yet) and the old
+    /// failure does not.
+    #[test]
+    fn a_stale_record_neither_suppresses_nor_speaks() {
+        let sig = Signals {
+            claude_last_seen: "2.3.0".to_string(),
+            claude_last_verified: "2.1.14".to_string(),
+            claude_auto_verify: Some(auto_verify_failed("2.2.0", "claude.statusline.stdin")),
+            ..Signals::default()
+        };
+        let props = evaluate(&sig);
+        assert!(props.iter().any(|p| p.rule_id == RULE_DRIFT_VERSION));
+        assert!(!props.iter().any(|p| p.rule_id == RULE_DRIFT_CAPABILITY));
+    }
+
+    /// The routine auto-update — canaries green, version advanced by the
+    /// background run — produces **no card at all**. This is the milestone's
+    /// Phase F exit criterion, asserted over the whole proposal list rather
+    /// than over one rule id.
+    #[test]
+    fn a_verified_update_produces_no_advisor_card() {
+        let sig = Signals {
+            claude_last_seen: "2.2.0".to_string(),
+            claude_last_verified: "2.2.0".to_string(),
+            claude_auto_verify: Some(crate::settings::AutoVerify {
+                version: "2.2.0".to_string(),
+                at_ms: 42,
+                status: crate::settings::AutoVerify::PASS.to_string(),
+                failures: Vec::new(),
+            }),
+            ..Signals::default()
+        };
+        assert!(
+            evaluate(&sig).is_empty(),
+            "a routine CLI auto-update that broke nothing must be silent: {:?}",
+            evaluate(&sig)
+                .iter()
+                .map(|p| p.rule_id)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Signals for the read-reason drift: advisor ON, ~100% reread at the

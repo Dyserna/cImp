@@ -483,18 +483,34 @@ pub fn mutate_global_harness_versions(
 /// `harness` is `"claude"` (from the OOB transcript tap) or `"opencode"`
 /// (from `opencode --version` at tab spawn). Change-guarded — safe to call
 /// once per session/spawn without file churn.
+///
+/// V35 Phase F: a **changed** `claude_last_seen` is also the first of the two
+/// auto-verify triggers (the other is the startup check). It fires from here
+/// rather than from the tap because this is the one place the observation is
+/// actually recorded — a caller-side trigger would miss the hand-edit and
+/// spawn-time paths, and would fire on the no-op re-observations this function
+/// exists to swallow. The call is non-blocking (it spawns a detached worker) so
+/// the tap is never delayed by a probe.
 pub fn note_harness_version(harness: &str, version: &str) {
     let version = version.trim();
     if version.is_empty() {
         return;
     }
+    let mut claude_changed = false;
     let res = mutate_global_harness_versions(|hv| match harness {
-        "claude" => hv.claude_last_seen = version.to_string(),
+        "claude" => {
+            claude_changed = hv.claude_last_seen != version;
+            hv.claude_last_seen = version.to_string();
+        }
         "opencode" => hv.opencode_last_seen = version.to_string(),
         _ => {}
     });
     if let Err(e) = res {
         tracing::warn!("failed to record {harness} version {version}: {e}");
+        return;
+    }
+    if claude_changed {
+        crate::harness::verify::on_claude_version_changed();
     }
 }
 

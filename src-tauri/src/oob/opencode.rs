@@ -931,8 +931,9 @@ impl Tracker {
     /// sub-agent is mid-run still goes to the tab's MAIN conversation. `None`
     /// until the tab has seen its first session-scoped event (ever — not just on
     /// this connection).
-    /// `pub(crate)` for the V35 canary suite (harness/canary.rs).
-    #[cfg(test)]
+    /// `pub(crate)` for the V35 canary suite (harness/canary.rs) — which V35
+    /// Phase F made runtime code (the canaries run in the shipped binary on a
+    /// harness version change), so this can no longer be `#[cfg(test)]`.
     pub(crate) fn current_session(&self) -> Option<String> {
         lock_sessions(&self.sessions).main.clone()
     }

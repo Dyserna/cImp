@@ -300,11 +300,13 @@ pub fn run(args: &[String]) -> i32 {
     let json = args.iter().any(|a| a == "--json");
 
     // OpenCode first — one `opencode serve` child serves both its probes, and
-    // `opencode.tool_registry` is the one this phase exists for.
+    // `opencode.tool_registry` is the one this phase exists for. Both groups go
+    // through [`run_for`], the same per-harness dispatch V35 Phase F's
+    // auto-verify uses, so the CLI and the background run can never drive
+    // different sets.
     let mut produced: Vec<ProbeResult> = Vec::new();
-    produced.extend(probe_opencode());
-    produced.extend(probe_claude_flags());
-    produced.extend(probe_claude_transcript());
+    produced.extend(run_for(Harness::OpenCode));
+    produced.extend(run_for(Harness::Claude));
 
     // The report is assembled in DECLARED order, not in the order the probe
     // functions happened to answer. That is what makes [`IMPLEMENTED`]
@@ -347,6 +349,33 @@ pub fn run(args: &[String]) -> i32 {
         print_human(&results);
     }
     i32::from(failed > 0)
+}
+
+/// Drive the probes belonging to ONE harness (V35 Phase F).
+///
+/// The auto-verify that runs on a Claude version change has no business
+/// spawning `opencode serve`, and vice versa — so the split lives here, beside
+/// the probe functions, rather than being re-derived by the caller from
+/// [`IMPLEMENTED`] and the registry's `harness` column. [`run`] uses it too, so
+/// there is exactly one mapping from harness to probe functions.
+///
+/// Only rows this module actually DRIVES are returned. `DECLARED_UNPROBED` is
+/// deliberately not included: `run` prints those as `unknown` because a CLI
+/// report that stopped listing a dependency would be a dependency that stopped
+/// being counted, but an auto-verify that scored them would be padding its
+/// evidence with rows nothing ever checks.
+pub(crate) fn run_for(harness: Harness) -> Vec<ProbeResult> {
+    match harness {
+        Harness::Claude => {
+            let mut out = probe_claude_flags();
+            out.extend(probe_claude_transcript());
+            out
+        }
+        Harness::OpenCode => probe_opencode(),
+        // No seeded row is harness-neutral yet (CHP, milestone decision 9, is
+        // what will produce the first one), so there is nothing to drive.
+        Harness::Any => Vec::new(),
+    }
 }
 
 /// `--json`: a flat array of the same records the human report prints, one per

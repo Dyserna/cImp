@@ -538,6 +538,24 @@ pub struct HarnessVersions {
     /// compaction prompt): `"unverified" | "pass" | "fail"`. Informational —
     /// a fail warns (the feature degrades to a no-op, it can't misbehave).
     pub d0_status: String,
+    /// V35 Phase F: the last **automatic** verification run for Claude Code —
+    /// the L1 embedded canaries plus the L2 live probes, run in the background
+    /// when [`Self::claude_last_seen`] changes and once at startup when it does
+    /// not match [`Self::claude_last_verified`].
+    ///
+    /// `None` until the first run, which is a genuinely different state from
+    /// "ran and passed": it is what makes the version tripwire the
+    /// *cannot-verify fallback* it became in Phase F (see
+    /// `harness::verify::supersedes_tripwire`). Additive and
+    /// `#[serde(default)]` via the container attribute, so a pre-V35 global
+    /// `settings.json` loads it as `None` — pinned by
+    /// `tests::harness_versions_loads_a_pre_phase_f_file_with_no_auto_verify`.
+    ///
+    /// Written ONLY through
+    /// `settings::persistence::mutate_global_harness_versions`, like every
+    /// other field here (`ipc/commands.rs` bans `harness_versions` from the
+    /// project overlay diff, so a Settings save cannot carry it).
+    pub claude_auto_verify: Option<AutoVerify>,
 }
 
 impl Default for HarnessVersions {
@@ -548,8 +566,66 @@ impl Default for HarnessVersions {
             opencode_last_seen: String::new(),
             e1_status: "unverified".to_string(),
             d0_status: "unverified".to_string(),
+            claude_auto_verify: None,
         }
     }
+}
+
+/// V35 Phase F: one recorded auto-verify run.
+///
+/// The record exists so three consumers can read the SAME fact instead of
+/// re-deriving it: the Advisor (which raises a `drift.capability.v1` notice per
+/// failing capability, and suppresses the version tripwire when this record
+/// already speaks for that version), the auto-advance itself, and Phase G's
+/// *Harness health* panel.
+///
+/// Invariant, pinned by `harness::verify::tests::a_record_agrees_with_itself`:
+/// [`Self::status`] is [`AutoVerify::FAIL`] **iff** [`Self::failures`] is
+/// non-empty. A status that disagreed with the list would be exactly the
+/// "empty is not absent" defect (a `"fail"` with nothing named is a card with
+/// no fix pointer; a `"pass"` with failures is a silenced break).
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoVerify {
+    /// The `claude_last_seen` value this run was made against. Compared by
+    /// equality with the current one — a record for an older version says
+    /// nothing about today's install.
+    pub version: String,
+    /// Wall-clock ms when the run finished (`activity::now_ms`).
+    pub at_ms: u64,
+    /// [`AutoVerify::PASS`] or [`AutoVerify::FAIL`]. A run that cannot reach a
+    /// verdict at all writes **no record**, rather than a third status: the
+    /// record and the version advance are one write, so there is no state where
+    /// half of it landed, and "no record for this build" is exactly the case
+    /// the version tripwire is kept as a fallback for. Anything else here is a
+    /// hand edit (or a newer cImp) and is read as *not* a failure — see
+    /// `harness::verify::tripwire_superseded`.
+    pub status: String,
+    /// One entry per capability that FAILED. Empty on a pass — and on an
+    /// error, where the run could not reach a verdict at all.
+    pub failures: Vec<AutoVerifyFailure>,
+}
+
+impl AutoVerify {
+    /// Every capability answered; none failed. The version auto-advanced.
+    pub const PASS: &'static str = "pass";
+    /// At least one capability failed. The version did NOT advance and the
+    /// Advisor names each failure.
+    pub const FAIL: &'static str = "fail";
+}
+
+/// One failing capability inside an [`AutoVerify`] record.
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoVerifyFailure {
+    /// The `harness::contract::Capability::id` — the join key the Advisor
+    /// notice, the gate and the registry all speak.
+    pub capability: String,
+    /// Which layer saw it: `harness::verify::EVIDENCE_CANARY` (L1, the
+    /// embedded fixture) or `EVIDENCE_PROBE` (L2, the installed CLI).
+    pub evidence: String,
+    /// The assertion message, verbatim — the sentence the Advisor card shows.
+    pub detail: String,
 }
 
 /// One provider/model price entry: USD per million tokens (MTok) for the four
@@ -4969,6 +5045,76 @@ impl Default for ProcessingSettings {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    /// **V35 Phase F, and the V32 F-19 trap it walks past.** A global
+    /// `settings.json` written before Phase F loads with
+    /// `claude_auto_verify == None` — a genuine default, not a masked seed —
+    /// and every field beside it survives untouched.
+    ///
+    /// F-19's lesson was that the container-level `#[serde(default)]` on
+    /// `Settings` silently fills a missing field, so an additive field whose
+    /// *correct* pre-upgrade value is NOT its `Default` ships broken and looks
+    /// fine. Here `None` genuinely is right — it means "auto-verify has never
+    /// completed on this install", which is exactly the state a pre-Phase-F
+    /// file is in, and it is what keeps the version tripwire speaking as the
+    /// fallback until the first run. This test is what makes that a checked
+    /// claim rather than an assumption: it deserializes the OLD shape (the five
+    /// V16 fields, no sixth key) and pins the answer.
+    ///
+    /// It is also why no schema-version bump was needed: there is no data
+    /// transform a migration could perform, and no pre-existing file whose
+    /// meaning changes.
+    #[test]
+    fn harness_versions_loads_a_pre_phase_f_file_with_no_auto_verify() {
+        let old_shape = json!({
+            "claude_last_seen": "2.1.232",
+            "claude_last_verified": "2.1.14",
+            "opencode_last_seen": "1.18.13",
+            "e1_status": "pass",
+            "d0_status": "unverified"
+        });
+        let hv: HarnessVersions =
+            serde_json::from_value(old_shape.clone()).expect("the pre-V35 shape still loads");
+        assert_eq!(hv.claude_auto_verify, None);
+        assert_eq!(hv.claude_last_seen, "2.1.232");
+        assert_eq!(hv.claude_last_verified, "2.1.14");
+        assert_eq!(hv.opencode_last_seen, "1.18.13");
+        assert_eq!(hv.e1_status, "pass");
+        assert_eq!(hv.d0_status, "unverified");
+
+        // …and through the whole `Settings` round trip, which is the shape
+        // `settings::persistence` actually reads: a v31 file with the old
+        // `harness_versions` block and nothing else about it.
+        let mut file = json!({ "schema_version": CURRENT_SCHEMA_VERSION });
+        file["harness_versions"] = old_shape;
+        let s: Settings = serde_json::from_value(file).expect("whole-settings round trip");
+        assert_eq!(s.harness_versions.claude_auto_verify, None);
+        assert_eq!(s.harness_versions.claude_last_seen, "2.1.232");
+        // The E1 spike outcome is the field a lost record would silently
+        // un-gate a feature through — pinned here too, since this is the
+        // struct that grew a field.
+        assert_eq!(s.harness_versions.e1_status, "pass");
+
+        // A record round-trips as itself.
+        let with_record = HarnessVersions {
+            claude_auto_verify: Some(AutoVerify {
+                version: "2.2.0".to_string(),
+                at_ms: 7,
+                status: AutoVerify::FAIL.to_string(),
+                failures: vec![AutoVerifyFailure {
+                    capability: "claude.statusline.stdin".to_string(),
+                    evidence: "harness.canary.l1".to_string(),
+                    detail: "context_window gone".to_string(),
+                }],
+            }),
+            ..HarnessVersions::default()
+        };
+        let text = serde_json::to_string(&with_record).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<HarnessVersions>(&text).expect("deserialize"),
+            with_record
+        );
+    }
 
     /// **#48 — the G-1 defect class, on the enum-ish STRING settings.**
     ///

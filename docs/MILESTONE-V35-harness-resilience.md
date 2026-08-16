@@ -1,10 +1,10 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phases A–E implemented 2026-08-16 (`82c0da2`,
-`7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`); the A+B+D value core is landed
-and live-verified. GitHub milestone 8, issues #54–#71 (one per phase;
-#55–#59 + #63 closed; #64 stays open — the overlay round-trip needs the
-scripted-turn probe class; #73 filed from Phase D's auth observation).
+**Status:** IN PROGRESS — Phases A–F implemented 2026-08-16 (`82c0da2`,
+`7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`). GitHub milestone 8,
+issues #54–#71 (one per phase; #55–#60 + #63 closed; #64 stays open — the
+overlay round-trip needs the scripted-turn probe class; #73 filed from
+Phase D's auth observation).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -383,6 +383,38 @@ Decisions:
   `checkpoint_beacon`) which have no registry row; they get rows in
   **Phase I** when CHP names that route surface. "One notice source" holds
   for every matrix-covered drift signal.
+
+**Phase F (`6a8c3f7`, 2026-08-16).** Auto-verify on version change.
+`harness/verify.rs` runs embedded L1 (the four positive canaries became
+runtime functions with `include_str!`-embedded synthetic fixtures; the
+cargo tests are now wrappers over the same code path) + the L2 probes for
+the changed harness; zero `Fail` (Unknown/Transition never block) advances
+`claude_last_verified` via `mutate_global_harness_versions` only. Failures
+surface per-capability through `drift.capability.v1`; the version tripwire
+survives solely as the cannot-verify fallback (its three V16 tests pass
+unchanged, now pinning exactly that case). Triggers: the
+`note_harness_version` writer + app startup, single-flight (panic-safe
+drop-guard), 90s layer-boundary cap. cargo 2139/0/6, clippy clean,
+vitest 643, svelte-check 0/0. Decisions:
+
+- **`AutoVerify` has two statuses, not three** — a run that cannot record
+  leaves no record, and the missing record IS the could-not-run state; the
+  tripwire speaks for it. An unrecognized status reads as not-a-failure.
+- **Schema stays 31** — additive `#[serde(default)]` fields with correct
+  `None` pre-upgrade meaning need no version stamp (v30→v31 stamped only to
+  gate a future migration); pinned by an old-shape deserialization test.
+- **A failed-verify version is re-run, not trusted** — a failure is the one
+  state fixable on our side with the harness unchanged.
+- **Mark verified also silences a stale auto-failure record**
+  (read-side rule) — otherwise the button hands the same card back.
+- **OpenCode has no verified-against notion** (`opencode_last_seen` is
+  write-only today) — auto-advance is Claude-only; the machinery is
+  harness-parameterised so symmetry is one trigger + one field later.
+- **Semantic change, accepted as designed (decisions 7+8):**
+  `claude_last_verified` now means "canaries passed", not "a human ran the
+  recipes" — the first post-ship launch will auto-advance nearly every
+  install, and an unreachable CLI advances on L1 evidence alone. The Tier-D
+  spike statuses (`e1_status`/`d0_status`) remain human-owned and untouched.
 
 ## Two gaps to fix ahead of the milestone
 

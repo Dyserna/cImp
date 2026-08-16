@@ -35,6 +35,10 @@ mod segmenter;
 mod tags;
 
 pub use sanitize::strip_terminal_escapes;
+// V35 Phase H: the disk-bound scrubber (strip + credential redaction), used by
+// `harness::capture`. Its `Scrubbed` result is reached through the return type
+// rather than re-exported — nothing outside that one call site names it.
+pub use sanitize::scrub_payload;
 pub use segmenter::segment_sentences;
 pub use tags::normalize_for_dedup;
 

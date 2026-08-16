@@ -1835,7 +1835,12 @@ pub(crate) fn newest_jsonl(root: &Path) -> Option<PathBuf> {
 }
 
 /// Resolve the user's home directory without pulling in a new dependency.
-fn home_dir() -> Option<PathBuf> {
+///
+/// `pub(crate)` since V35 Phase H: [`crate::harness::capture`] needs the same
+/// answer for its data-dir fallback, and a second three-line copy of the
+/// `USERPROFILE`-then-`HOME` order is exactly the kind of duplicate that ends
+/// up disagreeing on one platform.
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)

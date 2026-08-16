@@ -175,6 +175,30 @@ fn rules() -> Option<Arc<yara_x::Rules>> {
         .map(Arc::clone)
 }
 
+/// The compiled credential rule set, for a **second reader with a different
+/// action** (V35 Phase H).
+///
+/// [`crate::processing::sanitize::scrub_payload`] redacts what this module
+/// quarantines. The two need the same idea of what a credential looks like and
+/// must never grow two curated corpora — so the *patterns* are shared and each
+/// caller keeps its own verdict, rather than the capture path getting a second
+/// `.yar` file to maintain in parallel with this one.
+///
+/// **This is not a hole in F-15.** What is handed out is compiled rule data,
+/// not a way to screen a note without storing what was screened: [`screen`]
+/// stays module-private, [`ScreenedNote::of`] stays the only constructor, and
+/// the store still accepts nothing else. The property F-15 established — no
+/// spelling of "store this text" that skips the screen — is untouched, because
+/// nothing here can produce a [`ScreenedNote`].
+///
+/// `None` carries the same meaning it does inside this module: the baked source
+/// did not compile, so there is no screen. The capture path treats that as
+/// *write nothing*, which is the opposite of this module's fail-open — see
+/// `scrub_payload`'s docs for why the two postures differ.
+pub(crate) fn credential_rules() -> Option<Arc<yara_x::Rules>> {
+    rules()
+}
+
 /// Compile one rule source with the detection layer's own compiler, so the
 /// screen and the signature layer cannot diverge on what a rule file may
 /// contain. Split out for the test, which compiles the baked source explicitly

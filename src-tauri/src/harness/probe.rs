@@ -59,8 +59,21 @@
 //! harness metadata (it is what the `harness_versions` tripwire records) and is
 //! the useful half of what `claude.transcript.identity` proves.
 //!
-//! Capture-on-success (design doc § 4.1) is Phase H and is deliberately absent:
-//! this module never creates a file.
+//! # Capture-on-success (V35 Phase H)
+//!
+//! Since Phase H the probes ALSO hand over the payloads they read, so a run
+//! that found no drift can leave a known-good corpus behind
+//! ([`crate::harness::capture`]). Two properties of that are load-bearing here:
+//!
+//! * **Nothing about the report changed.** [`ProbeResult`], [`Outcome`] and the
+//!   order [`run`] assembles them in are exactly what `verify.rs` and
+//!   `health.rs` already consume. Capture is a side channel ([`Driven`]), not a
+//!   reshaping — a phase that made the report carry payloads would have put
+//!   transcript content into the Advisor and the Settings panel.
+//! * **This module still writes nothing.** It hands raw text to `capture`,
+//!   which scrubs at the boundary. The privacy discipline above (details carry
+//!   counts and field names only) is unchanged and is *why* the two are
+//!   separate: a detail string is printed, a capture is scrubbed and filed.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -71,6 +84,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::harness::capture::{self, Observed};
 use crate::harness::contract::{self, Harness, Seam};
 use crate::offload::toolclass::{OPENCODE_NATIVE_REVIEWED_UNGATED, OPENCODE_NATIVE_TABLE};
 
@@ -129,6 +143,14 @@ pub struct ProbeResult {
 }
 
 impl ProbeResult {
+    /// Build a row without consulting the registry — **tests only**, so a
+    /// module that needs a `ProbeResult` fixture (`harness::capture`'s) does not
+    /// have to pick a real capability id just to get one.
+    #[cfg(test)]
+    pub(crate) fn for_test(id: &'static str, outcome: Outcome) -> Self {
+        ProbeResult::new(id, outcome)
+    }
+
     fn new(id: &'static str, outcome: Outcome) -> Self {
         // Coordinates come from the registry rather than being repeated here —
         // a row that changed tier must not report its old one.
@@ -384,16 +406,88 @@ pub fn run(args: &[String]) -> i32 {
 /// being counted, but an auto-verify that scored them would be padding its
 /// evidence with rows nothing ever checks.
 pub(crate) fn run_for(harness: Harness) -> Vec<ProbeResult> {
-    match harness {
+    let driven = drive(harness);
+    // V35 Phase H. Here rather than at each caller so the background
+    // auto-verify, the Settings panel's *Run checks now* and
+    // `cimp --harness-canary` all capture identically — a trigger that had to
+    // be remembered at three call sites is a trigger that would be missing from
+    // one of them. Silent and best-effort; it cannot affect the verdict.
+    capture::on_success(&driven);
+    driven.results
+}
+
+/// Everything one harness's probes produced: the report rows, the raw payloads
+/// they read, and the CLI version they read them from (V35 Phase H).
+///
+/// A separate struct rather than extra fields on [`ProbeResult`] because the
+/// two travel to different places and must keep doing so — the rows go to the
+/// Advisor, the Settings panel and stdout, the payloads go to disk after a
+/// scrub. `version` is `""` when it could not be observed, which
+/// [`capture::write_into`] turns into "nothing to capture" (locked decision 6).
+#[derive(Debug, Clone)]
+pub(crate) struct Driven {
+    pub harness: Harness,
+    pub results: Vec<ProbeResult>,
+    pub observed: Vec<Observed>,
+    pub version: String,
+}
+
+/// Drive one harness and keep what was observed. [`run_for`] is this plus the
+/// capture trigger; `cimp --harness-capture` calls it directly, because that
+/// command writes whatever the outcome and so cannot go through the
+/// success-only trigger.
+pub(crate) fn drive(harness: Harness) -> Driven {
+    let (results, observed, version) = match harness {
         Harness::Claude => {
-            let mut out = probe_claude_flags();
-            out.extend(probe_claude_transcript());
-            out
+            let (mut results, help) = probe_claude_flags();
+            let (transcript, mut observed, version) = probe_claude_transcript();
+            results.extend(transcript);
+            // Both flag rows are answered from ONE `claude --help`, and each
+            // gets its own copy of it. The duplication is deliberate: the file
+            // name IS the join key, so a reader who was sent here by a failing
+            // `claude.flag.settings_overlay` finds a file with that name rather
+            // than a shared blob they have to know the provenance of. It is
+            // ~20 KiB twice, bounded by the retention sweep.
+            if let Some(help) = help {
+                observed.push(Observed::new(
+                    "claude.flag.session_id",
+                    "txt",
+                    help.clone(),
+                ));
+                observed.push(Observed::new("claude.flag.settings_overlay", "txt", help));
+            }
+            (results, observed, version)
         }
         Harness::OpenCode => probe_opencode(),
         // No seeded row is harness-neutral yet (CHP, milestone decision 9, is
         // what will produce the first one), so there is nothing to drive.
-        Harness::Any => Vec::new(),
+        Harness::Any => (Vec::new(), Vec::new(), String::new()),
+    };
+    Driven {
+        harness,
+        results,
+        observed,
+        // A CLI that has produced no observable version leaves the stamp to the
+        // version cImp last recorded for it — written by the OOB tap and by tab
+        // spawn from a real `--version`, so it is an observation too, just an
+        // older one. Empty when there has never been either.
+        version: if version.trim().is_empty() {
+            recorded_version(harness)
+        } else {
+            version
+        },
+    }
+}
+
+/// The version cImp last recorded for `harness`, from the physical global
+/// settings file. The fallback stamp for [`drive`] — never the primary, because
+/// a stale record would file today's shapes under yesterday's release.
+fn recorded_version(harness: Harness) -> String {
+    let hv = crate::settings::read_global_harness_versions();
+    match harness {
+        Harness::Claude => hv.claude_last_seen.trim().to_string(),
+        Harness::OpenCode => hv.opencode_last_seen.trim().to_string(),
+        Harness::Any => String::new(),
     }
 }
 
@@ -593,14 +687,21 @@ fn start_opencode_serve() -> Result<Serve, String> {
 }
 
 /// The two OpenCode probes that share one server child.
-fn probe_opencode() -> Vec<ProbeResult> {
+fn probe_opencode() -> (Vec<ProbeResult>, Vec<Observed>, String) {
     let serve = match start_opencode_serve() {
         Ok(s) => s,
         Err(why) => {
-            return vec![
-                ProbeResult::new("opencode.tool_registry", Outcome::Unknown { why: why.clone() }),
-                ProbeResult::new("opencode.route.noauth", Outcome::Unknown { why }),
-            ];
+            return (
+                vec![
+                    ProbeResult::new(
+                        "opencode.tool_registry",
+                        Outcome::Unknown { why: why.clone() },
+                    ),
+                    ProbeResult::new("opencode.route.noauth", Outcome::Unknown { why }),
+                ],
+                Vec::new(),
+                String::new(),
+            );
         }
     };
 
@@ -612,13 +713,46 @@ fn probe_opencode() -> Vec<ProbeResult> {
     // mean writing to the user's OpenCode state.
     let session = http_get(serve.port, "/session/cimp-harness-probe-does-not-exist");
 
-    vec![
+    let results = vec![
         ProbeResult::new("opencode.tool_registry", tool_registry_outcome(ids.as_ref())),
         ProbeResult::new(
             "opencode.route.noauth",
             noauth_outcome(ids.as_ref(), session.as_ref()),
         ),
-    ]
+    ];
+    // The registry listing is the payload worth keeping: it is the one this
+    // phase exists for, and a diff of it is exactly how "which tool id appeared"
+    // gets answered. Kept only when the route answered a usable body — a 404 or
+    // an error page would file an error message under a version number.
+    let observed = ids
+        .as_ref()
+        .filter(|(status, _)| *status == 200)
+        .map(|(_, body)| vec![Observed::new("opencode.tool_registry", "json", body.clone())])
+        .unwrap_or_default();
+
+    (results, observed, serve_version(serve.port))
+}
+
+/// The OpenCode build the probes just ran against, from the server child that
+/// is already up.
+///
+/// **Version-stamping only** (V35 Phase H), which is why `GET /global/health`
+/// is not a registry row: nothing cImp does depends on it, no user-visible
+/// feature degrades if it moves, and the entire cost of losing it is that a
+/// capture falls back to the version the tab spawn recorded — or is skipped.
+/// Declaring it as a capability would put a row in the matrix that can never
+/// fail, which is the padding the registry's own tests exist to prevent.
+///
+/// It is asked of the running child rather than by spawning `opencode
+/// --version`: the probe already paid for a server, and a second process to
+/// learn a string it can ask for over an open socket is a cost with no answer
+/// attached.
+fn serve_version(port: u16) -> String {
+    http_get(port, "/global/health")
+        .filter(|(status, _)| *status == 200)
+        .and_then(|(_, body)| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// Diff the live tool registry against what cImp has classified.
@@ -877,15 +1011,24 @@ fn declared_flags(id: &str) -> Vec<&'static str> {
 }
 
 /// The two Tier-B spawn-flag rows. Both are answered from one `claude --help`.
-fn probe_claude_flags() -> Vec<ProbeResult> {
+///
+/// Returns that help text alongside the rows when it was readable **and
+/// parseable as an option list** (V35 Phase H) — an unrecognizable help screen
+/// makes both rows `unknown`, and filing an unreadable one as a known-good
+/// capture would seed the corpus with the shape a later diff is supposed to
+/// flag.
+fn probe_claude_flags() -> (Vec<ProbeResult>, Option<String>) {
     let (session_id, settings) = ("claude.flag.session_id", "claude.flag.settings_overlay");
     let help = match claude_help() {
         Ok(h) => h,
         Err(why) => {
-            return vec![
-                ProbeResult::new(session_id, Outcome::Unknown { why: why.clone() }),
-                ProbeResult::new(settings, Outcome::Unknown { why }),
-            ];
+            return (
+                vec![
+                    ProbeResult::new(session_id, Outcome::Unknown { why: why.clone() }),
+                    ProbeResult::new(settings, Outcome::Unknown { why }),
+                ],
+                None,
+            );
         }
     };
     let tokens = help_option_tokens(&help);
@@ -899,10 +1042,13 @@ fn probe_claude_flags() -> Vec<ProbeResult> {
              dozens) — the probe cannot tell a renamed flag from a reformatted help screen",
             tokens.len()
         );
-        return vec![
-            ProbeResult::new(session_id, Outcome::Unknown { why: why.clone() }),
-            ProbeResult::new(settings, Outcome::Unknown { why }),
-        ];
+        return (
+            vec![
+                ProbeResult::new(session_id, Outcome::Unknown { why: why.clone() }),
+                ProbeResult::new(settings, Outcome::Unknown { why }),
+            ],
+            None,
+        );
     }
 
     let mut out = Vec::new();
@@ -950,14 +1096,15 @@ fn probe_claude_flags() -> Vec<ProbeResult> {
         };
         out.push(ProbeResult::new(id, outcome));
     }
-    out
+    (out, Some(help))
 }
 
 // ── claude: the transcript tail ─────────────────────────────────────────────
 
-/// A bounded window onto the newest real transcript. Carries no payload: the
-/// parsed lines never leave this module, and `session_id` is used only as the
-/// expected value for [`crate::oob::claude::record_names_session`].
+/// A bounded window onto the newest real transcript. The parsed lines leave
+/// this module only through [`Observed`], on the way to a scrub; `session_id` is
+/// used only as the expected value for
+/// [`crate::oob::claude::record_names_session`].
 struct Tail {
     lines: Vec<Value>,
     session_id: String,
@@ -1045,41 +1192,102 @@ fn read_tail(path: &PathBuf) -> Option<Tail> {
     })
 }
 
-/// The three `claude.transcript.*` rows, all read from one tail.
-fn probe_claude_transcript() -> Vec<ProbeResult> {
+/// The three `claude.transcript.*` rows, all read from one tail — plus, since
+/// V35 Phase H, up to [`capture::LINES_PER_CAPABILITY`] of the lines that
+/// actually satisfied each row's substantiveness predicate, and the CLI build
+/// string those lines carry.
+fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
     let ids = [
         "claude.transcript.usage",
         "claude.transcript.tool_result",
         "claude.transcript.identity",
     ];
+    let unknown = |why: String| {
+        (
+            ids.iter()
+                .map(|id| ProbeResult::new(id, Outcome::Unknown { why: why.clone() }))
+                .collect::<Vec<_>>(),
+            Vec::new(),
+            String::new(),
+        )
+    };
     let tail = newest_transcript().and_then(|p| read_tail(&p));
     let Some(tail) = tail else {
-        let why = "no Claude Code session transcript found under ~/.claude/projects — nothing to \
-                   tail. Not a failure: an unused harness cannot drift."
-            .to_string();
-        return ids
-            .iter()
-            .map(|id| ProbeResult::new(id, Outcome::Unknown { why: why.clone() }))
-            .collect();
+        return unknown(
+            "no Claude Code session transcript found under ~/.claude/projects — nothing to tail. \
+             Not a failure: an unused harness cannot drift."
+                .to_string(),
+        );
     };
     if tail.lines.is_empty() {
-        let why = format!(
+        return unknown(format!(
             "the newest transcript's last {} KiB held no parseable JSON object ({} unparsed \
              lines) — the artifact may no longer be JSONL",
             TAIL_BYTES / 1024,
             tail.unparsed
-        );
-        return ids
-            .iter()
-            .map(|id| ProbeResult::new(id, Outcome::Unknown { why: why.clone() }))
-            .collect();
+        ));
     }
 
-    vec![
+    let results = vec![
         ProbeResult::new(ids[0], usage_outcome(&tail)),
         ProbeResult::new(ids[1], tool_result_outcome(&tail)),
         ProbeResult::new(ids[2], identity_outcome(&tail)),
-    ]
+    ];
+    // Only rows that PASSED contribute lines. A line that failed the
+    // substantiveness predicate is not a known-good shape, and the harness-level
+    // gate in `capture::on_success` would not save us here: an `unknown` row
+    // sits in a run that can still be all-pass overall.
+    let mut observed = Vec::new();
+    for (id, lines) in [
+        (ids[0], substantive_lines(&tail, usage_is_substantive)),
+        (ids[1], substantive_lines(&tail, tool_result_is_substantive)),
+        (
+            ids[2],
+            substantive_lines(&tail, |l| identity_is_substantive(l, &tail.session_id)),
+        ),
+    ] {
+        let passed = results
+            .iter()
+            .any(|r| r.id == id && matches!(r.outcome, Outcome::Pass { .. }));
+        if passed && !lines.is_empty() {
+            observed.push(Observed::new(id, "jsonl", lines.join("\n")));
+        }
+    }
+    (results, observed, newest_cli_version(&tail))
+}
+
+/// Up to [`capture::LINES_PER_CAPABILITY`] transcript lines satisfying `keep`,
+/// re-serialized. The **newest** ones (the tail is in file order), because a
+/// shape that changed recently is the one a diff is looking for.
+///
+/// Re-serialized rather than kept as raw text: `read_tail` already parsed them,
+/// carrying the raw bytes alongside would double the window's footprint, and a
+/// canonical form makes the corpus diff on structure instead of on whitespace.
+fn substantive_lines(tail: &Tail, keep: impl Fn(&Value) -> bool) -> Vec<String> {
+    tail.lines
+        .iter()
+        .rev()
+        .filter(|l| keep(l))
+        .take(capture::LINES_PER_CAPABILITY)
+        .filter_map(|l| serde_json::to_string(l).ok())
+        .collect()
+}
+
+/// The newest CLI build string in the window — the version a Claude capture is
+/// stamped with (V35 Phase H, locked decision 6).
+///
+/// Read from the transcript's own `version` field, which is what
+/// `claude.transcript.identity` already proves is there and what the
+/// `harness_versions` tripwire is fed by. Newest rather than the whole set: a
+/// window can straddle an auto-update, and a capture belongs to the build that
+/// produced its newest lines.
+fn newest_cli_version(tail: &Tail) -> String {
+    tail.lines
+        .iter()
+        .rev()
+        .find_map(crate::oob::claude::cli_version_of)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// `message.usage.*` still produces substantive turns.
@@ -1110,10 +1318,6 @@ fn usage_outcome(tail: &Tail) -> Outcome {
     let (mut turns, mut substantive, mut cached) = (0usize, 0usize, 0usize);
     for line in &tail.lines {
         let Some(crate::graph::UsageEvent::Turn {
-            msg_id,
-            model,
-            in_tok,
-            out_tok,
             cache_read,
             cache_make,
             ..
@@ -1122,11 +1326,7 @@ fn usage_outcome(tail: &Tail) -> Outcome {
             continue;
         };
         turns += 1;
-        if !msg_id.is_empty()
-            && model.is_some_and(|m| !m.is_empty())
-            && in_tok > 0
-            && out_tok > 0
-        {
+        if usage_is_substantive(line) {
             substantive += 1;
         }
         if cache_read > 0 || cache_make > 0 {
@@ -1155,6 +1355,51 @@ fn usage_outcome(tail: &Tail) -> Outcome {
     }
 }
 
+/// One line yields a substantive usage `Turn`: non-empty `message.id`, a
+/// `message.model`, and both token counts above zero.
+///
+/// **The one spelling of the predicate** (V35 Phase H). [`usage_outcome`] counts
+/// with it and [`substantive_lines`] selects with it, so the corpus can never
+/// contain a line the probe would not have accepted — two spellings would let
+/// the capture drift into recording shapes the canary already rejects.
+fn usage_is_substantive(line: &Value) -> bool {
+    let Some(crate::graph::UsageEvent::Turn {
+        msg_id,
+        model,
+        in_tok,
+        out_tok,
+        ..
+    }) = crate::oob::claude::parse_usage_line(line, crate::graph::UsageOrigin::Session)
+    else {
+        return false;
+    };
+    !msg_id.is_empty() && model.is_some_and(|m| !m.is_empty()) && in_tok > 0 && out_tok > 0
+}
+
+/// One `tool_result` block was read with an id and a non-empty body. See
+/// [`usage_is_substantive`] for why this is a named function.
+fn tool_result_is_sized(id: &str, chars: usize) -> bool {
+    !id.is_empty() && chars > 0
+}
+
+/// One line carries at least one sized `tool_result`.
+fn tool_result_is_substantive(line: &Value) -> bool {
+    crate::oob::claude::extract_tool_results(line)
+        .iter()
+        .any(|(id, chars)| tool_result_is_sized(id, *chars))
+}
+
+/// One line carries BOTH identity fields: a top-level `sessionId` naming its own
+/// file, and a `version`.
+///
+/// Stricter than [`identity_outcome`]'s pass condition, which accepts the two
+/// facts from different lines — deliberately, because a capture wants one line
+/// that demonstrates the whole shape rather than two that each demonstrate half.
+fn identity_is_substantive(line: &Value, session_id: &str) -> bool {
+    crate::oob::claude::record_names_session(line, session_id)
+        && crate::oob::claude::cli_version_of(line).is_some()
+}
+
 /// `message.content[].tool_result` still yields sized results.
 ///
 /// Independent witness again, and a different field path so the witness cannot
@@ -1176,7 +1421,7 @@ fn tool_result_outcome(tail: &Tail) -> Outcome {
     for line in &tail.lines {
         for (id, chars) in crate::oob::claude::extract_tool_results(line) {
             results += 1;
-            if !id.is_empty() && chars > 0 {
+            if tool_result_is_sized(&id, chars) {
                 sized += 1;
             }
         }

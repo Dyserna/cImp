@@ -135,6 +135,14 @@ MAINTENANCE:
                           capability. Needs no running cImp. Exits non-zero ONLY on
                           real drift — an absent CLI or an upstream improvement
                           reports `unknown` / `transition` and exits 0.
+  --harness-capture [--json]
+                          run the same probes and FILE what they observed, scrubbed
+                          for credentials, under <app-data>/harness-captures/<harness>/
+                          <cli-version>/ — so a future breakage is a diff against the
+                          last known-good capture instead of an investigation. A run
+                          that found drift lands in `<cli-version>-failing/` and never
+                          overwrites the known-good corpus. Prints where it wrote;
+                          exits non-zero only if it could write nothing at all.
 
 SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --statusline                           Claude Code status-line renderer
@@ -218,6 +226,18 @@ fn main() {
         if early.iter().any(|a| a == "--harness-canary") {
             attach_parent_console();
             std::process::exit(harness::probe::run(&early));
+        }
+        // V35 Phase H: the capture corpus's manual trigger. Same probes, same
+        // GUI-free reasoning as above — and deliberately a SECOND command
+        // rather than a flag on the first, because the two answer different
+        // questions and only one of them owns an exit code. `--harness-canary`
+        // says whether the harness drifted; this says whether a capture was
+        // filed, and it files one whether or not anything drifted (a failing
+        // run goes to a marked sibling directory, so the last known-good
+        // capture — the thing you would diff against — survives).
+        if early.iter().any(|a| a == "--harness-capture") {
+            attach_parent_console();
+            std::process::exit(harness::capture::run(&early));
         }
     }
 

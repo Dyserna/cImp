@@ -39,14 +39,23 @@
 //! panel renders an answer instead of re-deriving one, and so "what is broken
 //! right now" stops requiring a source read.
 //!
-//! Still to come: the capture-on-success corpus (Phase H).
+//! Phase H adds [`capture`], the corpus: a probe run that found no drift files
+//! the payloads it read — scrubbed, stamped with the CLI version it saw them on
+//! — under the user's data directory, and `cimp --harness-capture` does the
+//! same on demand including for a run that *did* drift (into a marked sibling
+//! directory, never over the known-good one). It exists for a single moment:
+//! when something breaks, the first diagnostic should be a diff between the last
+//! known-good capture and today's, rather than reverse-engineering the shape
+//! from symptoms.
 //!
 //! Design: `docs/MILESTONE-V35-harness-resilience.md` (the why and the locked
 //! decisions), `docs/DESIGN-harness-capability-matrix.md` (the types and the
 //! seed rows), `docs/DESIGN-harness-drift-canaries.md` (the canary layers, § 5
-//! for Phase F's replacement of the noisy tripwire).
+//! for Phase F's replacement of the noisy tripwire, § 3.2 and § 4.1 for the
+//! capture dir's trust boundary).
 
 pub mod canary;
+pub mod capture;
 pub mod contract;
 pub mod health;
 pub mod probe;

@@ -2,12 +2,15 @@
 
 **Status:** SPEC — not yet coded (2026-08-16). GitHub milestone: not yet created.
 **Design source of truth:** this file for the *why*, the scope and the locked
-decisions; the two companion drafts for the detailed design —
+decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
-(what we depend on) and
+(what we depend on),
 [DESIGN-harness-drift-canaries.md](DESIGN-harness-drift-canaries.md)
-(proving it still holds). An `IMPL-PLAN-V35` splits out at build time if the
-phases need per-agent contracts, matching V33's convention.
+(proving it still holds), and
+[DESIGN-harness-plugin-architecture.md](DESIGN-harness-plugin-architecture.md)
+(making the surface small and confined instead of merely enumerable). An
+`IMPL-PLAN-V35` splits out at build time if the phases need per-agent
+contracts, matching V33's convention.
 
 **Builds on:** V16 harness contract hardening — the eight drift rules
 (`advisor.rs:149-156`), the `harness_versions` tripwire + Advisor **Mark
@@ -126,11 +129,37 @@ session to tail) reports *unknown*. A probe that finds a **better** upstream
 test. Modelling these as failures would recreate the alarm fatigue this
 milestone exists to remove.
 
+**9. The harness seam is a protocol, not a Rust trait (2026-08-16).** Both
+harnesses already POST an identical harness-neutral body
+(`{cwd, prompt, session_id, agent, tab}`) to `/context/retrieve` —
+`context_hook.rs:49` and `tabs/config.rs:2119`. That accidental protocol gets
+named, versioned (`chp`) and declared as **CHP**. Everything above it types
+against CHP, not against harness-shaped Rust, so a new harness adds no `match`
+arms. The `HarnessAdapter` trait from the matrix draft survives as an L3
+internal only. **The tier tells you why:** the push path (`/context/*`,
+`/permission/event`, `/latch/*`) is Tier A/B and has never hurt; the read path
+(`oob/*`, `statusline/*`) is Tier C/D and is where every painful adaptation
+has landed. The difference between them is whether the plugin layer exists.
+
+**10. No third-party plugin loading (2026-08-16).** cImp gets the plugin
+*architecture* — clear layers, one directory per harness — but does **not**
+load harness plugins it did not ship. No drop-in directory, no package
+manifest, no signing. A new harness is a PR adding `harness/<id>/`, released
+as part of cImp. **Why:** the harness plugin is inside the TCB. cImp only
+*computes* the V32 Phase H verdict; the enforcement is a `throw` inside the
+plugin's `tool.execute.before` (`tabs/config.rs:2205-2207`), and that same
+generated file owns the V33 Phase F checkpoint trigger and the V32 taint
+beacon. A plugin omitting the `throw` silently disables native-tool
+containment while looking fully functional, and nothing outside a harness can
+verify that a control inside it ran. Kept from the rejected model: the matrix
+gains a **TCB column** marking `tool.gate` / `checkpoint.pre_mutation` /
+`taint.beacon` as controls rather than data — documentation, not a gate.
+
 ## Phases
 
 | Phase | Work | Exit criteria |
 |---|---|---|
-| **A** | `src-tauri/src/harness/contract.rs` — the `Capability` registry, seeded with the ~18 real rows in the matrix draft §2.1 | Registry compiles; the three consistency tests pass (below) |
+| **A** | `src-tauri/src/harness/contract.rs` — the `Capability` registry, seeded with the ~18 real rows in the matrix draft §2.1, plus the **TCB column** from decision 10 | Registry compiles; the three consistency tests pass (below); every control-implementing capability is marked as such |
 | **B** | L1 fixture canaries for the four Tier-C readers: transcript usage, transcript tool_result, statusline stdin, OpenCode SSE | `cargo test` fails if any of those readers stops producing substantive output from a real fixture |
 | **C** | Negative canaries (renamed-field fixtures) + the matrix↔canary cross-check | Every `Silent` capability has a canary or a recorded waiver; no canary exists outside the matrix |
 | **D** | `cimp --harness-canary [--json]` live probe. **Start with the `opencode.tool_registry` diff** | Probe exits non-zero on a real drift; unclassified OpenCode tool ids fail |
@@ -141,6 +170,32 @@ milestone exists to remove.
 
 Phase A is worth landing alone — seeding the table already surfaced two live
 gaps (below). Phases A+B+D are the value core; E–H are consolidation.
+
+### Phases I–M — the plugin architecture (decisions 9 + 10)
+
+A+B+D make the surface *loud*; I–M make it *small*. Independent of A–H except
+that M's capability ids come from the Phase A registry. Full design in
+[DESIGN-harness-plugin-architecture.md](DESIGN-harness-plugin-architecture.md).
+
+| Phase | Work | Exit criteria |
+|---|---|---|
+| **I** | Declare **CHP**: name the existing loopback routes, add `chp` + a `/session/hello` capability negotiation. Zero behavior change. | The protocol has a written schema and a version on every message |
+| **J** | Claude hook shims → `type: "http"` hooks pointing straight at loopback (`headers` + `allowedEnvVars` carry the bearer token, as the OpenCode plugin already does) | The five `*_hook.rs` shims are deleted; Claude's L1 has the same shape as OpenCode's |
+| **K** | Move `harness/` into place: `OobSpec` → registry lookup, `oob/{claude,opencode}.rs` → `harness/<id>/read.rs`, plus the layering tests | `no_harness_literals_outside_harness` passes; a contributor can be pointed at one directory |
+| **L** | Push the read path, one capability at a time: permission → usage → assistant text → subagents | Each migrated capability moves C→B and deletes a silent-zeros failure mode |
+| **M** | Plugin templates out of `format!()` into real `.js`/`.json` files (`include_str!` + a checked substitution key set) | Every `{{key}}` is in the known set or the build fails; an upstream change is a readable diff |
+
+Phase J is the highest value-to-risk ratio. Phase K is a pure refactor with no
+behavior change — cheap to land, cheap to review, and it is what makes a third
+harness additive. **Phase K is a large file relocation**: the tree is not
+rustfmt-clean and is sometimes shared with a second agent, so scope every git
+operation to explicit paths.
+
+**Not scheduled:** publishing plugin templates on the `detection-v1` channel.
+That channel ships *rules cImp consumes*; a template is *code executing inside
+the harness with a loopback token*, which turns it into a code-delivery
+channel and raises the bar to signature verification — on top of the updater
+work already deferred to #53. Revisit only if release latency starts to hurt.
 
 ### Phase A consistency tests
 
@@ -191,6 +246,26 @@ Both surfaced while seeding the matrix; neither depends on V35 landing.
    fake secret; confirm the capture lands only in the gitignored dir and the
    secret is scrubbed.
 
+Phases I–M:
+
+7. **HTTP hooks carry identity (J).** Launch a Claude tab, submit a prompt,
+   confirm context injection still lands — and that the loopback access log
+   shows the POST arriving from the harness with the bearer token, with no
+   `cimp --context-hook` process ever spawned.
+8. **Stale plugin is detected, not mysterious (I + D5).** Launch a tab, then
+   hand-edit the generated plugin's `chp` to an older value; confirm cImp
+   reports a version mismatch rather than the capability silently misbehaving.
+   This is the trap V32 hit four times as "needs a FRESH TAB".
+9. **Gate still enforces after the move (K + L).** Re-run the V32 Phase H
+   native-tool refusal recipes against the relocated `harness/opencode/`;
+   the refusal strings and the `throw` must be byte-identical in behavior.
+   **Phase K is a refactor — a behavior change here is a defect, not a
+   finding.**
+10. **TTS survives the push path (L).** With assistant text arriving over CHP
+    rather than the JSONL tail, confirm sentence segmentation is unchanged for
+    Claude (complete text at message finish) *and* OpenCode (token deltas) —
+    the two cadences must not be flattened into one.
+
 ## Deploy traps
 
 - **Settings schema bump** if Phase G stores per-capability canary results.
@@ -227,7 +302,12 @@ Both surfaced while seeding the matrix; neither depends on V35 landing.
 
 ## Out of scope
 
-- Any alternative-harness adapter (locked decision 1). The Phase G trait keeps
-  the option cheap; nothing in V35 implements it.
-- Unifying the OOB adapters (locked decision 6).
+- Any alternative-harness adapter (locked decision 1). Phases I–K make the
+  option cost one directory; nothing in V35 exercises it.
+- Third-party plugin loading (locked decision 10) — no drop-in directory, no
+  package format, no signing.
+- Publishing plugin templates on the detection channel (see Phases I–M).
+- Unifying the OOB adapters' internals (locked decision 6). Phase L *retires*
+  them from the hot path and keeps each as a per-harness fallback; it does not
+  build a shared abstraction over JSONL-tailing and SSE.
 - New harness *features*. V35 is entirely about the durability of what exists.

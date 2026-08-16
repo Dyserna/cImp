@@ -1,8 +1,8 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** IN PROGRESS — Phase A implemented 2026-08-16 (`82c0da2`), Phase B
-2026-08-16 (`7a4262a`); Phase C underway. GitHub milestone 8, issues #54–#71
-(one per phase; #55/#56 closed by those commits; #63/#64 track the two
+**Status:** IN PROGRESS — Phases A–C implemented 2026-08-16 (`82c0da2`,
+`7a4262a`, `7610255`); Phase D underway. GitHub milestone 8, issues #54–#71
+(one per phase; #55/#56/#57 closed by those commits; #63/#64 track the two
 pre-milestone gaps).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
@@ -281,6 +281,34 @@ canaries. Decisions binding later phases:
   `extract_tool_results` — canary drives both; `claude.statusline.stdin`
   under-declares what `extract_context`/`render` read — reconciled in
   Phase C.
+
+**Phase C (`7610255`, 2026-08-16).** Four negative canaries (fixtures under
+`fixtures/harness/<harness>/_synthetic/`, each byte-identical to its positive
+twin except one renamed field) + the matrix↔canary cross-check
+(`canaries_and_the_matrix_agree`) + statusline `depends_on` reconciliation.
+Decisions:
+
+- **`_synthetic/` gets no walker exemption** — same manifest keys plus a
+  fifth, `models_version`, asserted to name a still-existing sibling version
+  dir, so a drift model cannot outlive its twin.
+- **Cross-check extracts `row("<id>")` call sites** from
+  `include_str!("canary.rs")` (needle assembled via `concat!` so the scanner
+  can't match its own source) and set-compares both directions against
+  `canary: Some` rows; ≥4 floor guards against vacuous extraction; every
+  row's `canary` must equal its own id.
+- **`extract_push_meta` fields stay undeclared** (verified: attribution
+  enrichment only — losing them changes no number, degrades multi-tab slot
+  ownership to last-writer-wins, which `usage::merge_push` handles). Same
+  grounds for the second undeclared group found in Phase C
+  (`session_name`/`agent.name`/`effort`/`thinking`/`fast_mode` + the
+  top-level `total_input_tokens` fallback). Rationale + re-declare trigger
+  recorded as comments on the row.
+- **Negative twins are not enforced by the cross-check** (deliberate —
+  `Behavior` rows can't have rename fixtures); recorded in the test's doc.
+- The statusline negative twin found a sharper fact: with `context_window`
+  renamed, the push **still returns `Some` and looks healthy** via
+  `rate_limits` — the loss is partial, which is exactly the silent-partial
+  degradation class the canaries exist to catch.
 
 ## Two gaps to fix ahead of the milestone
 

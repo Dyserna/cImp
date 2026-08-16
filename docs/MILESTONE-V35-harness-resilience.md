@@ -1,6 +1,8 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** SPEC — not yet coded (2026-08-16). GitHub milestone: not yet created.
+**Status:** IN PROGRESS — Phase A implemented 2026-08-16 (`82c0da2`); Phase B
+underway. GitHub milestone 8, issues #54–#71 (one per phase; #55 = Phase A
+closed by that commit; #63/#64 track the two pre-milestone gaps).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -209,6 +211,49 @@ Following the existing `include_str!` two-sources-of-truth pattern:
   dependencies entering unrecorded.
 - `wired_in_paths_exist` — every declared consumer path resolves to a real
   file.
+
+## Implementation record
+
+**Phase A (`82c0da2`, 2026-08-16).** Registry seeded (18 rows), four tests
+(the three below + `tcb_controls_are_declared_exactly_once`), MAINTENANCE.md
+drift table gained a leading **"Capability id(s)"** column + one new row
+(*Transcript tap — shape beyond usage*) for the four ids that had no prose row.
+Build-time decisions, all binding on later phases:
+
+- **Parity test works via id-set equality**, not prose parsing: backticked
+  ids extracted from the drift table's `|` lines, set-compared both ways
+  against the registry (plus uniqueness on both sides). A doc row may carry
+  several ids.
+- **`drift_rule` is a slice**, referencing the `advisor::RULE_DRIFT_*` consts
+  (never duplicated literals) — several rows lag via multiple rules.
+- **`waiver: Option<&str>`** exists from day one so
+  `every_silent_degradation_has_a_canary_or_a_waiver` enforces structurally
+  before any canary lands; phases B–D swap waivers for canary ids.
+- **Tier is a single `Seam`**; a row's D-component is expressed as a
+  `Dep::Behavior` entry (the §2.1 "B+D" rows are `Seam::B` + a Behavior dep;
+  `precompact` also carries one — decision 7 names D0 among the spike rows).
+- **TCB column** = `controls: &[&str]`; the three control ids live on
+  `opencode.plugin.load_all` and a test pins each to exactly one row.
+
+Findings out of Phase A (close-or-defer decided 2026-08-16):
+
+1. `perm.tui_scrape`'s literal `"Esc to cancel · Tab to amend"` is **stale in
+   the design docs and MAINTENANCE prose** — `processing/permission.rs:18-40`
+   ships `to cancel ·` / `to cancel` + `1. Yes 2.` with `none_of` guards.
+   Registry follows the code; MAINTENANCE cell corrected in Phase B.
+2. `claude.hook.posttooluse` has **zero lagging coverage** —
+   `postedit_hook.rs` never calls `report_contract_drift` (the "three shims"
+   in the V16 notes is literal). Explicit waiver; closes with the Phase D
+   probe class.
+3. `claude.transcript.identity` is the **inverse of the version tripwire** —
+   losing `version` silences `drift.harness_version.v1` rather than firing
+   it. Documented in the row's waiver; no drift_rule link.
+4. `GET /experimental/tool/ids` is **never called by cImp today** (doc-comment
+   only) — the `Dep::Route` is the Phase D probe's target, said so in the
+   waiver.
+5. `claude.flag.session_id`'s `VisibleOff` is **declared intent, not observed
+   behavior** (a vanished flag kills the tab loudly instead) — Phase E must
+   implement it or downgrade the row.
 
 ## Two gaps to fix ahead of the milestone
 

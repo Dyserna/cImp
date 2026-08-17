@@ -381,21 +381,36 @@ receiving end:
 | `PostToolUse` (matcher `Edit\|Write\|MultiEdit`) | `POST /claude/hook/post_tool_use` | `/context/post_edit`'s core (V12 Phase F) |
 | `Notification` + `PermissionDenied` (both `matcher: ""`) | `POST /claude/hook/notification` | `/permission/event`'s core (NC-2) |
 | `SessionStart` | `POST /claude/hook/session_start` | CHP hello (V35 Phase J) |
+| `PostToolUseFailure` (`matcher: ""`) | `POST /claude/hook/post_tool_use_failure` | `/session/tool_result`'s core, errored (2026-08-17) |
+| `PreToolUse` (matcher `WebFetch\|WebSearch`) | `POST /claude/hook/pre_tool_use_taint` | `/latch/beacon`'s core (V32 Phase F; http since 2026-08-17) |
+| `PreToolUse` (matcher `Edit\|Write\|MultiEdit\|Bash`) | `POST /claude/hook/pre_tool_use_checkpoint` | `/workbench/tool_checkpoint`'s core (V33 Phase F; http since 2026-08-17) |
 
 The **legacy `/context/*` routes stay**: a tab open across the upgrade is still
-running an overlay full of command hooks, and the five dispatch flags survive in
-`main.rs` as tombstones that drain stdin and exit 0 so an old overlay is inert
+running an overlay full of command hooks, and the retired dispatch flags survive
+in `main.rs` as tombstones that drain stdin and exit 0 so an old overlay is inert
 rather than launching a second cImp GUI. Both transports meet at one shared core
-per capability. Two hooks are still shim binaries — `cimp --taint-beacon` and
-`cimp --checkpoint-beacon` — because the checkpoint one deliberately *waits* for
-its reply and both were built around the undocumented timeout semantics of a
-command hook.
+per capability.
+
+**No Claude hook is a command any more.** The last two shim binaries —
+`cimp --taint-beacon` and `cimp --checkpoint-beacon` — became `type: "http"`
+entries on 2026-08-17 (`POST /claude/hook/pre_tool_use_taint`,
+`POST /claude/hook/pre_tool_use_checkpoint`), which moved their registry rows from
+Tier D to Tier B: both had been built around *undocumented* behaviours of a
+command hook (a silent exit-0 hook never perturbs the call, including on timeout;
+the tool does not begin until the hook process exits), and the http contract states
+both in writing. In particular a `PreToolUse` http hook blocks the tool call until
+the response, so the checkpoint handler simply takes the snapshot before it
+answers — the ordering is enforced rather than inferred. A third entry landed with
+them: `PostToolUseFailure`, because `PostToolUse` fires only on success and failed
+tool results were otherwise lost on every tab that serves `session.tool_result`.
 
 All of them fail open. For an http hook that is the harness's own contract: a
 timeout, a refused connection and any non-2xx are non-blocking, and a 2xx JSON
 body with no directive is a no-op — so every handler answers `200 {}` when it
 has nothing to say. Every emitted entry carries an explicit `timeout: 1`, the
-deleted shims' 600 ms budget rounded up, pinned by a test rather than inherited
+deleted shims' 600 ms budget rounded up — with one documented exception, the
+pre-mutation checkpoint's 5 s, a ceiling over the app's own 1800 ms snapshot
+budget — pinned by a test rather than inherited
 from the harness's 600 s / 30 s defaults. The full wire contract, including the
 `X-CIMP-*` identity headers, is `docs/CHP.md` § 4.5.
 

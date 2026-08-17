@@ -157,6 +157,126 @@ const OPENCODE_DENIED: &str = "deny";
 /// name for the channel `tabs::config::compose_ai_env` writes it on.
 pub(crate) const CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 
+// ── 2026-08-17: the local server's Basic auth (capability `opencode.route.noauth`) ──
+//
+// OpenCode's TUI hosts an HTTP server on the `--port` cImp launches it with, and
+// until today cImp relied on that server accepting UNAUTHENTICATED loopback
+// calls — a Tier-D dependency whose second edge was an unauthenticated local
+// surface on which `POST /session/:id/message` (without `noReply`) starts a real
+// agent turn. Upstream has a documented answer, live-spiked on the installed
+// binary today: set a non-empty `OPENCODE_SERVER_PASSWORD` on the child and
+// every route, `GET /event` included, requires HTTP Basic auth (unauth ⇒ 401,
+// Basic ⇒ 200/SSE). So cImp sets one per spawn and authenticates its own tap and
+// push, which is the D→B move locked decision 2 says outranks new features.
+//
+// Four properties of upstream's implementation shape everything below, and each
+// one is a way to get this subtly wrong:
+//
+//  1. **The password is snapshotted at module load in the child**, so it must be
+//     on the child's environment AT SPAWN. Setting it later does nothing.
+//  2. **An EMPTY password silently disables auth entirely** — the dangerous
+//     default, and exactly the "empty is not absent" failure of global principle
+//     5. [`new_server_password`] can only return a non-empty string, and
+//     [`server_basic_auth`] refuses to build a header for an empty one.
+//  3. **Credentials go in the `Authorization` header, never the `auth_token`
+//     query param.** A present-but-wrong query param WINS over a correct header
+//     and 401s, so cImp sends the header and nothing else — which also keeps the
+//     secret out of URLs (and therefore out of logs).
+//  4. **There is no unauthenticated health route.** Only three static asset
+//     paths bypass auth, so any readiness poll must either carry credentials or
+//     be a bare TCP connect.
+//
+// First-party clients are unaffected: the TUI, `opencode run` and the plugin's
+// own SDK client all read the same env and authenticate themselves, which is why
+// setting a password does not break the tab cImp launched.
+
+/// The env var whose non-empty value turns on HTTP Basic auth for OpenCode's
+/// local server.
+pub(crate) const SERVER_PASSWORD_ENV: &str = "OPENCODE_SERVER_PASSWORD";
+
+/// The env var carrying the Basic-auth username. Upstream defaults it to
+/// [`SERVER_USERNAME`]; cImp sets it explicitly anyway — belt and braces, and
+/// the same thing OpenCode's own desktop app does — so a future change to that
+/// default cannot silently invalidate the header cImp sends.
+pub(crate) const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
+
+/// The Basic-auth username cImp sets and authenticates with.
+pub(crate) const SERVER_USERNAME: &str = "opencode";
+
+/// A fresh per-spawn server password: 32 hex characters of UUIDv4 entropy.
+///
+/// The same source and shape as the loopback bearer token
+/// (`offload::loopback::make_token`, two UUIDs) — deliberately, so there is one
+/// answer in this tree to "where does a per-launch secret come from" and no new
+/// RNG dependency. Half the length because this one is a password on a loopback
+/// socket rather than the app's own bearer, and 128 bits of a CSPRNG is not the
+/// weak link in a threat model where any process running as this user can read
+/// the plugin file.
+///
+/// **Never persisted and never in argv**: it is regenerated at every tab spawn,
+/// lives in the child's environment and in the reader's in-memory
+/// `Authorization` header, and is not Settings-derived — so, exactly like the
+/// Claude hook token, it owes no `tabs::config::spawn_inject_sig` entry (that
+/// signature exists to nag about values a *user* changed).
+pub(crate) fn new_server_password() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The two env entries an OpenCode child must be spawned with for `password` to
+/// take effect, as `(name, value)` pairs.
+///
+/// Returned as a list rather than written into a map by this function so the
+/// caller (`tabs::config::compose_ai_env`) keeps its one composition order and
+/// its per-tab override semantics — and so the two variable NAMES, which are
+/// OpenCode's, are spelled once, here, beside the document that explains them.
+/// That is the same rule [`CONFIG_ENV`] follows, and the layering scan enforces
+/// it: both names are `Dep::ConfigKey`s on `opencode.route.noauth`, so they are
+/// needles no production file outside `harness/` may contain.
+pub(crate) fn server_auth_env(password: &str) -> [(String, String); 2] {
+    [
+        (SERVER_PASSWORD_ENV.to_string(), password.to_string()),
+        (SERVER_USERNAME_ENV.to_string(), SERVER_USERNAME.to_string()),
+    ]
+}
+
+/// The `Authorization` header value cImp's own calls to a tab's OpenCode server
+/// must carry — `Basic base64("opencode:<password>")`.
+///
+/// `None` for an empty password, which is the whole point: an empty
+/// `OPENCODE_SERVER_PASSWORD` disables auth upstream, so "no credential" and "a
+/// credential that is the empty string" must not produce the same header. A
+/// caller that gets `None` sends no header, which is correct for an
+/// unauthenticated server and 401s (visibly, into the `VisibleOff` degradation)
+/// against an authenticated one.
+pub(crate) fn server_basic_auth(password: &str) -> Option<String> {
+    use base64::prelude::*;
+    if password.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Basic {}",
+        BASE64_STANDARD.encode(format!("{SERVER_USERNAME}:{password}"))
+    ))
+}
+
+/// The credential for a child that will be spawned with `env` — read back OUT of
+/// the composed environment rather than remembered from generation.
+///
+/// The child's effective password is whatever ends up in its environment, and a
+/// per-tab `env` entry deliberately wins over everything cImp synthesizes
+/// (`compose_ai_env`'s last step). Deriving the reader's header from the same map
+/// is what keeps the tap authenticating with the password the server will
+/// actually be using — including the case where a user sets their own. `None`
+/// when the variable is absent or empty, i.e. when that child's server will be
+/// unauthenticated.
+pub(crate) fn server_auth_from_env(
+    env: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    env.get(SERVER_PASSWORD_ENV)
+        .map(String::as_str)
+        .and_then(server_basic_auth)
+}
+
 /// V19: synthesize OpenCode's session-scoped config — the JSON document that
 /// `OPENCODE_CONFIG_CONTENT` carries (the env-var analog of Claude's
 /// `--mcp-config` / `--settings` / `--append-system-prompt`):
@@ -450,5 +570,79 @@ pub(crate) fn build_opencode_config(
         }
     }
     serde_json::Value::Object(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // The rest of this module's tests live in `tabs::config`'s test module (see
+    // the note there): they drive the emitted config through the tab-spawn
+    // composition and share ~30 helpers with it. These four are pure functions
+    // over a string, so they live with the code.
+
+    /// The generated password can never be the value that DISABLES auth.
+    #[test]
+    fn a_generated_server_password_is_never_empty_and_never_repeats() {
+        let a = new_server_password();
+        let b = new_server_password();
+        assert!(!a.is_empty(), "an empty password disables auth upstream");
+        assert_eq!(a.len(), 32, "32 hex chars of UUIDv4 entropy: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b, "the password must be per spawn, not per build");
+    }
+
+    /// The header is `Basic base64("opencode:<password>")` — and an empty
+    /// password yields NO header rather than a header for the empty string,
+    /// because upstream reads an empty password as "auth off".
+    #[test]
+    fn the_basic_header_encodes_the_username_pair_and_refuses_an_empty_password() {
+        use base64::prelude::*;
+        let header = server_basic_auth("s3cret").expect("a non-empty password has a header");
+        let encoded = header
+            .strip_prefix("Basic ")
+            .expect("the scheme is Basic, not Bearer");
+        assert_eq!(
+            String::from_utf8(BASE64_STANDARD.decode(encoded).expect("base64")).expect("utf8"),
+            format!("{SERVER_USERNAME}:s3cret"),
+        );
+        assert_eq!(server_basic_auth(""), None);
+    }
+
+    /// The reader's credential comes from the child's COMPOSED environment, so a
+    /// per-tab override (which wins at spawn) cannot leave the tap
+    /// authenticating with a password the server never saw.
+    #[test]
+    fn the_readers_credential_follows_the_childs_effective_environment() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        assert_eq!(server_auth_from_env(&env), None, "no variable ⇒ no header");
+        env.insert(SERVER_PASSWORD_ENV.to_string(), String::new());
+        assert_eq!(
+            server_auth_from_env(&env),
+            None,
+            "an empty password disables auth upstream, so it must not produce a header"
+        );
+        env.insert(SERVER_PASSWORD_ENV.to_string(), "theirs".to_string());
+        assert_eq!(
+            server_auth_from_env(&env),
+            server_basic_auth("theirs"),
+            "the tap must authenticate with the password the CHILD will use"
+        );
+    }
+
+    /// The two variables are set as a pair, with the username pinned to the
+    /// value the header is built from.
+    #[test]
+    fn the_spawn_env_pairs_the_password_with_the_username_it_is_encoded_under() {
+        let pairs = server_auth_env("pw");
+        assert_eq!(
+            pairs,
+            [
+                (SERVER_PASSWORD_ENV.to_string(), "pw".to_string()),
+                (SERVER_USERNAME_ENV.to_string(), SERVER_USERNAME.to_string()),
+            ]
+        );
+    }
 }
 

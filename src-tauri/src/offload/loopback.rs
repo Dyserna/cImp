@@ -1269,7 +1269,17 @@ async fn handle_conn(
         // ── V35 Phase L: Claude's ingress for the three migrated reads ───────
         ("POST", "/claude/hook/stop") => handle_claude_stop(&mut stream, &app, &req).await,
         ("POST", "/claude/hook/post_tool_use_result") => handle_claude_tool_result(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/post_tool_use_failure") => handle_claude_tool_failure(&mut stream, &app, &req).await,
         ("POST", "/claude/hook/subagent") => handle_claude_subagent(&mut stream, &app, &req).await,
+        // ── 2026-08-17: the two beacons, as http hooks ───────────────────────
+        //
+        // The last two `type: "command"` Claude shims, migrated. Each reaches
+        // the SAME core its harness-neutral twin above does — `/latch/beacon`'s
+        // and `/workbench/tool_checkpoint`'s — so the two transports of each
+        // capability cannot come to behave differently (asserted by
+        // `both_transports_of_a_capability_call_one_core`).
+        ("POST", "/claude/hook/pre_tool_use_taint") => handle_claude_taint_beacon(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/pre_tool_use_checkpoint") => handle_claude_checkpoint(&mut stream, &app, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -5537,77 +5547,92 @@ async fn handle_tool_checkpoint(
         )
         .await;
     };
-    let harness = hook_agent(body.agent.as_deref());
-    if !tool_checkpoint_is_mutating(harness, tool) {
-        // 200, not 400: a caller whose matcher is wider than the table is not
-        // malformed, it is over-reporting, and a fail-open sensor must never
-        // learn to treat that as an error. `checkpointed: false` is the whole
-        // answer. No log line either — this is reachable once per non-mutating
-        // matched call and would be unbounded chatter.
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({ "ok": true, "checkpointed": false }),
-        )
-        .await;
-    }
-
-    let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() else {
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({ "ok": true, "checkpointed": false }),
-        )
-        .await;
-    };
-    let workbench = workbench.inner().clone();
-    if !workbench.checkpoints_enabled() {
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({ "ok": true, "checkpointed": false }),
-        )
-        .await;
-    }
-    let root = body
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let origin = checkpoint_identity(
+    let checkpointed = tool_checkpoint_core(
+        app,
         &live_settings(app),
         body.agent.as_deref(),
+        tool,
+        body.cwd.as_deref(),
         body.session_id.as_deref(),
         body.tab.as_deref(),
-    );
-    // `harness:tool_name` — the locked value format. `bounded_id` caps the
-    // caller-supplied half before it reaches a commit trailer; `trailer_identity`
-    // rejects the framing hazards at the write boundary, and an over-long value
-    // there would be dropped WHOLE, losing the harness prefix too.
-    let source = format!("{harness}:{}", bounded_id(tool));
-    // AWAITED, unlike the prompt-tap trigger's fire-and-forget spawn: the point
-    // of this trigger is that the snapshot precedes the mutation, and BOTH
-    // callers await this POST (the OpenCode plugin inside
-    // `tool.execute.before`, the Claude shim since the 2026-08-13 amendment).
-    // The wait is bounded twice over — by the throttle, which admits at most one
-    // snapshot per `checkpoint_min_gap_s` per `(root, tab)` and is what makes
-    // the common case free, and by the budget below, which is what stops a slow
-    // one from outliving the caller's patience and minting a row for a tool call
-    // that has already run.
-    let checkpointed = workbench
-        .on_tool(
-            &root,
-            origin,
-            &source,
-            Some(Instant::now() + TOOL_CHECKPOINT_BUDGET),
-        )
-        .await;
+    )
+    .await;
     write_json(
         stream,
         200,
         &serde_json::json!({ "ok": true, "checkpointed": checkpointed }),
     )
     .await
+}
+
+/// **The pre-tool checkpoint itself** — the core both out-of-process fire seams
+/// reach: this route's harness-neutral body (the OpenCode plugin) and
+/// [`claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT`]'s Claude hook payload.
+///
+/// Split out on 2026-08-17, when the Claude side stopped being a shim POSTing to
+/// the route and became a handler beside it. One core, so the two transports
+/// cannot come to disagree about the tool-name re-check, the enabled switch, the
+/// identity narrowing or the deadline — the property
+/// `both_transports_of_a_capability_call_one_core` asserts and the reason the
+/// Claude migration is a relocation rather than a second implementation.
+///
+/// Returns `checkpointed`: the trigger settled and nothing about this call is
+/// unaccounted for — true for a checkpoint created, a dedup hit and a throttled
+/// call; false for a non-mutating name, checkpoints off, no service, or a
+/// snapshot abandoned against [`TOOL_CHECKPOINT_BUDGET`]. `settings` is passed in
+/// rather than read here so a handler resolves identity and policy under ONE
+/// snapshot.
+async fn tool_checkpoint_core(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    agent: Option<&str>,
+    tool: &str,
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+    tab: Option<&str>,
+) -> bool {
+    // Normalized for the two decisions that must not cross the harnesses' tool
+    // vocabularies, and passed on RAW to `checkpoint_identity`, which records the
+    // caller's own spelling in the commit trailer exactly as it always has.
+    let harness = hook_agent(agent);
+    if !tool_checkpoint_is_mutating(harness, tool) {
+        // Not an error: a caller whose matcher is wider than the table is
+        // over-reporting, and a fail-open sensor must never learn to treat that
+        // as a failure. No log line either — this is reachable once per
+        // non-mutating matched call and would be unbounded chatter.
+        return false;
+    }
+    let Some(workbench) = app.try_state::<Arc<crate::workbench::WorkbenchService>>() else {
+        return false;
+    };
+    let workbench = workbench.inner().clone();
+    if !workbench.checkpoints_enabled() {
+        return false;
+    }
+    let root = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let origin = checkpoint_identity(settings, agent, session_id, tab);
+    // `harness:tool_name` — the locked value format. `bounded_id` caps the
+    // caller-supplied half before it reaches a commit trailer; `trailer_identity`
+    // rejects the framing hazards at the write boundary, and an over-long value
+    // there would be dropped WHOLE, losing the harness prefix too.
+    let source = format!("{harness}:{}", bounded_id(tool));
+    // AWAITED, unlike the prompt-tap trigger's fire-and-forget spawn: the point
+    // of this trigger is that the snapshot precedes the mutation, and both fire
+    // seams hold the tool call until this returns (the OpenCode plugin awaits
+    // its POST inside `tool.execute.before`; a Claude `PreToolUse` http hook
+    // blocks the call until the handler answers). The wait is bounded twice over
+    // — by the throttle, which admits at most one snapshot per
+    // `checkpoint_min_gap_s` per `(root, tab)` and is what makes the common case
+    // free, and by the budget below, which stops a slow one from outliving the
+    // caller's patience and minting a row for a tool call that has already run.
+    workbench
+        .on_tool(
+            &root,
+            origin,
+            &source,
+            Some(Instant::now() + TOOL_CHECKPOINT_BUDGET),
+        )
+        .await
 }
 
 // ── #48, finding M-7: the three `/context/*` hook routes' taint gate ───────
@@ -5908,26 +5933,41 @@ struct ContractDriftBody {
 /// The hook shims cImp itself installs — and, with [`DRIFT_SHIM_UNKNOWN`], the
 /// **only** keys [`CONTRACT_DRIFT_SEEN`] can hold (#48 F-37).
 ///
-/// Every entry is a literal one of this crate's own shim binaries sends:
-/// `context_hook::report_contract_drift`'s first argument at four call sites,
-/// plus the two beacons' hand-rolled bodies (they post through their own
-/// dispatchers rather than through that helper). Spelling is pinned against
-/// those sources by `tests::the_drift_shim_list_is_spelled_the_way_the_shims_spell_it`.
+/// Every entry is a literal one of this crate's own reporters sends. It used to
+/// be a list of shim binaries — `context_hook::report_contract_drift`'s first
+/// argument at four call sites, plus the two beacons' hand-rolled bodies — and
+/// every one of those files is now deleted, so the names are defined in
+/// `harness::claude::hook` and sent by its routes' handlers. Spelling is pinned
+/// against that source by
+/// `tests::the_drift_shim_list_is_spelled_the_way_the_shims_spell_it`.
 ///
 /// Drift here fails SAFE in both directions: an unlisted shim shares the
 /// sentinel bucket (fewer rows, never more), and a listed name no shim sends is
 /// a bucket nothing ever claims.
 ///
-/// `checkpoint_beacon` was missing when V33 Phase F landed — it ships a shim
-/// that reports drift under its own name, so its reports were folding into
+/// `checkpoint_beacon` was missing when V33 Phase F landed — it shipped a shim
+/// that reported drift under its own name, so its reports were folding into
 /// [`DRIFT_SHIM_UNKNOWN`] alongside genuinely forged names and sharing that
 /// bucket's doubling counter. Fail-safe, as documented, but it meant the newest
 /// shim's payload drift was the one hardest to see.
-const DRIFT_SHIMS: [&str; 9] = [
+///
+/// **2026-08-17: no shim binary sends any of these any more** — the last two
+/// (`taint_beacon`, `checkpoint_beacon`) became `type: "http"` routes whose
+/// checks run in-process, exactly as Phase J did to the other four. The names are
+/// unchanged for the reason they were unchanged then: a tab open across the
+/// upgrade still runs the old binary and still POSTs these strings over the wire,
+/// so both paths must land in ONE bucket per capability.
+const DRIFT_SHIMS: [&str; 10] = [
     "checkpoint_beacon",
     "compact_hook",
     "context_hook",
     "notify_hook",
+    // 2026-08-17: the auto-check route's token, closing V35 Phase A finding 2 —
+    // the one converted hook that reported no payload drift at all, so a matcher
+    // or field rename killed its diagnostics with nothing firing anywhere.
+    // Deliberately NOT the never-shipped `postedit_hook` spelling; see
+    // `claude_hook::DRIFT_POST_EDIT_HOOK`.
+    "post_edit_hook",
     "read_hook",
     // V35 Phase L's three. They name no shim binary — there never was one — but
     // they occupy the same key space for the same reason: one ledger bucket per
@@ -6496,7 +6536,8 @@ async fn handle_session_hello(
 
 // ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──────
 //
-// Six routes under `/claude/hook/`, replacing five shim binaries. Each one
+// Twelve routes under `/claude/hook/`, replacing seven shim binaries (five in
+// Phase J, the two beacons on 2026-08-17) plus five that replaced nothing. Each one
 // parses Claude's hook-input JSON, reports payload drift under the SAME shim
 // token the deleted binary used, builds the CHP body its legacy sibling
 // receives, calls the SAME internal core, and answers with Claude hook-output
@@ -7454,6 +7495,192 @@ async fn handle_claude_subagent(
             "claude sub-agent lifecycle push"
         );
     }
+    write_json(stream, 200, &no_op).await
+}
+
+/// `POST /claude/hook/post_tool_use_failure` — the all-tools
+/// `PostToolUseFailure` entry, sized (2026-08-17).
+///
+/// **Why this route exists at all:** `PostToolUse` fires only when a tool
+/// SUCCEEDS, so before this entry a failed tool result reached cImp only through
+/// the transcript tail — which [`tool_result_core`]'s own arbitration switches
+/// OFF for a tab that serves `session.tool_result`. Every failed result's size
+/// was therefore lost on exactly the tabs the push path serves, and a failing
+/// `Bash` returns as much text as a succeeding one.
+///
+/// **The same core, the same capability, the same arbitration.** It feeds
+/// [`tool_result_core`], which asks `chp::served(.., EV_SESSION_TOOL_RESULT)` —
+/// the capability whose reader tap is suppressed. The overlay emits this entry
+/// from the same boolean as the success entry, so the pair is declared together
+/// and exactly one path counts each result.
+///
+/// **`is_error`, and what "treated as errored" means here.** The transcript
+/// reader keeps two readers over one block (`claude.transcript.tool_result`):
+/// `extract_tool_results` sizes every result *including* failures and never looks
+/// at `is_error`, while `tool_result_is_error` exists solely to keep a FAILED
+/// result from being mined for commit hashes by the session→commit provenance
+/// tap. This handler mirrors both halves — the first by construction (the same
+/// sizing function, so a failure counts exactly as the reader counted it), the
+/// second **structurally**: the push path carries a character count and never the
+/// result text, and provenance is mined only in `harness::claude::read`'s
+/// `record_commit_events`, which is not arbitrated and reads the transcript
+/// directly. There is nothing here for a failed result to leak into.
+async fn handle_claude_tool_failure(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_POST_TOOL_USE_FAILURE;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        let cwd = claude_hook_cwd(app, &settings, Some(tab.as_str()), &input.cwd);
+        // The ERROR text is what a failed tool returned, and it is what the
+        // transcript reader sizes for the same call — through this same
+        // function, so the two paths produce the same number.
+        let chars =
+            u32::try_from(claude_hook::tool_result_chars(&input.error)).unwrap_or(u32::MAX);
+        let recorded = tool_result_core(
+            app,
+            "claude",
+            &tab,
+            cwd.as_deref(),
+            &input.session_id,
+            input.tool_name.clone(),
+            chars,
+        );
+        debug!(
+            target: "offload",
+            %tab,
+            tool = %bounded_id(input.tool_name.as_deref().unwrap_or("")),
+            chars,
+            recorded,
+            "claude failed tool result pushed"
+        );
+    }
+    write_json(stream, 200, &no_op).await
+}
+
+/// `POST /claude/hook/pre_tool_use_taint` — the V32 taint beacon, as an http
+/// hook (2026-08-17; was `cimp --taint-beacon`).
+///
+/// Reaches [`latch_beacon_core`], the same core `/latch/beacon` reaches, so the
+/// engagement, the row it writes and the #45 narrowing are one implementation.
+///
+/// **Report-only, and now structurally so.** A `PreToolUse` hook denies only by
+/// answering 2xx with a `permissionDecision`; this handler answers
+/// [`claude_hook::no_op`] on every path including a rejected tab, so locked
+/// decision 14 ("sensor mode must never break a tab") no longer rests on the
+/// undocumented question of what a timed-out command hook does — a timeout, a
+/// refused connection and a non-2xx are all documented as non-blocking, and this
+/// route emits no decision field to be non-blocking *about*.
+async fn handle_claude_taint_beacon(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_PRE_TOOL_USE_TAINT;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    // The tool name is reported verbatim (bounded) so the row and the log name
+    // the tool the harness actually ran; an empty one still engages the latch —
+    // the beacon fired, and the app labels it rather than dropping the
+    // engagement, exactly as the shim did.
+    let tool = bounded_tool(input.tool_name.as_deref());
+    match latch_beacon_core(
+        latches(),
+        app,
+        &settings,
+        "claude",
+        req.cimp.tab.as_deref(),
+        &tool,
+    ) {
+        Ok(view) => debug!(
+            target: "offload",
+            tab = %bounded_id(req.cimp.tab.as_deref().unwrap_or("")),
+            %tool,
+            latch = %view.latch,
+            "claude taint beacon"
+        ),
+        Err(tab) => warn!(
+            target: "offload",
+            tab = %tab,
+            %tool,
+            "loopback: a Claude taint beacon named no configured tab — nothing engaged"
+        ),
+    }
+    write_json(stream, 200, &no_op).await
+}
+
+/// `POST /claude/hook/pre_tool_use_checkpoint` — the V33 pre-mutation
+/// checkpoint, as an http hook (2026-08-17; was `cimp --checkpoint-beacon`).
+///
+/// Reaches [`tool_checkpoint_core`], the same core `/workbench/tool_checkpoint`
+/// reaches — including the `mutates_fs` re-check, which is the authority the
+/// spawn-time matcher is only a pre-filter for.
+///
+/// **This handler finishes its work before it answers, and that is the feature.**
+/// A `PreToolUse` http hook blocks the tool call until the response — the
+/// documented mechanism that makes `permissionDecision: "deny"` expressible —
+/// so awaiting the snapshot here is what makes "the checkpoint precedes the
+/// call" exact rather than best-effort. The deleted shim achieved the same thing
+/// from the outside, by reading its reply with a 2 s deadline and relying on
+/// Claude not starting the tool until the process exited; that ordering was
+/// **undocumented**, which is why the row was Tier D and is why this migration
+/// is the row's closing condition rather than a tidy-up.
+///
+/// The wait stays bounded by the app's own [`TOOL_CHECKPOINT_BUDGET`] (1800 ms),
+/// under the entry's pinned 5 s ceiling: past the budget the snapshot is
+/// abandoned unwritten and the miss is surfaced as its own Activity event
+/// (`workbench` / `checkpoint_missed`), because a checkpoint that might contain
+/// the change it claims to predate silently misleads a restore.
+async fn handle_claude_checkpoint(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    report_hook_drift(route, &input);
+    // An empty tool name is the one field this cannot proceed without: the core
+    // resolves it against the class table and a checkpoint attributed to
+    // `claude:` would be a row that names no call. The drift report above has
+    // already fired.
+    let tool = input.tool_name.as_deref().map(str::trim).unwrap_or("");
+    if tool.is_empty() {
+        return write_json(stream, 200, &no_op).await;
+    }
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let checkpointed = tool_checkpoint_core(
+        app,
+        &settings,
+        Some("claude"),
+        tool,
+        cwd.as_deref(),
+        Some(input.session_id.as_str()),
+        tab.as_deref(),
+    )
+    .await;
+    debug!(
+        target: "offload",
+        tab = %bounded_id(tab.as_deref().unwrap_or("")),
+        tool = %bounded_id(tool),
+        checkpointed,
+        "claude pre-mutation checkpoint"
+    );
     write_json(stream, 200, &no_op).await
 }
 
@@ -9028,10 +9255,14 @@ async fn handle_mcp_call(
 
 /// A `POST /latch/beacon` body — V32 Phase F (locked decision 14).
 ///
-/// Posted by the `cimp --taint-beacon` Claude `PreToolUse` shim and by the
-/// OpenCode plugin's `tool.execute.before` handler when the model reaches for a
-/// HARNESS-NATIVE web tool. Every field except `tab` is descriptive; `tab` is
-/// the only one the latch actually needs.
+/// Posted by the OpenCode plugin's `tool.execute.before` handler when the model
+/// reaches for a HARNESS-NATIVE web tool — and, until 2026-08-17, by the
+/// `cimp --taint-beacon` Claude shim, which a tab open across that upgrade may
+/// still be running. Claude's current path is
+/// [`claude_hook::ROUTE_PRE_TOOL_USE_TAINT`], whose handler carries Claude's own
+/// hook payload and reaches [`latch_beacon_core`] directly rather than through
+/// this body. Every field except `tab` is descriptive; `tab` is the only one the
+/// latch actually needs.
 #[derive(Deserialize)]
 struct LatchBeaconBody {
     /// The cImp tab id the reporting harness was spawned for. Absent ⇒
@@ -9129,39 +9360,67 @@ async fn handle_latch_beacon(
     // #48: the check reads the SAME resolution the scope does, rather than a
     // second `is_configured_tab` call beside it — two spellings of one rule are
     // two things to keep in step.
-    let scoping = latch_scope(app, &settings, agent, body.tab.as_deref());
     let tool = bounded_tool(body.tool.as_deref());
-    if let LatchScoping::Unknown(tab) = &scoping {
-        warn!(
-            target: "offload",
-            agent,
-            tab = %tab,
-            tool = %tool,
-            "loopback: /latch/beacon rejected — not a configured tab id"
-        );
-        let r = RunResult {
-            ok: false,
-            text: None,
-            error: Some(format!(
-                "unknown tab id {tab:?} — /latch/beacon accepts configured AI tabs only"
-            )),
-        };
-        return write_json(stream, 400, &r).await;
+    match latch_beacon_core(latches(), app, &settings, agent, body.tab.as_deref(), &tool) {
+        Ok(view) => write_json(stream, 200, &serde_json::json!({ "ok": true, "latch": view })).await,
+        Err(tab) => {
+            warn!(
+                target: "offload",
+                agent,
+                tab = %tab,
+                tool = %tool,
+                "loopback: /latch/beacon rejected — not a configured tab id"
+            );
+            let r = RunResult {
+                ok: false,
+                text: None,
+                error: Some(format!(
+                    "unknown tab id {tab:?} — /latch/beacon accepts configured AI tabs only"
+                )),
+            };
+            write_json(stream, 400, &r).await
+        }
+    }
+}
+
+/// **The taint engagement itself** — the core both fire seams reach: this
+/// route's harness-neutral body (the OpenCode plugin) and
+/// [`claude_hook::ROUTE_PRE_TOOL_USE_TAINT`]'s Claude hook payload.
+///
+/// Split out on 2026-08-17, when the Claude side stopped being a shim POSTing to
+/// the route and became a handler beside it. One core, so the two transports
+/// cannot come to disagree about the #45 narrowing, the policy resolution, the
+/// provenance or the row the engagement writes.
+///
+/// `Err(tab)` is the ONE case the two callers answer differently — the id names
+/// no configured AI tab — and it is returned rather than handled here because
+/// this route 400s a caller that will never read it while a Claude hook must
+/// answer `{}` on every path (a `PreToolUse` non-2xx is a non-blocking error the
+/// harness logs, and there is nothing to log about a hook with nothing to say).
+/// Either way nothing is engaged and no registry entry is created, which is #45's
+/// bound.
+fn latch_beacon_core(
+    reg: &LatchRegistry,
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    agent: &'static str,
+    tab: Option<&str>,
+    tool: &str,
+) -> Result<LatchView, String> {
+    let scoping = latch_scope(app, settings, agent, tab);
+    if let LatchScoping::Unknown(tab) = scoping {
+        return Err(tab);
     }
     let scope = scoping.scope();
-    let policy = GatePolicy::resolve(&settings, scope);
-    // `CallProvenance::http()`: this route is a loopback POST from a local
-    // process, and the contamination row it may write has to say so for the
-    // same reason the beacon row does — the launch token is readable by
-    // anything running as this user (#45).
-    let out = latches().beacon(scope, &tool, policy, CallProvenance::http());
-    report_beacon(scope, outbound::Origin::Http, &tool, &out);
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({ "ok": true, "latch": out.view }),
-    )
-    .await
+    let policy = GatePolicy::resolve(settings, scope);
+    // `CallProvenance::http()`: both seams are a loopback POST from a local
+    // process (a Claude hook's POST is the harness's, which is no better), and
+    // the contamination row this may write has to say so for the same reason the
+    // beacon row does — the launch token is readable by anything running as this
+    // user (#45).
+    let out = reg.beacon(scope, tool, policy, CallProvenance::http());
+    report_beacon(scope, outbound::Origin::Http, tool, &out);
+    Ok(out.view)
 }
 
 /// Write the [`Screen::LatchBeacon`](outbound::Screen) row for one beacon, if
@@ -9286,7 +9545,7 @@ fn beacon_row(origin: outbound::Origin, tool: &str, out: &BeaconOutcome) -> Flag
         detail: format!(
             "NATIVE-WEB BEACON ({tool}, origin: {}): the harness's own web tool is about to run, \
              {what} (latch={}, contaminated={}). This row records an authenticated POST to \
-             /latch/beacon from a local process — the cImp beacon shim is the expected sender, \
+             /latch/beacon from a local process — a cImp-generated artifact is the expected sender, \
              but the launch token is readable by anything running as this user, so this is NOT \
              evidence of a user action. This route only ever TIGHTENS: it cannot unlatch and it \
              cannot clear the contamination flag. Clearing that is a user action in cImp's own UI \
@@ -11033,16 +11292,18 @@ mod tests {
     fn the_drift_shim_list_is_spelled_the_way_the_shims_spell_it() {
         const CLAUDE_HOOK: &str = include_str!("../harness/claude/hook.rs");
         for (shim, src) in [
-            ("checkpoint_beacon", include_str!("../checkpoint_beacon.rs")),
+            // 2026-08-17: the last two shim FILES are gone, so every reporter is
+            // now defined in the one module and the route join below is what
+            // proves each name is actually reachable. The two beacon tokens are
+            // unchanged, so a pre-upgrade tab's own binary still lands here.
+            ("checkpoint_beacon", CLAUDE_HOOK),
             ("compact_hook", CLAUDE_HOOK),
             ("context_hook", CLAUDE_HOOK),
             ("notify_hook", CLAUDE_HOOK),
+            ("post_edit_hook", CLAUDE_HOOK),
             ("read_hook", CLAUDE_HOOK),
-            ("taint_beacon", include_str!("../taint_beacon.rs")),
-            // V35 Phase L's three. They name no binary, so the "is this the
-            // name that module sends" half checks the module that DEFINES them,
-            // which is the same file — and the route join below is what proves
-            // each one is actually reachable.
+            ("taint_beacon", CLAUDE_HOOK),
+            // V35 Phase L's three. They name no binary either.
             ("stop_hook", CLAUDE_HOOK),
             ("subagent_hook", CLAUDE_HOOK),
             ("tool_result_hook", CLAUDE_HOOK),
@@ -11068,11 +11329,16 @@ mod tests {
         }
         assert_eq!(
             DRIFT_SHIMS.len(),
-            9,
+            10,
             "a new reporter needs BOTH an entry here and its source pinned in the \
              loop above — otherwise its reports fold into the unrecognized-shim \
              bucket and nothing fails"
         );
+        // The never-shipped shim spelling must stay unclaimed: `postedit_hook` is
+        // the name the deleted `--postedit-hook` binary WOULD have reported under
+        // had it ever reported, and nothing can be carrying it.
+        assert!(!DRIFT_SHIMS.contains(&"postedit_hook"));
+        assert_eq!(drift_shim_key("postedit_hook"), DRIFT_SHIM_UNKNOWN);
         // V35 Phase L: every event whose SILENCE is reportable resolves to a
         // token in this list. Without this a quiet report would be filed under
         // the unrecognized-shim bucket, i.e. attributed to nothing.
@@ -11322,17 +11588,21 @@ mod tests {
     }
 
     /// **The hard constraint, as behaviour rather than a source scan for a call
-    /// that is not there.** The report must never appear on the hook shims'
-    /// resolution path: `taint_beacon`'s entire safety argument is that it
-    /// writes nothing to stdout or stderr and awaits nothing, and it reaches
-    /// discovery through `read_discovery_for`, not through `proxy_base_for`.
+    /// that is not there.** `read_discovery_for` resolves an endpoint and sends
+    /// NOTHING of its own; only `proxy_base_for`, one frame up, may file the
+    /// skipped-candidate report.
     ///
-    /// A `grep` for `dispatch(` in `taint_beacon.rs` would stay green while a
-    /// refactor moved the POST one frame down into the shared resolver. The
-    /// socket assertion would not.
+    /// **The callers that made this load-bearing are gone** — the two beacon
+    /// shims, deleted 2026-08-17, whose entire safety argument was that they
+    /// wrote nothing and awaited nothing on a tool call's path. The property is
+    /// kept rather than retired for two reasons: the split is what `proxy_base_for`
+    /// documents about itself, and the silent resolver is exactly what a future
+    /// fire-and-forget caller would reach for. A `grep` for a call that is not
+    /// there would stay green while a refactor moved the POST down into the
+    /// shared resolver; the socket assertion would not.
     #[test]
     fn the_discovery_report_never_reaches_the_hook_shims_path() {
-        // The shims' own resolution shape, against a real socket: one probe, and
+        // The silent resolver's shape, against a real socket: one probe, and
         // nothing else, ever leaves this path.
         let (port, seen) = recording_instance("tok-shim");
         let live = Discovery {
@@ -11365,8 +11635,9 @@ mod tests {
         );
         assert!(
             !top_level_fn(src, "pub fn read_discovery_for(").contains("report_skipped_to_app"),
-            "the shims call `read_discovery_for`; a report there is a write and a \
-             wait inside `taint_beacon`"
+            "a report inside `read_discovery_for` is a write and a wait inside every \
+             fire-and-forget caller of it — the shape the deleted beacon shims could \
+             not survive, and the reason this resolver stays silent"
         );
         // The production ledger really is what the route claims: the process-wide
         // doubling map, not a per-call one that would bound nothing.
@@ -15524,9 +15795,10 @@ mod tests {
         assert!(!reg.snapshot()[0].view.contaminated);
     }
 
-    /// The two Phase F request bodies parse the shapes the beacon shim and the
-    /// plugin actually send, and fail open on a missing tab exactly like
-    /// `/graph_run` and `/mcp/call` do.
+    /// The two Phase F request bodies parse the shapes their senders actually
+    /// send — the OpenCode plugin, and (until 2026-08-17) the Claude beacon shim,
+    /// which a tab open across that upgrade may still be running — and fail open
+    /// on a missing tab exactly like `/graph_run` and `/mcp/call` do.
     #[test]
     fn phase_f_bodies_parse_the_shapes_the_reporters_send() {
         let claude: LatchBeaconBody = serde_json::from_slice(
@@ -16917,6 +17189,43 @@ mod tests {
             ),
         ),
         route(
+            "/claude/hook/post_tool_use_failure",
+            "POST",
+            "handle_claude_tool_failure",
+            Containment::NoRegistry(
+                "the errored half of /session/tool_result; sizes an error string, runs nothing",
+            ),
+        ),
+        // ── 2026-08-17: the two migrated beacons ─────────────────────────────
+        //
+        // Each declares the SAME containment as the harness-neutral route it
+        // shares a core with, and the test below checks that against the
+        // handler's own source — so the two transports cannot come to gate
+        // differently, which is the only way a migration like this could
+        // introduce a containment hole.
+        route(
+            "/claude/hook/pre_tool_use_taint",
+            "POST",
+            "handle_claude_taint_beacon",
+            Containment::RegistryNoGate(
+                "engages the EXTERNAL latch for a harness-native web tool; it can only tighten",
+            ),
+        ),
+        route(
+            "/claude/hook/pre_tool_use_checkpoint",
+            "POST",
+            "handle_claude_checkpoint",
+            // `/workbench/tool_checkpoint`'s answer, for its reasons: it
+            // snapshots the work tree into cImp's own shadow repo, returns no
+            // local data and grants no capability, so a latch would have nothing
+            // to refuse — while a refusal would remove checkpoints from the tab
+            // most likely to need a rewind.
+            Containment::NoRegistry(
+                "snapshots the work tree into cImp's own shadow repo; returns no local data \
+                 and grants no capability",
+            ),
+        ),
+        route(
             "/mcp/list",
             "POST",
             "handle_mcp_list",
@@ -17751,6 +18060,25 @@ mod tests {
                 "permission_signal(",
                 ["handle_permission_event", "handle_claude_notification"],
             ),
+            // 2026-08-17: the two migrated beacons. Their cores were extracted
+            // from the routes' own handlers in the same change, which is what
+            // makes the migration a relocation — the `mutates_fs` re-check, the
+            // #45 narrowing, the deadline and the row each engagement writes are
+            // one implementation with two envelopes.
+            (
+                "latch_beacon_core(",
+                ["handle_latch_beacon", "handle_claude_taint_beacon"],
+            ),
+            (
+                "tool_checkpoint_core(",
+                ["handle_tool_checkpoint", "handle_claude_checkpoint"],
+            ),
+            // …and the two halves of the tool-result push: success and failure
+            // are ONE capability, so they must not grow two accountings.
+            (
+                "tool_result_core(",
+                ["handle_claude_tool_result", "handle_claude_tool_failure"],
+            ),
         ] {
             for h in handlers {
                 assert!(
@@ -17773,6 +18101,76 @@ mod tests {
                 "`{h}` must gate in its own body"
             );
         }
+    }
+
+    /// **The two-timer relationship the pre-tool checkpoint rests on**, restated
+    /// after the 2026-08-17 migration moved the outer timer.
+    ///
+    /// It used to be `checkpoint_beacon::REPLY_TIMEOUT > TOOL_CHECKPOINT_BUDGET`:
+    /// the shim had to keep listening for longer than the app took to give up, or
+    /// Claude would start the tool while the app was still staging into it. The
+    /// shim is gone and the outer timer is now the harness's own — the hook
+    /// entry's pinned `timeout` — so the same ordering has to hold against
+    /// that number instead. Nothing but this assertion keeps the two constants
+    /// (different files, different layers) in the right order.
+    ///
+    /// The second half is the other side of the argument: every OTHER route keeps
+    /// the 1 s budget, so this exception cannot quietly widen into "hooks may
+    /// take five seconds".
+    #[test]
+    fn the_checkpoint_hooks_ceiling_sits_above_the_apps_own_budget() {
+        let ceiling = Duration::from_secs(claude_hook::TIMEOUT_CHECKPOINT_SECS);
+        assert!(
+            ceiling > TOOL_CHECKPOINT_BUDGET,
+            "the harness must not stop waiting before the app answers, or an abandoned \
+             snapshot and a still-running one become indistinguishable to Claude: \
+             {ceiling:?} vs {TOOL_CHECKPOINT_BUDGET:?}"
+        );
+        assert_eq!(
+            claude_hook::timeout_secs(claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT),
+            claude_hook::TIMEOUT_CHECKPOINT_SECS
+        );
+        assert_eq!(
+            claude_hook::timeout_secs(claude_hook::ROUTE_PRE_TOOL_USE_TAINT),
+            claude_hook::TIMEOUT_SECS,
+            "the sensor has nothing to wait for and must not inherit the checkpoint's ceiling"
+        );
+    }
+
+    /// **A failed tool result is sized, counted, and never mined.**
+    ///
+    /// The transcript reader keeps two readers over one `tool_result` block:
+    /// `extract_tool_results` sizes every result including failures and never
+    /// looks at `is_error`, while `tool_result_is_error` exists solely to keep a
+    /// failed result out of the session→commit provenance tap. The push path has
+    /// to mirror both, and the second one it mirrors *structurally* — it carries
+    /// a `u32` and never the text — which is exactly the kind of claim that rots
+    /// silently if a later change starts forwarding the error string.
+    ///
+    /// Asserted on the handler's source because the property is an ABSENCE, and
+    /// an absence has no call to observe.
+    #[test]
+    fn a_failed_tool_result_is_counted_but_never_reaches_provenance() {
+        let src = include_str!("loopback.rs");
+        let body = handler_body(src, "handle_claude_tool_failure");
+        assert!(
+            body.contains("tool_result_core("),
+            "the failure half must feed the same accounting as the success half"
+        );
+        for forbidden in ["record_commit", "session_commit", "parse_commit_hashes"] {
+            assert!(
+                !body.contains(forbidden),
+                "the failure handler reaches `{forbidden}` — a failed tool's output must \
+                 never be mined for commit hashes (`tool_result_is_error`'s whole purpose)"
+            );
+        }
+        // …and what it sizes is the `error` field, through the transcript
+        // reader's own sizing function rather than a second implementation.
+        assert!(
+            body.contains("claude_hook::tool_result_chars(&input.error)"),
+            "the error must be sized by the function the reader sizes a failed \
+             result's content with, or the two paths report different numbers"
+        );
     }
 
     /// The dispatch arms spell the same paths `claude_hook` exports.

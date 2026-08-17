@@ -133,7 +133,7 @@ pub(crate) fn write_opencode_plugin(working_dir: &Path, settings: &Settings, tab
             native_gate: opencode_native_gate_for(settings, tab),
             // V33 Phase F: the app-wide checkpoint switch, the same one
             // `WorkbenchService::checkpoints_enabled` reads and the same one
-            // that gates the Claude `--checkpoint-beacon` hook. No graph
+            // that gates Claude's pre-mutation checkpoint hook. No graph
             // dependency — `/workbench/tool_checkpoint` is Workbench's own
             // route, unlike the `/context/retrieve` prompt tap which carries
             // checkpointing as a passenger on a graph feature.

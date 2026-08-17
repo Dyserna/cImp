@@ -198,17 +198,20 @@ pub const RULE_DRIFT_HOOK_SILENT: &str = "drift.read_hook_silent.v1";
 pub const RULE_DRIFT_INJECTION_UNSEEN: &str = "drift.injection_unseen.v1";
 /// Evidence for `claude.transcript.usage`.
 pub const RULE_DRIFT_USAGE_FIELDS: &str = "drift.usage_fields_gone.v1";
-/// Evidence for whichever capability's shim reported the malformed payload —
-/// four rows name this rule, and `contract::capability_for_payload_shim`
-/// resolves each report to exactly one of them through `wired_in`.
+/// Evidence for whichever capability reported the malformed payload — several
+/// rows name this rule, and `contract::capability_for_payload_shim` resolves each
+/// report to exactly one of them through the `drift_token` column.
 ///
-/// Also, uniquely, still a **notice id in its own right**: `taint_beacon` and
-/// `checkpoint_beacon` report through the same route and have no registry row,
-/// so their reports keep this un-consolidated channel rather than being
-/// mis-attributed. A report the matrix cannot place is a real signal about a
-/// shim the matrix does not cover, and dropping it to satisfy a
-/// one-notice-source count would be exactly the "computed then discarded"
-/// failure this milestone exists to remove.
+/// Also, uniquely, still a **notice id in its own right**, and the reason has
+/// narrowed rather than gone away. It used to be the two beacons: they reported
+/// through this route and had no registry row, so their reports could not be
+/// attributed. V35 Phase I gave them rows and 2026-08-17 closed the last
+/// unattributed reporter (the auto-check route, now `post_edit_hook`), so what
+/// remains in the un-consolidated channel is a shim name **nobody declared** — a
+/// forged one, or a future reporter added without a registry row. A report the
+/// matrix cannot place is a real signal about a reporter the matrix does not
+/// cover, and dropping it to satisfy a one-notice-source count would be exactly
+/// the "computed then discarded" failure this milestone exists to remove.
 pub const RULE_DRIFT_PAYLOAD: &str = "drift.payload.v1";
 /// Evidence for `claude.hook.pretooluse_deny`.
 pub const RULE_DRIFT_READ_BYPASS: &str = "drift.read_bypass.v1";

@@ -66,19 +66,12 @@ pub fn launch_command() -> Option<String> {
     Some(format!("{} --statusline", shell_safe_path(&exe)))
 }
 
-/// V11: the `command` string for a Claude hook shim re-invoking this binary with
-/// `flag`, shell-safe like [`launch_command`]. `None` when `current_exe()` can't
-/// be resolved.
-///
-/// **Two callers left after V35 Phase J** — `--taint-beacon` and
-/// `--checkpoint-beacon`, the only Claude hooks that are still separate
-/// binaries. The five that used to use this (and `context_hook_command`, deleted
-/// with them) are now `type: "http"` entries pointing at the loopback, so they
-/// need no command string at all.
-pub fn hook_command(flag: &str) -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    Some(format!("{} {flag}", shell_safe_path(&exe)))
-}
+// `hook_command` (V11) built the `command` string for a Claude hook shim
+// re-invoking this binary with a flag. Its last two callers — `--taint-beacon`
+// and `--checkpoint-beacon` — became `type: "http"` entries on 2026-08-17, so
+// **no Claude hook is a command any more** and the only shell-quoted path cImp
+// still emits is the status line's. [`launch_command`] keeps that job; the
+// quoting rules below are unchanged and are still all about it.
 
 /// Render an executable path so it survives whichever shell Claude Code
 /// uses to run the status line command. Forward slashes always (Git Bash

@@ -46,6 +46,22 @@
 # then read `git diff` on these files before committing. An unexplained golden
 # diff in a review is a change to a security control.
 #
+# ── Regenerations, in order ─────────────────────────────────────────────────
+#
+# The four keys at the bottom record where these bytes CAME FROM. Every
+# deliberate re-bless since is listed here, so the file's provenance stays true
+# without rewriting its origin:
+#
+#   2026-08-17  Two lines in each file: `CIMP_NATIVE_LOCAL_TOOLS` gained
+#               "execute" and "lsp", `CIMP_MUTATING_TOOLS` gained "execute".
+#               Cause: `harness::opencode::tools::OPENCODE_NATIVE_TABLE`
+#               classified the three experiment-gated upstream tool ids
+#               (`execute` runs arbitrary code ⇒ `bash`'s posture; `lsp` reads
+#               project data ⇒ local, non-mutating; `plan_exit` reviewed and
+#               deliberately ungated). This IS a change to a security control —
+#               the Phase H gate and the Phase F checkpoint set both widened —
+#               and the reviewable diff is exactly those six lines.
+#
 # ── Not part of the harness fixture corpus ──────────────────────────────────
 #
 # Deliberately a sibling of `fixtures/harness/` rather than a directory inside

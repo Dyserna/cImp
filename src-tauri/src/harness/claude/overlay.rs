@@ -31,25 +31,29 @@ use crate::tabs::config::{
 /// The Claude `PreToolUse` matcher and the OpenCode tool names for the two
 /// harness-native web tools, in one reviewed place.
 ///
-/// The matcher is deliberately NARROW. A `PreToolUse` hook costs a process
-/// spawn per matched call, so a wide (or empty) matcher would tax every
-/// `Read`/`Grep`/`Bash` in the session for a signal only the web tools can
-/// produce — which is also why the E1 latency spike is irrelevant to this
-/// phase (see the milestone's Phase E note).
+/// The matcher is deliberately NARROW. It cost a process spawn per matched call
+/// until the 2026-08-17 http migration and now costs a loopback POST, but the
+/// reasoning is unchanged and is not really about the cost: a wide (or empty)
+/// matcher would put cImp on the path of every `Read`/`Grep`/`Bash` in the
+/// session for a signal only the web tools can produce. What the migration did
+/// change is the *shape* of the tax — no `CreateProcess`, no discovery-file read
+/// per call — which is also why the E1 latency spike is irrelevant here (see the
+/// milestone's Phase E note).
 pub(crate) const CLAUDE_WEB_TOOL_MATCHER: &str = "WebFetch|WebSearch";
 
 /// **V33 Phase F**: the Claude `PreToolUse` matcher for the harness-native
 /// tools that can change files on disk — the pre-mutation checkpoint's fire
 /// set.
 ///
-/// Narrow for the same reason [`CLAUDE_WEB_TOOL_MATCHER`] is (a process spawn
-/// per matched call), and it is **not** the authority: the app-side
-/// `/workbench/tool_checkpoint` route re-resolves every name against
-/// `toolclass::TABLE`'s `mutates_fs` column, so this string only decides what
-/// costs a spawn. `checkpoint_beacon`'s
-/// `every_matched_claude_tool_is_classified_as_mutating` pins the one direction
-/// that matters — every name here has a `mutates_fs: true` row, so no spawn is
-/// wasted on a call the route will decline.
+/// Narrow for the same reason [`CLAUDE_WEB_TOOL_MATCHER`] is, and it is **not**
+/// the authority: the checkpoint core re-resolves every name against
+/// `toolclass::TABLE`'s `mutates_fs` column, so this string only decides which
+/// calls cImp is asked about. [`tests::every_matched_claude_tool_is_classified_as_mutating`]
+/// pins the one direction that matters — every name here has a
+/// `mutates_fs: true` row, so no call is *held* for a checkpoint the core will
+/// decline. That mattered when a mismatch cost a wasted process spawn; since the
+/// 2026-08-17 migration it matters more, because this entry's handler blocks the
+/// tool call while it runs.
 ///
 /// `MultiEdit` is in the set and got its `TABLE` row in the same change; `Bash`
 /// is in it because a shell command is the widest mutation surface Claude has,
@@ -79,9 +83,14 @@ struct ClaudeHookFlags {
     read_advisor: bool,
     post_edit: bool,
     notify: bool,
-    /// The two surviving COMMAND hooks. They are part of what this overlay
-    /// wired, so they belong in the declaration even though they are not
-    /// `type: "http"` — `serves` describes the tab's L1, not one transport.
+    /// The two beacons. `type: "http"` like everything else since 2026-08-17 —
+    /// this comment used to explain why two COMMAND hooks still belonged in a
+    /// declaration about `type: "http"` entries, and the answer (`serves`
+    /// describes the tab's L1, not one transport) is now simply unexercised.
+    ///
+    /// `checkpoint` additionally decides whether the tab has an entry whose
+    /// handler BLOCKS the tool call while it works, which is the one place in
+    /// this overlay where a `serves` claim is also a latency claim.
     taint_beacon: bool,
     checkpoint: bool,
     /// V35 Phase L: the three read-path pushes. Each is what turns its
@@ -364,6 +373,17 @@ pub(crate) fn build_pre_args(
             let stop_hook = settings.loopback_needed();
             let tool_result_hook = settings.graph.enabled && settings.loopback_needed();
             let subagent_hook = settings.loopback_needed();
+            // ── 2026-08-17: the two migrated beacons ────────────────────────
+            //
+            // Hoisted here with the rest, and their gates are unchanged to the
+            // boolean — that is this migration's whole risk posture, exactly as
+            // it was Phase J's. They were previously spelled inline at the two
+            // emission sites AND again in the `ClaudeHookFlags` block below,
+            // which is precisely how an emitted artifact and its own hello come
+            // to disagree; one binding each, read twice.
+            let taint_beacon_hook =
+                native_web == NativeWebVisibility::Sensor && settings.loopback_needed();
+            let checkpoint_hook = settings.workbench.checkpoints && settings.loopback_needed();
             // V32 Phase F: `PreToolUse` now has TWO independent producers (the
             // V11 read advisor and the Phase F web beacon), so its entries
             // accumulate here and are inserted once. Claude Code evaluates every
@@ -414,53 +434,43 @@ pub(crate) fn build_pre_args(
             // `PreToolUse` beacon on the harness's OWN web tools. Claude's
             // `WebFetch`/`WebSearch` never route through cImp, so the proxy
             // latch cannot see them — without this the session can ingest a
-            // hostile page while `/status` still reads `open`. The shim POSTs to
-            // the loopback's `/latch/beacon`, which engages the tab's EXTERNAL
-            // latch exactly as a proxied fetch would.
+            // hostile page while `/status` still reads `open`. It POSTs to
+            // `/claude/hook/pre_tool_use_taint`, whose handler reaches the same
+            // `/latch/beacon` core and engages the tab's EXTERNAL latch exactly
+            // as a proxied fetch would.
             //
-            // Report-only by construction: `--taint-beacon` prints nothing and
-            // always exits 0, and a PreToolUse hook only denies by *saying so*
-            // (exit 2, or a `permissionDecision` verdict on stdout). A dead app,
-            // a bad token or a timeout therefore lets the call proceed — locked
-            // decision 14's "sensor mode must never break a tab".
+            // **`type: "http"` since 2026-08-17** (was `cimp --taint-beacon`,
+            // deleted). Report-only is now structural rather than argued: a
+            // `PreToolUse` hook denies ONLY by answering 2xx with a
+            // `permissionDecision`, and the handler answers `{}` on every path.
+            // A dead app, a rotated token, a non-2xx and a timeout are all
+            // documented as non-blocking — which is locked decision 14's "sensor
+            // mode must never break a tab" resting on a written contract instead
+            // of on the undocumented timeout semantic the shim was built around.
             //
             // GATED ON `loopback_needed()` for the H2 reason the NC-2 hooks are
-            // (see the long note below): the shim's only delivery path is the
-            // loopback, and injecting it without one spawns a process per web
-            // call whose POST has nowhere to land. Consequence, stated honestly:
-            // on an install with offload, graph and Code-Audit-MCP all off there
-            // is no proxy latch to engage either, so the beacon has nothing to
-            // report to — inert, not silently broken.
+            // (see the long note below), and now structurally as well: an http
+            // entry has no endpoint to bake without a running loopback, so
+            // `http_port` is `None` and nothing is emitted. Consequence, stated
+            // honestly: on an install with offload, graph and Code-Audit-MCP all
+            // off there is no proxy latch to engage either, so the beacon has
+            // nothing to report to — inert, not silently broken.
             //
-            // `--tab` is baked in because a hook payload carries no tab identity
-            // (the E2 spike's finding on the OpenCode side applies here too);
-            // the tab id is the key the whole latch registry is built on.
-            if native_web == NativeWebVisibility::Sensor && settings.loopback_needed() {
-                if let Some(command) = crate::statusline::hook_command("--taint-beacon") {
-                    pre_tool_use.push(serde_json::json!({
-                        "matcher": CLAUDE_WEB_TOOL_MATCHER,
-                        "hooks": [ {
-                            "type": "command",
-                            "command": format!("{command} --tab {tab}"),
-                            // An explicit short ceiling (the sibling shims'
-                            // value; the harness default is 600 s) as
-                            // defence-in-depth — NOT as the fail-open
-                            // mechanism. What a TIMED-OUT hook does is
-                            // undocumented: the hooks reference specifies the
-                            // exit-code table and the `timeout` field's unit
-                            // and default, but never says whether a timeout is
-                            // treated as the blocking case or the non-blocking
-                            // one. Decision 14 forbids this hook from being
-                            // able to affect a call, so `--taint-beacon` never
-                            // waits on anything the app controls (it dispatches
-                            // its POST with an 80 ms deadline and never reads
-                            // the reply — see `taint_beacon`'s module doc).
-                            // This ceiling therefore covers only a pathological
-                            // process spawn, and should never be reached.
-                            "timeout": 5
-                        } ]
-                    }));
-                }
+            // The tab id rides `X-CIMP-Tab` (it was `--tab` in argv) because a
+            // hook payload carries no tab identity — the E2 spike's finding —
+            // and the tab id is the key the whole latch registry is built on.
+            if let Some(port) = http_port.filter(|_| taint_beacon_hook) {
+                pre_tool_use.push(serde_json::json!({
+                    "matcher": CLAUDE_WEB_TOOL_MATCHER,
+                    "hooks": [
+                        claude_hook::http_hook_entry(
+                            port,
+                            tab,
+                            claude_hook::ROUTE_PRE_TOOL_USE_TAINT,
+                            None,
+                        )
+                    ]
+                }));
             }
             // V33 Phase F: the THIRD `PreToolUse` producer — a report-only
             // checkpoint beacon on the harness's own MUTATING tools. Claude's
@@ -472,9 +482,7 @@ pub(crate) fn build_pre_args(
             // Gated on `workbench.checkpoints` — the same single switch
             // `WorkbenchService::checkpoints_enabled` reads, so the hook exists
             // exactly when the app would act on it — AND on `loopback_needed()`
-            // for the H2 reason every other shim is (its only delivery path is
-            // the loopback; injecting it without one spawns a process per edit
-            // whose POST has nowhere to land).
+            // for the H2 reason every other entry is.
             //
             // Deliberately NOT also gated on `graph.enabled`, unlike the
             // UserPromptSubmit checkpoint trigger above. That one rides the
@@ -484,42 +492,33 @@ pub(crate) fn build_pre_args(
             // graph would make a checkpoint setting silently depend on an
             // unrelated one.
             //
-            // Report-only by construction: `--checkpoint-beacon` prints nothing
-            // and always exits 0, and a `PreToolUse` hook denies only by saying
-            // so. `--tab` is baked in because the payload names no cImp tab and
-            // an unattributable checkpoint is the one thing this feature must
-            // not write.
-            //
-            // **Unlike `--taint-beacon` above, this shim DOES wait for its
-            // reply** (2026-08-13 amendment): Claude runs the tool the instant
-            // the hook exits, so a shim that did not wait let the app stage the
-            // snapshot *into* the edit it was supposed to precede. The wait is
-            // bounded at 2 s by the shim and at 1.8 s app-side, and the app
+            // **`type: "http"` since 2026-08-17** (was `cimp --checkpoint-beacon`,
+            // deleted), and this is the entry the migration is really about. The
+            // 2026-08-13 amendment made the shim WAIT for the app's reply,
+            // because Claude runs the tool the instant the hook finishes and a
+            // snapshot taken concurrently with the edit is a snapshot of the
+            // damage. That wait is now the handler's own: a `PreToolUse` http
+            // hook blocks the tool call until the response, which is the
+            // documented mechanism that makes `permissionDecision` expressible —
+            // so the ordering the feature's whole claim rests on is upstream's
+            // written contract rather than an observed behaviour. The app still
+            // bounds itself (`loopback::TOOL_CHECKPOINT_BUDGET`, 1800 ms) and
             // abandons an unfinished snapshot rather than writing a row that
-            // might contain the change it claims to predate. See
-            // `checkpoint_beacon`'s module doc — the divergence is deliberate
-            // and must not be "made consistent" with the beacon.
-            if settings.workbench.checkpoints && settings.loopback_needed() {
-                if let Some(command) = crate::statusline::hook_command("--checkpoint-beacon") {
-                    pre_tool_use.push(serde_json::json!({
-                        "matcher": CLAUDE_MUTATING_TOOL_MATCHER,
-                        "hooks": [ {
-                            "type": "command",
-                            "command": format!("{command} --tab {tab}"),
-                            // The siblings' ceiling, and still defence-in-depth
-                            // rather than the fail-open mechanism — but here it
-                            // is a ceiling over a shim that genuinely waits, so
-                            // the margin is what matters: 80 ms connect + 80 ms
-                            // write + a 2 s reply budget is 2.16 s worst case
-                            // against 5 s, asserted by
-                            // `checkpoint_beacon::tests::the_shim_waits_longer_than_the_app_takes_to_give_up`.
-                            // Every failure path (no app, refused connect, 401)
-                            // is still immediate, so only a live-but-slow app
-                            // can spend the budget at all.
-                            "timeout": 5
-                        } ]
-                    }));
-                }
+            // might contain the change it claims to predate; the entry's
+            // `timeout` is 5 s, a backstop over that (see
+            // `claude_hook::TIMEOUT_CHECKPOINT_SECS`).
+            if let Some(port) = http_port.filter(|_| checkpoint_hook) {
+                pre_tool_use.push(serde_json::json!({
+                    "matcher": CLAUDE_MUTATING_TOOL_MATCHER,
+                    "hooks": [
+                        claude_hook::http_hook_entry(
+                            port,
+                            tab,
+                            claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT,
+                            None,
+                        )
+                    ]
+                }));
             }
             // V35 Phase L: `PostToolUse` now has TWO producers, and they are
             // deliberately two ENTRIES pointing at two ROUTES rather than one
@@ -564,6 +563,34 @@ pub(crate) fn build_pre_args(
                 hooks.insert(
                     "PostToolUse".to_string(),
                     serde_json::Value::Array(post_tool_use),
+                );
+            }
+            // 2026-08-17: `PostToolUseFailure` — a SEPARATE hook EVENT upstream
+            // (new since 2.1.63), not a third `PostToolUse` matcher group.
+            // `PostToolUse` fires only when a tool succeeds, so before this
+            // entry a failed tool result reached cImp only through the
+            // transcript tail — which is arbitrated OFF on exactly the tabs that
+            // serve `session.tool_result`. A serving tab therefore lost every
+            // failed result's size, which for a failing `Bash` is as much text
+            // as a succeeding one.
+            //
+            // Gated on the SAME boolean as the success entry, and that coupling
+            // is load-bearing rather than tidy: the reader's tap is suppressed
+            // per CAPABILITY (`session.tool_result`), so an overlay that wired
+            // one entry without the other would either lose failures (as today)
+            // or double-count them. `"matcher": ""` for the same reason the
+            // success entry uses it — sizing is about every tool the model ran.
+            if let Some(port) = http_port.filter(|_| tool_result_hook) {
+                hooks.insert(
+                    "PostToolUseFailure".to_string(),
+                    serde_json::json!([ { "matcher": "", "hooks": [
+                        claude_hook::http_hook_entry(
+                            port,
+                            tab,
+                            claude_hook::ROUTE_POST_TOOL_USE_FAILURE,
+                            None,
+                        )
+                    ] } ]),
                 );
             }
             // V35 Phase L: `Stop` carries `last_assistant_message` — the
@@ -676,9 +703,8 @@ pub(crate) fn build_pre_args(
                         read_advisor: read_hook,
                         post_edit: post_edit_hook,
                         notify: notify_hook,
-                        taint_beacon: native_web == NativeWebVisibility::Sensor
-                            && settings.loopback_needed(),
-                        checkpoint: settings.workbench.checkpoints && settings.loopback_needed(),
+                        taint_beacon: taint_beacon_hook,
+                        checkpoint: checkpoint_hook,
                         stop: stop_hook,
                         tool_result: tool_result_hook,
                         subagent: subagent_hook,
@@ -822,4 +848,34 @@ pub(crate) fn build_pre_args(
     }
 
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every tool the pre-mutation matcher names must be one the checkpoint
+    /// core will accept.**
+    ///
+    /// Moved here from `checkpoint_beacon.rs` when that shim was deleted
+    /// (2026-08-17); the matcher it guards lives in this file, so this is where
+    /// it belongs. The matcher and `toolclass::TABLE` are still edited
+    /// separately, and a matcher naming a tool with no `mutates_fs: true` row now
+    /// costs more than it used to: the entry's handler blocks the tool call, so a
+    /// mismatch means a call held for a checkpoint the core immediately declines
+    /// — a silently dead seam with a latency bill.
+    ///
+    /// The reverse direction is deliberately NOT asserted: `run_command` is
+    /// mutating and is not a Claude tool at all, so the table is legitimately
+    /// wider than the matcher.
+    #[test]
+    fn every_matched_claude_tool_is_classified_as_mutating() {
+        for tool in CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
+            assert!(
+                crate::offload::toolclass::mutates_fs(tool),
+                "`{tool}` is in the PreToolUse matcher but has no `mutates_fs: true` row — \
+                 every matched call would be held for a checkpoint the core refuses"
+            );
+        }
+    }
 }

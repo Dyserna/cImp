@@ -235,8 +235,8 @@ fn harness_literals() -> BTreeSet<String> {
 /// literal, each with the reason and the phase that retires it.
 ///
 /// This list is the point of the test. Before Phase K the answer was "wherever";
-/// now it is these seven files, on purpose, and an eighth needs a line here and
-/// a reviewer.
+/// now it is these five files, on purpose, and a sixth needs a line here and a
+/// reviewer.
 ///
 /// **Checked in both directions**, like [`UPWARD_EXEMPT`] and for the same
 /// reason: [`every_literal_allowlist_entry_is_still_earning_it`] requires each
@@ -250,19 +250,15 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
          `classify_permission_event` reads Claude's `hook_event_name` values because it is the \
          receiving end of the wire — the CHP seam itself, not a consumer above it.",
     ),
-    (
-        "taint_beacon.rs",
-        "V35 Phase J deleted five of Claude's seven command-hook shims; these two survive because \
-         they are report-only side effects with no reply to parse, so `type: \"http\"` bought them \
-         nothing. They read `tool_name` off a Claude payload — genuinely Claude's L1, living \
-         outside `harness/claude/` because they are separate process entry points. Retire with \
-         the beacons themselves, or fold their payload reading into `harness::claude::hook` \
-         (which already serves them `missing_fields`/`resolve_cwd`/`tab_arg`).",
-    ),
-    (
-        "checkpoint_beacon.rs",
-        "The sibling of `taint_beacon.rs` above — same shape, same reason, same follow-up.",
-    ),
+    // TWO MORE entries were deleted here on 2026-08-17, and this time by the
+    // follow-up their reasons named. `taint_beacon.rs` and
+    // `checkpoint_beacon.rs` were Claude's last two command-hook shims, exempted
+    // because they read `tool_name` off a Claude payload from outside
+    // `harness/claude/` — they were separate process entry points. Their reasons
+    // ended "retire with the beacons themselves, or fold their payload reading
+    // into `harness::claude::hook`", and the http migration did both at once: the
+    // payload reading is `claude_hook::contract_checks`, the files are gone, and
+    // the scan is two files wider with nothing to allow.
     (
         "processing/patterns_file.rs",
         "The Claude TUI permission footer (capability `perm.tui_scrape`, Tier D). The regex \
@@ -426,7 +422,7 @@ fn the_literal_scan_reads_the_same_code_on_every_platform() {
 ///
 /// [`UPWARD_EXEMPT`] has had this check since Phase K and it is what caught a
 /// false exemption the moment `executable_text` stopped reading test text; the
-/// literal allowlist had no equivalent, so nine reasons could have rotted
+/// literal allowlist had no equivalent, so its reasons could have rotted
 /// unobserved. An entry that no longer names any harness literal is not harmless:
 /// it exempts the WHOLE file from the scan, so the next feature that puts a
 /// Claude payload read in `graph/index.rs` inherits a pass.

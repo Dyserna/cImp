@@ -1,6 +1,16 @@
 //! V35 Phase J — **Claude Code's L1**: the harness POSTs its own hook payloads
-//! straight at cImp's loopback as `type: "http"` hooks, and the five shim
-//! binaries that used to stand between them are gone.
+//! straight at cImp's loopback as `type: "http"` hooks, and the shim binaries
+//! that used to stand between them are gone.
+//!
+//! **2026-08-17 (Claude Code 2.1.233): the last two went with them.** Phase J
+//! deleted five and left `cimp --taint-beacon` / `cimp --checkpoint-beacon` as
+//! `type: "command"` hooks, because a report-only side effect with no reply to
+//! parse gained nothing from http. What that reasoning missed is that the two
+//! rows were **Tier D** — their fail-open and their ordering were undocumented
+//! behaviours, not contracts — and the http hook contract states both facts in
+//! writing. Migrating them is the D→B move locked decision 2 ranks above new
+//! features, and it is the closing condition both rows' waivers named. See the
+//! route constants below.
 //!
 //! # What changed
 //!
@@ -125,6 +135,23 @@ pub const ROUTE_STOP: &str = "/claude/hook/stop";
 /// makes "the post-edit path is unchanged" a fact about the diff.
 pub const ROUTE_POST_TOOL_USE_RESULT: &str = "/claude/hook/post_tool_use_result";
 
+/// `PostToolUseFailure` on an ALL-TOOLS matcher — the **errored** half of
+/// `session.tool_result` (2026-08-17, Claude Code 2.1.233).
+///
+/// `PostToolUse` fires only when a tool SUCCEEDS. Upstream added
+/// `PostToolUseFailure` for the other half (`tool_name`, `tool_input`, `error`,
+/// `tool_use_id` plus the common fields), and without it a failed tool result
+/// reached cImp **only** through the transcript tail — which is arbitrated OFF
+/// on exactly the tabs that serve `session.tool_result`. So a serving tab lost
+/// every failed result's size: a real seam gap, not a rounding error, since a
+/// failing `Bash` returns as much text as a succeeding one.
+///
+/// **Its own route, and deliberately no CHP event of its own** — see
+/// [`chp_event`]. The capability is `session.tool_result`; the failure half is
+/// the same datum with `is_error` set, and the transcript reader it replaces
+/// sizes both through one function without looking at the flag.
+pub const ROUTE_POST_TOOL_USE_FAILURE: &str = "/claude/hook/post_tool_use_failure";
+
 /// `SubagentStart` **and** `SubagentStop` — sub-agent lifecycle, feeding
 /// `session.subagent`.
 ///
@@ -140,6 +167,57 @@ pub const ROUTE_POST_TOOL_USE_RESULT: &str = "/claude/hook/post_tool_use_result"
 /// changes — see `claude.transcript.subagents`' registry row.
 pub const ROUTE_SUBAGENT: &str = "/claude/hook/subagent";
 
+// ── 2026-08-17: the two beacons, migrated (Tier D → B) ──────────────────────
+//
+// `cimp --taint-beacon` and `cimp --checkpoint-beacon` were the two Claude
+// hooks Phase J left as `type: "command"` shims, on the reasoning that
+// report-only side effects with no reply to parse gained nothing from http.
+// That reasoning was incomplete: what the shims *also* had was an
+// **undocumented** contract — "a hook that writes nothing and exits 0 never
+// perturbs the call, including on timeout" — and the checkpoint one leaned on
+// "the tool does not start until the hook process exits". Both were `Dep::
+// Behavior` entries, which is why both rows were Tier D.
+//
+// The http hook contract states the same two facts *documented* (verified
+// against the 2.1.233 hooks reference, 2026-08-17): a non-2xx, a timeout and a
+// refused connection are non-blocking, blocking is expressible ONLY as 2xx plus
+// a decision field, and a `PreToolUse` hook BLOCKS the tool call until the
+// response — which is what makes `permissionDecision: "deny"` expressible at
+// all, and therefore what makes the checkpoint's ordering a documented
+// guarantee rather than an observed one. Multiple `PreToolUse` entries run in
+// parallel and all must resolve before the tool starts, so the beacon and the
+// advisor still do not serialize against each other.
+//
+// What the migration buys, in the registry's terms: delivery becomes
+// **app-observable** (the route is either reached or it is not, and the tab's
+// `chp`/hello observation runs on it), payload drift reports through the same
+// in-process channel as every other converted hook, and two process spawns per
+// matched tool call disappear.
+
+/// `PreToolUse` (matcher `WebFetch|WebSearch`) — the V32 taint beacon. Was
+/// `cimp --taint-beacon`.
+///
+/// Report-only: the handler answers [`no_op`] on every path, exactly as the
+/// shim wrote nothing to stdout. Locked decision 14 ("hooks never deny; sensor
+/// mode must never break a tab") is now structural in a second way — a beacon
+/// route that cannot emit a decision field cannot deny.
+pub const ROUTE_PRE_TOOL_USE_TAINT: &str = "/claude/hook/pre_tool_use_taint";
+
+/// `PreToolUse` (matcher `Edit|Write|MultiEdit|Bash`) — the V33 pre-mutation
+/// checkpoint. Was `cimp --checkpoint-beacon`.
+///
+/// **The one route in this family whose handler must FINISH its work before it
+/// replies.** "The checkpoint precedes the tool call" rests on the tool not
+/// starting until the hook resolves, so the handler awaits the snapshot (bounded
+/// by `loopback::TOOL_CHECKPOINT_BUDGET`, 1800 ms) and only then answers 200.
+/// That is the shim's 2 s reply wait expressed the other way round: the app is
+/// now on the *inside* of the wait rather than being polled across a socket by a
+/// process that had to guess how long to listen.
+///
+/// It is why this entry's [`timeout_secs`] is 5 rather than 1 — see that
+/// function.
+pub const ROUTE_PRE_TOOL_USE_CHECKPOINT: &str = "/claude/hook/pre_tool_use_checkpoint";
+
 /// Every route in this family, so the dispatcher's CHP observation and the
 /// overlay generator agree about the surface without either restating it.
 pub const ROUTES: &[&str] = &[
@@ -151,7 +229,10 @@ pub const ROUTES: &[&str] = &[
     ROUTE_SESSION_START,
     ROUTE_STOP,
     ROUTE_POST_TOOL_USE_RESULT,
+    ROUTE_POST_TOOL_USE_FAILURE,
     ROUTE_SUBAGENT,
+    ROUTE_PRE_TOOL_USE_TAINT,
+    ROUTE_PRE_TOOL_USE_CHECKPOINT,
 ];
 
 /// The CHP event one Claude ingress route feeds — the join the quiet detector
@@ -161,6 +242,20 @@ pub const ROUTES: &[&str] = &[
 /// `None` for the routes whose event is not one arbitration can turn off: the
 /// hello is the negotiation itself, and the four Phase J capability hooks have
 /// no fallback reader to arbitrate against.
+///
+/// **[`ROUTE_POST_TOOL_USE_FAILURE`] is the deliberate exception to
+/// one-route-one-event, and it maps to `None` rather than to
+/// `session.tool_result`.** Two ids that can never be declared independently are
+/// one id (the same reasoning that keeps `session.usage` off *both* sides of
+/// Claude's hello): the failure entry is emitted from the same boolean as the
+/// success entry, feeds the same core, the same consumer, the same drift token
+/// and the same `served` predicate, so there is no per-tab decision a second
+/// event could report. What mapping it here would cost is precise: `note_event`
+/// **resets** a served capability's quiet counter, so a rare failure push would
+/// silently rearm the detector that watches the common success entry — a live
+/// breakage hidden by a tool that happened to fail. Staleness observation is
+/// unaffected either way; `note_chp` reads a hook route's envelope from headers
+/// before it consults this join.
 pub fn chp_event(route: &str) -> Option<&'static str> {
     use crate::harness::chp;
     match route {
@@ -172,6 +267,8 @@ pub fn chp_event(route: &str) -> Option<&'static str> {
         ROUTE_STOP => Some(chp::EV_ASSISTANT_TEXT),
         ROUTE_POST_TOOL_USE_RESULT => Some(chp::EV_SESSION_TOOL_RESULT),
         ROUTE_SUBAGENT => Some(chp::EV_SESSION_SUBAGENT),
+        ROUTE_PRE_TOOL_USE_TAINT => Some(chp::EV_TAINT_BEACON),
+        ROUTE_PRE_TOOL_USE_CHECKPOINT => Some(chp::EV_CHECKPOINT_PRE_MUTATION),
         _ => None,
     }
 }
@@ -233,6 +330,36 @@ pub const TOKEN_ENV: &str = "CIMP_HOOK_TOKEN";
 /// either would turn a wedged handler into a wedged turn. A test on the emitted
 /// overlay pins it.
 pub const TIMEOUT_SECS: u64 = 1;
+
+/// The `timeout` (seconds) the **pre-mutation checkpoint** entry carries — the
+/// one route whose handler must finish its work before it answers.
+///
+/// Deliberately the value the deleted `--checkpoint-beacon` hook entry carried,
+/// and for the same reason: it is a ceiling over a wait that is *supposed* to
+/// happen, not a budget for a round trip. The app abandons an unfinished
+/// snapshot at `loopback::TOOL_CHECKPOINT_BUDGET` (1800 ms) and answers, so this
+/// is a backstop for a wedged listener rather than the mechanism — the same
+/// two-timer relationship the shim had, with the outer timer now enforced by the
+/// harness instead of by a process that had to guess. A test pins the ordering
+/// (`5 s > TOOL_CHECKPOINT_BUDGET`), because the two constants live in different
+/// files and nothing else keeps them ordered.
+///
+/// Everything else stays at [`TIMEOUT_SECS`]: 1 s is right for a hook that must
+/// not delay a turn, and would be wrong here — a checkpoint abandoned at 1 s on
+/// a large work tree is the feature not working on the trees that need it.
+pub const TIMEOUT_CHECKPOINT_SECS: u64 = 5;
+
+/// The pinned `timeout` for one emitted entry, **derived from its route** so the
+/// number is decided in one place rather than typed per call site.
+///
+/// Design § 5.2's "timeouts are pinned at generation" with one documented
+/// exception; see [`TIMEOUT_CHECKPOINT_SECS`].
+pub fn timeout_secs(route: &str) -> u64 {
+    match route {
+        ROUTE_PRE_TOOL_USE_CHECKPOINT => TIMEOUT_CHECKPOINT_SECS,
+        _ => TIMEOUT_SECS,
+    }
+}
 
 // ── the hook-output vocabulary ──────────────────────────────────────────────
 
@@ -301,6 +428,29 @@ pub const DRIFT_CONTEXT_HOOK: &str = "context_hook";
 pub const DRIFT_COMPACT_HOOK: &str = "compact_hook";
 pub const DRIFT_READ_HOOK: &str = "read_hook";
 pub const DRIFT_NOTIFY_HOOK: &str = "notify_hook";
+
+/// The two beacons' tokens, unchanged by the 2026-08-17 http migration for
+/// exactly the reason the four above are unchanged: a tab open across the
+/// upgrade is still running the old shim binary and still POSTs these strings to
+/// `/activity/contract_drift`, and the registry rows that resolve them
+/// (`claude.hook.taint_beacon` / `claude.hook.checkpoint_beacon`) keep their ids
+/// and their tokens. One bucket per capability, two ways in.
+pub const DRIFT_TAINT_BEACON: &str = "taint_beacon";
+pub const DRIFT_CHECKPOINT_BEACON: &str = "checkpoint_beacon";
+
+/// **The auto-check route's token, and it is new** (2026-08-17), closing the
+/// recorded gap V35 Phase A opened as finding 2 and Phase J deliberately left
+/// open: this was the ONE converted hook that reported no payload drift at all,
+/// so a matcher or field rename stopped auto-check diagnostics with nothing
+/// firing anywhere.
+///
+/// Named `post_edit_hook` and **not** `postedit_hook`, which is the name the
+/// deleted shim binary would have used had it ever reported. The distinction is
+/// deliberate: `postedit_hook` never appeared on the wire, so nothing can be
+/// carrying it, and keeping the two spellings apart means a report under the old
+/// name still resolves to nothing (as it always has) instead of quietly claiming
+/// this row.
+pub const DRIFT_POST_EDIT_HOOK: &str = "post_edit_hook";
 
 /// V35 Phase L's three. These name no deleted binary — there never was one —
 /// so they are named for the capability they carry, in the same `<thing>_hook`
@@ -404,6 +554,20 @@ pub struct HookInput {
     /// reader computes, and deliberately not for anything else.
     #[serde(default)]
     pub tool_result: serde_json::Value,
+    /// `PostToolUseFailure` (2026-08-17): what the tool failed with. Read for its
+    /// SIZE through the same [`tool_result_chars`] the success half uses, and for
+    /// nothing else — the transcript reader it replaces sizes a failed
+    /// `tool_result` block's content with that one function too, without looking
+    /// at `is_error`, so the two paths produce the same number for the same
+    /// failure.
+    ///
+    /// `Value` rather than `String` on purpose: the payload documents a text
+    /// error, but a reshape into `{type:"text", text}` blocks (the shape the
+    /// success half already tolerates) must size rather than read as absent, and
+    /// a shape NEITHER reader knows must report as drift rather than pass as an
+    /// empty error. See the `PostToolUseFailure` arm of [`contract_checks`].
+    #[serde(default)]
+    pub error: serde_json::Value,
     // `tool_use_id` is documented on this payload and is deliberately NOT read.
     // The tool-result core keys nothing on it — the `UsageEvent::ToolResult`
     // row it writes has no id column, exactly as the transcript reader's does
@@ -521,9 +685,9 @@ fn first_non_empty<'a>(candidates: &[&'a str]) -> &'a str {
 /// pairs in, missing names out.
 ///
 /// Kept split from the reporter so the check is unit-testable without a socket,
-/// exactly as it was in `context_hook.rs`. Still used by the two surviving
-/// Claude shim binaries (`taint_beacon`, `checkpoint_beacon`) as well as by
-/// [`contract_checks`].
+/// exactly as it was in `context_hook.rs`. Its second caller — the two beacon
+/// shims, which built their check lists by hand — went away with them on
+/// 2026-08-17; [`contract_checks`] now owns every list.
 pub fn missing_fields(checks: &[(&'static str, bool)]) -> Vec<&'static str> {
     checks
         .iter()
@@ -547,10 +711,14 @@ pub fn missing_fields(checks: &[(&'static str, bool)]) -> Vec<&'static str> {
 ///   `transcript_path`, and — for a `Notification` only — some way to tell a
 ///   permission prompt from an idle one.
 ///
-/// `postedit_hook` is the one shim that never reported drift at all (Phase A
-/// finding 2). Phase J does **not** silently fix that: [`ROUTE_POST_TOOL_USE`]
-/// gets no checks here and its registry row keeps saying so, because inventing
-/// a report for it would move a recorded gap into a footnote.
+/// The auto-check route ([`ROUTE_POST_TOOL_USE`]) reported nothing at all until
+/// 2026-08-17 — Phase A finding 2, recorded rather than assumed and deliberately
+/// not closed by the http migration. It is closed **here**, under
+/// [`DRIFT_POST_EDIT_HOOK`], and the two fields it asserts are exactly the two
+/// the route cannot work without: `tool_name` (the handler re-checks it against
+/// the edit tools and drops anything else) and `tool_input.file_path` (the file
+/// the checks run against — absent, the diff is empty and the auto-check answers
+/// nothing, silently). `session_id`/`cwd` come with `base` like everywhere else.
 pub fn contract_checks(route: &str, input: &HookInput) -> Vec<(&'static str, bool)> {
     let base = |v: &mut Vec<(&'static str, bool)>| {
         v.push(("session_id", !input.session_id.is_empty()));
@@ -622,24 +790,69 @@ pub fn contract_checks(route: &str, input: &HookInput) -> Vec<(&'static str, boo
             // handler drops such a payload and this is what says so out loud.
             out.push(("agent_id", !input.agent_id.trim().is_empty()));
         }
-        // `PostToolUse` (see above) and `SessionStart` (whose only required
-        // field is one cImp supplies itself, in a header) report nothing.
+        // ── 2026-08-17 ──────────────────────────────────────────────────────
+        //
+        // Phase A finding 2, closed. See this function's doc for why these two
+        // fields and not others.
+        ROUTE_POST_TOOL_USE => {
+            base(&mut out);
+            out.push(("tool_name", input.tool_name.is_some()));
+            out.push((
+                "tool_input.file_path",
+                !nested_str(&input.tool_input, "file_path").is_empty(),
+            ));
+        }
+        // The failure half of the tool-result push. `error` gets the same
+        // "empty is not absent" treatment `tool_result` gets on the success
+        // route: a tool that failed with no message at all is odd but not
+        // drift, while a PRESENT error that sizes to zero means neither reader
+        // shape matched — i.e. the payload changed under us.
+        ROUTE_POST_TOOL_USE_FAILURE => {
+            base(&mut out);
+            out.push(("tool_name", input.tool_name.is_some()));
+            out.push((
+                "error",
+                !tool_result_is_present(&input.error) || tool_result_chars(&input.error) > 0,
+            ));
+        }
+        // The two migrated beacons, field for field what the deleted shims
+        // checked and in the order they reported them: `tool_name` is what the
+        // rows name, and `cwd` is the one whose absence would break the
+        // checkpoint silently (the snapshot would be taken against the wrong
+        // root) rather than loudly.
+        ROUTE_PRE_TOOL_USE_TAINT | ROUTE_PRE_TOOL_USE_CHECKPOINT => {
+            out.push((
+                "tool_name",
+                input.tool_name.as_deref().is_some_and(|t| !t.is_empty()),
+            ));
+            base(&mut out);
+        }
+        // `SessionStart`'s only required field is one cImp supplies itself, in a
+        // header, so it reports nothing.
         _ => {}
     }
     out
 }
 
-/// The drift token a route reports under, or `None` for the two that do not
+/// The drift token a route reports under, or `None` for the one that does not
 /// report at all. See [`DRIFT_CONTEXT_HOOK`] for why these are the shim names.
+///
+/// **`SessionStart` is now the only `None`.** The auto-check route joined the
+/// reporters on 2026-08-17 ([`DRIFT_POST_EDIT_HOOK`]), and the failure half of
+/// the tool-result push shares its sibling's token deliberately: one capability,
+/// one bucket, whether the payload that broke was a success or an error.
 pub fn drift_token(route: &str) -> Option<&'static str> {
     match route {
         ROUTE_USER_PROMPT_SUBMIT => Some(DRIFT_CONTEXT_HOOK),
         ROUTE_PRE_COMPACT => Some(DRIFT_COMPACT_HOOK),
         ROUTE_PRE_TOOL_USE => Some(DRIFT_READ_HOOK),
+        ROUTE_POST_TOOL_USE => Some(DRIFT_POST_EDIT_HOOK),
         ROUTE_NOTIFICATION => Some(DRIFT_NOTIFY_HOOK),
         ROUTE_STOP => Some(DRIFT_STOP_HOOK),
-        ROUTE_POST_TOOL_USE_RESULT => Some(DRIFT_TOOL_RESULT_HOOK),
+        ROUTE_POST_TOOL_USE_RESULT | ROUTE_POST_TOOL_USE_FAILURE => Some(DRIFT_TOOL_RESULT_HOOK),
         ROUTE_SUBAGENT => Some(DRIFT_SUBAGENT_HOOK),
+        ROUTE_PRE_TOOL_USE_TAINT => Some(DRIFT_TAINT_BEACON),
+        ROUTE_PRE_TOOL_USE_CHECKPOINT => Some(DRIFT_CHECKPOINT_BEACON),
         _ => None,
     }
 }
@@ -648,7 +861,21 @@ pub fn drift_token(route: &str) -> Option<&'static str> {
 /// under — the same bucket that event's payload drift uses, so one capability
 /// has one channel however it broke.
 ///
-/// `None` for an event with no push producer to go quiet.
+/// `None` for an event whose silence is not reportable.
+///
+/// **`taint.beacon` and `checkpoint.pre_mutation` are deliberately absent even
+/// though 2026-08-17 gave them push producers**, and there are two independent
+/// reasons, either of which is sufficient:
+///
+///  * **No sound witness exists.** `chp::witness_of` returns `None` for both, so
+///    `note_event` can never return them and an entry here would be unreachable.
+///    A turn may legitimately never reach for `WebFetch` and never edit a file,
+///    so any threshold would manufacture false reports — the same declared gap
+///    `session.subagent` carries, for the same reason.
+///  * **Both events have an OpenCode producer too.** These tokens name CLAUDE
+///    registry rows, so if a future witness were wired, an OpenCode plugin's
+///    silence would report under a Claude row. A per-agent token would be needed
+///    first.
 pub fn drift_token_for_event(event: &str) -> Option<&'static str> {
     use crate::harness::chp;
     match event {
@@ -739,40 +966,14 @@ fn as_u32(v: &serde_json::Value) -> Option<u32> {
     v.as_u64().and_then(|n| u32::try_from(n).ok())
 }
 
-// ── what the two surviving shim binaries still need ─────────────────────────
-
-/// The working directory a hook payload names, falling back to the shim's own
-/// process cwd when the field is absent/empty.
-///
-/// **For the two surviving Claude shim binaries only** (`cimp --taint-beacon`,
-/// `cimp --checkpoint-beacon`). Claude spawns hook processes in the project
-/// directory, so the fallback is usually right *for a process Claude spawned* —
-/// which is exactly why the app-side handlers must NOT use it: the app's own cwd
-/// is its launch directory, not the tab's project. They resolve an absent `cwd`
-/// from the tab instead (`loopback::hook_cwd`).
-pub fn resolve_cwd(cwd_raw: &str) -> String {
-    if !cwd_raw.is_empty() {
-        return cwd_raw.to_string();
-    }
-    std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-/// The value following `--tab` in `args`, trimmed and non-empty.
-///
-/// A cImp tab id is never discoverable from a hook payload, so the two beacon
-/// shims get theirs baked into argv at spawn. (The five converted hooks get
-/// theirs from [`HEADER_TAB`] instead — same fact, one layer up.)
-///
-/// Pure, so the contract ("no id ⇒ no tab claimed") is testable without a socket
-/// or a Claude process.
-pub fn tab_arg(args: &[String]) -> Option<String> {
-    let i = args.iter().position(|a| a == "--tab")?;
-    let raw = args.get(i + 1)?.trim();
-    (!raw.is_empty()).then(|| raw.to_string())
-}
+// `resolve_cwd` and `tab_arg` lived here for the two surviving shim binaries and
+// were deleted with them on 2026-08-17. Both were about a SEPARATE PROCESS
+// resolving what an in-process handler already knows: `tab_arg` parsed the
+// `--tab <id>` baked into a hook command's argv, which is now `HEADER_TAB`, and
+// `resolve_cwd` fell back to the shim's own cwd — a fallback the app-side
+// handlers must never take, because the app's cwd is its launch directory rather
+// than the tab's project (`loopback::claude_hook_cwd` resolves the tab's
+// configured directory instead).
 
 // ── the hello declaration (design D3) ───────────────────────────────────────
 
@@ -848,10 +1049,11 @@ impl Hello {
 ///   doc). `X-CIMP-Chp` is substituted from [`crate::harness::chp::CHP_VERSION`]
 ///   and never typed as a literal, exactly as the generated OpenCode plugin
 ///   substitutes it.
-/// * `timeout` — [`TIMEOUT_SECS`], always explicit. The harness defaults are
-///   600 s (most events), 30 s (`UserPromptSubmit`) and 10 s
+/// * `timeout` — [`timeout_secs`] for this route, always explicit. The harness
+///   defaults are 600 s (most events), 30 s (`UserPromptSubmit`) and 10 s
 ///   (`MessageDisplay`); inheriting any of them would turn a wedged handler into
-///   a wedged turn.
+///   a wedged turn. One route answers 5 rather than 1, with its reason at
+///   [`TIMEOUT_CHECKPOINT_SECS`].
 pub fn http_hook_entry(
     port: u16,
     tab: &str,
@@ -886,7 +1088,7 @@ pub fn http_hook_entry(
         "url": format!("http://127.0.0.1:{port}{route}"),
         "headers": serde_json::Value::Object(headers),
         "allowedEnvVars": [TOKEN_ENV],
-        "timeout": TIMEOUT_SECS,
+        "timeout": timeout_secs(route),
     })
 }
 
@@ -1108,25 +1310,6 @@ mod tests {
         assert_eq!(odd.notification_kind(), "");
     }
 
-    /// `tab_arg` is the two surviving shims' identity parser, unchanged by the
-    /// move: it reads the baked id and refuses an empty one.
-    #[test]
-    fn tab_arg_reads_the_baked_id_and_refuses_an_empty_one() {
-        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            tab_arg(&a(&["--taint-beacon", "--tab", "claude-2"])).as_deref(),
-            Some("claude-2")
-        );
-        assert_eq!(
-            tab_arg(&a(&["--tab", " claude ", "--taint-beacon"])).as_deref(),
-            Some("claude")
-        );
-        assert!(tab_arg(&a(&["--taint-beacon"])).is_none());
-        assert!(tab_arg(&a(&["--taint-beacon", "--tab"])).is_none());
-        assert!(tab_arg(&a(&["--tab", "   "])).is_none());
-        assert!(tab_arg(&[]).is_none());
-    }
-
     /// The hook-output builders emit exactly the shapes the deleted shims
     /// printed — and never `terminalSequence`, which is not a CHP capability
     /// (design § 5.2). A handler that grows one writes escape sequences into the
@@ -1192,29 +1375,192 @@ mod tests {
         }
         assert!(!is_hook_route("/context/retrieve"));
         assert!(!is_hook_route(ROUTE_PREFIX));
-        // The four converted reporters keep the shim names; the two that never
-        // reported still do not.
+        // The four converted reporters keep the shim names…
         assert_eq!(drift_token(ROUTE_USER_PROMPT_SUBMIT), Some("context_hook"));
         assert_eq!(drift_token(ROUTE_PRE_COMPACT), Some("compact_hook"));
         assert_eq!(drift_token(ROUTE_PRE_TOOL_USE), Some("read_hook"));
         assert_eq!(drift_token(ROUTE_NOTIFICATION), Some("notify_hook"));
+        // …and so do the two migrated beacons, because a tab open across the
+        // upgrade still POSTs these strings from its old shim binary.
+        assert_eq!(drift_token(ROUTE_PRE_TOOL_USE_TAINT), Some("taint_beacon"));
         assert_eq!(
-            drift_token(ROUTE_POST_TOOL_USE),
-            None,
-            "Phase A finding 2 is recorded, not quietly fixed"
+            drift_token(ROUTE_PRE_TOOL_USE_CHECKPOINT),
+            Some("checkpoint_beacon")
         );
+        // **Phase A finding 2, CLOSED 2026-08-17.** This assertion used to read
+        // `None` with the note "recorded, not quietly fixed" — the gap was that
+        // nothing anywhere lagged the auto-check route, so a matcher or field
+        // rename killed its diagnostics in silence. It reports now, under a token
+        // that is deliberately NOT the never-shipped shim name.
+        assert_eq!(drift_token(ROUTE_POST_TOOL_USE), Some("post_edit_hook"));
+        assert_ne!(
+            drift_token(ROUTE_POST_TOOL_USE),
+            Some("postedit_hook"),
+            "the never-shipped shim spelling must stay unclaimed"
+        );
+        assert!(!contract_checks(ROUTE_POST_TOOL_USE, &HookInput::default()).is_empty());
+        // The failure half shares its sibling's bucket: one capability, one
+        // token, whichever half of it broke.
+        assert_eq!(
+            drift_token(ROUTE_POST_TOOL_USE_FAILURE),
+            drift_token(ROUTE_POST_TOOL_USE_RESULT)
+        );
+        // `SessionStart` is now the only route that reports nothing, and it
+        // really has nothing to check: its one required field is a header cImp
+        // supplies itself.
         assert_eq!(drift_token(ROUTE_SESSION_START), None);
-        // …and a route with no checks reports nothing even when the payload is
-        // empty, which is what makes the `None` above honest rather than lossy.
-        assert!(contract_checks(ROUTE_POST_TOOL_USE, &HookInput::default()).is_empty());
         assert!(contract_checks(ROUTE_SESSION_START, &HookInput::default()).is_empty());
+        assert_eq!(
+            ROUTES.iter().filter(|r| drift_token(r).is_none()).count(),
+            1,
+            "every route but the hello reports payload drift"
+        );
     }
 
     /// The whole point of the timeout column: it is 1 s, derived from the shims'
-    /// 600 ms budget, and not the harness's 600 s / 30 s defaults.
+    /// 600 ms budget, and not the harness's 600 s / 30 s defaults — with ONE
+    /// documented exception, the checkpoint route, whose handler is supposed to
+    /// take time because the tool waits for it.
     #[test]
     fn the_pinned_timeout_is_the_shims_budget_rounded_up() {
         assert_eq!(TIMEOUT_SECS, 1, "600 ms rounded up to whole seconds");
+        assert_eq!(
+            TIMEOUT_CHECKPOINT_SECS, 5,
+            "the deleted shim's own hook-entry ceiling, kept: it is a backstop over a wait \
+             the app bounds itself, not a round-trip budget"
+        );
+        // Derived from the route, so the exception is one `match` arm rather
+        // than a hand-typed number at a call site.
+        for r in ROUTES {
+            let want = if *r == ROUTE_PRE_TOOL_USE_CHECKPOINT {
+                TIMEOUT_CHECKPOINT_SECS
+            } else {
+                TIMEOUT_SECS
+            };
+            assert_eq!(timeout_secs(r), want, "{r}");
+        }
+        assert_eq!(
+            ROUTES
+                .iter()
+                .filter(|r| timeout_secs(r) != TIMEOUT_SECS)
+                .count(),
+            1,
+            "exactly one route may deviate from the 1 s budget, and it is the one \
+             whose ordering guarantee is the wait"
+        );
+    }
+
+    // ── 2026-08-17: the migrated beacons and the failure half ───────────────
+
+    /// The two beacon routes assert exactly the three fields their deleted shims
+    /// asserted, in the same order — the payload half of the migration is a
+    /// relocation, and this is what makes that a fact rather than a claim.
+    #[test]
+    fn the_migrated_beacons_check_the_fields_their_shims_checked() {
+        for route in [ROUTE_PRE_TOOL_USE_TAINT, ROUTE_PRE_TOOL_USE_CHECKPOINT] {
+            assert_eq!(
+                missing_fields(&contract_checks(route, &HookInput::default())),
+                vec!["tool_name", "session_id", "cwd"],
+                "{route}"
+            );
+            let full = HookInput {
+                session_id: "s-1".into(),
+                cwd: "/proj".into(),
+                tool_name: Some("WebFetch".into()),
+                ..Default::default()
+            };
+            assert!(
+                missing_fields(&contract_checks(route, &full)).is_empty(),
+                "the happy path never reports: {route}"
+            );
+            // An EMPTY tool name is absent, not present — the shims read a
+            // string field that defaults to `""`, and a checkpoint attributed to
+            // `claude:` is a row that names no call.
+            let anon = HookInput {
+                tool_name: Some(String::new()),
+                ..full.clone()
+            };
+            assert!(
+                missing_fields(&contract_checks(route, &anon)).contains(&"tool_name"),
+                "{route}"
+            );
+        }
+    }
+
+    /// The auto-check route's new report (Phase A finding 2's closure) names the
+    /// two fields whose absence makes the diagnostics silently empty, and stays
+    /// quiet on a complete payload.
+    #[test]
+    fn the_auto_check_route_now_reports_its_missing_fields() {
+        let bare = missing_fields(&contract_checks(ROUTE_POST_TOOL_USE, &HookInput::default()));
+        for f in ["session_id", "cwd", "tool_name", "tool_input.file_path"] {
+            assert!(bare.contains(&f), "{f} missing from {bare:?}");
+        }
+        let full = HookInput {
+            session_id: "s".into(),
+            cwd: "c".into(),
+            tool_name: Some("Edit".into()),
+            tool_input: json!({ "file_path": "src/main.rs" }),
+            ..Default::default()
+        };
+        assert!(missing_fields(&contract_checks(ROUTE_POST_TOOL_USE, &full)).is_empty());
+        // A renamed path field is the exact failure the gap left invisible.
+        let renamed = HookInput {
+            tool_input: json!({ "path": "src/main.rs" }),
+            ..full
+        };
+        let miss = missing_fields(&contract_checks(ROUTE_POST_TOOL_USE, &renamed));
+        assert_eq!(miss, vec!["tool_input.file_path"], "got {miss:?}");
+    }
+
+    /// `PostToolUseFailure` sizes its `error` through the SAME function the
+    /// success half sizes `tool_result` with, and separates an empty error from
+    /// an unreadable one exactly as that route does.
+    #[test]
+    fn the_failure_route_sizes_the_error_like_a_tool_result() {
+        let sized = |v: serde_json::Value| {
+            let input = HookInput {
+                session_id: "s".into(),
+                cwd: "c".into(),
+                tool_name: Some("Bash".into()),
+                error: v,
+                ..Default::default()
+            };
+            (
+                tool_result_chars(&input.error),
+                missing_fields(&contract_checks(ROUTE_POST_TOOL_USE_FAILURE, &input)),
+            )
+        };
+        let (chars, miss) = sized(json!("exit status 1"));
+        assert_eq!(chars, 13);
+        assert!(miss.is_empty());
+        let (chars, miss) = sized(json!([{ "type": "text", "text": "boom" }]));
+        assert_eq!(chars, 4, "the block shape sizes too");
+        assert!(miss.is_empty());
+        for empty in [json!(null), json!(""), json!([])] {
+            let (chars, miss) = sized(empty.clone());
+            assert_eq!(chars, 0);
+            assert!(miss.is_empty(), "an empty error is not drift: {empty}");
+        }
+        for reshaped in [json!({ "message": "boom" }), json!([{ "type": "text", "body": "x" }])] {
+            let (chars, miss) = sized(reshaped.clone());
+            assert_eq!(chars, 0);
+            assert!(
+                miss.contains(&"error"),
+                "a present-but-unsizeable error must be reported: {reshaped}"
+            );
+        }
+        // …and the tool name, without which the row cannot be attributed.
+        let anon = HookInput {
+            session_id: "s".into(),
+            cwd: "c".into(),
+            error: json!("boom"),
+            ..Default::default()
+        };
+        assert!(
+            missing_fields(&contract_checks(ROUTE_POST_TOOL_USE_FAILURE, &anon))
+                .contains(&"tool_name")
+        );
     }
 
     // ── V35 Phase L ─────────────────────────────────────────────────────────
@@ -1337,12 +1683,27 @@ mod tests {
     fn the_route_to_event_join_is_total_and_reversible() {
         use crate::harness::chp;
         let mut events: Vec<&str> = ROUTES.iter().filter_map(|r| chp_event(r)).collect();
+        // TWO routes map to no event, and each `None` is a decision with its own
+        // reason recorded at `chp_event`: `SessionStart` IS the negotiation, and
+        // `PostToolUseFailure` carries the error half of an event its sibling
+        // route owns — mapping it would let a rare failure push reset the quiet
+        // counter watching the common success entry. The injectivity below is
+        // what makes that the only way to express "same capability, second
+        // entry", so the two facts are one design rather than two.
         assert_eq!(
             events.len(),
-            ROUTES.len() - 1,
-            "only `SessionStart` (the hello itself) maps to no event"
+            ROUTES.len() - 2,
+            "exactly two routes map to no CHP event: the hello, and the failure half"
         );
         assert_eq!(chp_event(ROUTE_SESSION_START), None);
+        assert_eq!(chp_event(ROUTE_POST_TOOL_USE_FAILURE), None);
+        // …and it is NOT invisible to the capability it belongs to: it reports
+        // drift under the same token and its handler consults the same `served`
+        // predicate as the success half (asserted in `chp`'s arbitration test).
+        assert_eq!(
+            drift_token(ROUTE_POST_TOOL_USE_FAILURE),
+            drift_token_for_event(chp::EV_SESSION_TOOL_RESULT)
+        );
         events.sort_unstable();
         let n = events.len();
         events.dedup();
@@ -1373,5 +1734,19 @@ mod tests {
         // producer to go quiet — the upstream limitation, restated as code.
         assert_eq!(drift_token_for_event(chp::EV_SESSION_USAGE), None);
         assert_eq!(drift_token_for_event(chp::EV_SESSION_CONTEXT), None);
+        // The two beacons DO have producers as of 2026-08-17 and still have no
+        // quiet token, which is a declared gap rather than an omission: no
+        // witness proves either should have fired, and both events also have an
+        // OpenCode producer these Claude-named tokens would misattribute. See
+        // `drift_token_for_event`.
+        for event in [chp::EV_TAINT_BEACON, chp::EV_CHECKPOINT_PRE_MUTATION] {
+            assert_eq!(drift_token_for_event(event), None, "{event}");
+            assert_eq!(
+                chp::witness_of(event),
+                None,
+                "`{event}` gained a witness — wire its quiet token, and make it \
+                 per-agent first (both harnesses push it)"
+            );
+        }
     }
 }

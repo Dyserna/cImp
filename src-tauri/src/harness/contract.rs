@@ -230,12 +230,35 @@ pub const CONTROL_CHECKPOINT_PRE_MUTATION: &str = "checkpoint.pre_mutation";
 /// V32: the taint beacon the OpenCode plugin posts for native web tools.
 /// **The OpenCode instance** — see [`CONTROL_TAINT_BEACON_CLAUDE`].
 pub const CONTROL_TAINT_BEACON: &str = "taint.beacon";
-/// V32 Phase F: the taint beacon as it executes on the **Claude** side — the
-/// `cimp --taint-beacon` `PreToolUse` shim (`taint_beacon.rs`).
+/// V32 Phase F: the taint beacon as it executes on the **Claude** side.
+///
+/// **Enforcement moved on 2026-08-17 and this is where it lives now:** the
+/// emitted `type: "http"` `PreToolUse` entry (`harness/claude/overlay.rs`,
+/// matcher `WebFetch|WebSearch`) plus the handler it points at
+/// (`offload::loopback::handle_claude_taint_beacon` →
+/// `latch_beacon_core`). It was `cimp --taint-beacon` (`taint_beacon.rs`,
+/// deleted). The control did not change what it does — engage the tab's EXTERNAL
+/// latch before a harness-native web tool runs — but *where it executes* is the
+/// whole content of this column, so the move is recorded rather than implied.
+///
+/// Note the asymmetry with OpenCode's [`CONTROL_TAINT_BEACON`]: that one runs
+/// INSIDE the harness (a `throw`-capable plugin), which is why nothing cImp can
+/// test proves it ran. This one is now delivery cImp can observe — the hook
+/// either reaches the route or it does not.
 pub const CONTROL_TAINT_BEACON_CLAUDE: &str = "taint.beacon.claude";
 /// V33 Phase F: the pre-mutation checkpoint as it executes on the **Claude**
-/// side — the `cimp --checkpoint-beacon` `PreToolUse` shim
-/// (`checkpoint_beacon.rs`).
+/// side.
+///
+/// **Enforcement moved on 2026-08-17**, same as its sibling above: the emitted
+/// `type: "http"` `PreToolUse` entry (matcher `Edit|Write|MultiEdit|Bash`) plus
+/// `offload::loopback::handle_claude_checkpoint` → `tool_checkpoint_core`. It was
+/// `cimp --checkpoint-beacon` (`checkpoint_beacon.rs`, deleted).
+///
+/// The ordering this control rests on — the snapshot completes before the tool
+/// runs — is now enforced by the handler awaiting it, under upstream's documented
+/// "a `PreToolUse` hook blocks the call until the response". The shim enforced the
+/// same thing from outside by reading its reply with a deadline, on an
+/// undocumented behaviour.
 pub const CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE: &str = "checkpoint.pre_mutation.claude";
 
 /// The capability behind the read advisor's PreToolUse deny, spelled once.
@@ -255,12 +278,17 @@ pub const CAP_PRETOOLUSE_DENY: &str = "claude.hook.pretooluse_deny";
 /// is what the exactly-once test is actually asserting, and V35 Phase I is where
 /// the distinction became load-bearing: the taint beacon and the pre-mutation
 /// checkpoint each run in *two* enforcement sites — inside the generated
-/// OpenCode plugin's `tool.execute.before`, and inside a Claude `PreToolUse`
-/// shim binary — on two harnesses, in two source files, with two different
-/// failure modes (the Claude checkpoint shim waits for the app's reply; the
-/// OpenCode one is bounded by its own abort signal). Folding them onto one id
-/// would have made the column say "enforcement lives here", singular, about a
-/// row that is only half of it.
+/// OpenCode plugin's `tool.execute.before`, and on Claude's own `PreToolUse`
+/// path — on two harnesses, in two artifacts, with two different failure modes
+/// (the Claude checkpoint holds the tool call until the app has taken the
+/// snapshot; the OpenCode one is bounded by its own abort signal). Folding them
+/// onto one id would have made the column say "enforcement lives here",
+/// singular, about a row that is only half of it.
+///
+/// The Claude half's site MOVED on 2026-08-17 — shim binary → `type: "http"`
+/// entry plus its handler — without either id changing, which is the column
+/// working as intended: an id names a place, and the place is described at the
+/// id.
 // Documentation, not a gate (milestone locked decision 10): the enforcement
 // test IS its consumer, so it has no runtime reader by design.
 #[allow(dead_code)]
@@ -279,7 +307,8 @@ pub const CAPABILITIES: &[Capability] = &[
         id: "claude.hook.user_prompt_submit",
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "A `UserPromptSubmit` hook of `type: \"http\"` (Claude Code ≥ 2.1.63) POSTs \
+        contract: "A `UserPromptSubmit` hook of `type: \"http\"` (Claude Code ≥ 2.1.63, contract \
+                   verified unchanged through 2.1.233 on 2026-08-17) POSTs \
                    `{prompt, session_id, cwd}` as JSON, substitutes `$CIMP_HOOK_TOKEN` into the \
                    configured `Authorization` header from `allowedEnvVars`, and parses the 2xx \
                    JSON reply exactly as it parses a command hook's stdout — so the \
@@ -411,9 +440,12 @@ pub const CAPABILITIES: &[Capability] = &[
         harness: Harness::Claude,
         tier: Seam::B,
         contract: "A `PostToolUse` hook of `type: \"http\"` fires for `Edit` / `Write` / \
-                   `MultiEdit` with the documented payload (`tool_name`, `tool_input.file_path`, \
-                   `session_id`, `cwd`) and accepts `hookSpecificOutput.additionalContext` back \
-                   in the 2xx JSON reply.",
+                   `MultiEdit` **on success** with the documented payload (`tool_name`, \
+                   `tool_input.file_path`, `session_id`, `cwd`) and accepts \
+                   `hookSpecificOutput.additionalContext` back in the 2xx JSON reply. \
+                   Success-only is correct for THIS row — there is nothing to check after a failed \
+                   edit — and is why `PostToolUseFailure` is wired for the sizing row instead \
+                   (`claude.hook.tool_result`).",
         depends_on: &[
             Dep::ConfigKey("hooks.PostToolUse"),
             Dep::ConfigKey("type=http"),
@@ -430,20 +462,24 @@ pub const CAPABILITIES: &[Capability] = &[
             "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
-        drift_rule: &[],
+        drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
         waiver: Some(
-            "GAP, recorded rather than assumed and deliberately NOT closed by V35 Phase J: this \
-             is the ONE converted hook that reports no payload drift (it was the one shim that \
-             never called `report_contract_drift`), so `drift.payload.v1` does NOT lag this row \
-             and no other V16 rule does either — a matcher or field rename stops auto-check \
-             diagnostics with nothing firing anywhere. Inventing a report during the http \
-             migration would have moved a recorded gap into a footnote. Canary lands in V35 \
-             Phase B; owner is the V35 milestone.",
+            "The recorded GAP (Phase A finding 2 — the ONE converted hook that lagged NOTHING) is \
+             CLOSED as of 2026-08-17: the route now reports a payload missing `session_id`, `cwd`, \
+             `tool_name` or `tool_input.file_path` as `drift.payload.v1`, under the new token \
+             `post_edit_hook`. It is deliberately NOT the never-shipped `postedit_hook` spelling — \
+             that shim never reported, so nothing can be carrying it and it stays unattributed. \
+             What is STILL uncovered, and why this row keeps a waiver: the report is LAGGING (it \
+             fires when a broken payload arrives, so a hook that stops firing entirely says \
+             nothing), there is no quiet detector because no witness proves an edit should have \
+             happened, and there is no fixture canary over the response envelope. The row is \
+             `Silent`, so a matcher removed upstream still costs auto-check diagnostics with only \
+             the ABSENCE of `context.post_edit` pushes to notice it by. Owner: the V35 milestone.",
         ),
         controls: &[],
-        drift_token: None,
+        drift_token: Some("post_edit_hook"),
     },
     Capability {
         id: "claude.hook.notification",
@@ -487,47 +523,61 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: Some("notify_hook"),
     },
-    // ── Claude Code: the two beacon shims (Tier D — V35 Phase I) ────────────
+    // ── Claude Code: the two beacons (Tier D → B, 2026-08-17) ───────────────
     //
-    // These two close V35 Phase E's accepted residual. `drift.payload.v1`
-    // survived Phase E's consolidation *solely* as the channel for their
-    // reports, because they post to `/activity/contract_drift` under their own
-    // shim names and neither had a registry row — so their reports could not be
-    // attributed to a capability and their drift landed in the un-consolidated
-    // channel. With these rows, [`capability_for_payload_shim`] resolves both
-    // through `wired_in` like every other shim, and "one notice source" holds
-    // for the whole matrix.
+    // These two closed V35 Phase E's accepted residual when Phase I gave them
+    // rows: `drift.payload.v1` had survived Phase E's consolidation *solely* as
+    // the channel for their reports, because they posted to
+    // `/activity/contract_drift` under their own shim names and neither had a
+    // registry row. With the rows, [`capability_for_payload_shim`] resolves both
+    // and "one notice source" holds for the whole matrix.
     //
-    // **They are CLAUDE shims, not OpenCode plugin code.** `cimp --taint-beacon`
-    // and `cimp --checkpoint-beacon` are `PreToolUse` hook binaries
-    // (`taint_beacon.rs`, `checkpoint_beacon.rs`); the OpenCode plugin reaches
-    // the same two loopback routes from inside `tool.execute.before`, and THAT
-    // half is `opencode.plugin.load_all`'s. Two harnesses, two enforcement
-    // sites, two rows — which is also why the TCB column carries a distinct
-    // control id per site (see [`CONTROLS`]).
+    // **2026-08-17 moved them D → B**, which is the migration both waivers named
+    // as their closing condition. `cimp --taint-beacon` and
+    // `cimp --checkpoint-beacon` are deleted; both are `type: "http"`
+    // `PreToolUse` entries now, and what changed is not the transport but the
+    // TIER: each row's D-component was a `Dep::Behavior` on something upstream
+    // does not document (a silent exit-0 hook never perturbs the call *including
+    // on timeout*; the tool does not start until the hook process exits), and the
+    // http hook contract states both facts in writing. Verified against the
+    // 2.1.233 hooks reference on 2026-08-17: a non-2xx, a timeout and a refused
+    // connection are non-blocking, blocking is expressible ONLY as 2xx plus a
+    // decision field, and a `PreToolUse` http hook BLOCKS the tool call until the
+    // response — which is what makes `permissionDecision: "deny"` expressible and
+    // therefore what makes the checkpoint's ordering a documented guarantee.
+    //
+    // **They are still CLAUDE rows, not OpenCode plugin code.** The OpenCode
+    // plugin reaches the same two loopback cores from inside
+    // `tool.execute.before`, and THAT half is `opencode.plugin.load_all`'s. Two
+    // harnesses, two enforcement sites, two rows — which is also why the TCB
+    // column carries a distinct control id per site (see [`CONTROLS`]).
     Capability {
         id: "claude.hook.taint_beacon",
         harness: Harness::Claude,
-        tier: Seam::D,
-        contract: "A `PreToolUse` hook with matcher `WebFetch|WebSearch` fires BEFORE the tool \
-                   runs, carrying `{session_id, cwd, tool_name}`, and a hook that writes nothing \
-                   to stdout/stderr and exits 0 is NON-BLOCKING — including when it times out, \
-                   which the hooks reference does not document at all. That undocumented \
-                   timeout semantic is why the shim never waits on anything it does not control.",
+        tier: Seam::B,
+        contract: "A `PreToolUse` hook of `type: \"http\"` with matcher `WebFetch|WebSearch` fires \
+                   BEFORE the tool runs, POSTing `{session_id, cwd, tool_name}`, and a 2xx reply \
+                   carrying no `hookSpecificOutput.permissionDecision` lets the call proceed. \
+                   Report-only is STRUCTURAL rather than argued: blocking is expressible only as \
+                   2xx plus a decision field, so a handler that never emits one cannot deny, and \
+                   a timeout / refused connection / non-2xx is a documented NON-BLOCKING error.",
         depends_on: &[
             Dep::ConfigKey("hooks.PreToolUse"),
+            Dep::ConfigKey("type=http"),
             Dep::ConfigKey("WebFetch|WebSearch"),
+            Dep::ConfigKey("headers"),
+            Dep::ConfigKey("allowedEnvVars"),
+            Dep::ConfigKey("timeout"),
             Dep::JsonPath("session_id"),
             Dep::JsonPath("cwd"),
             Dep::JsonPath("tool_name"),
-            Dep::Behavior(
-                "a silent exit-0 hook never blocks or perturbs the tool call — and a TIMED-OUT \
-                 hook does not either, which is undocumented (verified against the hooks \
-                 reference 2026-08-07) and is the D-component this row is tiered on",
-            ),
+            // The `Dep::Behavior` on the undocumented timeout semantic is GONE,
+            // and its deletion is the whole point of the migration: the fail-open
+            // contract is now the documented one this row's `contract` sentence
+            // quotes, shared with every other `type: "http"` row.
         ],
         wired_in: &[
-            "src-tauri/src/taint_beacon.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
@@ -536,16 +586,19 @@ pub const CAPABILITIES: &[Capability] = &[
         canary: None,
         probe: None,
         waiver: Some(
-            "No canary and no probe yet, and the gap is structural rather than unowned: proving \
-             this row needs a real Claude turn that reaches for `WebFetch` and an assertion that \
-             the beacon landed — the scripted-turn probe class V35 Phase D deliberately did not \
-             fake. Two things cover it meanwhile: `drift.payload.v1` lags it (the shim reports its \
-             own missing fields, and Phase I is what makes that report resolve to THIS row), and \
-             a beacon that stops arriving leaves the tab's EXTERNAL latch unengaged, which the \
-             proxied half of the same latch still catches for anything routed through cImp. \
-             CLOSES WITH: Phase L's push migration, which replaces the shim with an http hook \
-             whose delivery is observable app-side, or a scripted-turn probe — whichever lands \
-             first.",
+            "Delivery is now app-observable and payload drift reports through the route (token \
+             `taint_beacon`, unchanged so a pre-upgrade tab's own shim lands in the same bucket) — \
+             but there is still NO quiet-detection witness, and that is declared rather than \
+             missed: a turn may legitimately never reach for `WebFetch`, so no other push proves \
+             this one should have fired and any threshold would manufacture false reports \
+             (`chp::witness_of` returns `None`, exactly as for `claude.hook.subagent`). A second \
+             reason not to wire one: `taint.beacon` also has an OpenCode producer, so a token \
+             named for this Claude row would misattribute an OpenCode plugin's silence. What \
+             covers the row meanwhile: the payload reports above, and a beacon that stops arriving \
+             leaves the tab's EXTERNAL latch unengaged — which the PROXIED half of the same latch \
+             still catches for anything routed through cImp. A scripted-turn probe (a real turn \
+             that reaches for `WebFetch`, asserting the beacon LANDED) is the only thing that \
+             would close it, and it stays the Phase D residual it was.",
         ),
         controls: &[CONTROL_TAINT_BEACON_CLAUDE],
         drift_token: Some("taint_beacon"),
@@ -553,27 +606,34 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         id: "claude.hook.checkpoint_beacon",
         harness: Harness::Claude,
-        tier: Seam::D,
-        contract: "A `PreToolUse` hook with matcher `Edit|Write|MultiEdit|Bash` fires BEFORE the \
-                   tool runs with the same payload, and Claude Code does not start the tool until \
-                   the hook process EXITS — which is what makes \"the checkpoint precedes the \
-                   call\" exact rather than best-effort. The configured `timeout` (5 s) stays a \
-                   ceiling above the shim's own 2 s reply deadline, not the mechanism.",
+        tier: Seam::B,
+        contract: "A `PreToolUse` hook of `type: \"http\"` with matcher \
+                   `Edit|Write|MultiEdit|Bash` fires BEFORE the tool runs with the same payload, \
+                   and **the tool call does not start until the hook's response arrives** — the \
+                   documented mechanism that makes `permissionDecision: \"deny\"` expressible at \
+                   all, and therefore what makes \"the checkpoint precedes the call\" exact rather \
+                   than best-effort. Multiple `PreToolUse` entries run in parallel and all must \
+                   resolve first, so the read advisor on its own matchers does not serialize \
+                   against this one. The pinned `timeout` (5 s) is a ceiling above the app's own \
+                   1800 ms snapshot budget, not the mechanism.",
         depends_on: &[
             Dep::ConfigKey("hooks.PreToolUse"),
+            Dep::ConfigKey("type=http"),
             Dep::ConfigKey("Edit|Write|MultiEdit|Bash"),
             Dep::ConfigKey("timeout"),
             Dep::JsonPath("session_id"),
             Dep::JsonPath("cwd"),
             Dep::JsonPath("tool_name"),
-            Dep::Behavior(
-                "the tool call does not begin until this hook process exits — undocumented, and \
-                 the ordering the whole feature rests on: a checkpoint that can contain the \
-                 change it claims to predate silently misleads a restore",
-            ),
+            // The ordering `Dep::Behavior` is GONE — it is the `contract`
+            // sentence above now, grounded in the documented deny contract. What
+            // is NOT claimed as documented, and needs no spike because a payload
+            // cannot reveal it either way: whether the harness's parallel
+            // evaluation of several `PreToolUse` entries has a *combined* deadline
+            // beyond each entry's own `timeout`. It would only ever make this
+            // hook give up sooner, which is the fail-open direction.
         ],
         wired_in: &[
-            "src-tauri/src/checkpoint_beacon.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
             "src-tauri/src/harness/claude/overlay.rs",
         ],
@@ -582,14 +642,16 @@ pub const CAPABILITIES: &[Capability] = &[
         canary: None,
         probe: None,
         waiver: Some(
-            "Same structural gap as its sibling — a scripted Claude turn that edits a file, plus \
-             an assertion about checkpoint ORDERING, which no fixture can express. What covers it \
-             meanwhile is strictly better than for the taint beacon: `drift.payload.v1` lags the \
-             payload half (resolving to this row from Phase I on), and a blown reply deadline \
-             already surfaces as its own Activity event (`workbench` / `checkpoint_missed`) \
-             instead of being lost — so the failure mode this row is `Silent` for is the hook not \
-             FIRING, not the checkpoint failing. CLOSES WITH: Phase L's push migration or a \
-             scripted-turn probe.",
+            "Same shape as its sibling, and better covered. The ORDERING half stopped needing a \
+             spike on 2026-08-17: it is upstream's documented deny contract, and the handler \
+             awaits the snapshot before answering, so the guarantee is enforced app-side rather \
+             than inferred. What remains uncovered is the same missing witness — no push proves \
+             an edit should have happened, and `checkpoint.pre_mutation` has an OpenCode producer \
+             this Claude-named token would misattribute — plus the fixture gap: no canary can \
+             express an ordering. Covering it meanwhile: `drift.payload.v1` lags the payload half \
+             (token `checkpoint_beacon`, unchanged), and a blown snapshot budget is NOT silent — \
+             it writes its own Activity event (`workbench` / `checkpoint_missed`). So the failure \
+             mode this row is `Silent` for is the hook not FIRING at all.",
         ),
         controls: &[CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE],
         drift_token: Some("checkpoint_beacon"),
@@ -701,19 +763,30 @@ pub const CAPABILITIES: &[Capability] = &[
         id: "claude.hook.tool_result",
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "A SECOND `PostToolUse` entry with an all-tools matcher (`\"\"`) fires of \
-                   `type: \"http\"` for every tool call, carrying `tool_name` and `tool_result` \
-                   (the full result content, as a string or as `{type:\"text\", text}` blocks). \
-                   It is a SEPARATE route from the auto-check entry on purpose: both groups fire \
-                   for an `Edit`, so one shared route would run the project's checks twice and \
-                   count one result twice.",
+        contract: "TWO all-tools (`\"\"`) `type: \"http\"` entries, one per outcome, because \
+                   `PostToolUse` fires only when a tool SUCCEEDS. `hooks.PostToolUse` carries \
+                   `tool_name` + `tool_result` (a string or `{type:\"text\", text}` blocks); \
+                   `hooks.PostToolUseFailure` carries `tool_name` + `error` and fires when the \
+                   tool fails. Both are SEPARATE routes from the auto-check entry on purpose: its \
+                   group and the success group both fire for an `Edit`, so one shared route would \
+                   run the project's checks twice and count one result twice.",
         depends_on: &[
             Dep::ConfigKey("hooks.PostToolUse"),
+            // 2026-08-17: the errored half. A NEW upstream hook event (it did not
+            // exist at 2.1.63), so an older CLI ignores the entry and failed
+            // results go uncounted — see the waiver.
+            Dep::ConfigKey("hooks.PostToolUseFailure"),
             Dep::ConfigKey("type=http"),
             Dep::JsonPath("tool_name"),
             Dep::JsonPath("tool_result"),
+            Dep::JsonPath("error"),
             Dep::JsonPath("session_id"),
             Dep::JsonPath("cwd"),
+            // `tool_use_id` is documented on both payloads and deliberately NOT
+            // declared, because no line of code reads it: the `UsageEvent::
+            // ToolResult` row these feed has no id column, exactly as the
+            // transcript reader's does not. An unread field is a contract cImp
+            // could not notice breaking.
             Dep::Behavior(
                 "that an all-tools matcher (`\"\"`) really does fire for EVERY tool and not only \
                  for the ones the sibling entry names — the notification hooks rely on the same \
@@ -732,13 +805,19 @@ pub const CAPABILITIES: &[Capability] = &[
         canary: None,
         probe: None,
         waiver: Some(
-            "The SHAPE half needs no canary of its own: the push sizes `tool_result` through the \
-             transcript reader's own `tool_result_chars`, so `claude.transcript.tool_result`'s \
-             fixture canary is the leading check for both paths at once — which is why the push \
-             reuses that function rather than restating it. `contract_checks` covers the \
-             present-but-unreadable case (a result that sizes to zero while carrying something), \
-             and the quiet detector covers the stopped-firing case (witness \
-             `context.post_edit`).",
+            "The SHAPE half needs no canary of its own: the push sizes `tool_result` — and, since \
+             2026-08-17, `error` — through the transcript reader's own `tool_result_chars`, so \
+             `claude.transcript.tool_result`'s fixture canary is the leading check for both paths \
+             at once, which is why the push reuses that function rather than restating it. \
+             `contract_checks` covers the present-but-unreadable case (a payload that sizes to \
+             zero while carrying something), and the quiet detector covers the stopped-firing case \
+             (witness `context.post_edit`). ONE residual, and it is upstream's version skew rather \
+             than a gap in coverage: `PostToolUseFailure` is newer than the 2.1.63 floor the other \
+             entries need, so a CLI between the two ignores that entry and failed results go \
+             uncounted with nothing firing — an absent hook event cannot report. It fails in the \
+             direction the fallback covers (a tab that never serves this capability keeps its \
+             reader), and the quiet detector does NOT see it, because the success half keeps \
+             pushing.",
         ),
         controls: &[],
         drift_token: Some("tool_result_hook"),
@@ -791,6 +870,19 @@ pub const CAPABILITIES: &[Capability] = &[
         drift_token: Some("subagent_hook"),
     },
     // ── Claude Code: emitted transcript artifact (Tier C) ───────────────────
+    //
+    // **The Tier-C risk on these three is now UPSTREAM-CONFIRMED, not inferred**
+    // (checked 2026-08-17 against the 2.1.233 docs). The reference pages now
+    // state explicitly that the transcript JSONL format is *internal and
+    // unstable*, and 2.1.210 shipped a transcript-size compression change — i.e.
+    // upstream has both reserved the right to reshape this artifact and used it.
+    // Nothing about the rows changes: Tier C already means "an emitted artifact,
+    // not an API, that breaks silently as zeros and empties", and the mitigation
+    // is already the right one — the L1 substantiveness canaries, the L2 probes
+    // that drive them against a real transcript, and the capture-on-success
+    // corpus so the first diagnostic is a diff. What changes is the confidence
+    // with which the waivers below can be read: "this may move" is now "upstream
+    // says this may move".
     Capability {
         id: "claude.transcript.assistant_text",
         harness: Harness::Claude,
@@ -825,15 +917,23 @@ pub const CAPABILITIES: &[Capability] = &[
     // carries token counts.** The common payload set is `session_id`,
     // `transcript_path`, `cwd`, `permission_mode` and `hook_event_name`; `Stop`
     // adds `last_assistant_message`; `PostToolUse` adds `tool_name` /
-    // `tool_input` / `tool_result` / `tool_use_id`; `SubagentStart`/`Stop` add
-    // `agent_id` / `agent_type` / `agent_instructions`; and `PostCompact`
-    // exposes no compaction metrics. The only documented token-usage surface is
-    // the OpenTelemetry `claude_code.token.usage` metric, which is a different
-    // integration (an exporter, not a hook) and is under-documented enough that
-    // the design doc's mention of it could not be verified.
+    // `tool_input` / `tool_result` / `tool_use_id`; `PostToolUseFailure` adds
+    // `error` beside them; `SubagentStart`/`Stop` add `agent_id` / `agent_type` /
+    // `agent_instructions`; and `PostCompact` exposes no compaction metrics. The
+    // only documented token-usage surface is the OpenTelemetry
+    // `claude_code.token.usage` metric, which is a different integration (an
+    // exporter, not a hook) and is under-documented enough that the design doc's
+    // mention of it could not be verified.
+    //
+    // **RE-VERIFIED against the 2.1.233 docs on 2026-08-17** (the previous check
+    // was against 2.1.63-era docs): the hook-input contract has grown events
+    // (`PostToolUseFailure`) and fields (`tool_use_id`), and still carries no
+    // token counts, no context window and no rate-limit block anywhere. The
+    // OpenTelemetry exporter remains the only usage surface.
     //
     // So this stays Tier C on the transcript tail, **permanently-until-upstream-
-    // changes**, and the same is true of `claude.statusline.stdin` below.
+    // changes**, and the same is true of `claude.statusline.stdin` below (whose
+    // stdin shape is likewise unchanged at 2.1.233 — additive fields only).
     // Decision 2's D→C→B→A ladder still applies — it is simply not climbable
     // here yet. The milestone's Phase L row lists "usage" among the migrations;
     // that text predates this check, and this comment is the correction.
@@ -1097,14 +1197,24 @@ pub const CAPABILITIES: &[Capability] = &[
         drift_token: None,
     },
     // ── OpenCode: SSE artifact (Tier C) ─────────────────────────────────────
+    //
+    // **Re-verified live on 2026-08-17** against the installed OpenCode 1.18.13
+    // and diffed against 1.18.18: every SSE shape below is unchanged, and the one
+    // real movement is the turn-over signal — `session.idle` is now marked
+    // deprecated in the upstream schema while still being emitted beside its
+    // replacement `session.status`. That is the Tier-C failure mode arriving with
+    // notice for once, so the reader took the notice (see the two new deps).
     Capability {
         id: "opencode.sse.events",
         harness: Harness::OpenCode,
         tier: Seam::C,
         contract: "`GET /event` streams SSE envelopes `{type, properties}` carrying \
                    `message.updated`, `message.part.updated`, `message.part.delta`, \
-                   `session.created` and `session.idle`, and every session-scoped event carries \
-                   `properties.sessionID`.",
+                   `session.created` and BOTH turn-over signals — `session.idle` (deprecated in \
+                   the upstream schema, still emitted) and its replacement `session.status`, whose \
+                   `properties.status.type` is `\"busy\"` or `\"idle\"`. Both may arrive for one \
+                   turn-over; the reader honours either and the second is a no-op. Every \
+                   session-scoped event carries `properties.sessionID`.",
         depends_on: &[
             Dep::Route("GET /event"),
             Dep::JsonPath("message.updated"),
@@ -1123,6 +1233,14 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("properties.delta"),
             Dep::JsonPath("session.created"),
             Dep::JsonPath("session.idle"),
+            // 2026-08-17 (re-verified against 1.18.18): `session.idle` is marked
+            // DEPRECATED upstream and still emitted, so the reader now honours
+            // BOTH. Declared as two deps because they are two reads — the event
+            // type, and the field that says which status it is. Honouring only
+            // the deprecated one would go silent the day upstream drops it, and
+            // only the new one would go silent on every installed build today.
+            Dep::JsonPath("session.status"),
+            Dep::JsonPath("properties.status.type"),
             Dep::JsonPath("properties.sessionID"),
         ],
         wired_in: &["src-tauri/src/harness/opencode/read.rs"],
@@ -1134,7 +1252,13 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: None,
     },
-    // ── OpenCode: HTTP routes (Tiers B and D) ───────────────────────────────
+    // ── OpenCode: HTTP routes (both Tier B since 2026-08-17) ────────────────
+    //
+    // `noReply` re-verified present and unchanged at 1.18.18 on 2026-08-17 (the
+    // route and the field are byte-identical to 1.18.13 upstream). The waiver
+    // below is unaffected: what it defers is proving that `noReply` still means
+    // "do not start a turn", which needs a real session to push into — reading
+    // the field in the source is not that proof.
     Capability {
         id: "opencode.route.push",
         harness: Harness::OpenCode,
@@ -1163,25 +1287,69 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: None,
     },
+    // **The id is unchanged and the contract is inverted** (2026-08-17). This row
+    // used to be the Tier-D watch its name still says: cImp sent no credential,
+    // the probe confirmed OpenCode's local server answered anybody, and the row
+    // recorded a DOUBLE-EDGED dependency — auth arriving would break the tap, and
+    // until it did, every OpenCode tab cImp launched hosted an unauthenticated
+    // HTTP server on loopback where `POST /session/:id/message` without `noReply`
+    // starts a real agent turn.
+    //
+    // **That posture is CLOSED as of 2026-08-17**, which is locked decision 2's
+    // D→C→B migration outranking new features. Live-spiked the same day against
+    // the installed OpenCode 1.18.13 (and diffed against 1.18.18, byte-identical
+    // in every integration-relevant file): setting a non-empty
+    // `OPENCODE_SERVER_PASSWORD` on the `opencode` process enforces HTTP Basic
+    // auth on every route — `GET /event` included (unauth ⇒ 401, Basic ⇒
+    // 200/SSE). cImp now generates a fresh password per tab spawn, sets both
+    // documented variables on the child, and authenticates its own tap and push
+    // with `Authorization: Basic base64("opencode:<password>")`.
+    //
+    // Three details that are the row rather than trivia. The password is
+    // snapshotted at module load in the child, so it MUST be set at spawn; an
+    // EMPTY password silently disables auth entirely (global principle 5 — the
+    // generator can only return a non-empty value); and the credential goes in
+    // the header alone, because upstream's `auth_token` query param WINS over a
+    // correct header and a present-but-wrong one 401s. First-party clients are
+    // unaffected — the TUI, `opencode run` and the plugin's SDK client all
+    // self-authenticate from the same env, which is why this does not break the
+    // tab cImp launched with `--port`/`--hostname`.
+    //
+    // The id is NEVER renamed (§ 5.1), so "noauth" now reads as the name of the
+    // thing that was fixed. The `Behavior` dep is gone with the tier: what the
+    // row depends on is two documented env vars and three routes, and the probe
+    // drives both directions of it.
     Capability {
         id: "opencode.route.noauth",
         harness: Harness::OpenCode,
-        tier: Seam::D,
-        contract: "OpenCode's local HTTP server still accepts unauthenticated localhost calls on \
-                   `GET /event`, `GET /session/:id` and `POST /session/:id/message`. \
-                   Double-edged, and deliberately recorded as a capability rather than a bug: if \
-                   a release adds auth the tap and push break, and until then the unauthenticated \
-                   server is a localhost exposure.",
+        tier: Seam::B,
+        contract: "Setting the documented `OPENCODE_SERVER_PASSWORD` (non-empty) and \
+                   `OPENCODE_SERVER_USERNAME` on the `opencode` child enforces HTTP Basic auth on \
+                   its local server for every route cImp uses — `GET /event`, `GET /session/:id` \
+                   and `POST /session/:id/message` — and a request carrying \
+                   `Authorization: Basic base64(\"opencode:<password>\")` is accepted. cImp \
+                   generates that password per tab spawn, so the tap and the V30 push \
+                   authenticate with per-spawn credentials and the local server is no longer an \
+                   unauthenticated loopback surface.",
         depends_on: &[
+            Dep::ConfigKey("OPENCODE_SERVER_PASSWORD"),
+            Dep::ConfigKey("OPENCODE_SERVER_USERNAME"),
             Dep::Route("GET /event"),
             Dep::Route("GET /session/:id"),
             Dep::Route("POST /session/:id/message"),
-            Dep::Behavior("the server serves these routes with no Authorization header sent"),
         ],
-        wired_in: &["src-tauri/src/harness/opencode/read.rs"],
+        wired_in: &[
+            // Where the credential is generated and where the header is built.
+            "src-tauri/src/harness/opencode/config.rs",
+            // The tap and push that present it.
+            "src-tauri/src/harness/opencode/read.rs",
+            // The spec field that carries it from the spawn to the reader.
+            "src-tauri/src/harness/reader.rs",
+        ],
         degradation: Degradation::VisibleOff {
-            user_message: "OpenCode's local server now requires authentication — the live session \
-                           tap and the V30 push fanout are off until a token is wired.",
+            user_message: "OpenCode's local server no longer accepts cImp's credentials — the \
+                           live session tap and the V30 push fanout are off for OpenCode tabs \
+                           until the authentication scheme is rewired.",
         },
         drift_rule: &[],
         canary: None,
@@ -1191,6 +1359,16 @@ pub const CAPABILITIES: &[Capability] = &[
         drift_token: None,
     },
     // ── OpenCode: tool registry + plugin (Tiers C and D) ────────────────────
+    //
+    // **The live id set was re-verified on 2026-08-17** against the installed
+    // 1.18.13 and diffed against 1.18.18: `GET /experimental/tool/ids` answers the
+    // same 14 ids, so nothing this row watches has drifted. What DID change is
+    // cImp's side — the three ids that exist only behind experiment env flags
+    // (`execute`, `lsp`, `plan_exit`) are now classified rather than unexamined.
+    // They are invisible to this row's probe by construction (a default serve
+    // never lists them), so `harness::opencode::tools` carries a test of its own
+    // for them: the subtraction `live − (gated ∪ reviewed) = ∅` can say nothing
+    // about an id that is never live.
     Capability {
         id: "opencode.tool_registry",
         harness: Harness::OpenCode,
@@ -1227,6 +1405,13 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: None,
     },
+    // **Plugin API re-verified byte-identical at 1.18.18 on 2026-08-17** —
+    // discovery, ESM loading, `OPENCODE_PURE`, and every `Hooks` signature this
+    // row names. One thing worth writing down while looking at it: the published
+    // Hooks type declares `permission.ask`, and NOTHING upstream fires it. It is
+    // declared-but-dead, so no control may be built on it — a handler wired there
+    // would read like a permission gate and never run once (the note lives in
+    // `harness::opencode::tools`, beside the gate that IS real).
     Capability {
         id: "opencode.plugin.load_all",
         harness: Harness::OpenCode,
@@ -1442,17 +1627,21 @@ pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
 /// `src-tauri/src/read_hook.rs` ⇒ [`CAP_PRETOOLUSE_DENY`] — which was exact
 /// while every reporter was its own binary in its own file, and which Phase I
 /// leaned on to close Phase E's residual for the two beacons at zero cost.
-/// Phase J deleted the five shim files and moved four of the six reporters into
-/// one module, so the file-suffix inference has nothing left to discriminate on.
+/// Phase J deleted five shim files and moved four of the six reporters into
+/// one module, so the file-suffix inference had nothing left to discriminate on.
+/// 2026-08-17 finished the job: the last two shim files are gone too, so EVERY
+/// reporter now lives in `harness::claude::hook` and the column is the only
+/// attribution there is.
 /// Naming the token is the honest replacement: the tokens themselves are
 /// unchanged (a pre-upgrade tab still POSTs them from its old shim binary), and
 /// the tests below assert uniqueness in both directions.
 ///
-/// `None` therefore means one of two things, and both are real rather than
-/// defensive: a **forged** name, which lands in the loopback's
-/// `(unrecognized shim)` bucket; or `postedit_hook` — Phase A finding 2, the one
-/// converted hook that files no drift report at all, so its row names no drift
-/// rule and can never appear here.
+/// `None` therefore means a **forged** name, which lands in the loopback's
+/// `(unrecognized shim)` bucket. It used to mean one more thing —
+/// `postedit_hook`, Phase A finding 2's hook that filed no report at all — and
+/// since 2026-08-17 that row DOES report, under the deliberately different token
+/// `post_edit_hook`. The old spelling stays unattributed for the reason a forged
+/// name is: nothing ever sent it.
 pub fn capability_for_payload_shim(shim: &str) -> Option<&'static Capability> {
     if shim.is_empty() {
         return None;
@@ -1926,8 +2115,8 @@ mod tests {
         assert!(capabilities_for_rule("drift.no_such_rule.v1").is_empty());
     }
 
-    /// The six reporters that file payload drift each resolve to exactly one
-    /// row, through the [`Capability::drift_token`] column.
+    /// Every reporter that files payload drift resolves to exactly one row,
+    /// through the [`Capability::drift_token`] column.
     ///
     /// **The last two were V35 Phase I**, closing Phase E's accepted residual:
     /// `taint_beacon` and `checkpoint_beacon` report through the same route and
@@ -1942,10 +2131,13 @@ mod tests {
     /// the old shim and still POSTs these strings, so both paths must land on
     /// the same row.
     ///
-    /// The negative half is still the interesting one and is asserted by name:
-    /// `postedit_hook` is Phase A finding 2 (the one converted hook that never
-    /// reports at all, so its row names no rule), and a forged name must never
-    /// be pinned on a capability that did not report it.
+    /// **2026-08-17 closed Phase A finding 2 and kept its negative half.** The
+    /// auto-check route reports now, under `post_edit_hook` — but
+    /// `postedit_hook`, the name the deleted shim binary would have used had it
+    /// ever reported, must STILL resolve to nothing. Nothing on the wire can be
+    /// carrying it (that shim never reported), so treating it as this row's token
+    /// would only make a forged name attributable. The negative half is the
+    /// interesting one and is asserted by name.
     #[test]
     fn every_payload_shim_resolves_to_one_row() {
         for (shim, expect) in [
@@ -1953,6 +2145,7 @@ mod tests {
             ("compact_hook", "claude.hook.precompact"),
             ("read_hook", CAP_PRETOOLUSE_DENY),
             ("notify_hook", "claude.hook.notification"),
+            ("post_edit_hook", "claude.hook.posttooluse"),
             ("taint_beacon", "claude.hook.taint_beacon"),
             ("checkpoint_beacon", "claude.hook.checkpoint_beacon"),
         ] {
@@ -2001,8 +2194,10 @@ mod tests {
         assert_eq!(n, tokens.len(), "two rows claim the same drift token");
         // Six through Phase J (the five converted hooks' shim names plus the
         // two surviving beacons, minus the one that never reported); nine since
-        // Phase L, which added a reporter per migrated read capability.
-        assert_eq!(n, 9, "the reporter set changed without this test noticing");
+        // Phase L, which added a reporter per migrated read capability; ten since
+        // 2026-08-17, which closed Phase A finding 2 — the one that never
+        // reported now does.
+        assert_eq!(n, 10, "the reporter set changed without this test noticing");
     }
 
     /// The TCB column (milestone locked decision 10) is documentation, not a

@@ -1,7 +1,11 @@
 # The harness plugin layer
 
-**Status:** V35 phases A–M complete (2026-08-17). This document describes the
-layer *as it shipped*, and is the long-form twin of
+**Status:** V35 phases A–M complete (2026-08-17), plus the same-day
+capability-refresh batch: both harnesses re-audited against current upstream
+(Claude Code 2.1.233, OpenCode 1.18.18), the two Claude beacons and OpenCode
+server auth moved D → B, `PostToolUseFailure` wired, and the
+`claude.hook.posttooluse` drift gap closed. § 3.2 and § 11 reflect it. This
+document describes the layer *as it shipped*, and is the long-form twin of
 [`src-tauri/src/harness/README.md`](../src-tauri/src/harness/README.md).
 
 cImp rides two user-installed, aggressively self-updating CLIs it does not pin.
@@ -48,7 +52,8 @@ the places that matters.
   L1  Harness plugin   harness/claude/* · harness/opencode/*
                        + harness/render.rs · harness/reader.rs
                        THE ONLY PER-HARNESS ARTIFACT
-  L0  Harness          Claude Code (≥ 2.1.63) · OpenCode (1.18.13)
+  L0  Harness          Claude Code (≥ 2.1.63; verified 2.1.233)
+                       OpenCode (1.18.13; byte-identical surface at 1.18.18)
                        uncontrolled, self-updating
 ```
 
@@ -66,7 +71,7 @@ The real tree at HEAD:
 | `harness/claude/statusline.rs` | L1 | The Claude-shaped stdin payload `cimp --statusline` is handed (Tier C). |
 | `harness/opencode/plugin.rs` | L1 | cImp ▸ OpenCode: the generated plugin's key set, its values, when it is written or swept. |
 | `harness/opencode/templates/plugin.js` | L1 | **The emitted artifact itself**, as a real 645-line `.js` file with `{{cimp.*}}` slots. |
-| `harness/opencode/config.rs` | L1 | cImp ▸ OpenCode: `OPENCODE_CONFIG_CONTENT`, the managed instructions file, the pinned permission block. |
+| `harness/opencode/config.rs` | L1 | cImp ▸ OpenCode: `OPENCODE_CONFIG_CONTENT`, the managed instructions file, the pinned permission block, and (2026-08-17) the per-spawn server-auth env pair. |
 | `harness/opencode/tools.rs` | L1 | The reviewed table of OpenCode's **own** tool ids — what the plugin's gate and beacon match on. |
 | `harness/opencode/read.rs` | L1 | OpenCode's fallback reader — the `GET /event` SSE tap (Tier C). |
 | `harness/render.rs` | L1 | `{{key}}` substitution for text artifacts, and the one place a value gets JSON-quoted (`json_lit`). |
@@ -92,7 +97,8 @@ Three tests in `harness/layering.rs`:
   prose explaining the seam is wanted everywhere. `Dep::Flag` needles are
   deliberately excluded — a declared gap, because Claude's session-selection
   flags are still read in `tabs::config`. Exceptions are an explicit allowlist,
-  **nine files today**, each with a reason.
+  **seven files today** (2026-08-17: the two beacon shims retired theirs), each
+  with a reason.
 - **`harness_modules_do_not_import_capabilities`** — the direction is L1 → L2
   only. A file under `harness/` may not name `crate::graph`, `crate::tts`,
   `crate::usage` or `crate::workbench`. `UPWARD_EXEMPT` holds the **seven** that
@@ -154,13 +160,13 @@ The 24 rows of `CAPABILITIES` at HEAD. **Coverage** is the row's own
 | `claude.hook.user_prompt_submit` | Claude | B | Silent | waiver | drift token `context_hook` |
 | `claude.hook.precompact` | Claude | B | Silent | waiver | behavior half is spike D0 |
 | `claude.hook.pretooluse_deny` | Claude | B | FailClosed | — | the one **gated** row (`GATED`); spike E1 |
-| `claude.hook.posttooluse` | Claude | B | Silent | waiver | **recorded gap**: no V16 rule lags it at all |
+| `claude.hook.posttooluse` | Claude | B | Silent | waiver | gap closed 2026-08-17: `drift.payload.v1` lags it (token `post_edit_hook`) |
 | `claude.hook.notification` | Claude | B | Fallback → `perm.tui_scrape` | — | flat *and* nested payload shapes both parsed |
-| `claude.hook.taint_beacon` | Claude | **D** | Silent | waiver | **TCB** `taint.beacon.claude` — a `type:"command"` shim |
-| `claude.hook.checkpoint_beacon` | Claude | **D** | Silent | waiver | **TCB** `checkpoint.pre_mutation.claude` — ditto |
+| `claude.hook.taint_beacon` | Claude | B | Silent | waiver | **TCB** `taint.beacon.claude` — `type:"http"` since 2026-08-17 (shim deleted); D→B on the documented deny contract |
+| `claude.hook.checkpoint_beacon` | Claude | B | Silent | waiver | **TCB** `checkpoint.pre_mutation.claude` — ditto; handler completes the checkpoint before replying |
 | `perm.tui_scrape` | Claude | **D** | Silent | waiver | scraped TUI footer; user-editable patterns |
 | `claude.hook.stop` | Claude | B | Fallback → `claude.transcript.assistant_text` | waiver | Phase L; quiet-detected, witness `prompt` |
-| `claude.hook.tool_result` | Claude | B | Fallback → `claude.transcript.tool_result` | waiver | Phase L; witness `context.post_edit` |
+| `claude.hook.tool_result` | Claude | B | Fallback → `claude.transcript.tool_result` | waiver | Phase L; witness `context.post_edit`; + `PostToolUseFailure` (2026-08-17) so failures stay counted on serving tabs |
 | `claude.hook.subagent` | Claude | B | Fallback → `claude.transcript.subagents` | waiver | Phase L; **no witness**, and says why |
 | `claude.transcript.assistant_text` | Claude | C | Silent | canary + probe | the arbitrated fallback behind `Stop` |
 | `claude.transcript.usage` | Claude | C | Silent | canary + probe | **cannot move** — no hook carries token counts |
@@ -170,19 +176,25 @@ The 24 rows of `CAPABILITIES` at HEAD. **Coverage** is the row's own
 | `claude.statusline.stdin` | Claude | C | Silent | canary | **cannot move** — no hook carries a context window |
 | `claude.flag.settings_overlay` | Claude | B | Silent | probe + waiver | the delivery mechanism for every Claude hook row |
 | `claude.flag.session_id` | Claude | B | FailClosed | probe | downgraded in Phase E to what the code truly does |
-| `opencode.sse.events` | OpenCode | C | Silent | canary | OpenCode's **declared** fallback, and its whole read path |
+| `opencode.sse.events` | OpenCode | C | Silent | canary | OpenCode's **declared** fallback, and its whole read path; honors both `session.idle` (deprecated upstream) and `session.status` idle (2026-08-17) |
 | `opencode.route.push` | OpenCode | B | Silent | waiver | `noReply` losing its meaning is the dangerous half |
-| `opencode.route.noauth` | OpenCode | **D** | VisibleOff | probe | double-edged: auth arriving breaks the tap |
+| `opencode.route.noauth` | OpenCode | B | VisibleOff | probe | since 2026-08-17: per-spawn Basic auth (documented env pair) enforced and used by the tap/push; id kept, meaning inverted; probe proves both directions |
 | `opencode.tool_registry` | OpenCode | C | Silent | probe | allowlist-only ⇒ a new upstream tool ships **ungated** |
 | `opencode.plugin.load_all` | OpenCode | **D** | Silent | waiver | **TCB** `tool.gate` + `checkpoint.pre_mutation` + `taint.beacon` |
 
-Counts: 11 × Tier B, 8 × Tier C, 5 × Tier D, 0 × Tier A. 19 Claude rows, 5
-OpenCode rows.
+Counts: 14 × Tier B, 8 × Tier C, 2 × Tier D, 0 × Tier A. 19 Claude rows, 5
+OpenCode rows. (2026-08-17 moved three rows D → B; the two that remain Tier D
+are `perm.tui_scrape` — a scrape by construction, and only a fallback — and
+`opencode.plugin.load_all`, which is structural: nothing outside a harness can
+verify a control inside it ran.)
 
 ### 3.3 The rows that cannot climb the ladder
 
 Three Claude dependencies are Tier C **permanently-until-upstream-changes**, and
-that is upstream's constraint rather than a missing phase:
+that is upstream's constraint rather than a missing phase. (Re-verified
+2026-08-17 against the 2.1.233 docs: still no hook input carries token counts,
+a context window or rate limits; OTel export remains the only alternative
+surface, and it is an exporter, not a hook. § 11 keeps the wishlist.)
 
 - **`claude.transcript.usage`** and **`claude.statusline.stdin`** — *no Claude
   Code hook input carries token counts, a context window or a `rate_limits`
@@ -241,11 +253,11 @@ Read the tree, not the milestone table, on these four:
    `claude/templates/settings.json` line does not apply. The implemented rule is
    *text artifact ⇒ template with checked slots; structured artifact ⇒ build it
    structurally*, and the overlay stays `serde_json::Value`.
-4. **The beacons are Claude shims.** `taint.beacon` and
-   `checkpoint.pre_mutation` execute in `taint_beacon.rs` /
-   `checkpoint_beacon.rs` — Claude `PreToolUse` `type:"command"` hooks — as well
-   as inside the OpenCode plugin. Two harnesses, two enforcement sites, two
-   rows, two control ids. Decision 10's phrasing attributed both to plugin code.
+4. **The beacons were Claude shims** — the correction decision 10's phrasing
+   needed — and since 2026-08-17 they are Claude `type:"http"` `PreToolUse`
+   hooks whose handlers live in `offload/loopback.rs` (the shim binaries are
+   deleted, their argv flags tombstoned). Still two harnesses, two enforcement
+   sites, two rows, two control ids.
 
 ## 4. CHP in one page
 
@@ -400,7 +412,9 @@ loopback and no settings file. Its `Outcome` has four values and **only one is a
 failure**: `Pass`, `Fail` (the only non-zero exit), `Unknown` (could not be
 driven — CLI absent, no session to tail, no tool call in the window; reported
 with a reason, never counted as broken) and `Transition` (upstream changed *for
-the better*; OpenCode growing auth is the worked example). Modelling the last
+the better*; OpenCode growing auth WAS the worked
+example until the 2026-08-17 batch completed that transition — the variant is
+now declared-unconstructed, kept for the next one). Modelling the last
 two as failures would recreate exactly the alarm fatigue the milestone exists to
 remove — `drift.harness_version.v1` fired on every CLI auto-update until the
 rational response became clicking *Mark verified* without running anything.
@@ -565,10 +579,14 @@ JSON). It carries `hooks`, `statusLine` and, in native-web `deny` mode,
 **`type:"http"` hooks (Claude Code ≥ 2.1.63).** The harness POSTs its own
 hook-input JSON at `/claude/hook/<event>` and parses the 2xx JSON reply exactly
 as it parses a command hook's stdout. Phase J deleted the five shim binaries
-(1053 lines) that used to courier that payload; `harness/claude/hook.rs` is the
-receiving end. Nine routes are declared in `ROUTES`, and `chp_event` maps eight
-of them onto CHP events (only `SessionStart` maps to none — it *is* the
-negotiation), a join asserted total and reversible.
+(1053 lines) that used to courier that payload, and the 2026-08-17 batch
+deleted the last two (the beacons); `harness/claude/hook.rs` is the receiving
+end. Twelve routes are declared in `ROUTES`, and `chp_event` maps ten of them
+onto CHP events — `SessionStart` maps to none (it *is* the negotiation), and
+`PostToolUseFailure` maps to none deliberately: it is the error half of
+`session.tool_result`, and a second event would let a rare failure push re-arm
+the quiet detector watching the common success entry. The join stays asserted
+total, with both absences encoded in the test.
 
 **Identity rides headers, because a hook's body is the harness's.** Every
 emitted entry carries `X-CIMP-Tab` (caller-asserted, validated against the
@@ -609,15 +627,20 @@ advisor structurally unable to refuse a read by failing.
 PTY cImp renders, it is not a CHP capability, and two tests assert no overlay and
 no handler produces one.
 
-**The two surviving command shims.** `cimp --taint-beacon` and
-`cimp --checkpoint-beacon` stay `type:"command"` `PreToolUse` hooks with their
-own 5 s ceiling. They are report-only side effects with no reply to parse, so
-`type:"http"` bought them nothing — and the checkpoint one genuinely waits (2 s)
-for the app's reply, because "the checkpoint precedes the call" rests on Claude
-Code not starting the tool until the hook process exits. They are Tier D because
-that ordering, and the non-blocking-on-timeout semantic beside it, are
-undocumented. They live outside `harness/claude/` because they are separate
-process entry points, allowlisted in the literal scan with that reason.
+**The beacons, since 2026-08-17.** `cimp --taint-beacon` and
+`cimp --checkpoint-beacon` are gone — the two `PreToolUse` entries are
+`type:"http"` like everything else, and their handlers reach the same cores
+`/latch/beacon` and `/workbench/tool_checkpoint` serve (a source-scan test
+holds both transports of each capability to one core). Report-only is now
+structural: the handlers answer 2xx with no decision field on every path. The
+checkpoint handler finishes its work before it replies — a `PreToolUse` http
+hook blocks the tool call until the response, the documented mechanism that
+makes `deny` expressible — so the ordering the feature rests on is upstream's
+written contract rather than an observed behavior, and both rows moved D → B
+on it (a test pins the entry's 5 s ceiling above the app's own 1800 ms budget).
+The deleted argv flags stay tombstoned — an unrecognized flag would fall
+through to the GUI launch path — so a pre-upgrade tab's overlay fails open and
+reports `old_plugin` instead of misbehaving.
 
 **The fallback reader still owns real work.** `harness/claude/read.rs` is
 arbitrated *off* per tab for `assistant_text`, `session.tool_result` and
@@ -895,9 +918,10 @@ beacon rows. The taint beacon and the checkpoint each run in *two* enforcement
 sites, on two harnesses, in two source files, with two different failure modes —
 folding them onto one id would have made the column say "enforcement lives
 here", singular, about a row that is only half of it. `tool.gate` stays
-OpenCode-only, and that is a fact rather than a gap: Claude Code's `PreToolUse`
-shims are report-only by V32 locked decision 14 and are structurally incapable
-of denying.
+OpenCode-only, and that is a fact rather than a gap: Claude's beacon hooks are
+report-only by V32 locked decision 14, and structurally so since 2026-08-17 —
+their handlers emit no decision field on any path, so there is nothing for a
+deny to ride on.
 
 **`serves` is not a trust claim.** An artifact declaring
 `serves: ["tool.gate"]` has said nothing cImp relies on. The gate's authority
@@ -941,3 +965,51 @@ promotion to a committed fixture stays manual and reviewed. The L2 probes read
 real transcripts and print **counts and field names only** — never a payload
 value, never a transcript path, never a session id; the one exception is the CLI
 build string, which is harness metadata.
+
+## 11. The upstream wishlist
+
+Everything cImp is waiting on a harness for, in one place — each item tied to
+the row it would move and re-checked on every capability audit. This section
+used to live scattered across § 3.3, the reserved `chp::EVENTS` entries and
+individual waiver texts; those stay authoritative, this is the checklist.
+**Last checked 2026-08-17** (Claude Code 2.1.233 docs + changelog; OpenCode
+1.18.18 source).
+
+**Waiting on Claude Code:**
+
+| Missing upstream | Would unlock | Row / reserved event |
+|---|---|---|
+| Token usage in any push surface (a usage block in a hook payload, on `Stop`, or on `SessionEnd`) | `claude.transcript.usage` C → B; `session.usage` goes live | reserved `session.usage` (`live: false`) |
+| Context-window / rate-limit data in a hook | `claude.statusline.stdin` C → B; `session.context` goes live | reserved `session.context` |
+| Sub-agent token usage on `SubagentStop`, or a payload naming the sub-agent transcript path | completes the Phase L sub-agent migration (lifecycle already pushed) | `claude.transcript.subagents` |
+| Pushed session identity (`version`, `isSidechain`, `isMeta`) | retires `claude.transcript.identity`; gives the `harness_version` stale-kind its Claude producer | `claude.transcript.identity` |
+| Compaction metrics on `PostCompact` | compaction observability without the transcript | — |
+| A stable, documented transcript format | moot if the rows above land; upstream now **explicitly documents the JSONL as unstable**, and 2.1.210 shipped a transcript-compression change | every `claude.transcript.*` |
+
+**Waiting on OpenCode:**
+
+| Missing upstream | Would unlock | Row |
+|---|---|---|
+| A whole-message completion hook (`experimental.text.complete` graduating, plus a message-level signal beside it) | assistant text C → B without changing the unit the sentence segmenter is fed (§ 3.3) | `opencode.sse.events` |
+| `permission.ask` actually firing (declared in the plugin types; **zero trigger sites** at 1.18.18) | dynamic permission interception instead of the gate's `throw` | `opencode.plugin.load_all` |
+| The harness version exposed to plugins | the OpenCode `harness_version` producer | — |
+| A stable tool-enumeration API (`/experimental/tool/ids` is explicitly experimental) | de-risks the registry probe | `opencode.tool_registry` |
+
+**Flipped into cImp's court by the 2026-08-17 audit** — upstream already ships
+these; the missing half is now a cImp consumer:
+
+- **OpenCode real token accounting.** `message.updated` carries actual provider
+  `info.tokens` / `cost` (per-step via `step-finish` parts; session totals are a
+  DB projection, pollable but not pushed). cImp's OpenCode usage is still
+  estimate-only from tool-call input args. Caveats recorded from the source
+  audit: message-level `tokens` is the *last step's* usage, not a sum — per-step
+  accumulation is the honest reading.
+- **Claude `PermissionRequest` hook event** (new since 2.1.63) — could shrink
+  what the `perm.tui_scrape` fallback has to cover.
+
+**Watch items** (breaks, not features): OpenCode 2.0 **renames the `bash` tool
+id** (stated in upstream source, `tool/shell/id.ts`); `session.idle` is
+deprecated in the upstream schema (the reader honors its replacement,
+`session.status`, since 2026-08-17); `opencode run` declares but ignores
+`--port`; and the `auth_token` query param **beats** a correct `Authorization`
+header when both are sent — cImp sends header-only.

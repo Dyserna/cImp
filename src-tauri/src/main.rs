@@ -5,7 +5,6 @@ mod advisor;
 mod attach;
 mod audio;
 mod audit;
-mod checkpoint_beacon;
 mod checks;
 mod content;
 mod error;
@@ -35,7 +34,6 @@ mod statusline;
 mod stt;
 mod sysmon;
 mod tabs;
-mod taint_beacon;
 mod theming;
 mod tts;
 mod usage;
@@ -144,8 +142,6 @@ MAINTENANCE:
 
 SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --statusline                           Claude Code status-line renderer
-  --taint-beacon --tab <id>              PreToolUse native-web beacon shim (report-only)
-  --checkpoint-beacon --tab <id>         PreToolUse pre-mutation checkpoint shim (report-only)
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
                                          stdio MCP server (offload + graph + proxied servers)
   --code-audit-mcp [--consumer <name>] [--tab <id>]
@@ -245,37 +241,54 @@ fn main() {
         return;
     }
 
-    // ── V35 Phase J: the five hook shims are GONE, and these are TOMBSTONES ──
+    // ── V35 Phase J: the hook shims are GONE, and these are TOMBSTONES ───────
     //
     // `--context-hook`, `--precompact-hook`, `--read-hook`, `--postedit-hook`
     // and `--notify-hook` were five stateless binaries that carried a payload
     // from stdin to the loopback and a reply back to stdout. Claude Code 2.1.63's
     // `type: "http"` hooks let the harness do that itself, so the overlay now
     // emits `type: "http"` entries pointing at `/claude/hook/*` and the shim
-    // logic lives in `harness::claude_hook` + `offload::loopback`.
+    // logic lives in `harness::claude::hook` + `offload::loopback`.
+    //
+    // **2026-08-17 added the last two.** `--taint-beacon` and
+    // `--checkpoint-beacon` were the two Phase J left behind; both are now
+    // `type: "http"` entries too (`/claude/hook/pre_tool_use_taint`,
+    // `/claude/hook/pre_tool_use_checkpoint`) and `taint_beacon.rs` /
+    // `checkpoint_beacon.rs` are deleted.
     //
     // **The flags must not simply vanish, and this is why.** A `--settings`
     // overlay is written at TAB LAUNCH: a Claude tab open across this upgrade is
-    // still configured to run `cimp --context-hook` on every prompt. If the flag
-    // stopped being recognised, `main()` would fall through to the normal
-    // startup path and every prompt in that tab would launch a whole second cImp
-    // GUI. So each flag still terminates the process quietly: drain stdin (the
-    // harness writes the payload and can block on a full pipe otherwise), print
-    // nothing, exit 0 — which for every one of the five is the documented
-    // fail-open answer. The old tab keeps working, inert: no injection, no
-    // advisor, no auto-check, permission detection falls back to the TUI regex.
-    // Restart the tab and it gets the http hooks.
+    // still configured to run `cimp --context-hook` on every prompt and
+    // `cimp --taint-beacon` on every `WebFetch`. If a flag stopped being
+    // recognised, `main()` would fall through to the normal startup path and
+    // every such call would launch a whole second cImp GUI. So each flag still
+    // terminates the process quietly: drain stdin (the harness writes the payload
+    // and can block on a full pipe otherwise), print nothing, exit 0 — which for
+    // every one of the seven is the documented fail-open answer. The old tab
+    // keeps working, inert: no injection, no advisor, no auto-check, no taint
+    // beacon, no pre-tool checkpoint, and permission detection falls back to the
+    // TUI regex. Restart the tab and it gets the http hooks.
     //
-    // REMOVABLE ONE RELEASE AFTER V35 — by then no overlay that names them can
-    // still be in force, because a tab cannot outlive two upgrades unrestarted
-    // without the *Harness health* panel having reported it as `old_plugin` the
-    // whole time (`chp::expects_chp` answers `true` for Claude from Phase J).
-    const RETIRED_HOOK_FLAGS: [&str; 5] = [
+    // The inert beacons are the one consequence worth naming, because they are
+    // security-relevant: until such a tab is restarted its native `WebFetch` is
+    // unobserved (the PROXIED half of the latch still catches everything routed
+    // through cImp) and its edits get no per-call rewind point (the prompt-level
+    // checkpoints remain). *Harness health* reports the tab as `old_plugin` for
+    // exactly as long as that is true.
+    //
+    // REMOVABLE ONE RELEASE AFTER the release that deletes each shim — by then no
+    // overlay that names it can still be in force, because a tab cannot outlive
+    // two upgrades unrestarted without the *Harness health* panel having reported
+    // it as `old_plugin` the whole time (`chp::expects_chp` answers `true` for
+    // Claude from Phase J).
+    const RETIRED_HOOK_FLAGS: [&str; 7] = [
         "--context-hook",
         "--precompact-hook",
         "--read-hook",
         "--postedit-hook",
         "--notify-hook",
+        "--taint-beacon",
+        "--checkpoint-beacon",
     ];
     if std::env::args()
         .skip(1)
@@ -283,38 +296,6 @@ fn main() {
     {
         let mut sink = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut sink);
-        return;
-    }
-
-    // V32 Phase F (locked decision 14): Claude Code invokes
-    // `cimp --taint-beacon --tab <id>` as a `PreToolUse` hook matched on
-    // `WebFetch|WebSearch` only. It POSTs to the app's loopback
-    // `/latch/beacon`, engaging that tab's EXTERNAL taint latch — the harness's
-    // own web tools bypass cImp's proxy entirely and would otherwise be
-    // invisible to containment. Report-only: like `--notify-hook` it is
-    // GUI-free, never writes to stdout/stderr, and always returns normally, so
-    // it cannot deny a tool call however badly the app is behaving.
-    if std::env::args().skip(1).any(|a| a == "--taint-beacon") {
-        taint_beacon::run();
-        return;
-    }
-
-    // V33 Phase F: Claude Code invokes `cimp --checkpoint-beacon --tab <id>` as
-    // a `PreToolUse` hook matched on `Edit|Write|MultiEdit|Bash`. It POSTs to
-    // the app's loopback `/workbench/tool_checkpoint`, which takes a Workbench
-    // checkpoint attributed to that exact call so the Timeline can rewind to
-    // just before it. Report-only: GUI-free, never writes to stdout/stderr and
-    // always returns normally, so it cannot deny an edit however badly the app
-    // is behaving.
-    //
-    // It does DIVERGE from `--taint-beacon` in one deliberate way: it waits for
-    // the app's reply (2 s) instead of firing and forgetting, because Claude
-    // starts the tool the moment the hook exits and a checkpoint taken
-    // concurrently with the edit is a checkpoint of the damage. Past the
-    // deadline the app writes nothing and records the miss. See
-    // `checkpoint_beacon`'s module doc.
-    if std::env::args().skip(1).any(|a| a == "--checkpoint-beacon") {
-        checkpoint_beacon::run();
         return;
     }
 

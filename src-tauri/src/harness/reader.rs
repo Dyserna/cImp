@@ -65,7 +65,28 @@ pub enum OobSpec {
     },
     /// Subscribe to an OpenCode TUI's event stream on this loopback port (the
     /// `--port` cImp launched the TUI with).
-    OpenCodeEvent { port: u16 },
+    OpenCodeEvent {
+        port: u16,
+        /// 2026-08-17: the `Authorization: Basic …` value every call this reader
+        /// makes against that server must carry, because cImp now spawns the
+        /// child with a per-spawn `OPENCODE_SERVER_PASSWORD` (capability
+        /// `opencode.route.noauth`, Tier D → B).
+        ///
+        /// Carried on the SPEC rather than looked up by the reader, for the same
+        /// reason `pinned_session` is: the credential the child was spawned with
+        /// is a fact about *this launch*, and a reader that re-derived it could
+        /// authenticate against a value the running server never read (the
+        /// password is snapshotted at module load in the child). It travels with
+        /// the port it belongs to.
+        ///
+        /// `None` = that child's server is unauthenticated, which is what a
+        /// launch whose composed environment carries no password means. Never a
+        /// URL parameter and never argv:
+        /// `harness::opencode::config::server_basic_auth` builds a header, and
+        /// upstream's `auth_token` query param is deliberately unused (a
+        /// present-but-wrong one wins over a correct header and 401s).
+        auth: Option<String>,
+    },
 }
 
 /// Everything an out-of-band adapter needs to feed TTS + avatar state for one
@@ -103,9 +124,16 @@ pub fn spawn(spec: OobSpec, ctx: OobContext) {
             debug!(tab = ?ctx.tab, ?project_dir, ?pinned_session, "spawning Claude transcript OOB source");
             tauri::async_runtime::spawn(claude::read::run(project_dir, pinned_session, ctx));
         }
-        OobSpec::OpenCodeEvent { port } => {
-            debug!(tab = ?ctx.tab, port, "spawning OpenCode event OOB source");
-            tauri::async_runtime::spawn(opencode::read::run(port, ctx));
+        OobSpec::OpenCodeEvent { port, auth } => {
+            // The credential itself is never logged — only whether there is one,
+            // which is the fact worth having when a tap starts 401ing.
+            debug!(
+                tab = ?ctx.tab,
+                port,
+                authenticated = auth.is_some(),
+                "spawning OpenCode event OOB source"
+            );
+            tauri::async_runtime::spawn(opencode::read::run(port, auth, ctx));
         }
     }
 }

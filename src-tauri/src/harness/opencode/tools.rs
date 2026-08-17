@@ -21,7 +21,9 @@ use crate::offload::toolclass::ToolClass;
 
 // ── V32 Phase H — OpenCode's OWN native tool names ─────────────────────────
 
-/// The OpenCode 1.18.13 native tool ids, classified for the Phase H gate.
+/// The OpenCode 1.18.13 native tool ids, classified for the Phase H gate —
+/// **re-verified live against 1.18.18 on 2026-08-17**, where every
+/// integration-relevant upstream file is byte-identical to 1.18.13.
 ///
 /// # Why this is a SECOND table and not more rows in [`crate::offload::toolclass::TABLE`]
 ///
@@ -47,6 +49,32 @@ use crate::offload::toolclass::ToolClass;
 /// load-bearing: it *replaces* `edit`/`write` on OpenAI-provider models, so a
 /// list naming only `edit`/`write` would leave the whole mutation surface open
 /// on exactly those tabs.
+///
+/// **The sourced set, re-verified live on 2026-08-17** against the installed
+/// 1.18.13 (and diffed against 1.18.18, where every integration-relevant
+/// upstream file is byte-identical): a default `opencode serve` answers exactly
+/// `["invalid","question","bash","read","glob","grep","edit","write","task",`
+/// `"webfetch","todowrite","websearch","skill","apply_patch"]`. Three more ids
+/// exist in the binary behind experiment env flags and are therefore **absent
+/// from that route's answer** — `execute`, `lsp` and `plan_exit`. The probe can
+/// only ever see the default set, so those three are classified here from the
+/// source rather than from the route: an experiment a user switches on must not
+/// be the thing that opens an ungated surface. `list`, `todoread` and `patch`
+/// are served by no current build (`apply_patch` superseded `patch`).
+///
+/// **UPSTREAM 2.0 WATCH ITEM.** `tool/shell/id.ts` pins the tool id `bash` with
+/// a comment saying it will be RENAMED at opencode 2.0. When that lands, the
+/// live probe reports `bash` as declared-but-not-served (a note, not a failure —
+/// see `probe::tool_registry_outcome`) *and* the new name as UNCLASSIFIED (a
+/// failure). Both halves are the intended reading: the next audit should expect
+/// them, classify the new id here, and keep `bash` for the same
+/// costs-nothing-and-closes-it reason `patch` is kept.
+///
+/// **`permission.ask` is declared-but-never-fires upstream** (checked
+/// 2026-08-17 in the plugin `Hooks` type at both versions): it is part of the
+/// published plugin API and no code path emits it. Nothing here or in
+/// [`crate::harness::opencode::plugin`] may be built on it — a handler wired to
+/// it would look like a permission control and never run once.
 /// **V33 Phase F added the third element, `mutates_fs`** — the same axis
 /// [`crate::offload::toolclass::ClassRow::mutates_fs`] carries in [`crate::offload::toolclass::TABLE`], for the same consumer (the
 /// pre-tool checkpoint). It is a THIRD element rather than a second table
@@ -66,6 +94,25 @@ pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
     // name the harness does not serve costs nothing and closes it in advance.
     ("patch", ToolClass::LocalCapability, true),
     ("apply_patch", ToolClass::LocalCapability, true),
+    // ── Experiment-gated ids (2026-08-17), absent from a default serve ───────
+    //
+    // Both exist in the installed binary but are only registered when their
+    // experiment env flag is set, so `GET /experimental/tool/ids` never lists
+    // them and the live probe cannot classify them for us. Gating them here is
+    // the same costs-nothing move as `patch` above, with a sharper reason: a
+    // user who switches an experiment on must not thereby open an UNGATED
+    // mutation/exec surface. The gate is allowlist-only, so the alternative is
+    // not "gated later" — it is "never gated".
+    //
+    // `OPENCODE_EXPERIMENTAL_CODE_MODE`: the code-mode tool. It EXECUTES code,
+    // so it gets `bash`'s posture exactly — local capability, mutating — because
+    // anything that can run code can rewrite the tree and reach the network.
+    ("execute", ToolClass::LocalCapability, true),
+    // `OPENCODE_EXPERIMENTAL_LSP_TOOL`: language-server queries over the project
+    // (hover/definition/diagnostics). Reads private project data ⇒ local
+    // capability; changes nothing on disk ⇒ not mutating, exactly like
+    // `read`/`glob`/`grep`.
+    ("lsp", ToolClass::LocalCapability, false),
     // The harness's own web tools — the EXTERNAL side of the same boundary.
     // Neither writes to the project tree, so neither checkpoints.
     ("webfetch", ToolClass::External, false),
@@ -90,8 +137,8 @@ pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
 ///   locked decision 8: a probe that cries wolf gets ignored, which is the
 ///   exact fate of the version tripwire this milestone exists to fix.)
 ///
-/// All five entries were already reviewed and written down; moving them here
-/// changes no gating behavior whatsoever (the plugin builder reads
+/// The five original entries were already reviewed and written down; moving them
+/// here changed no gating behavior whatsoever (the plugin builder reads
 /// [`opencode_native_names`] / [`opencode_native_mutating_names`], neither of
 /// which consults this list). Adding a row here IS a security decision and
 /// belongs in review, exactly like adding one to the table.
@@ -121,6 +168,16 @@ pub const OPENCODE_NATIVE_REVIEWED_UNGATED: &[(&str, &str)] = &[
         "invalid",
         "no file access, no process execution, no egress — see `skill`. (The harness's own \
          placeholder for an unresolvable tool call.)",
+    ),
+    (
+        "plan_exit",
+        "no file access, no process execution, no egress — see `skill`. Plan-mode bookkeeping: it \
+         announces that the model wants to leave plan mode, and the mode switch itself is the \
+         harness's, not a capability. Experiment-gated \
+         (`OPENCODE_EXPERIMENTAL_PLAN_MODE`, plus a cli client), so it is absent from \
+         `GET /experimental/tool/ids` on a default serve and reviewed here from the source — its \
+         two experiment siblings, `execute` and `lsp`, ARE gated in the table above, which is the \
+         difference this list exists to record.",
     ),
 ];
 
@@ -212,6 +269,13 @@ mod tests {
             "write",
             "patch",
             "apply_patch",
+            // 2026-08-17, the experiment-gated pair. They are in this list for
+            // the same reason the whole-surface property exists: a local
+            // capability the gate does not name is one the model can reach for
+            // after a taint, and an experiment flag is a user setting rather
+            // than a boundary.
+            "execute",
+            "lsp",
         ] {
             assert!(local.contains(&n), "{n} missing from the local set");
             assert_eq!(
@@ -220,7 +284,7 @@ mod tests {
                 "{n}"
             );
         }
-        assert_eq!(local.len(), 8, "got: {local:?}");
+        assert_eq!(local.len(), 10, "got: {local:?}");
 
         let web = opencode_native_names(ToolClass::External);
         assert_eq!(web, vec!["webfetch", "websearch"]);
@@ -240,14 +304,19 @@ mod tests {
         let mutating = opencode_native_mutating_names();
         assert_eq!(
             mutating,
-            vec!["bash", "edit", "write", "patch", "apply_patch"],
+            // `execute` joined on 2026-08-17: the code-mode tool runs arbitrary
+            // code, so it can rewrite the tree by definition — `bash`'s posture,
+            // for `bash`'s reason.
+            vec!["bash", "edit", "write", "patch", "apply_patch", "execute"],
             "the pre-tool checkpoint set changed — every member is a name that \
              can rewrite the project tree, and every non-member is one that cannot"
         );
         // Reads are local capability and do NOT mutate: the two axes are
         // independent, which is the whole reason `mutates_fs` is a column of
-        // its own rather than being inferred from the class.
-        for n in ["read", "glob", "grep"] {
+        // its own rather than being inferred from the class. `lsp` is the
+        // 2026-08-17 addition to that half — it queries a language server about
+        // the project and writes nothing.
+        for n in ["read", "glob", "grep", "lsp"] {
             assert_eq!(
                 opencode_native_class(n),
                 Some(ToolClass::LocalCapability),
@@ -290,5 +359,32 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate id in the reviewed list");
+    }
+
+    /// 2026-08-17: the three EXPERIMENT-GATED upstream ids are classified, and
+    /// each lands on the side its capability earns.
+    ///
+    /// They need a test of their own precisely because the live probe cannot
+    /// give them one: `GET /experimental/tool/ids` on a default serve does not
+    /// list them, so the `live − (gated ∪ reviewed) = ∅` subtraction says
+    /// nothing about them either way. Without this, dropping a row for
+    /// `execute` would leave the code-mode tool ungated and every other check
+    /// in this file green.
+    #[test]
+    fn the_experiment_gated_ids_are_classified_even_though_no_probe_sees_them() {
+        let gated = |n: &str| OPENCODE_NATIVE_TABLE.iter().any(|(id, _, _)| *id == n);
+        let reviewed = |n: &str| OPENCODE_NATIVE_REVIEWED_UNGATED.iter().any(|(id, _)| *id == n);
+        for n in ["execute", "lsp", "plan_exit"] {
+            assert!(
+                gated(n) || reviewed(n),
+                "`{n}` is an upstream tool id behind an experiment flag and is classified in \
+                 NEITHER list — the table is allowlist-only, so it would ship UNGATED the moment \
+                 a user sets that flag"
+            );
+        }
+        // …and the split is the one that was reviewed: the two capabilities are
+        // gated, the bookkeeping one is not.
+        assert!(gated("execute") && gated("lsp"), "a capability lost its gate");
+        assert!(reviewed("plan_exit"), "plan_exit is a recorded decision, not a gate");
     }
 }

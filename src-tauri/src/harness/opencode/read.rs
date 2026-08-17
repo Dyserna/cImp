@@ -10,6 +10,12 @@
 //!   * `message.part.delta` — `properties.{messageID,partID,field,delta}`.
 //!     `field:"text"` is speakable prose; `field:"reasoning"` is skipped.
 //!   * `session.idle` — the turn finished; flush anything still buffered.
+//!     **Deprecated upstream, still emitted** (2026-08-17, verified live on
+//!     1.18.13 and diffed against 1.18.18).
+//!   * `session.status` — `properties.status.type` is `"busy"` or `"idle"`; the
+//!     idle one is `session.idle`'s replacement and both may arrive for the same
+//!     turn-over. Handled identically, and a second arrival is a no-op
+//!     ([`Tracker::close_turn`]).
 //!
 //! We accumulate text deltas per assistant message and flush (segment → speak)
 //! when that message completes, so each assistant message is spoken as soon as
@@ -84,7 +90,7 @@ const LIVE_MARK_INTERVAL_MS: i64 = 5_000;
 /// Subscribe to the OpenCode event stream on `port` and drive TTS + avatar
 /// state until the tab's cancel token fires. Reconnects on stream errors (the
 /// TUI may not have bound the port yet at launch, or may restart its server).
-pub async fn run(port: u16, ctx: OobContext) {
+pub async fn run(port: u16, auth: Option<String>, ctx: OobContext) {
     // V28: clear this tab's live-session registry entry on every exit path, so a
     // closed OpenCode tab stops being reported live without waiting out the TTL.
     // Mirrors `claude::LiveSessionGuard`. Only the TAB-keyed entry is dropped —
@@ -94,7 +100,17 @@ pub async fn run(port: u16, ctx: OobContext) {
     // No request timeout: this is a long-lived stream. (reqwest's default
     // builder sets none; we read with explicit cancel-aware selects instead.)
     // Push POSTs set their own per-request `PUSH_TIMEOUT` on the same client.
-    let client = match reqwest::Client::builder().build() {
+    let client = match reqwest::Client::builder()
+        // 2026-08-17: the tab's server credential rides the CLIENT, not each
+        // call site, and that is a contract rather than a convenience: every
+        // request this reader makes goes through this one client, so a call site
+        // added later cannot forget the header and 401 silently. reqwest applies
+        // default headers to the SSE `GET /event` too — the one route where a
+        // missing credential would look like "the TUI has not bound the port
+        // yet" and be retried forever.
+        .default_headers(auth_headers(&auth))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             warn!(tab = ?ctx.tab, error = %e, "OpenCode OOB: client build failed");
@@ -143,6 +159,31 @@ pub async fn run(port: u16, ctx: OobContext) {
             _ = sleep(RECONNECT_DELAY) => {}
         }
     }
+}
+
+/// 2026-08-17: the default header set for one tab's server client.
+///
+/// `Authorization: Basic base64("opencode:<per-spawn password>")` when this tab's
+/// child was spawned with a password (capability `opencode.route.noauth`), and an
+/// empty set when it was not — an unauthenticated server ignores the header, but
+/// sending a credential nobody asked for is exactly the kind of thing that turns
+/// into a 400 on a future build.
+///
+/// The value is marked SENSITIVE, so reqwest redacts it from every `Debug` render
+/// of a request or of the client itself — the same posture as the loopback bearer
+/// token, and the reason this is a function rather than an inline builder call.
+/// An unrepresentable header value (impossible for base64, defensive against a
+/// future credential shape) degrades to no header rather than to a panic: a
+/// reader must never break a tab's launch.
+fn auth_headers(auth: &Option<String>) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = auth {
+        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(value) {
+            v.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+    }
+    headers
 }
 
 /// V28: RAII cleanup of an OpenCode tab's TAB-keyed live-session registry entry
@@ -690,9 +731,13 @@ async fn forward_push(
             ),
         }
     }
-    // Same client, same host, no auth — mirrors the `/event` GET above, which is
-    // the only other request cImp makes against a tab's OpenCode server (the TUI
-    // binds loopback-only and requires no credentials).
+    // Same client, same host, same credential — the client carries this tab's
+    // `Authorization: Basic …` as a default header (see [`auth_headers`]), so
+    // this POST, the `/event` GET and the `GET /session/:id` probe above all
+    // authenticate identically against the server cImp spawned. A 401 here is
+    // therefore a real contract break rather than a missing header, and it lands
+    // in the `warn!` below, which is what `opencode.route.noauth`'s `VisibleOff`
+    // degradation is written against.
     //
     // RISK (V30 Phase D, unresolved by design): `noReply: true` is
     // source-verified in OpenCode 1.18.13 — it persists the message into the
@@ -845,21 +890,56 @@ impl Tracker {
                         .push_str(delta);
                 }
             }
-            "session.idle" => {
-                self.flush_all(ctx).await;
-                self.set_working(ctx, false);
-                // Turn over: whatever part state is still buffered belongs to
-                // messages that will never flush (user echoes, tool parts).
-                // Without this a long-lived session accumulates every part it
-                // ever streamed. `assistant`/`flushed` are kept — they hold
-                // only message ids (small) and guard against double-speaking.
-                self.part_text.clear();
-                self.part_snapshot.clear();
-                self.part_type.clear();
-                self.msg_parts.clear();
+            // Both turn-over signals, deliberately. `session.idle` is marked
+            // DEPRECATED in the upstream schema and is still actively emitted
+            // (verified live on the installed 1.18.13 and diffed against
+            // 1.18.18, 2026-08-17) alongside its replacement `session.status`,
+            // so a single turn can raise BOTH. Honouring only the deprecated one
+            // would go mute the day upstream drops it — the Tier-C failure mode
+            // this whole layer exists to make legible — and honouring only the
+            // new one would go mute on every currently-installed build.
+            "session.idle" => self.close_turn(ctx).await,
+            "session.status" => {
+                // `properties.status.type` is `"busy"` or `"idle"`. Only idle
+                // closes the turn: a busy status is the OPENING of one, and
+                // flushing there would speak a message mid-stream. An absent or
+                // unrecognized value does nothing, which is the reader's
+                // standing leniency — a new status value must never break a
+                // user's turn.
+                let status = props
+                    .get("status")
+                    .and_then(|s| s.get("type"))
+                    .and_then(Value::as_str);
+                if status == Some("idle") {
+                    self.close_turn(ctx).await;
+                }
             }
             _ => {}
         }
+    }
+
+    /// The turn is over: speak whatever is still buffered, release the Thinking
+    /// edge, and drop the per-turn part state.
+    ///
+    /// Called from BOTH turn-over signals, which is why it is a function rather
+    /// than the body of one match arm: the two must not be able to drift, and a
+    /// second call for the same turn must be a no-op. It is one, structurally
+    /// rather than by a flag — [`Self::flush_all`] skips already-`flushed`
+    /// message ids, [`Self::set_working`] is edge-triggered, and clearing an
+    /// already-cleared map speaks nothing. Pinned by
+    /// `both_turn_over_signals_do_not_double_speak`.
+    async fn close_turn(&mut self, ctx: &OobContext) {
+        self.flush_all(ctx).await;
+        self.set_working(ctx, false);
+        // Turn over: whatever part state is still buffered belongs to
+        // messages that will never flush (user echoes, tool parts).
+        // Without this a long-lived session accumulates every part it
+        // ever streamed. `assistant`/`flushed` are kept — they hold
+        // only message ids (small) and guard against double-speaking.
+        self.part_text.clear();
+        self.part_snapshot.clear();
+        self.part_type.clear();
+        self.msg_parts.clear();
     }
 
     /// V28 (issue #13) — OpenCode's half of the per-tab session identity.
@@ -1233,6 +1313,179 @@ mod tests {
             sig.try_recv(),
             Ok(StateSignal::ClaudeOutputStopped { .. })
         ));
+    }
+
+    // ── 2026-08-17: `session.status` is the turn-over signal too ───────────
+
+    /// The FUTURE state, and the reason this branch exists: `session.idle` is
+    /// deprecated upstream, so a build that stops emitting it must still close
+    /// the turn. With `session.status` idle alone, everything a turn-over does
+    /// still happens — the buffered message is spoken and Thinking is released.
+    #[tokio::test]
+    async fn session_status_idle_alone_closes_the_turn() {
+        let (ctx, mut tts_rx, mut sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Status closed it."}}"#),
+            &ctx,
+        )
+        .await;
+        // No `session.idle` anywhere in this stream.
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}"#),
+            &ctx,
+        )
+        .await;
+        match tts_rx.try_recv() {
+            Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Status closed it."),
+            other => panic!("expected the turn to flush, got {other:?}"),
+        }
+        assert!(matches!(
+            sig.try_recv(),
+            Ok(StateSignal::ClaudeOutputStarted { .. })
+        ));
+        assert!(
+            matches!(sig.try_recv(), Ok(StateSignal::ClaudeOutputStopped { .. })),
+            "a status-idle turn-over must release the Thinking edge"
+        );
+    }
+
+    /// A `busy` status is the OPENING of a turn, not its end: flushing there
+    /// would speak a message while it is still streaming, and the rest of the
+    /// deltas would then be dropped by the `flushed` latch.
+    #[tokio::test]
+    async fn session_status_busy_does_not_flush() {
+        let (ctx, mut tts_rx, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Half a sen"}}"#),
+            &ctx,
+        )
+        .await;
+        // Another busy tick mid-stream (the real stream emits these).
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(
+            tts_rx.try_recv().is_err(),
+            "a busy status must not flush a still-streaming message"
+        );
+        // …and an unrecognized status value is inert too (leniency: a new
+        // upstream status must never break a user's turn).
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"compacting"}}}"#),
+            &ctx,
+        )
+        .await;
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_1"}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(tts_rx.try_recv().is_err(), "only `idle` closes the turn");
+        // The turn still closes when the real signal lands — proving the two
+        // asserts above are about the status VALUE, not about a wedged tracker.
+        t.handle(
+            &ev(r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}"#),
+            &ctx,
+        )
+        .await;
+        assert!(matches!(
+            tts_rx.try_recv(),
+            Ok(TtsRequest::Synthesize { .. })
+        ));
+    }
+
+    /// TODAY's state: both signals arrive for one turn-over. The second one must
+    /// be a harmless no-op — one utterance, one Thinking release — or every
+    /// OpenCode turn on a current build would be spoken twice.
+    #[tokio::test]
+    async fn both_turn_over_signals_do_not_double_speak() {
+        for order in [
+            [
+                r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#,
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}"#,
+            ],
+            // Either arrival order — nothing upstream promises which lands first.
+            [
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}"#,
+                r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#,
+            ],
+        ] {
+            let (ctx, mut tts_rx, mut sig) = ctx_with("opencode");
+            let mut t = Tracker::default();
+            t.handle(
+                &ev(r#"{"type":"message.updated","properties":{"info":{"id":"m1","role":"assistant","time":{}}}}"#),
+                &ctx,
+            )
+            .await;
+            t.handle(
+                &ev(r#"{"type":"message.part.delta","properties":{"messageID":"m1","partID":"p1","field":"text","delta":"Spoken once."}}"#),
+                &ctx,
+            )
+            .await;
+            for raw in order {
+                t.handle(&ev(raw), &ctx).await;
+            }
+            match tts_rx.try_recv() {
+                Ok(TtsRequest::Synthesize { text, .. }) => assert_eq!(text, "Spoken once."),
+                other => panic!("expected one utterance, got {other:?}"),
+            }
+            assert!(
+                tts_rx.try_recv().is_err(),
+                "the second turn-over signal re-spoke the turn ({order:?})"
+            );
+            assert!(matches!(
+                sig.try_recv(),
+                Ok(StateSignal::ClaudeOutputStarted { .. })
+            ));
+            assert!(matches!(
+                sig.try_recv(),
+                Ok(StateSignal::ClaudeOutputStopped { .. })
+            ));
+            assert!(
+                sig.try_recv().is_err(),
+                "the Thinking edge was released twice ({order:?})"
+            );
+        }
+    }
+
+    /// The liveness half must not regress: `track_live_session` has always seen
+    /// `session.status` (it is one of the low-frequency events that opens a
+    /// turn), and adding a turn-over arm for the same event must not change
+    /// that. A status event still binds the tab to its session.
+    #[tokio::test]
+    async fn session_status_still_marks_the_tab_live() {
+        let (ctx, _tts, _sig) = ctx_with("opencode");
+        let mut t = Tracker::default();
+        for raw in [
+            r#"{"type":"session.status","properties":{"sessionID":"ses_live_1","status":{"type":"busy"}}}"#,
+            r#"{"type":"session.status","properties":{"sessionID":"ses_live_1","status":{"type":"idle"}}}"#,
+        ] {
+            t.handle(&ev(raw), &ctx).await;
+            assert_eq!(
+                t.current_session().as_deref(),
+                Some("ses_live_1"),
+                "session.status must keep binding the tab to its session: {raw}"
+            );
+        }
     }
 
     // ── Legacy sweep session 5 regressions ────────────────────────────────

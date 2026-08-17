@@ -117,12 +117,17 @@ fn build_ai_tool_spec(
         // token. Uses `working_dir` (the project root the TUI opens).
         write_opencode_plugin(&working_dir, settings, tab.as_str());
     }
+    // The child's environment is composed FIRST, because since 2026-08-17 the
+    // OpenCode tap's credential is read back out of it: the effective server
+    // password is whatever the child is spawned with (including a per-tab
+    // override), so the reader must derive its header from the same map rather
+    // than from a value remembered at generation.
+    let env = compose_ai_env(cfg, settings, tab.as_str(), endpoint.as_ref());
     // V20: resolve the out-of-band TTS source. For OpenCode this also injects
     // the `--port`/`--hostname` the fullscreen TUI hosts its event server on
     // (which the adapter taps). Mutates `extra_args`, so it runs on the real
     // launch path only — the pure `build_extra_args` stays test-stable.
-    let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args);
-    let env = compose_ai_env(cfg, settings, tab.as_str(), endpoint.as_ref());
+    let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args, &env);
     let env_remove = ai_env_removals(cfg);
     Ok(PtyLaunchSpec {
         tab,
@@ -181,10 +186,17 @@ fn ai_env_removals(cfg: &AiToolTabConfig) -> Vec<String> {
 ///   and tap `http://127.0.0.1:<N>/event`. If no port can be allocated, the
 ///   tab still launches — just without automatic TTS.
 /// - **Anything else**: no source.
+///
+/// `env` is the environment this child will be spawned with, and it is read
+/// (never written) for exactly one thing: the OpenCode server credential the tap
+/// must authenticate with, resolved by the harness so this function spells none
+/// of that harness's variable names. See
+/// [`crate::harness::opencode::config::server_auth_from_env`].
 fn resolve_oob_source(
     cfg: &AiToolTabConfig,
     working_dir: &Path,
     extra_args: &mut Vec<String>,
+    env: &HashMap<String, String>,
 ) -> Option<crate::harness::OobSpec> {
     if command_is(&cfg.command, "claude") {
         // V34: pin this tab's session id. `--session-id <uuid>` is the only
@@ -227,7 +239,14 @@ fn resolve_oob_source(
         extra_args.push(port.to_string());
         extra_args.push("--hostname".to_string());
         extra_args.push("127.0.0.1".to_string());
-        return Some(crate::harness::OobSpec::OpenCodeEvent { port });
+        return Some(crate::harness::OobSpec::OpenCodeEvent {
+            port,
+            // 2026-08-17: the credential for the server this child is about to
+            // host, taken from the environment it will be spawned with — so the
+            // tap authenticates with the password the server will read, and the
+            // secret rides neither argv nor a URL.
+            auth: crate::harness::opencode::config::server_auth_from_env(env),
+        });
     }
     None
 }
@@ -541,6 +560,22 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // `native_web` (carried by `"injection"` below) and
         // `notify_hooks`/`workbench.checkpoints` (already here). So every input
         // that can change what the hello says already moves this signature.
+        //
+        // **2026-08-17 changed the SHAPE of three emitted entries and needs no
+        // new slot either, which is a fact worth checking rather than assuming**
+        // (the rule at the top of this object demands an entry per
+        // Settings-derived value BAKED into an artifact, and all three are):
+        //   * the taint beacon became `type: "http"` — its gate is still
+        //     `native_web == Sensor && loopback_needed()`, carried by
+        //     `"injection"` (every tab's resolved mode) + `"notify_hooks"`;
+        //   * the pre-mutation checkpoint became `type: "http"` — its gate is
+        //     still `workbench.checkpoints && loopback_needed()`, and both halves
+        //     are already here (the fifth `hooks` slot, and `"notify_hooks"`);
+        //   * the new `PostToolUseFailure` entry rides `tool_result_hook`
+        //     (`graph.enabled && loopback_needed()`), and `graph.enabled` already
+        //     moves `"guidance"` and three `hooks` slots.
+        // A restart hint therefore still fires for every input that can change
+        // what a fresh tab writes.
         "hooks": [
             s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
             s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
@@ -1049,7 +1084,10 @@ fn args_select_session(args: &[String]) -> bool {
 ///   `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL`
 ///   from `claude_local`.
 /// - OpenCode binary: always set `OPENCODE_CONFIG_CONTENT` (the synthesized
-///   session config) plus the noise-suppression env vars. When
+///   session config), the 2026-08-17 server-auth pair (a fresh per-spawn
+///   password, so the TUI's own HTTP server stops serving unauthenticated
+///   loopback calls — `harness::opencode::config::server_auth_env`), plus the
+///   noise-suppression env vars. When
 ///   `use_local_provider`, the local endpoint is carried inside that config
 ///   as a `provider` block (see `build_opencode_config`), not as env.
 /// - Anything else (cloud Claude, `use_local_provider` off): no synthesized
@@ -1109,6 +1147,30 @@ fn compose_ai_env(
         // V35 Phase K: the env var's NAME is OpenCode's, so it is spelled once,
         // in `harness/opencode/config.rs`, beside the document it carries.
         env.insert(CONFIG_ENV.to_string(), config.to_string());
+        // ── 2026-08-17: authenticate the TUI's own HTTP server ───────────────
+        //
+        // The fullscreen TUI hosts an HTTP server on the `--port` below, and
+        // until today cImp depended on that server accepting UNAUTHENTICATED
+        // loopback calls — capability `opencode.route.noauth`, whose second edge
+        // was that any local process could `POST /session/:id/message` into a
+        // live session and start an agent turn. Upstream's documented answer is
+        // these two variables, and the whole mechanism lives in
+        // `harness/opencode/config.rs`: the names are OpenCode's, so this file
+        // spells neither of them (the same rule `CONFIG_ENV` above follows, and
+        // the layering scan enforces it now that both are `Dep::ConfigKey`s).
+        //
+        // A FRESH password per spawn, never persisted, never in argv, and read
+        // back out of this map by `resolve_oob_source` so the tap presents the
+        // credential the child will actually use. Not Settings-derived, so it
+        // owes no `spawn_inject_sig` entry — same reasoning as the Claude hook
+        // token above and `CIMP_TAB_ID` below.
+        for (name, value) in
+            crate::harness::opencode::config::server_auth_env(
+                &crate::harness::opencode::config::new_server_password(),
+            )
+        {
+            env.insert(name, value);
+        }
         // V32 Phase F: the generated plugin's only channel to its own tab
         // identity. OpenCode's `tool.execute.before` input carries a session id
         // but no tab and no cwd (the E2 spike's finding), and the latch registry
@@ -1948,8 +2010,15 @@ mod tests {
         let dirs = claude_tab_dirs(&settings, launch);
         for (cfg, id) in [(claude_cfg(), "claude"), (wt, "ai-worktree")] {
             let mut extra: Vec<String> = Vec::new();
-            // Exactly what `build_ai_tool_spec` hands the oob resolver.
-            let source = resolve_oob_source(&cfg, &ai_working_dir(&cfg, launch), &mut extra);
+            // Exactly what `build_ai_tool_spec` hands the oob resolver. The env
+            // map is only read for the OpenCode server credential, so a Claude
+            // tab's resolution is unaffected by it being empty here.
+            let source = resolve_oob_source(
+                &cfg,
+                &ai_working_dir(&cfg, launch),
+                &mut extra,
+                &HashMap::new(),
+            );
             let Some(crate::harness::OobSpec::ClaudeTranscript {
                 project_dir,
                 pinned_session,
@@ -2067,7 +2136,7 @@ mod tests {
         );
         // …and the three producers really are three DISTINCT matchers, not one
         // entry duplicated: Claude evaluates every matching entry, so an
-        // accidental overlap would spawn two shims per call.
+        // accidental overlap would fire two hooks per call.
         let matchers: Vec<&str> = overlay["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array")
@@ -2146,7 +2215,8 @@ mod tests {
         (hooks, http)
     }
 
-    /// **Every emitted http hook carries an explicit, pinned `timeout`.**
+    /// **Every emitted hook is `type: "http"` and carries an explicit, pinned
+    /// `timeout` — the one its own route declares.**
     ///
     /// Design § 5.2: the five shims budgeted 600 ms for their loopback round
     /// trip *"so a slow/cold index never delays the prompt"*, and with the shim
@@ -2156,22 +2226,47 @@ mod tests {
     /// turns a wedged handler into a wedged turn, and the old value survived
     /// only as a comment. This is the test that makes a hand edit or a template
     /// drift fail the build.
+    ///
+    /// **2026-08-17: the numbers come from `claude_hook::timeout_secs(route)`**,
+    /// not from one constant, because the pre-mutation checkpoint entry is a
+    /// ceiling over a wait that is supposed to happen (its handler holds the tool
+    /// call while the snapshot is taken) rather than a round-trip budget. The
+    /// assertion is still "the value the generator pinned for THIS route", which
+    /// is what a hand edit breaks; `hook.rs`'s own test is what stops the
+    /// exception from spreading.
     #[test]
-    fn every_emitted_http_hook_pins_the_one_second_budget() {
+    fn every_emitted_hook_is_http_and_pins_its_routes_budget() {
         let (hooks, http) = maxed_overlay();
         assert_eq!(
             http.len(),
-            12,
+            15,
             "the five converted hooks — the read advisor is TWO entries (Read + Bash) \
              on one route and Notification/PermissionDenied are two more on one route \
              — plus SessionStart, plus V35 Phase L's four (Stop, the all-tools \
-             PostToolUse result entry, and SubagentStart/SubagentStop on one route): {hooks}"
+             PostToolUse result entry, and SubagentStart/SubagentStop on one route), \
+             plus 2026-08-17's three (PostToolUseFailure and the two migrated \
+             beacons): {hooks}"
+        );
+        // No COMMAND hook survives anywhere in the overlay: the two beacons were
+        // the last of them, and `statusLine` is the only `type: "command"` cImp
+        // still emits (a different key entirely, asserted below).
+        assert!(
+            !hooks.to_string().contains("\"command\""),
+            "a Claude hook is never a command any more: {hooks}"
         );
         for h in &http {
+            let url = h["url"].as_str().unwrap_or_default();
+            let route = url
+                .strip_prefix("http://127.0.0.1:41999")
+                .unwrap_or_else(|| panic!("an http hook must point at THIS instance's loopback: {h}"));
+            assert!(
+                claude_hook::is_hook_route(route),
+                "an emitted entry points at a route `claude_hook` does not declare: {h}"
+            );
             assert_eq!(
                 h["timeout"],
-                serde_json::json!(claude_hook::TIMEOUT_SECS),
-                "an http hook without the pinned budget: {h}"
+                serde_json::json!(claude_hook::timeout_secs(route)),
+                "an http hook without the budget its route pins: {h}"
             );
             assert!(
                 h["timeout"].is_u64(),
@@ -2179,27 +2274,22 @@ mod tests {
             );
             assert_eq!(h["allowedEnvVars"], serde_json::json!(["CIMP_HOOK_TOKEN"]));
             assert_eq!(h["headers"]["Authorization"], "Bearer $CIMP_HOOK_TOKEN");
-            assert!(
-                h["url"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with("http://127.0.0.1:41999/claude/hook/")),
-                "an http hook must point at THIS instance's loopback: {h}"
-            );
         }
-        // The two beacons stay COMMAND hooks with their own 5 s ceiling — a
-        // deliberate divergence (`checkpoint_beacon` waits 2 s for its reply),
-        // and one this test must not quietly flatten.
-        let commands: Vec<serde_json::Value> = hooks["PreToolUse"]
-            .as_array()
-            .expect("PreToolUse")
+        // …and the exception is exactly one entry, so "pinned at 1 s" stays the
+        // rule rather than becoming a range.
+        let long: Vec<&serde_json::Value> = http
             .iter()
-            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
-            .filter(|h| h["type"] == "command")
+            .filter(|h| h["timeout"] != serde_json::json!(claude_hook::TIMEOUT_SECS))
             .collect();
-        assert_eq!(commands.len(), 2, "the taint and checkpoint beacons");
-        for c in commands {
-            assert_eq!(c["timeout"], 5, "the beacons keep their own ceiling: {c}");
-        }
+        assert_eq!(long.len(), 1, "exactly one entry may deviate: {long:?}");
+        assert_eq!(long[0]["timeout"], 5);
+        assert!(
+            long[0]["url"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT)),
+            "and it is the pre-mutation checkpoint: {:?}",
+            long[0]
+        );
     }
 
     /// **`terminalSequence` is never emitted**, by the overlay or by any handler
@@ -2255,6 +2345,53 @@ mod tests {
         ] {
             assert!(hello.serves.contains(&id.to_string()), "missing {id}");
         }
+        // **A declared capability has an ENTRY behind it.** The two beacons are
+        // the pair this most matters for since 2026-08-17: they were declared
+        // from booleans re-spelled beside the hello while the emission sites had
+        // their own copies, which is exactly how an artifact and its own hello
+        // come to disagree. One binding each now, and this is the check.
+        let routes: Vec<String> = hooks
+            .as_object()
+            .expect("hooks object")
+            .values()
+            .flat_map(|entries| entries.as_array().cloned().unwrap_or_default())
+            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|h| h["url"].as_str().map(str::to_string))
+            .collect();
+        let wired = |route: &str| routes.iter().any(|u| u.ends_with(route));
+        for (id, route) in [
+            (chp::EV_TAINT_BEACON, claude_hook::ROUTE_PRE_TOOL_USE_TAINT),
+            (
+                chp::EV_CHECKPOINT_PRE_MUTATION,
+                claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT,
+            ),
+            (
+                chp::EV_SESSION_TOOL_RESULT,
+                claude_hook::ROUTE_POST_TOOL_USE_RESULT,
+            ),
+        ] {
+            assert_eq!(
+                hello.serves.contains(&id.to_string()),
+                wired(route),
+                "`{id}` is declared iff its entry (`{route}`) was emitted"
+            );
+        }
+        // …and the failure half rides the SUCCESS half's declaration, because it
+        // is the same capability. Emitted together or not at all: one without the
+        // other would either lose failed results or count them twice.
+        assert_eq!(
+            wired(claude_hook::ROUTE_POST_TOOL_USE_FAILURE),
+            wired(claude_hook::ROUTE_POST_TOOL_USE_RESULT),
+            "the tool-result pair must be emitted together"
+        );
+        assert!(
+            !hello
+                .serves
+                .iter()
+                .chain(hello.cannot.iter().map(|u| &u.id))
+                .any(|id| id.contains("tool_error") || id.contains("tool_failure")),
+            "the failure half declares no id of its own — see `claude_hook::chp_event`"
+        );
         // …and the one thing a maxed overlay still cannot serve, because the
         // native-web mode defaults to `sensor` only when it is set to it.
         let mut off = Settings::default();
@@ -2333,6 +2470,13 @@ mod tests {
     /// reaches this point implies `loopback_needed()`, so the endpoint is
     /// present at any real spawn; the residual is the window before the listener
     /// binds.
+    ///
+    /// **Since 2026-08-17 that covers the two beacons too**, and it is the one
+    /// behavioural consequence of migrating them worth pinning: as command hooks
+    /// they resolved the endpoint themselves at run time, so they were installed
+    /// regardless. Now they are not installed at all without one — which is the
+    /// same trade every other entry already made, and strictly better than a hook
+    /// that spawns a process per web call to POST into a closed socket.
     #[test]
     fn no_endpoint_means_no_http_hooks_at_all() {
         let mut settings = Settings::default();
@@ -2343,15 +2487,10 @@ mod tests {
         let args = build_pre_args(&claude_cfg(), &settings, "claude", None);
         let overlay = settings_overlay(&args).expect("statusLine keeps the overlay alive");
         assert!(overlay.get("statusLine").is_some());
-        let hooks = overlay["hooks"].clone();
         assert!(
-            !hooks.to_string().contains("\"http\""),
-            "no endpoint ⇒ no http hook: {hooks}"
+            overlay.get("hooks").is_none(),
+            "no endpoint ⇒ no hooks of any kind, including the two beacons: {overlay}"
         );
-        // The two beacon COMMAND hooks are unaffected — they resolve the
-        // endpoint themselves at run time, which is exactly the property the
-        // http hooks trade away.
-        assert!(hooks["PreToolUse"].is_array(), "got {hooks}");
     }
 
     #[test]
@@ -3236,6 +3375,108 @@ mod tests {
         }
     }
 
+    // ── 2026-08-17: the OpenCode server credential, spawn → reader ──────────
+
+    /// **The seam, end to end.** The password is generated where the child's env
+    /// is composed and consumed where the tap is described, and the two halves are
+    /// only correct together: a credential on the child that the reader does not
+    /// present makes every tap request 401, and a credential the reader presents
+    /// that the child never got makes the server refuse nothing.
+    #[test]
+    fn an_opencode_tab_is_spawned_authenticated_and_its_tap_is_given_the_credential() {
+        use crate::harness::opencode::config::{
+            server_basic_auth, SERVER_PASSWORD_ENV, SERVER_USERNAME, SERVER_USERNAME_ENV,
+        };
+        let settings = Settings::default();
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
+
+        // The pair is on the child, and the password is substantive — an EMPTY
+        // one disables auth upstream, which is the one value that would make
+        // every assertion below pass while enforcing nothing.
+        let password = env
+            .get(SERVER_PASSWORD_ENV)
+            .expect("an OpenCode tab must be spawned with a server password");
+        assert!(!password.is_empty(), "an empty password disables auth");
+        assert_eq!(env.get(SERVER_USERNAME_ENV).map(String::as_str), Some(SERVER_USERNAME));
+
+        // …and the tap is handed the matching credential, via the spec rather
+        // than via argv or a URL.
+        let mut extra: Vec<String> = Vec::new();
+        let source = resolve_oob_source(
+            &opencode_cfg(),
+            Path::new("C:/proj"),
+            &mut extra,
+            &env,
+        );
+        let Some(crate::harness::OobSpec::OpenCodeEvent { port, auth }) = source else {
+            panic!("an OpenCode tab must resolve an event source");
+        };
+        assert_eq!(
+            auth.as_deref(),
+            server_basic_auth(password).as_deref(),
+            "the tap must present the credential the child was spawned with"
+        );
+        // The secret is on neither the command line nor the port flag.
+        assert!(
+            !extra.iter().any(|a| a.contains(password.as_str())),
+            "a secret must never reach argv: {extra:?}"
+        );
+        assert!(extra.iter().any(|a| a == &port.to_string()));
+
+        // A CLAUDE tab gets neither half: this is an OpenCode server.
+        let claude = compose_ai_env(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+        assert!(!claude.contains_key(SERVER_PASSWORD_ENV));
+        assert!(!claude.contains_key(SERVER_USERNAME_ENV));
+    }
+
+    /// Every spawn gets its own password — the same discipline as the loopback
+    /// token, and the reason neither owes a `spawn_inject_sig` entry: nothing a
+    /// user can configure moves it, so there is no setting to raise a restart
+    /// hint for.
+    #[test]
+    fn each_opencode_spawn_gets_a_fresh_server_password() {
+        use crate::harness::opencode::config::SERVER_PASSWORD_ENV;
+        let settings = Settings::default();
+        let first = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
+        let second = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
+        assert_ne!(
+            first.get(SERVER_PASSWORD_ENV),
+            second.get(SERVER_PASSWORD_ENV),
+            "the password must be per spawn, not per build"
+        );
+        // …and it is not what `spawn_inject_sig` reports on: two signatures over
+        // the same settings must still compare equal, or every settings edit
+        // would nag every OpenCode tab to restart for a value the user cannot
+        // see or set.
+        assert_eq!(spawn_inject_sig(&settings), spawn_inject_sig(&settings));
+    }
+
+    /// A user who sets their own password per tab keeps it (the per-tab `env`
+    /// merge is an instruction, not an accident) — and the tap follows, because
+    /// it reads the credential back out of the COMPOSED environment rather than
+    /// remembering what cImp generated. Getting this wrong 401s every tap on a
+    /// tab that looks correctly configured.
+    #[test]
+    fn a_per_tab_server_password_override_is_honoured_by_the_tap_too() {
+        use crate::harness::opencode::config::{server_basic_auth, SERVER_PASSWORD_ENV};
+        let mut cfg = opencode_cfg();
+        cfg.env
+            .insert(SERVER_PASSWORD_ENV.to_string(), "mine-not-cimps".to_string());
+        let env = compose_ai_env(&cfg, &Settings::default(), "opencode", Some(&hook_endpoint()));
+        assert_eq!(
+            env.get(SERVER_PASSWORD_ENV).map(String::as_str),
+            Some("mine-not-cimps"),
+            "a per-tab env entry wins over the synthesized value"
+        );
+        let mut extra: Vec<String> = Vec::new();
+        let Some(crate::harness::OobSpec::OpenCodeEvent { auth, .. }) =
+            resolve_oob_source(&cfg, Path::new("C:/proj"), &mut extra, &env)
+        else {
+            panic!("an OpenCode tab must resolve an event source");
+        };
+        assert_eq!(auth.as_deref(), server_basic_auth("mine-not-cimps").as_deref());
+    }
+
     // ---- V19: OpenCode launch spine ----
 
     #[test]
@@ -3776,8 +4017,13 @@ mod tests {
 
     /// Sensor mode injects a `PreToolUse` beacon matched ONLY on the two web
     /// tools — the narrowness is the point (no per-call tax on Read/Grep/Bash)
-    /// — with the tab id baked into argv, since a hook payload carries none.
+    /// — with the tab id in `X-CIMP-Tab`, since a hook payload carries none.
     /// `off` and `deny` inject no hook at all.
+    ///
+    /// **`type: "http"` since 2026-08-17** (the tab id was `--tab` in argv, on a
+    /// `cimp --taint-beacon` command). What this test pins is unchanged in
+    /// substance: the matcher is narrow, the identity is baked, and the two other
+    /// modes inject nothing.
     #[test]
     fn sensor_mode_injects_a_web_only_beacon_hook() {
         let pre_tool_use = |mode: &str| -> Vec<serde_json::Value> {
@@ -3795,12 +4041,22 @@ mod tests {
             .iter()
             .find(|e| e["matcher"] == CLAUDE_WEB_TOOL_MATCHER)
             .unwrap_or_else(|| panic!("sensor must install the beacon: {sensor:?}"));
-        let cmd = beacon["hooks"][0]["command"]
-            .as_str()
-            .expect("beacon command is a string");
-        assert!(cmd.contains(" --taint-beacon "), "got: {cmd}");
-        assert!(cmd.ends_with(" --tab claude-2"), "got: {cmd}");
-        assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+        let entry = &beacon["hooks"][0];
+        assert_eq!(entry["type"], "http", "got: {entry}");
+        assert_eq!(
+            entry["url"],
+            format!(
+                "http://127.0.0.1:41999{}",
+                claude_hook::ROUTE_PRE_TOOL_USE_TAINT
+            ),
+            "got: {entry}"
+        );
+        // The identity a hook payload cannot carry — the key the whole latch
+        // registry is built on — rides the header instead of argv.
+        assert_eq!(entry["headers"]["X-CIMP-Tab"], "claude-2", "got: {entry}");
+        // Report-only stays structural: no decision field can be emitted from an
+        // entry, and the sensor's own budget is the standard 1 s.
+        assert_eq!(entry["timeout"], 1, "got: {entry}");
 
         for mode in ["off", "deny"] {
             assert!(
@@ -5125,23 +5381,33 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             "the checkpoint beacon must not depend on the code graph: {:?}",
             pre_tool_matchers(&s)
         );
-        // …and the tab id is baked into the command, since the payload names no
-        // cImp tab and an unattributable checkpoint is the one thing this
-        // feature must not write.
+        // …and the tab id is baked into the entry's headers, since the payload
+        // names no cImp tab and an unattributable checkpoint is the one thing
+        // this feature must not write.
         let args = build_pre_args(&claude_cfg(), &s, "claude-7", Some(&hook_endpoint()));
         let entries = settings_overlay(&args).expect("overlay")["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array")
             .clone();
-        let cmd = entries
+        let entry = entries
             .iter()
             .find(|e| e["matcher"] == CLAUDE_MUTATING_TOOL_MATCHER)
-            .expect("the checkpoint entry")["hooks"][0]["command"]
-            .as_str()
-            .expect("command")
-            .to_string();
-        assert!(cmd.contains(" --checkpoint-beacon "), "got: {cmd}");
-        assert!(cmd.ends_with(" --tab claude-7"), "got: {cmd}");
+            .expect("the checkpoint entry")["hooks"][0]
+            .clone();
+        assert_eq!(entry["type"], "http", "got: {entry}");
+        assert_eq!(
+            entry["url"],
+            format!(
+                "http://127.0.0.1:41999{}",
+                claude_hook::ROUTE_PRE_TOOL_USE_CHECKPOINT
+            ),
+            "got: {entry}"
+        );
+        assert_eq!(entry["headers"]["X-CIMP-Tab"], "claude-7", "got: {entry}");
+        // The ONE entry whose ceiling is not 1 s: its handler holds the tool call
+        // while the snapshot is taken, which is what makes "the checkpoint
+        // precedes the call" exact (`claude_hook::TIMEOUT_CHECKPOINT_SECS`).
+        assert_eq!(entry["timeout"], 5, "got: {entry}");
 
         // Checkpoints OFF ⇒ no checkpoint entry (the web beacon is unaffected —
         // asserted, so a regression that deleted BOTH would not read as a pass).

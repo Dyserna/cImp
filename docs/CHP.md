@@ -5,13 +5,16 @@
 **Status:** declared V35 Phase I (2026-08-16), issue #66; extended additively by
 V35 Phase J (2026-08-17), issue #67 — § 4.5 — and again by V35 Phase L
 (2026-08-17), issue #69 — § 4.6, which realizes three of the six reserved
-read-path events and makes `serves` load-bearing. This document is the wire contract;
+read-path events and makes `serves` load-bearing. Extended additively once more
+on **2026-08-17 (Claude Code 2.1.233)**: the two beacon hooks moved off
+`type: "command"` and `PostToolUseFailure` was wired — three new routes in § 4.5,
+no new events. This document is the wire contract;
 `src-tauri/src/harness/chp.rs` is the code half, and `harness::chp::CHP_VERSION`
 is checked equal to the version above by
 `harness::chp::tests::the_doc_states_this_version`. The two move in one commit
 or neither.
 
-**`chp` stays at 1 through Phase J.** Nothing on the wire changed shape: the
+**`chp` stays at 1 through all of it.** Nothing on the wire changed shape: the
 routes in § 4.2 carry the same bodies from the same senders, and § 4.5's
 Claude-native ingress is *additive* — new routes, new meaning, per compatibility
 rule 4. What changed is who sends them.
@@ -183,10 +186,10 @@ listed, because both are live.
 | `context.post_edit` | `POST /context/post_edit` | `/claude/hook/post_tool_use`'s handler (was `cimp --postedit-hook`) (claude), plugin `tool.execute.after` (opencode) | `cwd`, `session_id`, `file_path`, `tool_name` |
 | `memory.event` | `POST /memory/event` | plugin `tool.execute.after` and `event` (opencode only) | tool form: `cwd`, `session_id`, `tool`, `args`, `parent_session_id?` · usage form: `kind: "usage"`, `msg_id`, `model`, `in_tok`, `out_tok`, `cache_read`, `cache_make` |
 | `permission.event` | `POST /permission/event` | `/claude/hook/notification`'s handler (was `cimp --notify-hook`) | `cwd`, `session_id`, `transcript_path`, `event`, `notification_type`, `message`, `tool_name` — **carries neither `agent` nor `tab`** (see § 4.4) |
-| `taint.beacon` | `POST /latch/beacon` | `taint_beacon.rs` (claude), plugin `tool.execute.before` (opencode) | `tool`, `cwd`, `session_id` |
+| `taint.beacon` | `POST /latch/beacon` | `/claude/hook/pre_tool_use_taint`'s handler — or, from a pre-2026-08-17 tab, `cimp --taint-beacon` (claude); plugin `tool.execute.before` (opencode) | `tool`, `cwd`, `session_id` |
 | `tool.gate` | `POST /latch/state` | plugin `tool.execute.before` (opencode only) | — (identity only, deliberately: the answer must not depend on what the caller claims about the tool) |
-| `checkpoint.pre_mutation` | `POST /workbench/tool_checkpoint` | `checkpoint_beacon.rs` (claude), plugin `tool.execute.before` (opencode) | `tool`, `cwd`, `session_id` |
-| `contract.drift` | `POST /activity/contract_drift` | the two surviving Claude beacon shims, over the wire; the four converted hooks raise the same report **in process** (same tokens, same ledger, same row) | `shim`, `missing`, `session_id` — **carries no `tab`**, so its reports are attributed by shim name, not by tab |
+| `checkpoint.pre_mutation` | `POST /workbench/tool_checkpoint` | `/claude/hook/pre_tool_use_checkpoint`'s handler (was `cimp --checkpoint-beacon`), plugin `tool.execute.before` (opencode) | `tool`, `cwd`, `session_id` |
+| `contract.drift` | `POST /activity/contract_drift` | every converted hook raises this report **in process** (same tokens, same ledger, same row); a pre-upgrade tab's own shim binary still POSTs it over the wire | `shim`, `missing`, `session_id` — **carries no `tab`**, so its reports are attributed by shim name, not by tab |
 
 ### 4.4 Where the live wire departs from the design's summary
 
@@ -217,8 +220,8 @@ attributed to a peer, so `contract.drift` and `permission.event` contribute no
 
 ### 4.5 `POST /claude/hook/*` — the Claude-native ingress (Phase J)
 
-**Additive extension, `chp` unchanged.** Six routes that take Claude Code's own
-hook-input JSON verbatim rather than a CHP body. They are not a second body
+**Additive extension, `chp` unchanged.** Twelve routes that take Claude Code's
+own hook-input JSON verbatim rather than a CHP body. They are not a second body
 shape on an existing route (compatibility rule 4 forbids that) and they are not
 in the § 5 vocabulary: they are a *transport* for events that already have ids.
 
@@ -232,13 +235,47 @@ in the § 5 vocabulary: they are a *transport* for events that already have ids.
 | `SessionStart` | `POST /claude/hook/session_start` | `hello` | always `{}` |
 | `Stop` | `POST /claude/hook/stop` | `assistant_text` (§ 4.6) | always `{}` (observe-only) |
 | `PostToolUse` (matcher `""`) | `POST /claude/hook/post_tool_use_result` | `session.tool_result` (§ 4.6) | always `{}` (observe-only) |
+| `PostToolUseFailure` (matcher `""`) | `POST /claude/hook/post_tool_use_failure` | **none of its own** — it is the errored half of `session.tool_result` (see below) | always `{}` (observe-only) |
 | `SubagentStart`, `SubagentStop` | `POST /claude/hook/subagent` | `session.subagent` (§ 4.6) | always `{}` (observe-only) |
+| `PreToolUse` (`WebFetch\|WebSearch`) | `POST /claude/hook/pre_tool_use_taint` | `taint.beacon` | always `{}` (report-only) |
+| `PreToolUse` (`Edit\|Write\|MultiEdit\|Bash`) | `POST /claude/hook/pre_tool_use_checkpoint` | `checkpoint.pre_mutation` | always `{}` (report-only) — **answered only after the snapshot is taken** |
 
-**Minimum Claude Code: 2.1.63**, when `type: "http"` hooks shipped. Phase J is a
-hard switch — the overlay generates no command-hook fallback — so an older CLI
-gets hook entries it does not understand and every one of these capabilities is
-simply absent. The two beacon hooks (`taint.beacon`,
-`checkpoint.pre_mutation`) are still `type: "command"` and are unaffected.
+**Minimum Claude Code: 2.1.63**, when `type: "http"` hooks shipped; the contract
+is verified unchanged through **2.1.233 (2026-08-17)**. Phase J is a hard switch —
+the overlay generates no command-hook fallback — so an older CLI gets hook entries
+it does not understand and every one of these capabilities is simply absent.
+
+**Two of the twelve are newer than that floor**, and each degrades differently:
+
+- `PostToolUseFailure` (the event itself is newer than 2.1.63) — a CLI without it
+  ignores the entry, so *failed* tool results go uncounted while successes keep
+  flowing. Nothing reports it: an absent hook event cannot.
+- the two beacon routes are not new upstream, only new here — they were
+  `type: "command"` shims (`cimp --taint-beacon`, `cimp --checkpoint-beacon`)
+  until 2026-08-17. **The migration is a tier change, not a transport preference:**
+  each rested on an *undocumented* behaviour (a hook that writes nothing and exits
+  0 is non-blocking including on timeout; the tool does not begin until the hook
+  process exits), and the http contract states both facts in writing. In
+  particular a `PreToolUse` http hook **blocks the tool call until the response** —
+  the documented mechanism that makes `permissionDecision: "deny"` expressible —
+  which is what turns "the checkpoint precedes the call" into a guarantee cImp can
+  enforce by awaiting the snapshot before it answers. Multiple `PreToolUse` entries
+  run in parallel and all must resolve before the tool starts, so the beacons do
+  not serialize against the read advisor. A tab open across the upgrade keeps its
+  old command hooks and gets neither beacon until it is restarted; the flags
+  survive in `main.rs` as stdin-draining tombstones, because a `cimp` that no
+  longer recognized one would fall through and launch a second GUI per web call.
+
+**The failure half maps to no CHP event on purpose.** Two ids that can never be
+declared independently are one id: the failure entry is emitted from the same
+per-tab boolean as the success entry, feeds the same core, the same consumer, the
+same drift token and the same `served` predicate, so there is no per-tab decision
+a second event could report (the same reasoning that keeps `session.usage` off
+*both* sides of Claude's hello). What a second mapping would cost is concrete —
+the quiet detector **resets** a served capability's counter on each push of it, so
+a rare failure push would silently rearm the detector watching the common success
+entry. Staleness observation is unaffected either way: a hook route's envelope
+rides headers and is read before the event join.
 
 **Identity rides headers, because a hook's body is the harness's.** cImp gets no
 field in the payload, so the envelope of § 3 is carried alongside it:
@@ -378,12 +415,35 @@ harness's and cannot carry a CHP envelope:
 |---|---|---|
 | `Stop` | `POST /claude/hook/stop` | `assistant_text` |
 | `PostToolUse` (matcher `""`) | `POST /claude/hook/post_tool_use_result` | `session.tool_result` |
+| `PostToolUseFailure` (matcher `""`) | `POST /claude/hook/post_tool_use_failure` | `session.tool_result`, its errored half |
 | `SubagentStart`, `SubagentStop` | `POST /claude/hook/subagent` | `session.subagent` |
 
 The tool-result entry is a **second `PostToolUse` matcher group pointing at a
 second route**, never a widening of the auto-check entry: Claude evaluates every
 matching group, so one shared route would run the project's checks twice and
 count one result twice.
+
+**And it needs a third entry, because `PostToolUse` fires only on success**
+(2026-08-17). Without `PostToolUseFailure`, a failed tool result reached cImp only
+through the transcript tail — which arbitration switches OFF on exactly the tabs
+that serve `session.tool_result`, so a serving tab lost every failure's size, and
+a failing `Bash` returns as much text as a succeeding one. The failure entry sizes
+its `error` field through the same `tool_result_chars` the success entry sizes
+`tool_result` with, because that is the function the transcript reader sizes a
+failed result's content with too — so the two paths report the same number for the
+same failure. It is gated on the same boolean as the success entry, and that
+coupling is load-bearing rather than tidy: the reader's tap is suppressed per
+CAPABILITY, so wiring one entry without the other would either lose failures or
+double-count them.
+
+**"Errored" here means exactly what it means in the transcript reader.** That
+reader keeps two readers over one `tool_result` block: one sizes every result
+including failures and never looks at `is_error`, the other exists solely to keep
+a failed result out of the session→commit provenance tap. The push path mirrors
+the first by construction and the second **structurally** — it carries a character
+count and never the result text, and provenance is mined only by the transcript
+reader, which is not arbitrated. There is nothing on this path for a failed result
+to leak into.
 
 **OpenCode produces none of them, declares so, and keeps its SSE reader.** This
 is a Phase L outcome under design D6 ("a fallback contained and declared beats a
@@ -474,12 +534,15 @@ The immediate consequence is intended, not a false positive: **every Claude tab
 open across the Phase J upgrade reports `old_plugin` until it is restarted.** It
 really is running an overlay full of `cimp --context-hook` command hooks that
 this build no longer generates, and *restart the tab* really is the fix. Those
-tabs keep working, inert — the five dispatch flags survive in `main.rs` as
+tabs keep working, inert — the retired dispatch flags survive in `main.rs` as
 tombstones that drain stdin and exit 0, so an old overlay costs a fast no-op per
 hook rather than launching a second cImp — but they get no injection, no read
 advisor, no auto-check, and permission detection falls back to the TUI regex.
-This is the V32 "needs a FRESH TAB" trap being *named at the moment it applies*,
-which is what § 6.1 exists for.
+**Since 2026-08-17 that list is seven flags and includes the two beacons**, so
+such a tab also has no native-web taint sensor (the proxied half of the latch
+still catches anything routed through cImp) and no per-call rewind points (the
+prompt-level checkpoints remain). This is the V32 "needs a FRESH TAB" trap being
+*named at the moment it applies*, which is what § 6.1 exists for.
 
 ### 6.2 Why OpenCode's hello omits `harness_version`
 
@@ -522,6 +585,18 @@ carries a TCB column marking those three rows.
 `serves: ["tool.gate"]` has said nothing cImp relies on; the gate's authority
 comes from cImp computing the verdict, and the artifact's only power is to
 refuse *more* than it was told to.
+
+**Two of those three read differently on Claude, and always did.** `taint.beacon`
+and `checkpoint.pre_mutation` have a second enforcement site — Claude's own
+`PreToolUse` path — where cImp is not inside the harness at all: the harness calls
+cImp, and cImp does the work. Since 2026-08-17 that site is an http hook plus its
+handler rather than a shim binary, which makes the difference sharper: on OpenCode
+these controls run in code cImp cannot verify ran, while on Claude the delivery is
+observable (the route is reached or it is not) and the checkpoint's ordering is
+enforced app-side by answering only after the snapshot is taken. `tool.gate` stays
+OpenCode-only, and that is a fact rather than a gap — Claude's beacons are
+report-only by V32 locked decision 14 and are structurally incapable of denying,
+because a hook that emits no decision field cannot.
 
 ---
 

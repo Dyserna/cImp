@@ -521,10 +521,12 @@ mod tests {
     ///
     /// **V35 Phase I widened this from one row to three.** A control id names a
     /// *place* enforcement executes, and the taint beacon and the pre-mutation
-    /// checkpoint each run in two of them — inside the OpenCode plugin, and
-    /// inside a Claude `PreToolUse` shim binary. The Claude sites now have rows,
+    /// checkpoint each run in two of them — inside the OpenCode plugin, and on
+    /// Claude's own `PreToolUse` path (a shim binary until 2026-08-17, a
+    /// `type: "http"` entry plus its handler since). The Claude sites have rows,
     /// so they carry their own control ids rather than the plugin row standing
-    /// for both harnesses.
+    /// for both harnesses; the ids did not change when the site moved, which is
+    /// what keeps this assertion meaningful across such a migration.
     #[test]
     fn the_tcb_column_reaches_the_panel() {
         let health = health(&settings_with(None));

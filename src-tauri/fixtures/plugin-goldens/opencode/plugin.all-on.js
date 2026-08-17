@@ -86,7 +86,7 @@ const CIMP_WEB_TOOLS = new Set(["webfetch","websearch"]);
 // failure is swallowed — a lost checkpoint costs one call its rewind point, a
 // thrown error would refuse the user's own edit.
 const CIMP_CHECKPOINT_ENABLED = true;
-const CIMP_MUTATING_TOOLS = new Set(["bash","edit","write","patch","apply_patch"]);
+const CIMP_MUTATING_TOOLS = new Set(["bash","edit","write","patch","apply_patch","execute"]);
 // The cImp TAB this FILE was generated for, baked at spawn. The tab id is the
 // key the whole latch registry uses, and the hook input carries no tab or cwd
 // identity (the E2 spike's finding), so without it a beacon has nothing to
@@ -155,7 +155,7 @@ const CIMP_TAB_MATCH =
 // `opencode` that inherits CIMP_TAB_ID, publish a fresh session id under this
 // tab's identity, and get its web tools back. The bit is what survives that.
 const CIMP_NATIVE_GATE_ENABLED = true;
-const CIMP_NATIVE_LOCAL_TOOLS = new Set(["bash","read","glob","grep","edit","write","patch","apply_patch"]);
+const CIMP_NATIVE_LOCAL_TOOLS = new Set(["bash","read","glob","grep","edit","write","patch","apply_patch","execute","lsp"]);
 const CIMP_REFUSAL_NATIVE_LOCAL = "REFUSED (security boundary): this session has already used an external tool (web fetch/search or an MCP-server tool), so this harness's own local tools — file reads, edits, patches, file search and shell commands — are unavailable for the remainder of this session. This cannot be unlocked, re-asked for, or worked around; it is enforced outside the model, and spawning a sub-agent or a nested shell reaches the same boundary. Continue with the tools you still have, or answer with what you have gathered.";
 const CIMP_REFUSAL_NATIVE_WEB = "REFUSED (security boundary): this session has already used a local-capability tool (file read, edit, file search or shell command), so this harness's own web tools — fetch and search — are unavailable for the remainder of this session. This cannot be unlocked, re-asked for, or worked around; it is enforced outside the model, and spawning a sub-agent reaches the same boundary. Continue with the tools you still have, or answer with what you have gathered.";
 // #48 (F-13): the THIRD refusal — the harness's own web tools from a tab that is

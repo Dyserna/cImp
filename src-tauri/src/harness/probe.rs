@@ -22,9 +22,12 @@
 //! * [`Outcome::Unknown`] — the probe could not run: CLI absent, no session to
 //!   tail, no tool call in the window, or a probe class not implemented here.
 //!   Reported with a reason, never counted as broken.
-//! * [`Outcome::Transition`] — upstream changed **for the better** (OpenCode
-//!   growing auth is the worked example). A capability transition, not a red
-//!   test.
+//! * [`Outcome::Transition`] — upstream changed **for the better**. A capability
+//!   transition, not a red test. OpenCode growing server auth was the worked
+//!   example until 2026-08-17, when that transition COMPLETED: cImp sets a
+//!   password at every spawn and the probe now checks the auth contract instead
+//!   of watching for it, so the variant is currently declared and unconstructed
+//!   (see [`Outcome::Transition`]).
 //!
 //! Modelling the last two as failures would recreate exactly the alarm fatigue
 //! this milestone exists to remove: `drift.harness_version.v1` fires on every
@@ -103,6 +106,20 @@ pub enum Outcome {
     Unknown { why: String },
     /// Upstream changed for the better; the capability moves rather than
     /// breaks. Never a failure.
+    ///
+    /// **Declared and, since 2026-08-17, unconstructed in production** — the same
+    /// posture `Seam::A` and `Harness::Any` have in the registry, and for the same
+    /// reason: a vocabulary needs the rung named even when nothing is standing on
+    /// it. Its one constructor was `noauth_outcome`, watching for OpenCode to grow
+    /// server auth. It did, cImp now sets a password at every spawn
+    /// (`opencode.route.noauth`, Tier D → B), and the improvement this variant
+    /// existed to announce is the contract the probe checks. So there is no probe
+    /// watching for an upstream improvement today, which is a fact worth being
+    /// able to read rather than one to hide behind a deleted variant — every
+    /// consumer (`verify.rs`'s advance rule, `label`, `detail`, the printer,
+    /// `--json`) still handles it, and the next D→C→B migration will construct it
+    /// again.
+    #[allow(dead_code)]
     Transition { note: String },
 }
 
@@ -316,12 +333,16 @@ const DECLARED_UNPROBED: &[(&str, &str)] = &[
         "claude.hook.taint_beacon",
         "needs a scripted turn (L2 residual): the hook only fires when a real turn reaches for \
          WebFetch/WebSearch, and the property worth proving is that the beacon LANDED before the \
-         tool ran — an ordering, not a payload shape",
+         tool ran — an ordering, not a payload shape. Unchanged by the 2026-08-17 http migration, \
+         which moved the row to Tier B: what it bought is app-observable DELIVERY, which is a \
+         production signal rather than something this probe can drive",
     ),
     (
         "claude.hook.checkpoint_beacon",
         "needs a scripted turn (L2 residual), and the load-bearing half is an ORDERING no fixture \
-         can express: that the tool call does not begin until this hook process exits",
+         can express: that the tool call does not begin until the hook's response arrives. Since \
+         2026-08-17 that ordering is upstream's DOCUMENTED deny contract rather than an observed \
+         behaviour, so what a probe would add is confirmation, not coverage",
     ),
     (
         "opencode.plugin.load_all",
@@ -605,17 +626,38 @@ fn print_human(results: &[ProbeResult]) {
 // ── minimal blocking HTTP ───────────────────────────────────────────────────
 
 /// A loopback HTTP/1.1 GET, returning `(status, body)`. Hand-rolled for the
-/// same reason the beacon shims hand-roll theirs: this runs before any runtime
-/// exists, and a probe that needed an async stack to ask one question would be
-/// harder to trust than the question is worth.
+/// reason the deleted beacon shims hand-rolled theirs: this runs before any
+/// runtime exists, and a probe that needed an async stack to ask one question
+/// would be harder to trust than the question is worth.
 fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
+    http_get_as(port, path, None)
+}
+
+/// [`http_get`] with an optional `Authorization` header value.
+///
+/// 2026-08-17: the OpenCode child is now spawned with a server password, so every
+/// route — including the readiness poll, since upstream has **no unauthenticated
+/// health route** — has to present a credential. The unauthenticated form above
+/// stays, and is not a leftover: it is one half of what
+/// [`noauth_outcome`] proves.
+///
+/// The credential goes in the header and nowhere else. Upstream also accepts an
+/// `auth_token` query parameter, and a present-but-wrong one WINS over a correct
+/// header — so a probe that hedged by sending both would 401 against a perfectly
+/// healthy server. Same rule the reader follows
+/// (`harness::opencode::config::server_basic_auth`).
+fn http_get_as(port: u16, path: &str, auth: Option<&str>) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(HTTP_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(HTTP_TIMEOUT)).ok()?;
+    let authorization = auth
+        .map(|v| format!("Authorization: {v}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
          Accept: application/json\r\n\
+         {authorization}\
          Connection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).ok()?;
@@ -658,6 +700,15 @@ fn alloc_loopback_port() -> Option<u16> {
 struct Serve {
     child: std::process::Child,
     port: u16,
+    /// 2026-08-17: the `Authorization: Basic …` value this child's server
+    /// requires, because the probe spawns it WITH a server password — which is
+    /// what makes `opencode.route.noauth` provable in both directions instead of
+    /// being a watch for auth to arrive.
+    ///
+    /// `None` only if the credential could not be built at all (an empty
+    /// password, which upstream reads as "auth off"); the probe then reports
+    /// `unknown` rather than testing a contract it did not set up.
+    auth: Option<String>,
 }
 
 impl Drop for Serve {
@@ -681,8 +732,18 @@ fn start_opencode_serve() -> Result<Serve, String> {
     })?;
     let port = alloc_loopback_port()
         .ok_or_else(|| "could not reserve a loopback port for `opencode serve`".to_string())?;
+    // 2026-08-17: the probe sets a password on its own child, because the
+    // contract it now checks is "these documented env vars enforce Basic auth",
+    // not "the server answers anybody". Generated by the same function the tab
+    // spawn uses, so the probe cannot pass on a credential shape production does
+    // not produce.
+    let password = crate::harness::opencode::config::new_server_password();
+    let auth = crate::harness::opencode::config::server_basic_auth(&password);
 
     let mut cmd = Command::new(&binary);
+    for (name, value) in crate::harness::opencode::config::server_auth_env(&password) {
+        cmd.env(name, value);
+    }
     cmd.arg("serve")
         .arg("--port")
         .arg(port.to_string())
@@ -709,13 +770,21 @@ fn start_opencode_serve() -> Result<Serve, String> {
     let child = cmd
         .spawn()
         .map_err(|e| format!("`opencode serve` could not be spawned: {e}"))?;
-    let serve = Serve { child, port };
+    let serve = Serve {
+        child,
+        port,
+        auth: auth.clone(),
+    };
 
     // Readiness = the server answers an HTTP request, not merely that the
-    // socket accepts. Bun binds before its routes are mounted.
+    // socket accepts. Bun binds before its routes are mounted. It has to be an
+    // AUTHENTICATED request: there is no unauthenticated health route (only three
+    // static asset paths bypass auth), so an unauthenticated poll would be
+    // answering "does it 401 yet" — a question about the wrong thing, and one
+    // that would go on succeeding if the routes never mounted.
     let deadline = Instant::now() + SERVE_READY_TIMEOUT;
     while Instant::now() < deadline {
-        if http_get(port, "/experimental/tool/ids").is_some() {
+        if http_get_as(port, "/experimental/tool/ids", auth.as_deref()).is_some() {
             return Ok(serve);
         }
         std::thread::sleep(SERVE_POLL_INTERVAL);
@@ -745,19 +814,44 @@ fn probe_opencode() -> (Vec<ProbeResult>, Vec<Observed>, String) {
         }
     };
 
-    let ids = http_get(serve.port, "/experimental/tool/ids");
+    let auth = serve.auth.as_deref();
+    let ids = http_get_as(serve.port, "/experimental/tool/ids", auth);
     // A declared route (`GET /session/:id`) rather than the one above, so the
     // auth question is asked of a surface cImp actually depends on. The id is
     // deliberately one that cannot exist: a 404 still proves the request was
-    // not rejected for want of a credential, and inventing a real session would
-    // mean writing to the user's OpenCode state.
-    let session = http_get(serve.port, "/session/cimp-harness-probe-does-not-exist");
+    // ACCEPTED (processed and answered) rather than refused for want of a
+    // credential, and inventing a real session would mean writing to the user's
+    // OpenCode state.
+    let session = http_get_as(
+        serve.port,
+        "/session/cimp-harness-probe-does-not-exist",
+        auth,
+    );
+    // The other half of the new contract: the SAME two routes with no credential
+    // at all must be refused. Both halves are needed — "authenticated calls
+    // work" alone is also true of a server enforcing nothing.
+    let ids_unauth = http_get(serve.port, "/experimental/tool/ids");
+    let session_unauth = http_get(serve.port, "/session/cimp-harness-probe-does-not-exist");
 
     let results = vec![
         ProbeResult::new("opencode.tool_registry", tool_registry_outcome(ids.as_ref())),
         ProbeResult::new(
             "opencode.route.noauth",
-            noauth_outcome(ids.as_ref(), session.as_ref()),
+            noauth_outcome(
+                serve.auth.is_some(),
+                &[
+                    AuthPair {
+                        route: "GET /experimental/tool/ids",
+                        authed: ids.as_ref().map(|(s, _)| *s),
+                        unauthed: ids_unauth.as_ref().map(|(s, _)| *s),
+                    },
+                    AuthPair {
+                        route: "GET /session/:id",
+                        authed: session.as_ref().map(|(s, _)| *s),
+                        unauthed: session_unauth.as_ref().map(|(s, _)| *s),
+                    },
+                ],
+            ),
         ),
     ];
     // The registry listing is the payload worth keeping: it is the one this
@@ -770,7 +864,7 @@ fn probe_opencode() -> (Vec<ProbeResult>, Vec<Observed>, String) {
         .map(|(_, body)| vec![Observed::new("opencode.tool_registry", "json", body.clone())])
         .unwrap_or_default();
 
-    (results, observed, serve_version(serve.port))
+    (results, observed, serve_version(serve.port, auth))
 }
 
 /// The OpenCode build the probes just ran against, from the server child that
@@ -787,8 +881,8 @@ fn probe_opencode() -> (Vec<ProbeResult>, Vec<Observed>, String) {
 /// --version`: the probe already paid for a server, and a second process to
 /// learn a string it can ask for over an open socket is a cost with no answer
 /// attached.
-fn serve_version(port: u16) -> String {
-    http_get(port, "/global/health")
+fn serve_version(port: u16, auth: Option<&str>) -> String {
+    http_get_as(port, "/global/health", auth)
         .filter(|(status, _)| *status == 200)
         .and_then(|(_, body)| serde_json::from_str::<Value>(&body).ok())
         .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string))
@@ -911,48 +1005,124 @@ fn tool_registry_outcome(ids: Option<&(u16, String)>) -> Outcome {
     }
 }
 
-/// Whether OpenCode's local server still serves cImp's routes unauthenticated.
+/// One route, observed twice: with this run's credential and with none.
 ///
-/// A 401/403 is the **good** news case (locked decision 8): auth landed, and
-/// the response is to wire a token into `harness/opencode/read.rs`, not to file a bug.
-/// Note the CLI already warns `OPENCODE_SERVER_PASSWORD is not set; server is
-/// unsecured` on 1.18.13, so the mechanism exists — this row is watching for
-/// the day it becomes mandatory.
-fn noauth_outcome(ids: Option<&(u16, String)>, session: Option<&(u16, String)>) -> Outcome {
-    let statuses: Vec<(&str, u16)> = [
-        ("GET /experimental/tool/ids", ids),
-        ("GET /session/:id", session),
-    ]
-    .into_iter()
-    .filter_map(|(what, r)| r.map(|(s, _)| (what, *s)))
-    .collect();
+/// Both halves are the point. "Authenticated calls work" is also true of a server
+/// enforcing nothing, and "unauthenticated calls are refused" alone would be true
+/// of a server cImp can no longer talk to — so the verdict needs the pair.
+struct AuthPair {
+    /// Route label. A label, not a URL: the detail strings this feeds carry
+    /// field names and counts only.
+    route: &'static str,
+    /// Status with `Authorization: Basic …`, or `None` if the route did not
+    /// answer at all.
+    authed: Option<u16>,
+    /// Status with no credential.
+    unauthed: Option<u16>,
+}
 
-    if statuses.is_empty() {
+/// Whether the documented `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME`
+/// pair really does enforce Basic auth on the routes cImp depends on — and
+/// whether cImp's own credential is still accepted.
+///
+/// **This replaced a watch with a check on 2026-08-17.** The row used to be Tier
+/// D: cImp sent no credential, the probe confirmed the server still answered
+/// anybody, and a 401 was reported as `Transition` ("auth landed — wire a
+/// token"). Auth has landed, cImp now sets a per-spawn password at tab launch,
+/// and the row is Tier B — so the probe's job flipped with it. What it proves:
+///
+/// * **unauthenticated ⇒ refused** on every probed route. Anything else means
+///   the documented env vars did not take effect, i.e. every OpenCode tab cImp
+///   launches is hosting an unauthenticated server on loopback while the code
+///   believes otherwise. That is a security control that stopped enforcing, so
+///   it is a **`Fail`** — the one direction locked decision 8 does want scored.
+/// * **authenticated ⇒ accepted**. A 401/403 with a correct header means the
+///   scheme moved (a changed username default, or the credential is no longer
+///   read from the header), and the tap and the V30 push are dark until it is
+///   rewired. Also a `Fail`, and the one the `VisibleOff` degradation is written
+///   for.
+///
+/// A 404 counts as accepted, deliberately: the session-route probe asks for an id
+/// that cannot exist, and "processed and answered" is exactly what
+/// distinguishes acceptance from refusal.
+///
+/// `unknown` — never a failure — covers every way the question could not be
+/// asked: a route that answered neither way, or a run whose own credential could
+/// not be built (an empty password disables auth upstream, so a probe without one
+/// would report a passing server as broken).
+fn noauth_outcome(credentialed: bool, pairs: &[AuthPair]) -> Outcome {
+    if !credentialed {
         return Outcome::Unknown {
-            why: "the server answered neither probed route, so nothing can be said about auth"
+            why: "this probe run could not build a server credential of its own, so the child was \
+                  spawned without one — an empty `OPENCODE_SERVER_PASSWORD` disables auth \
+                  upstream, and testing an unsecured server against the auth contract would \
+                  report a healthy build as broken"
                 .to_string(),
         };
     }
-    let rendered = statuses
+    let observed: Vec<(&str, u16, u16)> = pairs
         .iter()
-        .map(|(what, s)| format!("{what} → {s}"))
+        .filter_map(|p| Some((p.route, p.authed?, p.unauthed?)))
+        .collect();
+    if observed.is_empty() {
+        return Outcome::Unknown {
+            why: "no probed route answered both with and without a credential, so nothing can be \
+                  said about auth"
+                .to_string(),
+        };
+    }
+    let rendered = observed
+        .iter()
+        .map(|(route, authed, unauthed)| format!("{route} → {authed} authenticated, {unauthed} not"))
         .collect::<Vec<_>>()
         .join(", ");
-    if statuses.iter().any(|(_, s)| *s == 401 || *s == 403) {
-        return Outcome::Transition {
-            note: format!(
-                "AUTH LANDED — OpenCode now rejects unauthenticated localhost calls ({rendered}). \
-                 This is an upstream IMPROVEMENT, not drift: wire the token into \
-                 `harness/opencode/read.rs` (tap + V30 push) and retire this watch. Until then the live \
-                 session tap and the push fanout are off."
+    let refused = |status: u16| status == 401 || status == 403;
+
+    let unenforced: Vec<&str> = observed
+        .iter()
+        .filter(|(_, _, unauthed)| !refused(*unauthed))
+        .map(|(route, _, _)| *route)
+        .collect();
+    if !unenforced.is_empty() {
+        return Outcome::Fail {
+            detail: format!(
+                "AUTH NOT ENFORCED on {} of {} probed route(s) despite \
+                 `OPENCODE_SERVER_PASSWORD` being set on the server child ({rendered}). Every \
+                 OpenCode tab cImp launches is then hosting an unauthenticated HTTP server on \
+                 loopback — where `POST /session/:id/message` without `noReply` starts a real \
+                 agent turn — while `harness/opencode/config.rs` believes the password closed it. \
+                 Unenforced: {}.",
+                unenforced.len(),
+                observed.len(),
+                unenforced.join(", ")
+            ),
+        };
+    }
+    let rejected: Vec<&str> = observed
+        .iter()
+        .filter(|(_, authed, _)| refused(*authed))
+        .map(|(route, _, _)| *route)
+        .collect();
+    if !rejected.is_empty() {
+        return Outcome::Fail {
+            detail: format!(
+                "cImp's own credential was REFUSED on {} of {} probed route(s) ({rendered}). The \
+                 Basic-auth scheme moved: check the username default and that the credential is \
+                 still read from the `Authorization` header, then rewire \
+                 `harness/opencode/config.rs::server_basic_auth`. Until then this tab's live \
+                 session tap and the V30 push fanout are off. Refused: {}.",
+                rejected.len(),
+                observed.len(),
+                rejected.join(", ")
             ),
         };
     }
     Outcome::Pass {
         detail: format!(
-            "unauthenticated localhost calls still served ({rendered}); no Authorization header \
-             sent. Double-edged by design: the tap and push work, and the local server remains an \
-             unauthenticated loopback surface."
+            "the documented server-password env pair enforces Basic auth on all {} probed \
+             route(s), and cImp's own credential is accepted ({rendered}). The Tier-D \
+             unauthenticated-loopback exposure is closed for every tab cImp launches.",
+            observed.len()
         ),
     }
 }
@@ -1776,35 +1946,67 @@ Options:
         }
     }
 
-    /// A 401/403 is upstream getting BETTER, so it must transition rather than
-    /// fail — the worked example of locked decision 8.
+    /// The auth contract, both directions — and the two ways of getting it wrong
+    /// that are genuinely failures rather than noise.
+    ///
+    /// This test replaced `opencode_growing_auth_is_a_transition_not_a_failure`
+    /// on 2026-08-17. That one pinned the OLD contract: cImp sent no credential,
+    /// an unauthenticated 200 was the pass, and a 401 was the `Transition`
+    /// ("upstream got better — go wire a token"). The token is wired, so a 401 on
+    /// an unauthenticated call is now the PASS and its absence is the failure.
+    /// Nothing about locked decision 8 changed: a control that stopped enforcing
+    /// is drift in the bad direction, and every could-not-ask case below is still
+    /// `unknown`.
     #[test]
-    fn opencode_growing_auth_is_a_transition_not_a_failure() {
-        let ok = (200u16, "[]".to_string());
-        let denied = (401u16, String::new());
-        let not_found = (404u16, String::new());
+    fn opencode_server_auth_is_proven_in_both_directions() {
+        let pair = |route: &'static str, authed: u16, unauthed: u16| AuthPair {
+            route,
+            authed: Some(authed),
+            unauthed: Some(unauthed),
+        };
+        let ids = "GET /experimental/tool/ids";
+        let sess = "GET /session/:id";
 
-        assert!(matches!(
-            noauth_outcome(Some(&ok), Some(&not_found)),
-            Outcome::Pass { .. }
-        ));
-        for pair in [
-            (Some(&denied), Some(&ok)),
-            (Some(&ok), Some(&denied)),
-            (Some(&denied), Some(&denied)),
+        // The healthy shape: credential accepted (200 on one route, 404 on the
+        // deliberately-nonexistent session id), no credential refused.
+        let outcome = noauth_outcome(true, &[pair(ids, 200, 401), pair(sess, 404, 401)]);
+        assert!(matches!(outcome, Outcome::Pass { .. }), "{outcome:?}");
+
+        // Auth silently not enforced — the password had no effect. Names the
+        // route, because "which surface is open" is the whole answer.
+        let outcome = noauth_outcome(true, &[pair(ids, 200, 200), pair(sess, 404, 401)]);
+        assert!(outcome.is_fail(), "{outcome:?}");
+        assert!(outcome.detail().contains(ids), "{outcome:?}");
+
+        // cImp's own credential refused — the scheme moved and the tap is dark.
+        let outcome = noauth_outcome(true, &[pair(ids, 401, 401), pair(sess, 404, 403)]);
+        assert!(outcome.is_fail(), "{outcome:?}");
+        assert!(
+            outcome.detail().contains("harness/opencode/config.rs"),
+            "{outcome:?}"
+        );
+
+        // …and every could-not-ask case is `unknown`, never a failure.
+        for (label, credentialed, pairs) in [
+            ("no credential of our own", false, vec![pair(ids, 200, 401)]),
+            ("nothing answered", true, vec![]),
+            (
+                "answered only one way",
+                true,
+                vec![AuthPair {
+                    route: ids,
+                    authed: Some(200),
+                    unauthed: None,
+                }],
+            ),
         ] {
-            let outcome = noauth_outcome(pair.0, pair.1);
+            let outcome = noauth_outcome(credentialed, &pairs);
             assert!(
-                matches!(outcome, Outcome::Transition { .. }),
-                "{outcome:?}"
+                matches!(outcome, Outcome::Unknown { .. }),
+                "{label}: {outcome:?}"
             );
-            assert!(!outcome.is_fail());
-            assert!(outcome.detail().contains("harness/opencode/read.rs"), "{outcome:?}");
+            assert!(!outcome.is_fail(), "{label}");
         }
-        assert!(matches!(
-            noauth_outcome(None, None),
-            Outcome::Unknown { .. }
-        ));
     }
 
     /// A transcript window with no evidence in it is `unknown`; one with an

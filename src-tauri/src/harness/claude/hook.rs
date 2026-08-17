@@ -91,6 +91,55 @@ pub const ROUTE_NOTIFICATION: &str = "/claude/hook/notification";
 /// hello.
 pub const ROUTE_SESSION_START: &str = "/claude/hook/session_start";
 
+// ── V35 Phase L: the read path, pushed ──────────────────────────────────────
+//
+// Three routes that replace no shim, because what they replace is not a shim:
+// they are the Tier-C transcript tail's taps, arriving as documented hook
+// payloads instead of as fields cImp scrapes out of an emitted artifact. Each
+// feeds a CHP event that Phase I reserved (`docs/CHP.md` § 4.3) and Phase L
+// realizes.
+
+/// `Stop` — the complete final assistant message of a turn
+/// (`last_assistant_message`), feeding `assistant_text` → TTS.
+///
+/// **`MessageDisplay` is deliberately NOT wired**, and that is locked decision
+/// 2 rather than an oversight. It fires per streaming chunk, which would hand
+/// the segmenter token deltas where it is fed complete text today; and it runs
+/// on the streaming hot path with a 10 s default timeout, i.e. inside the
+/// rendering the user is watching. `Stop`'s cadence — one complete message at
+/// message finish — is *identically* the cadence
+/// `harness::claude::read::assistant_texts` delivers, so the migration
+/// preserves TTS behaviour by construction rather than by testing for it after
+/// the fact (live-verify recipe 10).
+pub const ROUTE_STOP: &str = "/claude/hook/stop";
+
+/// `PostToolUse` on an ALL-TOOLS matcher — the tool result's size, feeding
+/// `session.tool_result`.
+///
+/// **A second route, not a widened [`ROUTE_POST_TOOL_USE`].** Both entries fire
+/// for an `Edit`, so sharing one route would run the auto-check twice and count
+/// one tool result twice — the two failure modes this phase is most exposed to.
+/// CHP compatibility rule 4 says the same thing from the protocol side: new
+/// meaning, new route. The consequence is that the auto-check entry keeps its
+/// exact `Edit|Write|MultiEdit` matcher and its exact handler, which is what
+/// makes "the post-edit path is unchanged" a fact about the diff.
+pub const ROUTE_POST_TOOL_USE_RESULT: &str = "/claude/hook/post_tool_use_result";
+
+/// `SubagentStart` **and** `SubagentStop` — sub-agent lifecycle, feeding
+/// `session.subagent`.
+///
+/// One route for two events, dispatching on `hook_event_name`, exactly as
+/// [`ROUTE_NOTIFICATION`] serves `Notification` and `PermissionDenied`. The
+/// pair is a lifecycle: an id that started and has not stopped is an agent
+/// running, which is the only fact the avatar's `AgentsActiveChanged` edge
+/// needs.
+///
+/// **Sub-agent TOKEN usage does not come this way**, and cannot: no hook
+/// payload carries token counts. The transcript tail keeps reading
+/// `<session_id>/subagents/agent-*.jsonl` for that, permanently-until-upstream-
+/// changes — see `claude.transcript.subagents`' registry row.
+pub const ROUTE_SUBAGENT: &str = "/claude/hook/subagent";
+
 /// Every route in this family, so the dispatcher's CHP observation and the
 /// overlay generator agree about the surface without either restating it.
 pub const ROUTES: &[&str] = &[
@@ -100,7 +149,32 @@ pub const ROUTES: &[&str] = &[
     ROUTE_POST_TOOL_USE,
     ROUTE_NOTIFICATION,
     ROUTE_SESSION_START,
+    ROUTE_STOP,
+    ROUTE_POST_TOOL_USE_RESULT,
+    ROUTE_SUBAGENT,
 ];
+
+/// The CHP event one Claude ingress route feeds — the join the quiet detector
+/// (`chp::note_event`) and the arbitration rule need in order to speak about
+/// capabilities rather than about transports.
+///
+/// `None` for the routes whose event is not one arbitration can turn off: the
+/// hello is the negotiation itself, and the four Phase J capability hooks have
+/// no fallback reader to arbitrate against.
+pub fn chp_event(route: &str) -> Option<&'static str> {
+    use crate::harness::chp;
+    match route {
+        ROUTE_USER_PROMPT_SUBMIT => Some(chp::EV_PROMPT),
+        ROUTE_PRE_COMPACT => Some(chp::EV_CONTEXT_COMPACTION),
+        ROUTE_PRE_TOOL_USE => Some(chp::EV_CONTEXT_SHOULD_READ),
+        ROUTE_POST_TOOL_USE => Some(chp::EV_CONTEXT_POST_EDIT),
+        ROUTE_NOTIFICATION => Some(chp::EV_PERMISSION_EVENT),
+        ROUTE_STOP => Some(chp::EV_ASSISTANT_TEXT),
+        ROUTE_POST_TOOL_USE_RESULT => Some(chp::EV_SESSION_TOOL_RESULT),
+        ROUTE_SUBAGENT => Some(chp::EV_SESSION_SUBAGENT),
+        _ => None,
+    }
+}
 
 /// Whether `route` is a harness-native Claude ingress route — i.e. one whose
 /// identity arrives in headers rather than in the body.
@@ -173,6 +247,10 @@ pub const EVENT_POST_TOOL_USE: &str = "PostToolUse";
 /// branches on it, and the classifier that does lives beside the state signal it
 /// emits (`offload::loopback::classify_permission_event`).
 pub const EVENT_NOTIFICATION: &str = "Notification";
+/// V35 Phase L: the `hook_event_name` [`ROUTE_SUBAGENT`] dispatches on. Its
+/// twin `SubagentStop` needs no constant for the same reason `PermissionDenied`
+/// does not — nothing branches on it, it is simply "not a start".
+pub const EVENT_SUBAGENT_START: &str = "SubagentStart";
 
 /// The reply that says nothing: a 2xx JSON body with no directive in it.
 ///
@@ -223,6 +301,24 @@ pub const DRIFT_CONTEXT_HOOK: &str = "context_hook";
 pub const DRIFT_COMPACT_HOOK: &str = "compact_hook";
 pub const DRIFT_READ_HOOK: &str = "read_hook";
 pub const DRIFT_NOTIFY_HOOK: &str = "notify_hook";
+
+/// V35 Phase L's three. These name no deleted binary — there never was one —
+/// so they are named for the capability they carry, in the same `<thing>_hook`
+/// shape so one glance at an Activity row says which family it came from.
+///
+/// They carry a second duty the Phase J tokens do not: a **quiet** report
+/// (locked decision 7) rides the same channel, so a served capability that
+/// stops pushing is attributed to the same capability row as a malformed
+/// payload from it. One bucket per capability, two ways in.
+pub const DRIFT_STOP_HOOK: &str = "stop_hook";
+pub const DRIFT_TOOL_RESULT_HOOK: &str = "tool_result_hook";
+pub const DRIFT_SUBAGENT_HOOK: &str = "subagent_hook";
+
+/// The `missing` entry a quiet report carries.
+///
+/// Not a payload field name, and deliberately shaped so it cannot be mistaken
+/// for one: what is missing is not a field in a message, it is the message.
+pub const MISSING_PUSH: &str = "(no push — the hook stopped firing)";
 
 // ── the payload ─────────────────────────────────────────────────────────────
 
@@ -287,6 +383,42 @@ pub struct HookInput {
     /// `Notification`, nested spelling (`notification: {type, message}`).
     #[serde(default)]
     pub notification: serde_json::Value,
+    // ── V35 Phase L ─────────────────────────────────────────────────────────
+    /// `Stop` and `SubagentStop`: the complete final assistant message.
+    ///
+    /// **The whole basis of the TTS migration.** It is documented as the final
+    /// assistant text, which is the same unit
+    /// `harness::claude::read::assistant_texts` lifts out of an `assistant`
+    /// transcript line — so the segmenter's input cadence is unchanged. What
+    /// cImp does NOT know without a live turn is whether the two renderings are
+    /// byte-identical (markdown fences, tool-use interleaving); the reader's
+    /// per-block extraction and this per-message one can only differ in how
+    /// several text blocks of one message are joined. `to_speakable` reduces
+    /// both before segmentation, and the L1 canary asserts the reader half
+    /// still produces substantive prose, so a divergence degrades to *what is
+    /// spoken*, never to *whether anything is spoken*.
+    #[serde(default)]
+    pub last_assistant_message: String,
+    /// `PostToolUse`: the tool's full result content. Read only for its SIZE
+    /// ([`tool_result_chars`]) — the same estimated-token proxy the transcript
+    /// reader computes, and deliberately not for anything else.
+    #[serde(default)]
+    pub tool_result: serde_json::Value,
+    // `tool_use_id` is documented on this payload and is deliberately NOT read.
+    // The tool-result core keys nothing on it — the `UsageEvent::ToolResult`
+    // row it writes has no id column, exactly as the transcript reader's does
+    // not — so declaring the field would put a dependency in the registry that
+    // no line of code has. An unread field is a contract cImp cannot notice
+    // breaking.
+    /// `SubagentStart` / `SubagentStop`: which sub-agent. This is the lifecycle
+    /// key — an id that started and has not stopped is an agent running.
+    #[serde(default)]
+    pub agent_id: String,
+    /// `SubagentStart` / `SubagentStop`: the sub-agent's type. Carried for the
+    /// log line, never branched on: a new agent type must not change whether
+    /// the avatar sees an agent.
+    #[serde(default)]
+    pub agent_type: String,
 }
 
 impl HookInput {
@@ -321,6 +453,49 @@ impl HookInput {
     /// every shape documented today. See [`HookInput::version`].
     pub fn harness_version(&self) -> &str {
         self.version.trim()
+    }
+
+    /// V35 Phase L: whether this sub-agent payload is a START (rather than the
+    /// `SubagentStop` half). Read off `hook_event_name`, the one field the
+    /// shared route dispatches on.
+    pub fn is_subagent_start(&self) -> bool {
+        self.hook_event_name == EVENT_SUBAGENT_START
+    }
+}
+
+/// The character length of a `PostToolUse` payload's `tool_result` — the
+/// estimated-token proxy `session.tool_result` carries.
+///
+/// **Delegates to the transcript reader's own sizing**
+/// ([`crate::harness::claude::read::tool_result_chars`]) on purpose. The two
+/// paths carry the same shape (a plain string, or an array of `{type, text}`
+/// blocks), they feed the same `UsageEvent::ToolResult` row, and the whole
+/// point of arbitrating between them is that they must produce the *same
+/// number* for the same result — which a second implementation could not
+/// promise. It also means the Phase B fixture canary for
+/// `claude.transcript.tool_result` is the leading check for both.
+///
+/// A shape neither reader recognises sizes to `0`, which is a silent zero — so
+/// [`contract_checks`] reports it as drift rather than letting it pass as a
+/// legitimately empty result (see that function's `PostToolUse`-result arm).
+pub fn tool_result_chars(tool_result: &serde_json::Value) -> usize {
+    crate::harness::claude::read::tool_result_chars(tool_result)
+}
+
+/// Whether a `tool_result` payload holds anything at all — the "empty is not
+/// absent" half of the check above.
+///
+/// A tool that genuinely returned nothing is `null`, `""` or `[]`, and reports
+/// no drift. A tool_result that is a non-empty object, or a non-empty array
+/// with no text block cImp can read, IS drift: something is there and cImp
+/// sized it at zero.
+pub fn tool_result_is_present(tool_result: &serde_json::Value) -> bool {
+    match tool_result {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+        _ => true,
     }
 }
 
@@ -411,6 +586,42 @@ pub fn contract_checks(route: &str, input: &HookInput) -> Vec<(&'static str, boo
                     || !input.notification_message().is_empty(),
             ));
         }
+        // ── V35 Phase L ─────────────────────────────────────────────────────
+        //
+        // These three are the first hooks whose checks were written WITH the
+        // capability rather than retrofitted onto a shim, so each one asserts
+        // the field the capability would go silently to zero without — which is
+        // the whole reason the row moved off Tier C.
+        ROUTE_STOP => {
+            base(&mut out);
+            // The migration's single point of failure: no `last_assistant_
+            // message` is a mute tab, and (before this line) it would have been
+            // a mute tab with nothing anywhere saying why.
+            out.push((
+                "last_assistant_message",
+                !input.last_assistant_message.trim().is_empty(),
+            ));
+        }
+        ROUTE_POST_TOOL_USE_RESULT => {
+            base(&mut out);
+            out.push(("tool_name", input.tool_name.is_some()));
+            // "Empty is not absent": a result that is genuinely empty is fine;
+            // a result that is PRESENT and sizes to zero means neither shape
+            // matched, i.e. the payload changed under us.
+            out.push((
+                "tool_result",
+                !tool_result_is_present(&input.tool_result)
+                    || tool_result_chars(&input.tool_result) > 0,
+            ));
+        }
+        ROUTE_SUBAGENT => {
+            out.push(("hook_event_name", !input.hook_event_name.is_empty()));
+            base(&mut out);
+            // Without an id there is no lifecycle — a start that cannot be
+            // matched to its stop would wedge the avatar in Thinking, so the
+            // handler drops such a payload and this is what says so out loud.
+            out.push(("agent_id", !input.agent_id.trim().is_empty()));
+        }
         // `PostToolUse` (see above) and `SessionStart` (whose only required
         // field is one cImp supplies itself, in a header) report nothing.
         _ => {}
@@ -426,6 +637,24 @@ pub fn drift_token(route: &str) -> Option<&'static str> {
         ROUTE_PRE_COMPACT => Some(DRIFT_COMPACT_HOOK),
         ROUTE_PRE_TOOL_USE => Some(DRIFT_READ_HOOK),
         ROUTE_NOTIFICATION => Some(DRIFT_NOTIFY_HOOK),
+        ROUTE_STOP => Some(DRIFT_STOP_HOOK),
+        ROUTE_POST_TOOL_USE_RESULT => Some(DRIFT_TOOL_RESULT_HOOK),
+        ROUTE_SUBAGENT => Some(DRIFT_SUBAGENT_HOOK),
+        _ => None,
+    }
+}
+
+/// The drift token a CHP event's **quiet** report (locked decision 7) arrives
+/// under — the same bucket that event's payload drift uses, so one capability
+/// has one channel however it broke.
+///
+/// `None` for an event with no push producer to go quiet.
+pub fn drift_token_for_event(event: &str) -> Option<&'static str> {
+    use crate::harness::chp;
+    match event {
+        chp::EV_ASSISTANT_TEXT => Some(DRIFT_STOP_HOOK),
+        chp::EV_SESSION_TOOL_RESULT => Some(DRIFT_TOOL_RESULT_HOOK),
+        chp::EV_SESSION_SUBAGENT => Some(DRIFT_SUBAGENT_HOOK),
         _ => None,
     }
 }
@@ -986,5 +1215,163 @@ mod tests {
     #[test]
     fn the_pinned_timeout_is_the_shims_budget_rounded_up() {
         assert_eq!(TIMEOUT_SECS, 1, "600 ms rounded up to whole seconds");
+    }
+
+    // ── V35 Phase L ─────────────────────────────────────────────────────────
+
+    /// The three new routes carry the fields their capabilities would go
+    /// silently to zero without, and say so when they are absent.
+    #[test]
+    fn the_phase_l_routes_report_the_field_each_capability_lives_on() {
+        // Stop: no text is a mute tab.
+        let bare = HookInput {
+            session_id: "s".into(),
+            cwd: "c".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            missing_fields(&contract_checks(ROUTE_STOP, &bare)),
+            vec!["last_assistant_message"]
+        );
+        let spoke = HookInput {
+            last_assistant_message: "Something was said.".into(),
+            ..bare.clone()
+        };
+        assert!(missing_fields(&contract_checks(ROUTE_STOP, &spoke)).is_empty());
+        // Whitespace is not text — "empty is not absent" in the other
+        // direction: a payload that is present but blank is still a mute tab.
+        let blank = HookInput {
+            last_assistant_message: "   \n ".into(),
+            ..bare.clone()
+        };
+        assert!(missing_fields(&contract_checks(ROUTE_STOP, &blank))
+            .contains(&"last_assistant_message"));
+
+        // Sub-agent: no id means a lifecycle that can never be closed.
+        let start = HookInput {
+            hook_event_name: EVENT_SUBAGENT_START.into(),
+            agent_id: "agent_1".into(),
+            ..bare.clone()
+        };
+        assert!(missing_fields(&contract_checks(ROUTE_SUBAGENT, &start)).is_empty());
+        assert!(start.is_subagent_start());
+        let stop = HookInput {
+            hook_event_name: "SubagentStop".into(),
+            ..start.clone()
+        };
+        assert!(!stop.is_subagent_start());
+        let anon = HookInput {
+            agent_id: "  ".into(),
+            ..start.clone()
+        };
+        let miss = missing_fields(&contract_checks(ROUTE_SUBAGENT, &anon));
+        assert!(miss.contains(&"agent_id"), "got {miss:?}");
+    }
+
+    /// Tool-result sizing: the two documented shapes size, an EMPTY result is
+    /// not drift, and a present-but-unreadable one IS.
+    ///
+    /// That last distinction is the whole check. A tool that returned nothing
+    /// and a payload cImp can no longer read both size to zero, and treating
+    /// them the same is how a reshape becomes a silent zero.
+    #[test]
+    fn tool_result_sizing_separates_an_empty_result_from_an_unreadable_one() {
+        let sized = |v: serde_json::Value| {
+            let input = HookInput {
+                session_id: "s".into(),
+                cwd: "c".into(),
+                tool_name: Some("Read".into()),
+                tool_result: v,
+                ..Default::default()
+            };
+            (
+                tool_result_chars(&input.tool_result),
+                missing_fields(&contract_checks(ROUTE_POST_TOOL_USE_RESULT, &input)),
+            )
+        };
+        // A plain string, and an array of text blocks — the two shapes the
+        // transcript reader already knows, reused rather than re-implemented.
+        let (chars, miss) = sized(json!("twelve chars"));
+        assert_eq!(chars, 12);
+        assert!(miss.is_empty());
+        let (chars, miss) = sized(json!([
+            { "type": "text", "text": "ab" },
+            { "type": "image", "source": "…" },
+            { "type": "text", "text": "cde" },
+        ]));
+        assert_eq!(chars, 5, "non-text blocks do not count");
+        assert!(miss.is_empty());
+        // Genuinely empty: nothing to size, nothing to report.
+        for empty in [json!(null), json!(""), json!([])] {
+            let (chars, miss) = sized(empty.clone());
+            assert_eq!(chars, 0);
+            assert!(miss.is_empty(), "an empty result is not drift: {empty}");
+        }
+        // Present and unreadable: something is there and cImp sized it at zero.
+        for reshaped in [json!({ "output": "hello" }), json!([{ "type": "text", "body": "x" }])] {
+            let (chars, miss) = sized(reshaped.clone());
+            assert_eq!(chars, 0);
+            assert!(
+                miss.contains(&"tool_result"),
+                "a present-but-unsizeable result must be reported: {reshaped}"
+            );
+        }
+        // …and the tool name, without which a row cannot be attributed.
+        let anon = HookInput {
+            session_id: "s".into(),
+            cwd: "c".into(),
+            tool_result: json!("x"),
+            ..Default::default()
+        };
+        assert!(missing_fields(&contract_checks(ROUTE_POST_TOOL_USE_RESULT, &anon))
+            .contains(&"tool_name"));
+    }
+
+    /// Every route maps to exactly one CHP event or to none, and every event
+    /// whose SILENCE is reportable maps back to a drift token.
+    ///
+    /// The two directions are what let a quiet report name a capability rather
+    /// than a transport — and what stops a new route from being observed for
+    /// staleness while being invisible to arbitration.
+    #[test]
+    fn the_route_to_event_join_is_total_and_reversible() {
+        use crate::harness::chp;
+        let mut events: Vec<&str> = ROUTES.iter().filter_map(|r| chp_event(r)).collect();
+        assert_eq!(
+            events.len(),
+            ROUTES.len() - 1,
+            "only `SessionStart` (the hello itself) maps to no event"
+        );
+        assert_eq!(chp_event(ROUTE_SESSION_START), None);
+        events.sort_unstable();
+        let n = events.len();
+        events.dedup();
+        assert_eq!(n, events.len(), "two routes claim one CHP event");
+        // Every mapped event is really in the vocabulary.
+        for e in &events {
+            assert!(
+                chp::EVENTS.iter().any(|x| x.id == *e),
+                "`{e}` is not a CHP event"
+            );
+        }
+        // The reverse join, for the three that can go quiet.
+        assert_eq!(
+            drift_token_for_event(chp::EV_ASSISTANT_TEXT),
+            drift_token(ROUTE_STOP),
+            "a capability's payload drift and its silence must land in ONE bucket"
+        );
+        assert_eq!(
+            drift_token_for_event(chp::EV_SESSION_TOOL_RESULT),
+            drift_token(ROUTE_POST_TOOL_USE_RESULT)
+        );
+        assert_eq!(
+            drift_token_for_event(chp::EV_SESSION_SUBAGENT),
+            drift_token(ROUTE_SUBAGENT)
+        );
+        assert_eq!(drift_token_for_event(chp::EV_PROMPT), None);
+        // The two that never migrated have no token because they have no
+        // producer to go quiet — the upstream limitation, restated as code.
+        assert_eq!(drift_token_for_event(chp::EV_SESSION_USAGE), None);
+        assert_eq!(drift_token_for_event(chp::EV_SESSION_CONTEXT), None);
     }
 }

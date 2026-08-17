@@ -634,7 +634,208 @@ pub const CAPABILITIES: &[Capability] = &[
         controls: &[],
         drift_token: None,
     },
+    // ── Claude Code: the read path, PUSHED (Tier B — V35 Phase L) ───────────
+    //
+    // Three rows that did not exist before Phase L, because before Phase L the
+    // data they carry had no seam of its own: it was read out of an emitted
+    // artifact, and the artifact's row was the only row. Each one is paired
+    // with the Tier-C row below it by `Degradation::Fallback { to }`, which is
+    // the shape `claude.hook.notification` → `perm.tui_scrape` already used —
+    // and which is what the milestone's "C→B" exit criterion means in the
+    // registry: the CAPABILITY is served at Tier B, and the Tier-C reader it
+    // used to depend on is now a named, tested, arbitrated fallback rather than
+    // the only path.
+    //
+    // The arbitration itself is `harness::chp::served(agent, tab, event)`, asked
+    // by BOTH sides — the push core refuses to act when the tab did not declare
+    // the capability, the reader's tap refuses when it did — so for one tab
+    // exactly one of the two produces each datum.
+    Capability {
+        id: "claude.hook.stop",
+        harness: Harness::Claude,
+        tier: Seam::B,
+        contract: "A `Stop` hook of `type: \"http\"` fires at the end of every assistant turn \
+                   with `last_assistant_message` carrying the complete final assistant text. \
+                   `MessageDisplay` is deliberately NOT used: it delivers per-chunk deltas on the \
+                   streaming hot path, which would change the unit the sentence segmenter is fed \
+                   (milestone locked decision 2, live-verify recipe 10).",
+        depends_on: &[
+            Dep::ConfigKey("hooks.Stop"),
+            Dep::ConfigKey("type=http"),
+            Dep::JsonPath("last_assistant_message"),
+            Dep::JsonPath("session_id"),
+            Dep::JsonPath("cwd"),
+            Dep::Behavior(
+                "that `last_assistant_message` renders a multi-block assistant message the same \
+                 way the transcript reader joins its `content[].text` blocks — both are reduced \
+                 by `to_speakable` before segmentation, so a divergence changes WHAT is spoken, \
+                 never WHETHER anything is. No payload reveals it; it needs a live turn",
+            ),
+        ],
+        wired_in: &[
+            "src-tauri/src/harness/claude/hook.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tts/prose.rs",
+        ],
+        degradation: Degradation::Fallback {
+            to: "claude.transcript.assistant_text",
+        },
+        drift_rule: &[RULE_DRIFT_PAYLOAD],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "No fixture canary: the payload has one field cImp reads and `contract_checks` \
+             already reports its absence on every fire, which is a LEADING check on the live wire \
+             rather than against a recording. The silence case — the hook stops firing entirely — \
+             is covered by the Phase L quiet detector (`chp::note_event`, witness `prompt`), \
+             which reports under this row's own drift token instead of letting the reader quietly \
+             take over. Degradation is `Fallback`, not `Silent`, so the enforcement test does not \
+             require one.",
+        ),
+        controls: &[],
+        drift_token: Some("stop_hook"),
+    },
+    Capability {
+        id: "claude.hook.tool_result",
+        harness: Harness::Claude,
+        tier: Seam::B,
+        contract: "A SECOND `PostToolUse` entry with an all-tools matcher (`\"\"`) fires of \
+                   `type: \"http\"` for every tool call, carrying `tool_name` and `tool_result` \
+                   (the full result content, as a string or as `{type:\"text\", text}` blocks). \
+                   It is a SEPARATE route from the auto-check entry on purpose: both groups fire \
+                   for an `Edit`, so one shared route would run the project's checks twice and \
+                   count one result twice.",
+        depends_on: &[
+            Dep::ConfigKey("hooks.PostToolUse"),
+            Dep::ConfigKey("type=http"),
+            Dep::JsonPath("tool_name"),
+            Dep::JsonPath("tool_result"),
+            Dep::JsonPath("session_id"),
+            Dep::JsonPath("cwd"),
+            Dep::Behavior(
+                "that an all-tools matcher (`\"\"`) really does fire for EVERY tool and not only \
+                 for the ones the sibling entry names — the notification hooks rely on the same \
+                 spelling, so a regression would surface on both at once",
+            ),
+        ],
+        wired_in: &[
+            "src-tauri/src/harness/claude/hook.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
+            "src-tauri/src/offload/loopback.rs",
+        ],
+        degradation: Degradation::Fallback {
+            to: "claude.transcript.tool_result",
+        },
+        drift_rule: &[RULE_DRIFT_PAYLOAD],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "The SHAPE half needs no canary of its own: the push sizes `tool_result` through the \
+             transcript reader's own `tool_result_chars`, so `claude.transcript.tool_result`'s \
+             fixture canary is the leading check for both paths at once — which is why the push \
+             reuses that function rather than restating it. `contract_checks` covers the \
+             present-but-unreadable case (a result that sizes to zero while carrying something), \
+             and the quiet detector covers the stopped-firing case (witness \
+             `context.post_edit`).",
+        ),
+        controls: &[],
+        drift_token: Some("tool_result_hook"),
+    },
+    Capability {
+        id: "claude.hook.subagent",
+        harness: Harness::Claude,
+        tier: Seam::B,
+        contract: "`SubagentStart` and `SubagentStop` hooks of `type: \"http\"` fire (matcher \
+                   `\"\"` = all agent types) carrying `agent_id` and `agent_type`; the pair is a \
+                   lifecycle, so an id that started and has not stopped is an agent running. \
+                   **No hook carries sub-agent TOKEN usage and no payload names a sub-agent \
+                   transcript path**, so this row migrates the lifecycle only — the spend stays \
+                   on `claude.transcript.subagents`.",
+        depends_on: &[
+            Dep::ConfigKey("hooks.SubagentStart"),
+            Dep::ConfigKey("hooks.SubagentStop"),
+            Dep::ConfigKey("type=http"),
+            Dep::JsonPath("hook_event_name"),
+            Dep::JsonPath("agent_id"),
+            Dep::JsonPath("session_id"),
+            Dep::JsonPath("cwd"),
+        ],
+        wired_in: &[
+            "src-tauri/src/harness/claude/hook.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
+            "src-tauri/src/offload/loopback.rs",
+        ],
+        degradation: Degradation::Fallback {
+            to: "claude.transcript.subagents",
+        },
+        // `drift.subagent_transcripts.v1` is deliberately NOT listed, even
+        // though it is about sub-agents: that rule is fed by
+        // `SubagentState::drift_tick`, which reads the TRANSCRIPT layout, so it
+        // lags the Tier-C row below and not this one. Claiming it here would
+        // point one notice at two capabilities and make the Advisor unable to
+        // say which broke.
+        drift_rule: &[RULE_DRIFT_PAYLOAD],
+        canary: None,
+        probe: None,
+        waiver: Some(
+            "No quiet detector, and that is DECLARED rather than missed: a session may \
+             legitimately launch no sub-agents forever, so no other push proves one should have \
+             been reported (`chp::witness_of` returns `None` here). What covers it instead is the \
+             fallback's own canary path — `SubagentState::drift_condition` keeps running on the \
+             transcript for a serving tab, because its `launch_seen` bookkeeping is what would \
+             otherwise start reporting a false 'launcher tool renamed'.",
+        ),
+        controls: &[],
+        drift_token: Some("subagent_hook"),
+    },
     // ── Claude Code: emitted transcript artifact (Tier C) ───────────────────
+    Capability {
+        id: "claude.transcript.assistant_text",
+        harness: Harness::Claude,
+        tier: Seam::C,
+        contract: "Assistant transcript lines (`type == \"assistant\"`) carry `message.content[]` \
+                   blocks with `type == \"text\"` and a `text` string, written COMPLETE at \
+                   message finish, and `thinking` / `tool_use` blocks stay distinguishable by \
+                   `type` so they are never spoken aloud. `message.id` prefixes the dedup key, \
+                   which is what stops one message being re-spoken on every 200 ms drain tick.",
+        depends_on: &[
+            Dep::JsonPath("type"),
+            Dep::JsonPath("message.id"),
+            Dep::JsonPath("message.content[].type"),
+            Dep::JsonPath("message.content[].text"),
+        ],
+        wired_in: &[
+            "src-tauri/src/harness/claude/read.rs",
+            "src-tauri/src/tts/prose.rs",
+        ],
+        degradation: Degradation::Silent,
+        drift_rule: &[],
+        canary: Some("claude.transcript.assistant_text"),
+        probe: Some("claude.transcript.assistant_text"),
+        waiver: None,
+        controls: &[],
+        drift_token: None,
+    },
+    // **This row does NOT migrate, and the reason is upstream's, not cImp's.**
+    //
+    // V35 Phase L moved the read path onto pushed hook payloads wherever a hook
+    // carries the data. This one has no such hook: **no Claude Code hook input
+    // carries token counts.** The common payload set is `session_id`,
+    // `transcript_path`, `cwd`, `permission_mode` and `hook_event_name`; `Stop`
+    // adds `last_assistant_message`; `PostToolUse` adds `tool_name` /
+    // `tool_input` / `tool_result` / `tool_use_id`; `SubagentStart`/`Stop` add
+    // `agent_id` / `agent_type` / `agent_instructions`; and `PostCompact`
+    // exposes no compaction metrics. The only documented token-usage surface is
+    // the OpenTelemetry `claude_code.token.usage` metric, which is a different
+    // integration (an exporter, not a hook) and is under-documented enough that
+    // the design doc's mention of it could not be verified.
+    //
+    // So this stays Tier C on the transcript tail, **permanently-until-upstream-
+    // changes**, and the same is true of `claude.statusline.stdin` below.
+    // Decision 2's D→C→B→A ladder still applies — it is simply not climbable
+    // here yet. The milestone's Phase L row lists "usage" among the migrations;
+    // that text predates this check, and this comment is the correction.
     Capability {
         id: "claude.transcript.usage",
         harness: Harness::Claude,
@@ -680,6 +881,14 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("message.content[].content[].text"),
         ],
         wired_in: &["src-tauri/src/harness/claude/read.rs"],
+        // V35 Phase L: the FALLBACK behind `claude.hook.tool_result`, not the
+        // primary. `Silent` is still the right degradation and the canary still
+        // the right proof — a fallback that rots unnoticed is worse than one
+        // that never existed, because the primary's own failure is what makes
+        // it load-bearing. Arbitration: the reader's tap is suppressed for a tab
+        // whose hello declares `session.tool_result`, so one result is never
+        // counted twice; a tab that declares nothing (pre-upgrade, no loopback,
+        // OpenCode) is served here exactly as before.
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.transcript.tool_result"),
@@ -741,7 +950,13 @@ pub const CAPABILITIES: &[Capability] = &[
         waiver: Some(
             "Canary lands in V35 Phase B (fixture L1 — a directory fixture, not a single file). \
              `drift.subagent_transcripts.v1` already lags it and has fired once for real (the \
-             Task→Agent rename), which is the evidence this layout moves.",
+             Task→Agent rename), which is the evidence this layout moves. V35 Phase L made this \
+             row the FALLBACK behind `claude.hook.subagent` — for the LIFECYCLE only. Sub-agent \
+             TOKEN accounting (`SubagentState::scan`'s `UsageOrigin::Agent` rows) and the \
+             `launch_seen`/`completion_seen` bookkeeping this waiver's drift rule reads are NOT \
+             arbitrated and keep running on every tab: no hook payload carries sub-agent tokens \
+             or names a sub-agent transcript path, and suppressing the bookkeeping would make \
+             `drift_condition` report a false 'launcher tool renamed' on every serving session.",
         ),
         controls: &[],
         drift_token: None,
@@ -1775,7 +1990,10 @@ mod tests {
         let n = tokens.len();
         tokens.dedup();
         assert_eq!(n, tokens.len(), "two rows claim the same drift token");
-        assert_eq!(n, 6, "the reporter set changed without this test noticing");
+        // Six through Phase J (the five converted hooks' shim names plus the
+        // two surviving beacons, minus the one that never reported); nine since
+        // Phase L, which added a reporter per migrated read capability.
+        assert_eq!(n, 9, "the reporter set changed without this test noticing");
     }
 
     /// The TCB column (milestone locked decision 10) is documentation, not a

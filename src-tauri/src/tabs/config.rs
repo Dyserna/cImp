@@ -1673,10 +1673,14 @@ mod tests {
         settings.graph.auto_check = false;
         settings.checks = vec![crate::checks::CheckDef::default()];
         let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
-        // auto_check off → no PostToolUse hook (nothing else is on either, so
-        // the overlay carries only the unconditional NC-2 permission hooks).
+        // auto_check off → no auto-check entry. `PostToolUse` itself is no
+        // longer empty, because V35 Phase L put a SECOND, independently gated
+        // entry on the same event (the all-tools tool-result push), so the
+        // assertion is about the MATCHER GROUP rather than about the key —
+        // which is the sharper claim anyway: what must not exist is a group
+        // that runs the project's checks.
         let overlay = settings_overlay(&args).expect("overlay present");
-        assert!(overlay["hooks"].get("PostToolUse").is_none());
+        assert!(!post_tool_use_has_auto_check(&overlay), "{}", overlay["hooks"]);
 
         let mut settings2 = Settings::default();
         settings2.statusline.enabled = false;
@@ -1685,7 +1689,100 @@ mod tests {
         settings2.checks = Vec::new();
         let args2 = build_pre_args(&claude_cfg(), &settings2, "claude", Some(&hook_endpoint()));
         let overlay2 = settings_overlay(&args2).expect("overlay present");
-        assert!(overlay2["hooks"].get("PostToolUse").is_none());
+        assert!(!post_tool_use_has_auto_check(&overlay2), "{}", overlay2["hooks"]);
+    }
+
+    /// Whether the overlay wired the AUTO-CHECK `PostToolUse` group — the one
+    /// on `Edit|Write|MultiEdit` pointing at `/claude/hook/post_tool_use`.
+    ///
+    /// Distinguishes it from V35 Phase L's sibling group on the same event
+    /// (matcher `""`, route `/claude/hook/post_tool_use_result`), which is a
+    /// different capability with a different gate.
+    fn post_tool_use_has_auto_check(overlay: &serde_json::Value) -> bool {
+        overlay["hooks"]["PostToolUse"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|g| {
+                g["matcher"] == "Edit|Write|MultiEdit"
+                    && g["hooks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|h| {
+                            h["url"]
+                                .as_str()
+                                .is_some_and(|u| u.ends_with(claude_hook::ROUTE_POST_TOOL_USE))
+                        })
+            })
+    }
+
+    /// **The two `PostToolUse` groups are two routes, and that is what stops the
+    /// auto-check running twice** (V35 Phase L).
+    ///
+    /// Claude evaluates every matching group, so an `Edit` fires BOTH. Sharing
+    /// one route would therefore execute the project's configured checks twice
+    /// per edit and count one tool result twice — the two double-delivery
+    /// failures this phase is most exposed to. This is the assertion that keeps
+    /// a later "simplify the matcher" from reintroducing them.
+    #[test]
+    fn the_two_post_tool_use_groups_never_share_a_route() {
+        let (hooks, _http) = maxed_overlay();
+        let groups = hooks["PostToolUse"]
+            .as_array()
+            .expect("both PostToolUse groups")
+            .clone();
+        assert_eq!(groups.len(), 2, "{hooks}");
+        let by_matcher: Vec<(String, String)> = groups
+            .iter()
+            .map(|g| {
+                (
+                    g["matcher"].as_str().unwrap_or_default().to_string(),
+                    g["hooks"][0]["url"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let auto = by_matcher
+            .iter()
+            .find(|(m, _)| m == "Edit|Write|MultiEdit")
+            .expect("the auto-check group keeps its exact matcher");
+        let result = by_matcher
+            .iter()
+            .find(|(m, _)| m.is_empty())
+            .expect("the tool-result group takes every tool");
+        assert!(auto.1.ends_with(claude_hook::ROUTE_POST_TOOL_USE));
+        assert!(result.1.ends_with(claude_hook::ROUTE_POST_TOOL_USE_RESULT));
+        assert_ne!(
+            auto.1, result.1,
+            "one shared route would run the auto-check twice on every Edit"
+        );
+    }
+
+    /// The sub-agent pair rides ONE route, like the notification pair — so the
+    /// lifecycle's two halves cannot be served by handlers that disagree.
+    #[test]
+    fn the_subagent_pair_shares_one_route_like_the_notification_pair() {
+        let (hooks, _http) = maxed_overlay();
+        for event in ["SubagentStart", "SubagentStop"] {
+            let group = &hooks[event][0];
+            assert_eq!(group["matcher"], "", "{event} must take every agent type");
+            assert!(group["hooks"][0]["url"]
+                .as_str()
+                .expect("url")
+                .ends_with(claude_hook::ROUTE_SUBAGENT));
+        }
+        assert!(hooks["Stop"][0]["hooks"][0]["url"]
+            .as_str()
+            .expect("url")
+            .ends_with(claude_hook::ROUTE_STOP));
+        // `MessageDisplay` is the cadence trap (locked decision 2): it fires per
+        // streaming chunk with a 10 s default timeout. A future edit that wires
+        // it would hand the sentence segmenter token deltas where it is fed
+        // complete text today, silently changing what TTS says.
+        assert!(
+            hooks.get("MessageDisplay").is_none(),
+            "MessageDisplay must never be wired — see claude_hook::ROUTE_STOP"
+        );
     }
 
     /// NC-2 (issue #5) + H2 (2026-08-05 review): the `Notification` +
@@ -2064,10 +2161,11 @@ mod tests {
         let (hooks, http) = maxed_overlay();
         assert_eq!(
             http.len(),
-            8,
+            12,
             "the five converted hooks — the read advisor is TWO entries (Read + Bash) \
              on one route and Notification/PermissionDenied are two more on one route \
-             — plus SessionStart: {hooks}"
+             — plus SessionStart, plus V35 Phase L's four (Stop, the all-tools \
+             PostToolUse result entry, and SubagentStart/SubagentStop on one route): {hooks}"
         );
         for h in &http {
             assert_eq!(
@@ -2366,9 +2464,38 @@ mod tests {
                 "ALL_ON must declare `{id}` in `serves`"
             );
         }
+        // …and even with every flag on, the read path is declared UNSERVED —
+        // V35 Phase L's OpenCode outcome (design D6). This is the assertion
+        // that keeps that from being a silent omission: `serves ∪ cannot` must
+        // still cover the vocabulary, so an operator reading the hello learns
+        // that the SSE reader is carrying assistant text on purpose rather than
+        // finding two capabilities simply missing.
+        let on_cannot = on
+            .lines()
+            .find(|l| l.trim_start().starts_with("cannot: ["))
+            .expect("a cannot line");
+        for id in [
+            crate::harness::chp::EV_ASSISTANT_TEXT,
+            crate::harness::chp::EV_SESSION_TOOL_RESULT,
+        ] {
+            assert!(
+                on_cannot.contains(id),
+                "with every flag on, `{id}` must still be declared UNSERVED with a reason: \
+                 {on_cannot}"
+            );
+            assert!(
+                !on.contains(&format!("serves: [\"{id}\"")) && !on_cannot.is_empty(),
+                "`{id}` must not appear in `serves`"
+            );
+        }
+        let serves_on = on
+            .lines()
+            .find(|l| l.trim_start().starts_with("serves: ["))
+            .expect("a serves line");
         assert!(
-            on.contains("cannot: []"),
-            "with every flag on there is nothing it cannot do: {on}"
+            !serves_on.contains(crate::harness::chp::EV_ASSISTANT_TEXT)
+                && !serves_on.contains(crate::harness::chp::EV_SESSION_TOOL_RESULT),
+            "OpenCode pushes no read-path capability: {serves_on}"
         );
 
         // ALL_OFF is the mirror: the flag-gated four move to `cannot`, each with
@@ -2396,11 +2523,17 @@ mod tests {
             assert!(cannot_line.contains(id), "`{id}` must be declared unavailable");
         }
         // A reason per entry — "unavailable, not broken" is only useful if it
-        // says which.
+        // says which. Six since V35 Phase L: the flag-gated four plus the two
+        // read-path capabilities OpenCode declines unconditionally.
         assert_eq!(
             cannot_line.matches("\"why\":").count(),
-            4,
+            cannot_line.matches("{\"id\":").count(),
             "every `cannot` entry needs a `why`: {cannot_line}"
+        );
+        assert_eq!(
+            cannot_line.matches("{\"id\":").count(),
+            6,
+            "the flag-gated four plus V35 Phase L's two unconditional declines: {cannot_line}"
         );
         // Rendered through serde like every other list in this file, so a future
         // reason containing a quote or an em dash cannot malform the emitted JS.

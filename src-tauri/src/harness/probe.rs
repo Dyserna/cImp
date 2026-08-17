@@ -214,6 +214,10 @@ const IMPLEMENTED: &[&str] = &[
     "claude.transcript.usage",
     "claude.transcript.tool_result",
     "claude.transcript.identity",
+    // V35 Phase L. Driven for the same one-tail cost as the three above, and
+    // worth driving precisely BECAUSE it is now a fallback: a fallback nobody
+    // checks is what turns the primary's failure into a mute tab.
+    "claude.transcript.assistant_text",
 ];
 
 /// Every other registry row, with the reason this phase does not drive it.
@@ -261,6 +265,31 @@ const DECLARED_UNPROBED: &[(&str, &str)] = &[
         "perm.tui_scrape",
         "no probe can settle it: a scrape of rendered TUI chrome. Re-characterized in minutes \
          with RUST_LOG=perm_capture=debug; the real fix is the D→C→B migration of decision 2",
+    ),
+    // V35 Phase L's three pushed rows. Same answer as their Phase J siblings
+    // above and for the same reason: a hook payload exists only while a real
+    // turn produces one, so nothing here can be driven without scripting a
+    // model. What is NOT deferred with them is their silence — the Phase L
+    // quiet detector reports a served capability that stops pushing, in
+    // production, on the live wire, which is the half a scripted probe would
+    // have been worst at anyway.
+    (
+        "claude.hook.stop",
+        "needs a scripted turn (L2 residual): `last_assistant_message` exists only when a real \
+         turn finishes. The open question is a Behavior dep besides — whether its rendering of a \
+         multi-block message matches the transcript reader's join",
+    ),
+    (
+        "claude.hook.tool_result",
+        "needs a scripted turn (L2 residual): the payload exists only while a real tool call \
+         returns, and the property worth proving is that the all-tools matcher fires for tools \
+         the sibling entry does not name",
+    ),
+    (
+        "claude.hook.subagent",
+        "needs a scripted turn (L2 residual) AND a session that happens to launch a sub-agent — \
+         the same 'an absence proves nothing' problem `claude.transcript.subagents` has, one \
+         layer up",
     ),
     (
         "claude.transcript.subagents",
@@ -1212,6 +1241,7 @@ fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
         "claude.transcript.usage",
         "claude.transcript.tool_result",
         "claude.transcript.identity",
+        "claude.transcript.assistant_text",
     ];
     let unknown = |why: String| {
         (
@@ -1243,6 +1273,7 @@ fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
         ProbeResult::new(ids[0], usage_outcome(&tail)),
         ProbeResult::new(ids[1], tool_result_outcome(&tail)),
         ProbeResult::new(ids[2], identity_outcome(&tail)),
+        ProbeResult::new(ids[3], assistant_text_outcome(&tail)),
     ];
     // Only rows that PASSED contribute lines. A line that failed the
     // substantiveness predicate is not a known-good shape, and the harness-level
@@ -1256,6 +1287,7 @@ fn probe_claude_transcript() -> (Vec<ProbeResult>, Vec<Observed>, String) {
             ids[2],
             substantive_lines(&tail, |l| identity_is_substantive(l, &tail.session_id)),
         ),
+        (ids[3], substantive_lines(&tail, assistant_text_is_substantive)),
     ] {
         let passed = results
             .iter()
@@ -1398,6 +1430,71 @@ fn tool_result_is_substantive(line: &Value) -> bool {
     crate::harness::claude::read::extract_tool_results(line)
         .iter()
         .any(|(id, chars)| tool_result_is_sized(id, *chars))
+}
+
+/// One line yields at least one non-empty speakable block, with a keyed dedup
+/// id. See [`usage_is_substantive`] for why this is a named function.
+fn assistant_text_is_substantive(line: &Value) -> bool {
+    crate::harness::claude::read::assistant_texts(line)
+        .iter()
+        .any(|(key, text)| key.contains(':') && !text.trim().is_empty())
+}
+
+/// `message.content[].text` still yields speakable prose (V35 Phase L).
+///
+/// Independent witness, on the same discipline as its two siblings: the count
+/// of assistant lines that carry a `message.content` ARRAY. A window with such
+/// lines and no readable text block is drift — the reader would run, find
+/// nothing, and the tab would go mute with no error anywhere. A window with no
+/// assistant content arrays at all is simply not evidence.
+///
+/// Deliberately NOT a failure when every content array holds only `thinking` or
+/// `tool_use` blocks: that is a real and normal shape (a turn that only called
+/// tools), and treating it as drift would fire on ordinary sessions.
+fn assistant_text_outcome(tail: &Tail) -> Outcome {
+    let with_content = tail
+        .lines
+        .iter()
+        .filter(|l| {
+            l.get("type").and_then(Value::as_str) == Some("assistant")
+                && crate::harness::claude::read::message_parts(l).is_some()
+        })
+        .count();
+    if with_content == 0 {
+        return Outcome::Unknown {
+            why: format!(
+                "no assistant line with a `message.content[]` array in the last {} transcript \
+                 lines — nothing to read a text block out of",
+                tail.lines.len()
+            ),
+        };
+    }
+    let text_blocks: usize = tail
+        .lines
+        .iter()
+        .map(|l| crate::harness::claude::read::assistant_texts(l).len())
+        .sum();
+    let substantive = tail
+        .lines
+        .iter()
+        .filter(|l| assistant_text_is_substantive(l))
+        .count();
+    if substantive == 0 {
+        return Outcome::Fail {
+            detail: format!(
+                "{with_content} assistant line(s) carry a `message.content[]` array but NONE \
+                 yielded a speakable text block ({text_blocks} extracted) — \
+                 `content[].type == \"text\"` or `content[].text` has moved. A tab with no `Stop` \
+                 push would go silently mute."
+            ),
+        };
+    }
+    Outcome::Pass {
+        detail: format!(
+            "{substantive}/{with_content} assistant line(s) yielded speakable prose \
+             ({text_blocks} text block(s) total)"
+        ),
+    }
 }
 
 /// One line carries BOTH identity fields: a top-level `sessionId` naming its own

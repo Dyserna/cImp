@@ -40,7 +40,7 @@
 //! without content — and the handlers stay in `offload/loopback.rs` regardless
 //! (design § 4: *"route table; handlers stay in offload/loopback.rs"*).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 // ── the version ─────────────────────────────────────────────────────────────
@@ -130,10 +130,13 @@ pub const EVENTS: &[Event] = &[
     // ── core (D4) ───────────────────────────────────────────────────────────
     ev(EV_HELLO, true, HELLO_ROUTE, true),
     ev(EV_PROMPT, true, "/context/retrieve", true),
-    // Reserved: today assistant prose reaches TTS through the OOB readers
-    // (`harness/claude/read.rs` tailing JSONL, `harness/opencode/read.rs` consuming SSE), which is
-    // the Tier-C half Phase L retires from the hot path.
-    ev(EV_ASSISTANT_TEXT, true, "/session/assistant_text", false),
+    // LIVE since V35 Phase L. Claude reaches it through `Stop`
+    // (`/claude/hook/stop`, § 4.5) and the reader
+    // (`harness/claude/read.rs::assistant_texts`) is arbitrated off for a tab
+    // that serves it. OpenCode declares `cannot` and keeps its SSE reader —
+    // see `docs/CHP.md` § 4.6 for why, which is a real Phase L outcome under
+    // design D6 and not an unfinished migration.
+    ev(EV_ASSISTANT_TEXT, true, "/session/assistant_text", true),
     ev(EV_SESSION_END, true, "/session/end", false),
     // ── optional, live today ────────────────────────────────────────────────
     ev(EV_CONTEXT_COMPACTION, false, "/context/compaction", true),
@@ -150,12 +153,34 @@ pub const EVENTS: &[Event] = &[
         true,
     ),
     ev(EV_CONTRACT_DRIFT, false, "/activity/contract_drift", true),
-    // ── optional, reserved for Phase L (design D2) ──────────────────────────
+    // ── realized by V35 Phase L (design D2) ─────────────────────────────────
+    //
+    // `session.usage` stays RESERVED, permanently-until-upstream-changes: **no
+    // Claude hook payload carries token counts** (the common set is
+    // `session_id` / `transcript_path` / `cwd` / `permission_mode` /
+    // `hook_event_name`, and `PostCompact` exposes no compaction metrics), so
+    // there is nothing to push and `claude.transcript.usage` keeps tailing the
+    // transcript. `session.context` likewise: the statusline payload has no
+    // hook equivalent. Naming them here rather than deleting them is the point
+    // — an absence with a stated reason, not a blank.
     ev(EV_SESSION_USAGE, false, "/session/usage", false),
-    ev(EV_SESSION_TOOL_RESULT, false, "/session/tool_result", false),
-    ev(EV_SESSION_SUBAGENT, false, "/session/subagent", false),
+    ev(EV_SESSION_TOOL_RESULT, false, "/session/tool_result", true),
+    ev(EV_SESSION_SUBAGENT, false, "/session/subagent", true),
     ev(EV_SESSION_CONTEXT, false, "/session/context", false),
 ];
+
+/// The CHP event a live push route carries, or `None` for a route that carries
+/// none (the hello, a reserved route, a route that is not CHP at all).
+///
+/// Derived from [`EVENTS`] for the same reason [`is_push_route`] is: the quiet
+/// detector below joins on event ids, and a second hand-kept route table is how
+/// a new event ends up observed for staleness but invisible to arbitration.
+pub fn event_for_route(route: &str) -> Option<&'static str> {
+    EVENTS
+        .iter()
+        .find(|e| e.live && e.route != HELLO_ROUTE && e.route == route)
+        .map(|e| e.id)
+}
 
 /// Whether `route` carries a CHP message that can be *attributed* — i.e. a
 /// live, non-hello route whose body cImp defines end to end.
@@ -239,6 +264,21 @@ pub struct Peer {
     pub hello_at_ms: u64,
     /// When anything was last heard from this tab.
     pub seen_at_ms: u64,
+    /// V35 Phase L — the quiet detector's counters: for each served capability
+    /// that has a [`witness_of`] entry, how many WITNESS pushes have arrived
+    /// since that capability last pushed (or since the hello).
+    ///
+    /// Reset wholesale by a hello, which is right: a hello is a fresh
+    /// declaration from a (re)loaded artifact, so counting against the previous
+    /// one would report the old artifact's silence as the new one's.
+    #[serde(skip)]
+    pub quiet_counters: BTreeMap<String, u32>,
+    /// Capabilities already reported quiet for this artifact — the once-per-
+    /// (tab, capability) latch, so a permanently dead hook costs one report and
+    /// not one per turn. `Doubling` is the loopback's ledger for repeats; this
+    /// is the cheaper "say it once" the ledger sits behind.
+    #[serde(skip)]
+    pub quiet_reported: BTreeSet<String>,
 }
 
 impl Peer {
@@ -295,6 +335,11 @@ pub fn note_push(agent: &str, tab: &str, chp: u32, at_ms: u64) {
             e.cannot.clear();
             e.harness_version.clear();
         }
+        // V35 Phase L: the quiet counters belong to the declaration they were
+        // opened against. A different artifact makes them meaningless, and
+        // keeping them would report the previous plugin's silence as this one's.
+        e.quiet_counters.clear();
+        e.quiet_reported.clear();
         e.chp = chp;
     }
     e.seen_at_ms = at_ms;
@@ -322,6 +367,7 @@ pub fn note_hello(
         cannot,
         hello_at_ms: at_ms,
         seen_at_ms: at_ms,
+        ..Default::default()
     };
     let mut peers = lock();
     let key = (agent.to_string(), tab.to_string());
@@ -339,6 +385,120 @@ pub fn note_hello(
     };
     peers.insert(key, next);
     changed
+}
+
+// ── V35 Phase L: arbitration — push wins WHEN SERVED ────────────────────────
+
+/// **The arbitration rule, spelled once**: is `event` being pushed for this
+/// exact `(agent, tab)`?
+///
+/// `true` ⇒ the fallback reader's output for THAT capability on THAT tab is
+/// suppressed. `false` ⇒ the reader serves it, exactly as it did before Phase L.
+/// Three properties, and each one closes a specific way this could go wrong:
+///
+/// * **Per capability.** A tab that pushes assistant text still has its
+///   transcript tailed for usage and identity, which no hook payload carries
+///   (see [`EVENTS`]). Suppressing a whole reader because one of its five taps
+///   migrated is how a migration loses data.
+/// * **Per tab.** Two Claude tabs can be running two different spawn-baked
+///   overlays; one may push and the other (launched before the upgrade) may
+///   not. A process-wide switch would mute the older tab entirely.
+/// * **Only when the tab has actually spoken.** `greeted()` is required, not
+///   just a non-empty `serves`: the declaration arrives *over the push path*,
+///   so a hello is itself the proof that the path works. A pre-upgrade tab
+///   sends none, gets `false` here, and behaves exactly as it did on `develop`
+///   — which is what makes the migration safe to ship with old tabs open.
+///
+/// It is deliberately NOT "the capability is wired in settings": settings say
+/// what cImp *asked* for; the hello says what the artifact on disk actually
+/// does, and those two differ for precisely as long as a stale tab stays open
+/// (§ 6.1).
+pub fn served(agent: &str, tab: &str, event: &str) -> bool {
+    lock()
+        .get(&(agent.to_string(), tab.to_string()))
+        .is_some_and(|p| p.greeted() && p.serves.iter().any(|s| s == event))
+}
+
+/// How many WITNESS pushes may arrive with a served capability silent before
+/// that silence is reported as drift.
+///
+/// Three, not one: a single turn can legitimately end without the witnessed
+/// event (an interrupted turn, a `/clear`), and reporting on the first one
+/// would train the reader to ignore the notice — the exact failure V16's
+/// tripwire had and this milestone exists to avoid.
+pub const QUIET_WITNESS_PUSHES: u32 = 3;
+
+/// The event whose arrival PROVES a served capability should also have pushed
+/// — the "demonstrably active" half of locked decision 7.
+///
+/// A witness is only sound when the implication is exact, so the list is short
+/// and every entry states the implication:
+///
+/// * `assistant_text` ← `prompt`: every prompt a harness accepts ends in a
+///   final assistant message, so a `UserPromptSubmit` with no `Stop` behind it
+///   is the `Stop` hook having stopped firing.
+/// * `session.tool_result` ← `context.post_edit`: the post-edit hook fires on
+///   `Edit|Write|MultiEdit`, and the tool-result hook fires on the SAME event
+///   with an all-tools matcher, so an edit that produced one and not the other
+///   is the wider entry having gone.
+///
+/// `session.subagent` deliberately has **none**: a session may legitimately
+/// launch no sub-agents, forever, so there is no arrival that proves one should
+/// have been reported. Inventing a threshold there would manufacture false
+/// reports, which is worse than the gap — the gap is at least declared here.
+pub fn witness_of(event: &str) -> Option<&'static str> {
+    match event {
+        EV_ASSISTANT_TEXT => Some(EV_PROMPT),
+        EV_SESSION_TOOL_RESULT => Some(EV_CONTEXT_POST_EDIT),
+        _ => None,
+    }
+}
+
+/// Record one push of `event` from `(agent, tab)` and return the served
+/// capabilities that have just gone QUIET.
+///
+/// **Locked decision 7: a served capability going silent must NOT quietly fall
+/// back to the reader.** Falling back would restore the data and hide the
+/// breakage — which is the silent-drift class this whole milestone exists to
+/// delete. So the reader stays suppressed while the hello's claim stands, and
+/// the silence is *reported* instead: each returned id gets a
+/// `drift.payload.v1` row, which the Advisor already consolidates per
+/// capability.
+///
+/// **Never inserts.** A peer this process has not validated (§ the handler's
+/// `is_configured_tab` check) has no entry, so an unknown tab cannot grow the
+/// map here — the counters ride an entry the validated path created.
+pub fn note_event(agent: &str, tab: &str, event: &str) -> Vec<String> {
+    let mut peers = lock();
+    let Some(peer) = peers.get_mut(&(agent.to_string(), tab.to_string())) else {
+        return Vec::new();
+    };
+    if !peer.greeted() {
+        return Vec::new();
+    }
+    // This capability just pushed: it is demonstrably alive, so its counter
+    // goes back to zero — including after a report, so a hook that recovers
+    // stops being counted against its own past silence.
+    if peer.serves.iter().any(|s| s == event) {
+        peer.quiet_counters.insert(event.to_string(), 0);
+    }
+    // …and every served capability WITNESSED by this event moves one step
+    // closer to being reported.
+    let mut quiet: Vec<String> = Vec::new();
+    let watched: Vec<String> = peer
+        .serves
+        .iter()
+        .filter(|s| witness_of(s) == Some(event) && s.as_str() != event)
+        .cloned()
+        .collect();
+    for id in watched {
+        let n = peer.quiet_counters.entry(id.clone()).or_insert(0);
+        *n = n.saturating_add(1);
+        if *n >= QUIET_WITNESS_PUSHES && peer.quiet_reported.insert(id.clone()) {
+            quiet.push(id);
+        }
+    }
+    quiet
 }
 
 /// Every peer cImp currently knows about, in a stable order.
@@ -716,6 +876,201 @@ mod tests {
             ),
             "a different `serves` list is"
         );
+    }
+
+    // ── V35 Phase L: arbitration ────────────────────────────────────────────
+
+    /// **The rule, and the mid-session switchover.**
+    ///
+    /// The two dangerous failures this phase could ship are TTS speaking one
+    /// message twice and one tool result being counted twice, and both reduce
+    /// to the same question: can the reader's tap and the push core ever both
+    /// act on one datum? They cannot, because they ask ONE predicate — so this
+    /// test is about that predicate, in the three states a tab passes through.
+    #[test]
+    fn arbitration_is_per_capability_per_tab_and_needs_a_hello() {
+        let tab = "chp-arbitration-test";
+        let other = "chp-arbitration-other-tab";
+
+        // STATE 1 — a pre-upgrade tab: no hello, so nothing is served and the
+        // reader does everything, exactly as it did before this phase. This is
+        // the assertion that makes the migration safe to ship with tabs open.
+        assert!(!served("claude", tab, EV_ASSISTANT_TEXT));
+        note_push("claude", tab, PRE_CHP, 10);
+        assert!(
+            !served("claude", tab, EV_ASSISTANT_TEXT),
+            "a routed POST is not a declaration — only a hello can move arbitration"
+        );
+
+        // STATE 2 — the hello lands MID-SESSION (`SessionStart` fires on resume
+        // and clear, not only at launch). From here the reader's tap for the
+        // declared capabilities is suppressed and the push core acts.
+        note_hello(
+            "claude",
+            tab,
+            CHP_VERSION,
+            "",
+            vec![
+                EV_ASSISTANT_TEXT.to_string(),
+                EV_SESSION_TOOL_RESULT.to_string(),
+            ],
+            vec![],
+            20,
+        );
+        assert!(served("claude", tab, EV_ASSISTANT_TEXT));
+        assert!(served("claude", tab, EV_SESSION_TOOL_RESULT));
+        // PER CAPABILITY: an undeclared one is still the reader's. Usage is the
+        // standing example — no hook payload carries token counts, so the
+        // transcript tail must keep reading it on a tab that pushes prose.
+        assert!(
+            !served("claude", tab, EV_SESSION_USAGE),
+            "a tab that pushes prose still has its transcript tailed for usage"
+        );
+        assert!(!served("claude", tab, EV_SESSION_SUBAGENT));
+        // PER TAB: a sibling tab running an older spawn-baked overlay is
+        // untouched. A process-wide switch would have muted it.
+        assert!(!served("claude", other, EV_ASSISTANT_TEXT));
+        // PER AGENT: OpenCode declares `cannot` for the read path, so its
+        // reader keeps serving even while a Claude tab pushes.
+        assert!(!served("opencode", tab, EV_ASSISTANT_TEXT));
+
+        // STATE 3 — the tab is relaunched with an older artifact. The hello's
+        // claims are retired, so arbitration hands the capability straight back
+        // to the reader rather than leaving a tab served by nobody.
+        note_push("claude", tab, PRE_CHP, 30);
+        assert!(
+            !served("claude", tab, EV_ASSISTANT_TEXT),
+            "a retired hello must not keep a reader suppressed — that is a mute tab"
+        );
+    }
+
+    /// **A served capability that goes quiet is REPORTED, not un-served**
+    /// (locked decision 7).
+    ///
+    /// The tempting alternative — notice the silence and quietly resume the
+    /// reader — restores the data and hides the breakage, which is the exact
+    /// class of silent drift this milestone exists to delete. So the counters
+    /// produce a report and change nothing about arbitration.
+    #[test]
+    fn a_served_capability_going_quiet_is_reported_once_and_changes_nothing() {
+        let tab = "chp-quiet-test";
+        note_hello(
+            "claude",
+            tab,
+            CHP_VERSION,
+            "",
+            vec![EV_ASSISTANT_TEXT.to_string()],
+            vec![],
+            10,
+        );
+        // Witness pushes below the threshold say nothing: one turn can end
+        // without its `Stop` (an interruption, a `/clear`), and reporting on the
+        // first would train the reader to ignore the notice.
+        for _ in 1..QUIET_WITNESS_PUSHES {
+            assert!(note_event("claude", tab, EV_PROMPT).is_empty());
+        }
+        assert_eq!(
+            note_event("claude", tab, EV_PROMPT),
+            vec![EV_ASSISTANT_TEXT.to_string()],
+            "three prompts with no Stop between them is the hook having stopped firing"
+        );
+        // ONCE. A permanently dead hook costs one report, not one per turn.
+        for _ in 0..10 {
+            assert!(note_event("claude", tab, EV_PROMPT).is_empty());
+        }
+        // …and the reader stays suppressed throughout: the report is the whole
+        // response to the silence.
+        assert!(served("claude", tab, EV_ASSISTANT_TEXT));
+
+        // A capability that IS pushing resets its own counter, so a hook that
+        // recovers stops being counted against its past silence.
+        let tab = "chp-quiet-recovery-test";
+        note_hello(
+            "claude",
+            tab,
+            CHP_VERSION,
+            "",
+            vec![EV_ASSISTANT_TEXT.to_string()],
+            vec![],
+            10,
+        );
+        for _ in 0..20 {
+            assert!(note_event("claude", tab, EV_PROMPT).is_empty());
+            assert!(note_event("claude", tab, EV_ASSISTANT_TEXT).is_empty());
+        }
+
+        // A capability the tab does NOT serve is never reported quiet — there is
+        // nothing to be silent about.
+        let tab = "chp-quiet-unserved-test";
+        note_hello("claude", tab, CHP_VERSION, "", vec![], vec![], 10);
+        for _ in 0..20 {
+            assert!(note_event("claude", tab, EV_PROMPT).is_empty());
+        }
+        // Neither is an unknown tab: the counters never INSERT, so an
+        // unvalidated caller cannot grow the registry through this path.
+        assert!(note_event("claude", "chp-quiet-never-seen", EV_PROMPT).is_empty());
+        assert!(!snapshot().iter().any(|p| p.tab == "chp-quiet-never-seen"));
+    }
+
+    /// The witness table is sound in the only direction that matters: every
+    /// witness is itself a live CHP event, and no capability witnesses itself.
+    ///
+    /// `session.subagent` having NO witness is asserted, not tolerated — a
+    /// session may legitimately launch no sub-agents forever, so any threshold
+    /// there would manufacture false reports.
+    #[test]
+    fn every_witness_is_a_live_event_and_nothing_witnesses_itself() {
+        for e in EVENTS {
+            let Some(w) = witness_of(e.id) else { continue };
+            assert_ne!(w, e.id, "`{}` cannot witness itself", e.id);
+            let witness = EVENTS
+                .iter()
+                .find(|x| x.id == w)
+                .unwrap_or_else(|| panic!("`{}`'s witness `{w}` is not a CHP event", e.id));
+            assert!(
+                witness.live,
+                "`{}`'s witness `{w}` is reserved — a witness that never arrives can never fire",
+                e.id
+            );
+        }
+        assert!(
+            witness_of(EV_SESSION_SUBAGENT).is_none(),
+            "a session may launch no sub-agents; a threshold here would be a false-report machine"
+        );
+        assert_eq!(witness_of(EV_ASSISTANT_TEXT), Some(EV_PROMPT));
+        assert_eq!(witness_of(EV_SESSION_TOOL_RESULT), Some(EV_CONTEXT_POST_EDIT));
+    }
+
+    /// **Both sides ask this module, and neither reimplements the decision.**
+    ///
+    /// The double-speak and double-count failures are only impossible while
+    /// that is true — a reader tap guarded by its own boolean, or a push core
+    /// that acts unconditionally, would restore them without any test noticing.
+    /// So this is a source scan, in the same idiom as
+    /// [`crate::harness::layering`]: for each migrated capability, the reader
+    /// that used to own it must consult the predicate, and the core that now
+    /// owns it must consult the same one.
+    #[test]
+    fn each_migrated_capability_is_arbitrated_on_both_sides() {
+        const READER: &str = include_str!("claude/read.rs");
+        const LOOPBACK: &str = include_str!("../offload/loopback.rs");
+        // (event const name, how the reader spells its guard)
+        for (event, konst) in [
+            (EV_ASSISTANT_TEXT, "EV_ASSISTANT_TEXT"),
+            (EV_SESSION_TOOL_RESULT, "EV_SESSION_TOOL_RESULT"),
+            (EV_SESSION_SUBAGENT, "EV_SESSION_SUBAGENT"),
+        ] {
+            assert!(
+                READER.contains(&format!("ctx.pushed(\"claude\", crate::harness::chp::{konst})")),
+                "`{event}` migrated but `harness/claude/read.rs` still produces it \
+                 unconditionally — that is the double-delivery this phase exists to avoid"
+            );
+            assert!(
+                LOOPBACK.contains(&format!("crate::harness::chp::served(agent, tab, crate::harness::chp::{konst})")),
+                "`{event}`'s push core does not check `chp::served` — it would act on a tab whose \
+                 reader is also still producing it"
+            );
+        }
     }
 
     /// A routed POST carrying a different `chp` than the stored hello means the

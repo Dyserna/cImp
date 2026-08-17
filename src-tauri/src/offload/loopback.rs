@@ -1240,6 +1240,16 @@ async fn handle_conn(
         ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
         ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
         ("POST", "/session/hello") => handle_session_hello(&mut stream, &app, &req).await,
+        // ── V35 Phase L: the read path, as CHP pushes ────────────────────────
+        //
+        // The harness-neutral half of the three capabilities Phase L moves off
+        // the Tier-C readers. Claude reaches the same cores through its own
+        // `/claude/hook/*` ingress below (its hook body is Claude's, so it
+        // cannot carry a CHP envelope); these routes are what a harness whose
+        // plugin CAN build a body posts to, and what the tests drive.
+        ("POST", "/session/assistant_text") => handle_session_assistant_text(&mut stream, &app, &req).await,
+        ("POST", "/session/tool_result") => handle_session_tool_result(&mut stream, &app, &req).await,
+        ("POST", "/session/subagent") => handle_session_subagent(&mut stream, &app, &req).await,
         // ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──
         //
         // The `type: "http"` half of the five hooks that used to be shim
@@ -1256,6 +1266,10 @@ async fn handle_conn(
         ("POST", "/claude/hook/post_tool_use") => handle_claude_post_tool_use(&mut stream, &app, &req).await,
         ("POST", "/claude/hook/notification") => handle_claude_notification(&mut stream, &app, &req).await,
         ("POST", "/claude/hook/session_start") => handle_claude_session_start(&mut stream, &app, &req).await,
+        // ── V35 Phase L: Claude's ingress for the three migrated reads ───────
+        ("POST", "/claude/hook/stop") => handle_claude_stop(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/post_tool_use_result") => handle_claude_tool_result(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/subagent") => handle_claude_subagent(&mut stream, &app, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -5909,13 +5923,22 @@ struct ContractDriftBody {
 /// [`DRIFT_SHIM_UNKNOWN`] alongside genuinely forged names and sharing that
 /// bucket's doubling counter. Fail-safe, as documented, but it meant the newest
 /// shim's payload drift was the one hardest to see.
-const DRIFT_SHIMS: [&str; 6] = [
+const DRIFT_SHIMS: [&str; 9] = [
     "checkpoint_beacon",
     "compact_hook",
     "context_hook",
     "notify_hook",
     "read_hook",
+    // V35 Phase L's three. They name no shim binary — there never was one — but
+    // they occupy the same key space for the same reason: one ledger bucket per
+    // capability, `&'static str` so a caller-supplied string can never become a
+    // key. Both a malformed payload AND a served capability gone QUIET (locked
+    // decision 7) report under these, so a capability that broke either way
+    // lands in one bucket.
+    "stop_hook",
+    "subagent_hook",
     "taint_beacon",
+    "tool_result_hook",
 ];
 
 /// The one bucket every shim name cImp does not ship shares. Parenthesized like
@@ -6136,6 +6159,15 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
 /// identity arrives in `X-CIMP-*` headers instead. Same three properties, same
 /// validation, same hot-path shortcut — only the read differs, and which of the
 /// two applies is decided by the route rather than by sniffing the body.
+///
+/// **V35 Phase L** added the second duty: the same one-lookup pass counts the
+/// push against the tab's served capabilities and reports any that have gone
+/// QUIET. Locked decision 7 — a served capability whose pushes stop arriving
+/// must NOT silently fall back to the reader, because falling back would
+/// restore the data and hide the breakage, which is the exact silent-drift
+/// class this milestone exists to delete. The reader stays suppressed while the
+/// hello's claim stands; the silence gets a `drift.payload.v1` row instead,
+/// under the same token that capability's payload drift uses.
 fn note_chp(app: &AppHandle, route: &str, req: &Request) {
     let (chp, agent_token, tab) = if claude_hook::is_hook_route(route) {
         let tab = req.cimp.tab.as_deref().map(str::trim).unwrap_or("");
@@ -6158,6 +6190,12 @@ fn note_chp(app: &AppHandle, route: &str, req: &Request) {
         )
     };
     let agent = crate::graph::source_for_consumer(&agent_token);
+    // The quiet pass runs FIRST and on every POST, including the ones the
+    // `already_seen` shortcut below returns early from — a tab whose `chp` has
+    // not changed is precisely the steady state in which a hook goes silent.
+    // It never inserts, so an unvalidated tab still cannot grow the registry:
+    // the counters ride an entry only the validated path below creates.
+    report_quiet_capabilities(route, agent, &tab);
     if crate::harness::chp::already_seen(agent, &tab, chp) {
         return;
     }
@@ -6166,6 +6204,45 @@ fn note_chp(app: &AppHandle, route: &str, req: &Request) {
         return;
     }
     crate::harness::chp::note_push(agent, &tab, chp, crate::activity::now_ms());
+}
+
+/// Count one push against this tab's served capabilities and file a drift row
+/// for any that have now gone quiet (V35 Phase L, locked decision 7).
+///
+/// "Demonstrably active" is deliberately the cheapest sound definition:
+/// **another push whose arrival proves this one should also have fired**
+/// ([`crate::harness::chp::witness_of`]). No timers, no wall-clock thresholds,
+/// nothing that fires because a user went to lunch — a `UserPromptSubmit` with
+/// no `Stop` behind it three times over is the `Stop` hook having stopped
+/// firing, and nothing else.
+fn report_quiet_capabilities(route: &str, agent: &'static str, tab: &str) {
+    let Some(event) = claude_hook::chp_event(route).or_else(|| crate::harness::chp::event_for_route(route))
+    else {
+        return;
+    };
+    for capability in crate::harness::chp::note_event(agent, tab, event) {
+        let Some(shim) = claude_hook::drift_token_for_event(&capability) else {
+            continue;
+        };
+        warn!(
+            target: "offload",
+            agent,
+            %tab,
+            %capability,
+            witness = %event,
+            "loopback: a SERVED capability has gone quiet — its hook stopped firing while the \
+             session kept pushing. The fallback reader stays suppressed on purpose (falling back \
+             would hide this); restart the tab to re-declare."
+        );
+        let body = ContractDriftBody {
+            shim: shim.to_string(),
+            missing: vec![claude_hook::MISSING_PUSH.to_string()],
+            session_id: None,
+        };
+        if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
+            crate::activity::record_bg(record);
+        }
+    }
 }
 
 /// A `POST /session/hello` body — V35 Phase I, design D3.
@@ -6945,6 +7022,448 @@ async fn handle_claude_session_start(
         "claude hello recorded"
     );
     write_json(stream, 200, &no_op).await
+}
+
+// ── V35 Phase L: the read path, pushed (design D2, issue #69) ────────────────
+//
+// Three capabilities that reached cImp by TAILING AN EMITTED ARTIFACT — Tier C,
+// whose whole failure mode is silent zeros — now arrive as documented hook
+// payloads. Six routes, three cores:
+//
+//   `/session/assistant_text`  ← `/claude/hook/stop`                (Stop)
+//   `/session/tool_result`     ← `/claude/hook/post_tool_use_result` (PostToolUse, all tools)
+//   `/session/subagent`        ← `/claude/hook/subagent`             (SubagentStart/Stop)
+//
+// **The arbitration rule lives in the cores, not in the handlers**, and it is
+// the same predicate the fallback readers ask
+// ([`crate::harness::chp::served`]): a capability is served for a tab when
+// THAT tab's hello declared it. Both sides consulting one predicate is what
+// makes "exactly one path produces this data" a property rather than a
+// convention — the two failures that would otherwise be invisible are TTS
+// speaking a message twice and one tool result being counted twice.
+//
+// What is deliberately NOT here:
+//
+// * **`session.usage`.** No Claude hook payload carries token counts — the
+//   common input set is `session_id` / `transcript_path` / `cwd` /
+//   `permission_mode` / `hook_event_name`, and `PostCompact` exposes no
+//   compaction metrics either. `claude.transcript.usage` therefore stays Tier C
+//   on the transcript tail, permanently-until-upstream-changes. The V35
+//   milestone's Phase L row lists "usage" among the migrations; that was
+//   written before the payload set was checked, and the registry row now
+//   records the limitation instead of the intent.
+// * **`session.context`.** Same shape of answer: the statusline stdin payload
+//   has no hook equivalent.
+// * **Sub-agent token usage.** `SubagentStop` carries
+//   `last_assistant_message`, not tokens, and there is no sub-agent transcript
+//   path in any payload — so `SubagentState::scan`'s `UsageOrigin::Agent`
+//   accounting keeps reading `<session_id>/subagents/agent-*.jsonl`. What
+//   migrates is the LIFECYCLE (which drives the avatar), not the spend.
+
+/// A `POST /session/assistant_text` body — one complete assistant message, as
+/// prose.
+///
+/// **Prose, never markup or control** (design § 5.2). The sender is not trusted
+/// to segment: `text` goes through `tts::prose::speak_prose`, which strips
+/// terminal escapes, reduces markdown and segments app-side exactly as it does
+/// for the fallback readers. A plugin controls *what* cImp says out loud, which
+/// is why this capability sits in the freely-declarable data tier and the
+/// per-tab `tts_injection.enabled` gate still applies.
+#[derive(Deserialize)]
+struct SessionAssistantTextBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    text: String,
+}
+
+/// A `POST /session/tool_result` body — one tool result's SIZE.
+///
+/// `chars` and not the content: the consumer is usage accounting, whose
+/// estimated-token proxy has always been a character count
+/// (`harness::claude::read::tool_result_chars`). Taking the content here would
+/// put an unbounded, model-influenced blob on the wire for a `u32`'s worth of
+/// information.
+#[derive(Deserialize)]
+struct SessionToolResultBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    chars: u32,
+}
+
+/// A `POST /session/subagent` body — one sub-agent lifecycle edge.
+///
+/// `active` rather than an event-name string, because the only thing the
+/// consumer needs is whether this id is now running: an id that started and has
+/// not stopped holds the avatar in *Thinking*. A harness that grows a third
+/// lifecycle state maps it onto this pair rather than teaching L3 a new word.
+#[derive(Deserialize)]
+struct SessionSubagentBody {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    agent_id: String,
+    #[serde(default)]
+    active: bool,
+}
+
+/// Speak one pushed assistant message — the `assistant_text` core.
+///
+/// Returns whether it acted, which is what the arbitration tests assert on:
+/// for one `(agent, tab, capability)` the answer here and the fallback reader's
+/// `ctx.pushed(..)` are exact complements.
+async fn assistant_text_core(app: &AppHandle, agent: &'static str, tab: &str, text: &str) -> bool {
+    if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_ASSISTANT_TEXT) {
+        // Not declared by THIS tab's artifact ⇒ its reader is still speaking,
+        // and speaking here too is the double-speak this phase must not ship.
+        return false;
+    }
+    if text.trim().is_empty() {
+        return false;
+    }
+    let Some(state) = app.try_state::<crate::ipc::AppState>() else {
+        return false;
+    };
+    let tab_id = crate::state::TabId::from_str(tab);
+    crate::tts::speak_prose(
+        &tab_id,
+        &state.tts_segments,
+        &state.settings,
+        None,
+        crate::tts::ProseSource::ChpPush,
+        text,
+    )
+    .await;
+    true
+}
+
+/// Record one pushed tool-result size — the `session.tool_result` core.
+///
+/// The same `UsageEvent::ToolResult` row the transcript tail writes, into the
+/// same graph service, keyed the same way. Nothing downstream can tell which
+/// path produced it, which is the point: the migration is of the SOURCE, not of
+/// the data model.
+fn tool_result_core(
+    app: &AppHandle,
+    agent: &'static str,
+    tab: &str,
+    cwd: Option<&str>,
+    session_id: &str,
+    tool: Option<String>,
+    chars: u32,
+) -> bool {
+    if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_SESSION_TOOL_RESULT) {
+        return false;
+    }
+    let (Some(cwd), false) = (cwd.filter(|c| !c.trim().is_empty()), session_id.is_empty()) else {
+        // No project root or no session ⇒ nothing to attribute the row to. The
+        // reader has both by construction (it IS reading a session's file), so
+        // this is the push path's own honest floor.
+        return false;
+    };
+    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
+        return false;
+    };
+    graph.record_usage(
+        std::path::Path::new(cwd),
+        session_id,
+        agent,
+        crate::graph::UsageEvent::ToolResult { tool, chars },
+    );
+    true
+}
+
+/// The most sub-agent ids one tab's pushed lifecycle set will hold.
+///
+/// The set is keyed by `(agent, tab)` — both validated — but the ids inside it
+/// come off the wire, and a `SubagentStart` storm with no matching stops would
+/// otherwise grow one tab's set without limit. At the cap a further start is
+/// counted as "still active" without being remembered individually, which
+/// degrades the edge detection to coarse rather than unbounded.
+const MAX_PUSHED_SUBAGENTS: usize = 64;
+
+/// Sub-agents currently running per `(agent, tab)`, as declared by pushes.
+///
+/// In-memory and non-durable for the reason the CHP peer registry is: it
+/// describes live tabs, and an app restart ends every one of them. The
+/// transcript tail keeps its OWN equivalent set (`update_agents`) for the tabs
+/// that do not push, and the two never both drive the avatar for one tab —
+/// arbitration decides which.
+type SubagentSets = HashMap<(String, String), std::collections::HashSet<String>>;
+static PUSHED_SUBAGENTS: OnceLock<Mutex<SubagentSets>> = OnceLock::new();
+
+/// Apply one pushed sub-agent lifecycle edge — the `session.subagent` core.
+///
+/// Emits `StateSignal::AgentsActiveChanged` on the empty↔non-empty EDGE only,
+/// exactly as `harness::claude::read::update_agents` does, so the state manager
+/// sees the same signal shape whichever path produced it.
+fn subagent_core(
+    app: &AppHandle,
+    agent: &'static str,
+    tab: &str,
+    agent_id: &str,
+    active: bool,
+) -> bool {
+    if !crate::harness::chp::served(agent, tab, crate::harness::chp::EV_SESSION_SUBAGENT) {
+        return false;
+    }
+    let agent_id = bounded_id(agent_id);
+    if agent_id.trim().is_empty() {
+        // A lifecycle with no key cannot be closed; recording it would wedge the
+        // avatar in Thinking forever. `contract_checks` reports the absence.
+        return false;
+    }
+    let key = (agent.to_string(), tab.to_string());
+    let registry = PUSHED_SUBAGENTS.get_or_init(Default::default);
+    let mut registry = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    let set = registry.entry(key).or_default();
+    let was_active = !set.is_empty();
+    if active {
+        if set.len() < MAX_PUSHED_SUBAGENTS {
+            set.insert(agent_id);
+        }
+    } else {
+        set.remove(&agent_id);
+    }
+    let now_active = !set.is_empty();
+    drop(registry);
+    if was_active == now_active {
+        return true; // recorded, but not an edge — no signal.
+    }
+    if let Some(state) = app.try_state::<crate::ipc::AppState>() {
+        let _ = state
+            .state_signals
+            .try_send(crate::state::StateSignal::AgentsActiveChanged {
+                tab: crate::state::TabId::from_str(tab),
+                active: now_active,
+            });
+    }
+    true
+}
+
+/// The `(agent, tab)` a harness-neutral Phase L body claims, **validated**.
+///
+/// One helper for the three routes, because all three carry the same two
+/// identity fields and all three must narrow them the same way (#45's rule):
+/// `agent` normalizes through `source_for_consumer` like every other route's
+/// discriminator, and `tab` must name a configured AI tab for that agent.
+fn session_push_identity(
+    app: &AppHandle,
+    agent: Option<&str>,
+    tab: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let agent = crate::graph::source_for_consumer(agent.unwrap_or("claude"));
+    let tab = tab.map(str::trim).unwrap_or("");
+    if tab.is_empty() {
+        return None;
+    }
+    let settings = live_settings(app);
+    if !is_configured_tab(&settings, agent, tab) {
+        return None;
+    }
+    Some((agent, tab.to_string()))
+}
+
+/// `POST /session/assistant_text` — one complete assistant message, spoken.
+async fn handle_session_assistant_text(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<SessionAssistantTextBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        assistant_text_core(app, agent, &tab, &body.text).await;
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// `POST /session/tool_result` — one tool result's size, recorded.
+async fn handle_session_tool_result(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<SessionToolResultBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        tool_result_core(
+            app,
+            agent,
+            &tab,
+            body.cwd.as_deref(),
+            body.session_id.as_deref().unwrap_or(""),
+            body.tool.as_deref().map(bounded_tool_name),
+            body.chars,
+        );
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// `POST /session/subagent` — one sub-agent lifecycle edge.
+async fn handle_session_subagent(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let ok = RunResult {
+        ok: true,
+        text: None,
+        error: None,
+    };
+    let Ok(body) = serde_json::from_slice::<SessionSubagentBody>(&req.body) else {
+        return write_json(stream, 400, &bad_request("bad request body")).await;
+    };
+    if let Some((agent, tab)) =
+        session_push_identity(app, body.agent.as_deref(), body.tab.as_deref())
+    {
+        subagent_core(app, agent, &tab, &body.agent_id, body.active);
+    }
+    write_json(stream, 200, &ok).await
+}
+
+/// A tool name from the wire, bounded like every other caller-supplied id.
+fn bounded_tool_name(raw: &str) -> String {
+    bounded_id(raw)
+}
+
+/// `POST /claude/hook/stop` — the `Stop` hook: the turn's complete final
+/// assistant message.
+///
+/// **The TTS migration, and its cadence guarantee.** `last_assistant_message`
+/// is one complete message at message finish, which is exactly what
+/// `harness::claude::read::assistant_texts` hands `speak` today — so the
+/// segmenter's input is unchanged by construction (locked decision 2, recipe
+/// 10). `MessageDisplay`, which would deliver per-chunk deltas on the streaming
+/// hot path, is deliberately not wired.
+///
+/// Observe-only: answers [`claude_hook::no_op`] on every path.
+async fn handle_claude_stop(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_STOP;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        assistant_text_core(app, "claude", &tab, &input.last_assistant_message).await;
+    }
+    write_json(stream, 200, &no_op).await
+}
+
+/// `POST /claude/hook/post_tool_use_result` — the all-tools `PostToolUse`
+/// entry, sized.
+///
+/// Shares `PostToolUse` with [`handle_claude_post_tool_use`] and shares NOTHING
+/// else: two matcher groups, two routes, two meanings. That separation is what
+/// keeps the auto-check from running twice on an `Edit` — see
+/// [`claude_hook::ROUTE_POST_TOOL_USE_RESULT`].
+async fn handle_claude_tool_result(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_POST_TOOL_USE_RESULT;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        let cwd = claude_hook_cwd(app, &settings, Some(tab.as_str()), &input.cwd);
+        let chars = u32::try_from(claude_hook::tool_result_chars(&input.tool_result))
+            .unwrap_or(u32::MAX);
+        tool_result_core(
+            app,
+            "claude",
+            &tab,
+            cwd.as_deref(),
+            &input.session_id,
+            input.tool_name.clone(),
+            chars,
+        );
+    }
+    write_json(stream, 200, &no_op).await
+}
+
+/// `POST /claude/hook/subagent` — `SubagentStart` **and** `SubagentStop`.
+///
+/// One route, dispatching on `hook_event_name`, exactly as
+/// [`handle_claude_notification`] serves its own pair. Observe-only.
+async fn handle_claude_subagent(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_SUBAGENT;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    report_hook_drift(route, &input);
+    if input.hook_event_name.is_empty() {
+        // Without the event name a start is indistinguishable from a stop, and
+        // guessing would either wedge the avatar in Thinking or release it
+        // early. `contract_checks` has already reported the absence.
+        return write_json(stream, 200, &no_op).await;
+    }
+    let settings = live_settings(app);
+    if let Some(tab) = claude_hook_tab(&settings, req) {
+        let active = input.is_subagent_start();
+        subagent_core(app, "claude", &tab, &input.agent_id, active);
+        debug!(
+            target: "offload",
+            %tab,
+            agent_type = %bounded_id(&input.agent_type),
+            active,
+            "claude sub-agent lifecycle push"
+        );
+    }
+    write_json(stream, 200, &no_op).await
+}
+
+/// A `400` body, spelled once for the three Phase L routes.
+fn bad_request(msg: &str) -> RunResult {
+    RunResult {
+        ok: false,
+        text: None,
+        error: Some(msg.to_string()),
+    }
 }
 
 // ── #48 F-32 / locked decision 37: a child reports what containment did ──────
@@ -10520,6 +11039,13 @@ mod tests {
             ("notify_hook", CLAUDE_HOOK),
             ("read_hook", CLAUDE_HOOK),
             ("taint_beacon", include_str!("../taint_beacon.rs")),
+            // V35 Phase L's three. They name no binary, so the "is this the
+            // name that module sends" half checks the module that DEFINES them,
+            // which is the same file — and the route join below is what proves
+            // each one is actually reachable.
+            ("stop_hook", CLAUDE_HOOK),
+            ("subagent_hook", CLAUDE_HOOK),
+            ("tool_result_hook", CLAUDE_HOOK),
         ] {
             assert!(
                 DRIFT_SHIMS.contains(&shim),
@@ -10542,11 +11068,23 @@ mod tests {
         }
         assert_eq!(
             DRIFT_SHIMS.len(),
-            6,
+            9,
             "a new reporter needs BOTH an entry here and its source pinned in the \
              loop above — otherwise its reports fold into the unrecognized-shim \
              bucket and nothing fails"
         );
+        // V35 Phase L: every event whose SILENCE is reportable resolves to a
+        // token in this list. Without this a quiet report would be filed under
+        // the unrecognized-shim bucket, i.e. attributed to nothing.
+        for event in [
+            crate::harness::chp::EV_ASSISTANT_TEXT,
+            crate::harness::chp::EV_SESSION_TOOL_RESULT,
+            crate::harness::chp::EV_SESSION_SUBAGENT,
+        ] {
+            let token = claude_hook::drift_token_for_event(event)
+                .unwrap_or_else(|| panic!("{event} can go quiet but reports under no token"));
+            assert!(DRIFT_SHIMS.contains(&token));
+        }
         assert!(!DRIFT_SHIMS.contains(&DRIFT_SHIM_UNKNOWN));
     }
 
@@ -10683,6 +11221,13 @@ mod tests {
                     | "/latch/state"
                     | "/workbench/tool_checkpoint"
                     | "/activity/contract_drift"
+                    // V35 Phase L: the three realized read-path events. Their
+                    // Claude ingress twins are NOT here — a `/claude/hook/*`
+                    // route carries Claude's own body and its envelope rides
+                    // headers, which `note_chp` reads on the other branch.
+                    | "/session/assistant_text"
+                    | "/session/tool_result"
+                    | "/session/subagent"
             );
             assert_eq!(
                 observed, expected,
@@ -16306,6 +16851,69 @@ mod tests {
             Containment::NoRegistry(
                 "a harness artifact declaring its protocol version and capabilities; returns no \
                  local data and grants nothing",
+            ),
+        ),
+        // ── V35 Phase L: the read path, pushed ───────────────────────────────
+        //
+        // Six routes, one containment answer: none of them consults the latch,
+        // and the reason is the same for all six and is worth stating rather
+        // than assuming. Each one moves data FROM the harness INTO cImp and
+        // hands nothing back — no project content, no tool, no capability. The
+        // taint latch exists to stop a conversation that has ingested untrusted
+        // content from reaching cImp's own capabilities; a route that only
+        // receives has none to reach.
+        //
+        // The one that came closest to needing a gate is `assistant_text`,
+        // because its effect is audible: a compromised artifact can make cImp
+        // SAY something. That is a social-engineering surface, not code
+        // execution (design § 5.2), and it is contained by three things that are
+        // not the latch — the per-tab `tts_injection.enabled` toggle, the
+        // app-side escape-sequence strip, and app-side segmentation of prose the
+        // sender cannot control.
+        route(
+            "/session/assistant_text",
+            "POST",
+            "handle_session_assistant_text",
+            Containment::NoRegistry(
+                "receives assistant prose for TTS; returns no local data and grants no capability \
+                 — contained by the per-tab TTS toggle and app-side escape stripping, not by the \
+                 latch",
+            ),
+        ),
+        route(
+            "/session/tool_result",
+            "POST",
+            "handle_session_tool_result",
+            Containment::NoRegistry("receives one tool result's SIZE; returns nothing"),
+        ),
+        route(
+            "/session/subagent",
+            "POST",
+            "handle_session_subagent",
+            Containment::NoRegistry("receives a sub-agent lifecycle edge; returns nothing"),
+        ),
+        route(
+            "/claude/hook/stop",
+            "POST",
+            "handle_claude_stop",
+            Containment::NoRegistry(
+                "the Claude ingress for /session/assistant_text; same core, same answer",
+            ),
+        ),
+        route(
+            "/claude/hook/post_tool_use_result",
+            "POST",
+            "handle_claude_tool_result",
+            Containment::NoRegistry(
+                "the Claude ingress for /session/tool_result; sizes a result, runs nothing",
+            ),
+        ),
+        route(
+            "/claude/hook/subagent",
+            "POST",
+            "handle_claude_subagent",
+            Containment::NoRegistry(
+                "the Claude ingress for /session/subagent; same core, same answer",
             ),
         ),
         route(

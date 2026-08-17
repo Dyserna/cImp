@@ -474,10 +474,17 @@ pub async fn run(project_dir: PathBuf, pinned_session: Option<String>, ctx: OobC
                 // wedge in Thinking across the rotation.
                 if !agents.is_empty() {
                     agents.clear();
-                    ctx.signal(StateSignal::AgentsActiveChanged {
-                        tab: ctx.tab.clone(),
-                        active: false,
-                    });
+                    // V35 Phase L: arbitrated with the edge in `update_agents`,
+                    // and it has to be. For a tab whose sub-agent lifecycle is
+                    // PUSHED, a rotation says nothing about whether an agent is
+                    // running — releasing the avatar here would contradict a
+                    // `SubagentStart` that has not been stopped.
+                    if !ctx.pushed("claude", crate::harness::chp::EV_SESSION_SUBAGENT) {
+                        ctx.signal(StateSignal::AgentsActiveChanged {
+                            tab: ctx.tab.clone(),
+                            active: false,
+                        });
+                    }
                 }
                 // The tool-name ring is per-session too: a new file means old
                 // tool_use ids can never see a matching tool_result.
@@ -651,8 +658,19 @@ async fn drain_new_lines(
                 crate::graph::UsageOrigin::Session,
             );
             record_commit_events(&obj, commit_calls, project_dir, session_id, ctx);
+            // V35 Phase L — **arbitration, and why the dedup set is fed
+            // anyway.** A tab whose `Stop` hook pushes `assistant_text` has
+            // this tap suppressed (locked decision 4: push wins when served).
+            // `seen` is still filled, because a tab can start serving
+            // mid-session — `SessionStart` fires on `resume` and `clear` — and
+            // a `seen` set with a hole in it would re-speak everything the
+            // suppressed window covered if the hello were later retired by a
+            // relaunch. The handoff in `tts::prose` covers the other half of
+            // that boundary: the first push after a switchover strips whatever
+            // this tap already spoke of the same message.
+            let pushed = ctx.pushed("claude", crate::harness::chp::EV_ASSISTANT_TEXT);
             for (key, text) in assistant_texts(&obj) {
-                if seen.insert(key) {
+                if seen.insert(key) && !pushed {
                     trace!(tab = ?ctx.tab, "Claude OOB: speaking assistant block");
                     ctx.speak(&text).await;
                 }
@@ -720,7 +738,7 @@ pub(crate) fn message_parts(obj: &Value) -> Option<&Vec<Value>> {
 /// Extract `(dedup_key, text)` for each assistant `text` block in a transcript
 /// line. `thinking` and tool blocks are skipped. The key is `messageID` +
 /// content prefix so a re-read (rotation/compaction) doesn't re-speak.
-fn assistant_texts(obj: &Value) -> Vec<(String, String)> {
+pub(crate) fn assistant_texts(obj: &Value) -> Vec<(String, String)> {
     if obj.get("type").and_then(Value::as_str) != Some("assistant") {
         return Vec::new();
     }
@@ -853,7 +871,20 @@ fn update_agents(obj: &Value, agents: &mut HashSet<String>, ctx: &OobContext) ->
     }
 
     let now_active = !agents.is_empty();
-    if now_active != was_active {
+    // V35 Phase L — arbitration, on the SIGNAL only.
+    //
+    // The bookkeeping above (the `agents` set, and the `launched`/`completed`
+    // deltas this returns) keeps running for a tab that pushes, and that is not
+    // an oversight: those two flags feed `SubagentState::drift_condition`,
+    // whose "the launcher tool was renamed" arm reads `!launch_seen`. Suppress
+    // the bookkeeping and that canary starts firing on every session with a
+    // sub-agent — a migration manufacturing the very false alarm it was meant
+    // to make unnecessary.
+    //
+    // What is suppressed is the one thing that would be DOUBLE-delivered: the
+    // avatar edge, which `SubagentStart`/`SubagentStop` now drive directly for
+    // a serving tab.
+    if now_active != was_active && !ctx.pushed("claude", crate::harness::chp::EV_SESSION_SUBAGENT) {
         debug!(tab = ?ctx.tab, count = agents.len(), active = now_active, "Claude OOB: agents active edge");
         ctx.signal(StateSignal::AgentsActiveChanged {
             tab: ctx.tab.clone(),
@@ -1118,7 +1149,14 @@ fn tool_result_text_blocks(content: &Value) -> Vec<&str> {
 
 /// Character length of a `tool_result` block's `content` — the estimated-
 /// token proxy for usage accounting.
-fn tool_result_chars(content: &Value) -> usize {
+///
+/// `pub(crate)` since V35 Phase L: the `PostToolUse` push path
+/// ([`crate::harness::claude::hook::tool_result_chars`]) sizes the SAME shape
+/// arriving over a hook payload instead of out of the transcript. Two readings
+/// of one shape is exactly the drift this milestone exists to prevent, so the
+/// push reuses this function rather than restating it — and the L1 canary that
+/// proves the shape still parses therefore covers both paths at once.
+pub(crate) fn tool_result_chars(content: &Value) -> usize {
     tool_result_text_blocks(content)
         .iter()
         .map(|t| t.chars().count())
@@ -1423,6 +1461,20 @@ fn record_usage(
         ctx.record_usage(project_dir, session_id, "claude", event);
     }
 
+    // V35 Phase L — arbitration, on THIS tap only. The `UsageEvent::Turn` above
+    // is NOT arbitrated and never will be: no hook payload carries token
+    // counts, so `claude.transcript.usage` stays Tier C here
+    // permanently-until-upstream-changes. Only the tool-result SIZING moved,
+    // and only for a tab whose all-tools `PostToolUse` entry declares it —
+    // otherwise one result would be counted twice, in the same `msg_id`-less
+    // row shape, with nothing downstream able to tell the copies apart.
+    //
+    // The `tool_names` ring above is fed regardless, because it is what joins a
+    // `tool_use` id to a name for the OTHER readers (and for this one again if
+    // a relaunch retires the hello).
+    if ctx.pushed("claude", crate::harness::chp::EV_SESSION_TOOL_RESULT) {
+        return;
+    }
     for (tool_use_id, chars) in extract_tool_results(obj) {
         let tool = tool_names.get(&tool_use_id).map(str::to_string);
         ctx.record_usage(

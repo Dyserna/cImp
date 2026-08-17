@@ -16,6 +16,10 @@
 #   tool-result-renamed-tool-use-id.jsonl   claude.transcript.tool_result
 #       message.content[].tool_use_id -> toolUseId
 #       degraded default: `extract_tool_results` skips the block; empty Vec
+#   assistant-text-renamed-text.jsonl       claude.transcript.assistant_text
+#       message.content[].text -> body (on both text blocks)
+#       degraded default: `assistant_texts` skips the block; empty Vec, and the
+#       tab simply goes mute on any tab with no `Stop` push (V35 Phase L)
 #   statusline-renamed-context-window.json  claude.statusline.stdin
 #       context_window -> contextWindow (the whole block; live-verify recipe 3)
 #       degraded default: `extract_context` -> None, blank context bar, and a

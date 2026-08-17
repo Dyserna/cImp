@@ -97,6 +97,14 @@ const FIXTURE_CLAUDE_USAGE: &str =
     include_str!("../../fixtures/harness/claude/2.1.232/transcript.assistant-usage.jsonl");
 const FIXTURE_CLAUDE_TOOL_RESULT: &str =
     include_str!("../../fixtures/harness/claude/2.1.232/transcript.tool-result.jsonl");
+/// V35 Phase L. The fifth, and the one whose ABSENCE was the finding: assistant
+/// prose → TTS was a live Tier-C dependency with no registry row and no canary,
+/// because Phase B seeded the rows it could point a *named reader function* at
+/// and this one's reader (`assistant_texts`) was inlined in the drain loop.
+/// Phase L needed the row anyway — a `Fallback { to: .. }` cannot point at a
+/// capability that does not exist.
+const FIXTURE_CLAUDE_ASSISTANT_TEXT: &str =
+    include_str!("../../fixtures/harness/claude/2.1.232/transcript.assistant-text.jsonl");
 const FIXTURE_CLAUDE_STATUSLINE: &str =
     include_str!("../../fixtures/harness/claude/2.1.232/statusline-stdin.json");
 const FIXTURE_OPENCODE_SSE: &str =
@@ -113,6 +121,7 @@ const FIXTURE_OPENCODE_SSE: &str =
 pub const EMBEDDED: &[&str] = &[
     "claude.transcript.usage",
     "claude.transcript.tool_result",
+    "claude.transcript.assistant_text",
     "claude.statusline.stdin",
     "opencode.sse.events",
 ];
@@ -131,6 +140,7 @@ pub fn run_embedded(id: &str) -> Option<Result<(), String>> {
     match id {
         "claude.transcript.usage" => Some(claude_transcript_usage()),
         "claude.transcript.tool_result" => Some(claude_transcript_tool_result()),
+        "claude.transcript.assistant_text" => Some(claude_transcript_assistant_text()),
         "claude.statusline.stdin" => Some(claude_statusline_stdin()),
         "opencode.sse.events" => Some(block_on_current_thread(opencode_sse_events())),
         _ => None,
@@ -306,6 +316,69 @@ fn check_claude_transcript_tool_result(raw: &str) -> Result<(), String> {
         flags == vec![false, true],
         "claude.transcript.tool_result: `message.content[].is_error` no longer round-trips — a \
          failed tool result reading as success is what lets an ABORTED commit be mined for hashes"
+    );
+    Ok(())
+}
+
+// ── claude.transcript.assistant_text ────────────────────────────────────────
+
+/// `harness/claude/read.rs::assistant_texts` still lifts speakable prose — and
+/// only speakable prose — out of an assistant transcript line.
+///
+/// **This canary now proves a FALLBACK** (V35 Phase L). Assistant prose reaches
+/// TTS from the `Stop` hook on a tab that declares `assistant_text`, and from
+/// this reader on every tab that does not — a pre-upgrade tab, a tab on an
+/// install with no loopback, or a harness whose plugin cannot push (OpenCode,
+/// declared). "Fallback" is exactly the state in which a reader rots unnoticed,
+/// so the leading check matters MORE after the migration than before it, not
+/// less. The same is true of `claude.transcript.tool_result` above.
+///
+/// The failure this catches: `message.content[]` reshapes, `assistant_texts`
+/// returns an empty vector, `ctx.speak` is never called, and a tab whose push
+/// path is also absent simply goes mute — no error, no log, no row.
+pub fn claude_transcript_assistant_text() -> Result<(), String> {
+    check_claude_transcript_assistant_text(FIXTURE_CLAUDE_ASSISTANT_TEXT)
+}
+
+fn check_claude_transcript_assistant_text(raw: &str) -> Result<(), String> {
+    let lines = parse_lines(raw)?;
+    substantive!(
+        lines.len() == 1,
+        "fixture guard: expected one assistant line, got {}",
+        lines.len()
+    );
+    let blocks = crate::harness::claude::read::assistant_texts(&lines[0]);
+    substantive!(
+        blocks.len() == 2,
+        "claude.transcript.assistant_text: expected both `text` blocks of the assistant line, got \
+         {} — `type == \"assistant\"`, `message.content[]` or `content[].type == \"text\"` has \
+         moved, and a tab with no push path goes silently mute",
+        blocks.len()
+    );
+    // Substantiveness: prose out, not empty strings, and the dedup key is a key.
+    for (key, text) in &blocks {
+        substantive!(
+            !text.trim().is_empty(),
+            "claude.transcript.assistant_text: a text block came back empty — `content[].text` gone"
+        );
+        substantive!(
+            !key.is_empty() && key.contains(':'),
+            "claude.transcript.assistant_text: the dedup key lost its `message.id` prefix, so one \
+             message would be re-spoken on every drain tick"
+        );
+    }
+    // …and NOTHING else. A `thinking` or `tool_use` block reaching TTS is the
+    // failure the `type == "text"` filter exists to prevent, and it is a
+    // user-visible one: cImp would read the model's reasoning out loud.
+    let spoken = blocks
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    substantive!(
+        !spoken.contains("reasoning") && !spoken.contains("canary.rs"),
+        "claude.transcript.assistant_text: a non-text block reached the speech path — thinking or \
+         tool_use content is being spoken aloud"
     );
     Ok(())
 }
@@ -626,6 +699,21 @@ mod tests {
         claude_statusline_stdin().unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// V35 Phase L. Proves the FALLBACK, which is the state a reader is most
+    /// likely to rot in: on a tab whose `Stop` hook pushes, nothing here runs,
+    /// so the day the push breaks is the day this reader has to work.
+    #[test]
+    fn canary_claude_transcript_assistant_text() {
+        row("claude.transcript.assistant_text");
+        claude_transcript_assistant_text().unwrap_or_else(|e| panic!("{e}"));
+        // …and the runtime dispatcher reaches it, so auto-verify runs the same
+        // check `cargo test` does.
+        assert!(matches!(
+            run_embedded("claude.transcript.assistant_text"),
+            Some(Ok(()))
+        ));
+    }
+
     #[tokio::test]
     async fn canary_opencode_sse_events() {
         row("opencode.sse.events");
@@ -683,6 +771,53 @@ mod tests {
             check_claude_transcript_usage(&raw).is_err(),
             "the runtime canary must FAIL on the drift model — otherwise auto-verify would \
              advance `claude_last_verified` straight past this rename"
+        );
+    }
+
+    /// Negative twin: `message.content[].text` renamed to `body` on both text
+    /// blocks (V35 Phase L).
+    ///
+    /// `assistant_texts` `filter_map`s past a block with no `text`, so the whole
+    /// line yields an EMPTY vector — and an empty vector is indistinguishable
+    /// from an assistant turn that only called tools. Nothing errors, nothing
+    /// logs, and a tab whose `Stop` hook is also absent (pre-upgrade, or an
+    /// install with no loopback) simply stops speaking. This row has no V16 rule
+    /// lagging it either, which is why the empty case is the whole point.
+    #[test]
+    fn negative_canary_claude_transcript_assistant_text() {
+        row("claude.transcript.assistant_text");
+
+        let raw = fixture("claude/_synthetic/assistant-text-renamed-text.jsonl");
+        let lines = json_lines(&raw);
+        assert_eq!(lines.len(), 1, "fixture guard: expected one assistant line");
+        let line = &lines[0];
+
+        let blocks = crate::harness::claude::read::assistant_texts(line);
+        assert!(
+            blocks.is_empty(),
+            "guard: this fixture models the drift case — a renamed `text` must yield NO speakable \
+             blocks, silently. Got {blocks:?}, which means the reader grew an alias and the \
+             positive canary can no longer detect this rename."
+        );
+
+        // The line is otherwise intact: all four content blocks are still there
+        // and still typed, so the test cannot pass on a merely malformed fixture.
+        let parts = crate::harness::claude::read::message_parts(line)
+            .expect("guard: the drift fixture must still be a well-formed assistant line");
+        assert_eq!(parts.len(), 4, "guard: every content block is still present");
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .count(),
+            2,
+            "guard: only the field name was renamed, not the block types"
+        );
+
+        assert!(
+            check_claude_transcript_assistant_text(&raw).is_err(),
+            "the runtime canary must FAIL on the drift model — otherwise auto-verify would \
+             advance `claude_last_verified` straight past a rename that mutes every fallback tab"
         );
     }
 

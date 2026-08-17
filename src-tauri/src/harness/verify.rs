@@ -815,8 +815,9 @@ mod tests {
         assert!(report.capped, "the L2 half must have been skipped");
         assert_eq!(
             report.answers.len(),
-            3,
-            "expected the three Claude canaries, got {:?}",
+            4,
+            "expected the four Claude canaries (V35 Phase L added \
+             `claude.transcript.assistant_text`), got {:?}",
             report.answers.iter().map(|a| a.id).collect::<Vec<_>>()
         );
         for a in &report.answers {
@@ -832,7 +833,7 @@ mod tests {
             );
         }
         assert!(report.advances());
-        assert_eq!(report.tally(), (3, 0, 0, 0));
+        assert_eq!(report.tally(), (4, 0, 0, 0));
         assert_eq!(report.record("2.2.0", 0).status, AutoVerify::PASS);
     }
 

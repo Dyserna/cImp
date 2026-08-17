@@ -3,7 +3,9 @@
 **Protocol version:** `chp = 1`
 
 **Status:** declared V35 Phase I (2026-08-16), issue #66; extended additively by
-V35 Phase J (2026-08-17), issue #67 — § 4.5. This document is the wire contract;
+V35 Phase J (2026-08-17), issue #67 — § 4.5 — and again by V35 Phase L
+(2026-08-17), issue #69 — § 4.6, which realizes three of the six reserved
+read-path events and makes `serves` load-bearing. This document is the wire contract;
 `src-tauri/src/harness/chp.rs` is the code half, and `harness::chp::CHP_VERSION`
 is checked equal to the version above by
 `harness::chp::tests::the_doc_states_this_version`. The two move in one commit
@@ -143,10 +145,12 @@ POST /session/hello
 Response: `200 {"ok": true, "chp": <CHP_VERSION>}`. The ack carries the
 *server's* version so a future client can adapt; today's plugin discards it.
 
-**Nothing gates on `serves`/`cannot` in Phase I.** They are recorded per tab and
-displayed in Settings → *Harness health*. Gating becomes load-bearing in
-Phase L, when the read path moves onto CHP and a capability's absence has to
-turn a feature off rather than merely describe it.
+**Nothing gated on `serves`/`cannot` in Phase I; § 4.6 is where that changed.**
+Since Phase L a hello's `serves` decides, per capability and per tab, whether the
+fallback reader's tap runs — so a hello is no longer only a description, it is
+the arbitration input. `cannot` is still purely descriptive, and deliberately:
+"this artifact will not push X" and "therefore the reader must" are the same
+statement, and one of them is enough to act on.
 
 **Claude Code sends a hello since Phase J.** Its L1 was five stateless shim
 binaries plus a spawn-baked `--settings` overlay, with nowhere to put a version
@@ -226,6 +230,9 @@ in the § 5 vocabulary: they are a *transport* for events that already have ids.
 | `PostToolUse` (`Edit\|Write\|MultiEdit`) | `POST /claude/hook/post_tool_use` | `context.post_edit` | `hookSpecificOutput.additionalContext`, or `{}` |
 | `Notification`, `PermissionDenied` | `POST /claude/hook/notification` | `permission.event` | always `{}` (observe-only) |
 | `SessionStart` | `POST /claude/hook/session_start` | `hello` | always `{}` |
+| `Stop` | `POST /claude/hook/stop` | `assistant_text` (§ 4.6) | always `{}` (observe-only) |
+| `PostToolUse` (matcher `""`) | `POST /claude/hook/post_tool_use_result` | `session.tool_result` (§ 4.6) | always `{}` (observe-only) |
+| `SubagentStart`, `SubagentStop` | `POST /claude/hook/subagent` | `session.subagent` (§ 4.6) | always `{}` (observe-only) |
 
 **Minimum Claude Code: 2.1.63**, when `type: "http"` hooks shipped. Phase J is a
 hard switch — the overlay generates no command-hook fallback — so an older CLI
@@ -262,23 +269,144 @@ Not CHP, listed so the boundary is explicit: `/run`, `/graph_run`, `/audit/run`,
 `/activity/discovery_skipped` (a cImp MCP *child* reporting on itself, not a
 harness), `/describe`, `/events`, `/health`, `/status`.
 
-### 4.3 Reserved (Phase L)
+### 4.6 The read path, pushed (Phase L)
 
-Design D2 retires the Tier-C read path — `harness/claude/read.rs` tailing transcript
-JSONL, `harness/opencode/read.rs` consuming SSE, `harness/claude/statusline.rs` parsing stdin — by
-having the plugin push the same facts. Those routes are named now so the
-vocabulary is one table:
+Design D2 retires the Tier-C read path — `harness/claude/read.rs` tailing
+transcript JSONL, `harness/opencode/read.rs` consuming SSE,
+`harness/claude/statusline.rs` parsing stdin — by having the harness push the
+same facts. **Phase L realized three of the six** routes Phase I reserved. `chp`
+stays at **1**: these are new routes with new meaning (compatibility rule 4),
+not a reshaping of anything already on the wire.
 
-| Event | Route | Replaces |
+| Event | Route | Status | Replaces |
+|---|---|---|---|
+| `assistant_text` | `POST /session/assistant_text` | **live** | `harness/{claude,opencode}/read.rs` assistant prose → TTS |
+| `session.tool_result` | `POST /session/tool_result` | **live** | `harness/claude/read.rs` tool_result sizing |
+| `session.subagent` | `POST /session/subagent` | **live** | `harness/claude/read.rs` sub-agent lifecycle (`update_agents`) |
+| `session_end` | `POST /session/end` | reserved | session lifecycle inferred from the tap |
+| `session.usage` | `POST /session/usage` | **reserved, and stuck** | `harness/claude/read.rs::parse_usage_line` |
+| `session.context` | `POST /session/context` | **reserved, and stuck** | `harness/claude/statusline.rs` context window / quota |
+
+Posting to a reserved route gets a `404`.
+
+**Two of them cannot be realized, and that is upstream's constraint rather than
+a missing phase.** No Claude Code hook input carries token counts — the common
+payload set is `session_id`, `transcript_path`, `cwd`, `permission_mode`,
+`hook_event_name`, and `PostCompact` exposes no compaction metrics — and none
+carries a context window or a `rate_limits` block. The only documented
+token-usage surface is the OpenTelemetry `claude_code.token.usage` metric, which
+is an exporter integration and not a hook. So `claude.transcript.usage` and
+`claude.statusline.stdin` stay Tier C, permanently-until-upstream-changes, and
+these two rows stay named-but-reserved rather than being deleted: an absence with
+a stated reason is a fact, a deletion is a blank.
+
+#### Bodies
+
+```json
+POST /session/assistant_text
+{ "chp": 1, "agent": "claude", "tab": "claude-1",
+  "text": "The complete final assistant message, as prose." }
+
+POST /session/tool_result
+{ "chp": 1, "agent": "claude", "tab": "claude-1",
+  "cwd": "C:/proj", "session_id": "…", "tool": "Read", "chars": 4211 }
+
+POST /session/subagent
+{ "chp": 1, "agent": "claude", "tab": "claude-1",
+  "agent_id": "agent_01…", "active": true }
+```
+
+`text` is **prose, never markup or control**: the sender does not segment, and
+everything below `to_speakable` — escape stripping, markdown reduction, sentence
+segmentation — is cImp's (`tts/prose.rs`, design § 5.2). `chars` and not the
+result content: the consumer is usage accounting, whose estimated-token proxy has
+always been a character count, and shipping the content would put an unbounded
+model-influenced blob on the wire for a `u32`'s worth of information. `active`
+and not an event name: an id that started and has not stopped is an agent
+running, which is the whole fact the avatar needs.
+
+#### Arbitration: per capability, per tab, push wins when served
+
+**This is where `serves` stopped being descriptive.** § 4.1 said gating "becomes
+load-bearing in Phase L, when the read path moves onto CHP and a capability's
+absence has to turn a feature off rather than merely describe it". The rule, in
+one sentence:
+
+> A capability is **served** for a tab when that tab has sent a hello AND that
+> hello lists the capability. The fallback reader's tap for that capability on
+> that tab is then suppressed, and the push core acts. Otherwise the reader
+> serves it and the push core refuses.
+
+Both sides ask one predicate (`harness::chp::served`), so exactly one path
+produces each datum. Three properties, each closing a specific failure:
+
+- **Per capability.** A tab that pushes assistant text still has its transcript
+  tailed for usage and identity. Suppressing a whole reader because one of its
+  taps migrated is how a migration loses data.
+- **Per tab.** Two Claude tabs can run two different spawn-baked overlays; one
+  may push and one (launched before the upgrade) may not.
+- **Requires a hello, not a setting.** Settings say what cImp *asked* for; the
+  hello says what the artifact on disk actually does, and those differ for
+  exactly as long as a stale tab stays open (§ 6.1). A pre-upgrade tab sends no
+  hello, is served by its reader, and behaves precisely as it did before.
+
+**The mid-session switchover.** `SessionStart` fires on `resume` and `clear`, so
+a hello can land after the reader has already spoken part of a turn that is about
+to arrive as one complete `Stop` payload. Speaking the push whole would *replay*;
+dropping it would *lose* the remainder. So the reader records the speakable prose
+it last emitted for a tab and the first push after the switchover strips it as a
+prefix — no replay, no dropped message boundary (`tts::prose`, one `String` per
+tab, consumed on read).
+
+**A served capability that goes quiet is reported, not silently un-served.** If a
+harness update kills a hook, falling back to the reader would restore the data
+and hide the breakage — the exact silent-drift class this protocol exists to
+delete. So the reader stays suppressed while the hello's claim stands, and the
+silence raises a `contract.drift` report under that capability's own token.
+"Demonstrably active" is defined by a **witness**: another push whose arrival
+proves this one should also have fired (`prompt` witnesses `assistant_text`;
+`context.post_edit` witnesses `session.tool_result`). Three witness pushes with
+the served capability silent ⇒ one report. `session.subagent` has no witness
+and declares so: a session may legitimately launch no sub-agents forever.
+
+#### Who produces these today
+
+**Claude, through § 4.5's native ingress**, because a hook's body is the
+harness's and cannot carry a CHP envelope:
+
+| Claude event | Route | CHP event it feeds |
 |---|---|---|
-| `assistant_text` | `POST /session/assistant_text` | `harness/{claude,opencode}/read.rs` assistant prose → TTS |
-| `session_end` | `POST /session/end` | session lifecycle inferred from the tap |
-| `session.usage` | `POST /session/usage` | `harness/claude/read.rs::parse_usage_line` |
-| `session.tool_result` | `POST /session/tool_result` | `harness/claude/read.rs` tool_result extraction |
-| `session.subagent` | `POST /session/subagent` | `harness/claude/read.rs::SubagentFile` discovery |
-| `session.context` | `POST /session/context` | `harness/claude/statusline.rs` context window / quota |
+| `Stop` | `POST /claude/hook/stop` | `assistant_text` |
+| `PostToolUse` (matcher `""`) | `POST /claude/hook/post_tool_use_result` | `session.tool_result` |
+| `SubagentStart`, `SubagentStop` | `POST /claude/hook/subagent` | `session.subagent` |
 
-None of these is served today. Posting to one gets a `404`.
+The tool-result entry is a **second `PostToolUse` matcher group pointing at a
+second route**, never a widening of the auto-check entry: Claude evaluates every
+matching group, so one shared route would run the project's checks twice and
+count one result twice.
+
+**OpenCode produces none of them, declares so, and keeps its SSE reader.** This
+is a Phase L outcome under design D6 ("a fallback contained and declared beats a
+lossy migration"), not an unfinished migration — the plugin API *can* reach both,
+and the `cannot` reasons in its hello say why neither is wired:
+
+- *assistant text* — `experimental.text.complete` delivers one completed text
+  **part**, while the SSE reader speaks one **message** with its parts joined, so
+  pushing per part would change the unit the sentence segmenter is fed (locked
+  decision 2). The alternative, widening the plugin's existing `event` handler,
+  reads `properties.part.text` / `properties.delta` — the *same Tier-C shapes the
+  reader already reads*, over a different transport, for no tier gain.
+- *tool results* — `tool.execute.after`'s second parameter carries
+  `{title, output, metadata}` and cImp's handler takes only the first, so the
+  result text is one parameter away; but OpenCode usage is estimate-only by
+  design and there is no consumer, so wiring it would *add* a capability rather
+  than migrate one.
+
+The neutral routes above therefore have no external producer today. They are
+implemented rather than deferred because they are the seam: when
+`experimental.text.complete` graduates, or when a third harness arrives, the
+change is a plugin change and nothing above L2 moves — which is design D6's whole
+promise.
 
 ---
 
@@ -290,15 +418,19 @@ every harness must serve to be usable at all, and an **optional** set each
 capability declares a dependency on.
 
 **Core:** `hello`, `prompt`, `assistant_text`, `session_end`.
-Two of the four are reserved (§ 4.3) — a harness is usable today on the strength
-of the OOB fallback readers, which Phase L retires into `harness/<id>/read.rs`.
+Three of the four are live since Phase L; `session_end` remains reserved. A
+harness that serves none of the read path is still usable on the strength of its
+declared fallback reader in `harness/<id>/read.rs` — that is what "unavailable,
+not broken" means here, and OpenCode is the standing example (§ 4.6).
 
 **Optional, live:** `context.compaction`, `context.should_read`,
 `context.post_edit`, `memory.event`, `permission.event`, `taint.beacon`,
-`tool.gate`, `checkpoint.pre_mutation`, `contract.drift`.
+`tool.gate`, `checkpoint.pre_mutation`, `contract.drift`,
+`session.tool_result`, `session.subagent`.
 
-**Optional, reserved:** `session.usage`, `session.tool_result`,
-`session.subagent`, `session.context`.
+**Optional, reserved:** `session.usage`, `session.context` — and both are
+reserved *permanently until upstream changes*, for the reason § 4.6 gives: no
+hook payload carries token counts or a context window.
 
 The table lives in code as `harness::chp::EVENTS` and is checked against this
 document by `harness::chp::tests::the_doc_documents_every_event`, so an id

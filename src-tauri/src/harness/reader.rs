@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::graph::GraphService;
-use crate::settings::{SettingsHandle, TabConfig};
+use crate::settings::SettingsHandle;
 use crate::state::{StateSignal, TabId};
 use crate::tts::TtsRequest;
 
@@ -111,90 +111,46 @@ pub fn spawn(spec: OobSpec, ctx: OobContext) {
 }
 
 impl OobContext {
-    /// Whether this tab should speak its assistant output. Reuses the per-tab
-    /// `tts_injection.enabled` toggle (V20 repurposes it from "inject the
-    /// `[[TTS]]` markup convention" to "speak this tab's assistant prose"; the
-    /// markup convention itself is retired with the scrape path). Read live so
-    /// a settings toggle takes effect without a relaunch.
-    pub fn tts_enabled(&self) -> bool {
-        matches!(
-            self.settings.current().find_tab(self.tab.as_str()),
-            Some(TabConfig::AiTool(c)) if c.tts_injection.enabled
-        )
+    /// V35 Phase L — **the arbitration query, asked at the tap**: is `event`
+    /// being PUSHED for this tab, so that this reader must not also produce it?
+    ///
+    /// `agent` is the harness this reader speaks for; it is a literal at every
+    /// call site because a reader only ever serves one, and passing it keeps
+    /// the arbitration keyed the same way the peer registry is (`(agent, tab)`).
+    ///
+    /// A `true` here suppresses ONE tap, never the reader: the Claude
+    /// transcript tail still carries usage, identity and sub-agent token
+    /// accounting, none of which any hook payload exposes. See
+    /// [`crate::harness::chp::served`] for the three properties of the rule.
+    pub fn pushed(&self, agent: &str, event: &str) -> bool {
+        crate::harness::chp::served(agent, self.tab.as_str(), event)
     }
 
-    /// Segment `text` into sentences and push each onto the TTS channel as a
-    /// suppressible `Synthesize` request (so Esc/`tts_stop` cuts the rest of
-    /// the burst, exactly like the old scrape path). Markdown is reduced to
-    /// speakable prose first; empty/code-only input speaks nothing.
+    /// Speak one block of assistant prose from THIS reader.
     ///
-    /// V32 Phase D — **escape hygiene at the one external-text boundary the
-    /// TTS path has.** `text` is assistant prose lifted from a transcript /
-    /// event stream, and an assistant that just read a fetched page routinely
-    /// quotes it verbatim — so a page carrying `ESC ] 52 ; c ; …` (a clipboard
-    /// write) or cursor-motion sequences reaches this composition site intact.
-    /// Stripping here rather than at each tap keeps it one decision in one
-    /// place, and it happens BEFORE markdown reduction so a control sequence
-    /// cannot alter how `to_speakable` sees fences or list markers.
+    /// V35 Phase L moved the composition itself — escape hygiene, markdown
+    /// reduction, sentence segmentation, the per-sentence live toggle re-read
+    /// and the cancel-raced send — into [`crate::tts::prose::speak_prose`], so
+    /// that the CHP push path speaks through the same code rather than through
+    /// a second copy of it. This wrapper supplies the three things a reader owns
+    /// and a loopback handler does not: the tab, the sender it was handed at
+    /// spawn, and the tab's cancellation token.
     ///
-    /// V32 Phase G (locked decision 16): the strip is one of the eleven
-    /// switchable controls (ten until Phase H added `opencode_native_gate`;
-    /// count corrected 2026-08-08, #48), resolved at [`Scope::AppWide`] — TTS and
-    /// toasts are global surfaces
-    /// (the global-only avatar/TTS decision), so this feature has an L1 and an
-    /// L2 and deliberately no per-scope row. Resolved per burst rather than
-    /// cached: the settings handle is already read here for `tts_enabled`, and a
-    /// user who turns hygiene off wants the next thing spoken to reflect it.
+    /// [`ProseSource::FallbackReader`] is not decoration: it is what records the
+    /// handoff that stops a mid-session switchover from re-speaking a message
+    /// this reader had already started (see that module's docs).
     ///
-    /// **The app-wide baseline, not the identity-less caller's answer** (#48,
-    /// F-35): the two were one variant until locked decision 36 split them, and
-    /// they are provably equal here — a feature with no per-tab row can never
-    /// carry the N-1 elevation — so this is a naming change, not a behaviour
-    /// change. `AppWide` is the honest one: this is a statement about the
-    /// application, and there is no caller to be unsure about.
-    ///
-    /// [`Scope::AppWide`]: crate::settings::injection::Scope::AppWide
+    /// [`ProseSource::FallbackReader`]: crate::tts::ProseSource::FallbackReader
     pub async fn speak(&self, text: &str) {
-        if !self.tts_enabled() {
-            return;
-        }
-        let text = if crate::settings::injection::effective(
-            crate::settings::injection::Feature::TerminalEscapeHygiene,
-            crate::settings::injection::Scope::AppWide,
-            &self.settings.current(),
-        ) {
-            crate::processing::strip_terminal_escapes(text)
-        } else {
-            std::borrow::Cow::Borrowed(text)
-        };
-        let prose = crate::processing::to_speakable(&text);
-        if prose.trim().is_empty() {
-            return;
-        }
-        for sentence in crate::processing::segment_sentences(&prose) {
-            // Re-check the toggle per sentence so switching TTS off mid-burst
-            // cuts the rest of a long message (the doc above promises a live
-            // read), and race the bounded send against the cancel token so a
-            // closing tab isn't held hostage by a backed-up TTS channel.
-            if self.cancel.is_cancelled() || !self.tts_enabled() {
-                return;
-            }
-            let send = self.tts.send(TtsRequest::Synthesize {
-                tab: self.tab.clone(),
-                text: sentence,
-                suppressible: true,
-            });
-            tokio::select! {
-                _ = self.cancel.cancelled() => return,
-                // Bounded channel; if the worker is backed up, awaiting applies
-                // natural backpressure rather than dropping speech.
-                res = send => {
-                    if res.is_err() {
-                        return; // worker gone — stop feeding.
-                    }
-                }
-            }
-        }
+        crate::tts::speak_prose(
+            &self.tab,
+            &self.tts,
+            &self.settings,
+            Some(&self.cancel),
+            crate::tts::ProseSource::FallbackReader,
+            text,
+        )
+        .await;
     }
 
     /// Emit a state signal, ignoring a full/closed channel (state is

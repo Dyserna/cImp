@@ -12,6 +12,11 @@
 #   transcript.tool-result.jsonl      claude.transcript.tool_result
 #                                     oob/claude.rs::extract_tool_results,
 #                                     oob/claude.rs::tool_result_is_error
+#   transcript.assistant-text.jsonl   claude.transcript.assistant_text
+#                                     harness/claude/read.rs::assistant_texts
+#                                     (V35 Phase L: the row existed in the code
+#                                     and not in the registry until the push
+#                                     migration needed a fallback to name)
 #   statusline-stdin.json             claude.statusline.stdin
 #                                     statusline/mod.rs::render,
 #                                     ::extract_push / ::extract_rate_limits

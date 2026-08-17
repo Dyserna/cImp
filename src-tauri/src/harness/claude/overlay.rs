@@ -84,6 +84,13 @@ struct ClaudeHookFlags {
     /// `type: "http"` — `serves` describes the tab's L1, not one transport.
     taint_beacon: bool,
     checkpoint: bool,
+    /// V35 Phase L: the three read-path pushes. Each is what turns its
+    /// fallback reader's tap OFF for this tab (`chp::served`), so a `false`
+    /// here is not merely "no push" — it is "the transcript tail keeps serving
+    /// it", which is the sentence the `cannot` reason has to say.
+    stop: bool,
+    tool_result: bool,
+    subagent: bool,
 }
 
 /// The `serves` / `cannot` declaration for one Claude tab — the payload of
@@ -153,6 +160,36 @@ fn claude_hello(settings: &Settings, flags: ClaudeHookFlags) -> claude_hook::Hel
         chp::EV_CHECKPOINT_PRE_MUTATION,
         "Workbench checkpoints are off",
     );
+    // V35 Phase L. Every `cannot` here names the FALLBACK that keeps serving the
+    // capability, because that is what an operator needs to know: an absence
+    // from `serves` means "still Tier C on the transcript tail", not "gone".
+    hello.declare(
+        flags.stop,
+        chp::EV_ASSISTANT_TEXT,
+        "no cImp loopback runs on this install, so the `Stop` hook has nowhere to post — assistant \
+         prose still reaches TTS through the transcript tail (`claude.transcript.assistant_text`, \
+         Tier C)",
+    );
+    hello.declare(
+        flags.tool_result,
+        chp::EV_SESSION_TOOL_RESULT,
+        "the graph is off (or there is no loopback), so nothing consumes tool-result sizes — the \
+         transcript tail keeps serving them when it is on (`claude.transcript.tool_result`)",
+    );
+    hello.declare(
+        flags.subagent,
+        chp::EV_SESSION_SUBAGENT,
+        "no cImp loopback runs on this install, so sub-agent lifecycle is still inferred from the \
+         transcript's `isSidechain` lines and `Task`/`Agent` tool_use blocks \
+         (`claude.transcript.subagents`, Tier C)",
+    );
+    // NOT declared on either side, and that is the honest answer rather than an
+    // omission: `session.usage` and `session.context` have NO Claude producer to
+    // declare. No hook payload carries token counts (`PostCompact` exposes no
+    // compaction metrics either) and none carries the statusline's context
+    // window, so `claude.transcript.usage` and `claude.statusline.stdin` remain
+    // Tier C permanently-until-upstream-changes. A `cannot` entry would imply a
+    // per-tab decision cImp made; there is none to make.
     hello
 }
 
@@ -301,6 +338,32 @@ pub(crate) fn build_pre_args(
             // fallback. See the long note at its emission site for the H2 reason
             // it is gated on `loopback_needed()` and the accepted tradeoff.
             let notify_hook = settings.loopback_needed();
+            // ── V35 Phase L: the read path, pushed ──────────────────────────
+            //
+            // All three are gated on `loopback_needed()` alone (plus the graph
+            // for the one whose consumer is the graph), and NOT on the feature
+            // switch each capability's fallback reader consults. That is
+            // deliberate and it is what keeps a live toggle live:
+            //
+            //   * `tts_injection.enabled` is per-tab and read LIVE by
+            //     `tts::prose::speak_prose` on every burst. Baking it into the
+            //     hook gate would make "turn TTS on for this tab" require a tab
+            //     restart — a regression against the reader path, which re-reads
+            //     it per sentence. The cost of not gating is one loopback POST
+            //     per turn on a tab with TTS off, which the handler drops at the
+            //     same live check the reader uses.
+            //   * `graph.enabled` DOES gate the tool-result push, because
+            //     without the graph there is no `UsageEvent` sink at all — the
+            //     reader's own tap is `ctx.mem.is_none()`-gated for the same
+            //     reason, so the two agree.
+            //
+            // Neither needs a new `spawn_inject_sig` slot: `loopback_needed()`
+            // already rides the `"notify_hooks"` key and `graph.enabled` already
+            // moves the `"guidance"` array, so every input that can change what
+            // these declare already raises the restart hint.
+            let stop_hook = settings.loopback_needed();
+            let tool_result_hook = settings.graph.enabled && settings.loopback_needed();
+            let subagent_hook = settings.loopback_needed();
             // V32 Phase F: `PreToolUse` now has TWO independent producers (the
             // V11 read advisor and the Phase F web beacon), so its entries
             // accumulate here and are inserted once. Claude Code evaluates every
@@ -458,16 +521,81 @@ pub(crate) fn build_pre_args(
                     }));
                 }
             }
+            // V35 Phase L: `PostToolUse` now has TWO producers, and they are
+            // deliberately two ENTRIES pointing at two ROUTES rather than one
+            // widened matcher. Claude evaluates every matching group, so an
+            // `Edit` fires both — which is exactly why they must not share a
+            // route: one shared route would run the auto-check twice and count
+            // one tool result twice, the two double-delivery failures this phase
+            // is most exposed to. CHP rule 4 ("a route is never repurposed")
+            // says the same thing from the protocol side. The auto-check entry
+            // below is therefore byte-identical to what Phase J emitted.
+            let mut post_tool_use: Vec<serde_json::Value> = Vec::new();
             if let Some(port) = http_port.filter(|_| post_edit_hook) {
                 // This is the hook whose route EXECUTES the project's configured
                 // checks, so it is the one whose taint gate most needs a scope to
                 // resolve — `X-CIMP-Tab` is what gives it one.
+                post_tool_use.push(serde_json::json!({
+                    "matcher": "Edit|Write|MultiEdit",
+                    "hooks": [
+                        claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_POST_TOOL_USE, None)
+                    ]
+                }));
+            }
+            if let Some(port) = http_port.filter(|_| tool_result_hook) {
+                // `"matcher": ""` — every tool, because tool-result SIZING is
+                // about every tool the model ran, not about the edit tools. The
+                // transcript tail it replaces is equally indiscriminate
+                // (`extract_tool_results` reads every `tool_result` block), so
+                // narrowing here would lose rows the fallback was collecting.
+                post_tool_use.push(serde_json::json!({
+                    "matcher": "",
+                    "hooks": [
+                        claude_hook::http_hook_entry(
+                            port,
+                            tab,
+                            claude_hook::ROUTE_POST_TOOL_USE_RESULT,
+                            None,
+                        )
+                    ]
+                }));
+            }
+            if !post_tool_use.is_empty() {
                 hooks.insert(
                     "PostToolUse".to_string(),
-                    serde_json::json!([ { "matcher": "Edit|Write|MultiEdit", "hooks": [
-                        claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_POST_TOOL_USE, None)
+                    serde_json::Value::Array(post_tool_use),
+                );
+            }
+            // V35 Phase L: `Stop` carries `last_assistant_message` — the
+            // complete final assistant text of the turn, which is the SAME unit
+            // and the SAME cadence the transcript tail delivers to TTS today.
+            // That equivalence is the migration (locked decision 2): the
+            // segmenter's input does not change, so recipe 10 is a confirmation
+            // rather than a hope. `MessageDisplay` is deliberately not wired —
+            // it would deliver per-chunk deltas on the streaming hot path.
+            if let Some(port) = http_port.filter(|_| stop_hook) {
+                hooks.insert(
+                    "Stop".to_string(),
+                    serde_json::json!([ { "hooks": [
+                        claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_STOP, None)
                     ] } ]),
                 );
+            }
+            // V35 Phase L: `SubagentStart` + `SubagentStop` on ONE route, which
+            // dispatches on `hook_event_name` exactly as the notification pair
+            // does. `"matcher": ""` for the documented "all agent types" form —
+            // narrowing on `agent_type` would make a new sub-agent type
+            // silently invisible to the avatar, which is the failure this row
+            // moved off Tier C to escape.
+            if let Some(port) = http_port.filter(|_| subagent_hook) {
+                let entry =
+                    claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_SUBAGENT, None);
+                for event in ["SubagentStart", "SubagentStop"] {
+                    hooks.insert(
+                        event.to_string(),
+                        serde_json::json!([ { "matcher": "", "hooks": [ entry.clone() ] } ]),
+                    );
+                }
             }
             // NC-2 (issue #5): `Notification` + `PermissionDenied` — the
             // PRIMARY "this tab is awaiting a permission decision" detector,
@@ -551,6 +679,9 @@ pub(crate) fn build_pre_args(
                         taint_beacon: native_web == NativeWebVisibility::Sensor
                             && settings.loopback_needed(),
                         checkpoint: settings.workbench.checkpoints && settings.loopback_needed(),
+                        stop: stop_hook,
+                        tool_result: tool_result_hook,
+                        subagent: subagent_hook,
                     },
                 );
                 hooks.insert(

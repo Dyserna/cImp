@@ -201,8 +201,8 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
         "processing/patterns_file.rs",
         "The Claude TUI permission footer (capability `perm.tui_scrape`, Tier D). The regex \
          matcher is the FALLBACK detector behind the `Notification` hook, and it lives with the \
-         PTY screen scraper it runs against. Phase L retires the fallback's primacy, not the \
-         fallback.",
+         PTY screen scraper it runs against. Phase J already retired its primacy; Phase L kept \
+         the fallback, on the same principle every other fallback here follows.",
     ),
     (
         "processing/permission.rs",
@@ -224,6 +224,17 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
          consumer resolves a tool name there. The HARNESS-owned table (OpenCode's own ids) moved \
          to `harness/opencode/tools.rs` in this phase; folding Claude's into it would recreate \
          the two-vocabularies-one-lookup bug both tables exist to prevent.",
+    ),
+    (
+        "graph/index.rs",
+        "A COLLISION, not a dependency — and one worth stating rather than silencing. `\"tool_result\"` \
+         here is cImp's OWN discriminator in the usage-event table (`kind` column: `\"turn\"` vs \
+         `\"tool_result\"`), chosen long before V35 and readable by cImp alone. It became a needle \
+         in V35 Phase L, when `claude.hook.tool_result` declared the Claude payload field of the \
+         same name, so the scan now sees two unrelated uses of one word. Renaming the column would \
+         be a graph migration to fix a test's vocabulary; renaming the Claude field is not cImp's \
+         to do. The exemption is the honest third option — and it is narrow: `graph/index.rs` \
+         reads no harness payload at all.",
     ),
     (
         "graph/memory.rs",
@@ -342,11 +353,22 @@ const CAPABILITY_MODULES: &[&str] = &["crate::graph", "crate::tts", "crate::usag
 /// Harness modules that DO still import upward, with the reason — **a shrinking
 /// list, not an escape hatch**.
 ///
-/// Every entry is a Phase L casualty: these are the Tier-C fallback readers that
-/// pull assistant prose onto the TTS channel, usage events into the graph and a
-/// context window into the usage widget, in-process, because no harness pushed
-/// them. Phase L makes the plugin the source of all three, at which point each
-/// of these files stops needing anything above L2 and its line here is deleted.
+/// Phase K wrote this list expecting Phase L to empty it: "Phase L makes the
+/// plugin the source of all three, at which point each of these files stops
+/// needing anything above L2 and its line here is deleted." **That expectation
+/// was wrong, and the reasons below are the correction.** Phase L moved
+/// assistant text, tool-result sizing and sub-agent lifecycle onto pushes, but
+/// it could not move usage, session identity, the context window or sub-agent
+/// token accounting — no Claude hook payload carries any of them — and it
+/// deliberately did not move OpenCode's half (design D6: a declared fallback
+/// beats a lossy migration). So every reader here still runs, for the
+/// capabilities nothing pushes, on every tab.
+///
+/// What DID change is the entries' meaning: these are no longer "the only path,
+/// pending a migration" but "the arbitrated fallback, plus the capabilities that
+/// have no other path". An entry leaves this list when its file stops importing
+/// upward at all — which for the readers now means an upstream change, not a
+/// cImp phase.
 ///
 /// The test asserts in BOTH directions: a harness module NOT on this list may
 /// not import upward, and a module ON it must still be importing upward — so
@@ -354,33 +376,44 @@ const CAPABILITY_MODULES: &[&str] = &["crate::graph", "crate::tts", "crate::usag
 const UPWARD_EXEMPT: &[(&str, &str)] = &[
     (
         "harness/reader.rs",
-        "Phase L: `OobContext` is the fallback readers' spawn context — it OWNS the TTS sender \
-         and the graph handle it hands them. Retired with the readers.",
+        "`OobContext` is the fallback readers' spawn context — it OWNS the TTS sender and the \
+         graph handle it hands them. V35 Phase L thinned it: the prose→speech composition moved \
+         to `crate::tts::prose` so the push path could share it, leaving this file with the \
+         sender, the graph recorders and the arbitration query. Retires with the readers.",
     ),
     (
         "harness/claude/read.rs",
-        "Phase L: the transcript tail records usage/memory into `graph` and speaks through `tts` \
-         because Claude pushes neither today (design D2's first two rows).",
+        "V35 Phase L arbitrated three of its taps off for a tab that pushes them, and could not \
+         arbitrate the rest: `UsageEvent::Turn` (no hook carries token counts), session identity, \
+         session→commit provenance and sub-agent token accounting all still record into `graph` \
+         from here, and prose still reaches `tts` on every tab that does not serve \
+         `assistant_text`. Retires when upstream grows the payloads, not on a cImp schedule.",
     ),
     (
         "harness/opencode/read.rs",
-        "Phase L: the SSE tap, same story on the other harness.",
+        "The SSE tap, and OpenCode's DECLARED fallback since V35 Phase L (design D6). Its plugin \
+         API can reach assistant text and tool results — the hello now says so, and says why \
+         neither is wired: one would change the segmenter's unit, the other would add a \
+         capability rather than migrate one. Until that changes this file is the whole read path \
+         for OpenCode.",
     ),
     (
         "harness/claude/statusline.rs",
-        "Phase L: the status-line payload IS the usage widget's only data source today \
-         (`POST /session/context` replaces it).",
+        "The status-line payload IS the usage widget's only data source, and V35 Phase L did not \
+         change that: no hook input carries a context window or a rate-limit block, so \
+         `session.context` stays reserved with no producer (`chp::EVENTS`).",
     ),
     (
         "harness/canary.rs",
-        "Phase L (consequential): the L1 canaries assert the four Tier-C readers still produce \
-         SUBSTANTIVE output, so they necessarily speak the capability types those readers return. \
-         They follow the readers.",
+        "The L1 canaries assert the Tier-C readers still produce SUBSTANTIVE output, so they \
+         necessarily speak the capability types those readers return. Since V35 Phase L they are \
+         the FALLBACK's proof — which makes them more load-bearing, not less: a fallback nobody \
+         checks is what makes a primary's failure fatal. They follow the readers.",
     ),
     (
         "harness/probe.rs",
-        "Phase L (consequential): the L2 probe drives the same readers against the installed CLI \
-         — same reason as the canaries.",
+        "The L2 probe drives the same readers against the installed CLI — same reason as the \
+         canaries.",
     ),
     (
         "harness/claude/hook.rs",

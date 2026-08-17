@@ -1,8 +1,10 @@
 mod engine;
 mod phonemize;
+pub mod prose;
 mod voice;
 mod worker;
 
+pub use prose::{speak_prose, ProseSource};
 pub use worker::spawn_tts_worker;
 
 use std::path::PathBuf;

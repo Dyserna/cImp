@@ -349,6 +349,59 @@ pub(crate) fn opencode_plugin_source(
             chp::EV_CHECKPOINT_PRE_MUTATION,
             "Workbench checkpoints are off",
         );
+        // ── V35 Phase L: the read path, and why OpenCode does NOT push it ────
+        //
+        // Milestone locked decision 5 for this phase asked the honest question
+        // first — what does the plugin API actually serve? — and the answer,
+        // read off `@opencode-ai/plugin`'s own `Hooks` interface, is that BOTH
+        // capabilities are reachable. They are declared `cannot` anyway, per
+        // design D6 ("a fallback contained and declared beats a lossy
+        // migration"), and the reasons are recorded here because they are the
+        // conditions under which this decision should be revisited:
+        //
+        //  * **assistant text.** Two routes exist and neither is a clean win.
+        //    `experimental.text.complete` hands over one COMPLETED TEXT PART
+        //    (`{sessionID, messageID, partID}` + `{text}`) — but the SSE reader
+        //    speaks one MESSAGE, joining its text parts, and pushing per part
+        //    would hand the segmenter a different unit at part boundaries. That
+        //    is precisely the cadence flattening locked decision 2 forbids
+        //    (live-verify recipe 10). The other route, widening this plugin's
+        //    existing `event` handler past `message.updated`, reads
+        //    `properties.part.text` / `properties.delta` — the SAME Tier-C JSON
+        //    shapes `harness/opencode/read.rs` already reads, over a different
+        //    transport. It would move no tier and buy no resilience, at the cost
+        //    of re-implementing the reader's part accumulator in generated JS.
+        //    REVISIT when `experimental.text.complete` graduates out of
+        //    `experimental.` **and** a message-completion signal is available
+        //    beside it.
+        //  * **tool results.** `tool.execute.after`'s SECOND parameter carries
+        //    `{title, output, metadata}`; this plugin's handler takes only the
+        //    first, so the result text is one parameter away. But cImp has no
+        //    OpenCode tool-result consumer to feed: OpenCode usage is
+        //    `est_only` from tool-call INPUT args by design, and wiring the
+        //    output would be a new capability rather than a migration of an
+        //    existing one — out of scope for a milestone about the durability
+        //    of what exists. REVISIT with OpenCode usage accounting, not here.
+        //
+        // Both therefore stay on `harness/opencode/read.rs`, which is now that
+        // harness's DECLARED fallback rather than its ambient one — the whole
+        // difference D6 is about.
+        declare(
+            false,
+            chp::EV_ASSISTANT_TEXT,
+            "OpenCode's plugin API delivers assistant text per completed PART \
+             (`experimental.text.complete`) or as the same SSE payload shapes the reader already \
+             consumes (`event`), so pushing it would either change the segmenter's unit or move no \
+             tier — the `/event` SSE reader stays this harness's declared fallback \
+             (`opencode.sse.events`)",
+        );
+        declare(
+            false,
+            chp::EV_SESSION_TOOL_RESULT,
+            "reachable (`tool.execute.after`'s output parameter carries the result text) but \
+             unconsumed: OpenCode usage is estimate-only from tool-call input args, so wiring it \
+             would add a capability rather than migrate one",
+        );
         (
             serde_json::to_string(&serves).unwrap_or_else(|_| "[]".to_string()),
             serde_json::to_string(&cannot).unwrap_or_else(|_| "[]".to_string()),

@@ -735,8 +735,13 @@ tests in `harness/layering.rs` keep it that way:
   appear in production code outside `harness/`. The needle list is *derived from
   the capability registry's* `depends_on`, so declaring a new dependency
   automatically widens what the scan refuses to see elsewhere. Exceptions are an
-  explicit, commented allowlist in that file — four files today, each with the
-  phase that retires it.
+  explicit, commented allowlist in that file — seven files today, each with the
+  phase that retires it, and each re-checked by
+  `every_literal_allowlist_entry_is_still_earning_it` so an entry cannot outlive
+  the literal it was written for. The scan reads each file with its
+  `#[cfg(test)]` items removed, line-ending-blind and brace-matched via
+  `crate::rustsrc` — it used to hand-roll that boundary, and got both halves
+  wrong (see `executable_text`'s docs).
 - `harness_modules_do_not_import_capabilities` — the dependency direction is
   L1 → L2 only. A module under `harness/` may not reach into `graph::`, `tts::`,
   `usage::` or `workbench::`; the Tier-C fallback readers that still do are a

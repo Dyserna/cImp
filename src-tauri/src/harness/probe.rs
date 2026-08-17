@@ -34,9 +34,9 @@
 //!
 //! # What is probed, and what is only enumerated
 //!
-//! [`IMPLEMENTED`] holds the seven rows this phase actually drives — the ones
+//! [`IMPLEMENTED`] holds the eight rows this phase actually drives — the ones
 //! reachable without scripting a model turn. [`DECLARED_UNPROBED`] holds the
-//! other thirteen, each with the reason it cannot be, and they are **printed**
+//! other sixteen, each with the reason it cannot be, and they are **printed**
 //! as `unknown` rather than silently omitted: a dependency that stops being
 //! listed is a dependency that stopped being counted without anyone deciding
 //! to. Neither list is hand-reconciled — `contract.rs`'s

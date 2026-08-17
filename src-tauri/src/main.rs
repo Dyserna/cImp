@@ -22,6 +22,10 @@ mod process_guard;
 mod processing;
 mod procutil;
 mod pty;
+/// Test-only: reading this crate's own source as text, for the three source
+/// scanners that gate on it (see the module docs).
+#[cfg(test)]
+mod rustsrc;
 mod sandbox;
 mod settings;
 mod shell;

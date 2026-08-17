@@ -1,15 +1,26 @@
 //! V35 Phase K — **the layering, as tests** (design § 4.1).
 //!
 //! A layering that exists only in a design document rots. Phase K moved the
-//! harness surface into one directory; these three tests are what stop the next
+//! harness surface into one directory; the three § 4.1 tests here
+//! ([`no_harness_literals_outside_harness`],
+//! [`harness_modules_do_not_import_capabilities`],
+//! [`every_harness_dir_declares_its_capabilities`]) are what stop the next
 //! feature from putting it back. The fourth test named in § 4.1,
 //! `wired_in_paths_exist`, already lives with the registry it checks
 //! ([`crate::harness::contract`]) and is what forced this phase to update every
 //! `wired_in` path in the same commit.
 //!
-//! All three read the source tree, in the repo's existing source-scanning
-//! idiom: `CARGO_MANIFEST_DIR` is `<repo>/src-tauri`, so `src/` is one join
-//! away and no path is hard-coded relative to a working directory.
+//! Three more tests guard the *guards*, because a source scanner that reads the
+//! wrong slice of a file reports on nothing and says `ok` while doing it:
+//! [`the_literal_scan_reads_the_same_code_on_every_platform`],
+//! [`every_literal_allowlist_entry_is_still_earning_it`] and
+//! [`executable_text_ignores_line_endings_and_cuts_at_every_test_item`]. All
+//! three were added after the first two tests shipped a defect each — the story
+//! is on [`executable_text`], and it is worth reading before touching this file.
+//!
+//! The tree-reading tests use the repo's existing source-scanning idiom:
+//! `CARGO_MANIFEST_DIR` is `<repo>/src-tauri`, so `src/` is one join away and no
+//! path is hard-coded relative to a working directory.
 //!
 //! # What "harness-owned" means here
 //!
@@ -63,7 +74,7 @@ fn source_files() -> Vec<(String, String)> {
     out
 }
 
-/// Drop the trailing `#[cfg(test)]` module and every comment line.
+/// Drop every `#[cfg(test)]` item and every comment line.
 ///
 /// **Tests are deliberately out of scope.** A fixture that quotes a harness
 /// payload is a *recorded input*, not a dependency on one — the Phase B canary
@@ -76,14 +87,63 @@ fn source_files() -> Vec<(String, String)> {
 /// Comments go for the same reason: prose naming `rate_limits` is
 /// documentation, and documentation that explains the seam is wanted
 /// everywhere, not confined.
-fn executable_text(text: &str) -> String {
-    let cut = text
-        .match_indices("\n#[cfg(test)]\n")
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    text[..cut]
-        .lines()
+///
+/// # Why this delegates instead of finding a boundary itself
+///
+/// It used to cut at `text.match_indices("\n#[cfg(test)]\n").last()`, and that
+/// was wrong in two independent ways — both of which shipped, and one of which
+/// only ever fired off this developer's machine:
+///
+///  1. **It was line-ending-sensitive.** `\r\n#[cfg(test)]\r\n` does not match,
+///     so a CRLF checkout found no boundary at all and fell back to scanning the
+///     WHOLE file, tests included. Every `.rs` file in this repo is LF *in the
+///     index*, but `core.autocrlf` is on by default on Windows, so the CI
+///     runner's checkout is CRLF while a working copy whose files were rewritten
+///     in place is a mix. The v0.52.0-rc.1 Tests run is the record: byte-identical
+///     content, `no_harness_literals_outside_harness` green on the Linux job and
+///     red on the Windows job with 26 hits across four files, every one inside a
+///     `mod tests`. A verification test whose coverage depends on how Git checked
+///     the file out reports on the checkout, not on the code.
+///  2. **`.last()` is not "the trailing test module".** `#[cfg(test)]` marks
+///     test-only *items*, of which a file may have many: `graph/mcp.rs` has
+///     eleven test modules, so the cut landed at the eleventh and left the first
+///     ten (~1800 lines) inside the scan. Worse in the other direction, a
+///     `#[cfg(test)] mod tests;` **declaration** is the last such item in its
+///     file — so `processing/mod.rs` was cut at line 47 of ~500 and
+///     `harness/mod.rs` at line 99, hiding the production code both tests exist
+///     to read. Silent under-coverage, which is how a canary goes vacuous.
+///
+/// Neither is fixable by a smarter single cut: `offload/mcp.rs` has production
+/// code (`proxy_graph_outcome`) *between* two test modules, so no one boundary
+/// separates test from production text. What is needed is every
+/// `#[cfg(test)]` item's span, brace-matched, with strings and comments blanked
+/// first so a `"#[cfg(test)]"` inside a literal is not mistaken for one — which
+/// is exactly what [`crate::rustsrc`] already did for the spawn ledger, controls
+/// and all. So this normalizes line endings, asks for the spans, and removes
+/// them.
+///
+/// What that deliberately still keeps in scope: `#[cfg(test)]`-gated *helpers*
+/// are removed along with the modules (they are test-only either way), while a
+/// plain `fn` used only by tests but not gated is production text and is
+/// scanned. That is the right side to err on — the gate is the declaration.
+fn executable_text(rel: &str, text: &str) -> String {
+    // FIRST, before any offset is taken: Windows and Linux must scan
+    // byte-identical bytes, so the local run is authoritative for CI.
+    let norm = text.replace('\r', "");
+    let code = crate::rustsrc::code_of(rel, &norm);
+    let mut kept = String::with_capacity(norm.len());
+    let mut at = 0usize;
+    // Sorted by start; a nested `#[cfg(test)]` inside a test module yields a
+    // span already covered, hence the `max`.
+    for (start, end) in crate::rustsrc::test_regions(&code) {
+        let (start, end) = (start.min(norm.len()), end.min(norm.len()));
+        if start > at {
+            kept.push_str(&norm[at..start]);
+        }
+        at = at.max(end);
+    }
+    kept.push_str(&norm[at..]);
+    kept.lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -175,8 +235,14 @@ fn harness_literals() -> BTreeSet<String> {
 /// literal, each with the reason and the phase that retires it.
 ///
 /// This list is the point of the test. Before Phase K the answer was "wherever";
-/// now it is these four files, on purpose, and a fifth needs a line here and a
-/// reviewer.
+/// now it is these seven files, on purpose, and an eighth needs a line here and
+/// a reviewer.
+///
+/// **Checked in both directions**, like [`UPWARD_EXEMPT`] and for the same
+/// reason: [`every_literal_allowlist_entry_is_still_earning_it`] requires each
+/// path to exist and to still contain a needle, so an entry cannot outlive the
+/// literal it was written for and quietly become a blanket exemption for
+/// whatever that file grows into next.
 const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
     (
         "offload/loopback.rs",
@@ -202,21 +268,28 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
         "The Claude TUI permission footer (capability `perm.tui_scrape`, Tier D). The regex \
          matcher is the FALLBACK detector behind the `Notification` hook, and it lives with the \
          PTY screen scraper it runs against. Phase J already retired its primacy; Phase L kept \
-         the fallback, on the same principle every other fallback here follows.",
+         the fallback, on the same principle every other fallback here follows. Its sibling \
+         `processing/permission.rs` used to be listed too — see below.",
     ),
-    (
-        "processing/permission.rs",
-        "The same footer, in the matcher `patterns_file.rs` feeds — one capability row \
-         (`perm.tui_scrape`), two files, same follow-up.",
-    ),
-    (
-        "usage/mod.rs",
-        "cImp's OWN on-disk usage format, which deliberately reuses the upstream spelling \
-         (`five_hour`, `resets_at`, `context_window_size`) so a reader can line the two up. The \
-         thing that PARSES the harness payload moved to `harness/claude/statusline.rs` in this \
-         phase; what is left here is the sink and its serde field names, which cImp owns and a \
-         Claude rename cannot touch.",
-    ),
+    // TWO entries were deleted here once the allowlist gained its own
+    // both-directions check (`every_literal_allowlist_entry_is_still_earning_it`),
+    // and in both cases the reason had been describing code that does not exist:
+    //
+    //  * `processing/permission.rs` was exempted for "the same footer" as
+    //    `patterns_file.rs`. It does not contain it. `Esc to cancel · Tab to amend`
+    //    appears in that file only in its module docs, in `//` comments explaining
+    //    the wrapped/padded variants, and in test fixtures — the production
+    //    matcher is fed patterns from `patterns_file.rs` and quotes no footer of
+    //    its own. One capability row, ONE file.
+    //  * `usage/mod.rs` was exempted for reusing the upstream spelling
+    //    (`five_hour`, `resets_at`, `context_window_size`) in cImp's own on-disk
+    //    format. That description of the code is accurate and still worth knowing
+    //    — but serde field names are IDENTIFIERS, and this scan only ever matched
+    //    quoted literals, so those fields were never hits. What was hitting was
+    //    the JSON in its doc comment and its test fixtures.
+    //
+    // Both files are now inside the scan and clean, which is strictly better than
+    // an exemption: a future Claude-payload read in either one fails the build.
     (
         "offload/toolclass.rs",
         "`MultiEdit` in cImp's routed tool `TABLE`. Deliberate and documented at the row: those \
@@ -253,8 +326,13 @@ const LITERAL_ALLOWLIST: &[(&str, &str)] = &[
 /// a new feature that reads a Claude payload field in `graph/` or `workbench/`
 /// fails the build instead of quietly creating the next Tier-C dependency
 /// nobody wrote down.
-#[test]
-fn no_harness_literals_outside_harness() {
+/// The scan itself, over whatever `(path, text)` pairs it is handed.
+///
+/// Extracted from the test so [`the_literal_scan_reads_the_same_code_on_every_platform`]
+/// can feed it the same tree with the other line ending — the failure this
+/// separation exists to catch was invisible to a test that could only ever see
+/// one checkout.
+fn literal_offenders(files: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
     let needles = harness_literals();
     assert!(
         needles.len() > 30,
@@ -263,14 +341,14 @@ fn no_harness_literals_outside_harness() {
         needles.len()
     );
     let mut offenders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (path, text) in source_files() {
+    for (path, text) in files {
         if path.starts_with("harness/") || path.ends_with("tests.rs") {
             continue;
         }
-        if LITERAL_ALLOWLIST.iter().any(|(p, _)| *p == path) {
+        if LITERAL_ALLOWLIST.iter().any(|(p, _)| p == path) {
             continue;
         }
-        let body = executable_text(&text);
+        let body = executable_text(path, text);
         for n in &needles {
             // The whole literal, not a substring: a log line that mentions
             // `SessionStart` in prose is describing the seam, while `"tool_name"`
@@ -280,10 +358,141 @@ fn no_harness_literals_outside_harness() {
             }
         }
     }
+    offenders
+}
+
+#[test]
+fn no_harness_literals_outside_harness() {
+    let offenders = literal_offenders(&source_files());
     assert!(
         offenders.is_empty(),
         "harness-owned literals outside `harness/` — move the code that reads them into \
          `harness/<id>/`, or add an allowlist entry saying why it cannot move:\n{offenders:#?}"
+    );
+}
+
+/// **The scan's coverage does not depend on the checkout** — the regression test
+/// for the bug that made the v0.52.0-rc.1 Tests run red.
+///
+/// `no_harness_literals_outside_harness` above is only as good as the slice of
+/// each file it looks at, and for one release it looked at a *different* slice
+/// depending on whether Git had written LF or CRLF: green on Linux, red on
+/// Windows, identical bytes. So this asserts the property the scan needs rather
+/// than the result it happens to produce — run the whole thing twice over the
+/// same tree, once with every line ending flipped, and demand the same answer.
+///
+/// It is deliberately not an `assert!(is_empty())` duplicate: an empty-vs-empty
+/// comparison would still pass if a future change made BOTH runs blind, so it
+/// also re-checks that the CRLF pass reads a substantive amount of code. Both
+/// halves are needed — the equality catches divergence, the substantiveness
+/// catches a shared collapse.
+#[test]
+fn the_literal_scan_reads_the_same_code_on_every_platform() {
+    let lf = source_files();
+    let crlf: Vec<(String, String)> = lf
+        .iter()
+        .map(|(p, t)| (p.clone(), t.replace('\n', "\r\n")))
+        .collect();
+    assert_eq!(
+        literal_offenders(&lf),
+        literal_offenders(&crlf),
+        "the literal scan sees different code in a CRLF checkout than in an LF one — the \
+         `#[cfg(test)]` boundary is line-ending-sensitive again, and the test now reports on how \
+         Git checked the tree out rather than on the tree"
+    );
+
+    // …and neither pass may be reading nothing. `tabs/config.rs` is the file the
+    // CRLF bug flooded with false hits, so it is also the honest witness that the
+    // CRLF pass still reaches real production code: `resolve_oob_source` is a
+    // production fn, sits above that file's test module, and is not a needle.
+    let (_, config) = crlf
+        .iter()
+        .find(|(p, _)| p == "tabs/config.rs")
+        .expect("tabs/config.rs is in the tree");
+    let body = executable_text("tabs/config.rs", config);
+    assert!(
+        body.contains("fn resolve_oob_source"),
+        "the CRLF pass lost `tabs/config.rs`'s production code — an equal-and-empty comparison \
+         above would then be two blind runs agreeing"
+    );
+    assert!(
+        !body.contains("\"PostToolUse\""),
+        "the CRLF pass is still scanning `tabs/config.rs`'s test module, where ~70 tests assert \
+         on Claude's hook names — that is the exact CI failure this test pins"
+    );
+}
+
+/// **Every [`LITERAL_ALLOWLIST`] entry still hits** — the other direction.
+///
+/// [`UPWARD_EXEMPT`] has had this check since Phase K and it is what caught a
+/// false exemption the moment `executable_text` stopped reading test text; the
+/// literal allowlist had no equivalent, so nine reasons could have rotted
+/// unobserved. An entry that no longer names any harness literal is not harmless:
+/// it exempts the WHOLE file from the scan, so the next feature that puts a
+/// Claude payload read in `graph/index.rs` inherits a pass.
+#[test]
+fn every_literal_allowlist_entry_is_still_earning_it() {
+    let needles = harness_literals();
+    let files: BTreeMap<String, String> = source_files().into_iter().collect();
+    let mut stale = Vec::new();
+    for (path, _reason) in LITERAL_ALLOWLIST {
+        let Some(text) = files.get(*path) else {
+            stale.push(format!("{path}: no such file under src/ — the code moved or was deleted"));
+            continue;
+        };
+        let body = executable_text(path, text);
+        if !needles.iter().any(|n| body.contains(&format!("\"{n}\""))) {
+            stale.push(format!(
+                "{path}: names no harness literal any more, so its exemption now covers the whole \
+                 file for free — delete the entry"
+            ));
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "LITERAL_ALLOWLIST entries that stopped earning their exemption:\n{stale:#?}"
+    );
+}
+
+/// [`executable_text`]'s own unit controls, on input whose answer is written
+/// down rather than inferred from the tree.
+///
+/// The tree-wide test above proves the property end to end; these name the two
+/// specific defects, so a future regression says which one came back.
+#[test]
+fn executable_text_ignores_line_endings_and_cuts_at_every_test_item() {
+    // Defect 1: the same source, two line endings, one answer.
+    let src = "fn prod() { let a = \"keep\"; }\n#[cfg(test)]\nmod tests {\n    let b = \"drop\";\n}\n";
+    let lf = executable_text("f.rs", src);
+    let crlf = executable_text("f.rs", &src.replace('\n', "\r\n"));
+    assert_eq!(lf, crlf, "line endings must not change what is scanned");
+    assert!(lf.contains("\"keep\""));
+    assert!(!lf.contains("\"drop\""), "the test module must be dropped");
+
+    // Defect 2a: a `#[cfg(test)] mod tests;` DECLARATION ends at its semicolon —
+    // it must not swallow the production code that follows it, which is how
+    // `processing/mod.rs` lost ~500 lines from the scan.
+    let decl = "#[cfg(test)]\nmod tests;\n\nfn prod() { let a = \"keep\"; }\n";
+    let body = executable_text("f.rs", decl);
+    assert!(
+        body.contains("\"keep\""),
+        "a `#[cfg(test)] mod x;` declaration must not truncate the file: {body:?}"
+    );
+
+    // Defect 2b: EVERY test item goes, not just the last one, and production
+    // code between two of them survives — `offload/mcp.rs`'s real shape.
+    let many = "#[cfg(test)]\nmod a { let x = \"drop_a\"; }\nfn mid() { let m = \"keep_mid\"; }\n\
+                #[cfg(test)]\nmod b { let y = \"drop_b\"; }\n";
+    let body = executable_text("f.rs", many);
+    assert!(body.contains("\"keep_mid\""), "code between test modules is production");
+    assert!(!body.contains("\"drop_a\""), "the FIRST test module must go too");
+    assert!(!body.contains("\"drop_b\""));
+
+    // A `#[cfg(test)]` spelt inside a string literal is not a test item.
+    let quoted = "fn prod() { let s = \"#[cfg(test)]\\nmod t {\"; let a = \"keep\"; }\n";
+    assert!(
+        executable_text("f.rs", quoted).contains("\"keep\""),
+        "a quoted `#[cfg(test)]` must not start a region"
     );
 }
 
@@ -389,14 +598,18 @@ const UPWARD_EXEMPT: &[(&str, &str)] = &[
          from here, and prose still reaches `tts` on every tab that does not serve \
          `assistant_text`. Retires when upstream grows the payloads, not on a cImp schedule.",
     ),
-    (
-        "harness/opencode/read.rs",
-        "The SSE tap, and OpenCode's DECLARED fallback since V35 Phase L (design D6). Its plugin \
-         API can reach assistant text and tool results — the hello now says so, and says why \
-         neither is wired: one would change the segmenter's unit, the other would add a \
-         capability rather than migrate one. Until that changes this file is the whole read path \
-         for OpenCode.",
-    ),
+    // `harness/opencode/read.rs` USED to be listed here, and its removal is the
+    // first thing this list's both-directions assertion ever caught. The entry
+    // was never true: that file's production `use` block names no capability
+    // module at all — it reaches TTS and the graph through
+    // `super::super::OobContext`, which is precisely the L1 → L2 direction this
+    // test wants. The only `crate::tts` in it is a `use` inside `mod tests`, and
+    // the old boundary finder (see `executable_text`) was scanning that test
+    // module, so the exemption "still imports upward" check passed on test text.
+    // The capability-coverage claim it carried — that this file is OpenCode's
+    // DECLARED fallback since Phase L (design D6) — was real but belongs where it
+    // is enforced: the hello (`chp::EVENTS`) and the file's own module docs. An
+    // import exemption is only ever about import direction.
     (
         "harness/claude/statusline.rs",
         "The status-line payload IS the usage widget's only data source, and V35 Phase L did not \
@@ -443,7 +656,7 @@ fn harness_modules_do_not_import_capabilities() {
         if !path.starts_with("harness/") || path == "harness/layering.rs" {
             continue;
         }
-        let body = executable_text(&text);
+        let body = executable_text(&path, &text);
         let found: BTreeSet<String> = CAPABILITY_MODULES
             .iter()
             .filter(|m| body.contains(**m))

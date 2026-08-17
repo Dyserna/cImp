@@ -224,8 +224,9 @@ pub(crate) fn opencode_plugin_wanted(s: &Settings, tab: &str) -> bool {
         // V33 Phase F: the pre-mutation checkpoint POST. The FOURTH disjunct the
         // note above warns about — so `spawn_inject_sig`'s opencode `"plugin"`
         // array gained a matching `s.workbench.checkpoints` entry in the same
-        // change, and `the_plugin_predicate_and_the_restart_hint_agree` asserts
-        // the two still add up. Without this line an OpenCode tab with the graph
+        // change, and `tabs::config::tests::
+        // checkpoints_alone_keep_the_opencode_plugin_on_disk_and_move_the_signature`
+        // asserts the two still add up. Without this line an OpenCode tab with the graph
         // off would silently lose its Timeline rewind points.
         || s.workbench.checkpoints
 }

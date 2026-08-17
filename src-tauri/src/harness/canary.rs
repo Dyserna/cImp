@@ -1,4 +1,4 @@
-//! V35 Phase B — L1 canaries for the four Tier-C readers.
+//! V35 Phase B — L1 canaries for the five Tier-C readers.
 //!
 //! # What these assert, and why it is not "does it parse"
 //!
@@ -24,9 +24,10 @@
 //! Phase B shipped this module as `#[cfg(test)]`, which was enough while
 //! `cargo test` was the only consumer. Phase F made the canaries run **in the
 //! shipped binary**, in the background, whenever the installed Claude Code
-//! version changes — so the four positive assertions are now ordinary
+//! version changes — so the five positive assertions are now ordinary
 //! functions returning `Result<(), String>` ([`claude_transcript_usage`],
-//! [`claude_transcript_tool_result`], [`claude_statusline_stdin`],
+//! [`claude_transcript_tool_result`], [`claude_transcript_assistant_text`],
+//! [`claude_statusline_stdin`],
 //! [`opencode_sse_events`], dispatched by [`run_embedded`]), and the `#[test]`s
 //! below are thin wrappers that assert they return `Ok`.
 //!
@@ -39,7 +40,7 @@
 //!
 //! # Fixtures
 //!
-//! `src-tauri/fixtures/harness/<harness>/<version>/<name>`. The four
+//! `src-tauri/fixtures/harness/<harness>/<version>/<name>`. The five
 //! **positive** fixtures are `include_str!`-embedded (a release binary has no
 //! repo tree to load them from — the milestone deploy trap allows exactly this:
 //! "`include_str!` only for the small synthetic fixtures"). Everything else —
@@ -89,9 +90,9 @@ use serde_json::Value;
 
 // ── the embedded corpus (V35 Phase F) ───────────────────────────────────────
 
-/// The four positive fixtures, embedded so the canaries run from a release
+/// The five positive fixtures, embedded so the canaries run from a release
 /// binary. A missing or renamed fixture is a **compile** error, which is the
-/// other half of why these four are embedded rather than path-loaded: the
+/// other half of why these five are embedded rather than path-loaded: the
 /// runtime canary can never degrade to "fixture not found ⇒ skipped".
 const FIXTURE_CLAUDE_USAGE: &str =
     include_str!("../../fixtures/harness/claude/2.1.232/transcript.assistant-usage.jsonl");
@@ -674,7 +675,7 @@ mod tests {
         cap
     }
 
-    // ── the four positive canaries ──────────────────────────────────────────
+    // ── the five positive canaries ──────────────────────────────────────────
     //
     // Each is a WRAPPER over the runtime function the auto-verify calls
     // (V35 Phase F). Re-implementing the assertions here would let `cargo test`
@@ -1067,7 +1068,7 @@ mod tests {
     /// is free.
     ///
     /// Deliberately **not** checked here: that every declared canary also has a
-    /// negative twin. The four Tier-C readers have one, but Phase D's live-probe
+    /// negative twin. The five Tier-C readers have one, but Phase D's live-probe
     /// canaries cover `Behavior` deps where a "renamed field" fixture is
     /// meaningless — recorded rather than assumed, so the omission is a decision
     /// and not an oversight.

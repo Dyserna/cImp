@@ -1,12 +1,12 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** PHASES A–J IMPLEMENTED (A–H 2026-08-16; I, J 2026-08-17:
+**Status:** PHASES A–K IMPLEMENTED (A–H 2026-08-16; I–K 2026-08-17:
 `82c0da2`, `7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`,
-`4e1c519`, `347c938`, `27b6241`, `8fcce94`). The shim layer is deleted;
-Claude's L1 is http hooks straight at loopback. Phases K–M remain.
-GitHub milestone 8: #55–#62 + #63 + #66 + #67 closed; #64 open; #71 open;
-#73 filed. Remaining live-verify recipes: 2 (app leg), 3, 6 (user leg),
-7 (now the key one — proves $VAR header substitution live), 8–10.
+`4e1c519`, `347c938`, `27b6241`, `8fcce94`, `74a5152`). The harness
+surface lives in `harness/` with layering tests; Phases L–M remain.
+GitHub milestone 8: #55–#63 + #66–#68 closed; #64, #71 open; #73, #74
+filed. Remaining live-verify recipes: 2 (app leg), 3, 6 (user leg),
+7 (the key one — proves $VAR header substitution live), 8–10.
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -552,6 +552,38 @@ command hooks (timeout 5s — checkpoint genuinely waits 2s). cargo
   tombstones + legacy routes. Recipe 7 (live) is the proof that `$VAR`
   header substitution reads the child env — the one assumption unit tests
   cannot settle; fallback is a one-line literal-token switch.
+
+**Phase K (`74a5152`, 2026-08-17).** Pure-refactor relocation, one commit:
+`oob/` → `harness/{claude,opencode}/read.rs` + `harness/reader.rs` (spawn
+seam), statusline parsing → `harness/claude/statusline.rs`, both OpenCode
+tool tables → `harness/opencode/tools.rs`, the generators out of
+`tabs/config.rs` (7874 → 6212 lines) into
+`harness/claude/overlay.rs` + `harness/opencode/{plugin,config}.rs`,
+`prose.rs` → `processing/prose.rs` (harness-neutral, load-bearing for L).
+`harness/README.md` + ARCHITECTURE "Adding a harness plugin". Three
+layering tests in `harness/layering.rs`. cargo 2191/0/6, clippy clean,
+ignored 6/6, no TS. Decisions + findings:
+
+- `harness_modules_do_not_import_capabilities` ships with a **declared,
+  self-checking exemption list** (7 entries naming Phase L; the reverse
+  assertion — an exempt file must still import upward — caught and
+  deleted one padding entry immediately).
+- Literal-scan findings, allowlisted with reasons: the two beacon shims
+  (Claude L1 as separate process entry points), `classify_permission_event`
+  (L2 by design), the TUI footer patterns (Tier D row),
+  `usage/mod.rs`'s own serde mirror names, `toolclass`'s routed
+  `"MultiEdit"`. **`graph/memory.rs:754` matches harness tool ids inline —
+  recorded as #74**, a behavior decision, not relocated (recipe 9).
+- `build_opencode_config` moved though absent from design §4's table
+  (leaving OpenCode session config behind would make the split arbitrary).
+- The ~70 `tabs/config.rs` tests did NOT move: they drive the moved code
+  through `build_launch_spec`/`build_ai_tool_spec` (which stay) and share
+  ~30 helpers; splitting was the greater behavior risk. Accepted.
+- `Dep::Flag` needles are excluded from the literal scan (declared in the
+  test): session-selection flags are spawn logic in `tabs/config.rs`, not
+  payload parsing.
+- MAINTENANCE prose still names `oob/` in ~4 places outside the drift
+  table — folded into Phase L's scoped doc edits.
 
 ## Two gaps to fix ahead of the milestone
 

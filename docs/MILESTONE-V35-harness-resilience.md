@@ -1,13 +1,15 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** PHASES A–L IMPLEMENTED (A–H 2026-08-16; I–L 2026-08-17:
+**Status:** ALL PHASES A–M IMPLEMENTED (A–H 2026-08-16; I–M 2026-08-17:
 `82c0da2`, `7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`,
-`4e1c519`, `347c938`, `27b6241`, `8fcce94`, `74a5152`, `e2b9cee`). The
-read path is pushed where upstream payloads allow; Phase M remains.
-GitHub milestone 8: #55–#63 + #66–#69 closed; #64, #71 open; #73, #74
-filed. Remaining live-verify recipes: 2 (app leg), 3, 6 (user leg),
-7 (the key one — proves $VAR header substitution live), 8, 9, 10 (now
-targets block-joining, not cadence — see Phase L record).
+`4e1c519`, `347c938`, `27b6241`, `8fcce94`, `74a5152`, `e2b9cee`,
+`8ca599c`). Final gates: cargo 2217/0/6, clippy clean, vitest 643,
+svelte-check 333/0/0, ignored 6/6. GitHub milestone 8: #55–#63 +
+#66–#70 closed; #54 is the live-verify tracker; #64, #71 open; #73, #74
+filed. **Remaining = live-verify recipes** (user-side, in a fresh tab
+post-deploy): 2 (app leg), 3, 6 (user leg), **7 (the gating one —
+proves `$VAR` header substitution reads the child env)**, 8, 9, 10
+(targets block-joining, not cadence — see Phase L record).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -627,6 +629,33 @@ fallback. cargo 2204/0/6, clippy clean, ignored 6/6 (correction: that is
   plugin-only change.
 - Deploy note: overlay is spawn-baked — a FRESH TAB is required to
   exercise Phase L; old tabs keep the Phase J hook set and their readers.
+
+**Phase M (`8ca599c`, 2026-08-17).** The OpenCode plugin is a real 645-line
+`harness/opencode/templates/plugin.js` (`include_str!` + `harness/render.rs`
+substituting an 18-key set, every value a whole serde literal via
+`json_lit`). Three-way key enforcement (template ⊆ declared, declared ⊆
+used, generator supplies exactly the set); a rendered config with residual
+`{{` fails; at runtime an unknown key is echoed VERBATIM and logged — never
+blanked, because a blanked gate constant is a silently disarmed control.
+**Byte-identity goldens held on all three flag sets, first run** — goldens
+at `fixtures/plugin-goldens/` (deliberately NOT under `fixtures/harness/`,
+which is contracted to recorded upstream payloads), re-blessed only via
+`CIMP_BLESS_PLUGIN_GOLDENS=1`, `.gitattributes` pins `eol=lf`.
+plugin.rs 1084→587 lines. cargo 2217/0/6. Decisions:
+
+- **Spec adjustment to design §5.1:** the Claude overlay is structured
+  `serde_json` (post-J) and STAYS structured — the implemented rule is
+  "text artifact ⇒ template with checked slots; structured artifact ⇒
+  build structurally". §5.1's `claude/templates/settings.json` line does
+  not apply; `plugin/render.rs` landed as `harness/render.rs` (no
+  `plugin/` dir post-K).
+- Placeholders sit in expression position (array-valued slots force it) —
+  the template diffs/highlights as JS, which is the point.
+- The only behavioral delta in the phase: the url/token slots' hand-quoting
+  tightened to serde literals (byte-identical for all real values; a
+  quote-bearing token now escapes instead of closing the literal — tested).
+- Stale post-K pointer fixed in passing (`CONTROL_TOOL_GATE` cited
+  `tabs/config.rs:2205`).
 
 ## Two gaps to fix ahead of the milestone
 

@@ -173,11 +173,11 @@ export interface UsageSettings {
   show_percentage: boolean;
   /// Show the live countdown to reset.
   show_countdown: boolean;
-  /// Show the local reset clock time.
+  /// Show the local reset clock time. The widget ends here: `show_context`
+  /// (NC-3's live context/cache group) was retired on 2026-08-17 along with
+  /// the group itself, and a stale key in an existing settings.json is ignored
+  /// on read — Rust `UsageSettings` sets no `deny_unknown_fields`.
   show_reset_clock: boolean;
-  /// Show the live context-window row (used %, tokens, cache read/creation
-  /// split). Also data-gated: nothing shows until a Claude tab pushes one.
-  show_context: boolean;
   /// Poll cadence for the usage push file, in seconds. Clamped to a sane
   /// minimum in the UI as busy-poll hygiene.
   poll_interval_secs: number;
@@ -1971,7 +1971,6 @@ export function defaultSettings(): Settings {
       show_percentage: true,
       show_countdown: true,
       show_reset_clock: true,
-      show_context: true,
       poll_interval_secs: 60,
     },
     system_stats: {

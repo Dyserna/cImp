@@ -3306,22 +3306,6 @@
             />
             <span>Reset clock (local time)</span>
           </label>
-          <label class="checkbox">
-            <input
-              type="checkbox"
-              checked={snapshot.usage.show_context}
-              disabled={!snapshot.usage.enabled}
-              onchange={(e) =>
-                patch((s) => (s.usage.show_context = (e.currentTarget as HTMLInputElement).checked))}
-            />
-            <span>Context window + cache (live)</span>
-          </label>
-          <small class="hint">
-            The context row shows the running session's context-window usage and
-            the last turn's prompt-cache split, reported by the same status
-            line. It appears only once a Claude tab reports one; anything the
-            report leaves out shows as "—" rather than as zero.
-          </small>
           <label>
             <span>Poll interval (seconds)</span>
             <input

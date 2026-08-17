@@ -7,38 +7,25 @@
   // exists (no Claude tab has pushed a quota reading yet, or the last one
   // expired).
   //
-  // NC-3: the same push also carries the live context-window reading, shown
-  // as a second group (context used% + tokens, and the turn's cache
-  // read/creation split). Historical per-turn cache stats live on the
-  // transcript/graph path (Code Intelligence) — this group is the live
-  // snapshot only.
+  // The widget ends at the reset clock: the live context/cache group that used
+  // to sit to its right (NC-3) was retired, together with its `usage.show_context`
+  // toggle. The push file still carries the `context_window` block and the
+  // terminal status line still renders it — the app widget simply has no
+  // consumer for that half any more, so nothing on the backend push path moved.
   //
   // Data path: each `cimp --statusline` run inside a Claude tab persists the
-  // payload's `rate_limits` (5h/7d quota) and `context_window` block to one
-  // push file; the backend `get_claude_usage` command reads that file — a
-  // local read, no network. We poll it on `usage.poll_interval_secs`; the
-  // countdown ticks locally between polls.
+  // payload's `rate_limits` (5h/7d quota) to one push file; the backend
+  // `get_claude_usage` command reads that file — a local read, no network. We
+  // poll it on `usage.poll_interval_secs`; the countdown ticks locally between
+  // polls.
   //
-  // Absence rule (both groups): every part is independently absent-able —
-  // `rate_limits` exists only for subscription auth after the first API
-  // response, the context block only on a new enough Claude Code, and each
-  // field inside either can be missing. Missing renders as "—" / an empty
+  // Absence rule: every part is independently absent-able — `rate_limits`
+  // exists only for subscription auth after the first API response, and each
+  // field inside it can be missing. Missing renders as "—" / an empty
   // "unknown" track, NEVER as 0%.
   import { settings } from '../settings/store';
   import { getClaudeUsage, type UsageResult, type UsageSnapshot } from '../ipc';
-  import {
-    cacheHitPct,
-    cacheSplitLabel,
-    clampPct,
-    claudePushTabActive,
-    contextAttribution,
-    contextTitle,
-    contextTokensLabel,
-    contextUsedPct,
-    hasContextData,
-    hasQuotaData,
-    humanizeTokens,
-  } from './contextMeter';
+  import { clampPct, claudePushTabActive, hasQuotaData } from './contextMeter';
 
   // Floor on the poll cadence so a hand-edited tiny interval can't busy-poll.
   // The read is a local file, so this is UI hygiene rather than protection of
@@ -55,20 +42,22 @@
   // false under the push path.
   let rateLimited = $state(false);
   // True when every part of `snapshot` is an aging push — the Claude tabs that
-  // produced it closed or went quiet. The two halves are written by different
-  // tabs and age separately, so each also has its own flag (M14).
+  // produced it closed or went quiet. The quota half keeps its own flag
+  // (`quotaStale`): the push file's two halves are written by different tabs
+  // and age separately, so the widget dims on the age of the data it actually
+  // draws, not on the roll-up (M14).
   let stale = $state(false);
   let quotaStale = $state(false);
-  let contextStale = $state(false);
   let now = $state(Date.now());
 
   const usage = $derived($settings.usage);
   // The widget is worth polling for whenever *some* running AI tab can push a
   // status-line reading. That is decided by the tab's command, not its id:
   // `claude-local` and any user-created claude-command tab get the same
-  // statusline injection as the subscription tab (M15). The quota half is
-  // still subscription-only, but it gates itself — API-key auth reports no
-  // `rate_limits`, so those tabs simply push context alone.
+  // statusline injection as the subscription tab (M15). What is *drawn* is
+  // subscription-only and gates itself — API-key auth reports no
+  // `rate_limits`, so such a tab pushes context alone and the widget stays
+  // hidden (it used to show the context group for those; that group is gone).
   const claudePushTabEnabled = $derived(
     claudePushTabActive($settings.tabs, $settings.enabled_ai_tabs),
   );
@@ -88,10 +77,6 @@
   );
   const showCountdown = $derived(usage.show_countdown);
   const showResetClock = $derived(usage.show_reset_clock);
-  // `show_context` is additive with a serde default, so a settings file
-  // written before NC-3 has no such key — treat a missing value as on rather
-  // than as off, otherwise the row silently never appears for existing users.
-  const showContextSetting = $derived(usage.show_context !== false);
 
   // Largest backoff between polls when the endpoint is unavailable (not a 429).
   const MAX_BACKOFF_MS = 5 * 60_000;
@@ -122,7 +107,6 @@
       rateLimited = false;
       stale = false;
       quotaStale = false;
-      contextStale = false;
       return;
     }
     let cancelled = false;
@@ -147,10 +131,10 @@
           snapshot = null;
         }
         stale = result.stale;
-        // Per-section, because the two halves come from different tabs on
-        // different clocks; `stale` is only the whole-widget roll-up.
+        // Per-section, because the push file's halves come from different tabs
+        // on different clocks; `stale` is only the whole-file roll-up, and the
+        // context half of it has no consumer here any more.
         quotaStale = result.quota_stale;
-        contextStale = result.context_stale;
         rateLimited = result.rate_limited;
         if (result.rate_limited) {
           // Back off to 5× the normal cadence, but never retry before the
@@ -220,31 +204,14 @@
     return `${wd} ${time}`;
   }
 
-  // Live context reading + the derived figures the group renders. All the
-  // absence/ratio logic lives in `contextMeter.ts` so it is unit-tested.
-  const ctx = $derived(snapshot?.context ?? null);
-  const showContext = $derived(showContextSetting && hasContextData(ctx));
-  const cacheHit = $derived(cacheHitPct(ctx));
-  // `used_percentage`, or `100 − remaining_percentage` when only that was
-  // reported — the field otherwise has no reader at all.
-  const ctxUsed = $derived(contextUsedPct(ctx));
-  const ctxTokens = $derived(contextTokensLabel(ctx));
-  const cacheSplit = $derived(cacheSplitLabel(ctx));
-  const ctxTitle = $derived(contextTitle(ctx));
-  // Which session these numbers belong to. Visible, not just in the tooltip:
-  // any Claude tab can own the context slot, so a fresh-looking reading may
-  // still be the other tab's (M14).
-  const ctxWho = $derived(contextAttribution(ctx));
-
-  // Quota data can be absent while context data is present (API-key auth
-  // reports no `rate_limits` at all) — then the quota rows are dropped
-  // entirely rather than drawn as a column of placeholders. The rate-limited
-  // half is legacy and can no longer trigger.
+  // Quota data is absent entirely under API-key auth (no `rate_limits` in the
+  // push at all) — the rows are then dropped rather than drawn as a column of
+  // placeholders. The rate-limited half is legacy and can no longer trigger.
   const showQuota = $derived(hasQuotaData(snapshot) || (rateLimited && !snapshot));
 
-  // Show the widget when either group has something to draw. Hidden until a
+  // Show the widget when the quota group has something to draw. Hidden until a
   // Claude tab pushes its first reading, and again once the last push expires.
-  const visible = $derived(showQuota || showContext);
+  const visible = $derived(showQuota);
 
   // The two quota windows in display order. `w` is null while we have no
   // data yet (rate-limited at startup) — cells render "—" placeholders so
@@ -278,8 +245,8 @@
   >
     {#if showQuota}
       <!-- label column: name + duration in their own tracks so (5h)/(7d)
-           line up across the two rows. Dimming is per group, not per widget:
-           the quota half can be aging while the context half is live. -->
+           line up across the two rows. Dimmed on the quota slot's own age
+           (`quotaStale`), not the push file's roll-up. -->
       <div class="ug label" class:dim={quotaStale}>
         {#each windowsList as r}
           <span class="name" title={r.full}>{r.name}</span>
@@ -333,60 +300,6 @@
         </div>
       {/if}
     {/if}
-    {#if showQuota && showContext}
-      <span class="vdiv" aria-hidden="true"></span>
-    {/if}
-    {#if showContext}
-      <!-- NC-3 context group: row 1 = context window, row 2 = the latest
-           turn's prompt-cache split. Same 2-row grid as the quota columns.
-           Dimmed on the context slot's own age, not the widget's. -->
-      <div class="ug label" class:dim={contextStale} title={ctxTitle}>
-        <span class="name">context</span>
-        <span class="dur">({humanizeTokens(ctx?.context_window_size)})</span>
-        <span class="name">cache</span>
-        <span class="dur">(turn)</span>
-      </div>
-      {#if usage.show_bar}
-        <div class="ug" class:dim={contextStale}>
-          <span
-            class="bar"
-            class:unknown={ctxUsed == null}
-            title={ctxUsed == null ? 'not reported' : 'context window in use'}
-          >
-            {#if ctxUsed != null}
-              <span class="fill" style="width: {clampPct(ctxUsed)}%"></span>
-            {/if}
-          </span>
-          <span
-            class="bar"
-            class:unknown={cacheHit == null}
-            title={cacheHit == null
-              ? 'not reported'
-              : 'share of this turn’s input tokens served from cache'}
-          >
-            {#if cacheHit != null}
-              <span class="fill" style="width: {clampPct(cacheHit)}%"></span>
-            {/if}
-          </span>
-        </div>
-      {/if}
-      {#if usage.show_percentage}
-        <div class="ug" class:dim={contextStale}>
-          <span class="pct">{ctxUsed != null ? pct(ctxUsed) + '%' : '—'}</span>
-          <span class="pct">{cacheHit != null ? pct(cacheHit) + '%' : '—'}</span>
-        </div>
-      {/if}
-      <div class="ug" class:dim={contextStale}>
-        <span class="fig">{ctxTokens ?? '—'}</span>
-        <span class="fig">{cacheSplit ?? '—'}</span>
-      </div>
-      {#if ctxWho}
-        <!-- Which session the reading belongs to. Any Claude tab can own the
-             context slot, so this is the only on-screen way to notice that a
-             confident-looking number is the *other* tab's. -->
-        <span class="who" class:dim={contextStale} title={ctxTitle}>{ctxWho}</span>
-      {/if}
-    {/if}
   </div>
 {/if}
 
@@ -405,10 +318,10 @@
     user-select: none;
   }
   /* Aging numbers: dimmed so they read as "may be out of date" without
-     hiding the data. Applied per group (quota / context) rather than to the
-     whole widget, because the two halves are pushed by different Claude tabs
-     and age on their own clocks — dimming both when only one is old was the
-     old, misleading behavior. */
+     hiding the data. Driven by the quota slot's own age rather than the push
+     file's roll-up, because the file's halves are pushed by different Claude
+     tabs and age on their own clocks — dimming on the roll-up was the old,
+     misleading behavior. */
   .dim {
     opacity: 0.55;
   }
@@ -485,19 +398,5 @@
   }
   .clk {
     color: var(--text-secondary);
-  }
-  /* Context/cache token figures ("25k/200k", "read 20k · new 5k"). */
-  .fig {
-    font-variant-numeric: tabular-nums;
-    color: var(--text-primary);
-  }
-  /* Session attribution for the context group — secondary weight: it is an
-     identifier, not a number, and must not compete with the figures. */
-  .who {
-    color: var(--text-secondary);
-    font-style: italic;
-    max-width: 14ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 </style>

@@ -4342,11 +4342,17 @@ pub struct UsageSettings {
     pub show_countdown: bool,
     /// Show the local reset clock time.
     pub show_reset_clock: bool,
-    /// NC-3: show the live context-window row (used %, tokens in the window,
-    /// and the turn's cache read/creation split) alongside the quota windows.
-    /// The row is data-gated too — it only appears once a Claude tab pushes a
-    /// `context_window` block.
-    pub show_context: bool,
+    // `show_context` lived here until 2026-08-17. It gated NC-3's live
+    // context/cache group, which was removed from the widget (the meter now
+    // ends at the reset clock), leaving a toggle with no consumer. An
+    // installed settings file may still carry the key; `Settings` does not set
+    // `deny_unknown_fields`, so it is ignored on read and gone on the next
+    // write. No migration, no schema-version bump — same treatment as
+    // `detection_update_classifier_mode` above.
+    //
+    // Only the widget went: `usage::extract_push`, the `context_window` slot
+    // in the push file, `get_claude_usage`'s wire shape and the terminal
+    // status line all still carry and render the context reading.
     /// How often the frontend re-reads the status-line usage push (a local
     /// file — see `crate::usage`), in seconds. The UI clamps this to a sane
     /// minimum as busy-poll hygiene.
@@ -4361,7 +4367,6 @@ impl Default for UsageSettings {
             show_percentage: true,
             show_countdown: true,
             show_reset_clock: true,
-            show_context: true,
             poll_interval_secs: 60,
         }
     }

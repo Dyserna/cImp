@@ -332,8 +332,9 @@ consumer) has no tab and keeps its project-wide, agent-`None` scope.
 **Context injection** (opt-in, `graph.context_injection`). `graph/context.rs`
 ranks files (symbol/reference/doc hits + session working set) and budget-packs
 outline digests — synchronous, no per-prompt embedding. Claude injects via a
-`UserPromptSubmit` hook (`cimp --context-hook`, `context_hook.rs`) added to the
-`--settings` overlay; OpenCode via a generated dependency-free plugin
+`UserPromptSubmit` hook added to the `--settings` overlay (a `type: "http"`
+entry since V35 Phase J — see the hook table below); OpenCode via a generated
+dependency-free plugin
 (`tabs/config.rs::write_opencode_plugin` → `<project>/.opencode/plugin/cimp-inject.js`,
 baking in the loopback port+token per launch; `.opencode/` is added to
 `.git/info/exclude`). **Never launch OpenCode with `--pure`** — it disables all
@@ -363,31 +364,49 @@ relation** — it's an in-memory `HashMap<session_id, InjectState>` on
 no schema entry; a restart just re-injects fresh on the next turn, which is
 the intended fail-safe.
 
-**Claude hook shims, one shared POST helper.** `context_hook.rs`'s
-`post_loopback(path, body)` (Bearer auth, `Content-Length`, `Connection:
-close`, 2xx-only, ~600 ms timeout) is used by every hook CLI subcommand
-wired in `main.rs`:
+**Claude hooks are `type: "http"` (V35 Phase J).** They used to be five shim
+binaries (`cimp --context-hook` and friends) whose whole job was to carry a
+payload from stdin to the loopback and a reply back to stdout. Claude Code
+2.1.63's http hooks let the harness POST that payload itself and parse the 2xx
+JSON reply exactly as it parses a command hook's stdout, so the shims were
+deleted and their payload mechanics moved into `harness/claude_hook.rs` on the
+receiving end:
 
-| Subcommand | Hook event | Route | Module |
-|---|---|---|---|
-| `cimp --context-hook` | `UserPromptSubmit` | `POST /context/retrieve` | `context_hook.rs` (V10) |
-| `cimp --precompact-hook` | `PreCompact` | `POST /context/compaction` | `compact_hook.rs` (V11 Phase D) |
-| `cimp --read-hook` | `PreToolUse` (matchers `Read`, `Bash`) | `POST /context/should_read` | `read_hook.rs` (V11 Phase E) |
-| `cimp --postedit-hook` | `PostToolUse` (matcher `Edit\|Write\|MultiEdit`) | `POST /context/post_edit` | `postedit_hook.rs` (V12 Phase F) |
-| `cimp --notify-hook` | `Notification` + `PermissionDenied` (both `matcher: ""`) | `POST /permission/event` | `notify_hook.rs` (NC-2) |
+| Hook event | Route | Feeds |
+|---|---|---|
+| `UserPromptSubmit` | `POST /claude/hook/user_prompt_submit` | `/context/retrieve`'s core (V10) |
+| `PreCompact` | `POST /claude/hook/pre_compact` | `/context/compaction`'s core (V11 Phase D) |
+| `PreToolUse` (matchers `Read`, `Bash`) | `POST /claude/hook/pre_tool_use` | `/context/should_read`'s core (V11 Phase E) |
+| `PostToolUse` (matcher `Edit\|Write\|MultiEdit`) | `POST /claude/hook/post_tool_use` | `/context/post_edit`'s core (V12 Phase F) |
+| `Notification` + `PermissionDenied` (both `matcher: ""`) | `POST /claude/hook/notification` | `/permission/event`'s core (NC-2) |
+| `SessionStart` | `POST /claude/hook/session_start` | CHP hello (V35 Phase J) |
 
-All of them are dependency-light, synchronous, and fail open (print nothing,
-exit 0) on any error — a hook must never block or perturb the agent's turn.
+The **legacy `/context/*` routes stay**: a tab open across the upgrade is still
+running an overlay full of command hooks, and the five dispatch flags survive in
+`main.rs` as tombstones that drain stdin and exit 0 so an old overlay is inert
+rather than launching a second cImp GUI. Both transports meet at one shared core
+per capability. Two hooks are still shim binaries — `cimp --taint-beacon` and
+`cimp --checkpoint-beacon` — because the checkpoint one deliberately *waits* for
+its reply and both were built around the undocumented timeout semantics of a
+command hook.
 
-**Every `/context/*` shim carries `--tab <id>`** (#48, finding M-7), baked into
-argv at spawn by `tabs/config.rs` — a Claude hook payload names `session_id`
-and `cwd` and nothing that identifies a cImp tab, and the four `/context/*`
-routes need a tab to resolve the V32 taint latch scope against. Three of those
-routes (`compaction`, `should_read`, `post_edit`) gate on it: under an EXTERNAL
-latch `post_edit` will not run the project's configured checks and
-`should_read` will not return source text, each answering with its own
-fail-safe rather than an error. A shim from an older build sends no `tab`,
-resolves no scope, and is admitted — the same locked fail-open every
+All of them fail open. For an http hook that is the harness's own contract: a
+timeout, a refused connection and any non-2xx are non-blocking, and a 2xx JSON
+body with no directive is a no-op — so every handler answers `200 {}` when it
+has nothing to say. Every emitted entry carries an explicit `timeout: 1`, the
+deleted shims' 600 ms budget rounded up, pinned by a test rather than inherited
+from the harness's 600 s / 30 s defaults. The full wire contract, including the
+`X-CIMP-*` identity headers, is `docs/CHP.md` § 4.5.
+
+**Every hook carries its cImp tab** (#48, finding M-7) — `--tab <id>` in argv for
+the two surviving beacon shims, `X-CIMP-Tab` in the emitted headers for the six
+http hooks. A Claude hook payload names `session_id` and `cwd` and nothing that
+identifies a cImp tab, and the four `/context/*` routes need a tab to resolve the
+V32 taint latch scope against. Three of those routes (`compaction`,
+`should_read`, `post_edit`) gate on it: under an EXTERNAL latch `post_edit` will
+not run the project's configured checks and `should_read` will not return source
+text, each answering with its own fail-safe rather than an error. A caller that
+sends no tab resolves no scope and is admitted — the same locked fail-open every
 tool-serving loopback route takes.
 `tabs/config.rs` adds the `PreCompact` hook to the Claude settings overlay
 whenever `context_injection && compaction_context`, and the `PreToolUse` hook
@@ -397,14 +416,16 @@ can run compaction survival without the read advisor).
 **Permission detection is hook-primary, regex-fallback (NC-2).** The
 `Notification` / `PermissionDenied` pair has no toggle and no schema entry of
 its own; it is injected whenever `Settings::loopback_needed()` holds — i.e.
-whenever the loopback the shim POSTs into actually runs (offload / graph / Code
+whenever the loopback it POSTs into actually runs (offload / graph / Code
 Audit MCP). That gate is load-bearing (H2, 2026-08-05 review): without it a
 default install spawned a `cimp --notify-hook` process per Claude notification
 whose POST had nowhere to land, so the *primary* signal was dead and silent.
-The consequence is deliberate — **a feature-less install runs regex-only
-permission detection** — and the injection carries a `spawn_inject_sig` entry
+Since V35 Phase J the gate is structural as well as deliberate: an http hook
+bakes its URL at spawn, so with no loopback there is nothing to emit. The
+consequence is unchanged — **a feature-less install runs regex-only permission
+detection** — and the injection carries a `spawn_inject_sig` entry
 (`notify_hooks`) so enabling one of those features raises the restart hint.
-`--notify-hook` forwards the payload to `POST /permission/event`, which
+The route forwards the payload to `/permission/event`'s core, which
 classifies it (`notification_type == "permission_prompt"` ⇒ detected; the other
 documented types, `idle_prompt` included, are ignored *without* consulting the
 prose; an absent **or unrecognized** type falls through to permission-flavoured

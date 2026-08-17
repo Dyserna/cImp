@@ -110,7 +110,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::context_hook::{missing_fields, resolve_cwd, tab_arg};
+use crate::harness::claude_hook::{missing_fields, resolve_cwd, tab_arg};
 
 /// The harness vocabulary this shim reports under — the left half of the
 /// `harness:tool_name` source value, and what tells the route which tool table
@@ -248,7 +248,7 @@ pub fn run() {
 /// blocked `Edit` breaks the tab.
 ///
 /// Discovery is root-aware by this process's own cwd, exactly like
-/// `context_hook::post_loopback`: Claude spawns hook shims in the project
+/// its sibling beacon: Claude spawns hook shims in the project
 /// directory, so with several cImp instances off one install the POST reaches
 /// the instance serving ITS project — which for this route is load-bearing
 /// beyond routing, since the wrong instance would checkpoint the wrong repo.

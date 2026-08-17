@@ -59,15 +59,26 @@
 //! line in the *Harness health* panel. The wire contract is `docs/CHP.md`;
 //! handlers stay in `offload/loopback.rs`.
 //!
+//! Phase J adds [`claude_hook`] and deletes five binaries. Claude's L1 was the
+//! odd one out: where OpenCode gets one generated plugin that speaks CHP
+//! directly, Claude got five stateless shim executables that existed only to
+//! carry a payload from stdin to a socket and a reply back to stdout. Claude
+//! Code 2.1.63's `type: "http"` hooks let the harness POST that payload itself,
+//! so the shims are gone and their payload mechanics moved into this module —
+//! on the receiving end of the same wire. Claude now sends a `/session/hello`
+//! too, which is what turns Phase I's staleness detection on for its tabs.
+//!
 //! Design: `docs/MILESTONE-V35-harness-resilience.md` (the why and the locked
 //! decisions), `docs/DESIGN-harness-capability-matrix.md` (the types and the
 //! seed rows), `docs/DESIGN-harness-drift-canaries.md` (the canary layers, § 5
 //! for Phase F's replacement of the noisy tripwire, § 3.2 and § 4.1 for the
-//! capture dir's trust boundary).
+//! capture dir's trust boundary),
+//! `docs/DESIGN-harness-plugin-architecture.md` § 7 step 2 (Phase J).
 
 pub mod canary;
 pub mod capture;
 pub mod chp;
+pub mod claude_hook;
 pub mod contract;
 pub mod health;
 pub mod probe;

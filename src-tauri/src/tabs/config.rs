@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{AppError, AppResult};
+use crate::harness::claude_hook;
 use crate::pty::{resolve_command, PtyLaunchSpec};
 use crate::settings::injection::Consumer as InjConsumer;
 use crate::settings::{AiToolTabConfig, Settings, TabConfig};
@@ -86,7 +87,14 @@ fn build_ai_tool_spec(
     invocation_args: &[String],
 ) -> AppResult<PtyLaunchSpec> {
     let binary = resolve_command(&cfg.command)?;
-    let pre_args = build_pre_args(cfg, settings, tab.as_str());
+    // V35 Phase J: the loopback THIS instance serves, read once and handed to
+    // both the overlay builder (which bakes the port into every `type: "http"`
+    // hook's URL) and the env composer (which puts the bearer token where the
+    // harness will substitute it). `read_own_discovery` is pid-keyed — never the
+    // shared last-writer-wins file a sibling instance may have overwritten —
+    // exactly as `write_opencode_plugin` reads it for the same reason.
+    let endpoint = crate::offload::loopback::read_own_discovery();
+    let pre_args = build_pre_args(cfg, settings, tab.as_str(), endpoint.as_ref());
     let mut extra_args = build_extra_args(cfg, settings, invocation_args);
     let working_dir = ai_working_dir(cfg, launch_cwd);
     // V19: OpenCode reads its guidance from a file referenced in the injected
@@ -104,7 +112,7 @@ fn build_ai_tool_spec(
     // (which the adapter taps). Mutates `extra_args`, so it runs on the real
     // launch path only — the pure `build_extra_args` stays test-stable.
     let oob = resolve_oob_source(cfg, &working_dir, &mut extra_args);
-    let env = compose_ai_env(cfg, settings, tab.as_str());
+    let env = compose_ai_env(cfg, settings, tab.as_str(), endpoint.as_ref());
     let env_remove = ai_env_removals(cfg);
     Ok(PtyLaunchSpec {
         tab,
@@ -554,6 +562,13 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
         // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
         // PreToolUse pre-mutation checkpoint (V33 Phase F), PostToolUse
         // auto-check.
+        //
+        // V35 Phase J's `SessionStart` hello needs **no slot of its own**: it is
+        // emitted whenever any other hook is, and its `serves`/`cannot`
+        // declaration is computed from exactly these booleans plus
+        // `native_web` (carried by `"injection"` below) and
+        // `notify_hooks`/`workbench.checkpoints` (already here). So every input
+        // that can change what the hello says already moves this signature.
         "hooks": [
             s.graph.enabled && (s.graph.context_injection || s.workbench.checkpoints),
             s.graph.enabled && s.graph.context_injection && s.graph.compaction_context,
@@ -653,6 +668,96 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
     [claude, opencode]
 }
 
+/// V35 Phase J: which Claude hooks one tab's `--settings` overlay actually
+/// wired, as the booleans the overlay builder decided from.
+///
+/// Passed to [`claude_hello`] so the tab's CHP declaration is computed from the
+/// same values that decided what to emit — the OpenCode side's discipline
+/// (`opencode_plugin_source` builds `serves`/`cannot` from `OpencodePluginFlags`)
+/// applied to the harness that has no plugin file to bake them into.
+struct ClaudeHookFlags {
+    prompt: bool,
+    compact: bool,
+    read_advisor: bool,
+    post_edit: bool,
+    notify: bool,
+    /// The two surviving COMMAND hooks. They are part of what this overlay
+    /// wired, so they belong in the declaration even though they are not
+    /// `type: "http"` — `serves` describes the tab's L1, not one transport.
+    taint_beacon: bool,
+    checkpoint: bool,
+}
+
+/// The `serves` / `cannot` declaration for one Claude tab — the payload of
+/// `X-CIMP-Hello` on the `SessionStart` entry, and the twin of the generated
+/// OpenCode plugin's hello body.
+///
+/// Every Claude-servable CHP event lands on exactly one side, so an absence
+/// reads as *unavailable, with a reason* rather than as *nobody wrote it down*
+/// (global principle 5). Deliberately **not** derived server-side from live
+/// settings at hello time: `SessionStart` also fires on `resume` / `clear` /
+/// `compact`, potentially long after the spawn, and a declaration recomputed
+/// then would describe settings the running overlay never saw — which is the
+/// exact class of drift `chp` exists to make legible.
+///
+/// `harness_version` is absent for the reason `docs/CHP.md` § 6.2 gives for
+/// OpenCode: no hook-input field carries the CLI version, and baking in the
+/// number cImp last saw would be cImp attesting to itself.
+fn claude_hello(settings: &Settings, flags: ClaudeHookFlags) -> claude_hook::Hello {
+    use crate::harness::chp;
+    let mut hello = claude_hook::Hello::default();
+    // Unconditional: this message is the hello, and every hook emitted below
+    // reports payload drift through the same in-process path.
+    hello.serves.push(chp::EV_HELLO.to_string());
+    hello.serves.push(chp::EV_CONTRACT_DRIFT.to_string());
+    hello.declare(
+        flags.prompt,
+        chp::EV_PROMPT,
+        "context injection and Workbench checkpoints are both off for this tab (the prompt tap \
+         needs the graph plus one of them)",
+    );
+    hello.declare(
+        flags.compact,
+        chp::EV_CONTEXT_COMPACTION,
+        "compaction carry-over is off (needs the graph, `graph.context_injection` and \
+         `graph.compaction_context`)",
+    );
+    hello.declare(
+        flags.read_advisor,
+        chp::EV_CONTEXT_SHOULD_READ,
+        if read_advisor_gate_blocked(settings) {
+            "the read advisor is BLOCKED by the capability matrix — `claude.hook.pretooluse_deny` \
+             is recorded as failed, so a deny's reason would never reach the model"
+        } else {
+            "the read advisor is off for this tab (needs the graph and `graph.read_advisor`)"
+        },
+    );
+    hello.declare(
+        flags.post_edit,
+        chp::EV_CONTEXT_POST_EDIT,
+        "auto-check is off for this tab (needs the graph, `graph.auto_check`, and at least one \
+         configured check)",
+    );
+    hello.declare(
+        flags.notify,
+        chp::EV_PERMISSION_EVENT,
+        "no cImp loopback runs on this install (offload, graph and the Code Audit MCP are all \
+         off), so permission detection is regex-only",
+    );
+    hello.declare(
+        flags.taint_beacon,
+        chp::EV_TAINT_BEACON,
+        "native web visibility is not `sensor` for this tab — in `deny` the overlay's permission \
+         block refuses those tools outright, so there is nothing to observe",
+    );
+    hello.declare(
+        flags.checkpoint,
+        chp::EV_CHECKPOINT_PRE_MUTATION,
+        "Workbench checkpoints are off",
+    );
+    hello
+}
+
 /// Pre-args injected ahead of the tab's own `args` and the wrapper's
 /// invocation args. Claude-only — these injections target Claude Code's CLI
 /// flags; OpenCode gets the equivalents via `OPENCODE_CONFIG_CONTENT` (see
@@ -672,7 +777,24 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
 /// V28: `tab` is the launching tab's id, baked into the `cimp-offload` MCP
 /// child's argv (`--tab <id>`) so the app can resolve which of this agent's
 /// sessions a `context_*` call belongs to.
-fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<String> {
+///
+/// **V35 Phase J: `endpoint` is this instance's loopback.** Five of the hook
+/// entries are now `type: "http"` and carry a baked URL, so the generator needs
+/// the port at spawn time — the same `read_own_discovery()` value
+/// [`write_opencode_plugin`] bakes into the generated plugin, and for the same
+/// reason (pid-keyed, never the shared last-writer-wins file a sibling instance
+/// may have overwritten). `None` ⇒ those five entries are not emitted at all,
+/// stated as a consequence rather than hidden: a command hook could be installed
+/// before the loopback existed and would find it later through discovery, an
+/// http hook cannot. Every one of the five is gated on a setting that implies
+/// `loopback_needed()`, so the loopback is running by the time any tab spawns;
+/// the residual is a tab launched in the window before the listener bound.
+fn build_pre_args(
+    cfg: &AiToolTabConfig,
+    settings: &Settings,
+    tab: &str,
+    endpoint: Option<&crate::offload::loopback::Discovery>,
+) -> Vec<String> {
     if !command_is(&cfg.command, "claude") {
         return Vec::new();
     }
@@ -725,98 +847,106 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
         // one `hooks` object — each entry is installed only when its gate is on.
         {
             let mut hooks = serde_json::Map::new();
+            // ── V35 Phase J: the five `type: "http"` entries ────────────────
+            //
+            // Their gates are unchanged, to the boolean — that is the phase's
+            // whole risk posture — so they are hoisted here and used both to
+            // decide what to emit and to declare it in the hello below. Each is
+            // ANDed with `http_port`: an http hook carries a baked URL, so
+            // without this instance's loopback endpoint there is nothing to
+            // point it at. Every one of these gates implies `loopback_needed()`,
+            // so in practice the endpoint is always there — see `build_pre_args`'
+            // own note on the launch-window residual.
+            let http_port: Option<u16> = endpoint.map(|d| d.port);
+            // V13 Phase C: widened from `context_injection` alone so the
+            // prompt-tap checkpoint trigger (`workbench::on_prompt`, called from
+            // the `/context/retrieve` handler BEFORE its own injection gate)
+            // still runs when the user wants checkpoints but has injection off —
+            // the milestone's Decision 4. The retrieve handler's own *injection*
+            // gate is unaffected; it stays on `context_injection` alone.
+            let prompt_hook =
+                settings.graph.enabled && (settings.graph.context_injection || settings.workbench.checkpoints);
+            // V11 Phase D: carry the working set through a compaction. Kept on
+            // its own narrower condition (still requires injection, unlike the
+            // widened UserPromptSubmit hook) — compaction survival is meaningless
+            // without injection to feed.
+            let compact_hook = settings.graph.enabled
+                && settings.graph.context_injection
+                && settings.graph.compaction_context;
+            // V11 Phase E: the read advisor (opt-in; independent of the injection
+            // toggle, but still needs the graph). V16 Feature 0: a recorded E1
+            // spike FAILURE (the deny reason never reaches the model — every
+            // remind would be a bare refusal) hard-blocks it regardless of the
+            // toggle. V35 Phase E made that block the capability matrix's gate,
+            // asked by id: `contract::gate(CAP_PRETOOLUSE_DENY, ..)` owns the
+            // fail-closed reading of unrecognized hand-typed values, and the SAME
+            // query answers the Settings window over IPC — so the toggle and this
+            // hook can no longer disagree by one of them being re-implemented in
+            // TypeScript. The registry refreshes `harness_versions` from the
+            // physical global file at spawn, so a hand-recorded outcome takes
+            // effect on the next tab launch, not the next app restart.
+            let read_hook = settings.graph.enabled
+                && settings.graph.read_advisor
+                && !read_advisor_gate_blocked(settings);
+            // V17 Phase B: a second matcher intercepts a whole-file shell read
+            // (`cat FILE`) of an already-read file via the SAME route (which
+            // dispatches on `tool_name`).
+            let read_hook_shell = read_hook && settings.graph.read_advisor_shell;
+            // V12 Phase F (6a/6b): auto-check after an edit — opt-in (behavior
+            // hook), needs the graph AND at least one configured check (nothing
+            // to run otherwise).
+            let post_edit_hook =
+                settings.graph.enabled && settings.graph.auto_check && !settings.checks.is_empty();
+            // NC-2 (issue #5): the `Notification` / `PermissionDenied` pair —
+            // the PRIMARY "this tab is awaiting a permission decision" detector,
+            // demoting the TUI-regex matcher (`processing::permission`) to
+            // fallback. See the long note at its emission site for the H2 reason
+            // it is gated on `loopback_needed()` and the accepted tradeoff.
+            let notify_hook = settings.loopback_needed();
             // V32 Phase F: `PreToolUse` now has TWO independent producers (the
             // V11 read advisor and the Phase F web beacon), so its entries
             // accumulate here and are inserted once. Claude Code evaluates every
             // matching entry, so a beacon on `WebFetch|WebSearch` and an advisor
             // on `Read|Bash` never interfere.
             let mut pre_tool_use: Vec<serde_json::Value> = Vec::new();
-            // V13 Phase C: widened from `context_injection` alone so the
-            // prompt-tap checkpoint trigger (`workbench::on_prompt`, called
-            // from the `/context/retrieve` handler BEFORE its own injection
-            // gate) still runs when the user wants checkpoints but has
-            // injection off — the milestone's Decision 4. The retrieve
-            // handler's own *injection* gate is unaffected by this; it stays
-            // on `context_injection` alone.
-            if settings.graph.enabled
-                && (settings.graph.context_injection || settings.workbench.checkpoints)
-            {
-                if let Some(command) = crate::statusline::context_hook_command() {
-                    // V33: `--tab` is baked in for the same reason
-                    // `--taint-beacon`'s is — a `UserPromptSubmit` payload
-                    // carries `session_id` and `cwd` but nothing that names a
-                    // cImp tab, and the checkpoint this hook triggers needs the
-                    // tab id to tell two Claude tabs on one project root apart
-                    // in the Timeline. Purely additive: the shim sends `tab:
-                    // null` without it and the app records a checkpoint with no
-                    // tab, which is exactly the pre-V33 row.
-                    hooks.insert(
-                        "UserPromptSubmit".to_string(),
-                        serde_json::json!([ { "hooks": [
-                            { "type": "command", "command": format!("{command} --tab {tab}"), "timeout": 5 }
-                        ] } ]),
-                    );
-                }
+            if let Some(port) = http_port.filter(|_| prompt_hook) {
+                // V35 Phase J: `type: "http"`. The tab id rides `X-CIMP-Tab`
+                // for the reason `--tab` used to be baked into argv — a
+                // `UserPromptSubmit` payload carries `session_id` and `cwd` but
+                // nothing that names a cImp tab, and the checkpoint this hook
+                // triggers needs the tab id to tell two Claude tabs on one
+                // project root apart in the Timeline.
+                hooks.insert(
+                    "UserPromptSubmit".to_string(),
+                    serde_json::json!([ { "hooks": [
+                        claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_USER_PROMPT_SUBMIT, None)
+                    ] } ]),
+                );
             }
-            // V11 Phase D: PreCompact — carry the working set through a
-            // compaction. Kept on its own narrower condition (still requires
-            // injection, unlike the widened UserPromptSubmit hook above) —
-            // compaction survival is meaningless without injection to feed.
-            if settings.graph.enabled
-                && settings.graph.context_injection
-                && settings.graph.compaction_context
-            {
-                if let Some(command) = crate::statusline::hook_command("--precompact-hook") {
-                    // #48 (M-7): `--tab` for the same reason `--context-hook`'s
-                    // is baked in — the payload names no cImp tab, and
-                    // `/context/compaction`'s taint gate has no scope to
-                    // resolve without one.
-                    hooks.insert(
-                        "PreCompact".to_string(),
-                        serde_json::json!([ { "hooks": [
-                            { "type": "command", "command": format!("{command} --tab {tab}"), "timeout": 5 }
-                        ] } ]),
-                    );
-                }
+            if let Some(port) = http_port.filter(|_| compact_hook) {
+                hooks.insert(
+                    "PreCompact".to_string(),
+                    serde_json::json!([ { "hooks": [
+                        claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_PRE_COMPACT, None)
+                    ] } ]),
+                );
             }
-            // V11 Phase E: PreToolUse read advisor (opt-in; independent of the
-            // injection toggle, but still needs the graph). Matches only `Read`.
-            // V16 Feature 0: a recorded E1 spike FAILURE (the deny reason
-            // never reaches the model — every remind would be a bare
-            // refusal) hard-blocks the read advisor regardless of the
-            // toggle. V35 Phase E made that block the capability matrix's
-            // gate, asked by id: `contract::gate(CAP_PRETOOLUSE_DENY, ..)`
-            // owns the fail-closed reading of unrecognized hand-typed values
-            // that `e1_blocked` used to, and the SAME query now answers the
-            // Settings window over IPC — so the toggle and this hook can no
-            // longer disagree by one of them being re-implemented in
-            // TypeScript. The registry refreshes `harness_versions` from the
-            // physical global file at spawn, so a hand-recorded outcome takes
-            // effect on the next tab launch, not the next app restart.
-            if settings.graph.enabled
-                && settings.graph.read_advisor
-                && !read_advisor_gate_blocked(settings)
-            {
-                if let Some(command) = crate::statusline::hook_command("--read-hook") {
-                    // #48 (M-7): `--tab` baked in, as on every other hook —
-                    // `/context/should_read`'s taint gate needs a scope, and
-                    // BOTH matchers below reach the same route, so it rides the
-                    // shared command string rather than being added twice.
-                    let command = format!("{command} --tab {tab}");
+            if let Some(port) = http_port.filter(|_| read_hook) {
+                // BOTH matchers reach the same route, which dispatches on
+                // `tool_name` — so the entry is built once and cloned rather
+                // than spelled twice.
+                let entry =
+                    claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_PRE_TOOL_USE, None);
+                pre_tool_use.push(serde_json::json!({
+                    "matcher": "Read",
+                    "hooks": [ entry.clone() ]
+                }));
+                // Gated on the sub-toggle, so it's a zero overlay delta when off.
+                if read_hook_shell {
                     pre_tool_use.push(serde_json::json!({
-                        "matcher": "Read",
-                        "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
+                        "matcher": "Bash",
+                        "hooks": [ entry ]
                     }));
-                    // V17 Phase B: a second matcher intercepts a whole-file shell
-                    // read (`cat FILE`) of an already-read file via the SAME
-                    // `--read-hook` shim (which dispatches on `tool_name`). Gated
-                    // on the sub-toggle, so it's a zero overlay delta when off.
-                    if settings.graph.read_advisor_shell {
-                        pre_tool_use.push(serde_json::json!({
-                            "matcher": "Bash",
-                            "hooks": [ { "type": "command", "command": command.clone(), "timeout": 5 } ]
-                        }));
-                    }
                 }
             }
             // V32 Phase F (locked decision 14), `sensor` mode: a report-only
@@ -930,62 +1060,50 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
                     }));
                 }
             }
-            if !pre_tool_use.is_empty() {
+            if let Some(port) = http_port.filter(|_| post_edit_hook) {
+                // This is the hook whose route EXECUTES the project's configured
+                // checks, so it is the one whose taint gate most needs a scope to
+                // resolve — `X-CIMP-Tab` is what gives it one.
                 hooks.insert(
-                    "PreToolUse".to_string(),
-                    serde_json::Value::Array(pre_tool_use),
+                    "PostToolUse".to_string(),
+                    serde_json::json!([ { "matcher": "Edit|Write|MultiEdit", "hooks": [
+                        claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_POST_TOOL_USE, None)
+                    ] } ]),
                 );
-            }
-            // V12 Phase F (6a/6b): PostToolUse auto-check after an edit — opt-in
-            // (behavior hook), needs the graph AND at least one configured check
-            // (nothing to run otherwise). Matches the edit-class tools.
-            if settings.graph.enabled && settings.graph.auto_check && !settings.checks.is_empty() {
-                if let Some(command) = crate::statusline::hook_command("--postedit-hook") {
-                    // #48 (M-7): `--tab` baked in. This is the hook whose route
-                    // EXECUTES the project's configured checks, so it is the
-                    // one whose taint gate most needs a scope to resolve.
-                    hooks.insert(
-                        "PostToolUse".to_string(),
-                        serde_json::json!([ { "matcher": "Edit|Write|MultiEdit", "hooks": [
-                            { "type": "command", "command": format!("{command} --tab {tab}"), "timeout": 5 }
-                        ] } ]),
-                    );
-                }
             }
             // NC-2 (issue #5): `Notification` + `PermissionDenied` — the
             // PRIMARY "this tab is awaiting a permission decision" detector,
             // demoting the TUI-regex matcher (`processing::permission`) to
-            // fallback. Both point at the SAME `--notify-hook` shim, which
-            // dispatches on the payload's `hook_event_name`.
+            // fallback. Both point at the SAME route, which dispatches on the
+            // payload's `hook_event_name` exactly as the one `--notify-hook`
+            // binary did.
             //
             // H2 fix (2026-08-05 review): GATED on `loopback_needed()`. The
-            // shim's ONLY delivery path is `post_loopback` →
-            // `read_discovery_for` (`context_hook.rs`), and the loopback server
+            // shim's ONLY delivery path was the loopback, and the loopback server
             // starts only under that predicate (`main.rs`). Injecting the hooks
             // without it spawned a `cimp --notify-hook` process per Claude
             // notification whose POST had nowhere to land — the primary signal
-            // dead, silently (the shim is silent by design, and the
-            // `contract_drift` report rides the same dead channel). The schema's
-            // invariant — every spawn-time advertisement must be a subset of
-            // `loopback_needed` — now covers hooks, not just `--mcp-config`; the
-            // tripwire is `every_advertised_mcp_server_gets_a_loopback`.
+            // dead, silently. V35 Phase J made the gate structural as well as
+            // deliberate: an http hook has no endpoint to bake without a running
+            // loopback, so `http_port` is `None` and nothing is emitted. The
+            // schema's invariant — every spawn-time advertisement must be a
+            // subset of `loopback_needed` — is unchanged; the tripwire is
+            // `every_advertised_mcp_server_gets_a_loopback`.
             //
             // ACCEPTED TRADEOFF: on a DEFAULT install (offload + graph +
             // code_audit all off) permission detection is regex-only. That is
             // the status quo ante for such installs — the hook never worked
-            // there — and it is strictly better than burning a process spawn per
-            // notification to feed a closed socket. Hook-primary detection
-            // requires one of offload / graph / Code-Audit-MCP to be on. Do NOT
-            // "fix" this by making the loopback always run: keeping it off for
-            // feature-less installs was a deliberate v0.48.0 decision.
+            // there — and it is strictly better than pointing a hook at a closed
+            // socket. Hook-primary detection requires one of offload / graph /
+            // Code-Audit-MCP to be on. Do NOT "fix" this by making the loopback
+            // always run: keeping it off for feature-less installs was a
+            // deliberate v0.48.0 decision.
             //
-            // Because the injection is now Settings-DEPENDENT and baked at spawn,
-            // it carries a `spawn_inject_sig` entry (`"notify_hooks"`) so
-            // toggling one of those features raises the restart hint — a running
-            // tab launched without the hooks would otherwise stay hook-blind
-            // with no indication. The shim itself is fail-open and only spawns
-            // when Claude actually surfaces a notification or the
-            // auto-classifier denies a call — both rare.
+            // Because the injection is Settings-DEPENDENT and baked at spawn, it
+            // carries a `spawn_inject_sig` entry (`"notify_hooks"`) so toggling
+            // one of those features raises the restart hint — a running tab
+            // launched without the hooks would otherwise stay hook-blind with no
+            // indication.
             //
             // `"matcher": ""` on BOTH entries — the docs' explicit "fires on
             // all notification types" form (and, for `PermissionDenied`, all
@@ -999,19 +1117,61 @@ fn build_pre_args(cfg: &AiToolTabConfig, settings: &Settings, tab: &str) -> Vec<
             // support matchers at all, so the empty string is the safe spelling
             // here. Idle/`idle_prompt` notifications are deliberately NOT wired
             // to the `awaiting_question` pipe — see that classifier's doc.
-            if let Some(command) = settings
-                .loopback_needed()
-                .then(|| crate::statusline::hook_command("--notify-hook"))
-                .flatten()
-            {
+            if let Some(port) = http_port.filter(|_| notify_hook) {
+                let entry =
+                    claude_hook::http_hook_entry(port, tab, claude_hook::ROUTE_NOTIFICATION, None);
                 for event in ["Notification", "PermissionDenied"] {
                     hooks.insert(
                         event.to_string(),
-                        serde_json::json!([ { "matcher": "", "hooks": [
-                            { "type": "command", "command": command.clone(), "timeout": 5 }
-                        ] } ]),
+                        serde_json::json!([ { "matcher": "", "hooks": [ entry.clone() ] } ]),
                     );
                 }
+            }
+            // ── V35 Phase J: the CHP hello (design D3, milestone decision 5) ──
+            //
+            // A `SessionStart` hook whose only job is to introduce this tab's
+            // overlay — the version it speaks and what it was actually wired to
+            // serve. It is the Claude analogue of the generated OpenCode plugin's
+            // module-scope hello, and it is what makes Phase I's stale-artifact
+            // detection cover Claude tabs (`chp::expects_chp`).
+            //
+            // Gated on there being any hook at all: an overlay that wired nothing
+            // has nothing to introduce, and on a feature-less install the
+            // loopback is not running to hear it. `serves`/`cannot` are computed
+            // from the SAME booleans that decided what was emitted above, three
+            // lines up, so the declaration cannot claim something the overlay did
+            // not wire.
+            if let Some(port) = http_port.filter(|_| !hooks.is_empty() || !pre_tool_use.is_empty()) {
+                let hello = claude_hello(
+                    settings,
+                    ClaudeHookFlags {
+                        prompt: prompt_hook,
+                        compact: compact_hook,
+                        read_advisor: read_hook,
+                        post_edit: post_edit_hook,
+                        notify: notify_hook,
+                        taint_beacon: native_web == NativeWebVisibility::Sensor
+                            && settings.loopback_needed(),
+                        checkpoint: settings.workbench.checkpoints && settings.loopback_needed(),
+                    },
+                );
+                hooks.insert(
+                    "SessionStart".to_string(),
+                    serde_json::json!([ { "hooks": [
+                        claude_hook::http_hook_entry(
+                            port,
+                            tab,
+                            claude_hook::ROUTE_SESSION_START,
+                            Some(&hello),
+                        )
+                    ] } ]),
+                );
+            }
+            if !pre_tool_use.is_empty() {
+                hooks.insert(
+                    "PreToolUse".to_string(),
+                    serde_json::Value::Array(pre_tool_use),
+                );
             }
             if !hooks.is_empty() {
                 overlay.insert("hooks".to_string(), serde_json::Value::Object(hooks));
@@ -2975,8 +3135,34 @@ fn compose_ai_env(
     cfg: &AiToolTabConfig,
     settings: &Settings,
     tab: &str,
+    endpoint: Option<&crate::offload::loopback::Discovery>,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
+
+    // ── V35 Phase J: the bearer token for Claude's `type: "http"` hooks ──────
+    //
+    // Every emitted hook entry sends `Authorization: Bearer $CIMP_HOOK_TOKEN`
+    // and names that variable in `allowedEnvVars`; the harness substitutes it
+    // from its OWN environment, which is this map. An unlisted or unset name
+    // substitutes to the empty string, so a missing value here is a silent 401
+    // on every hook — which is why it is set unconditionally for a Claude tab
+    // whenever this instance has a loopback at all, rather than being ANDed with
+    // the per-hook gates.
+    //
+    // **Env rather than a literal in the overlay**, which is where the OpenCode
+    // side puts it (`opencode_plugin_source` bakes it into a file). The overlay
+    // is an argv value — `--settings <json>` — and argv is readable by every
+    // process running as this user with no effort at all. That is not a trust
+    // boundary either way (`docs/CHP.md` § 2: the token means *a local process*,
+    // never *cImp's own child*), so this is defence in depth, not containment.
+    //
+    // Not Settings-derived — the token is per app launch — so it needs no
+    // `spawn_inject_sig` entry, same reasoning as `CIMP_TAB_ID` below.
+    if command_is(&cfg.command, "claude") {
+        if let Some(disc) = endpoint {
+            env.insert(claude_hook::TOKEN_ENV.to_string(), disc.token.clone());
+        }
+    }
 
     // V20: Claude Code runs in its native fullscreen (alternate-screen) TUI —
     // cImp no longer sets `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`. The old
@@ -3096,6 +3282,23 @@ mod tests {
         checkpoint: true,
     };
 
+    /// V35 Phase J: the loopback endpoint the overlay bakes into every
+    /// `type: "http"` hook's URL, and whose token `compose_ai_env` puts in the
+    /// child's environment.
+    ///
+    /// A fixture rather than a real `read_own_discovery()` for the reason every
+    /// other input to `build_pre_args` is one: the emitted overlay has to be
+    /// assertable byte for byte, and a test that read the live discovery file
+    /// would pass or fail depending on whether a cImp happened to be running.
+    fn hook_endpoint() -> crate::offload::loopback::Discovery {
+        crate::offload::loopback::Discovery {
+            port: 41999,
+            token: "test-loopback-token".to_string(),
+            pid: 0,
+            root: String::new(),
+        }
+    }
+
     fn claude_cfg() -> AiToolTabConfig {
         match default_claude_tab() {
             TabConfig::AiTool(c) => c,
@@ -3134,7 +3337,7 @@ mod tests {
     fn injects_statusline_overlay_for_claude_when_enabled() {
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let overlay = settings_overlay(&args).expect("statusLine overlay present");
         assert_eq!(overlay["statusLine"]["type"], "command");
@@ -3153,7 +3356,7 @@ mod tests {
     fn no_statusline_overlay_when_disabled() {
         let mut settings = Settings::default();
         settings.statusline.enabled = false;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // With the statusline off and no loopback (H2 gated the NC-2 permission
         // hooks on it), the overlay has nothing to carry and no `--settings`
         // flag is emitted at all.
@@ -3161,24 +3364,37 @@ mod tests {
         // With a loopback running the overlay reappears — carrying the hooks,
         // still no statusLine.
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
         assert!(overlay.get("statusLine").is_none());
         assert!(overlay["hooks"].get("Notification").is_some());
     }
 
+    /// The one hook object inside `hooks[<event>][idx]`, so an assertion names
+    /// the entry it is about rather than a chain of indices.
+    fn hook_entry(overlay: &serde_json::Value, event: &str, idx: usize) -> serde_json::Value {
+        overlay["hooks"][event][idx]["hooks"][0].clone()
+    }
+
+    /// V35 Phase J: the `UserPromptSubmit` hook is `type: "http"` and points at
+    /// this instance's loopback — no `cimp --context-hook` process anywhere.
     #[test]
     fn context_hook_overlay_injected_when_injection_on() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
-        let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-            .as_str()
-            .expect("hook command is a string");
-        assert!(cmd.contains(" --context-hook"), "got: {cmd}");
-        assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+        let entry = hook_entry(&overlay, "UserPromptSubmit", 0);
+        assert_eq!(entry["type"], "http");
+        assert_eq!(
+            entry["url"],
+            "http://127.0.0.1:41999/claude/hook/user_prompt_submit"
+        );
+        assert!(
+            entry.get("command").is_none(),
+            "the shim is gone; nothing may spawn a process: {entry}"
+        );
     }
 
     #[test]
@@ -3187,7 +3403,7 @@ mod tests {
         settings.statusline.enabled = false;
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // Graph on but injection off + statusline off + checkpoints off →
         // no UserPromptSubmit hook (the overlay itself still carries the
         // unconditional NC-2 permission hooks).
@@ -3217,19 +3433,19 @@ mod tests {
         // V32 Phase F's sensor beacon is a second one, turned off so
         // "no PreToolUse hook" keeps meaning "no read advisor".
         settings.set_native_web_mode_for_test(NativeWebVisibility::Off);
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
-        let cmd = overlay["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .expect("hook command is a string");
-        // #48 (M-7) appended ` --tab <id>`; the flag itself is pinned by
-        // `every_context_hook_carries_the_tab_its_route_gates_on`.
-        assert!(cmd.contains(" --read-hook "), "got: {cmd}");
+        let entry = hook_entry(&overlay, "PreToolUse", 0);
+        assert_eq!(entry["type"], "http");
+        assert_eq!(
+            entry["url"],
+            "http://127.0.0.1:41999/claude/hook/pre_tool_use"
+        );
         assert_eq!(overlay["hooks"]["PreToolUse"][0]["matcher"], "Read");
 
         // E1 recorded as failed ⇒ no PreToolUse hook even with the toggle on.
         settings.harness_versions.e1_status = "fail".to_string();
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args);
         assert!(
             overlay.is_none_or(|o| o["hooks"].get("PreToolUse").is_none()),
@@ -3239,14 +3455,14 @@ mod tests {
         // Unverified (the default) does NOT block — Feature 0's posture is
         // opt-in-until-proven-broken, not blocked-until-proven-working.
         settings.harness_versions.e1_status = "unverified".to_string();
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
 
         // The statuses are hand-editable strings; anything unrecognized
         // fails CLOSED (a typo'd failure record must not install the hook).
         for status in ["Fail", " fail ", "failed", "faill"] {
             settings.harness_versions.e1_status = status.to_string();
-            let args = build_pre_args(&claude_cfg(), &settings, "claude");
+            let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
             let overlay = settings_overlay(&args);
             assert!(
                 overlay.is_none_or(|o| o["hooks"].get("PreToolUse").is_none()),
@@ -3255,7 +3471,7 @@ mod tests {
         }
         // Recognized non-fail spellings still pass, case-folded.
         settings.harness_versions.e1_status = "Pass".to_string();
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(settings_overlay(&args).is_some_and(|o| o["hooks"]["PreToolUse"].is_array()));
     }
 
@@ -3274,7 +3490,7 @@ mod tests {
             settings.graph.read_advisor = read_advisor;
             settings.graph.read_advisor_shell = shell;
             settings.harness_versions.e1_status = e1.to_string();
-            let args = build_pre_args(&claude_cfg(), &settings, "claude");
+            let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
             settings_overlay(&args)
                 .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
                 .is_some_and(|arr| arr.iter().any(|e| e["matcher"] == matcher))
@@ -3311,27 +3527,29 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.context_injection = false;
         settings.workbench.checkpoints = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
-        let cmd = overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-            .as_str()
-            .expect("hook command is a string");
-        assert!(cmd.contains(" --context-hook"), "got: {cmd}");
+        assert_eq!(
+            hook_entry(&overlay, "UserPromptSubmit", 0)["url"],
+            "http://127.0.0.1:41999/claude/hook/user_prompt_submit"
+        );
         // PreCompact stays off — it's still gated on context_injection alone.
         assert!(overlay["hooks"].get("PreCompact").is_none());
     }
 
-    /// V33: the `UserPromptSubmit` shim carries the cImp TAB it serves, so the
+    /// V33: the `UserPromptSubmit` hook carries the cImp TAB it serves, so the
     /// prompt-tap checkpoint it fires can be attributed to one tab rather than
     /// to "some Claude tab on this root".
     ///
-    /// The hook PAYLOAD carries no tab identity, so argv is the only channel —
-    /// the same conclusion `--taint-beacon` and the per-tab MCP children
-    /// reached, pinned by `the_code_audit_child_carries_its_own_tab_id`.
+    /// The hook PAYLOAD carries no tab identity, so the emitted entry is the
+    /// only channel — the same conclusion `--taint-beacon` and the per-tab MCP
+    /// children reached. **V35 Phase J moved it from argv (` --tab <id>`) to the
+    /// `X-CIMP-Tab` header**, because an http hook has no argv; the fact it
+    /// encodes is identical.
     ///
     /// **What it would still pass with:** a build that emitted a constant tab
     /// id for every tab — hence the loop over two different ids and the
-    /// assertion that the emitted commands DIFFER, which is the property the
+    /// assertion that the emitted entries DIFFER, which is the property the
     /// whole step exists for.
     #[test]
     fn the_context_hook_carries_its_own_tab_id() {
@@ -3339,23 +3557,20 @@ mod tests {
         settings.statusline.enabled = false;
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
-        let hook_command = |tab: &str| {
-            let args = build_pre_args(&claude_cfg(), &settings, tab);
+        let entry = |tab: &str| {
+            let args = build_pre_args(&claude_cfg(), &settings, tab, Some(&hook_endpoint()));
             let overlay = settings_overlay(&args).expect("overlay present");
-            overlay["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-                .as_str()
-                .expect("hook command is a string")
-                .to_string()
+            hook_entry(&overlay, "UserPromptSubmit", 0)
         };
         for tab in ["claude", "claude-local"] {
-            let cmd = hook_command(tab);
-            assert!(cmd.contains(" --context-hook "), "got: {cmd}");
-            assert!(cmd.ends_with(&format!(" --tab {tab}")), "got: {cmd}");
+            let e = entry(tab);
+            assert_eq!(e["headers"]["X-CIMP-Tab"], tab, "got: {e}");
+            assert_eq!(e["headers"]["X-CIMP-Agent"], "claude", "got: {e}");
         }
         assert_ne!(
-            hook_command("claude"),
-            hook_command("claude-local"),
-            "two tabs must not spawn an identical hook command"
+            entry("claude"),
+            entry("claude-local"),
+            "two tabs must not post an identical hook entry"
         );
     }
 
@@ -3369,7 +3584,7 @@ mod tests {
         settings.statusline.enabled = false;
         settings.graph.enabled = false;
         settings.workbench.checkpoints = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // Graph off ⇒ no loopback either, so the overlay is empty and omitted
         // entirely (H2). Assert through the option so the test keeps meaning
         // "no UserPromptSubmit hook" in both shapes.
@@ -3392,32 +3607,36 @@ mod tests {
             cmd: "cargo check".to_string(),
             ..Default::default()
         }];
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let overlay = settings_overlay(&args).expect("overlay present");
-        let hook = &overlay["hooks"]["PostToolUse"][0];
-        assert_eq!(hook["matcher"], "Edit|Write|MultiEdit");
-        let cmd = hook["hooks"][0]["command"]
-            .as_str()
-            .expect("hook command is a string");
-        // #48 (M-7) appended ` --tab <id>`; the flag itself is pinned by
-        // `every_context_hook_carries_the_tab_its_route_gates_on`.
-        assert!(cmd.contains(" --postedit-hook "), "got: {cmd}");
+        assert_eq!(overlay["hooks"]["PostToolUse"][0]["matcher"], "Edit|Write|MultiEdit");
+        assert_eq!(
+            hook_entry(&overlay, "PostToolUse", 0)["url"],
+            "http://127.0.0.1:41999/claude/hook/post_tool_use"
+        );
     }
 
-    /// #48 (M-7): **every** shim whose loopback route now resolves a taint
-    /// scope carries the cImp TAB it serves in argv.
+    /// #48 (M-7): **every** hook whose loopback route resolves a taint scope
+    /// carries the cImp TAB it serves.
     ///
     /// `--context-hook` already did (V33). `--precompact-hook`, `--read-hook`
     /// and `--postedit-hook` did not, which is why `/context/compaction`,
     /// `/context/should_read` and `/context/post_edit` had no identity to gate
     /// against — the second half of the finding. A hook payload names no cImp
-    /// tab (the E2 spike), so argv is the only channel.
+    /// tab (the E2 spike), so the emitted entry is the only channel.
+    ///
+    /// **V35 Phase J: the channel is `X-CIMP-Tab`, not ` --tab <id>`.** Four of
+    /// the routes below are now the app's own; the identity they carry, and the
+    /// gate that consumes it, are unchanged. The token and the CHP version ride
+    /// the same headers and are asserted here too, because a hook that reaches
+    /// the loopback without the token is a silent 401 on every call — the exact
+    /// class of failure this test exists to make loud.
     ///
     /// **What this would still pass with:** a build that baked one constant id
-    /// into every tab's commands — hence the two ids and the inequality
+    /// into every tab's entries — hence the two ids and the inequality
     /// assertion, the same guard `the_context_hook_carries_its_own_tab_id` uses.
-    /// And a build that baked the flag into only SOME of the four hooks —
-    /// hence all four in one loop rather than one assertion per test.
+    /// And a build that wired only SOME of the four routes — hence all four in
+    /// one loop rather than one assertion per test.
     #[test]
     fn every_context_hook_carries_the_tab_its_route_gates_on() {
         let mut settings = Settings::default();
@@ -3437,11 +3656,11 @@ mod tests {
         // the read advisor's two matchers and nothing else.
         settings.set_native_web_mode_for_test(NativeWebVisibility::Off);
 
-        // Every hook command the overlay installs, flattened across events and
+        // Every hook object the overlay installs, flattened across events and
         // matchers — so a hook that stops being installed at all fails the
-        // count below rather than silently passing the loop.
-        let commands = |tab: &str| -> Vec<String> {
-            let args = build_pre_args(&claude_cfg(), &settings, tab);
+        // lookup below rather than silently passing the loop.
+        let entries = |tab: &str| -> Vec<serde_json::Value> {
+            let args = build_pre_args(&claude_cfg(), &settings, tab, Some(&hook_endpoint()));
             let overlay = settings_overlay(&args).expect("overlay present");
             let hooks = overlay["hooks"].clone();
             let mut out = Vec::new();
@@ -3451,10 +3670,9 @@ mod tests {
                 "PreToolUse",
                 "PostToolUse",
             ] {
-                let entries = hooks[event].as_array().cloned().unwrap_or_default();
-                for entry in entries {
+                for entry in hooks[event].as_array().cloned().unwrap_or_default() {
                     for h in entry["hooks"].as_array().cloned().unwrap_or_default() {
-                        out.push(h["command"].as_str().unwrap_or_default().to_string());
+                        out.push(h);
                     }
                 }
             }
@@ -3462,33 +3680,40 @@ mod tests {
         };
 
         for tab in ["claude", "claude-local"] {
-            let cmds = commands(tab);
-            for shim in [
-                "--context-hook",
-                "--precompact-hook",
-                "--read-hook",
-                "--postedit-hook",
+            let all = entries(tab);
+            for route in [
+                claude_hook::ROUTE_USER_PROMPT_SUBMIT,
+                claude_hook::ROUTE_PRE_COMPACT,
+                claude_hook::ROUTE_PRE_TOOL_USE,
+                claude_hook::ROUTE_POST_TOOL_USE,
             ] {
-                // Matched WITHOUT a trailing space, so a command that has lost
-                // its `--tab` suffix is still found and fails on the assertion
-                // that names the real problem rather than on "not installed".
-                let hits: Vec<&String> = cmds
+                let hits: Vec<&serde_json::Value> = all
                     .iter()
-                    .filter(|c| c.contains(&format!(" {shim}")))
+                    .filter(|h| h["url"].as_str().is_some_and(|u| u.ends_with(route)))
                     .collect();
-                assert!(!hits.is_empty(), "{shim} is not installed at all: {cmds:?}");
-                for cmd in hits {
-                    assert!(
-                        cmd.ends_with(&format!(" --tab {tab}")),
-                        "{shim} must carry its tab, got: {cmd}"
+                assert!(!hits.is_empty(), "{route} is not installed at all: {all:?}");
+                for h in hits {
+                    assert_eq!(h["headers"]["X-CIMP-Tab"], tab, "{route} must carry its tab");
+                    assert_eq!(
+                        h["headers"]["Authorization"], "Bearer $CIMP_HOOK_TOKEN",
+                        "{route} must carry the token or every call is a silent 401"
+                    );
+                    assert_eq!(
+                        h["allowedEnvVars"],
+                        serde_json::json!(["CIMP_HOOK_TOKEN"]),
+                        "{route}: an env var not listed here substitutes to the empty string"
+                    );
+                    assert_eq!(
+                        h["headers"]["X-CIMP-Chp"],
+                        crate::harness::chp::CHP_VERSION.to_string()
                     );
                 }
             }
         }
         assert_ne!(
-            commands("claude"),
-            commands("claude-local"),
-            "two tabs must not spawn identical hook commands"
+            entries("claude"),
+            entries("claude-local"),
+            "two tabs must not post identical hook entries"
         );
     }
 
@@ -3499,7 +3724,7 @@ mod tests {
         settings.graph.enabled = true;
         settings.graph.auto_check = false;
         settings.checks = vec![crate::checks::CheckDef::default()];
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // auto_check off → no PostToolUse hook (nothing else is on either, so
         // the overlay carries only the unconditional NC-2 permission hooks).
         let overlay = settings_overlay(&args).expect("overlay present");
@@ -3510,7 +3735,7 @@ mod tests {
         settings2.graph.enabled = true;
         settings2.graph.auto_check = true;
         settings2.checks = Vec::new();
-        let args2 = build_pre_args(&claude_cfg(), &settings2, "claude");
+        let args2 = build_pre_args(&claude_cfg(), &settings2, "claude", Some(&hook_endpoint()));
         let overlay2 = settings_overlay(&args2).expect("overlay present");
         assert!(overlay2["hooks"].get("PostToolUse").is_none());
     }
@@ -3519,7 +3744,7 @@ mod tests {
     /// `PermissionDenied` hooks are injected for a Claude tab exactly when the
     /// loopback they POST into runs — from the barest settings that flip
     /// `loopback_needed()` and nothing else. Both point at the one
-    /// `--notify-hook` shim with the documented match-everything
+    /// notification route with the documented match-everything
     /// `"matcher": ""` (a narrowing matcher filters on notification TYPE; we
     /// classify app-side so a renamed type degrades to "ignored", not silence).
     #[test]
@@ -3534,7 +3759,7 @@ mod tests {
         settings.graph.read_advisor = false;
         settings.graph.auto_check = false;
         assert!(settings.loopback_needed());
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // The Claude Code `--settings` contract: ONE flag, one merged overlay —
         // the hooks must ride the same object as everything else, never a
         // second flag (Claude does not concatenate repeated `--settings`).
@@ -3546,16 +3771,16 @@ mod tests {
                 entry["matcher"], "",
                 "{event} must match every type/tool: {entry}"
             );
-            let cmd = entry["hooks"][0]["command"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{event} hook command is a string"));
-            assert!(cmd.ends_with(" --notify-hook"), "got: {cmd}");
-            assert!(!cmd.contains('\\'), "path must be forward-slashed: {cmd}");
+            assert_eq!(
+                entry["hooks"][0]["url"],
+                "http://127.0.0.1:41999/claude/hook/notification",
+                "both events reach the ONE route that dispatches on hook_event_name"
+            );
         }
 
         // Non-Claude tabs get no pre-args at all (OpenCode is configured via
         // OPENCODE_CONFIG_CONTENT), so nothing leaks there.
-        assert!(build_pre_args(&opencode_cfg(), &settings, "opencode").is_empty());
+        assert!(build_pre_args(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint())).is_empty());
     }
 
     /// H2: on a DEFAULT install nothing dials back into the app, so the hooks
@@ -3565,7 +3790,7 @@ mod tests {
     fn no_permission_hooks_when_the_loopback_does_not_run() {
         let settings = Settings::default(); // offload + graph + audit all off
         assert!(!settings.loopback_needed());
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // Statusline defaults on, so the overlay exists — it just must carry no
         // hooks at all (and if a future default drops the statusline too, the
         // absent overlay satisfies the same claim).
@@ -3714,7 +3939,7 @@ mod tests {
         settings.statusline.enabled = true;
         settings.graph.enabled = true;
         settings.graph.context_injection = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         // Exactly one `--settings` flag carrying both keys.
         assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
         let overlay = settings_overlay(&args).expect("overlay present");
@@ -3765,7 +3990,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let i = args
             .iter()
             .position(|a| a == "--settings")
@@ -3784,6 +4009,8 @@ mod tests {
             // NC-2 — unconditional, so present in every overlay.
             "Notification",
             "PermissionDenied",
+            // V35 Phase J: Claude's CHP hello.
+            "SessionStart",
         ] {
             assert!(hooks.contains_key(k), "expected hook {k} in {overlay}");
         }
@@ -3837,6 +4064,248 @@ mod tests {
             "overlay is {} bytes, ceiling is {MAX_OVERLAY_BYTES}",
             raw.len(),
         );
+    }
+
+    // ── V35 Phase J: the emitted `type: "http"` overlay ─────────────────────
+
+    /// The maxed-out overlay, with every gate on — the shape a live spawn
+    /// produces. Returns `(hooks, every http hook object in it)`.
+    fn maxed_overlay() -> (serde_json::Value, Vec<serde_json::Value>) {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = true;
+        settings.workbench.checkpoints = true;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        settings.graph.compaction_context = true;
+        settings.graph.read_advisor = true;
+        settings.graph.read_advisor_shell = true;
+        settings.graph.auto_check = true;
+        settings.checks = vec![crate::checks::CheckDef {
+            name: "cargo".to_string(),
+            cmd: "cargo check".to_string(),
+            ..Default::default()
+        }];
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let hooks = overlay["hooks"].clone();
+        let mut http = Vec::new();
+        for (_event, entries) in hooks.as_object().expect("hooks object") {
+            for entry in entries.as_array().cloned().unwrap_or_default() {
+                for h in entry["hooks"].as_array().cloned().unwrap_or_default() {
+                    if h["type"] == "http" {
+                        http.push(h);
+                    }
+                }
+            }
+        }
+        (hooks, http)
+    }
+
+    /// **Every emitted http hook carries an explicit, pinned `timeout`.**
+    ///
+    /// Design § 5.2: the five shims budgeted 600 ms for their loopback round
+    /// trip *"so a slow/cold index never delays the prompt"*, and with the shim
+    /// gone that budget is the whole of it rather than a ceiling over a process
+    /// that gave up first. The harness defaults are 600 s (most events), 30 s
+    /// (`UserPromptSubmit`) and 10 s (`MessageDisplay`) — inheriting any of them
+    /// turns a wedged handler into a wedged turn, and the old value survived
+    /// only as a comment. This is the test that makes a hand edit or a template
+    /// drift fail the build.
+    #[test]
+    fn every_emitted_http_hook_pins_the_one_second_budget() {
+        let (hooks, http) = maxed_overlay();
+        assert_eq!(
+            http.len(),
+            8,
+            "the five converted hooks — the read advisor is TWO entries (Read + Bash) \
+             on one route and Notification/PermissionDenied are two more on one route \
+             — plus SessionStart: {hooks}"
+        );
+        for h in &http {
+            assert_eq!(
+                h["timeout"],
+                serde_json::json!(claude_hook::TIMEOUT_SECS),
+                "an http hook without the pinned budget: {h}"
+            );
+            assert!(
+                h["timeout"].is_u64(),
+                "the timeout must be an integer number of seconds: {h}"
+            );
+            assert_eq!(h["allowedEnvVars"], serde_json::json!(["CIMP_HOOK_TOKEN"]));
+            assert_eq!(h["headers"]["Authorization"], "Bearer $CIMP_HOOK_TOKEN");
+            assert!(
+                h["url"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("http://127.0.0.1:41999/claude/hook/")),
+                "an http hook must point at THIS instance's loopback: {h}"
+            );
+        }
+        // The two beacons stay COMMAND hooks with their own 5 s ceiling — a
+        // deliberate divergence (`checkpoint_beacon` waits 2 s for its reply),
+        // and one this test must not quietly flatten.
+        let commands: Vec<serde_json::Value> = hooks["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse")
+            .iter()
+            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+            .filter(|h| h["type"] == "command")
+            .collect();
+        assert_eq!(commands.len(), 2, "the taint and checkpoint beacons");
+        for c in commands {
+            assert_eq!(c["timeout"], 5, "the beacons keep their own ceiling: {c}");
+        }
+    }
+
+    /// **`terminalSequence` is never emitted**, by the overlay or by any handler
+    /// that answers one of these routes.
+    ///
+    /// It is a hook-output field that writes escape sequences straight into the
+    /// PTY cImp renders (design § 5.2). It is not a CHP capability and cImp has
+    /// no use for it; a test is cheaper than a convention nobody remembers.
+    #[test]
+    fn no_emitted_hook_or_handler_ever_produces_a_terminal_sequence() {
+        let (hooks, _) = maxed_overlay();
+        assert!(
+            !hooks.to_string().contains("terminalSequence"),
+            "the overlay must never mention it: {hooks}"
+        );
+        for (file, src) in [
+            ("harness/claude_hook.rs", include_str!("../harness/claude_hook.rs")),
+            ("offload/loopback.rs", include_str!("../offload/loopback.rs")),
+        ] {
+            // The needle is the JSON KEY form, so the prose and the assertions
+            // that name the field (including this one) are not false positives —
+            // what is forbidden is writing it into an emitted object.
+            assert!(
+                !src.contains("\"terminalSequence\":"),
+                "{file} emits `terminalSequence`, which writes escape sequences \
+                 into the terminal cImp renders"
+            );
+        }
+    }
+
+    /// **Claude's CHP hello**: the `SessionStart` entry carries a declaration
+    /// computed from the very booleans that decided what to emit, and every
+    /// Claude-servable event lands on exactly one side of it.
+    #[test]
+    fn the_session_start_hello_declares_what_the_overlay_actually_wired() {
+        use crate::harness::chp;
+        let (hooks, _) = maxed_overlay();
+        let raw = hooks["SessionStart"][0]["hooks"][0]["headers"]["X-CIMP-Hello"]
+            .as_str()
+            .expect("the hello header");
+        let hello = claude_hook::Hello::parse(raw).expect("a parseable declaration");
+        // Everything on: nothing may be in `cannot`.
+        assert!(hello.cannot.is_empty(), "got {:?}", hello.cannot);
+        for id in [
+            chp::EV_HELLO,
+            chp::EV_PROMPT,
+            chp::EV_CONTEXT_COMPACTION,
+            chp::EV_CONTEXT_SHOULD_READ,
+            chp::EV_CONTEXT_POST_EDIT,
+            chp::EV_PERMISSION_EVENT,
+            chp::EV_CHECKPOINT_PRE_MUTATION,
+            chp::EV_CONTRACT_DRIFT,
+        ] {
+            assert!(hello.serves.contains(&id.to_string()), "missing {id}");
+        }
+        // …and the one thing a maxed overlay still cannot serve, because the
+        // native-web mode defaults to `sensor` only when it is set to it.
+        let mut off = Settings::default();
+        off.statusline.enabled = false;
+        off.graph.enabled = true;
+        off.set_native_web_mode_for_test(NativeWebVisibility::Off);
+        let args = build_pre_args(&claude_cfg(), &off, "claude", Some(&hook_endpoint()));
+        let overlay = settings_overlay(&args).expect("overlay present");
+        let hello = claude_hook::Hello::parse(
+            overlay["hooks"]["SessionStart"][0]["hooks"][0]["headers"]["X-CIMP-Hello"]
+                .as_str()
+                .expect("the hello header"),
+        )
+        .expect("a parseable declaration");
+        for id in [
+            chp::EV_PROMPT,
+            chp::EV_CONTEXT_COMPACTION,
+            chp::EV_CONTEXT_SHOULD_READ,
+            chp::EV_CONTEXT_POST_EDIT,
+            chp::EV_TAINT_BEACON,
+            chp::EV_CHECKPOINT_PRE_MUTATION,
+        ] {
+            let entry = hello.cannot.iter().find(|u| u.id == id);
+            let entry = entry.unwrap_or_else(|| panic!("`{id}` is neither served nor explained"));
+            assert!(
+                entry.why.len() > 20,
+                "`{id}` must say WHY it is unavailable, got {:?}",
+                entry.why
+            );
+        }
+        // serves ∪ cannot is a partition — no id may appear on both sides.
+        for u in &hello.cannot {
+            assert!(!hello.serves.contains(&u.id), "`{}` is on both sides", u.id);
+        }
+        // The declaration is header-safe: no CR/LF can reach the wire.
+        assert!(!raw.contains('\n') && !raw.contains('\r'));
+    }
+
+    /// The loopback bearer token reaches the Claude child's ENVIRONMENT, and is
+    /// **not** a literal in the overlay.
+    ///
+    /// Both halves matter and they fail differently: without the env var every
+    /// hook 401s silently (an unlisted/unset `allowedEnvVars` name substitutes
+    /// to the empty string), and with a literal in the overlay the token would
+    /// sit in an argv value, which is the most casually readable thing on the
+    /// machine.
+    #[test]
+    fn the_hook_token_rides_the_environment_and_never_the_overlay() {
+        let mut settings = Settings::default();
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        let ep = hook_endpoint();
+        let env = compose_ai_env(&claude_cfg(), &settings, "claude", Some(&ep));
+        assert_eq!(
+            env.get("CIMP_HOOK_TOKEN").map(String::as_str),
+            Some(ep.token.as_str()),
+            "the harness substitutes `$CIMP_HOOK_TOKEN` from its own environment"
+        );
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&ep));
+        let raw = settings_overlay(&args).expect("overlay present").to_string();
+        assert!(
+            !raw.contains(&ep.token),
+            "the token must never appear in the `--settings` argv value: {raw}"
+        );
+        // An OpenCode tab gets no such variable — its plugin carries its own.
+        let oc = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&ep));
+        assert!(!oc.contains_key("CIMP_HOOK_TOKEN"));
+    }
+
+    /// With no loopback endpoint, NO http hook is emitted — an http hook has a
+    /// baked URL and there is nothing to point it at.
+    ///
+    /// Stated as a test rather than left implicit because it is a real behaviour
+    /// change from the command-hook era: a command hook installed before the
+    /// loopback existed would find it later through discovery. Every gate that
+    /// reaches this point implies `loopback_needed()`, so the endpoint is
+    /// present at any real spawn; the residual is the window before the listener
+    /// binds.
+    #[test]
+    fn no_endpoint_means_no_http_hooks_at_all() {
+        let mut settings = Settings::default();
+        settings.statusline.enabled = true;
+        settings.graph.enabled = true;
+        settings.graph.context_injection = true;
+        settings.workbench.checkpoints = true;
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", None);
+        let overlay = settings_overlay(&args).expect("statusLine keeps the overlay alive");
+        assert!(overlay.get("statusLine").is_some());
+        let hooks = overlay["hooks"].clone();
+        assert!(
+            !hooks.to_string().contains("\"http\""),
+            "no endpoint ⇒ no http hook: {hooks}"
+        );
+        // The two beacon COMMAND hooks are unaffected — they resolve the
+        // endpoint themselves at run time, which is exactly the property the
+        // http hooks trade away.
+        assert!(hooks["PreToolUse"].is_array(), "got {hooks}");
     }
 
     #[test]
@@ -4173,7 +4642,7 @@ mod tests {
         // empty even with the global toggle on.
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
-        let args = build_pre_args(&opencode_cfg(), &settings, "opencode");
+        let args = build_pre_args(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
         assert!(
             args.is_empty(),
             "opencode must get no pre-args, got: {args:?}"
@@ -4188,7 +4657,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.statusline.enabled = true;
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         assert!(args.iter().any(|a| a == "--append-system-prompt"));
         assert!(args.iter().any(|a| a == "--settings"));
@@ -4262,7 +4731,7 @@ mod tests {
             assert!(text.contains(GRAPH_GUIDANCE), "{}: {text}", cfg.command);
         }
         // Claude's flag actually carries it.
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let i = args
             .iter()
             .position(|a| a == "--append-system-prompt")
@@ -4287,7 +4756,7 @@ mod tests {
                 cfg.command
             );
         }
-        assert!(build_pre_args(&claude_cfg(), &settings, "claude")
+        assert!(build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()))
             .iter()
             .all(|a| a != "--append-system-prompt"));
     }
@@ -4296,7 +4765,7 @@ mod tests {
     fn injects_offload_mcp_config_for_claude_when_enabled() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let i = args
             .iter()
@@ -4313,7 +4782,7 @@ mod tests {
 
     /// The `cimp-offload` child's argv, for whichever Claude tab id is given.
     fn claude_offload_argv(settings: &Settings, tab: &str) -> Vec<String> {
-        let args = build_pre_args(&claude_cfg(), settings, tab);
+        let args = build_pre_args(&claude_cfg(), settings, tab, Some(&hook_endpoint()));
         let i = args
             .iter()
             .position(|a| a == "--mcp-config")
@@ -4397,7 +4866,7 @@ mod tests {
         settings.code_audit.enabled = true;
         settings.code_audit.expose_claude = true;
         for tab in ["claude", "claude-local"] {
-            let args = build_pre_args(&claude_cfg(), &settings, tab);
+            let args = build_pre_args(&claude_cfg(), &settings, tab, Some(&hook_endpoint()));
             let i = args.iter().position(|a| a == "--mcp-config").unwrap();
             let cfg: serde_json::Value = serde_json::from_str(&args[i + 1]).unwrap();
             let argv: Vec<String> = cfg["mcpServers"]["cimp-code-audit"]["args"]
@@ -4445,7 +4914,7 @@ mod tests {
         settings.offload.enabled = true;
         settings.offload.inject_guidance = true;
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let count = args
             .iter()
@@ -4463,7 +4932,7 @@ mod tests {
     #[test]
     fn no_offload_injection_when_disabled() {
         let settings = Settings::default(); // offload + graph off by default
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(!args.iter().any(|a| a == "--mcp-config"));
     }
 
@@ -4474,7 +4943,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.offload.enabled = false;
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let i = args
             .iter()
@@ -4501,7 +4970,7 @@ mod tests {
             offload_access: false,
             ..Default::default()
         }];
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(
             args.iter().any(|a| a == "--mcp-config"),
             "--mcp-config present when a server is exposed to Claude Code"
@@ -4518,7 +4987,7 @@ mod tests {
         settings.offload.enabled = false;
         settings.graph.enabled = false;
         settings.code_audit.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let i = args
             .iter()
@@ -4544,7 +5013,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.code_audit.enabled = false;
         assert!(settings.code_audit.expose_claude, "default is opted-in");
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(!args.iter().any(|a| a == "--mcp-config"));
     }
 
@@ -4556,7 +5025,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.code_audit.enabled = true;
         settings.code_audit.expose_claude = false;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(
             !args.iter().any(|a| a == "--mcp-config"),
             "no server should be injected when the only enabled feature is opted out"
@@ -4569,7 +5038,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
         settings.code_audit.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         let count = args.iter().filter(|a| *a == "--mcp-config").count();
         assert_eq!(count, 1, "exactly one --mcp-config carries both servers");
         let i = args.iter().position(|a| a == "--mcp-config").unwrap();
@@ -4608,7 +5077,7 @@ mod tests {
             settings.offload.enabled = offload;
             settings.graph.enabled = graph;
             settings.code_audit.enabled = audit;
-            let claude_args = build_pre_args(&claude_cfg(), &settings, "claude");
+            let claude_args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
             let claude_advertises = claude_args.iter().any(|a| a == "--mcp-config");
             let opencode_advertises = build_opencode_config(&opencode_cfg(), &settings, "opencode")
                 .get("mcp")
@@ -4638,7 +5107,7 @@ mod tests {
     fn graph_enabled_injects_graph_guidance() {
         let mut settings = Settings::default();
         settings.graph.enabled = true;
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
 
         let i = args
             .iter()
@@ -4651,7 +5120,7 @@ mod tests {
     fn offload_injection_is_claude_only() {
         let mut settings = Settings::default();
         settings.offload.enabled = true;
-        let args = build_pre_args(&opencode_cfg(), &settings, "opencode");
+        let args = build_pre_args(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
         assert!(
             args.is_empty(),
             "opencode must get no pre-args, got: {args:?}"
@@ -4664,7 +5133,7 @@ mod tests {
         // explicit per-tab override, no `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`
         // is synthesized, so Claude runs in its native fullscreen TUI.
         let settings = Settings::default();
-        let env = compose_ai_env(&claude_cfg(), &settings, "claude");
+        let env = compose_ai_env(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         assert!(
             !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
             "V20: cImp must not force Claude's inline renderer",
@@ -4676,8 +5145,8 @@ mod tests {
         // V20: neither AI tool gets the alt-screen opt-out; both go fullscreen.
         let settings = Settings::default();
         for env in [
-            compose_ai_env(&claude_cfg(), &settings, "claude"),
-            compose_ai_env(&opencode_cfg(), &settings, "opencode"),
+            compose_ai_env(&claude_cfg(), &settings, "claude", Some(&hook_endpoint())),
+            compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint())),
         ] {
             assert!(
                 !env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
@@ -4828,7 +5297,7 @@ mod tests {
     #[test]
     fn opencode_config_content_is_valid_json() {
         let settings = Settings::default();
-        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
         let raw = env
             .get("OPENCODE_CONFIG_CONTENT")
             .expect("opencode tab sets OPENCODE_CONFIG_CONTENT");
@@ -5143,7 +5612,7 @@ mod tests {
         let TabConfig::AiTool(claude) = &s.tabs[0] else {
             unreachable!()
         };
-        let args = build_pre_args(claude, &s, &claude.id);
+        let args = build_pre_args(claude, &s, &claude.id, Some(&hook_endpoint()));
         let overlay = settings_overlay(&args);
         assert!(
             overlay.is_none_or(|o| o["permissions"].is_null() && o["hooks"]["PreToolUse"].is_null()),
@@ -5234,7 +5703,7 @@ mod tests {
             let mut s = Settings::default();
             s.graph.enabled = true; // the loopback the beacon POSTs into
             s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
-            let args = build_pre_args(&claude_cfg(), &s, "claude-2");
+            let args = build_pre_args(&claude_cfg(), &s, "claude-2", Some(&hook_endpoint()));
             settings_overlay(&args)
                 .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
                 .unwrap_or_default()
@@ -5275,7 +5744,7 @@ mod tests {
             NativeWebVisibility::Sensor,
             "the default mode is what makes this case worth pinning"
         );
-        let args = build_pre_args(&claude_cfg(), &settings, "claude");
+        let args = build_pre_args(&claude_cfg(), &settings, "claude", Some(&hook_endpoint()));
         if let Some(overlay) = settings_overlay(&args) {
             assert!(
                 overlay.get("hooks").is_none(),
@@ -5294,7 +5763,7 @@ mod tests {
             let mut s = Settings::default();
             s.graph.enabled = true;
             s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
-            settings_overlay(&build_pre_args(&claude_cfg(), &s, "claude"))
+            settings_overlay(&build_pre_args(&claude_cfg(), &s, "claude", Some(&hook_endpoint())))
         };
         let deny = overlay_for("deny").expect("overlay present");
         assert_eq!(
@@ -5406,7 +5875,7 @@ mod tests {
         for mode in ["off", "sensor", "deny"] {
             let mut s = Settings::default();
             s.set_native_web_mode_for_test(NativeWebVisibility::parse(mode));
-            let env = compose_ai_env(&opencode_cfg(), &s, "opencode-3");
+            let env = compose_ai_env(&opencode_cfg(), &s, "opencode-3", Some(&hook_endpoint()));
             assert_eq!(
                 env.get("CIMP_TAB_ID").map(String::as_str),
                 Some("opencode-3"),
@@ -5415,7 +5884,7 @@ mod tests {
         }
         // Claude tabs need no equivalent — their hook command bakes `--tab`
         // into argv — so nothing is synthesized there.
-        let env = compose_ai_env(&claude_cfg(), &Settings::default(), "claude");
+        let env = compose_ai_env(&claude_cfg(), &Settings::default(), "claude", Some(&hook_endpoint()));
         assert!(!env.contains_key("CIMP_TAB_ID"), "got: {env:?}");
     }
 
@@ -6550,7 +7019,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     #[test]
     fn the_checkpoint_beacon_is_gated_on_checkpoints_and_a_live_loopback() {
         let pre_tool_matchers = |s: &Settings| -> Vec<String> {
-            let args = build_pre_args(&claude_cfg(), s, "claude");
+            let args = build_pre_args(&claude_cfg(), s, "claude", Some(&hook_endpoint()));
             settings_overlay(&args)
                 .and_then(|o| o["hooks"]["PreToolUse"].as_array().cloned())
                 .unwrap_or_default()
@@ -6577,7 +7046,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // …and the tab id is baked into the command, since the payload names no
         // cImp tab and an unattributable checkpoint is the one thing this
         // feature must not write.
-        let args = build_pre_args(&claude_cfg(), &s, "claude-7");
+        let args = build_pre_args(&claude_cfg(), &s, "claude-7", Some(&hook_endpoint()));
         let entries = settings_overlay(&args).expect("overlay")["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array")
@@ -6799,7 +7268,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         );
 
         // End-to-end through the env composer the PTY actually launches with.
-        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
         let raw = env
             .get("OPENCODE_CONFIG_CONTENT")
             .expect("config env present");
@@ -6971,7 +7440,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
     #[test]
     fn opencode_sets_noise_suppression_env() {
         let settings = Settings::default();
-        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode");
+        let env = compose_ai_env(&opencode_cfg(), &settings, "opencode", Some(&hook_endpoint()));
         assert_eq!(
             env.get("OPENCODE_DISABLE_TERMINAL_TITLE")
                 .map(String::as_str),
@@ -6989,7 +7458,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         let mut cfg = opencode_cfg();
         cfg.env
             .insert("OPENCODE_CONFIG_CONTENT".to_string(), "custom".to_string());
-        let env = compose_ai_env(&cfg, &settings, "claude");
+        let env = compose_ai_env(&cfg, &settings, "claude", Some(&hook_endpoint()));
         assert_eq!(
             env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             Some("custom"),
@@ -7008,7 +7477,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
             "1".to_string(),
         );
-        let env = compose_ai_env(&cfg, &settings, "claude");
+        let env = compose_ai_env(&cfg, &settings, "claude", Some(&hook_endpoint()));
         assert_eq!(
             env.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN")
                 .map(String::as_str),
@@ -7030,7 +7499,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         let mut other = claude_cfg();
         other.command = "some-other-tool".to_string();
         for cfg in [claude_cfg(), opencode_cfg(), other] {
-            let env = compose_ai_env(&cfg, &settings, "claude");
+            let env = compose_ai_env(&cfg, &settings, "claude", Some(&hook_endpoint()));
             assert!(
                 !env.contains_key("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"),
                 "cImp must not synthesize the auto-background kill switch (command: {})",
@@ -7051,7 +7520,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS".to_string(),
             "0".to_string(),
         );
-        let env = compose_ai_env(&cfg, &settings, "claude");
+        let env = compose_ai_env(&cfg, &settings, "claude", Some(&hook_endpoint()));
         assert_eq!(
             env.get("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")
                 .map(String::as_str),
@@ -7339,7 +7808,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         // Default (off): no channel flag anywhere in the pre-args.
         let mut s = Settings::default();
         s.offload.enabled = true;
-        let off = build_pre_args(&cfg, &s, "claude");
+        let off = build_pre_args(&cfg, &s, "claude", Some(&hook_endpoint()));
         assert!(
             !off.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
             "session_push defaults off — no channel flag"
@@ -7356,7 +7825,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
 
         // On: flag + target, in that order, adjacent.
         s.offload.session_push = true;
-        let on = build_pre_args(&cfg, &s, "claude");
+        let on = build_pre_args(&cfg, &s, "claude", Some(&hook_endpoint()));
         let i = on
             .iter()
             .position(|a| a == CHANNEL_REGISTRATION_FLAG)
@@ -7386,7 +7855,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         );
 
         // OpenCode (and any non-Claude command) gets no pre-args at all.
-        assert!(build_pre_args(&opencode_cfg(), &s, "opencode").is_empty());
+        assert!(build_pre_args(&opencode_cfg(), &s, "opencode", Some(&hook_endpoint())).is_empty());
 
         // session_push without ANY reason to inject the `cimp-offload` server
         // (offload, graph, and Claude-exposed MCP all off) must emit no flag —
@@ -7395,7 +7864,7 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         bare.offload.session_push = true;
         bare.offload.enabled = false;
         bare.graph.enabled = false;
-        let none = build_pre_args(&cfg, &bare, "claude");
+        let none = build_pre_args(&cfg, &bare, "claude", Some(&hook_endpoint()));
         assert!(
             !none.iter().any(|a| a == CHANNEL_REGISTRATION_FLAG),
             "no cimp-offload server injected ⇒ no channel registration"

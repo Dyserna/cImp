@@ -68,9 +68,9 @@
 //! `WebFetch|WebSearch`, so `Read`/`Grep`/`Bash` pay nothing.
 //!
 //! **Corrected 2026-08-08 (#48, review Part 7 item 16.)** This paragraph said
-//! the POST is "capped by `context_hook`'s 600 ms socket timeout and the hook
+//! the POST is "capped by the context hook's 600 ms socket timeout and the hook
 //! entry's own 2 s budget". Both numbers named the wrong things. This shim
-//! does not use `context_hook`'s timeout at all — it has its own
+//! does not use that timeout at all — it has its own
 //! [`DISPATCH_TIMEOUT`] of **80 ms**, applied to the connect and to the write,
 //! and it never reads the reply, so there is no third wait. The hook entry
 //! `tabs::config` writes carries `"timeout": 5` (**5 s**, the siblings' value),
@@ -82,7 +82,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::context_hook::{missing_fields, resolve_cwd, tab_arg};
+use crate::harness::claude_hook::{missing_fields, resolve_cwd, tab_arg};
 
 /// The agent vocabulary this shim reports under. Only Claude Code runs
 /// `PreToolUse` hooks; OpenCode beacons from its plugin
@@ -92,9 +92,10 @@ const CONSUMER: &str = "claude";
 /// The entire network budget of this shim, applied to the connect and to the
 /// write separately (the response is never read, so there is no third).
 ///
-/// Deliberately an order of magnitude below `context_hook::TIMEOUT`'s 600 ms:
-/// the sibling shims wait because their whole purpose is the reply, while this
-/// one has nothing to wait for. On loopback a live app accepts into the backlog
+/// Deliberately an order of magnitude below the converted hooks' budget
+/// ([`crate::harness::claude_hook::TIMEOUT_SECS`], 1 s — the deleted shims'
+/// 600 ms rounded up): those wait because their whole purpose is the reply, while
+/// this one has nothing to wait for. On loopback a live app accepts into the backlog
 /// immediately and a dead one is refused immediately, so the only case this
 /// bound covers is a wedged app — the case where waiting would be worst.
 const DISPATCH_TIMEOUT: Duration = Duration::from_millis(80);
@@ -123,7 +124,7 @@ pub fn run() {
     // every sibling shim follows). `tool_name` is what the row names; `cwd` is
     // what routes the POST to the right instance when several cImps share one
     // install. Sent through this module's OWN dispatcher rather than
-    // `context_hook::report_contract_drift`, which waits for a reply — the
+    // the app-side drift reporter, which waits for a reply — the
     // module doc's rule is that nothing in this shim's path may block on app
     // health. Rare by construction: the happy path sends nothing here.
     let missing = missing_fields(&[
@@ -162,7 +163,7 @@ pub fn run() {
 
 /// Send one loopback POST and return, **without reading the response**.
 ///
-/// The deliberate difference from `context_hook::post_loopback`: that helper
+/// The deliberate difference from a shim that waits for its reply: such a helper
 /// waits for a reply because its callers need one (injected context, a read
 /// verdict). This shim needs nothing back, so waiting would only make its
 /// duration a function of app health — and with the harness's timeout semantics
@@ -231,9 +232,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// `tab_arg` moved to `context_hook` in V33 when `--context-hook` grew the
-    /// same `--tab` flag; this test stays here because this shim's contract
-    /// ("no tab ⇒ no beacon at all") is the stricter of the two consumers.
+    /// `tab_arg` now lives in `harness::claude_hook`, where V35 Phase J left the
+    /// payload mechanics when the five hook shims were deleted; this test stays
+    /// here because this shim's contract ("no tab ⇒ no beacon at all") is the
+    /// stricter of the two consumers.
     #[test]
     fn tab_arg_reads_the_baked_id_and_refuses_an_empty_one() {
         let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };

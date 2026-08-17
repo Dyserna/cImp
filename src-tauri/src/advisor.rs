@@ -2054,7 +2054,13 @@ mod tests {
         assert!(p.rationale.contains(RULE_DRIFT_READ_REASON));
         // The `wired_in` column, verbatim — this is what makes the card
         // actionable rather than merely alarming.
-        assert!(p.rationale.contains("src-tauri/src/read_hook.rs"), "{}", p.rationale);
+        // V35 Phase J: the read advisor's shim binary is gone; its payload
+        // mechanics and its route are what a reader must now open.
+        assert!(
+            p.rationale.contains("src-tauri/src/harness/claude_hook.rs"),
+            "{}",
+            p.rationale
+        );
         assert!(p.rationale.contains("src-tauri/src/tabs/config.rs"));
     }
 

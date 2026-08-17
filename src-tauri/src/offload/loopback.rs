@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
+use crate::harness::claude_hook;
 
 use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
@@ -241,8 +242,8 @@ fn is_ancestor_or_equal(root: &Path, hint: &Path) -> bool {
 /// raises the cost from *one write* to *one write plus a listener*. It does not
 /// remove the primitive.
 ///
-/// Blocking on purpose: two of the four consumers (`context_hook`,
-/// `taint_beacon`) are synchronous shims with no async runtime, and a second
+/// Blocking on purpose: two of the four consumers (`taint_beacon`,
+/// `checkpoint_beacon`) are synchronous shims with no async runtime, and a second
 /// async copy of this for the two MCP children is a second thing to get wrong.
 /// The callers are all short-lived child processes — no in-app path reaches it
 /// (the app's own entry is read pid-keyed by [`read_own_discovery`], which is
@@ -495,8 +496,7 @@ pub fn read_discovery_for(hint: Option<&Path>) -> Option<Discovery> {
 /// Every consumer calls this when the endpoint it holds fails, and that is the
 /// whole of decision 30's re-resolution half: `offload::mcp::proxy_graph` on any
 /// [`ProxyMiss`](crate::offload::mcp), `audit::mcp` when `/audit/run` cannot be
-/// reached, `context_hook::post_loopback` on a failed post and
-/// `taint_beacon::dispatch` on a refused connect. Without it the memo could
+/// reached, and `taint_beacon::dispatch` on a refused connect. Without it the memo could
 /// outlive the instance it names — a cImp restart rotates the token and the port,
 /// so a stale memo means a permanently headless tab, which is the precise cost
 /// that made "bake the endpoint into the child at spawn" a non-goal.
@@ -556,7 +556,7 @@ pub fn proxy_base_for(hint: Option<&Path>, who: ChildIdentity<'_>) -> Option<(St
     //    budget is spent, and the report itself cannot be steered by the very
     //    entry it is reporting.
     // 3. **Still not on the shims' path.** `read_discovery_for` is what
-    //    `context_hook` and `taint_beacon` call; this function has exactly two
+    //    `taint_beacon` and `checkpoint_beacon` call; this function has exactly two
     //    callers, both stdio MCP children. Moving the POST down one frame would
     //    hand `taint_beacon` a write and a wait and destroy locked decision 14's
     //    safety argument — pinned by
@@ -1053,7 +1053,25 @@ struct Request {
     method: String,
     path: String,
     auth: Option<String>,
+    /// V35 Phase J: the `X-CIMP-*` identity headers, when the caller sent any.
+    cimp: CimpHeaders,
     body: Vec<u8>,
+}
+
+/// The identity a **Claude `type: "http"` hook** carries, which its body cannot.
+///
+/// A hook's body is the harness's own payload — cImp gets no field in it — so
+/// the tab id, the harness discriminator, the CHP version and the hello
+/// declaration ride headers baked into the emitted hook entry at spawn
+/// (`harness::claude_hook`). Every value here is caller-supplied and is
+/// validated/bounded at the point of use exactly as the equivalent body fields
+/// are on the CHP routes.
+#[derive(Debug, Default, Clone)]
+struct CimpHeaders {
+    tab: Option<String>,
+    agent: Option<String>,
+    chp: Option<u32>,
+    hello: Option<String>,
 }
 
 /// Read and parse one HTTP/1.1 request from the stream (headers + an
@@ -1091,6 +1109,7 @@ async fn read_request(stream: &mut TcpStream) -> AppResult<Request> {
     let path = parts.next().unwrap_or("").to_string();
 
     let mut auth = None;
+    let mut cimp = CimpHeaders::default();
     let mut content_length = 0usize;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -1099,6 +1118,17 @@ async fn read_request(stream: &mut TcpStream) -> AppResult<Request> {
             match key.as_str() {
                 "authorization" => auth = Some(val.to_string()),
                 "content-length" => content_length = val.parse().unwrap_or(0),
+                // V35 Phase J. Read for EVERY request, not only the Claude hook
+                // routes: the parser has no route context, and a header on a
+                // route that does not consult it is simply unread. The names are
+                // the lowercase of `claude_hook`'s canonical spellings, pinned
+                // by `the_cimp_headers_are_read_under_the_names_the_overlay_emits`.
+                "x-cimp-tab" => cimp.tab = Some(val.to_string()),
+                "x-cimp-agent" => cimp.agent = Some(val.to_string()),
+                // A non-numeric version is `None`, i.e. pre-CHP — never an
+                // error. Same tolerated-absent rule as the `chp` body field.
+                "x-cimp-chp" => cimp.chp = val.parse().ok(),
+                "x-cimp-hello" => cimp.hello = Some(val.to_string()),
                 _ => {}
             }
         }
@@ -1125,6 +1155,7 @@ async fn read_request(stream: &mut TcpStream) -> AppResult<Request> {
         method,
         path,
         auth,
+        cimp,
         body,
     })
 }
@@ -1192,7 +1223,7 @@ async fn handle_conn(
     // body types stay byte-identical, which is this phase's exit criterion. It
     // reads only, answers nothing and cannot reject: a route's behaviour is the
     // same whether this line runs or not.
-    note_chp(&app, route, &req.body);
+    note_chp(&app, route, &req);
     match (req.method.as_str(), route) {
         ("POST", "/run") => handle_run(&mut stream, &service, &app, &req).await,
         ("POST", "/graph_run") => handle_graph_run(&mut stream, &app, &req).await,
@@ -1209,6 +1240,22 @@ async fn handle_conn(
         ("POST", "/latch/beacon") => handle_latch_beacon(&mut stream, &app, &req).await,
         ("POST", "/latch/state") => handle_latch_state(&mut stream, &app, &req).await,
         ("POST", "/session/hello") => handle_session_hello(&mut stream, &app, &req).await,
+        // ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──
+        //
+        // The `type: "http"` half of the five hooks that used to be shim
+        // binaries. Same internal cores as the CHP routes above, different
+        // envelope in and out: raw Claude hook-input JSON in, Claude hook-output
+        // JSON back, and the identity in `X-CIMP-*` headers rather than in the
+        // body. Spelled as literals here — like every other arm, and unlike the
+        // `claude_hook::ROUTE_*` constants the overlay generator emits — because
+        // the route-enumeration test scans this `match` as text; a test pins the
+        // two spellings equal.
+        ("POST", "/claude/hook/user_prompt_submit") => handle_claude_user_prompt_submit(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/pre_compact") => handle_claude_pre_compact(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/pre_tool_use") => handle_claude_pre_tool_use(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/post_tool_use") => handle_claude_post_tool_use(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/notification") => handle_claude_notification(&mut stream, &app, &req).await,
+        ("POST", "/claude/hook/session_start") => handle_claude_session_start(&mut stream, &app, &req).await,
         // NOTE (#45): there is deliberately no `POST /latch/override`. The
         // manual override is a capability GRANT, and the bearer token gating
         // this listener is readable by every process running as the user, so an
@@ -5123,7 +5170,7 @@ struct ContextRetrieveBody {
     #[serde(default)]
     session_id: Option<String>,
     /// V13 Phase C: which agent shim is calling — `"claude"` (set by
-    /// `context_hook.rs`) or `"opencode"` (set by the generated plugin);
+    /// the Claude `UserPromptSubmit` route) or `"opencode"` (the generated plugin);
     /// absent/`None` for an unrecognized caller. Recorded on the checkpoint
     /// it triggers (see [`WorkbenchService::on_prompt`](crate::workbench::WorkbenchService::on_prompt)),
     /// not otherwise used by context retrieval itself.
@@ -5221,6 +5268,21 @@ async fn handle_context_retrieve(
             .await;
         }
     };
+    let answer = context_retrieve_core(app, &body);
+    write_json(stream, 200, &answer).await
+}
+
+/// The prompt tap's whole effect, shared by `/context/retrieve` (the CHP body a
+/// pre-upgrade shim or the OpenCode plugin posts) and
+/// [`claude_hook::ROUTE_USER_PROMPT_SUBMIT`] (the raw `UserPromptSubmit` payload
+/// the harness posts since V35 Phase J).
+///
+/// Extracted rather than duplicated: this is the only place the checkpoint
+/// trigger fires, the injection gate is read and the digest is composed, so the
+/// two transports cannot come to disagree about what a prompt does. Returns the
+/// `/context/retrieve` answer verbatim — the Claude-native handler takes `text`
+/// out of it and wraps it in the hook-output envelope.
+fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
     let cwd = body
         .cwd
         .clone()
@@ -5247,7 +5309,7 @@ async fn handle_context_retrieve(
             // V33: the identity the Timeline is joined on. The settings read
             // sits INSIDE the `checkpoints_enabled` gate for FIX 8's reason —
             // a user with checkpoints off pays nothing for this.
-            let origin = checkpoint_origin(&live_settings(app), &body);
+            let origin = checkpoint_origin(&live_settings(app), body);
             let prompt_head: String = body.prompt.chars().take(80).collect();
             tauri::async_runtime::spawn(async move {
                 workbench.on_prompt(&root, origin, &prompt_head).await;
@@ -5257,13 +5319,13 @@ async fn handle_context_retrieve(
 
     let empty = serde_json::json!({ "ok": true, "text": "", "files": [], "tokens_est": 0 });
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
-        return write_json(stream, 200, &empty).await;
+        return empty;
     };
     let graph = graph.inner().clone();
     // The injection toggle is enforced here (the service's retrieve does not) so
     // the preview surface can reuse the same core while injection is off.
     if !graph.context_injection_enabled() {
-        return write_json(stream, 200, &empty).await;
+        return empty;
     }
     let r = graph.retrieve_context(&cwd, &body.prompt, body.session_id.as_deref());
     // V11 Phase B: prepend the once-per-session project map. Done here (the real
@@ -5292,12 +5354,7 @@ async fn handle_context_retrieve(
     // can't drift). Estimated from the FULL injected text (digest + greeting +
     // drained auto-check), not just the digest.
     let tokens_est = crate::graph::est_tokens(text.chars().count());
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({ "ok": true, "text": text, "files": r.files_used, "tokens_est": tokens_est }),
-    )
-    .await
+    serde_json::json!({ "ok": true, "text": text, "files": r.files_used, "tokens_est": tokens_est })
 }
 
 /// A `POST /workbench/tool_checkpoint` request body — V33 Phase F's two
@@ -5693,21 +5750,31 @@ async fn handle_context_compaction(
     {
         return write_json(stream, 200, &empty).await;
     }
+    let block = compaction_block(app, &body);
+    write_json(stream, 200, &serde_json::json!({ "ok": true, "text": block })).await
+}
+
+/// The compaction carry-over block, **after** the gate — shared by
+/// `/context/compaction` and [`claude_hook::ROUTE_PRE_COMPACT`].
+///
+/// The gate itself deliberately stays in each handler rather than moving in
+/// here: the route-enumeration test (`every_loopback_route_declares_what_it_does_
+/// about_the_latch`) checks each handler's own body for its `hook_admit(latches(),
+/// …)` call, and a gate that a route merely inherits from a helper is a gate a
+/// reviewer cannot see at the route.
+fn compaction_block(app: &AppHandle, body: &ContextCompactionBody) -> String {
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
-        return write_json(stream, 200, &empty).await;
+        return String::new();
     };
     let graph = graph.inner().clone();
     let cwd = body
         .cwd
+        .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let block = graph.compaction_context(&cwd, body.session_id.as_deref());
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({ "ok": true, "text": block.unwrap_or_default() }),
-    )
-    .await
+    graph
+        .compaction_context(&cwd, body.session_id.as_deref())
+        .unwrap_or_default()
 }
 
 /// A `POST /context/should_read` request body (the Claude `PreToolUse` Read
@@ -5779,21 +5846,7 @@ async fn handle_should_read(
     {
         return write_json(stream, 200, &pass).await;
     }
-    let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
-        return write_json(stream, 200, &pass).await;
-    };
-    let graph = graph.inner().clone();
-    let cwd = body
-        .cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    match graph.should_read(
-        &cwd,
-        body.session_id.as_deref(),
-        &body.file_path,
-        body.offset,
-        body.limit,
-    ) {
+    match should_read_verdict(app, &body) {
         Some(text) => {
             write_json(
                 stream,
@@ -5804,6 +5857,27 @@ async fn handle_should_read(
         }
         None => write_json(stream, 200, &pass).await,
     }
+}
+
+/// The read advisor's verdict, **after** the gate — `Some(reminder)` for a
+/// `remind`, `None` for a `pass`. Shared by `/context/should_read` and
+/// [`claude_hook::ROUTE_PRE_TOOL_USE`]; see [`compaction_block`] for why the
+/// gate stays at each route rather than moving in here.
+fn should_read_verdict(app: &AppHandle, body: &ShouldReadBody) -> Option<String> {
+    let graph = app.try_state::<Arc<crate::graph::GraphService>>()?;
+    let graph = graph.inner().clone();
+    let cwd = body
+        .cwd
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    graph.should_read(
+        &cwd,
+        body.session_id.as_deref(),
+        &body.file_path,
+        body.offset,
+        body.limit,
+    )
 }
 
 /// A `POST /activity/contract_drift` request body (V16 Feature 3): a hook
@@ -6056,12 +6130,34 @@ async fn handle_contract_drift(stream: &mut TcpStream, req: &Request) -> AppResu
 /// later message from a tab hits [`crate::harness::chp::already_seen`], a single
 /// map lookup, and returns. Only a *new* `(agent, tab, chp)` triple — i.e. a tab
 /// launching, or a tab's artifact having changed — pays one settings read.
-fn note_chp(app: &AppHandle, route: &str, body: &[u8]) {
-    let Some((env, tab)) = crate::harness::chp::envelope(route, body) else {
-        return;
+///
+/// **V35 Phase J** added the second source. A Claude `type: "http"` hook posts
+/// the harness's own payload, which has no room for a CHP envelope, so its
+/// identity arrives in `X-CIMP-*` headers instead. Same three properties, same
+/// validation, same hot-path shortcut — only the read differs, and which of the
+/// two applies is decided by the route rather than by sniffing the body.
+fn note_chp(app: &AppHandle, route: &str, req: &Request) {
+    let (chp, agent_token, tab) = if claude_hook::is_hook_route(route) {
+        let tab = req.cimp.tab.as_deref().map(str::trim).unwrap_or("");
+        if tab.is_empty() {
+            return;
+        }
+        (
+            req.cimp.chp.unwrap_or(crate::harness::chp::PRE_CHP),
+            req.cimp.agent.clone().unwrap_or_default(),
+            tab.to_string(),
+        )
+    } else {
+        let Some((env, tab)) = crate::harness::chp::envelope(route, &req.body) else {
+            return;
+        };
+        (
+            env.chp.unwrap_or(crate::harness::chp::PRE_CHP),
+            env.agent_token().to_string(),
+            tab,
+        )
     };
-    let chp = env.chp.unwrap_or(crate::harness::chp::PRE_CHP);
-    let agent = crate::graph::source_for_consumer(env.agent_token());
+    let agent = crate::graph::source_for_consumer(&agent_token);
     if crate::harness::chp::already_seen(agent, &tab, chp) {
         return;
     }
@@ -6319,6 +6415,536 @@ async fn handle_session_hello(
         &serde_json::json!({ "ok": true, "chp": crate::harness::chp::CHP_VERSION }),
     )
     .await
+}
+
+// ── V35 Phase J: Claude Code's own hook payloads, posted by the harness ──────
+//
+// Six routes under `/claude/hook/`, replacing five shim binaries. Each one
+// parses Claude's hook-input JSON, reports payload drift under the SAME shim
+// token the deleted binary used, builds the CHP body its legacy sibling
+// receives, calls the SAME internal core, and answers with Claude hook-output
+// JSON.
+//
+// **Why the legacy routes stay.** The `--settings` overlay is written at TAB
+// LAUNCH, so a tab open across the upgrade is still running command hooks that
+// POST harness-neutral bodies to `/context/*`. Those keep working, and the two
+// transports meet at one core per capability — which is the property the
+// convergence tests assert, and the reason no capability can behave differently
+// depending on how old the tab is.
+//
+// **Fail-open, in HTTP terms.** Every arm answers `200` with either a directive
+// or `claude_hook::no_op()`; nothing here returns a non-2xx, because a non-2xx
+// is a *non-blocking error* the harness logs, and there is nothing to log about
+// a hook that simply had nothing to say. The one route that can block says so
+// explicitly ([`handle_claude_pre_tool_use`]).
+
+/// The cImp tab a Claude hook request claims, **validated** against the user's
+/// configured Claude tabs — `None` when the claim is absent, empty or names no
+/// such tab.
+///
+/// The `X-CIMP-Tab` header is baked into the emitted hook entry at spawn, but it
+/// arrives over a listener whose bearer token any process running as this user
+/// can read, so it is exactly as caller-asserted as the `tab` body field on
+/// every CHP route and gets exactly the same narrowing (#45's rule).
+///
+/// A `None` here is not an error: it degrades to "this hook is attributed to no
+/// tab", which is precisely the pre-V33 behaviour of a shim launched without
+/// `--tab`. The gated routes then resolve no latch scope and admit the call.
+fn claude_hook_tab(settings: &crate::settings::Settings, req: &Request) -> Option<String> {
+    let tab = req.cimp.tab.as_deref().map(str::trim).unwrap_or("");
+    if tab.is_empty() || !is_configured_tab(settings, "claude", tab) {
+        return None;
+    }
+    Some(tab.to_string())
+}
+
+/// The working directory a Claude hook payload names, or the tab's own launch
+/// directory when the payload carries none.
+///
+/// **This is deliberately NOT the deleted shims' fallback.** They fell back to
+/// `current_dir()`, which was right *for a process Claude spawned* — Claude runs
+/// hook processes in the project directory. The app's cwd is its own launch
+/// directory and has nothing to do with the tab, so reproducing that fallback
+/// here would silently point a hook at the wrong project on any tab whose `cwd`
+/// is a worktree (V13 Phase D's "New tab in worktree…").
+///
+/// The tab's configured directory is resolved through [`crate::tabs::ai_tab_dir`]
+/// — the same call the spawner makes — so this is the directory cImp itself
+/// launched that tab in. `None` when neither is available, which every caller
+/// turns into its own existing "no cwd" default.
+fn claude_hook_cwd(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    tab: Option<&str>,
+    raw: &str,
+) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.is_empty() {
+        return Some(raw.to_string());
+    }
+    let tab = tab?;
+    let launch = app
+        .try_state::<crate::ipc::AppState>()
+        .map(|s| s.launch.cwd.clone())
+        .or_else(|| std::env::current_dir().ok())?;
+    crate::tabs::ai_tab_dir(settings, tab, &launch).map(|d| d.to_string_lossy().into_owned())
+}
+
+/// Parse a Claude hook-input payload, or `None` when the body is not JSON.
+///
+/// A malformed payload is the one drift this route cannot *report* (there is no
+/// `session_id` to attribute it to and no fields to enumerate), so it is logged
+/// with the caller's bytes bounded and answered as a no-op — the HTTP spelling
+/// of the shims' "bail silently, never perturb the turn".
+fn parse_hook_input(route: &str, req: &Request) -> Option<claude_hook::HookInput> {
+    match serde_json::from_slice::<claude_hook::HookInput>(&req.body) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                target: "offload",
+                route,
+                error = %e,
+                head = %bounded_id(&String::from_utf8_lossy(&req.body)),
+                "loopback: a Claude http hook posted a body that is not hook-input JSON — \
+                 answered as a no-op (the turn is never perturbed)"
+            );
+            None
+        }
+    }
+}
+
+/// Report a Claude hook payload that is missing required fields, through the
+/// same ledger, bound and Activity row `POST /activity/contract_drift` uses.
+///
+/// V16 Feature 3, moved off the shims and **not** re-designed: the token is the
+/// deleted binary's own name (`claude_hook::drift_token`), so a pre-upgrade tab's
+/// shim reports and this build's handler reports land in ONE bucket per
+/// capability and resolve to one registry row. Fired BEFORE any early return, so
+/// a payload broken enough to make the handler bail is still counted.
+fn report_hook_drift(route: &str, input: &claude_hook::HookInput) {
+    let Some(shim) = claude_hook::drift_token(route) else {
+        return;
+    };
+    let missing = claude_hook::missing_fields(&claude_hook::contract_checks(route, input));
+    if missing.is_empty() {
+        return;
+    }
+    let body = ContractDriftBody {
+        shim: shim.to_string(),
+        missing: missing.into_iter().map(str::to_string).collect(),
+        session_id: Some(input.session_id.clone()),
+    };
+    if let Some(record) = contract_drift_row(&body, claim_contract_drift) {
+        crate::activity::record_bg(record);
+    }
+}
+
+// ── the five body mappings, pure ────────────────────────────────────────────
+//
+// Each turns a Claude hook payload plus the resolved identity into **exactly
+// the CHP body the deleted shim used to POST**. Split out of the handlers so
+// that equivalence is a unit test rather than a claim: the tests compare each
+// against the literal `serde_json::json!` body the shim built, field for field.
+// Everything downstream of these is already one shared core per capability, so
+// "same body in" is what makes "same effect" a fact.
+
+/// `context_hook.rs`'s body: `{cwd, prompt, session_id, agent, tab}`.
+fn retrieve_body_from_hook(
+    input: &claude_hook::HookInput,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ContextRetrieveBody {
+    ContextRetrieveBody {
+        cwd,
+        prompt: input.prompt.clone(),
+        session_id: Some(input.session_id.clone()),
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `compact_hook.rs`'s body: `{cwd, session_id, trigger, agent, tab}`.
+fn compaction_body_from_hook(
+    input: &claude_hook::HookInput,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ContextCompactionBody {
+    ContextCompactionBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        trigger: Some(input.trigger.clone()),
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `read_hook.rs`'s body: `{cwd, session_id, file_path, offset, limit, agent,
+/// tab}` — built from the already-planned [`claude_hook::ReadRequest`], because
+/// the shim built it from the same plan.
+fn should_read_body_from_hook(
+    input: &claude_hook::HookInput,
+    reqst: &claude_hook::ReadRequest,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ShouldReadBody {
+    ShouldReadBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        file_path: reqst.file_path.clone(),
+        offset: reqst.offset,
+        limit: reqst.limit,
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `postedit_hook.rs`'s body: `{cwd, session_id, file_path, tool_name, agent,
+/// tab}`.
+fn post_edit_body_from_hook(
+    input: &claude_hook::HookInput,
+    tab: Option<String>,
+    cwd: Option<String>,
+) -> ContextPostEditBody {
+    ContextPostEditBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        file_path: input
+            .tool_input
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        tool_name: input.tool_name.clone(),
+        agent: Some("claude".to_string()),
+        tab,
+    }
+}
+
+/// `notify_hook.rs`'s body: `{cwd, session_id, transcript_path, event,
+/// notification_type, message, tool_name}` — and, like the shim's, it carries
+/// neither `agent` nor `tab` (`docs/CHP.md` § 4.4).
+fn permission_body_from_hook(
+    input: &claude_hook::HookInput,
+    cwd: Option<String>,
+) -> PermissionEventBody {
+    PermissionEventBody {
+        cwd,
+        session_id: Some(input.session_id.clone()),
+        transcript_path: Some(input.transcript_path.clone()),
+        event: input.hook_event_name.clone(),
+        notification_type: Some(input.notification_kind().to_string()),
+        message: Some(input.notification_message().to_string()),
+        tool_name: input.tool_name.clone(),
+    }
+}
+
+/// `POST /claude/hook/user_prompt_submit` — the `UserPromptSubmit` hook.
+///
+/// Fires the prompt-tap checkpoint trigger and returns the injectable digest as
+/// `hookSpecificOutput.additionalContext`, through
+/// [`context_retrieve_core`] — the same function `/context/retrieve` calls, so
+/// injection, the once-per-session project map and the parked auto-check drain
+/// are identical on both transports. Ungated for the reason `/context/retrieve`
+/// is (see its `ROUTE_CONTAINMENT` row).
+async fn handle_claude_user_prompt_submit(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_USER_PROMPT_SUBMIT;
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    report_hook_drift(route, &input);
+    if input.prompt.trim().is_empty() {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = retrieve_body_from_hook(&input, tab, cwd);
+    let answer = context_retrieve_core(app, &body);
+    let text = answer.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    write_json(
+        stream,
+        200,
+        &claude_hook::additional_context(claude_hook::EVENT_USER_PROMPT_SUBMIT, text),
+    )
+    .await
+}
+
+/// `POST /claude/hook/pre_compact` — the `PreCompact` hook.
+///
+/// Gated on [`HOOK_TOOL_COMPACTION`] exactly as `/context/compaction` is, and
+/// for the same reason: demoting that one class-table row is all it should take
+/// to close BOTH transports.
+async fn handle_claude_pre_compact(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_PRE_COMPACT;
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = compaction_body_from_hook(&input, tab, cwd);
+    if hook_admit(
+        latches(),
+        HOOK_TOOL_COMPACTION,
+        hook_agent(body.agent.as_deref()),
+        body.tab.as_deref(),
+        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |scope| GatePolicy::resolve(&settings, scope),
+    )
+    .is_err()
+    {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    let block = compaction_block(app, &body);
+    if block.trim().is_empty() {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    write_json(
+        stream,
+        200,
+        &claude_hook::additional_context(claude_hook::EVENT_PRE_COMPACT, &block),
+    )
+    .await
+}
+
+/// `POST /claude/hook/pre_tool_use` — the read advisor, on both its matchers.
+///
+/// **The one route in this family that can block a tool call**, and it does so
+/// only by returning `permissionDecision: "deny"` with the reminder as the
+/// reason — byte-identical to what `read_hook.rs` printed, from the same
+/// [`should_read_verdict`] the legacy route calls. Every other outcome (a
+/// non-target tool, a pass, a refused gate, missing state) is
+/// [`claude_hook::no_op`], and the read proceeds.
+///
+/// Gated on [`HOOK_TOOL_SHOULD_READ`], whose only reachable effect is to turn a
+/// `remind` into a `pass` — see `handle_should_read`'s note.
+async fn handle_claude_pre_tool_use(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_PRE_TOOL_USE;
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    report_hook_drift(route, &input);
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    // Map the payload to a verdict request, or let the tool proceed untouched.
+    let Some(reqst) = claude_hook::plan_request(
+        input.tool_name.as_deref(),
+        &input.tool_input,
+        cwd.as_deref().unwrap_or(""),
+    ) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    let body = should_read_body_from_hook(&input, &reqst, tab, cwd);
+    if hook_admit(
+        latches(),
+        HOOK_TOOL_SHOULD_READ,
+        hook_agent(body.agent.as_deref()),
+        body.tab.as_deref(),
+        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |scope| GatePolicy::resolve(&settings, scope),
+    )
+    .is_err()
+    {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    let Some(text) = should_read_verdict(app, &body) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    if text.trim().is_empty() {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    // The server verdict is tool-agnostic; the Bash path prepends its own
+    // "answered without running the command — " note so the deny reads sensibly
+    // for a shell read.
+    let reason = format!("{}{text}", reqst.deny_prefix);
+    write_json(stream, 200, &claude_hook::deny(&reason)).await
+}
+
+/// `POST /claude/hook/post_tool_use` — the auto-check diff after an edit.
+///
+/// Gated on [`HOOK_TOOL_POST_EDIT`], the route the M-7 finding is really about:
+/// it executes the project's configured check commands, in a directory V33 C4
+/// admits from an app-derived list rather than from the payload.
+async fn handle_claude_post_tool_use(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_POST_TOOL_USE;
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    report_hook_drift(route, &input);
+    // The matcher already scopes this to edit tools, but be safe — the shim
+    // made the same check for the same reason.
+    let tool_name = input.tool_name.as_deref().unwrap_or("");
+    if !matches!(tool_name, "Edit" | "Write" | "MultiEdit") {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    let settings = live_settings(app);
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = post_edit_body_from_hook(&input, tab, cwd);
+    if hook_admit(
+        latches(),
+        HOOK_TOOL_POST_EDIT,
+        hook_agent(body.agent.as_deref()),
+        body.tab.as_deref(),
+        |agent, tab| latch_scope(app, &settings, agent, tab),
+        |scope| GatePolicy::resolve(&settings, scope),
+    )
+    .is_err()
+    {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    let text = post_edit_diagnostics(app, &settings, &body).await;
+    if text.trim().is_empty() {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    write_json(
+        stream,
+        200,
+        &claude_hook::additional_context(claude_hook::EVENT_POST_TOOL_USE, &text),
+    )
+    .await
+}
+
+/// `POST /claude/hook/notification` — `Notification` **and** `PermissionDenied`.
+///
+/// One route for both events, dispatching on the payload's `hook_event_name`,
+/// exactly as the one `--notify-hook` binary did. Observe-only: it answers
+/// [`claude_hook::no_op`] on every path, because an observe-only hook must never
+/// emit a directive — for `PermissionDenied` the harness documents even the exit
+/// code and stderr as ignored.
+async fn handle_claude_notification(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_NOTIFICATION;
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    };
+    report_hook_drift(route, &input);
+    if input.hook_event_name.is_empty() {
+        // Without the event name the classifier cannot tell an edge from an idle
+        // notification, and guessing would risk flipping `awaiting_permission`.
+        return write_json(stream, 200, &claude_hook::no_op()).await;
+    }
+    let settings = live_settings(app);
+    // The tab is resolved only to give the `cwd` fallback something to resolve
+    // from: this body carries neither `agent` nor `tab`, exactly as the shim's
+    // did — `/permission/event` maps by session/transcript/cwd (CHP § 4.4).
+    let tab = claude_hook_tab(&settings, req);
+    let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
+    let body = permission_body_from_hook(&input, cwd);
+    let _ = permission_signal(app, &body).await;
+    write_json(stream, 200, &claude_hook::no_op()).await
+}
+
+/// `POST /claude/hook/session_start` — **Claude's CHP hello** (design D3).
+///
+/// New in Phase J: there was no shim to replace, because until the overlay could
+/// carry headers there was nothing to introduce. It synthesizes the same
+/// `/session/hello` record the generated OpenCode plugin posts, from the three
+/// things the emitted hook entry baked in — `X-CIMP-Tab`, `X-CIMP-Chp` and
+/// `X-CIMP-Hello`'s `serves`/`cannot` pair — plus, if the payload ever carries
+/// one, the harness's own version.
+///
+/// **`harness_version` is empty today and that is a recorded fact, not an
+/// omission.** No documented hook-input field carries the CLI version, and cImp
+/// will not bake in the number it last saw and let the hook report it back —
+/// that is cImp attesting to itself, the same objection that governs OpenCode's
+/// hello (`docs/CHP.md` § 6.2). So the `harness_version` staleness arm still has
+/// no Claude producer; the `chp` arm now does, which is the arm Phase J was for.
+///
+/// Answers [`claude_hook::no_op`] on every path including a rejected tab: a
+/// `SessionStart` hook's output is prepended to the session's context, and cImp
+/// has nothing to say to the model here.
+async fn handle_claude_session_start(
+    stream: &mut TcpStream,
+    app: &AppHandle,
+    req: &Request,
+) -> AppResult<()> {
+    let route = claude_hook::ROUTE_SESSION_START;
+    let no_op = claude_hook::no_op();
+    let Some(input) = parse_hook_input(route, req) else {
+        return write_json(stream, 200, &no_op).await;
+    };
+    let settings = live_settings(app);
+    let Some(tab) = claude_hook_tab(&settings, req) else {
+        warn!(
+            target: "offload",
+            tab = %bounded_id(req.cimp.tab.as_deref().unwrap_or("")),
+            "loopback: a Claude SessionStart hello named no configured tab — not recorded"
+        );
+        return write_json(stream, 200, &no_op).await;
+    };
+    let chp = req.cimp.chp.unwrap_or(crate::harness::chp::PRE_CHP);
+    let version = bounded_id(input.harness_version());
+    let declared = req
+        .cimp
+        .hello
+        .as_deref()
+        .and_then(claude_hook::Hello::parse)
+        .unwrap_or_default();
+    let serves = bounded_declarations(&declared.serves);
+    let cannot: Vec<crate::harness::chp::Unable> = declared
+        .cannot
+        .iter()
+        .take(MAX_HELLO_DECLARATIONS)
+        .map(|u| crate::harness::chp::Unable {
+            id: bounded_id(&u.id),
+            why: bounded_id(&u.why),
+        })
+        .collect();
+    let changed = crate::harness::chp::note_hello(
+        "claude",
+        &tab,
+        chp,
+        &version,
+        serves.clone(),
+        cannot.clone(),
+        crate::activity::now_ms(),
+    );
+    if changed {
+        if let Some(record) =
+            hello_row("claude", &tab, chp, &version, &serves, cannot.len(), claim_hello)
+        {
+            crate::activity::record_bg(record);
+        }
+    }
+    // `source` is `startup` / `resume` / `clear` / `compact`. Not part of the
+    // record — a hello describes the ARTIFACT, and the same overlay is in force
+    // on all four — but it is the difference between "this tab just launched"
+    // and "this tab was resumed", which is the first thing a reader wants when a
+    // hello turns up mid-session.
+    debug!(
+        target: "offload",
+        %tab,
+        chp,
+        source = %bounded_id(&input.source),
+        serves = serves.len(),
+        "claude hello recorded"
+    );
+    write_json(stream, 200, &no_op).await
 }
 
 // ── #48 F-32 / locked decision 37: a child reports what containment did ──────
@@ -6991,9 +7617,49 @@ async fn handle_permission_event(
             .await;
         }
     };
-    let session_id = body.session_id.unwrap_or_default();
-    let transcript_path = body.transcript_path.unwrap_or_default();
-    let cwd = body.cwd.unwrap_or_default();
+    match permission_signal(app, &body).await {
+        PermissionOutcome::Mapped(tab) => {
+            write_json(
+                stream,
+                200,
+                &serde_json::json!({ "ok": true, "mapped": true, "tab": tab }),
+            )
+            .await
+        }
+        PermissionOutcome::Unmapped(reason) => {
+            write_json(
+                stream,
+                200,
+                &serde_json::json!({ "ok": true, "mapped": false, "reason": reason }),
+            )
+            .await
+        }
+    }
+}
+
+/// What one permission payload did: the tab whose state signal was sent, or why
+/// nothing was sent.
+///
+/// The route answers 200 on every arm — the two producers are observe-only and
+/// must never be given a reason to retry — so this exists to keep the *diagnosis*
+/// out of the transport, not to give a caller anything to branch on.
+enum PermissionOutcome {
+    Mapped(String),
+    Unmapped(&'static str),
+}
+
+/// Classify a permission payload, map it to a tab and emit the state signal —
+/// the whole of `/permission/event`'s effect, shared with
+/// [`claude_hook::ROUTE_NOTIFICATION`] (V35 Phase J).
+///
+/// Both producers hand this the same `PermissionEventBody`: the pre-upgrade
+/// `--notify-hook` shim built one from the raw payload before posting it, and
+/// the Claude-native route builds the identical one from the payload it receives
+/// directly. One classifier, one tab-resolution, one signal.
+async fn permission_signal(app: &AppHandle, body: &PermissionEventBody) -> PermissionOutcome {
+    let session_id = body.session_id.clone().unwrap_or_default();
+    let transcript_path = body.transcript_path.clone().unwrap_or_default();
+    let cwd = body.cwd.clone().unwrap_or_default();
     let Some(edge) = classify_permission_event(
         &body.event,
         body.notification_type.as_deref().unwrap_or(""),
@@ -7004,12 +7670,7 @@ async fn handle_permission_event(
             kind = body.notification_type.as_deref().unwrap_or(""),
             "permission hook: ignored (not a permission edge)"
         );
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({ "ok": true, "mapped": false, "reason": "ignored" }),
-        )
-        .await;
+        return PermissionOutcome::Unmapped("ignored");
     };
 
     // Snapshot everything we need from managed state, then drop the guards —
@@ -7044,12 +7705,7 @@ async fn handle_permission_event(
             cwd = %cwd,
             "permission hook: no unambiguous tab — dropped (regex fallback still covers it)"
         );
-        return write_json(
-            stream,
-            200,
-            &serde_json::json!({ "ok": true, "mapped": false, "reason": "no tab" }),
-        )
-        .await;
+        return PermissionOutcome::Unmapped("no tab");
     };
 
     let tab_id = crate::state::TabId::from_str(&tab);
@@ -7087,12 +7743,7 @@ async fn handle_permission_event(
         %tab,
         "permission hook: state signal sent"
     );
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({ "ok": true, "mapped": true, "tab": tab }),
-    )
-    .await
+    PermissionOutcome::Mapped(tab)
 }
 
 /// A `POST /context/post_edit` request body (the Claude `PostToolUse` shim, or
@@ -7269,9 +7920,22 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
     {
         return write_json(stream, 200, &empty).await;
     }
+    let text = post_edit_diagnostics(app, &settings, &body).await;
+    write_json(stream, 200, &serde_json::json!({ "ok": true, "text": text })).await
+}
+
+/// The auto-check diff for one edit, **after** the gate — including V33 C4's
+/// root admission, which is part of the work rather than part of the latch gate.
+/// Shared by `/context/post_edit` and [`claude_hook::ROUTE_POST_TOOL_USE`]; see
+/// [`compaction_block`] for why the latch gate stays at each route.
+async fn post_edit_diagnostics(
+    app: &AppHandle,
+    settings: &crate::settings::Settings,
+    body: &ContextPostEditBody,
+) -> String {
     // V33 C4: decide WHERE before deciding whether there is anything to run —
     // the roots are app-derived, so this cannot be moved by the body.
-    let Some(cwd) = admitted_hook_root(&hook_exec_roots(app, &settings), body.cwd.as_deref()) else {
+    let Some(cwd) = admitted_hook_root(&hook_exec_roots(app, settings), body.cwd.as_deref()) else {
         // Bounded: the rejected string is caller-chosen and unbounded on the
         // wire, and this is the one place it reaches an operator-facing line.
         warn!(
@@ -7281,22 +7945,16 @@ async fn handle_post_edit(stream: &mut TcpStream, app: &AppHandle, req: &Request
              served root and its configured tabs' directories — the project's configured check \
              commands were NOT run there (the edit itself is unaffected)"
         );
-        return write_json(stream, 200, &empty).await;
+        return String::new();
     };
     let Some(graph) = app.try_state::<Arc<crate::graph::GraphService>>() else {
-        return write_json(stream, 200, &empty).await;
+        return String::new();
     };
     let graph = graph.inner().clone();
-    let text = graph
+    graph
         .post_edit(&cwd, body.session_id.as_deref(), &body.file_path)
         .await
-        .unwrap_or_default();
-    write_json(
-        stream,
-        200,
-        &serde_json::json!({ "ok": true, "text": text }),
-    )
-    .await
+        .unwrap_or_default()
 }
 
 /// A `POST /memory/event` request body (the OpenCode plugin's tool hook — the
@@ -8556,6 +9214,7 @@ mod tests {
             method: "POST".into(),
             path: "/run".into(),
             auth: Some("Bearer abc123".into()),
+            cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
         assert!(authorized(&req, "abc123"));
@@ -8564,6 +9223,7 @@ mod tests {
             method: "GET".into(),
             path: "/describe".into(),
             auth: None,
+            cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
         assert!(!authorized(&none, "abc123"));
@@ -8587,6 +9247,7 @@ mod tests {
             method: "GET".into(),
             path: "/events".into(),
             auth: None,
+            cimp: CimpHeaders::default(),
             body: Vec::new(),
         };
         assert_eq!(consumer_of(&legacy), Consumer::Claude);
@@ -9834,21 +10495,30 @@ mod tests {
     /// why it needs a tripwire rather than a reader's attention.
     ///
     /// **What this would still pass if the implementation were wrong:** a NEW
-    /// shim that reports drift under an unlisted name. That case degrades safely
-    /// (it shares the sentinel bucket, so it gets fewer rows, never more) and
-    /// cannot be enumerated from here without scanning the source tree at test
-    /// time. **It happened**: `checkpoint_beacon` shipped with V33 Phase F
-    /// reporting drift under its own name and no entry in the list, which is why
-    /// the length assertion below now names the failure it is guarding rather
-    /// than just pinning a number.
+    /// reporter using an unlisted name. That case degrades safely (it shares the
+    /// sentinel bucket, so it gets fewer rows, never more) and cannot be
+    /// enumerated from here without scanning the source tree at test time.
+    /// **It happened**: `checkpoint_beacon` shipped with V33 Phase F reporting
+    /// drift under its own name and no entry in the list, which is why the
+    /// length assertion below names the failure it is guarding rather than just
+    /// pinning a number.
+    ///
+    /// **V35 Phase J changed the sources, not the names.** Four of the six
+    /// reporters are no longer binaries: `context_hook`, `compact_hook`,
+    /// `read_hook` and `notify_hook` are `type: "http"` routes whose payload
+    /// checks run in-process (`harness::claude_hook`), and their tokens are
+    /// deliberately unchanged — a pre-upgrade tab is still running the old shim
+    /// and still POSTs these exact strings, so both paths land in ONE bucket per
+    /// capability. The scan therefore points at the module that sends them now.
     #[test]
     fn the_drift_shim_list_is_spelled_the_way_the_shims_spell_it() {
+        const CLAUDE_HOOK: &str = include_str!("../harness/claude_hook.rs");
         for (shim, src) in [
             ("checkpoint_beacon", include_str!("../checkpoint_beacon.rs")),
-            ("compact_hook", include_str!("../compact_hook.rs")),
-            ("context_hook", include_str!("../context_hook.rs")),
-            ("notify_hook", include_str!("../notify_hook.rs")),
-            ("read_hook", include_str!("../read_hook.rs")),
+            ("compact_hook", CLAUDE_HOOK),
+            ("context_hook", CLAUDE_HOOK),
+            ("notify_hook", CLAUDE_HOOK),
+            ("read_hook", CLAUDE_HOOK),
             ("taint_beacon", include_str!("../taint_beacon.rs")),
         ] {
             assert!(
@@ -9859,13 +10529,23 @@ mod tests {
                 src.contains(&format!("\"{shim}\"")),
                 "{shim} is not the name that module sends"
             );
+            // …and the four converted ones resolve through the route table, so a
+            // renamed token cannot quietly split a capability's reports in two.
+            if src == CLAUDE_HOOK {
+                assert!(
+                    claude_hook::ROUTES
+                        .iter()
+                        .any(|r| claude_hook::drift_token(r) == Some(shim)),
+                    "{shim} is listed but no Claude hook route reports under it"
+                );
+            }
         }
         assert_eq!(
             DRIFT_SHIMS.len(),
             6,
-            "a new shim that reports drift needs BOTH an entry here and its source \
-             pinned in the loop above — otherwise its reports fold into the \
-             unrecognized-shim bucket and nothing fails"
+            "a new reporter needs BOTH an entry here and its source pinned in the \
+             loop above — otherwise its reports fold into the unrecognized-shim \
+             bucket and nothing fails"
         );
         assert!(!DRIFT_SHIMS.contains(&DRIFT_SHIM_UNKNOWN));
     }
@@ -9965,7 +10645,7 @@ mod tests {
     /// CHP message*, which is the seam a new route would silently fall out of.
     #[test]
     fn the_chp_observation_reads_every_body_the_routes_actually_send() {
-        // Exactly the body `context_hook.rs` builds today — no `chp`.
+        // Exactly the body a pre-Phase-J `--context-hook` shim still posts — no `chp`.
         let (env, tab) = crate::harness::chp::envelope(
             "/context/retrieve",
             br#"{"cwd":"P:\\p","prompt":"hi","session_id":"s","agent":"claude","tab":"claude-1"}"#,
@@ -15563,6 +16243,71 @@ mod tests {
                  local data and grants nothing",
             ),
         ),
+        // ── V35 Phase J: the Claude-native ingress ───────────────────────────
+        //
+        // Six routes carrying Claude Code's own hook payloads, replacing five
+        // shim binaries. Each declares the SAME containment as the CHP route it
+        // shares a core with, and the test below checks that against the
+        // handler's own source — so the two transports cannot come to gate
+        // differently, which is the only way this phase could have introduced a
+        // containment hole.
+        route(
+            "/claude/hook/user_prompt_submit",
+            "POST",
+            "handle_claude_user_prompt_submit",
+            // Same recorded residual as `/context/retrieve`, whose core this
+            // shares: the auto-injection channel is contained by the
+            // spotlight/quarantine envelope, not by refusal.
+            Containment::NoRegistry(
+                "auto-injection; contained by the spotlight/quarantine envelope, not by refusal",
+            ),
+        ),
+        route(
+            "/claude/hook/pre_compact",
+            "POST",
+            "handle_claude_pre_compact",
+            Containment::GatesFixedTool {
+                tool: HOOK_TOOL_COMPACTION,
+                refused_under_external: false,
+            },
+        ),
+        route(
+            "/claude/hook/pre_tool_use",
+            "POST",
+            "handle_claude_pre_tool_use",
+            Containment::GatesFixedTool {
+                tool: HOOK_TOOL_SHOULD_READ,
+                refused_under_external: true,
+            },
+        ),
+        route(
+            "/claude/hook/post_tool_use",
+            "POST",
+            "handle_claude_post_tool_use",
+            Containment::GatesFixedTool {
+                tool: HOOK_TOOL_POST_EDIT,
+                refused_under_external: true,
+            },
+        ),
+        route(
+            "/claude/hook/notification",
+            "POST",
+            "handle_claude_notification",
+            Containment::NoRegistry("a hook reporting a permission prompt; returns nothing"),
+        ),
+        route(
+            "/claude/hook/session_start",
+            "POST",
+            "handle_claude_session_start",
+            // The Claude twin of `/session/hello`, and ungated for its reasons:
+            // it hands back no project data and grants no capability, while a
+            // refusal would deny cImp the one message that says a tab is running
+            // a STALE overlay.
+            Containment::NoRegistry(
+                "a harness artifact declaring its protocol version and capabilities; returns no \
+                 local data and grants nothing",
+            ),
+        ),
         route(
             "/mcp/list",
             "POST",
@@ -15629,12 +16374,18 @@ mod tests {
     /// Starts at the SIGNATURE, so a handler's doc comment is deliberately not
     /// part of it: a route must not be able to claim a gate in prose.
     fn handler_body(src: &str, name: &str) -> String {
-        let sig = format!("async fn {name}(");
+        fn_body(src, &format!("async fn {name}("))
+    }
+
+    /// [`handler_body`] for any top-level item, given its exact opening text —
+    /// so a non-`async` helper (or a shared core, V35 Phase J) can be scanned by
+    /// the same rules.
+    fn fn_body(src: &str, sig: &str) -> String {
         let mut out = String::new();
         let mut inside = false;
         for line in src.lines() {
             if !inside {
-                if !line.starts_with(&sig) {
+                if !line.starts_with(sig) {
                     continue;
                 }
                 inside = true;
@@ -15646,10 +16397,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!out.is_empty(), "no top-level `async fn {name}`");
+        assert!(!out.is_empty(), "no top-level `{sig}`");
         assert!(
             out.ends_with("}\n"),
-            "`async fn {name}` was not terminated — the scan would read past it"
+            "`{sig}` was not terminated — the scan would read past it"
         );
         out
     }
@@ -16065,23 +16816,35 @@ mod tests {
     /// kind of claim that survives its own violation if it lives only in prose.
     /// Two structural assertions:
     ///
-    /// 1. The handler resolves its working directory through the pair, so the
+    /// 1. The work resolves its working directory through the pair, so the
     ///    check cannot be deleted while the route keeps running commands.
     /// 2. [`hook_exec_roots`] takes the `AppHandle` and the settings snapshot
     ///    and NOTHING ELSE — the request is not in scope, so no future edit can
     ///    let a body widen the allowlist without changing this signature.
+    ///
+    /// **V35 Phase J moved the scan one frame down.** The admission now lives in
+    /// [`post_edit_diagnostics`], the core BOTH post-edit transports call, and
+    /// each transport's handler is asserted to go through it — which makes the
+    /// C4 guarantee stronger, not weaker: it is now impossible for the http
+    /// route to grow its own directory resolution without failing here.
     #[test]
     fn post_edit_takes_its_working_directory_from_the_app_not_from_the_body() {
         let src = include_str!("loopback.rs");
-        let body = handler_body(src, "handle_post_edit");
+        let body = fn_body(src, "async fn post_edit_diagnostics(");
         assert!(
-            body.contains("admitted_hook_root(&hook_exec_roots(app, &settings), body.cwd.as_deref())"),
+            body.contains("admitted_hook_root(&hook_exec_roots(app, settings), body.cwd.as_deref())"),
             "the route must resolve its cwd through the C4 allowlist: {body}"
         );
         assert!(
             !body.contains("PathBuf::from(\".\")"),
             "the pre-V33 caller-supplied default is back: {body}"
         );
+        for handler in ["handle_post_edit", "handle_claude_post_tool_use"] {
+            assert!(
+                handler_body(src, handler).contains("post_edit_diagnostics("),
+                "{handler} must run the checks through the one admitted-root core"
+            );
+        }
         assert!(
             src.contains(
                 "fn hook_exec_roots(app: &AppHandle, settings: &crate::settings::Settings) -> Vec<PathBuf>"
@@ -16140,6 +16903,291 @@ mod tests {
         .expect("post-#48 post_edit body");
         assert_eq!(edit.tab.as_deref(), Some("claude-1"));
         assert_eq!(edit.agent.as_deref(), Some("opencode"));
+    }
+
+    // ── V35 Phase J: the two transports meet at one body ────────────────────
+
+    /// **The convergence assertion.** For the same logical input, the Claude
+    /// `type: "http"` route builds *byte-identically* the CHP body the deleted
+    /// shim used to POST — which is what makes "both paths have the same
+    /// internal effect" a fact rather than a hope, since everything downstream
+    /// of the body is already one shared core per capability.
+    ///
+    /// The expected values are the deleted shims' own `serde_json::json!`
+    /// literals, transcribed. A test that built them from the new mapping would
+    /// assert nothing; these are what `context_hook.rs`, `compact_hook.rs`,
+    /// `read_hook.rs`, `postedit_hook.rs` and `notify_hook.rs` sent on
+    /// `develop` before this phase.
+    ///
+    /// The parse half is the other direction: the same literal, deserialized
+    /// through the route's own body type, must land on the same fields — so a
+    /// pre-upgrade tab's POST and this build's mapping are one body in both
+    /// senses.
+    #[test]
+    fn a_claude_http_hook_builds_the_body_its_shim_used_to_post() {
+        let tab = || Some("claude-1".to_string());
+        let cwd = || Some("P:\\proj".to_string());
+
+        // ── UserPromptSubmit / context_hook ──────────────────────────────
+        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-a",
+            "cwd": "P:\\proj",
+            "prompt": "why is the build slow?",
+        }))
+        .expect("hook input");
+        let mapped = retrieve_body_from_hook(&input, tab(), cwd());
+        let shim: ContextRetrieveBody = serde_json::from_value(serde_json::json!({
+            "cwd": "P:\\proj",
+            "prompt": "why is the build slow?",
+            "session_id": "sess-a",
+            "agent": "claude",
+            "tab": "claude-1",
+        }))
+        .expect("the shim's body");
+        assert_eq!((mapped.cwd, mapped.prompt), (shim.cwd, shim.prompt));
+        assert_eq!(mapped.session_id, shim.session_id);
+        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+
+        // ── PreCompact / compact_hook ────────────────────────────────────
+        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PreCompact",
+            "session_id": "sess-a",
+            "cwd": "P:\\proj",
+            "trigger": "auto",
+        }))
+        .expect("hook input");
+        let mapped = compaction_body_from_hook(&input, tab(), cwd());
+        let shim: ContextCompactionBody = serde_json::from_value(serde_json::json!({
+            "cwd": "P:\\proj",
+            "session_id": "sess-a",
+            "trigger": "auto",
+            "agent": "claude",
+            "tab": "claude-1",
+        }))
+        .expect("the shim's body");
+        assert_eq!(mapped.cwd, shim.cwd);
+        assert_eq!(mapped.session_id, shim.session_id);
+        assert_eq!(mapped.trigger, shim.trigger);
+        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+
+        // ── PreToolUse / read_hook, on BOTH its matchers ─────────────────
+        for (tool_input, want_path, want_offset, want_limit, want_prefix) in [
+            (
+                serde_json::json!({ "file_path": "P:\\proj\\big.rs", "offset": 40, "limit": 80 }),
+                "P:\\proj\\big.rs",
+                Some(40u32),
+                Some(80u32),
+                "",
+            ),
+            (
+                serde_json::json!({ "command": "cat P:\\proj\\big.rs" }),
+                "P:\\proj\\big.rs",
+                None,
+                None,
+                claude_hook::BASH_DENY_PREFIX,
+            ),
+        ] {
+            let tool = if tool_input.get("command").is_some() {
+                "Bash"
+            } else {
+                "Read"
+            };
+            let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "sess-a",
+                "cwd": "P:\\proj",
+                "tool_name": tool,
+                "tool_input": tool_input,
+            }))
+            .expect("hook input");
+            let plan = claude_hook::plan_request(Some(tool), &input.tool_input, "P:\\proj")
+                .expect("a verdict request");
+            assert_eq!(plan.deny_prefix, want_prefix);
+            let mapped = should_read_body_from_hook(&input, &plan, tab(), cwd());
+            let shim: ShouldReadBody = serde_json::from_value(serde_json::json!({
+                "cwd": "P:\\proj",
+                "session_id": "sess-a",
+                "file_path": want_path,
+                "offset": want_offset,
+                "limit": want_limit,
+                "agent": "claude",
+                "tab": "claude-1",
+            }))
+            .expect("the shim's body");
+            assert_eq!(mapped.cwd, shim.cwd);
+            assert_eq!(mapped.file_path, shim.file_path, "tool {tool}");
+            assert_eq!((mapped.offset, mapped.limit), (shim.offset, shim.limit));
+            assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+        }
+
+        // ── PostToolUse / postedit_hook ──────────────────────────────────
+        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-a",
+            "cwd": "P:\\proj",
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "P:\\proj\\a.rs" },
+        }))
+        .expect("hook input");
+        let mapped = post_edit_body_from_hook(&input, tab(), cwd());
+        let shim: ContextPostEditBody = serde_json::from_value(serde_json::json!({
+            "cwd": "P:\\proj",
+            "session_id": "sess-a",
+            "file_path": "P:\\proj\\a.rs",
+            "tool_name": "Edit",
+            "agent": "claude",
+            "tab": "claude-1",
+        }))
+        .expect("the shim's body");
+        assert_eq!(mapped.cwd, shim.cwd);
+        assert_eq!(mapped.file_path, shim.file_path);
+        assert_eq!((mapped.agent, mapped.tab), (shim.agent, shim.tab));
+
+        // ── Notification / notify_hook, in the NESTED payload shape ──────
+        //
+        // The nested spelling is the one the shim's module doc records as
+        // UNVERIFIED upstream, so it is the shape worth pinning: both spellings
+        // must flatten to the same body.
+        let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "Notification",
+            "session_id": "sess-a",
+            "cwd": "P:\\proj",
+            "transcript_path": "C:/t/sess-a.jsonl",
+            "notification": { "type": "permission_prompt", "message": "needs your permission" },
+        }))
+        .expect("hook input");
+        let mapped = permission_body_from_hook(&input, cwd());
+        let shim: PermissionEventBody = serde_json::from_value(serde_json::json!({
+            "cwd": "P:\\proj",
+            "session_id": "sess-a",
+            "transcript_path": "C:/t/sess-a.jsonl",
+            "event": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "needs your permission",
+            "tool_name": "",
+        }))
+        .expect("the shim's body");
+        assert_eq!(mapped.cwd, shim.cwd);
+        assert_eq!(mapped.event, shim.event);
+        assert_eq!(mapped.transcript_path, shim.transcript_path);
+        assert_eq!(mapped.notification_type, shim.notification_type);
+        assert_eq!(mapped.message, shim.message);
+        // …and it carries no identity fields at all, exactly as the shim's did.
+        let raw = serde_json::to_value(serde_json::json!({})).unwrap();
+        assert!(raw.get("agent").is_none() && raw.get("tab").is_none());
+
+        // The classifier reaches the same verdict from both bodies, which is the
+        // effect the two transports have to share.
+        assert_eq!(
+            classify_permission_event(
+                &mapped.event,
+                mapped.notification_type.as_deref().unwrap_or(""),
+                mapped.message.as_deref().unwrap_or("")
+            ),
+            Some(PermissionEdge::Detected)
+        );
+    }
+
+    /// Both transports of each capability run through the SAME core function —
+    /// scanned from the source, because a shared core that only one side calls
+    /// is how two paths silently diverge while every unit test stays green.
+    #[test]
+    fn both_transports_of_a_capability_call_one_core() {
+        let src = include_str!("loopback.rs");
+        for (core, handlers) in [
+            (
+                "context_retrieve_core(",
+                ["handle_context_retrieve", "handle_claude_user_prompt_submit"],
+            ),
+            (
+                "compaction_block(",
+                ["handle_context_compaction", "handle_claude_pre_compact"],
+            ),
+            (
+                "should_read_verdict(",
+                ["handle_should_read", "handle_claude_pre_tool_use"],
+            ),
+            (
+                "post_edit_diagnostics(",
+                ["handle_post_edit", "handle_claude_post_tool_use"],
+            ),
+            (
+                "permission_signal(",
+                ["handle_permission_event", "handle_claude_notification"],
+            ),
+        ] {
+            for h in handlers {
+                assert!(
+                    handler_body(src, h).contains(core),
+                    "`{h}` must reach `{core}` — the two transports of one capability may not \
+                     grow separate implementations"
+                );
+            }
+        }
+        // …and the three gated Claude routes carry their own `hook_admit` call
+        // rather than inheriting one, which is what keeps the route-enumeration
+        // test above able to see the gate at the route.
+        for h in [
+            "handle_claude_pre_compact",
+            "handle_claude_pre_tool_use",
+            "handle_claude_post_tool_use",
+        ] {
+            assert!(
+                handler_body(src, h).contains("hook_admit(\n        latches(),"),
+                "`{h}` must gate in its own body"
+            );
+        }
+    }
+
+    /// The dispatch arms spell the same paths `claude_hook` exports.
+    ///
+    /// The arms are literals (the route-enumeration test scans this `match` as
+    /// text) while the overlay generator emits the constants, so without this
+    /// the two could part company and every Claude hook would 404 — which,
+    /// being fail-open, would look exactly like a feature quietly switching
+    /// itself off.
+    #[test]
+    fn the_dispatch_arms_spell_the_routes_claude_hook_exports() {
+        let src = include_str!("loopback.rs");
+        let dispatched = dispatched_routes(src);
+        for route in claude_hook::ROUTES {
+            assert!(
+                dispatched.contains(route),
+                "`{route}` is emitted into the overlay but no dispatch arm serves it"
+            );
+        }
+        // The reverse: nothing under the prefix is dispatched that the module
+        // does not declare.
+        for r in &dispatched {
+            if r.starts_with(claude_hook::ROUTE_PREFIX) {
+                assert!(
+                    claude_hook::is_hook_route(r),
+                    "`{r}` is dispatched but is not in `claude_hook::ROUTES`"
+                );
+            }
+        }
+    }
+
+    /// The `X-CIMP-*` headers are read under exactly the names the overlay
+    /// emits. `read_request` lowercases keys and matches lowercase literals, so
+    /// a rename on either side is a silent loss of identity — the hook would
+    /// still 200 and simply stop being attributed to a tab.
+    #[test]
+    fn the_cimp_headers_are_read_under_the_names_the_overlay_emits() {
+        let src = include_str!("loopback.rs");
+        for name in [
+            claude_hook::HEADER_TAB,
+            claude_hook::HEADER_AGENT,
+            claude_hook::HEADER_CHP,
+            claude_hook::HEADER_HELLO,
+        ] {
+            let lower = name.to_ascii_lowercase();
+            assert!(
+                src.contains(&format!("\"{lower}\" =>")),
+                "`{name}` is emitted but `read_request` never matches `{lower}`"
+            );
+        }
     }
 
     /// **Neither clear is reachable over HTTP**, which is the invariant the whole

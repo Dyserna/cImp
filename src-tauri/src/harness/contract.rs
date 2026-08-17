@@ -197,6 +197,21 @@ pub struct Capability {
     /// *execute inside* this capability rather than merely depending on it.
     /// Documentation, not a gate.
     pub controls: &'static [&'static str],
+    /// The `shim` token this capability's payload-drift reports arrive under at
+    /// `POST /activity/contract_drift` — the join [`capability_for_payload_shim`]
+    /// makes. `None` for a row nothing ever reports about.
+    ///
+    /// **Explicit since V35 Phase J**, and the change is a consequence of the
+    /// phase rather than a preference. The attribution used to be *inferred*
+    /// from [`Capability::wired_in`] — `read_hook` ⇒ `src-tauri/src/read_hook.rs`
+    /// ⇒ this row — which worked while every reporter was its own binary in its
+    /// own file. Phase J deleted those five files and moved four of the
+    /// reporters into ONE module (`harness/claude_hook.rs`) plus one handler
+    /// file, so the inference has nothing left to discriminate on: four rows now
+    /// name the same two paths. Naming the token is the honest replacement, and
+    /// the tests below assert it is unique and that every `drift.payload.v1` row
+    /// carries one.
+    pub drift_token: Option<&'static str>,
 }
 
 /// V32 Phase H native-tool containment: the enforcement `throw` in the
@@ -263,39 +278,59 @@ pub const CAPABILITIES: &[Capability] = &[
         id: "claude.hook.user_prompt_submit",
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "A `UserPromptSubmit` hook receives `{prompt, session_id, cwd}` on stdin, and \
-                   the `hookSpecificOutput.additionalContext` it writes to stdout is prepended to \
-                   the user's prompt and reaches the model.",
+        contract: "A `UserPromptSubmit` hook of `type: \"http\"` (Claude Code ≥ 2.1.63) POSTs \
+                   `{prompt, session_id, cwd}` as JSON, substitutes `$CIMP_HOOK_TOKEN` into the \
+                   configured `Authorization` header from `allowedEnvVars`, and parses the 2xx \
+                   JSON reply exactly as it parses a command hook's stdout — so the \
+                   `hookSpecificOutput.additionalContext` cImp answers with is prepended to the \
+                   user's prompt and reaches the model.",
         depends_on: &[
             Dep::ConfigKey("hooks.UserPromptSubmit"),
+            Dep::ConfigKey("type=http"),
+            Dep::ConfigKey("headers"),
+            Dep::ConfigKey("allowedEnvVars"),
+            Dep::ConfigKey("timeout"),
             Dep::JsonPath("prompt"),
             Dep::JsonPath("session_id"),
             Dep::JsonPath("cwd"),
             Dep::JsonPath("hookSpecificOutput.hookEventName"),
             Dep::JsonPath("hookSpecificOutput.additionalContext"),
+            Dep::Behavior(
+                "a 2xx JSON response body is parsed as hook output, and a timeout / refused \
+                 connection / non-2xx is a NON-BLOCKING error — the fail-open contract the \
+                 deleted shim used to provide by printing nothing and exiting 0",
+            ),
         ],
-        wired_in: &["src-tauri/src/context_hook.rs", "src-tauri/src/tabs/config.rs"],
+        wired_in: &[
+            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tabs/config.rs",
+        ],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_INJECTION_UNSEEN, RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
         waiver: Some(
             "V16 lags both halves: `drift.injection_unseen.v1` watches the follow-rate collapse, \
-             and the `context_hook` shim reports a payload missing `session_id`/`cwd` as \
-             `drift.payload.v1`. Both are lagging; the leading fixture check over the stdout \
-             envelope lands in V35 Phase B.",
+             and the route reports a payload missing `session_id`/`cwd` as `drift.payload.v1` \
+             (under the token `context_hook`, unchanged from the shim so a pre-upgrade tab's \
+             reports land in the same bucket). Both are lagging; the leading fixture check over \
+             the response envelope lands in V35 Phase B.",
         ),
         controls: &[],
+        drift_token: Some("context_hook"),
     },
     Capability {
         id: "claude.hook.precompact",
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "A `PreCompact` hook receives `{session_id, trigger, cwd}` and its \
-                   `hookSpecificOutput.additionalContext` reaches the *compaction prompt* — \
-                   spike D0, outcome recorded in `harness_versions.d0_status`.",
+        contract: "A `PreCompact` hook of `type: \"http\"` POSTs `{session_id, trigger, cwd}` and \
+                   the `hookSpecificOutput.additionalContext` in its 2xx JSON reply reaches the \
+                   *compaction prompt* — spike D0, outcome recorded in \
+                   `harness_versions.d0_status`.",
         depends_on: &[
             Dep::ConfigKey("hooks.PreCompact"),
+            Dep::ConfigKey("type=http"),
             Dep::JsonPath("session_id"),
             Dep::JsonPath("trigger"),
             Dep::JsonPath("cwd"),
@@ -306,30 +341,40 @@ pub const CAPABILITIES: &[Capability] = &[
                  (spike D0 — still `unverified`)",
             ),
         ],
-        wired_in: &["src-tauri/src/compact_hook.rs", "src-tauri/src/tabs/config.rs"],
+        wired_in: &[
+            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tabs/config.rs",
+        ],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_PAYLOAD],
         canary: None,
         probe: None,
         waiver: Some(
-            "The payload half is covered by the `compact_hook` shim's `drift.payload.v1` reports. \
-             The behavior half is spike D0 and stays manual by milestone decision 7 — no payload \
-             reveals whether a compaction prompt consumed the block. A D0 failure degrades to a \
-             no-op (server-side dedup-clear stays correct regardless), so this is an accepted \
-             residual rather than a scheduled canary.",
+            "The payload half is covered by the route's `drift.payload.v1` reports (token \
+             `compact_hook`, unchanged from the deleted shim). The behavior half is spike D0 and \
+             stays manual by milestone decision 7 — no payload reveals whether a compaction \
+             prompt consumed the block. A D0 failure degrades to a no-op (server-side dedup-clear \
+             stays correct regardless), so this is an accepted residual rather than a scheduled \
+             canary.",
         ),
         controls: &[],
+        drift_token: Some("compact_hook"),
     },
     Capability {
         id: CAP_PRETOOLUSE_DENY,
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "A `PreToolUse` hook can deny a tool call with \
-                   `hookSpecificOutput.permissionDecision: \"deny\"`, and the accompanying \
+        contract: "A `PreToolUse` hook of `type: \"http\"` can deny a tool call by answering 2xx \
+                   with `hookSpecificOutput.permissionDecision: \"deny\"`, and the accompanying \
                    `permissionDecisionReason` is surfaced **to the model** — not only to the \
-                   user. Spike E1, recorded in `harness_versions.e1_status`.",
+                   user. Spike E1, recorded in `harness_versions.e1_status`. **Blocking is \
+                   expressible only this way**: a non-2xx, a timeout and a refused connection are \
+                   all non-blocking, which is what makes the advisor structurally unable to \
+                   refuse a read by failing.",
         depends_on: &[
             Dep::ConfigKey("hooks.PreToolUse"),
+            Dep::ConfigKey("type=http"),
             Dep::JsonPath("tool_name"),
             Dep::JsonPath("tool_input.file_path"),
             Dep::JsonPath("tool_input.command"),
@@ -342,7 +387,11 @@ pub const CAPABILITIES: &[Capability] = &[
                  bare refusal (spike E1) — the D-component of this Tier-B row",
             ),
         ],
-        wired_in: &["src-tauri/src/read_hook.rs", "src-tauri/src/tabs/config.rs"],
+        wired_in: &[
+            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tabs/config.rs",
+        ],
         degradation: Degradation::FailClosed,
         drift_rule: &[
             RULE_DRIFT_READ_REASON,
@@ -354,16 +403,19 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: None,
         waiver: None,
         controls: &[],
+        drift_token: Some("read_hook"),
     },
     Capability {
         id: "claude.hook.posttooluse",
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "A `PostToolUse` hook fires for `Edit` / `Write` / `MultiEdit` with the \
-                   documented payload (`tool_name`, `tool_input.file_path`, `session_id`, `cwd`) \
-                   and accepts `hookSpecificOutput.additionalContext` back.",
+        contract: "A `PostToolUse` hook of `type: \"http\"` fires for `Edit` / `Write` / \
+                   `MultiEdit` with the documented payload (`tool_name`, `tool_input.file_path`, \
+                   `session_id`, `cwd`) and accepts `hookSpecificOutput.additionalContext` back \
+                   in the 2xx JSON reply.",
         depends_on: &[
             Dep::ConfigKey("hooks.PostToolUse"),
+            Dep::ConfigKey("type=http"),
             Dep::JsonPath("tool_name"),
             Dep::JsonPath("tool_input.file_path"),
             Dep::JsonPath("session_id"),
@@ -371,32 +423,40 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("hookSpecificOutput.hookEventName"),
             Dep::JsonPath("hookSpecificOutput.additionalContext"),
         ],
-        wired_in: &["src-tauri/src/postedit_hook.rs", "src-tauri/src/tabs/config.rs"],
+        wired_in: &[
+            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/offload/loopback.rs",
+            "src-tauri/src/tabs/config.rs",
+        ],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
         probe: None,
         waiver: Some(
-            "GAP, recorded rather than assumed: `postedit_hook.rs` is the ONE shim that never \
-             calls `report_contract_drift`, so `drift.payload.v1` does NOT lag this row and no \
-             other V16 rule does either — a matcher or field rename stops auto-check diagnostics \
-             with nothing firing anywhere. Canary lands in V35 Phase B; owner is the V35 \
-             milestone.",
+            "GAP, recorded rather than assumed and deliberately NOT closed by V35 Phase J: this \
+             is the ONE converted hook that reports no payload drift (it was the one shim that \
+             never called `report_contract_drift`), so `drift.payload.v1` does NOT lag this row \
+             and no other V16 rule does either — a matcher or field rename stops auto-check \
+             diagnostics with nothing firing anywhere. Inventing a report during the http \
+             migration would have moved a recorded gap into a footnote. Canary lands in V35 \
+             Phase B; owner is the V35 milestone.",
         ),
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "claude.hook.notification",
         harness: Harness::Claude,
         tier: Seam::B,
-        contract: "`Notification` and `PermissionDenied` hooks fire (matcher `\"\"` = all types) \
-                   with `{hook_event_name, session_id, cwd, transcript_path}` plus a type and a \
-                   message. The type/message pair is read BOTH flat \
+        contract: "`Notification` and `PermissionDenied` hooks of `type: \"http\"` fire (matcher \
+                   `\"\"` = all types) with `{hook_event_name, session_id, cwd, transcript_path}` \
+                   plus a type and a message. The type/message pair is read BOTH flat \
                    (`notification_type`/`message`) and nested (`notification.{type,message}`) \
                    because the upstream docs are ambiguous about which shape ships.",
         depends_on: &[
             Dep::ConfigKey("hooks.Notification"),
             Dep::ConfigKey("hooks.PermissionDenied"),
+            Dep::ConfigKey("type=http"),
             Dep::JsonPath("hook_event_name"),
             Dep::JsonPath("session_id"),
             Dep::JsonPath("cwd"),
@@ -412,7 +472,7 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
         ],
         wired_in: &[
-            "src-tauri/src/notify_hook.rs",
+            "src-tauri/src/harness/claude_hook.rs",
             "src-tauri/src/offload/loopback.rs",
             "src-tauri/src/tabs/config.rs",
         ],
@@ -424,6 +484,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: None,
         waiver: None,
         controls: &[],
+        drift_token: Some("notify_hook"),
     },
     // ── Claude Code: the two beacon shims (Tier D — V35 Phase I) ────────────
     //
@@ -486,6 +547,7 @@ pub const CAPABILITIES: &[Capability] = &[
              first.",
         ),
         controls: &[CONTROL_TAINT_BEACON_CLAUDE],
+        drift_token: Some("taint_beacon"),
     },
     Capability {
         id: "claude.hook.checkpoint_beacon",
@@ -529,6 +591,7 @@ pub const CAPABILITIES: &[Capability] = &[
              scripted-turn probe.",
         ),
         controls: &[CONTROL_CHECKPOINT_PRE_MUTATION_CLAUDE],
+        drift_token: Some("checkpoint_beacon"),
     },
     // ── Claude Code: scraped UI (Tier D) ────────────────────────────────────
     Capability {
@@ -569,6 +632,7 @@ pub const CAPABILITIES: &[Capability] = &[
              minutes. Accepted residual; the real fix is the D→C→B migration of decision 2.",
         ),
         controls: &[],
+        drift_token: None,
     },
     // ── Claude Code: emitted transcript artifact (Tier C) ───────────────────
     Capability {
@@ -594,6 +658,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: Some("claude.transcript.usage"),
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "claude.transcript.tool_result",
@@ -621,6 +686,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: Some("claude.transcript.tool_result"),
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "claude.transcript.identity",
@@ -651,6 +717,7 @@ pub const CAPABILITIES: &[Capability] = &[
              indicator, and the reason this row needs a leading check more than most.",
         ),
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "claude.transcript.subagents",
@@ -677,6 +744,7 @@ pub const CAPABILITIES: &[Capability] = &[
              Task→Agent rename), which is the evidence this layout moves.",
         ),
         controls: &[],
+        drift_token: None,
     },
     // ── Claude Code: statusline stdin (Tier C) ──────────────────────────────
     //
@@ -735,6 +803,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: None,
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     // ── Claude Code: spawn flags (Tier B) ───────────────────────────────────
     Capability {
@@ -766,6 +835,7 @@ pub const CAPABILITIES: &[Capability] = &[
              any row here. Tier B and cheap to canary — scheduled for V35 Phase B/C.",
         ),
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "claude.flag.session_id",
@@ -808,6 +878,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: Some("claude.flag.session_id"),
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     // ── OpenCode: SSE artifact (Tier C) ─────────────────────────────────────
     Capability {
@@ -845,6 +916,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: None,
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     // ── OpenCode: HTTP routes (Tiers B and D) ───────────────────────────────
     Capability {
@@ -873,6 +945,7 @@ pub const CAPABILITIES: &[Capability] = &[
              `unknown` (`probe::DECLARED_UNPROBED`) so it is counted rather than omitted.",
         ),
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "opencode.route.noauth",
@@ -899,6 +972,7 @@ pub const CAPABILITIES: &[Capability] = &[
         probe: Some("opencode.route.noauth"),
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     // ── OpenCode: tool registry + plugin (Tiers C and D) ────────────────────
     Capability {
@@ -931,6 +1005,7 @@ pub const CAPABILITIES: &[Capability] = &[
         // right — that is `opencode.plugin.load_all`'s TCB waiver.
         waiver: None,
         controls: &[],
+        drift_token: None,
     },
     Capability {
         id: "opencode.plugin.load_all",
@@ -974,6 +1049,7 @@ pub const CAPABILITIES: &[Capability] = &[
             CONTROL_CHECKPOINT_PRE_MUTATION,
             CONTROL_TAINT_BEACON,
         ],
+        drift_token: None,
     },
 ];
 
@@ -1130,42 +1206,38 @@ pub fn capabilities_for_rule(rule: &str) -> Vec<&'static Capability> {
         .collect()
 }
 
-/// The registry row for the hook shim that reported a payload drift under
-/// `shim` — `context_hook::report_contract_drift`'s first argument, which
-/// `loopback::contract_drift_row` records as the leading token of the activity
-/// target (`"<shim>: <missing fields>"`).
+/// The registry row for the reporter that filed a payload drift under `shim` —
+/// the first argument of the drift report, which `loopback::contract_drift_row`
+/// records as the leading token of the activity target
+/// (`"<shim>: <missing fields>"`).
 ///
-/// Resolved through the [`Capability::wired_in`] column rather than a second
-/// hand-kept map: `read_hook` ⇒ `src-tauri/src/read_hook.rs` ⇒
-/// [`CAP_PRETOOLUSE_DENY`]. That is what keeps the attribution from drifting
-/// when a shim moves — the same test that keeps `wired_in` pointing at real
-/// files keeps this pointing at the right row.
+/// Resolved through the [`Capability::drift_token`] column.
 ///
-/// **V35 Phase I closed Phase E's accepted residual here.** `taint_beacon` and
-/// `checkpoint_beacon` used to resolve to `None` — they report through this
-/// route under their own shim names and had no registry row of their own, so
-/// their drift kept the un-consolidated `drift.payload.v1` channel rather than
-/// being mis-attributed. They now have rows (`claude.hook.taint_beacon`,
-/// `claude.hook.checkpoint_beacon`) and resolve through exactly the same
-/// `wired_in` mechanism as the other four — no second map, no special case: the
-/// rows name `src-tauri/src/{taint,checkpoint}_beacon.rs` and the suffix match
-/// does the rest.
+/// **That column is V35 Phase J, and it replaced an inference.** The attribution
+/// used to derive from [`Capability::wired_in`] — `read_hook` ⇒
+/// `src-tauri/src/read_hook.rs` ⇒ [`CAP_PRETOOLUSE_DENY`] — which was exact
+/// while every reporter was its own binary in its own file, and which Phase I
+/// leaned on to close Phase E's residual for the two beacons at zero cost.
+/// Phase J deleted the five shim files and moved four of the six reporters into
+/// one module, so the file-suffix inference has nothing left to discriminate on.
+/// Naming the token is the honest replacement: the tokens themselves are
+/// unchanged (a pre-upgrade tab still POSTs them from its old shim binary), and
+/// the tests below assert uniqueness in both directions.
 ///
-/// `None` therefore now means one of two things, and both are real rather than
+/// `None` therefore means one of two things, and both are real rather than
 /// defensive: a **forged** name, which lands in the loopback's
 /// `(unrecognized shim)` bucket; or `postedit_hook` — Phase A finding 2, the one
-/// shim that never calls `report_contract_drift` at all, so its row names no
-/// drift rule and can never appear here.
+/// converted hook that files no drift report at all, so its row names no drift
+/// rule and can never appear here.
 pub fn capability_for_payload_shim(shim: &str) -> Option<&'static Capability> {
     if shim.is_empty() {
         return None;
     }
-    let suffix = format!("/{shim}.rs");
-    let mut hits = CAPABILITIES.iter().filter(|c| {
-        c.drift_rule.contains(&RULE_DRIFT_PAYLOAD) && c.wired_in.iter().any(|p| p.ends_with(&suffix))
-    });
+    let mut hits = CAPABILITIES
+        .iter()
+        .filter(|c| c.drift_token == Some(shim) && c.drift_rule.contains(&RULE_DRIFT_PAYLOAD));
     let first = hits.next()?;
-    // Two rows naming one shim is a registry defect, not a runtime condition —
+    // Two rows naming one token is a registry defect, not a runtime condition —
     // and an arbitrary pick would attribute a real report to the wrong
     // capability. Fall back to the unattributed channel, which loses the row
     // but never lies about it. `tests::every_payload_shim_resolves_to_one_row`
@@ -1630,20 +1702,26 @@ mod tests {
         assert!(capabilities_for_rule("drift.no_such_rule.v1").is_empty());
     }
 
-    /// The six shims that report payload drift each resolve to exactly one row,
-    /// through `wired_in` rather than a hand-kept map.
+    /// The six reporters that file payload drift each resolve to exactly one
+    /// row, through the [`Capability::drift_token`] column.
     ///
-    /// **The last two are V35 Phase I**, closing Phase E's accepted residual:
+    /// **The last two were V35 Phase I**, closing Phase E's accepted residual:
     /// `taint_beacon` and `checkpoint_beacon` report through the same route and
     /// used to resolve to nothing, so their drift could not be attributed to a
-    /// capability and kept the un-consolidated `drift.payload.v1` channel. They
-    /// resolve through the identical mechanism now — the rows name the shim
-    /// files, and no code changed to make that work.
+    /// capability and kept the un-consolidated `drift.payload.v1` channel.
+    ///
+    /// **V35 Phase J changed the mechanism and kept every token.** Four of the
+    /// six are no longer binaries at all — they are `type: "http"` routes whose
+    /// payload checks run in-process — so the old `wired_in`-suffix inference
+    /// could no longer tell them apart (they share two files). The tokens are
+    /// deliberately unchanged: a tab open across the upgrade is still running
+    /// the old shim and still POSTs these strings, so both paths must land on
+    /// the same row.
     ///
     /// The negative half is still the interesting one and is asserted by name:
-    /// `postedit_hook` is Phase A finding 2 (the one shim that never reports at
-    /// all, so its row names no rule), and a forged name must never be pinned on
-    /// a capability that did not report it.
+    /// `postedit_hook` is Phase A finding 2 (the one converted hook that never
+    /// reports at all, so its row names no rule), and a forged name must never
+    /// be pinned on a capability that did not report it.
     #[test]
     fn every_payload_shim_resolves_to_one_row() {
         for (shim, expect) in [
@@ -1665,28 +1743,39 @@ mod tests {
             );
         }
 
-        // Every row that names `drift.payload.v1` must be reachable from some
-        // shim name, or the row claims a lagging indicator that can never
-        // attribute to it.
+        // Both directions, so the column cannot rot: a row that names
+        // `drift.payload.v1` must carry a token that resolves back to it (or it
+        // claims a lagging indicator that can never attribute to it), and a row
+        // that carries a token must name the rule (or the token is decoration).
+        let mut tokens: Vec<&str> = Vec::new();
         for c in CAPABILITIES {
-            if !c.drift_rule.contains(&RULE_DRIFT_PAYLOAD) {
-                continue;
+            match (c.drift_token, c.drift_rule.contains(&RULE_DRIFT_PAYLOAD)) {
+                (Some(tok), true) => {
+                    tokens.push(tok);
+                    assert!(
+                        capability_for_payload_shim(tok).is_some_and(|r| r.id == c.id),
+                        "`{}`'s drift token `{tok}` does not resolve back to it",
+                        c.id
+                    );
+                }
+                (Some(tok), false) => panic!(
+                    "`{}` declares drift token `{tok}` but does not name `{RULE_DRIFT_PAYLOAD}` \
+                     — the token would never be consulted",
+                    c.id
+                ),
+                (None, true) => panic!(
+                    "`{}` names `{RULE_DRIFT_PAYLOAD}` but declares no drift token — the row \
+                     would never receive an attributed report",
+                    c.id
+                ),
+                (None, false) => {}
             }
-            let reachable = c.wired_in.iter().any(|p| {
-                p.rsplit('/')
-                    .next()
-                    .and_then(|f| f.strip_suffix(".rs"))
-                    .is_some_and(|shim| {
-                        capability_for_payload_shim(shim).is_some_and(|r| r.id == c.id)
-                    })
-            });
-            assert!(
-                reachable,
-                "`{}` names `drift.payload.v1` but no shim name in its `wired_in` resolves back \
-                 to it — the row would never receive an attributed report",
-                c.id
-            );
         }
+        tokens.sort_unstable();
+        let n = tokens.len();
+        tokens.dedup();
+        assert_eq!(n, tokens.len(), "two rows claim the same drift token");
+        assert_eq!(n, 6, "the reporter set changed without this test noticing");
     }
 
     /// The TCB column (milestone locked decision 10) is documentation, not a

@@ -57,17 +57,15 @@ pub fn launch_command() -> Option<String> {
     Some(format!("{} --statusline", shell_safe_path(&exe)))
 }
 
-/// V10: the `command` string for the Claude `UserPromptSubmit` context hook —
-/// `<this-exe> --context-hook`, shell-safe like [`launch_command`]. `None` when
-/// `current_exe()` can't be resolved (caller skips the injection).
-pub fn context_hook_command() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    Some(format!("{} --context-hook", shell_safe_path(&exe)))
-}
-
 /// V11: the `command` string for a Claude hook shim re-invoking this binary with
-/// `flag` (e.g. `--precompact-hook`, `--read-hook`), shell-safe like
-/// [`launch_command`]. `None` when `current_exe()` can't be resolved.
+/// `flag`, shell-safe like [`launch_command`]. `None` when `current_exe()` can't
+/// be resolved.
+///
+/// **Two callers left after V35 Phase J** — `--taint-beacon` and
+/// `--checkpoint-beacon`, the only Claude hooks that are still separate
+/// binaries. The five that used to use this (and `context_hook_command`, deleted
+/// with them) are now `type: "http"` entries pointing at the loopback, so they
+/// need no command string at all.
 pub fn hook_command(flag: &str) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     Some(format!("{} {flag}", shell_safe_path(&exe)))

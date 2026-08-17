@@ -576,7 +576,7 @@ fn print_human(results: &[ProbeResult]) {
 // ── minimal blocking HTTP ───────────────────────────────────────────────────
 
 /// A loopback HTTP/1.1 GET, returning `(status, body)`. Hand-rolled for the
-/// same reason `context_hook::post_context` is: this runs before any runtime
+/// same reason the beacon shims hand-roll theirs: this runs before any runtime
 /// exists, and a probe that needed an async stack to ask one question would be
 /// harder to trust than the question is worth.
 fn http_get(port: u16, path: &str) -> Option<(u16, String)> {

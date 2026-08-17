@@ -7,9 +7,7 @@ mod audio;
 mod audit;
 mod checkpoint_beacon;
 mod checks;
-mod compact_hook;
 mod content;
-mod context_hook;
 mod error;
 mod fsutil;
 mod graph;
@@ -18,16 +16,13 @@ mod ipc;
 mod logging;
 mod mcp_stdio;
 mod notifications;
-mod notify_hook;
 mod offload;
 mod oob;
-mod postedit_hook;
 mod preview;
 mod process_guard;
 mod processing;
 mod procutil;
 mod pty;
-mod read_hook;
 mod sandbox;
 mod settings;
 mod shell;
@@ -146,11 +141,6 @@ MAINTENANCE:
 
 SERVICE FLAGS (spawned by agent harnesses over stdio; not for interactive use):
   --statusline                           Claude Code status-line renderer
-  --context-hook                         UserPromptSubmit hook shim
-  --precompact-hook                      PreCompact hook shim
-  --read-hook                            PreToolUse read-advisor hook shim
-  --postedit-hook                        PostToolUse checks hook shim
-  --notify-hook                          Notification / PermissionDenied hook shim
   --taint-beacon --tab <id>              PreToolUse native-web beacon shim (report-only)
   --checkpoint-beacon --tab <id>         PreToolUse pre-mutation checkpoint shim (report-only)
   --offload-mcp [--consumer <name>] [--tab <id>] [--channel-push]
@@ -252,58 +242,44 @@ fn main() {
         return;
     }
 
-    // V10 context-injection hook: Claude Code invokes `cimp --context-hook` as a
-    // UserPromptSubmit hook, pipes the hook JSON to our stdin, and reads the
-    // `additionalContext` to prepend from our stdout. Handled here before any
-    // Tauri init so it stays GUI-free and fast; on any error it prints nothing.
-    if std::env::args().skip(1).any(|a| a == "--context-hook") {
-        context_hook::run();
-        return;
-    }
-
-    // V11 Phase D context-compaction hook: Claude Code invokes
-    // `cimp --precompact-hook` as a `PreCompact` hook. It POSTs to the app's
-    // loopback `/context/compaction` (which clears dedup + marks the session
-    // post-compaction, and returns a working-set/notes block to survive the
-    // summary). GUI-free and fast like the other shims; prints nothing on error.
-    if std::env::args().skip(1).any(|a| a == "--precompact-hook") {
-        compact_hook::run();
-        return;
-    }
-
-    // V11 Phase E read advisor: Claude Code invokes `cimp --read-hook` as a
-    // `PreToolUse` (matcher `Read`) hook. It asks the app's loopback
-    // `/context/should_read` whether the file was already read unchanged this
-    // session; on a "remind" it denies the Read with the file's outline/body as
-    // the reason. GUI-free like the other shims; prints nothing (⇒ read proceeds)
-    // on any error, so it never wrongly blocks a read.
-    if std::env::args().skip(1).any(|a| a == "--read-hook") {
-        read_hook::run();
-        return;
-    }
-
-    // V12 Phase F: Claude Code invokes `cimp --postedit-hook` as a
-    // `PostToolUse` (matcher `Edit|Write|MultiEdit`) hook right after an edit
-    // completes. It POSTs to the app's loopback `/context/post_edit` (which
-    // debounces, runs the project's configured checks, and diffs against the
-    // session's baseline) and prints only NEW/worsened diagnostics as
-    // additional context. GUI-free like the other shims; prints nothing on
-    // any error, so it never blocks or perturbs an edit.
-    if std::env::args().skip(1).any(|a| a == "--postedit-hook") {
-        postedit_hook::run();
-        return;
-    }
-
-    // NC-2 (issue #5): Claude Code invokes `cimp --notify-hook` for the
-    // `Notification` and `PermissionDenied` events — the PRIMARY signal that a
-    // tab is (or is no longer) awaiting a permission decision, with the
-    // TUI-regex detector demoted to fallback. It POSTs the payload to the app's
-    // loopback `/permission/event`, which maps it to a tab and flips
-    // `awaiting_permission`. Observe-only: GUI-free like the other shims, never
-    // prints to stdout, and always exits 0 so a dead app can never delay
-    // Claude's permission flow.
-    if std::env::args().skip(1).any(|a| a == "--notify-hook") {
-        notify_hook::run();
+    // ── V35 Phase J: the five hook shims are GONE, and these are TOMBSTONES ──
+    //
+    // `--context-hook`, `--precompact-hook`, `--read-hook`, `--postedit-hook`
+    // and `--notify-hook` were five stateless binaries that carried a payload
+    // from stdin to the loopback and a reply back to stdout. Claude Code 2.1.63's
+    // `type: "http"` hooks let the harness do that itself, so the overlay now
+    // emits `type: "http"` entries pointing at `/claude/hook/*` and the shim
+    // logic lives in `harness::claude_hook` + `offload::loopback`.
+    //
+    // **The flags must not simply vanish, and this is why.** A `--settings`
+    // overlay is written at TAB LAUNCH: a Claude tab open across this upgrade is
+    // still configured to run `cimp --context-hook` on every prompt. If the flag
+    // stopped being recognised, `main()` would fall through to the normal
+    // startup path and every prompt in that tab would launch a whole second cImp
+    // GUI. So each flag still terminates the process quietly: drain stdin (the
+    // harness writes the payload and can block on a full pipe otherwise), print
+    // nothing, exit 0 — which for every one of the five is the documented
+    // fail-open answer. The old tab keeps working, inert: no injection, no
+    // advisor, no auto-check, permission detection falls back to the TUI regex.
+    // Restart the tab and it gets the http hooks.
+    //
+    // REMOVABLE ONE RELEASE AFTER V35 — by then no overlay that names them can
+    // still be in force, because a tab cannot outlive two upgrades unrestarted
+    // without the *Harness health* panel having reported it as `old_plugin` the
+    // whole time (`chp::expects_chp` answers `true` for Claude from Phase J).
+    const RETIRED_HOOK_FLAGS: [&str; 5] = [
+        "--context-hook",
+        "--precompact-hook",
+        "--read-hook",
+        "--postedit-hook",
+        "--notify-hook",
+    ];
+    if std::env::args()
+        .skip(1)
+        .any(|a| RETIRED_HOOK_FLAGS.contains(&a.as_str()))
+    {
+        let mut sink = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut sink);
         return;
     }
 

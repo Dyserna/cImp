@@ -4,13 +4,15 @@
 //!
 //! # What was already there
 //!
-//! `context_hook.rs` and `tabs/config.rs::opencode_plugin_source` POST the same
-//! harness-neutral body to the same loopback routes, discriminated by `agent`.
-//! That is a protocol; nobody had named, versioned or written it down. Phase I
-//! does exactly those three things and **changes no behavior**: `chp` is
+//! The Claude hook shims and `tabs/config.rs::opencode_plugin_source` POST the
+//! same harness-neutral body to the same loopback routes, discriminated by
+//! `agent`. That is a protocol; nobody had named, versioned or written it down.
+//! Phase I does exactly those three things and **changes no behavior**: `chp` is
 //! additive and tolerated-absent, `/session/hello` is new and nothing gates on
 //! what it says (locked decision 5 — negotiation becomes load-bearing in
-//! Phase L).
+//! Phase L). (Phase J then deleted those shims: Claude's half of the wire is now
+//! `type: "http"` hooks posting Claude's own payloads to `/claude/hook/*`, with
+//! the envelope in headers — see [`crate::harness::claude_hook`].)
 //!
 //! The written contract is [`docs/CHP.md`](../../../../docs/CHP.md). It and
 //! [`CHP_VERSION`] are kept in step by [`tests::the_doc_states_this_version`],
@@ -177,16 +179,23 @@ pub fn is_push_route(route: &str) -> bool {
 /// into every plugin it writes, so a POST carrying less than that came from a
 /// file an older build wrote.
 ///
-/// `claude` **no**, and that is locked decision 5, not an omission. Claude's L1
-/// today is five stateless shim binaries plus a spawn-baked `--settings`
-/// overlay; there is no persistent plugin to negotiate with, and faking a hello
-/// from cImp's own spawn code would be cImp attesting to itself. Claude's
-/// capabilities are declared by the registry (`harness::contract`), not
-/// negotiated — until Phase J points its hooks straight at loopback as
-/// `type: "http"` hooks, at which point this returns `true` for it too and every
-/// Claude tab starts being version-checked by the same code.
+/// `claude` **yes, since V35 Phase J**. Its L1 used to be five stateless shim
+/// binaries with nowhere to put a version, which is why Phase I answered `false`
+/// here (locked decision 5, recorded rather than assumed). Phase J replaced them
+/// with `type: "http"` hooks whose emitted entries carry `X-CIMP-Chp` —
+/// substituted from [`CHP_VERSION`] at overlay generation, exactly as the
+/// generated OpenCode plugin substitutes it — so a Claude tab is now a
+/// spawn-baked artifact that states its version, and the same three staleness
+/// arms apply to it.
+///
+/// **The day that flipped, every Claude tab open across the upgrade started
+/// reporting `old_plugin`.** That is the intended reading, not a false positive:
+/// such a tab really is running an overlay full of `cimp --context-hook` command
+/// hooks that this build no longer generates, and *restart the tab* really is
+/// the fix. It is the V32 "needs a FRESH TAB" trap being named at exactly the
+/// moment it applies.
 pub fn expects_chp(agent: &str) -> bool {
-    agent == "opencode"
+    agent == "opencode" || agent == "claude"
 }
 
 // ── the per-tab peer registry ───────────────────────────────────────────────
@@ -653,11 +662,19 @@ mod tests {
         assert_eq!(new.kind, STALE_NEW_PLUGIN);
         assert!(new.note.contains("NEWER"));
 
-        // CLAUDE sends no `chp` in Phase I and that is NOT staleness (locked
-        // decision 5) — this is the assertion that keeps every Claude tab from
-        // rendering as a broken plugin the day this ships.
-        assert!(classify(&peer("claude", PRE_CHP), "2.1.232").is_none());
-        assert!(!expects_chp("claude") && expects_chp("opencode"));
+        // CLAUDE, since V35 Phase J: its overlay is a spawn-baked artifact that
+        // states its `chp` in a header, so a tab that sends none is a tab still
+        // running the pre-Phase-J command hooks — the V32 "needs a FRESH TAB"
+        // trap, named at the moment it applies. In Phase I this asserted the
+        // opposite (`is_none`), deliberately, because there was nothing on the
+        // Claude side that could carry a version.
+        let claude = classify(&peer("claude", PRE_CHP), "2.1.232")
+            .expect("a pre-Phase-J Claude overlay is stale");
+        assert_eq!(claude.kind, STALE_OLD_PLUGIN);
+        assert!(claude.note.contains("RESTART THE TAB"));
+        assert!(classify(&peer("claude", CHP_VERSION), "2.1.232").is_none());
+        assert!(expects_chp("claude") && expects_chp("opencode"));
+        assert!(!expects_chp("codex"), "an unknown harness ships no artifact");
 
         // Version drift, when a hello declares one at all.
         let mut greeted = peer("opencode", CHP_VERSION);

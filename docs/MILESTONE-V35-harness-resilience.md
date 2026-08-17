@@ -1,12 +1,13 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** PHASES A–K IMPLEMENTED (A–H 2026-08-16; I–K 2026-08-17:
+**Status:** PHASES A–L IMPLEMENTED (A–H 2026-08-16; I–L 2026-08-17:
 `82c0da2`, `7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`,
-`4e1c519`, `347c938`, `27b6241`, `8fcce94`, `74a5152`). The harness
-surface lives in `harness/` with layering tests; Phases L–M remain.
-GitHub milestone 8: #55–#63 + #66–#68 closed; #64, #71 open; #73, #74
+`4e1c519`, `347c938`, `27b6241`, `8fcce94`, `74a5152`, `e2b9cee`). The
+read path is pushed where upstream payloads allow; Phase M remains.
+GitHub milestone 8: #55–#63 + #66–#69 closed; #64, #71 open; #73, #74
 filed. Remaining live-verify recipes: 2 (app leg), 3, 6 (user leg),
-7 (the key one — proves $VAR header substitution live), 8–10.
+7 (the key one — proves $VAR header substitution live), 8, 9, 10 (now
+targets block-joining, not cadence — see Phase L record).
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -584,6 +585,48 @@ ignored 6/6, no TS. Decisions + findings:
   payload parsing.
 - MAINTENANCE prose still names `oob/` in ~4 places outside the drift
   table — folded into Phase L's scoped doc edits.
+
+**Phase L (`e2b9cee`, 2026-08-17).** The read path pushed where payloads
+allow. Claude: `assistant_text` (from `Stop.last_assistant_message` —
+complete-at-finish, cadence preserved by construction; `MessageDisplay`
+deliberately NOT wired), `tool_result` (second matcher-`""` PostToolUse
+group on its own route — one shared route would run post-edit checks
+twice and double-count), `subagent` lifecycle (SubagentStart/Stop).
+Arbitration: per-capability per-tab push-wins-when-`served()` (requires a
+real hello — the hello arriving over the push path is itself proof the
+path works); pre-upgrade tabs keep the reader for everything.
+Quiet-served capability = drift report via a **witness rule** (another
+push whose arrival proves this one should have fired; threshold 3;
+subagent has no witness and asserts why), never a silent reader
+fallback. cargo 2204/0/6, clippy clean, ignored 6/6 (correction: that is
+4 node-driven plugin tests + 2 TTS). Decisions + findings:
+
+- **SPEC CORRECTION: `claude.transcript.usage` cannot migrate** — no hook
+  event carries token counts (verified against hooks docs); usage,
+  identity, subagent token accounting and the statusline stay on
+  readers permanently-until-upstream-changes. Phase K's "Phase L deletes
+  these exemptions" expectation was corrected in place: no layering
+  exemption shrank; all six are now honestly labeled "arbitrated fallback
+  + capabilities with no other path".
+- **OpenCode migrated NOTHING — declared `cannot` with reasons** (D6
+  outcome): `experimental.text.complete` is per-part (cadence violation +
+  experimental namespace); widening the `event` handler re-reads the same
+  Tier-C shapes over another transport (zero tier gain); `tool.execute.
+  after`'s result text has no cImp consumer (wiring it adds a capability,
+  doesn't migrate one). Plugin API finding recorded: 20-member Hooks
+  interface, cImp uses 4; types installed are 1.17.11 vs binary 1.18.13.
+- **GAP FOUND AND CLOSED: assistant prose → TTS was a live Tier-C
+  dependency with no registry row, no canary, no probe** — it now has all
+  three (`claude.transcript.assistant_text` + embedded canary + negative
+  twin + probe).
+- Stop-vs-reader **block joining** is a declared `Dep::Behavior` residual
+  (only a live turn can prove it; both sides pass through `to_speakable`)
+  — recipe 10's live leg now targets joining, not cadence.
+- Three neutral `/session/*` CHP routes exist with no external producer
+  today (documented in CHP.md §4.6) so a future harness migration is a
+  plugin-only change.
+- Deploy note: overlay is spawn-baked — a FRESH TAB is required to
+  exercise Phase L; old tabs keep the Phase J hook set and their readers.
 
 ## Two gaps to fix ahead of the milestone
 

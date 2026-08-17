@@ -5,6 +5,29 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Context injection was being discarded on almost every prompt.** The
+  `UserPromptSubmit` handler ran the context retrieval synchronously, and on
+  a project with semantic search plus a remote embedding endpoint that call
+  costs 0.67–2.5 s — past the hook entry's pinned 1 s timeout, so the harness
+  threw the reply away while the app had already consumed the once-per-session
+  project map, marked the dedup ledger injected and drained the parked
+  auto-check block. The retrieval now runs off the runtime and is raced against
+  a 500 ms budget — pinned by test under BOTH ceilings above it: the Claude
+  hook's 1 s discard and the OpenCode plugin's 600 ms client-side abort, so
+  even the timeout-path reply lands before anyone stops listening: a digest
+  that makes the budget is injected as
+  before, and one that does not is **parked for the next prompt** rather than
+  lost — the same bargain auto-check already made — carried in marked as having
+  been retrieved for the previous prompt. The greeting and the auto-check drain
+  still ride the immediate reply, since both are once-only reads. Same fix on
+  `POST /context/retrieve` (the OpenCode plugin), which budgeted ~600 ms
+  client-side and lost the same replies. **Deploy note: server-side only —
+  restart the app to pick it up, no fresh tabs needed.**
+
 ## [0.52.0-rc.3] — 2026-08-17
 
 **Pre-release, for testing.** The capability-refresh RC: both harness

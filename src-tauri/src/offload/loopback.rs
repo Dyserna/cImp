@@ -5292,8 +5292,75 @@ async fn handle_context_retrieve(
             .await;
         }
     };
-    let answer = context_retrieve_core(app, &body);
+    let answer = context_retrieve_core(app, &body).await;
     write_json(stream, 200, &answer).await
+}
+
+/// **The context-retrieval budget**: how long [`context_retrieve_core`] waits
+/// for a fresh digest before answering without it.
+///
+/// Two ceilings sit above this number, and it must clear BOTH with margin,
+/// because past either one the whole reply — greeting, drained auto-check
+/// block, and any parked backlog just TAKEN from the store — is discarded
+/// *after* those destructive reads already happened:
+///
+/// - the Claude harness discards the hook's reply outright at 1 s
+///   ([`claude_hook::TIMEOUT_SECS`]);
+/// - the OpenCode plugin aborts its `/context/retrieve` fetch at **600 ms**
+///   (`AbortSignal.timeout(600)` in `templates/plugin.js` — the five deleted
+///   shims' own `context_hook::TIMEOUT` number, "a slow/cold index never
+///   delays the prompt").
+///
+/// 500 ms leaves the tighter (OpenCode) ceiling ~100 ms for composing and
+/// writing the reply plus the plugin's own fetch overhead. A budget AT 600
+/// would lose that race on exactly the timeout path it exists to serve: the
+/// reply would leave at ~600 ms + ε, arrive after the client abort, and a
+/// backlog already drained out of the park store would be gone for good —
+/// on a chronically slow project the OpenCode transport would deliver
+/// nothing, ever, while consuming everything.
+///
+/// The race exists because the measured cost is not the index: on a project
+/// with `semantic_search` on and a remote embedding endpoint,
+/// `retrieve_context` spends **0.67–2.5 s** in a blocking embed round trip
+/// inside this handler. Before the race the handler lost that reply on
+/// essentially every prompt while still having consumed the session's
+/// once-per-session greeting, marked the dedup ledger injected and drained the
+/// parked auto-check block — spending the state and delivering nothing.
+///
+/// Over budget the result is not discarded, it is parked for the next prompt
+/// (`GraphService::park_injection`), the same bargain
+/// [`GraphService::post_edit`](crate::graph::GraphService::post_edit) strikes
+/// against `POST_EDIT_BUDGET_MS`. A test pins this below BOTH ceilings — the
+/// constants live in different files (one of them in a JS template) and
+/// nothing else keeps them ordered.
+const RETRIEVE_BUDGET_MS: u64 = 500;
+
+/// Join the pieces of one injection reply with a blank line, skipping any that
+/// are empty (or whitespace-only).
+///
+/// Extracted from [`context_retrieve_core`] so the ORDER — greeting, parked
+/// blocks, fresh digest, drained auto-check — is asserted by a test rather than
+/// re-read out of a chain of `if`s. Parts are joined verbatim: a block's own
+/// content is never rewritten here.
+fn merge_injection_blocks(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The reply's `files`: parked first (they were retrieved first), then fresh,
+/// de-duplicated preserving that order.
+fn merge_files_used(parked: Vec<String>, fresh: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(parked.len() + fresh.len());
+    for f in parked.into_iter().chain(fresh) {
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
 }
 
 /// The prompt tap's whole effect, shared by `/context/retrieve` (the CHP body a
@@ -5306,7 +5373,20 @@ async fn handle_context_retrieve(
 /// two transports cannot come to disagree about what a prompt does. Returns the
 /// `/context/retrieve` answer verbatim — the Claude-native handler takes `text`
 /// out of it and wraps it in the hook-output envelope.
-fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
+///
+/// **The retrieval itself is raced against [`RETRIEVE_BUDGET_MS`]** (2026-08-17
+/// fix). `GraphService::retrieve_context` is sync and blocking — SQLite plus,
+/// with semantic search on, a remote embed round trip measured at 0.67–2.5 s —
+/// so it runs on `spawn_blocking` and this function answers at the budget
+/// whether or not it is done. A digest that misses the budget is PARKED for the
+/// next prompt (`GraphService::park_injection`) and the reply carries whatever
+/// was parked by an earlier prompt, so nothing computed is thrown away.
+///
+/// What must NOT be parked rides the immediate reply unconditionally: the
+/// once-per-session greeting and the drained auto-check block are destructive
+/// reads (consumed exactly once), and both are cheap — no embed, no network —
+/// so a slow retrieval can never cost the session its project map.
+async fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_json::Value {
     let cwd = body
         .cwd
         .clone()
@@ -5351,34 +5431,94 @@ fn context_retrieve_core(app: &AppHandle, body: &ContextRetrieveBody) -> serde_j
     if !graph.context_injection_enabled() {
         return empty;
     }
-    let r = graph.retrieve_context(&cwd, &body.prompt, body.session_id.as_deref());
-    // V11 Phase B: prepend the once-per-session project map. Done here (the real
-    // injection path), not in `retrieve_context`, so the preview surface — which
-    // also calls `retrieve_context` — never consumes the once-per-session flag.
-    let mut text = r.context_md;
-    if let Some(map) = graph.session_greeting(&cwd, body.session_id.as_deref()) {
-        text = if text.is_empty() {
-            map
-        } else {
-            format!("{map}\n\n{text}")
-        };
-    }
+    let sid = body.session_id.clone().filter(|s| !s.is_empty());
+
+    // A digest an EARLIER prompt's retrieval finished too late to deliver is
+    // part of THIS reply. Taken before the race so that a fresh result which
+    // also misses the budget parks BEHIND it rather than racing it — the store
+    // is oldest-first and this keeps that ordering true.
+    let parked = graph.take_parked_injection(sid.as_deref());
+
+    // The slow part, off the async runtime's worker: `retrieve_context` is
+    // blocking (SQLite + a blocking HTTP embed), and blocking a runtime thread
+    // for seconds would stall every other loopback route, not just this one.
+    let mut handle = {
+        let graph = graph.clone();
+        let root = cwd.clone();
+        let prompt = body.prompt.clone();
+        let sid = sid.clone();
+        tokio::task::spawn_blocking(move || graph.retrieve_context(&root, &prompt, sid.as_deref()))
+    };
+    // The deadline is taken HERE, before the cheap work below, so the cheap
+    // work is overlapped with the retrieval instead of being added on top of
+    // the budget.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(RETRIEVE_BUDGET_MS);
+
+    // V11 Phase B: the once-per-session project map. Done here (the real
+    // injection path), not in `retrieve_context`, so the preview surface —
+    // which also calls `retrieve_context` — never consumes the once-per-session
+    // flag. Synchronous and unraced on purpose: it is a once-per-session
+    // destructive read with no embed in it, so it must ride this reply.
+    let greeting = graph
+        .session_greeting(&cwd, sid.as_deref())
+        .unwrap_or_default();
     // V12 Phase F: drain any auto-check block a slow post-edit run parked for
     // this session (see `GraphService::post_edit`'s budget/park path) — a
     // turn is never blocked waiting for a check, but its result still reaches
-    // the model on the very next opportunity.
-    if let Some(pending) = graph.drain_auto_check(body.session_id.as_deref()) {
-        text = if text.is_empty() {
-            pending
-        } else {
-            format!("{text}\n\n{pending}")
-        };
-    }
+    // the model on the very next opportunity. Destructive too: never parked,
+    // never lost to a slow retrieval.
+    let pending_check = graph.drain_auto_check(sid.as_deref()).unwrap_or_default();
+
+    let fresh = tokio::select! {
+        res = &mut handle => res.ok(),
+        _ = tokio::time::sleep_until(deadline) => {
+            match sid.clone() {
+                Some(s) => {
+                    let graph = graph.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Bound the parked run for `post_edit`'s reason: a
+                        // wedged embedding endpoint must not leave a task (and
+                        // a blocking-pool thread) alive for the process's
+                        // lifetime. On timeout we stop waiting — `abort` on a
+                        // `spawn_blocking` handle cannot interrupt the closure
+                        // itself, so this bounds the reaper, not the blocking
+                        // call, which is the part that would otherwise leak.
+                        const PARKED_MAX_MS: u64 = 60_000;
+                        match tokio::time::timeout(
+                            Duration::from_millis(PARKED_MAX_MS),
+                            &mut handle,
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => graph.park_injection(Some(&s), &r.context_md, r.files_used),
+                            Ok(Err(_join_err)) => {}
+                            Err(_elapsed) => handle.abort(),
+                        }
+                    });
+                }
+                // No session id to park under — both real transports always
+                // send one, so this is the preview-shaped edge case: drop it.
+                None => debug!(
+                    target: "offload",
+                    "context retrieve missed its budget with no session id to park under"
+                ),
+            }
+            None
+        }
+    };
+    let (fresh_text, fresh_files) = match fresh {
+        Some(r) => (r.context_md, r.files_used),
+        None => (String::new(), Vec::new()),
+    };
+
+    let (parked_text, parked_files) = parked.unwrap_or_default();
+    let text = merge_injection_blocks(&[&greeting, &parked_text, &fresh_text, &pending_check]);
+    let files = merge_files_used(parked_files, fresh_files);
     // Same char→token estimate as the retrieval core (shared divisor so the two
-    // can't drift). Estimated from the FULL injected text (digest + greeting +
-    // drained auto-check), not just the digest.
+    // can't drift). Estimated from the FULL injected text (greeting + parked +
+    // digest + drained auto-check), not just the digest.
     let tokens_est = crate::graph::est_tokens(text.chars().count());
-    serde_json::json!({ "ok": true, "text": text, "files": r.files_used, "tokens_est": tokens_est })
+    serde_json::json!({ "ok": true, "text": text, "files": files, "tokens_est": tokens_est })
 }
 
 /// A `POST /workbench/tool_checkpoint` request body — V33 Phase F's two
@@ -6764,6 +6904,11 @@ fn permission_body_from_hook(
 /// injection, the once-per-session project map and the parked auto-check drain
 /// are identical on both transports. Ungated for the reason `/context/retrieve`
 /// is (see its `ROUTE_CONTAINMENT` row).
+///
+/// This entry's pinned `timeout` is [`claude_hook::TIMEOUT_SECS`] (1 s) and the
+/// harness DISCARDS a later reply, which is why the core races its retrieval
+/// against [`RETRIEVE_BUDGET_MS`] and parks what overruns rather than composing
+/// a digest nobody will read.
 async fn handle_claude_user_prompt_submit(
     stream: &mut TcpStream,
     app: &AppHandle,
@@ -6781,7 +6926,7 @@ async fn handle_claude_user_prompt_submit(
     let tab = claude_hook_tab(&settings, req);
     let cwd = claude_hook_cwd(app, &settings, tab.as_deref(), &input.cwd);
     let body = retrieve_body_from_hook(&input, tab, cwd);
-    let answer = context_retrieve_core(app, &body);
+    let answer = context_retrieve_core(app, &body).await;
     let text = answer.get("text").and_then(Value::as_str).unwrap_or("");
     if text.trim().is_empty() {
         return write_json(stream, 200, &claude_hook::no_op()).await;
@@ -18135,6 +18280,99 @@ mod tests {
             claude_hook::TIMEOUT_SECS,
             "the sensor has nothing to wait for and must not inherit the checkpoint's ceiling"
         );
+    }
+
+    /// **The prompt hook's OTHER two-timer relationship** (2026-08-17 fix).
+    ///
+    /// `UserPromptSubmit` keeps the 1 s budget, and the harness DISCARDS a
+    /// reply that arrives after it — silently, so a handler that overruns looks
+    /// exactly like a handler that had nothing to say while having already
+    /// spent the session's once-per-session greeting, its dedup ledger and its
+    /// parked auto-check block. [`RETRIEVE_BUDGET_MS`] is the app's own,
+    /// smaller bound: past it the handler answers with what it has and parks
+    /// the digest for the next prompt.
+    ///
+    /// Nothing but this assertion keeps the two constants (different files,
+    /// different layers) in the right order — the same reason the checkpoint
+    /// pin above exists.
+    #[test]
+    fn the_retrieve_budget_sits_under_the_prompt_hooks_ceiling() {
+        let ceiling = Duration::from_secs(claude_hook::TIMEOUT_SECS);
+        let budget = Duration::from_millis(RETRIEVE_BUDGET_MS);
+        assert!(
+            budget < ceiling,
+            "a digest composed after the harness stopped listening is state spent for \
+             nothing: {budget:?} vs {ceiling:?}"
+        );
+        assert_eq!(
+            claude_hook::timeout_secs(claude_hook::ROUTE_USER_PROMPT_SUBMIT),
+            claude_hook::TIMEOUT_SECS,
+            "the prompt hook is not the documented exception — the checkpoint route is"
+        );
+
+        // The OpenCode transport's ceiling is CLIENT-side: the plugin aborts
+        // its `/context/retrieve` fetch on its own timer, and a reply that
+        // leaves after that abort is lost WITH the parked backlog it drained.
+        // Read the number out of the template rather than repeating it here,
+        // and demand real margin (compose + write + the plugin's own fetch
+        // overhead), not mere ordering — a budget equal to the abort loses
+        // the race on every timeout path.
+        let plugin = include_str!("../harness/opencode/templates/plugin.js");
+        let at = plugin
+            .find("/context/retrieve")
+            .expect("the plugin template posts /context/retrieve");
+        let tail = &plugin[at..];
+        let marker = "AbortSignal.timeout(";
+        let t = tail
+            .find(marker)
+            .expect("the retrieve fetch carries an AbortSignal.timeout");
+        let digits: String = tail[t + marker.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let client_abort_ms: u64 = digits.parse().expect("a literal millisecond count");
+        assert!(
+            RETRIEVE_BUDGET_MS + 100 <= client_abort_ms,
+            "the retrieval budget must leave the OpenCode plugin's client abort at least \
+             100 ms of reply margin: {RETRIEVE_BUDGET_MS} ms vs {client_abort_ms} ms"
+        );
+    }
+
+    /// The injected reply's composition: locked ORDER, empties skipped, files
+    /// parked-then-fresh with no duplicates.
+    ///
+    /// The order is the contract with the model: the project map first, then
+    /// anything retrieved for an EARLIER prompt (marked as such by the store),
+    /// then this prompt's own digest, then the auto-check block — so what is
+    /// most likely to answer the prompt is never buried under a late arrival.
+    #[test]
+    fn an_injection_reply_keeps_its_locked_order_and_skips_empties() {
+        assert_eq!(
+            merge_injection_blocks(&["greeting", "parked", "fresh", "check"]),
+            "greeting\n\nparked\n\nfresh\n\ncheck"
+        );
+        // Empties (and whitespace-only parts) never contribute a blank gap.
+        assert_eq!(
+            merge_injection_blocks(&["", "parked", "   \n", "check"]),
+            "parked\n\ncheck"
+        );
+        assert_eq!(merge_injection_blocks(&["", "", "", ""]), "");
+        // Blocks are joined verbatim — nothing here rewrites a block's content.
+        assert_eq!(
+            merge_injection_blocks(&["a\n\nb", "", "c"]),
+            "a\n\nb\n\nc",
+            "internal structure of a block is not normalised"
+        );
+
+        assert_eq!(
+            merge_files_used(
+                vec!["a.rs".into(), "b.rs".into()],
+                vec!["b.rs".into(), "c.rs".into()]
+            ),
+            vec!["a.rs".to_string(), "b.rs".into(), "c.rs".into()],
+            "parked first, fresh after, each file named once"
+        );
+        assert!(merge_files_used(Vec::new(), Vec::new()).is_empty());
     }
 
     /// **A failed tool result is sized, counted, and never mined.**

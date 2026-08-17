@@ -317,6 +317,15 @@ pub struct GraphService {
     /// V12 Phase F: the single-flight check runner shared by every session —
     /// see `checks::auto::RootRunner`'s doc comment.
     auto_check_runner: crate::checks::auto::RootRunner,
+    /// 2026-08-17: per-session context digests that missed their prompt's
+    /// retrieval budget (`loopback::RETRIEVE_BUDGET_MS`) and are waiting for
+    /// the next prompt to carry them. The exact shape `auto_check_sessions`'
+    /// `pending` slot has, for the same reason — a turn is never blocked on a
+    /// slow retrieval, but its result still reaches the model at the next
+    /// opportunity instead of being computed and thrown away. Keyed by session
+    /// id; the preview path (session id `None`) never touches it. In-memory: a
+    /// restart simply drops what was parked, which is safe.
+    parked_injections: StdMutex<HashMap<String, ParkedInjection>>,
     /// V12 review: session ids currently being distilled by [`GraphService::distill_session`],
     /// so two sweeps that both select the same idle-undistilled session (the
     /// rebuild sweep and the watcher-batch sweep can race onto the same
@@ -419,6 +428,90 @@ struct InjectState {
     /// (the API re-sends the whole conversation each turn). Measured
     /// turn-by-turn as the session actually runs — no projection.
     compounded_chars: u64,
+}
+
+/// One session's parked context injections — digests a retrieval produced
+/// *after* the prompt that asked for them had already been answered (see
+/// [`GraphService::park_injection`]).
+#[derive(Default)]
+struct ParkedInjection {
+    /// Whole `context_md` blocks, oldest first. Eviction drops whole blocks:
+    /// half a digest is worse than one digest fewer, since a truncated block
+    /// can end mid-path and read as a claim about a file it never described.
+    blocks: Vec<String>,
+    /// Files the parked blocks used, first-seen order, de-duplicated. Not
+    /// pruned when a block is evicted: the reply's `files` list is attribution
+    /// for what was *retrieved*, and over-listing there costs a name in a JSON
+    /// array, while tracking per-block files would split the store's shape for
+    /// a case the cap makes rare.
+    files: Vec<String>,
+}
+
+/// How much parked context one session may hold. Sized to sit under a single
+/// turn's injection budget (`context_turn_budget_chars` defaults well below
+/// this) so a session that spent a run of prompts over budget cannot hand the
+/// model a backlog larger than one honest turn of context.
+const PARKED_INJECTION_CAP_CHARS: usize = 24_000;
+
+/// The one line prefixed to each drained block. A parked digest was ranked
+/// against the PREVIOUS prompt, so its relevance can lag a turn; the model has
+/// to be able to tell it apart from the fresh digest instead of reading a
+/// stale ranking as an answer to what was just asked.
+const PARKED_INJECTION_NOTE: &str =
+    "> (Retrieved for your previous prompt — it arrived after that turn's deadline, so its \
+     relevance may lag one turn.)";
+
+/// Append `text` to `sid`'s parked blocks, evicting oldest blocks past
+/// [`PARKED_INJECTION_CAP_CHARS`]. Free function so the store's behaviour is
+/// unit-testable without an `AppHandle`/`SettingsHandle`.
+fn park_injection_into(
+    map: &mut HashMap<String, ParkedInjection>,
+    sid: &str,
+    text: &str,
+    files: Vec<String>,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    // Bound the per-session state exactly as `injected`/`auto_check_sessions`
+    // are: nothing evicts it when a session simply ends, and clearing is safe
+    // — it only ever loses context that was already late.
+    if map.len() > 1024 && !map.contains_key(sid) {
+        map.clear();
+    }
+    let slot = map.entry(sid.to_string()).or_default();
+    slot.blocks.push(text.to_string());
+    for f in files {
+        if !slot.files.contains(&f) {
+            slot.files.push(f);
+        }
+    }
+    // Oldest-first eviction. Never below one block: a single digest larger
+    // than the cap is kept whole rather than truncated (see `blocks`).
+    let mut total: usize = slot.blocks.iter().map(|b| b.chars().count()).sum();
+    while slot.blocks.len() > 1 && total > PARKED_INJECTION_CAP_CHARS {
+        let dropped = slot.blocks.remove(0);
+        total -= dropped.chars().count();
+    }
+}
+
+/// Take (remove) `sid`'s parked blocks, joined oldest-first and each marked
+/// with [`PARKED_INJECTION_NOTE`]. `None` when nothing is parked.
+fn take_parked_injection_from(
+    map: &mut HashMap<String, ParkedInjection>,
+    sid: &str,
+) -> Option<(String, Vec<String>)> {
+    let parked = map.remove(sid)?;
+    if parked.blocks.is_empty() {
+        return None;
+    }
+    let text = parked
+        .blocks
+        .iter()
+        .map(|b| format!("{PARKED_INJECTION_NOTE}\n{b}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((text, parked.files))
 }
 
 /// V16 Feature 4: when (and how big) a read-advisor reminder was, so the
@@ -1005,6 +1098,7 @@ impl GraphService {
             digest_inflight: StdMutex::new(HashSet::new()),
             auto_check_sessions: StdMutex::new(HashMap::new()),
             auto_check_runner: crate::checks::auto::RootRunner::new(),
+            parked_injections: StdMutex::new(HashMap::new()),
             distilling: StdMutex::new(HashSet::new()),
             live_sessions: StdMutex::new(HashMap::new()),
             live_tab_roots: StdMutex::new(HashMap::new()),
@@ -2110,6 +2204,17 @@ impl GraphService {
         // V12 review: `auto_check_sessions` (debounce/baseline/pending state
         // for `/context/post_edit`) grows per session and was never evicted —
         // clear the same scope here too, mirroring `injected`/`greeted`/`reminded`.
+        // 2026-08-17: the parked-retrieval store is the same kind of
+        // per-session leftover — a cleared session must not have a digest
+        // ranked against its old memory injected into it next turn.
+        if let Ok(mut parked) = self.parked_injections.lock() {
+            match session_id {
+                Some(s) => {
+                    parked.remove(s);
+                }
+                None => parked.clear(),
+            }
+        }
         if let Ok(mut sessions) = self.auto_check_sessions.lock() {
             match session_id {
                 Some(s) => {
@@ -3442,6 +3547,52 @@ impl GraphService {
             .unwrap()
             .get_mut(sid)
             .and_then(|st| st.pending.take())
+    }
+
+    // ── 2026-08-17: the same park/drain shape for context RETRIEVAL ──────
+
+    /// Park a context digest that finished after its prompt was answered.
+    ///
+    /// The retrieval half of [`Self::drain_auto_check`]'s bargain: a prompt is
+    /// never blocked on a slow retrieve (a remote embedding endpoint alone
+    /// costs 0.67–2.5 s, well past the harness's 1 s hook timeout), but the
+    /// work is not thrown away either — it is handed to the next prompt by
+    /// [`Self::take_parked_injection`]. Called only from the loopback's
+    /// `context_retrieve_core`, never from `retrieve_context`, so the preview
+    /// surface can never park or consume anything.
+    ///
+    /// No-op for a missing/empty session id (nothing to key on) or empty text.
+    pub fn park_injection(&self, session_id: Option<&str>, text: &str, files: Vec<String>) {
+        let Some(sid) = session_id.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let Ok(mut map) = self.parked_injections.lock() else {
+            return;
+        };
+        park_injection_into(&mut map, sid, text, files);
+        debug!(
+            session_id = sid,
+            chars = text.chars().count(),
+            "graph: parked a late context digest for the next prompt"
+        );
+    }
+
+    /// Take (remove) `session_id`'s parked context, joined oldest-first with
+    /// each block marked as belonging to an earlier prompt. `None` for a
+    /// missing/empty/unknown session id.
+    pub fn take_parked_injection(&self, session_id: Option<&str>) -> Option<(String, Vec<String>)> {
+        let sid = session_id.filter(|s| !s.is_empty())?;
+        let mut map = self.parked_injections.lock().ok()?;
+        let taken = take_parked_injection_from(&mut map, sid);
+        drop(map);
+        if let Some((text, _)) = &taken {
+            debug!(
+                session_id = sid,
+                chars = text.chars().count(),
+                "graph: draining a parked context digest into this prompt"
+            );
+        }
+        taken
     }
 
     // ── V12 Phase F (6c): analyses-auto trigger ───────────────────────────
@@ -5242,6 +5393,85 @@ mod tests {
         drop(verbatim);
         indices.lock().unwrap().clear();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Park → take is a DESTRUCTIVE read of the whole backlog: every block
+    /// comes back, oldest first, each marked as belonging to an earlier
+    /// prompt, together with the union of their files — and the second take
+    /// finds nothing, because a parked digest that could be drained twice
+    /// would inject the same context on every turn forever.
+    #[test]
+    fn parked_injections_are_taken_once_oldest_first_and_marked() {
+        let mut map: HashMap<String, ParkedInjection> = HashMap::new();
+        assert!(take_parked_injection_from(&mut map, "s1").is_none());
+
+        park_injection_into(&mut map, "s1", "first", vec!["a.rs".into(), "b.rs".into()]);
+        park_injection_into(&mut map, "s1", "second", vec!["b.rs".into(), "c.rs".into()]);
+        // Empty text parks nothing — an empty digest is not a late digest.
+        park_injection_into(&mut map, "s1", "   \n ", vec!["d.rs".into()]);
+        // Another session's backlog is its own.
+        park_injection_into(&mut map, "s2", "other", vec!["z.rs".into()]);
+
+        let (text, files) = take_parked_injection_from(&mut map, "s1").expect("parked");
+        assert_eq!(
+            text,
+            format!("{PARKED_INJECTION_NOTE}\nfirst\n\n{PARKED_INJECTION_NOTE}\nsecond")
+        );
+        assert_eq!(files, vec!["a.rs".to_string(), "b.rs".into(), "c.rs".into()]);
+        assert!(
+            take_parked_injection_from(&mut map, "s1").is_none(),
+            "a drained backlog must not come back on the next prompt"
+        );
+        assert!(take_parked_injection_from(&mut map, "s2").is_some());
+    }
+
+    /// The cap evicts WHOLE blocks, oldest first — a truncated digest can end
+    /// mid-path and read as a claim about a file it never described. A single
+    /// block bigger than the cap is therefore kept whole rather than shredded.
+    #[test]
+    fn parked_injections_evict_oldest_whole_blocks_at_the_cap() {
+        let mut map: HashMap<String, ParkedInjection> = HashMap::new();
+        // Two of these fit under the cap; the third pushes it over.
+        let block = "x".repeat(PARKED_INJECTION_CAP_CHARS / 3);
+        for tag in ['1', '2', '3'] {
+            park_injection_into(&mut map, "s", &format!("{tag}{block}"), Vec::new());
+        }
+        let slot = map.get("s").expect("parked");
+        assert_eq!(slot.blocks.len(), 2, "the oldest whole block was dropped");
+        assert!(slot.blocks[0].starts_with('2') && slot.blocks[1].starts_with('3'));
+        assert!(
+            slot.blocks.iter().map(|b| b.chars().count()).sum::<usize>()
+                <= PARKED_INJECTION_CAP_CHARS
+        );
+
+        // One oversized block survives intact: never truncated mid-block.
+        let mut map: HashMap<String, ParkedInjection> = HashMap::new();
+        let huge = "y".repeat(PARKED_INJECTION_CAP_CHARS + 500);
+        park_injection_into(&mut map, "s", &huge, Vec::new());
+        assert_eq!(map.get("s").expect("parked").blocks, vec![huge]);
+    }
+
+    /// Bounded exactly like `injected`/`auto_check_sessions`: a new session
+    /// past the cap clears the map rather than growing it forever. Losing a
+    /// parked block is safe — it was already late — while an unbounded map is
+    /// a leak for the process's lifetime.
+    #[test]
+    fn the_parked_injection_store_is_bounded_like_its_neighbours() {
+        let mut map: HashMap<String, ParkedInjection> = HashMap::new();
+        for i in 0..1025 {
+            park_injection_into(&mut map, &format!("s{i}"), "block", Vec::new());
+        }
+        assert_eq!(map.len(), 1025, "at the cap, nothing has been cleared yet");
+
+        // A session ALREADY in the map keeps its backlog (no clear).
+        park_injection_into(&mut map, "s0", "again", Vec::new());
+        assert_eq!(map.len(), 1025);
+        assert_eq!(map.get("s0").expect("still there").blocks.len(), 2);
+
+        // A new one past the cap clears and starts over with just itself.
+        park_injection_into(&mut map, "fresh", "block", Vec::new());
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("fresh"));
     }
 
     /// A full rebuild over a tiny on-disk Rust project: the store ends up with

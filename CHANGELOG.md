@@ -5,6 +5,37 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A sandboxed `run_command` could wedge forever, silently.** The first real
+  sandboxed child (`git --version`) hung for 22+ minutes: the grant row was
+  written, then nothing — no `sandboxed` row, no error, no timeout, and the
+  offload worker's single slot pinned for the duration. The child had exited
+  long before. What never returned was the parent's `join()` on a pipe-drain
+  thread: `CreateProcessW` was called with `bInheritHandles = 1` and an
+  attribute list carrying only the AppContainer's security capabilities, so
+  **any** other child cImp spawned in that instant (the shadow-repo `git` on
+  every prompt tap, a PTY shell, the offload server) could inherit a copy of
+  our pipe's write end and hold it open. Our copy closed, our child exited —
+  but the reader's blocking `ReadFile` never saw EOF, and the 120 s timeout
+  bounds only the wait on the *process*, never the drains. Fixed in three
+  places, because closing the race at one of them would still leave the failure
+  unbounded and invisible: the spawn now carries a
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly the three handles the child
+  may inherit (which also makes its stdin a real NUL device rather than a
+  pseudo-handle, so `Stdio::null` semantics finally hold); the parent's drain
+  collection is bounded by a 5 s grace, then `CancelSynchronousIo` on the
+  reader thread, then a 2 s grace, after which the thread is detached, its read
+  handle deliberately leaked (closing a handle another thread is blocked on is
+  worse than leaking one) and the incomplete capture reported as such in the
+  tool output; and the caller wraps the whole spawn in a backstop 30 s beyond
+  the child's own timeout. A wedge that gets past all of that now mints a
+  `wedged` row in the `sandbox` Events lane — the lane's entire purpose, and on
+  the night this happened it showed nothing at all, because every row was
+  minted downstream of a call that never returned.
+
 ## [0.52.0-rc.4] — 2026-08-17
 
 ### Added

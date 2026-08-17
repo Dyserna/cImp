@@ -432,11 +432,16 @@ pub fn record_denial(
 
 /// The `target` column for a sandbox-lane row: `"<label> — <program>"`, the
 /// shape [`record_skip`] established ("off (user choice) — git.exe"). Kept as
-/// one function so the two new row types cannot drift from the skip row's
-/// layout — a lane whose rows format their scannable column three different
+/// one function so the new row types cannot drift from the skip row's
+/// layout — a lane whose rows format their scannable column four different
 /// ways is a lane nobody scans.
+///
+/// `pub(crate)` because the `wedged` row is minted by the *caller*
+/// (`run_command::run_sandboxed`) rather than by a `record_*` helper here: the
+/// fact it records is "the engine never returned", which is only observable
+/// from outside the engine.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn state_target(label: &str, program: &Path) -> String {
+pub(crate) fn state_target(label: &str, program: &Path) -> String {
     format!(
         "{label} — {}",
         program.file_name().unwrap_or_default().to_string_lossy()

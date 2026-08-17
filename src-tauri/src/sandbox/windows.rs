@@ -21,22 +21,28 @@
 //!    §"the gotcha") never sees the unlistable `C:\`. Refcounted across
 //!    concurrent spawns on the same root; unmapped on last release.
 //!
-//! The spawn itself is a bespoke `CreateProcessW` with a
-//! `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list — std/tokio
-//! `Command` cannot attach one on stable Rust, which is the whole reason this
-//! path is hand-rolled. Job-object membership composes on top via
+//! The spawn itself is a bespoke `CreateProcessW` with a two-entry attribute
+//! list — `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` (the AppContainer
+//! itself; std/tokio `Command` cannot attach one on stable Rust, which is the
+//! whole reason this path is hand-rolled) and
+//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (which handles `bInheritHandles = 1`
+//! actually hands over — see [`spawn_blocking_inner`]'s "the inheritance race"
+//! comment). Job-object membership composes on top via
 //! `process_guard::guard_pid` (assign-after-spawn, same documented race as the
 //! PTY child).
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_ALREADY_EXISTS, GENERIC_READ, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE,
@@ -51,9 +57,11 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DefineDosDeviceW, GetLogicalDrives, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    CreateFileW, DefineDosDeviceW, GetLogicalDrives, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION,
+    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
@@ -68,12 +76,49 @@ const PROFILE_NAME: &str = "cimp.worker";
 /// documented constant value, guarded by a test that a capability SID built
 /// with it is valid.
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
-/// `ProcThreadAttributeSecurityCapabilities` (9) with `PROC_THREAD_ATTRIBUTE_INPUT`
-/// (0x0002_0000). windows-sys exposes neither symbol at this surface; the value
-/// is stable Win32 ABI and asserted against a successful spawn in tests.
-const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
+/// `PROC_THREAD_ATTRIBUTE_INPUT` — the bit `ProcThreadAttributeValue(Number,
+/// Thread, Input, Additive)` sets for an attribute the caller *supplies* (as
+/// opposed to one Win32 fills in). Both attributes below are inputs, neither is
+/// thread-scoped or additive, so each value is simply this bit OR'd with the
+/// attribute's number. windows-sys exposes none of these symbols at this
+/// surface; the encoding is stable Win32 ABI (`processthreadsapi.h`).
+const PROC_THREAD_ATTRIBUTE_INPUT: usize = 0x0002_0000;
+/// `ProcThreadAttributeSecurityCapabilities` = 9. Asserted against a successful
+/// spawn in tests.
+const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = PROC_THREAD_ATTRIBUTE_INPUT | 9;
+/// `ProcThreadAttributeHandleList` = 2 — the attribute that turns
+/// `bInheritHandles = 1` from "every inheritable handle in this process" into
+/// "exactly these". See [`spawn_blocking_inner`]'s inheritance-race comment for
+/// why this is a correctness fix and not a hardening nicety.
+const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = PROC_THREAD_ATTRIBUTE_INPUT | 2;
+/// The two attribute values, pinned: the constants above are derived from one
+/// shared bit, so a typo in the derivation would silently move BOTH. These are
+/// the numbers `processthreadsapi.h` produces.
+const _: () = assert!(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES == 0x0002_0009);
+const _: () = assert!(PROC_THREAD_ATTRIBUTE_HANDLE_LIST == 0x0002_0002);
 /// `SE_GROUP_ENABLED` sanity: a capability SID must validate.
 const _: () = assert!(SE_GROUP_ENABLED == 4);
+
+/// How long the parent waits for a drain thread to deliver its result after the
+/// child has exited (or been terminated).
+///
+/// **Why this exists (incident, 2026-08-18).** The first live sandboxed
+/// `run_command` (`git --version`) wedged for 22+ minutes with no row, no error
+/// and no timeout, pinning the offload worker's single slot. The child had long
+/// since exited; what never returned was the parent's `join()` on a drain
+/// thread whose blocking `ReadFile` never saw EOF, because a *concurrent* spawn
+/// elsewhere in cImp (the shadow-repo `git`, a PTY shell, a server) had
+/// inherited a copy of our pipe's write end and was holding it open. The
+/// `timeout` argument bounds only `WaitForSingleObject` on the process; nothing
+/// bounded the drains. [`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`] stops OUR child
+/// leaking handles, but it cannot stop other spawn sites from inheriting ours,
+/// so the drain wait is bounded too — belt and braces, deliberately.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// The second wait, after [`CancelSynchronousIo`] has aborted the pending
+/// `ReadFile`. Short: either the cancel took effect almost immediately or it
+/// never will, and a caller that has already waited [`DRAIN_GRACE`] should not
+/// wait another five seconds to learn nothing.
+const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
@@ -573,10 +618,24 @@ pub struct CapturedRun {
     pub stderr_capped: bool,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// At least one drain thread never finished, even after
+    /// [`CancelSynchronousIo`] — its pipe was still held open by a handle that
+    /// leaked to some other child (see [`DRAIN_GRACE`]). The run's output is
+    /// therefore INCOMPLETE (that stream reads as empty), the thread is
+    /// detached and its read handle deliberately leaked. The caller says so in
+    /// the model-visible output rather than presenting a truncated capture as
+    /// the whole answer.
+    pub drains_leaked: bool,
 }
 
 /// Spawn `program args…` inside the container with the given final environment
 /// and capture output, bounded by `cap` bytes per stream and `timeout`.
+///
+/// **`timeout` bounds the child, not this call.** It is what
+/// `WaitForSingleObject` gets; the drains that follow have their own bound
+/// ([`DRAIN_GRACE`]), and the caller carries a backstop over the whole future
+/// (`run_command::SANDBOX_BACKSTOP`) because a helper cannot be its own last
+/// line of defence.
 ///
 /// Runs the whole synchronous Win32 dance on a blocking thread: two reader
 /// threads drain stdout/stderr (so neither pipe deadlocks the other), the main
@@ -650,11 +709,25 @@ fn spawn_blocking_inner(
     // ── pipes ──
     let (out_rd, out_wr) = make_pipe()?;
     let (err_rd, err_wr) = make_pipe()?;
-    // Read ends must NOT be inherited; write ends must be.
+    // Read ends must NOT be inherited; write ends must be. (Still required with
+    // the handle list below: that attribute narrows what is inherited, it does
+    // not make a non-inheritable handle inheritable.)
     set_inherit(out_rd, false);
     set_inherit(err_rd, false);
     set_inherit(out_wr, true);
     set_inherit(err_wr, true);
+    // Stdin is the NUL device rather than `INVALID_HANDLE_VALUE`. Two reasons:
+    // a pseudo-handle cannot appear in the handle list below (and every handle
+    // named in `STARTUPINFO`'s std slots must), and NUL is what "no stdin" has
+    // always meant here — a child that reads stdin now gets EOF instead of an
+    // invalid handle.
+    let nul = match open_nul() {
+        Ok(h) => h,
+        Err(e) => {
+            close_all(&[out_rd, out_wr, err_rd, err_wr]);
+            return Err(e);
+        }
+    };
 
     // ── security capabilities + attribute list ──
     let mut cap_attrs: Vec<SID_AND_ATTRIBUTES> = cap_psids
@@ -675,14 +748,16 @@ fn spawn_blocking_inner(
         Reserved: 0,
     };
 
+    // Two attributes: the security capabilities and the handle list.
+    const ATTR_COUNT: u32 = 2;
     let mut size: usize = 0;
     // SAFETY: first call just sizes the list.
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), ATTR_COUNT, 0, &mut size) };
     let mut list_buf = vec![0u8; size];
     let attr_list = list_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-    // SAFETY: list_buf is sized by the call above; count 1.
-    if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut size) } == 0 {
-        close_all(&[out_rd, out_wr, err_rd, err_wr]);
+    // SAFETY: list_buf is sized by the call above; same count both calls.
+    if unsafe { InitializeProcThreadAttributeList(attr_list, ATTR_COUNT, 0, &mut size) } == 0 {
+        close_all(&[nul, out_rd, out_wr, err_rd, err_wr]);
         return Err(format!("InitializeProcThreadAttributeList failed ({})", last_error()));
     }
     struct AttrGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -706,15 +781,57 @@ fn spawn_blocking_inner(
         )
     } == 0
     {
-        close_all(&[out_rd, out_wr, err_rd, err_wr]);
+        close_all(&[nul, out_rd, out_wr, err_rd, err_wr]);
         return Err(format!("UpdateProcThreadAttribute failed ({})", last_error()));
+    }
+
+    // ── the inheritance race, closed ──
+    //
+    // `bInheritHandles = 1` without a handle list means "inherit EVERY
+    // inheritable handle this process holds at spawn time" — and cImp spawns
+    // children constantly from other threads (the shadow-repo `git` on every
+    // prompt tap, PTY shells, the offload server). Two races follow from that,
+    // and this attribute closes one of them:
+    //
+    //  * OUR child inheriting some other spawn's in-flight handles — closed
+    //    here, exactly, by naming the three handles it may have;
+    //  * some OTHER spawn inheriting the write ends below before we close them
+    //    — NOT closable from this side (the handles must be inheritable during
+    //    our own `CreateProcessW`, and Windows has no per-spawn scoping for
+    //    that). That leak is what wedged the first live sandboxed run: the
+    //    write end stayed open in a stranger's process, our reader never saw
+    //    EOF, and the parent's `join()` never returned. Bounding the drains
+    //    (see [`collect_drain`]) is the defence for that half.
+    //
+    // The array must outlive `CreateProcessW` — same lifetime discipline as
+    // `sec_caps` — so it is a plain local declared before the call.
+    let mut inherit_handles: [HANDLE; 3] = [nul, out_wr, err_wr];
+    // SAFETY: attr_list initialized with room for 2 attributes; the handle
+    // array outlives the CreateProcessW call below.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherit_handles.as_mut_ptr() as *const c_void,
+            std::mem::size_of::<HANDLE>() * inherit_handles.len(),
+            null_mut(),
+            null(),
+        )
+    } == 0
+    {
+        close_all(&[nul, out_rd, out_wr, err_rd, err_wr]);
+        return Err(format!(
+            "UpdateProcThreadAttribute (handle list) failed ({})",
+            last_error()
+        ));
     }
 
     // ── startup info ──
     let mut siex: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     siex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    siex.StartupInfo.hStdInput = INVALID_HANDLE_VALUE; // no stdin (matches Stdio::null)
+    siex.StartupInfo.hStdInput = nul; // no stdin (matches Stdio::null)
     siex.StartupInfo.hStdOutput = out_wr;
     siex.StartupInfo.hStdError = err_wr;
     siex.lpAttributeList = attr_list;
@@ -742,7 +859,7 @@ fn spawn_blocking_inner(
         )
     };
     // The child owns the write ends now; close ours so EOF arrives when it exits.
-    close_all(&[out_wr, err_wr]);
+    close_all(&[nul, out_wr, err_wr]);
     if ok == 0 {
         close_all(&[out_rd, err_rd]);
         return Err(format!("CreateProcessW failed ({})", last_error()));
@@ -752,10 +869,13 @@ fn spawn_blocking_inner(
     crate::process_guard::guard_pid(pi.dwProcessId);
 
     // ── drain both pipes on their own threads ──
-    let out_rd_val = out_rd as usize;
-    let err_rd_val = err_rd as usize;
-    let t_out = std::thread::spawn(move || drain_pipe(out_rd_val as HANDLE, cap));
-    let t_err = std::thread::spawn(move || drain_pipe(err_rd_val as HANDLE, cap));
+    //
+    // Each thread hands its result back over a channel rather than through its
+    // return value, so the parent's collection can be BOUNDED — a `join()` on a
+    // thread parked in `ReadFile` is unbounded by construction, which is the
+    // shape of the 2026-08-18 wedge (see [`DRAIN_GRACE`]).
+    let (t_out, out_rx) = spawn_drain(out_rd, cap);
+    let (t_err, err_rx) = spawn_drain(err_rd, cap);
 
     // ── wait with deadline ──
     let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
@@ -780,15 +900,41 @@ fn spawn_blocking_inner(
         exit_code = None;
     }
 
-    let (stdout, stdout_capped) = t_out.join().unwrap_or((Vec::new(), false));
-    let (stderr, stderr_capped) = t_err.join().unwrap_or((Vec::new(), false));
+    let out = collect_drain(&out_rx, t_out, DRAIN_GRACE, DRAIN_CANCEL_GRACE);
+    let err = collect_drain(&err_rx, t_err, DRAIN_GRACE, DRAIN_CANCEL_GRACE);
 
     // SAFETY: handles from CreateProcess, closed exactly once here.
     unsafe {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
-    close_all(&[out_rd, err_rd]);
+
+    // A read handle is closed only if the thread that was reading it is DONE.
+    // Closing a handle another thread is blocked in `ReadFile` on is
+    // UB-adjacent (the kernel object can be recycled under the pending IO); a
+    // leaked handle pair per wedged run is the far cheaper of the two costs,
+    // and the wedge is reported rather than hidden.
+    let mut drains_leaked = false;
+    let (stdout, stdout_capped) = match out {
+        DrainOutcome::Done(bytes, capped) => {
+            close_all(&[out_rd]);
+            (bytes, capped)
+        }
+        DrainOutcome::Leaked => {
+            drains_leaked = true;
+            (Vec::new(), false)
+        }
+    };
+    let (stderr, stderr_capped) = match err {
+        DrainOutcome::Done(bytes, capped) => {
+            close_all(&[err_rd]);
+            (bytes, capped)
+        }
+        DrainOutcome::Leaked => {
+            drains_leaked = true;
+            (Vec::new(), false)
+        }
+    };
 
     Ok(CapturedRun {
         stdout,
@@ -797,7 +943,99 @@ fn spawn_blocking_inner(
         stderr_capped,
         exit_code,
         timed_out,
+        drains_leaked,
     })
+}
+
+// ── bounded drains (the 2026-08-18 wedge) ─────────────────────────────────────
+
+/// One drain thread's product: the captured bytes and whether more was produced
+/// than the cap.
+type DrainResult = (Vec<u8>, bool);
+
+/// What [`collect_drain`] managed to get out of one drain thread.
+enum DrainOutcome {
+    Done(Vec<u8>, bool),
+    /// The thread never delivered, even after its pending `ReadFile` was
+    /// cancelled. It is detached and its read handle is deliberately leaked.
+    Leaked,
+}
+
+/// Start one drain thread, returning its join handle and the channel it will
+/// deliver on. The thread still returns normally — the channel exists so the
+/// PARENT's wait can be bounded, not to change the thread's own lifecycle.
+fn spawn_drain(rd: HANDLE, cap: usize) -> (std::thread::JoinHandle<()>, Receiver<DrainResult>) {
+    let (tx, rx) = std::sync::mpsc::channel::<DrainResult>();
+    // `HANDLE` is a raw pointer and therefore not `Send`; the value is a kernel
+    // handle, not a memory address, and moving it to the reader is the whole
+    // point — same `as usize` shuttle the pre-existing code used.
+    let rd_val = rd as usize;
+    let t = std::thread::spawn(move || {
+        let _ = tx.send(drain_pipe(rd_val as HANDLE, cap));
+    });
+    (t, rx)
+}
+
+/// Collect one drain thread's result without ever blocking indefinitely.
+///
+/// Three stages, in order of preference:
+///
+/// 1. `recv_timeout(grace)` — the normal path; the child exited, the pipe hit
+///    EOF, the thread already sent.
+/// 2. Still nothing ⇒ the `ReadFile` is parked on a pipe whose write end leaked
+///    to some other process. [`CancelSynchronousIo`] aborts that pending IO on
+///    the reader's own thread, which makes `ReadFile` fail and `drain_pipe`
+///    return what it has; `recv_timeout(cancel_grace)` picks it up.
+/// 3. Still nothing ⇒ give up on the thread. Detach it (dropping a
+///    `JoinHandle` does not stop the thread) and report [`DrainOutcome::Leaked`]
+///    so the caller can say the capture is incomplete instead of presenting an
+///    empty stream as the truth.
+///
+/// The two graces are parameters rather than the consts directly so the
+/// machinery is testable in milliseconds; production passes [`DRAIN_GRACE`] and
+/// [`DRAIN_CANCEL_GRACE`].
+fn collect_drain(
+    rx: &Receiver<DrainResult>,
+    thread: std::thread::JoinHandle<()>,
+    grace: Duration,
+    cancel_grace: Duration,
+) -> DrainOutcome {
+    match rx.recv_timeout(grace) {
+        Ok((bytes, capped)) => {
+            // The thread has already produced its value; this join is bounded
+            // by "return from send" and cannot re-enter `ReadFile`.
+            let _ = thread.join();
+            return DrainOutcome::Done(bytes, capped);
+        }
+        // The sender was dropped without sending — the thread panicked. Nothing
+        // to wait for and nothing pending; the handle is ours to close again.
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = thread.join();
+            return DrainOutcome::Done(Vec::new(), false);
+        }
+        Err(RecvTimeoutError::Timeout) => {}
+    }
+    // SAFETY: the JoinHandle owns a live thread handle for as long as it is
+    // alive, which is this whole scope. `CancelSynchronousIo` on a thread with
+    // no pending synchronous IO simply fails with ERROR_NOT_FOUND, which the
+    // second recv below covers.
+    unsafe { CancelSynchronousIo(thread.as_raw_handle() as HANDLE) };
+    match rx.recv_timeout(cancel_grace) {
+        Ok((bytes, capped)) => {
+            let _ = thread.join();
+            DrainOutcome::Done(bytes, capped)
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = thread.join();
+            DrainOutcome::Done(Vec::new(), false)
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            // Detach. Do NOT join (that is the hang we are here to avoid) and
+            // do NOT close the read handle (the caller's contract).
+            drop(thread);
+            DrainOutcome::Leaked
+        }
+    }
 }
 
 // ── small Win32 helpers ───────────────────────────────────────────────────────
@@ -811,6 +1049,35 @@ fn make_pipe() -> Result<(HANDLE, HANDLE), String> {
         return Err(format!("CreatePipe failed ({})", last_error()));
     }
     Ok((rd, wr))
+}
+
+/// An inheritable read handle on the NUL device — the child's stdin.
+///
+/// Replaces the `INVALID_HANDLE_VALUE` that used to sit in `hStdInput`: a
+/// pseudo-handle cannot appear in [`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`], and
+/// every handle named in `STARTUPINFO`'s std slots must. Opened by the PARENT
+/// (outside the container), so the child's own token never has to reach the
+/// device.
+fn open_nul() -> Result<HANDLE, String> {
+    let name = wide_str("NUL");
+    // SAFETY: name is a valid wide string; null security attributes and a null
+    // template handle are the documented defaults.
+    let h = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE || h.is_null() {
+        return Err(format!("opening NUL for the child's stdin failed ({})", last_error()));
+    }
+    set_inherit(h, true);
+    Ok(h)
 }
 
 fn set_inherit(h: HANDLE, inherit: bool) {
@@ -940,6 +1207,173 @@ mod tests {
             assert!(l.ends_with(':'));
             let c = l.as_bytes()[0];
             assert!((b'D'..=b'Z').contains(&c), "got {l}");
+        }
+    }
+
+    // ── bounded drains (the 2026-08-18 wedge) ──
+    //
+    // This whole module is `#[cfg(windows)]` (see `sandbox/mod.rs`), so these
+    // tests are Windows-only by construction. They need no AppContainer and no
+    // child process: the wedge is a *pipe* property, so a pipe plus a held-open
+    // write end reproduces it exactly.
+
+    /// The normal path: a stream that reaches EOF is collected whole, well
+    /// inside the grace.
+    #[test]
+    fn a_closed_write_end_drains_normally() {
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        let (rd, wr) = make_pipe().expect("pipe");
+        let payload = b"hello from the child\n";
+        let mut written: u32 = 0;
+        // SAFETY: wr is a live write handle; the buffer outlives the call.
+        let ok = unsafe {
+            WriteFile(
+                wr,
+                payload.as_ptr(),
+                payload.len() as u32,
+                &mut written,
+                null_mut(),
+            )
+        };
+        assert!(ok != 0, "WriteFile failed ({})", last_error());
+        // EOF only arrives once every write end is closed.
+        close_all(&[wr]);
+        let (t, rx) = spawn_drain(rd, 1024);
+        match collect_drain(&rx, t, Duration::from_secs(5), Duration::from_secs(2)) {
+            DrainOutcome::Done(bytes, capped) => {
+                assert_eq!(bytes, payload);
+                assert!(!capped);
+            }
+            DrainOutcome::Leaked => panic!("a closed pipe must drain, not leak"),
+        }
+        close_all(&[rd]);
+    }
+
+    /// The incident, reproduced: the write end is still open in (what stands in
+    /// for) another process, so `ReadFile` never sees EOF. The parent must NOT
+    /// hang — the grace must elapse and `CancelSynchronousIo` must break the
+    /// parked read so the second `recv_timeout` gets a result.
+    #[test]
+    fn a_leaked_write_end_never_hangs_the_parent() {
+        let (rd, wr) = make_pipe().expect("pipe");
+        let (t, rx) = spawn_drain(rd, 1024);
+        // Give the reader time to actually park inside ReadFile before the
+        // grace is measured against it.
+        std::thread::sleep(Duration::from_millis(50));
+        let grace = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let outcome = collect_drain(&rx, t, grace, Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        // (a) the grace path triggered — a drain that had already delivered
+        // would have returned in microseconds.
+        assert!(
+            elapsed >= grace,
+            "the grace path did not trigger (returned in {elapsed:?})"
+        );
+        // (b) the cancel unblocked the read and the second recv got a result.
+        match outcome {
+            DrainOutcome::Done(bytes, _) => assert!(bytes.is_empty()),
+            DrainOutcome::Leaked => {
+                panic!("CancelSynchronousIo did not unblock the parked ReadFile")
+            }
+        }
+        // The reader is done, so both ends are ours to close.
+        close_all(&[rd, wr]);
+    }
+
+    /// The two attribute values, as the reader of a diff would want them
+    /// stated: one shared input bit, two distinct attribute numbers.
+    #[test]
+    fn proc_thread_attribute_values_are_the_documented_ones() {
+        assert_eq!(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, 0x0002_0009);
+        assert_eq!(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, 0x0002_0002);
+        assert_ne!(
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+        );
+    }
+
+    /// The child's stdin is a real device handle, not a pseudo-handle — the
+    /// handle list requires it, and `Stdio::null` semantics want it.
+    #[test]
+    fn nul_opens_as_a_real_inheritable_handle() {
+        let h = open_nul().expect("NUL must be openable");
+        assert!(h != INVALID_HANDLE_VALUE && !h.is_null());
+        close_all(&[h]);
+    }
+
+    /// The composition itself, end to end: a real AppContainer child spawned
+    /// through the two-attribute list, with a real NUL stdin and a handle list.
+    ///
+    /// This is the assertion the unit tests above cannot make. The handle list
+    /// imposes a rule the old code did not have to satisfy — *every* handle in
+    /// `STARTUPINFO`'s std slots must be listed, and a pseudo-handle cannot be
+    /// — so a wrong answer here is not a subtle degradation but
+    /// `ERROR_INVALID_PARAMETER` on every sandboxed spawn. `cmd.exe` under
+    /// `System32` needs no grant (Windows gives ALL APPLICATION PACKAGES
+    /// read+execute there), so this touches no ACLs and maps no drive.
+    ///
+    /// Skips cleanly when the environment refuses AppContainer profiles, and
+    /// asserts on the *spawn*, not on the child's output — a container without
+    /// grants may well fail to run `echo`, and that is not what is under test.
+    #[test]
+    fn the_attribute_list_composition_actually_spawns() {
+        let Ok(container) = container_sid() else {
+            return; // environment refuses profiles; container_sid's own test says so
+        };
+        let system32 = std::env::var_os("SystemRoot")
+            .map(|r| PathBuf::from(r).join("System32"))
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+        let cmd = system32.join("cmd.exe");
+        if !cmd.exists() {
+            return;
+        }
+        let cmdline = format!("{} /c exit 7", quote_arg(&cmd.to_string_lossy()));
+        // The real environment, in the block shape `spawn_and_capture` builds:
+        // case-insensitively sorted "K=V" pairs, NUL-separated, double-NUL
+        // terminated. (A hand-made two-variable block is not enough — Windows
+        // itself fails the spawn with ERROR_ENVVAR_NOT_FOUND.)
+        let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        pairs.sort_by(|a, b| {
+            a.0.to_string_lossy()
+                .to_ascii_uppercase()
+                .cmp(&b.0.to_string_lossy().to_ascii_uppercase())
+        });
+        let mut env_block: Vec<u16> = Vec::new();
+        for (k, v) in &pairs {
+            if k.is_empty() {
+                continue;
+            }
+            env_block.extend(k.encode_wide());
+            env_block.push('=' as u16);
+            env_block.extend(v.encode_wide());
+            env_block.push(0);
+        }
+        env_block.push(0);
+        let run = spawn_blocking_inner(
+            container.as_psid() as usize,
+            &[],
+            wide_str(&cmdline),
+            env_block,
+            wide(system32.as_os_str()),
+            4096,
+            Duration::from_secs(30),
+        );
+        match run {
+            Ok(run) => {
+                assert!(!run.timed_out, "the child hung");
+                assert!(!run.drains_leaked, "a drain leaked on a well-behaved child");
+                assert_eq!(run.exit_code, Some(7), "the child's exit code must survive");
+            }
+            Err(e) => {
+                // A refused spawn is tolerable ONLY if the container itself was
+                // refused — `ERROR_INVALID_PARAMETER` (87) is the handle-list
+                // rule being violated and must never be tolerated.
+                assert!(
+                    !e.contains("(87)"),
+                    "the attribute list is malformed — CreateProcessW rejected it: {e}"
+                );
+            }
         }
     }
 

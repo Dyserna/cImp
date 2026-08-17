@@ -23,6 +23,30 @@ use super::ToolCtx;
 const TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
+/// How much longer than [`TIMEOUT`] the sandboxed path is given to *settle*
+/// after the child's own deadline has passed: terminate the child, wait for the
+/// job to reap the tree, drain both pipes (up to `DRAIN_GRACE +
+/// DRAIN_CANCEL_GRACE` each, worst case ~14 s serial) and return.
+#[cfg_attr(not(windows), allow(dead_code))]
+const SANDBOX_SETTLE_SLACK: Duration = Duration::from_secs(30);
+/// The caller-side backstop on `spawn_and_capture` (2026-08-18 incident).
+///
+/// The sandboxed path is a hand-rolled Win32 dance on a blocking thread; if any
+/// step of it ever fails to return, the tool call never completes, the offload
+/// worker's single slot stays pinned and NOTHING is recorded — which is exactly
+/// how the first live sandboxed `run_command` spent 22 minutes invisible. The
+/// engine bounds its own internals now, but a backstop that exists only inside
+/// the thing it is backstopping is not a backstop.
+///
+/// Derived from [`TIMEOUT`] in ONE expression so the two cannot drift apart in
+/// a later edit; `sandbox_backstop_exceeds_the_child_timeout` pins the relation.
+///
+/// `allow(dead_code)` off Windows for the same reason `sandbox::mod`'s helpers
+/// carry it: the only non-test consumer is the Windows AppContainer path.
+#[cfg_attr(not(windows), allow(dead_code))]
+const SANDBOX_BACKSTOP: Duration =
+    Duration::from_secs(TIMEOUT.as_secs() + SANDBOX_SETTLE_SLACK.as_secs());
+
 #[derive(Deserialize)]
 struct Args {
     /// Program to run (must match the allowlist by name).
@@ -704,19 +728,53 @@ async fn run_sandboxed(
         env.push((OsString::from(k), v.clone()));
     }
 
-    let run = match crate::sandbox::windows::spawn_and_capture(
-        prepared,
-        program,
-        &args.args,
-        &env,
-        &prepared.cwd(),
-        MAX_OUTPUT_BYTES,
-        TIMEOUT,
+    // The backstop (2026-08-18): the engine bounds its own waits now, but a
+    // path whose only deadline lives inside itself has no deadline at all. If
+    // this elapses the child may well have run — we simply do not know, which
+    // is precisely what makes it worth a row.
+    let settled = tokio::time::timeout(
+        SANDBOX_BACKSTOP,
+        crate::sandbox::windows::spawn_and_capture(
+            prepared,
+            program,
+            &args.args,
+            &env,
+            &prepared.cwd(),
+            MAX_OUTPUT_BYTES,
+            TIMEOUT,
+        ),
     )
-    .await
-    {
-        Ok(run) => run,
-        Err(e) => {
+    .await;
+    let run = match settled {
+        Err(_) => {
+            // The lane's whole point is that an incident leaves a trace. On the
+            // night this was diagnosed it showed nothing at all, because every
+            // row was minted downstream of a call that never returned.
+            crate::sandbox::record_event(
+                root,
+                "wedged",
+                crate::sandbox::state_target("wedged", program),
+                format!(
+                    "`{}` did not settle within {}s (child timeout {}s + {}s settle slack). \
+                     The sandboxed spawn helper never returned; the child may have run, may \
+                     still be running, or may never have started — cImp cannot tell, so this \
+                     row asserts only the wedge. Job-object membership still reaps the tree on \
+                     cImp's death.",
+                    args.command,
+                    SANDBOX_BACKSTOP.as_secs(),
+                    TIMEOUT.as_secs(),
+                    SANDBOX_SETTLE_SLACK.as_secs(),
+                ),
+                false,
+            );
+            return Err(format!(
+                "sandboxed spawn did not settle within {}s — the child may have run; \
+                 treating as wedged (see sandbox lane)",
+                SANDBOX_BACKSTOP.as_secs()
+            ));
+        }
+        Ok(Ok(run)) => run,
+        Ok(Err(e)) => {
             // Decision 4: the bespoke `CreateProcessW` refusing to start the
             // child is itself a denial shape (a container that cannot read the
             // program image fails right here), so its error string goes through
@@ -766,14 +824,29 @@ async fn run_sandboxed(
             &ctx.sandbox,
         );
     }
-    Ok(format_run_output(
+    let mut out = format_run_output(
         &run.stdout,
         &run.stderr,
         run.stdout_capped || run.stderr_capped,
         run.exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "unknown".into()),
-    ))
+    );
+    if run.drains_leaked {
+        // The child finished but one of its pipes stayed open in a process that
+        // inherited a copy of the write end. The output above is therefore
+        // MISSING a stream, and a model told nothing would read the gap as
+        // "the command printed nothing".
+        tracing::warn!(
+            command = %args.command,
+            "sandbox: a pipe drain never finished (leaked write end) — captured output is incomplete"
+        );
+        out.push_str(
+            "\n[sandbox: one output stream could not be drained — a copy of its pipe leaked to \
+             another process, so part of this output is missing]",
+        );
+    }
+    Ok(out)
 }
 
 /// Bytes captured from one stream, plus whether more was produced than the cap.
@@ -820,6 +893,33 @@ async fn read_capped<R: AsyncRead + Unpin>(reader: Option<R>, cap: usize) -> Cap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The caller-side backstop must outlast the child's own deadline, with
+    /// room for the engine to terminate, reap and drain afterwards. If it ever
+    /// did not, a perfectly ordinary `git log` hitting its 120 s cap would be
+    /// reported to the user as a *wedge* — the one row in that lane that is
+    /// supposed to mean "something is broken in cImp, not in your command".
+    ///
+    /// The two constants are derived from one expression precisely so this
+    /// cannot drift; the assertion is what notices if someone un-derives them.
+    #[test]
+    fn sandbox_backstop_exceeds_the_child_timeout() {
+        assert!(
+            SANDBOX_BACKSTOP > TIMEOUT,
+            "backstop {:?} must exceed the child timeout {:?}",
+            SANDBOX_BACKSTOP,
+            TIMEOUT
+        );
+        // The slack must cover the engine's own worst case: terminate + 2 s
+        // reap wait + two serial drain collections (5 s grace + 2 s cancel
+        // grace each).
+        assert!(
+            SANDBOX_SETTLE_SLACK >= Duration::from_secs(16),
+            "settle slack {:?} is under the engine's worst-case settle time",
+            SANDBOX_SETTLE_SLACK
+        );
+        assert_eq!(SANDBOX_BACKSTOP, TIMEOUT + SANDBOX_SETTLE_SLACK);
+    }
 
     #[test]
     fn allowlist_matches_by_stem() {

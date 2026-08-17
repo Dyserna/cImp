@@ -719,7 +719,10 @@ Parser fixtures rot when the underlying tool changes its output — see
 
 Same genre as the two how-tos above, one layer down: this is what it costs to
 support a **new CLI** (or absorb a change in one), after V35 Phase K moved the
-whole harness surface into `src-tauri/src/harness/`. The in-tree twin of this
+whole harness surface into `src-tauri/src/harness/`. The full treatment — layers
+as modules, the tier model, CHP, the registry, and a step-by-step developer guide
+for both adding a harness and changing an existing plugin — is
+[HARNESS-PLUGIN-LAYER.md](HARNESS-PLUGIN-LAYER.md). The in-tree twin of this
 section is `src-tauri/src/harness/README.md`; the design is
 `DESIGN-harness-plugin-architecture.md` (§ 4 for the tree, § 4.1 for the tests
 below, § 6 for this cost table).

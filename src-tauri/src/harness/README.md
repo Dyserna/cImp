@@ -102,6 +102,10 @@ Re-blessing a golden without reading its diff defeats the entire arrangement.
 
 ## Reading list
 
+- `docs/HARNESS-PLUGIN-LAYER.md` — **the long-form twin of this file**: the four
+  layers as modules, the tier model, CHP in one page, the registry's row anatomy
+  and enforcing tests, both shipped plugins in detail, and the two developer
+  guides (adding a harness, changing an existing plugin).
 - `docs/MILESTONE-V35-harness-resilience.md` — the why, and the locked decisions.
 - `docs/DESIGN-harness-plugin-architecture.md` — the four layers, D1–D7, the
   target tree (§ 4) and these tests (§ 4.1).

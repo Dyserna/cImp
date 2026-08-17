@@ -30,6 +30,8 @@
   //   • quiet — `ok`, `update`: ordinary traffic.
   //   • plain warning text — `signal`, `failed` keep the treatments the two
   //     feeds already gave them.
+  //   • UNDERLINED danger-soft — `down`, `boundary`: a real failure whose cause
+  //     is in the row, not a block we performed. Never the filled red.
   //
   // Colours are theme tokens only — themes/palettes ship as external files
   // beside the exe, so a hardcoded hex breaks the `tui` and light themes.
@@ -111,6 +113,20 @@
   .schip.unsandboxed {
     color: var(--warning, #f0a020);
     border-color: color-mix(in srgb, var(--warning, #f0a020) 45%, transparent);
+  }
+
+  /* A sandboxed child failed with denial-shaped output. Borrows the `failed`
+     treatment plus `down`'s dotted underline (the app's existing "this row
+     carries a reason worth opening") — so it reads as a failure, distinctly,
+     without taking `denied`'s filled red. That red is the one "we stopped it",
+     and this row is a HEURISTIC: the boundary is the likely cause, not an
+     observed fact. A chip that claimed more than the row's own wording does
+     would be the same over-claim in pixels. */
+  .schip.boundary {
+    color: var(--text-danger-soft, #ffb0c0);
+    border-color: color-mix(in srgb, var(--text-danger-soft, #ffb0c0) 40%, transparent);
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
   }
 
   /* Containment came on (beacon / contamination). */

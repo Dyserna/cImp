@@ -353,6 +353,10 @@ describe('rowStatus', () => {
       'ready',
       'stopped',
       'down',
+      // Sandbox lane. `unsandboxed` was missing from this list since V33
+      // Phase A added it — the tooltip existed, but nothing checked it did.
+      'unsandboxed',
+      'boundary',
     ];
     for (const s of all) expect(STATUS_TITLE[s].length).toBeGreaterThan(0);
   });
@@ -461,5 +465,42 @@ describe('rowStatus — sandbox', () => {
     // Other tools in this lane (grants, drive mappings) are ordinary rows.
     expect(rowStatus(sbx('grant', true, { target: 'C:/tools' }))).toBe('ok');
     expect(rowStatus(sbx('grant', false, { target: 'C:/tools' }))).toBe('failed');
+  });
+
+  it('reads a sandboxed run as ordinary traffic, not as an alarm', () => {
+    // The confirmation row exists to answer "is this actually sandboxed?" —
+    // an empty lane used to mean either "everything was" or "nothing ran".
+    // Answering it must not cost the lane its signal-to-noise: the expected
+    // case stays quiet, and the program name lives in `target`.
+    const run = sbx('sandboxed', true, { target: 'sandboxed — git.exe' });
+    expect(rowStatus(run)).toBe('ok');
+    expect(run.target).toContain('git.exe');
+  });
+
+  it('gives a suspected boundary hit its own word — not denied, not failed', () => {
+    const hit = sbx('denied', false, {
+      target: 'filesystem/OS access denied — git.exe',
+    });
+    expect(rowStatus(hit)).toBe('boundary');
+    // `denied` is this app's one "we stopped it", and it is filled red. cImp
+    // cannot see the OS's ACL decision — the backend words this row as a
+    // heuristic, so the chip must not assert more than the row does.
+    expect(rowStatus(hit)).not.toBe('denied');
+    // `failed` is wrong the other way: the tool call itself returned output.
+    expect(rowStatus(hit)).not.toBe('failed');
+    // The program is in the scannable column, like every other row in the lane.
+    expect(hit.target).toContain('git.exe');
+  });
+
+  it('keeps every sandbox row type visibly distinct', () => {
+    // One lane, four row types. If two of them ever render as the same word,
+    // the lane stops answering the question it was added to answer.
+    const words = [
+      rowStatus(sbx('unsandboxed', true, { target: 'off (user choice) — git.exe' })),
+      rowStatus(sbx('sandboxed', true, { target: 'sandboxed — git.exe' })),
+      rowStatus(sbx('denied', false, { target: 'socket access denied — curl.exe' })),
+      rowStatus(sbx('grant', false, { target: 'C:/tools' })),
+    ];
+    expect(new Set(words).size).toBe(words.length);
   });
 });

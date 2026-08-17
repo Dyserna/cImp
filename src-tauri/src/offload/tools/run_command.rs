@@ -662,6 +662,22 @@ fn format_run_output(
 /// The kill-on-close job assignment happens inside `spawn_and_capture` (the
 /// same `guard_pid` the PTY child uses), so a hard cImp death still reaps this
 /// child — decision 17's "job objects stay unconditional" holds on both paths.
+///
+/// # What this path tells the `sandbox` lane
+///
+/// Two things, and they are minted HERE because this is the only place the raw
+/// exit code and stderr exist — the function returns `Ok(format_run_output(…))`
+/// for a nonzero exit, so by the time the model sees a failure it is just text.
+///
+/// * A **confirmation** row on a successful spawn (once per program per
+///   session): before it, an empty lane meant either "everything ran sandboxed"
+///   or "nothing ever spawned", which is not an answer.
+/// * A **denial-suspicion** row, every time a failed child's output matches
+///   [`crate::sandbox::denial_signature`] — including the spawn-error path
+///   below, whose `Err` string is classified before it propagates.
+///
+/// A timeout mints neither: a hang is not a denial signature, and guessing
+/// would put noise in the one lane that is supposed to mean something.
 #[cfg(windows)]
 async fn run_sandboxed(
     prepared: &crate::sandbox::windows::Prepared,
@@ -669,7 +685,7 @@ async fn run_sandboxed(
     args: &Args,
     base_env: &[(&str, OsString)],
     policy_env: &[(String, OsString)],
-    _ctx: &ToolCtx,
+    ctx: &ToolCtx,
     root: &std::path::Path,
 ) -> Result<String, String> {
     // Same composition order as the plain path: minimal env first, then the
@@ -688,7 +704,7 @@ async fn run_sandboxed(
         env.push((OsString::from(k), v.clone()));
     }
 
-    let run = crate::sandbox::windows::spawn_and_capture(
+    let run = match crate::sandbox::windows::spawn_and_capture(
         prepared,
         program,
         &args.args,
@@ -697,16 +713,59 @@ async fn run_sandboxed(
         MAX_OUTPUT_BYTES,
         TIMEOUT,
     )
-    .await?;
+    .await
+    {
+        Ok(run) => run,
+        Err(e) => {
+            // Decision 4: the bespoke `CreateProcessW` refusing to start the
+            // child is itself a denial shape (a container that cannot read the
+            // program image fails right here), so its error string goes through
+            // the same classifier as a child's stderr — with no exit code,
+            // because nothing ran.
+            if let Some(class) = crate::sandbox::denial_signature(None, &e, ctx.sandbox.allow_network)
+            {
+                crate::sandbox::record_denial(
+                    root,
+                    program,
+                    &args.args,
+                    None,
+                    &e,
+                    class,
+                    &ctx.sandbox,
+                );
+            }
+            return Err(e);
+        }
+    };
+    // The spawn succeeded, so the boundary is real for this program: say so
+    // once, positively. Deduped per program inside `record_sandboxed`.
+    crate::sandbox::record_sandboxed(root, program, &ctx.sandbox);
 
     if run.timed_out {
+        // No denial row: a hang matches no access-denial signature, and
+        // labeling one would be the guess this lane must not make.
         return Err(format!(
             "`{}` timed out after {}s",
             args.command,
             TIMEOUT.as_secs()
         ));
     }
-    let _ = root;
+    // A nonzero exit returns `Ok` to the model (the output IS the answer), so
+    // this is the last point at which the raw exit code and stderr exist.
+    let stderr_text = String::from_utf8_lossy(&run.stderr);
+    if let Some(class) =
+        crate::sandbox::denial_signature(run.exit_code, &stderr_text, ctx.sandbox.allow_network)
+    {
+        crate::sandbox::record_denial(
+            root,
+            program,
+            &args.args,
+            run.exit_code,
+            &stderr_text,
+            class,
+            &ctx.sandbox,
+        );
+    }
     Ok(format_run_output(
         &run.stdout,
         &run.stderr,

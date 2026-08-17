@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The sandbox lane now reports what happens INSIDE the boundary, not just
+  what was skipped.** Two new row kinds in the existing `sandbox` Events lane.
+  A **confirmation** row (`sandboxed`, once per program per session) says
+  positively that a program is running inside the AppContainer and under which
+  capability posture — before this, an empty lane meant either "everything ran
+  sandboxed" or "nothing ever spawned", and there was no way to tell which. A
+  **denial-suspicion** row (`denied`) is written whenever a sandboxed child
+  fails with output matching an access-denial signature: `os error 5` /
+  `Access is denied` / `Permission denied`, the socket refusals
+  (`os error 10013`, `WSAEACCES`, "forbidden by its access permissions"), and —
+  **only when `allow_network` is off** — the name-resolution failures that are
+  an AppContainer's usual death shape without `internetClient`. Every
+  occurrence is recorded, not deduplicated: a child hitting the boundary over
+  and over is exactly the pattern worth seeing. The row carries the program and
+  its first three arguments, the exit code, the matched signature class, the
+  capability posture and a 500-character credential-screened stderr tail, and
+  it is worded as a labeled heuristic — cImp cannot observe the OS's ACL
+  decision, so the row says the failure *matches* a denial signature and is
+  *likely* the boundary, never that the sandbox denied it. An ordinary nonzero
+  exit with no matching signature mints nothing (a failing test suite is not a
+  boundary event), and a timeout mints nothing (a hang is not a denial shape).
+  Both row types sit in the lane's existing column shape (`tool` = the state
+  label, `target` = `"<label> — <program>"`), so the program name is
+  visible without opening the row. A sandboxed run wears the quiet `ok` chip —
+  it is the expected case — and a suspected boundary hit gets its own word,
+  **`boundary`**, rather than `denied` or `failed`: `denied` is the one filled-red
+  "we stopped it" and would claim a certainty cImp does not have, while `failed`
+  would read a boundary hit as an ordinary broken command.
+
 ### Fixed
 
 - **Context injection was being discarded on almost every prompt.** The

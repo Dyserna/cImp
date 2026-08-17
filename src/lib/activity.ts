@@ -262,7 +262,18 @@ export type RowStatus =
   /// V33 Phase A: a child ran outside the OS sandbox. Distinct from `denied`
   /// (a model was refused) and from `failed` (the command itself broke) — the
   /// command ran fine, the boundary was absent.
-  | 'unsandboxed';
+  | 'unsandboxed'
+  /// A sandboxed child failed with output MATCHING an access-denial signature.
+  ///
+  /// Its own word rather than `denied` or `failed`, because it is neither.
+  /// `denied` is this app's one "we stopped it" — filled red, a certainty cImp
+  /// does not have here: it cannot observe the OS's ACL decision, only the exit
+  /// code and stderr the child chose to print, so the backend words this row as
+  /// a labeled heuristic and the chip must not out-claim it. `failed` is wrong
+  /// the other way: the call itself returned normally (a nonzero exit is still
+  /// output the model receives), and reading a boundary hit as an ordinary
+  /// broken command is exactly the confusion this row exists to end.
+  | 'boundary';
 
 /// Classify one row.
 ///
@@ -300,7 +311,24 @@ export function rowStatus(e: ActivityEntry): RowStatus {
     // an unavailable one, so it cannot also carry the verb. Locked decision
     // 17 requires those two to stay visibly distinct, which the row's
     // `target` text spells out ("off (user choice)" / "unavailable").
-    return e.tool === 'unsandboxed' ? 'unsandboxed' : e.ok ? 'ok' : 'failed';
+    switch (e.tool) {
+      case 'unsandboxed':
+        return 'unsandboxed';
+      // A child ran INSIDE the boundary. Deliberately quiet: this is the
+      // expected case, and the row exists to remove the empty-lane ambiguity
+      // ("everything was sandboxed" vs "nothing ever ran"), not to compete for
+      // attention. The row's `target` names the program.
+      case 'sandboxed':
+        return 'ok';
+      // A sandboxed child failed with denial-shaped output. Its own word — see
+      // `boundary` in `RowStatus` for why neither `denied` nor `failed` fits.
+      case 'denied':
+        return 'boundary';
+      default:
+        // `grant` and anything added backend-side that this build predates:
+        // `ok` is that event's outcome, which is a claim we can still make.
+        return e.ok ? 'ok' : 'failed';
+    }
   }
   if (e.kind === 'injection_flag') {
     switch (e.source) {
@@ -367,6 +395,8 @@ export const STATUS_TITLE: Record<RowStatus, string> = {
     'A containment event this build has no category for. Open the row for the detail.',
   unsandboxed:
     'This command ran WITHOUT the OS sandbox — the row says whether that was your choice (the Sandboxing switch is off) or a missing prerequisite. The command itself ran normally; only the OS boundary was absent.',
+  boundary:
+    'A sandboxed command failed with output MATCHING an access-denial signature — likely the sandbox boundary, but cImp cannot see the OS decision itself, so this is a labeled guess, not proof. Open the row for the command, the exit code and the stderr tail. Several of these in a row is the pattern worth looking at.',
 };
 
 /// The feed (graph + offload), newest first, payload-free. Pass `sinceTs` to

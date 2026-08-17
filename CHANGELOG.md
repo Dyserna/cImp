@@ -5,6 +5,57 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0-rc.3] — 2026-08-17
+
+**Pre-release, for testing.** The capability-refresh RC: both harness
+dependencies re-audited against current upstream (Claude Code 2.1.233,
+OpenCode 1.18.18) and every ladder migration the audit opened executed —
+the registry moves from 11 B / 8 C / 5 D to **14 B / 8 C / 2 D**, and the
+two rows still Tier D (`perm.tui_scrape`, `opencode.plugin.load_all`)
+cannot climb by construction. No settings-schema change.
+
+### Changed
+
+- **The two Claude beacons are `type:"http"` hooks (Tier D → B).** The
+  `cimp --taint-beacon` / `cimp --checkpoint-beacon` shim binaries are
+  deleted (their argv flags tombstoned); both `PreToolUse` entries now POST
+  the harness's own payload to the loopback, reaching the same cores as
+  `/latch/beacon` and `/workbench/tool_checkpoint`. The checkpoint handler
+  completes its work before replying, so "the checkpoint precedes the
+  call" now rests on the documented hook contract; report-only is
+  structural (no decision field on any path). Pre-upgrade tabs fail open
+  and report `old_plugin` in Harness health — restart the tab.
+- **OpenCode tabs spawn with server authentication (Tier D → B).** Every
+  OpenCode tab gets a per-tab random `OPENCODE_SERVER_PASSWORD`; the SSE
+  tap, session verify and push authenticate with Basic auth, and the live
+  probe proves enforcement in both directions. This closes the
+  unauthenticated-localhost exposure the old `opencode.route.noauth` row
+  documented. **Anything external that scripted against an OpenCode tab's
+  port unauthenticated will now receive 401s.**
+- The OpenCode SSE reader honors `session.status` (`status.type ==
+  "idle"`) as the turn-over signal beside the upstream-deprecated (still
+  emitted) `session.idle`.
+
+### Added
+
+- **`PostToolUseFailure` hook wiring.** Upstream `PostToolUse` fires only
+  on success, so tabs served by the push path were losing every failed
+  tool result's size from usage accounting; failures are now pushed,
+  counted through the same core as successes, and kept away from the
+  provenance tap exactly as the transcript reader's `is_error` rule does.
+- **The OpenCode native-tool gate covers the experiment-gated ids** —
+  `execute` (code mode; mutating) and `lsp` join the gated table,
+  `plan_exit` joins the reviewed-ungated list, so enabling an upstream
+  experiment can no longer open an ungated exec/mutation surface.
+- **`drift.payload.v1` now lags `claude.hook.posttooluse`** (token
+  `post_edit_hook`) — previously the one converted hook whose field
+  renames nothing watched.
+- **`docs/HARNESS-PLUGIN-LAYER.md` § 11 "The upstream wishlist"** — the
+  consolidated waiting-on-upstream list with last-checked dates, the
+  flipped-to-cImp's-court items (OpenCode real token accounting, Claude's
+  new `PermissionRequest` event), and the watch items (OpenCode 2.0
+  renames the `bash` tool id).
+
 ## [0.52.0-rc.2] — 2026-08-17
 
 **Pre-release, for testing.** Identical to 0.52.0-rc.1 in features — that

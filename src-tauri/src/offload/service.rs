@@ -524,7 +524,7 @@ impl PushRegistry {
     /// of its queue. **Deregistration is the guard's `Drop`** — the SSE loop
     /// holds it for the connection's lifetime, so every exit path (clean close,
     /// write error, keep-alive failure, task cancellation, panic unwind) removes
-    /// the entry. Mirrors `oob/claude.rs::LiveSessionGuard`.
+    /// the entry. Mirrors `harness/claude/read.rs::LiveSessionGuard`.
     pub fn register(
         self: &Arc<Self>,
         tab: Option<String>,

@@ -110,7 +110,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::harness::claude_hook::{missing_fields, resolve_cwd, tab_arg};
+use crate::harness::claude::hook::{missing_fields, resolve_cwd, tab_arg};
 
 /// The harness vocabulary this shim reports under — the left half of the
 /// `harness:tool_name` source value, and what tells the route which tool table
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn every_matched_claude_tool_is_classified_as_mutating() {
-        for tool in crate::tabs::config::CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
+        for tool in crate::harness::claude::overlay::CLAUDE_MUTATING_TOOL_MATCHER.split('|') {
             assert!(
                 crate::offload::toolclass::mutates_fs(tool),
                 "`{tool}` is in the PreToolUse matcher but has no `mutates_fs: true` row — \

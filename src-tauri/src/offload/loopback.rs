@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::harness::claude_hook;
+use crate::harness::claude::hook as claude_hook;
 
 use super::agent::ThinkingMode;
 use super::mcp_host::Consumer;
@@ -5420,7 +5420,7 @@ pub(crate) const TOOL_CHECKPOINT_BUDGET: Duration = Duration::from_millis(1800);
 /// one of the two-word vocabulary and the `_` arm is Claude's.
 fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
     match harness {
-        "opencode" => crate::offload::toolclass::opencode_native_mutates_fs(tool),
+        "opencode" => crate::harness::opencode::tools::opencode_native_mutates_fs(tool),
         _ => crate::offload::toolclass::mutates_fs(tool),
     }
 }
@@ -5437,7 +5437,7 @@ fn tool_checkpoint_is_mutating(harness: &str, tool: &str) -> bool {
 /// the name against `toolclass`'s reviewed tables, per harness:
 /// [`mutates_fs`](crate::offload::toolclass::mutates_fs) for Claude's
 /// capitalized vocabulary,
-/// [`opencode_native_mutates_fs`](crate::offload::toolclass::opencode_native_mutates_fs)
+/// [`opencode_native_mutates_fs`](crate::harness::opencode::tools::opencode_native_mutates_fs)
 /// for OpenCode's. A drifted matcher, a shim from a newer build, or a forged
 /// POST from any local process therefore cannot mint a checkpoint for a tool
 /// cImp does not classify as mutating.
@@ -8036,7 +8036,7 @@ fn usage_event_from_body(body: &MemoryEventBody) -> Option<(String, crate::graph
 /// V24 Phase F: for a tool-event body (`tool.execute.after`), the parent
 /// session id when the reporting session is a task-tool CHILD (sub-agent), else
 /// `None`. A child's tool events mirror the Claude sidechain contract (see
-/// `oob/claude.rs` `record_tool_events`, which early-returns on `isSidechain`):
+/// `harness/claude/read.rs` `record_tool_events`, which early-returns on `isSidechain`):
 /// they are dropped rather than recorded against the child, and only the parent
 /// is marked live. Pure, so the routing is unit-tested without a live handler.
 fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
@@ -8053,7 +8053,7 @@ fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
 /// # Why the guard exists
 ///
 /// `live_sessions` is ONE map with TWO key spaces: the Claude tap keys it by
-/// **tab id** (`oob/claude.rs`), and OpenCode's loopback path keys it by the
+/// **tab id** (`harness/claude/read.rs`), and OpenCode's loopback path keys it by the
 /// **reporting session id**, because OpenCode has no tab binding here (V24
 /// Phase B). Nothing kept them apart. `handle_memory_event` derives all three
 /// of its keys from request-body strings, with `agent` defaulting to
@@ -8089,7 +8089,7 @@ fn tool_event_parent(body: &MemoryEventBody) -> Option<String> {
 ///
 /// This closes the token-gated half of C-2 only. The filesystem half — a
 /// zero-byte `.jsonl` appearing in the transcript dir — is closed in
-/// `oob/claude.rs` by requiring observed growth before a rotated file is marked
+/// `harness/claude/read.rs` by requiring observed growth before a rotated file is marked
 /// live. **Neither alone is sufficient**: they are two independent writers into
 /// the same registry.
 ///
@@ -8155,7 +8155,7 @@ async fn handle_memory_event(
 
     // V24 Phase F: the usage arm — a completed assistant turn's real token
     // totals (OpenCode's only exact-token ingress; see the spike note atop
-    // `oob/opencode.rs`). Distinct body shape (`kind == "usage"`, no `tool`),
+    // `harness/opencode/read.rs`). Distinct body shape (`kind == "usage"`, no `tool`),
     // so it short-circuits the tool-event path below.
     if body.kind.as_deref() == Some("usage") {
         if let Some((target, event)) = usage_event_from_body(&body) {
@@ -8185,7 +8185,7 @@ async fn handle_memory_event(
 
     // V24 Phase F: a task-tool CHILD (sub-agent) session's tool events are the
     // sub-agent's own working set, not the parent's — mirror the Claude sidechain
-    // contract (oob/claude.rs `record_tool_events` early-returns on isSidechain)
+    // contract (harness/claude/read.rs `record_tool_events` early-returns on isSidechain)
     // and drop them entirely: no mem event, no tool-result chars against the
     // child, and the child is never marked live. The child's real token spend
     // still reaches the parent via the usage arm above; mark the PARENT live so
@@ -8247,7 +8247,7 @@ async fn handle_memory_event(
     }
 
     // V14 Phase C: OpenCode's usage tap (see the C3 spike note atop
-    // `oob/opencode.rs` — its SSE stream carries no usage fields, so this
+    // `harness/opencode/read.rs` — its SSE stream carries no usage fields, so this
     // hook, which already fires after every tool call, is the only place
     // that can record OpenCode usage). Unlike the memory recording above,
     // this runs for EVERY tool call, not just ones `classify_tool` maps to a
@@ -8273,7 +8273,7 @@ async fn handle_memory_event(
     // V24 Phase B: OpenCode has no tab binding on this path, so the live-session
     // registry is keyed by the reporting session id itself; the entry expires by
     // TTL (there is no cancel signal to clear it — see the C3 spike note atop
-    // `oob/opencode.rs`). C-2: which is exactly why the key must not be allowed
+    // `harness/opencode/read.rs`). C-2: which is exactly why the key must not be allowed
     // to name a TAB — the other half of the same map.
     mark_live_session_from_event(
         |k| graph.mark_live_session(k, agent, k),
@@ -10512,7 +10512,7 @@ mod tests {
     /// capability. The scan therefore points at the module that sends them now.
     #[test]
     fn the_drift_shim_list_is_spelled_the_way_the_shims_spell_it() {
-        const CLAUDE_HOOK: &str = include_str!("../harness/claude_hook.rs");
+        const CLAUDE_HOOK: &str = include_str!("../harness/claude/hook.rs");
         for (shim, src) in [
             ("checkpoint_beacon", include_str!("../checkpoint_beacon.rs")),
             ("compact_hook", CLAUDE_HOOK),
@@ -14531,7 +14531,7 @@ mod tests {
     /// it, so weakening the gate fails this test.
     #[test]
     fn a_forged_rotation_neither_confirms_a_session_nor_clears_contamination() {
-        use crate::oob::claude::LiveSessionGate;
+        use crate::harness::claude::read::LiveSessionGate;
         let mut tab = contaminated_tab();
         let mut gate = LiveSessionGate::default();
         // The tap is running on a confirmed session.
@@ -14589,7 +14589,7 @@ mod tests {
     /// the test above.)
     #[test]
     fn a_rotation_with_decoded_evidence_does_reopen_the_latch() {
-        use crate::oob::claude::LiveSessionGate;
+        use crate::harness::claude::read::LiveSessionGate;
         let mut tab = contaminated_tab();
         let mut gate = LiveSessionGate::default();
         assert!(gate.observed(true));
@@ -15606,7 +15606,7 @@ mod tests {
     /// guard) fails here too rather than quietly clearing on a forged file.
     #[test]
     fn only_an_armed_tab_clears_on_a_proved_rotation() {
-        use crate::oob::claude::LiveSessionGate;
+        use crate::harness::claude::read::LiveSessionGate;
 
         for armed in [true, false] {
             outbound::test_rows::reset();
@@ -15684,7 +15684,7 @@ mod tests {
     /// worst effect is lifting it slightly earlier than their own `/clear`.
     #[test]
     fn a_forged_rotation_cannot_clear_an_unarmed_tab() {
-        use crate::oob::claude::LiveSessionGate;
+        use crate::harness::claude::read::LiveSessionGate;
         let (reg, _s) = contaminated_registry();
 
         // Forgery 1: bytes, but no record naming this session.

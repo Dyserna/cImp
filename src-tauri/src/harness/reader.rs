@@ -1,4 +1,11 @@
-//! V20: out-of-band TTS sources for fullscreen AI tabs.
+//! V20: out-of-band TTS sources for fullscreen AI tabs — **the L1 fallback
+//! readers' spawn seam** (V35 Phase K: moved here verbatim from `oob/mod.rs`).
+//!
+//! Design § 6: adding a harness must not mean a new `OobSpec` variant *and* a
+//! new arm in a `spawn` living somewhere else in the tree. Both now sit inside
+//! `harness/`, next to the readers they name, so the whole per-harness surface
+//! is one directory. Phase L retires the readers from the hot path; until then
+//! this is where a tab's fallback reader is chosen and started.
 //!
 //! Before V20, cImp forced its AI tools into an inline renderer so the
 //! processing layer could scrape `[[TTS]]` markers out of the linear terminal
@@ -8,10 +15,10 @@
 //!
 //!   * **Claude Code** appends a transcript JSONL under
 //!     `~/.claude/projects/<slug>/<id>.jsonl`; assistant `text` blocks are
-//!     written complete at message finish ([`claude`]).
+//!     written complete at message finish ([`crate::harness::claude::read`]).
 //!   * **OpenCode** exposes an SSE event stream at `GET /event` on the same
 //!     port the TUI is launched with (`--port`); assistant text arrives as
-//!     token-level `message.part.delta` events ([`opencode`]).
+//!     token-level delta events ([`crate::harness::opencode::read`]).
 //!
 //! Both adapters convert assistant prose to sentence segments (reusing
 //! [`crate::processing::segment_sentences`]) and push them onto the shared
@@ -33,9 +40,7 @@ use crate::settings::{SettingsHandle, TabConfig};
 use crate::state::{StateSignal, TabId};
 use crate::tts::TtsRequest;
 
-pub mod claude;
-pub mod opencode;
-pub mod prose;
+use super::{claude, opencode};
 
 /// Describes which out-of-band source (if any) a tab's launch should attach.
 /// Resolved by `tabs::config` at launch time and carried on the `PtyLaunchSpec`
@@ -96,11 +101,11 @@ pub fn spawn(spec: OobSpec, ctx: OobContext) {
             pinned_session,
         } => {
             debug!(tab = ?ctx.tab, ?project_dir, ?pinned_session, "spawning Claude transcript OOB source");
-            tauri::async_runtime::spawn(claude::run(project_dir, pinned_session, ctx));
+            tauri::async_runtime::spawn(claude::read::run(project_dir, pinned_session, ctx));
         }
         OobSpec::OpenCodeEvent { port } => {
             debug!(tab = ?ctx.tab, port, "spawning OpenCode event OOB source");
-            tauri::async_runtime::spawn(opencode::run(port, ctx));
+            tauri::async_runtime::spawn(opencode::read::run(port, ctx));
         }
     }
 }
@@ -162,7 +167,7 @@ impl OobContext {
         } else {
             std::borrow::Cow::Borrowed(text)
         };
-        let prose = prose::to_speakable(&text);
+        let prose = crate::processing::to_speakable(&text);
         if prose.trim().is_empty() {
             return;
         }

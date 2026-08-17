@@ -55,7 +55,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
-use super::OobContext;
+use super::super::OobContext;
 use crate::offload::service::{valid_meta_key, PushGuard, PushNotice};
 use crate::settings::Settings;
 use crate::state::StateSignal;
@@ -870,7 +870,7 @@ impl Tracker {
     /// `session.idle`, `message.updated`, `message.part.updated` and
     /// `message.part.delta` all do. (The module doc's older "no cwd/session"
     /// note is about the *token* fields the SSE lacks, not the session id.) So
-    /// this per-tab tap can do exactly what `oob/claude.rs:208` does: stamp
+    /// this per-tab tap can do exactly what `harness/claude/read.rs:208` does: stamp
     /// `tab id → session id` into the live-session registry, which is what
     /// `/graph_run`'s `tab` lookup resolves against.
     ///

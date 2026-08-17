@@ -206,7 +206,7 @@ pub struct Capability {
     /// from [`Capability::wired_in`] — `read_hook` ⇒ `src-tauri/src/read_hook.rs`
     /// ⇒ this row — which worked while every reporter was its own binary in its
     /// own file. Phase J deleted those five files and moved four of the
-    /// reporters into ONE module (`harness/claude_hook.rs`) plus one handler
+    /// reporters into ONE module (`harness/claude/hook.rs`) plus one handler
     /// file, so the inference has nothing left to discriminate on: four rows now
     /// name the same two paths. Naming the token is the honest replacement, and
     /// the tests below assert it is unique and that every `drift.payload.v1` row
@@ -302,9 +302,9 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
         ],
         wired_in: &[
-            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_INJECTION_UNSEEN, RULE_DRIFT_PAYLOAD],
@@ -342,9 +342,9 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
         ],
         wired_in: &[
-            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_PAYLOAD],
@@ -388,9 +388,9 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
         ],
         wired_in: &[
-            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::FailClosed,
         drift_rule: &[
@@ -424,9 +424,9 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("hookSpecificOutput.additionalContext"),
         ],
         wired_in: &[
-            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[],
@@ -472,9 +472,9 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
         ],
         wired_in: &[
-            "src-tauri/src/harness/claude_hook.rs",
+            "src-tauri/src/harness/claude/hook.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Fallback {
             to: "perm.tui_scrape",
@@ -528,7 +528,7 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/taint_beacon.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_PAYLOAD],
@@ -574,7 +574,7 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/checkpoint_beacon.rs",
             "src-tauri/src/offload/loopback.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_PAYLOAD],
@@ -651,7 +651,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("message.usage.cache_read_input_tokens"),
             Dep::JsonPath("message.usage.cache_creation_input_tokens"),
         ],
-        wired_in: &["src-tauri/src/oob/claude.rs"],
+        wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_USAGE_FIELDS],
         canary: Some("claude.transcript.usage"),
@@ -679,7 +679,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("message.content[].content"),
             Dep::JsonPath("message.content[].content[].text"),
         ],
-        wired_in: &["src-tauri/src/oob/claude.rs"],
+        wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.transcript.tool_result"),
@@ -702,7 +702,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("isSidechain"),
             Dep::JsonPath("isMeta"),
         ],
-        wired_in: &["src-tauri/src/oob/claude.rs"],
+        wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
@@ -733,7 +733,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("message.content[].type == \"tool_use\""),
             Dep::JsonPath("message.content[].name in {Task, Agent}"),
         ],
-        wired_in: &["src-tauri/src/oob/claude.rs"],
+        wired_in: &["src-tauri/src/harness/claude/read.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[RULE_DRIFT_SUBAGENT],
         canary: None,
@@ -796,7 +796,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("rate_limits.seven_day.used_percentage"),
             Dep::JsonPath("rate_limits.seven_day.resets_at"),
         ],
-        wired_in: &["src-tauri/src/statusline/mod.rs"],
+        wired_in: &["src-tauri/src/harness/claude/statusline.rs", "src-tauri/src/statusline/mod.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("claude.statusline.stdin"),
@@ -820,7 +820,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::ConfigKey("permissions"),
         ],
         wired_in: &[
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/claude/overlay.rs",
             "src-tauri/src/settings/injection.rs",
         ],
         degradation: Degradation::Silent,
@@ -852,7 +852,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::Flag("--fork-session"),
             Dep::Flag("--from-pr"),
         ],
-        wired_in: &["src-tauri/src/tabs/config.rs", "src-tauri/src/oob/claude.rs"],
+        wired_in: &["src-tauri/src/tabs/config.rs", "src-tauri/src/harness/claude/read.rs"],
         // V35 Phase E, closing Phase A finding 5. The seeded `VisibleOff` was
         // **declared intent, never observed behavior**: `resolve_oob_source`
         // (`tabs/config.rs:184-195`) pushes `--session-id <uuid>` onto the
@@ -909,7 +909,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::JsonPath("session.idle"),
             Dep::JsonPath("properties.sessionID"),
         ],
-        wired_in: &["src-tauri/src/oob/opencode.rs"],
+        wired_in: &["src-tauri/src/harness/opencode/read.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: Some("opencode.sse.events"),
@@ -930,7 +930,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::Route("POST /session/:id/message"),
             Dep::ConfigKey("noReply"),
         ],
-        wired_in: &["src-tauri/src/oob/opencode.rs"],
+        wired_in: &["src-tauri/src/harness/opencode/read.rs"],
         degradation: Degradation::Silent,
         drift_rule: &[],
         canary: None,
@@ -962,7 +962,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Dep::Route("POST /session/:id/message"),
             Dep::Behavior("the server serves these routes with no Authorization header sent"),
         ],
-        wired_in: &["src-tauri/src/oob/opencode.rs"],
+        wired_in: &["src-tauri/src/harness/opencode/read.rs"],
         degradation: Degradation::VisibleOff {
             user_message: "OpenCode's local server now requires authentication — the live session \
                            tap and the V30 push fanout are off until a token is wired.",
@@ -984,8 +984,8 @@ pub const CAPABILITIES: &[Capability] = &[
                    allowlist-only by deliberate design, so an id absent from it is UNGATED.",
         depends_on: &[Dep::Route("GET /experimental/tool/ids")],
         wired_in: &[
-            "src-tauri/src/offload/toolclass.rs",
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/opencode/tools.rs",
+            "src-tauri/src/harness/opencode/plugin.rs",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[],
@@ -1029,7 +1029,7 @@ pub const CAPABILITIES: &[Capability] = &[
             ),
         ],
         wired_in: &[
-            "src-tauri/src/tabs/config.rs",
+            "src-tauri/src/harness/opencode/plugin.rs",
             "src-tauri/src/offload/loopback.rs",
         ],
         degradation: Degradation::Silent,
@@ -1289,7 +1289,7 @@ mod tests {
     /// A backticked token is a capability id iff it starts with one of the
     /// known prefixes and is made only of `[a-z0-9_.]`. That rejects the other
     /// backticked prose in the same cells (`opencode --version`,
-    /// `.opencode/plugin`, `oob/opencode.rs:692`, `drift.payload.v1`, …).
+    /// `.opencode/plugin`, `harness/opencode/read.rs:692`, `drift.payload.v1`, …).
     fn looks_like_id(tok: &str) -> bool {
         ID_PREFIXES.iter().any(|p| tok.starts_with(p))
             && tok

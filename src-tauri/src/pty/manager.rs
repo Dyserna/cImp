@@ -46,7 +46,7 @@ pub struct PtyLaunchSpec {
     /// transcript tail / OpenCode event stream). `None` for shell tabs and any
     /// AI tab whose source can't be resolved. The source rides the tab's PTY
     /// cancel token, so it starts with the tab and dies with it.
-    pub oob: Option<crate::oob::OobSpec>,
+    pub oob: Option<crate::harness::OobSpec>,
 }
 
 pub struct PtyManager {
@@ -288,7 +288,7 @@ impl PtyManager {
         let oob_ctx = spec.oob.clone().map(|oob_spec| {
             (
                 oob_spec,
-                crate::oob::OobContext {
+                crate::harness::OobContext {
                     tab: tab.clone(),
                     tts: tts_segments.clone(),
                     state_signals: state_signals.clone(),
@@ -302,7 +302,7 @@ impl PtyManager {
         // OpenCode's event stream authoritatively drives Thinking/Idle, so the
         // processor must not also run its byte-burst activity fallback.
         let oob_drives_activity =
-            matches!(spec.oob, Some(crate::oob::OobSpec::OpenCodeEvent { .. }));
+            matches!(spec.oob, Some(crate::harness::OobSpec::OpenCodeEvent { .. }));
 
         tasks::spawn_reader(
             reader,
@@ -336,7 +336,7 @@ impl PtyManager {
         // Claude's multi-second boot before it writes a transcript — but that
         // is a property of THIS code order, not an enforced invariant.
         if let Some((oob_spec, ctx)) = oob_ctx {
-            crate::oob::spawn(oob_spec, ctx);
+            crate::harness::spawn(oob_spec, ctx);
         }
 
         *guard = Some(PtyHandle {

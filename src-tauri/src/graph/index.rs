@@ -3851,7 +3851,7 @@ impl GraphIndex {
     /// One row per known session with usage token totals, cache-hit ratio,
     /// and whether the session is estimate-only (no exact `usage` block —
     /// currently every non-Claude agent; see the OpenCode C3 spike note atop
-    /// `oob/opencode.rs`). Reuses [`Self::mem_sessions`] for the session list
+    /// `harness/opencode/read.rs`). Reuses [`Self::mem_sessions`] for the session list
     /// so a session with usage but zero classified `mem_event`s still shows.
     pub fn usage_all_sessions(&self) -> AppResult<Vec<SessionUsageRow>> {
         let sessions = self.mem_sessions()?;

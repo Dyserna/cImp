@@ -1484,7 +1484,7 @@ impl GraphService {
     /// Best-effort: a store error is logged, never propagated. Called
     /// in-process from the Claude transcript tap and via the `/memory/event`
     /// loopback route (OpenCode's usage tap — see the C3 spike note atop
-    /// `oob/opencode.rs`).
+    /// `harness/opencode/read.rs`).
     pub fn record_usage(&self, root: &Path, session_id: &str, agent: &str, event: UsageEvent) {
         if !self.settings.current().graph.enabled {
             return;

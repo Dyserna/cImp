@@ -59,7 +59,7 @@
 //! line in the *Harness health* panel. The wire contract is `docs/CHP.md`;
 //! handlers stay in `offload/loopback.rs`.
 //!
-//! Phase J adds [`claude_hook`] and deletes five binaries. Claude's L1 was the
+//! Phase J adds [`claude::hook`] and deletes five binaries. Claude's L1 was the
 //! odd one out: where OpenCode gets one generated plugin that speaks CHP
 //! directly, Claude got five stateless shim executables that existed only to
 //! carry a payload from stdin to a socket and a reply back to stdout. Claude
@@ -68,18 +68,38 @@
 //! on the receiving end of the same wire. Claude now sends a `/session/hello`
 //! too, which is what turns Phase I's staleness detection on for its tabs.
 //!
+//! Phase K moves the whole surface in here and locks the shape with tests
+//! ([`layering`]). Until it, "harness knowledge" was spread across nine
+//! locations, none named for it — `oob/{claude,opencode,mod}.rs`,
+//! `statusline/mod.rs`, `tabs/config.rs`, `offload/toolclass.rs` — so the
+//! layering existed only in a design document, which is the state in which a
+//! layering rots. It is now a directory a contributor can be pointed at, with
+//! one sub-directory per harness ([`claude`], [`opencode`]) and a
+//! harness-neutral core beside them. Nothing about behaviour changed: every
+//! moved function, string and test kept its exact text, and the four tests in
+//! [`layering`] are what stop the next feature from putting a harness literal
+//! back outside this tree. `README.md` in this directory is the entry point for
+//! "I want to add a harness".
+//!
 //! Design: `docs/MILESTONE-V35-harness-resilience.md` (the why and the locked
 //! decisions), `docs/DESIGN-harness-capability-matrix.md` (the types and the
 //! seed rows), `docs/DESIGN-harness-drift-canaries.md` (the canary layers, § 5
 //! for Phase F's replacement of the noisy tripwire, § 3.2 and § 4.1 for the
 //! capture dir's trust boundary),
-//! `docs/DESIGN-harness-plugin-architecture.md` § 7 step 2 (Phase J).
+//! `docs/DESIGN-harness-plugin-architecture.md` § 7 step 2 (Phase J) and § 4
+//! + § 4.1 (Phase K: the target tree and the layering tests).
 
 pub mod canary;
 pub mod capture;
 pub mod chp;
-pub mod claude_hook;
+pub mod claude;
 pub mod contract;
 pub mod health;
+#[cfg(test)]
+mod layering;
+pub mod opencode;
 pub mod probe;
+pub mod reader;
 pub mod verify;
+
+pub use reader::{spawn, OobContext, OobSpec};

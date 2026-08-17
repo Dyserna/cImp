@@ -86,7 +86,7 @@ use serde_json::Value;
 
 use crate::harness::capture::{self, Observed};
 use crate::harness::contract::{self, Harness, Seam};
-use crate::offload::toolclass::{OPENCODE_NATIVE_REVIEWED_UNGATED, OPENCODE_NATIVE_TABLE};
+use crate::harness::opencode::tools::{OPENCODE_NATIVE_REVIEWED_UNGATED, OPENCODE_NATIVE_TABLE};
 
 // ── outcome model ───────────────────────────────────────────────────────────
 
@@ -885,7 +885,7 @@ fn tool_registry_outcome(ids: Option<&(u16, String)>) -> Outcome {
 /// Whether OpenCode's local server still serves cImp's routes unauthenticated.
 ///
 /// A 401/403 is the **good** news case (locked decision 8): auth landed, and
-/// the response is to wire a token into `oob/opencode.rs`, not to file a bug.
+/// the response is to wire a token into `harness/opencode/read.rs`, not to file a bug.
 /// Note the CLI already warns `OPENCODE_SERVER_PASSWORD is not set; server is
 /// unsecured` on 1.18.13, so the mechanism exists — this row is watching for
 /// the day it becomes mandatory.
@@ -914,7 +914,7 @@ fn noauth_outcome(ids: Option<&(u16, String)>, session: Option<&(u16, String)>) 
             note: format!(
                 "AUTH LANDED — OpenCode now rejects unauthenticated localhost calls ({rendered}). \
                  This is an upstream IMPROVEMENT, not drift: wire the token into \
-                 `oob/opencode.rs` (tap + V30 push) and retire this watch. Until then the live \
+                 `harness/opencode/read.rs` (tap + V30 push) and retire this watch. Until then the live \
                  session tap and the push fanout are off."
             ),
         };
@@ -1115,7 +1115,7 @@ fn probe_claude_flags() -> (Vec<ProbeResult>, Option<String>) {
 /// A bounded window onto the newest real transcript. The parsed lines leave
 /// this module only through [`Observed`], on the way to a scrub; `session_id` is
 /// used only as the expected value for
-/// [`crate::oob::claude::record_names_session`].
+/// [`crate::harness::claude::read::record_names_session`].
 struct Tail {
     lines: Vec<Value>,
     session_id: String,
@@ -1129,11 +1129,11 @@ struct Tail {
 /// probe was run in. Path discovery goes through `oob::claude` — the tap's own
 /// helpers — so the probe cannot verify a layout the tap does not read.
 fn newest_transcript() -> Option<PathBuf> {
-    let root = crate::oob::claude::projects_root()?;
+    let root = crate::harness::claude::read::projects_root()?;
     if let Some(here) = std::env::current_dir()
         .ok()
-        .and_then(|cwd| crate::oob::claude::project_root(&cwd))
-        .and_then(|dir| crate::oob::claude::newest_jsonl(&dir))
+        .and_then(|cwd| crate::harness::claude::read::project_root(&cwd))
+        .and_then(|dir| crate::harness::claude::read::newest_jsonl(&dir))
     {
         return Some(here);
     }
@@ -1144,7 +1144,7 @@ fn newest_transcript() -> Option<PathBuf> {
         if !entry.path().is_dir() {
             continue;
         }
-        let Some(candidate) = crate::oob::claude::newest_jsonl(&entry.path()) else {
+        let Some(candidate) = crate::harness::claude::read::newest_jsonl(&entry.path()) else {
             continue;
         };
         let Ok(mtime) = candidate.metadata().and_then(|m| m.modified()) else {
@@ -1296,7 +1296,7 @@ fn newest_cli_version(tail: &Tail) -> String {
     tail.lines
         .iter()
         .rev()
-        .find_map(crate::oob::claude::cli_version_of)
+        .find_map(crate::harness::claude::read::cli_version_of)
         .unwrap_or_default()
         .to_string()
 }
@@ -1332,7 +1332,7 @@ fn usage_outcome(tail: &Tail) -> Outcome {
             cache_read,
             cache_make,
             ..
-        }) = crate::oob::claude::parse_usage_line(line, crate::graph::UsageOrigin::Session)
+        }) = crate::harness::claude::read::parse_usage_line(line, crate::graph::UsageOrigin::Session)
         else {
             continue;
         };
@@ -1380,7 +1380,7 @@ fn usage_is_substantive(line: &Value) -> bool {
         in_tok,
         out_tok,
         ..
-    }) = crate::oob::claude::parse_usage_line(line, crate::graph::UsageOrigin::Session)
+    }) = crate::harness::claude::read::parse_usage_line(line, crate::graph::UsageOrigin::Session)
     else {
         return false;
     };
@@ -1395,7 +1395,7 @@ fn tool_result_is_sized(id: &str, chars: usize) -> bool {
 
 /// One line carries at least one sized `tool_result`.
 fn tool_result_is_substantive(line: &Value) -> bool {
-    crate::oob::claude::extract_tool_results(line)
+    crate::harness::claude::read::extract_tool_results(line)
         .iter()
         .any(|(id, chars)| tool_result_is_sized(id, *chars))
 }
@@ -1407,8 +1407,8 @@ fn tool_result_is_substantive(line: &Value) -> bool {
 /// facts from different lines — deliberately, because a capture wants one line
 /// that demonstrates the whole shape rather than two that each demonstrate half.
 fn identity_is_substantive(line: &Value, session_id: &str) -> bool {
-    crate::oob::claude::record_names_session(line, session_id)
-        && crate::oob::claude::cli_version_of(line).is_some()
+    crate::harness::claude::read::record_names_session(line, session_id)
+        && crate::harness::claude::read::cli_version_of(line).is_some()
 }
 
 /// `message.content[].tool_result` still yields sized results.
@@ -1422,7 +1422,7 @@ fn tool_result_outcome(tail: &Tail) -> Outcome {
     let tool_uses = tail
         .lines
         .iter()
-        .filter_map(crate::oob::claude::message_parts)
+        .filter_map(crate::harness::claude::read::message_parts)
         .flat_map(|parts| parts.iter())
         .filter(|p| p.get("type").and_then(Value::as_str) == Some("tool_use"))
         .count();
@@ -1430,7 +1430,7 @@ fn tool_result_outcome(tail: &Tail) -> Outcome {
     let mut results = 0usize;
     let mut sized = 0usize;
     for line in &tail.lines {
-        for (id, chars) in crate::oob::claude::extract_tool_results(line) {
+        for (id, chars) in crate::harness::claude::read::extract_tool_results(line) {
             results += 1;
             if tool_result_is_sized(&id, chars) {
                 sized += 1;
@@ -1444,10 +1444,10 @@ fn tool_result_outcome(tail: &Tail) -> Outcome {
     let errors = tail
         .lines
         .iter()
-        .filter_map(crate::oob::claude::message_parts)
+        .filter_map(crate::harness::claude::read::message_parts)
         .flat_map(|parts| parts.iter())
         .filter(|p| p.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .filter(|p| crate::oob::claude::tool_result_is_error(p))
+        .filter(|p| crate::harness::claude::read::tool_result_is_error(p))
         .count();
 
     if tool_uses == 0 && results == 0 {
@@ -1488,12 +1488,12 @@ fn identity_outcome(tail: &Tail) -> Outcome {
     let named = tail
         .lines
         .iter()
-        .filter(|l| crate::oob::claude::record_names_session(l, &tail.session_id))
+        .filter(|l| crate::harness::claude::read::record_names_session(l, &tail.session_id))
         .count();
     let versions: BTreeSet<&str> = tail
         .lines
         .iter()
-        .filter_map(crate::oob::claude::cli_version_of)
+        .filter_map(crate::harness::claude::read::cli_version_of)
         .collect();
     let sidechain = tail
         .lines
@@ -1702,7 +1702,7 @@ Options:
                 "{outcome:?}"
             );
             assert!(!outcome.is_fail());
-            assert!(outcome.detail().contains("oob/opencode.rs"), "{outcome:?}");
+            assert!(outcome.detail().contains("harness/opencode/read.rs"), "{outcome:?}");
         }
         assert!(matches!(
             noauth_outcome(None, None),

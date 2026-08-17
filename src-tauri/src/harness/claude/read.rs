@@ -52,7 +52,7 @@ use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
-use super::OobContext;
+use super::super::OobContext;
 use crate::state::StateSignal;
 
 const POLL: Duration = Duration::from_millis(200);

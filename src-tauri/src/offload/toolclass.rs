@@ -385,175 +385,6 @@ pub const TABLE: &[ClassRow] = &[
     unrouted("MultiEdit", ToolClass::LocalCapability, true),
 ];
 
-// ── V32 Phase H — OpenCode's OWN native tool names ─────────────────────────
-
-/// The OpenCode 1.18.13 native tool ids, classified for the Phase H gate.
-///
-/// # Why this is a SECOND table and not more rows in [`TABLE`]
-///
-/// [`TABLE`] is cImp's own tool vocabulary — the names cImp *routes*, where the
-/// locked invariant is **unknown ⇒ EXTERNAL** because every unrouted name is a
-/// proxied MCP id in disguise. That default is exactly wrong for a harness's own
-/// registry, which is a closed, published set with members that are neither
-/// external nor local-capability (`todowrite`, `question`, `skill`, `invalid`).
-/// Folding these names into `TABLE` would make `classify("todowrite")` answer
-/// `External` and the Phase H gate would refuse a bookkeeping tool under a LOCAL
-/// latch — a partial, arbitrary gate, which the E2 spike showed is worse than
-/// none.
-///
-/// So the two tables share the [`ToolClass`] vocabulary and nothing else, and
-/// this one is **allowlist-only**: a name absent here is UNGATED, deliberately.
-/// The class table's `Edit`/`Write`/`Bash` rows stay where they are — those are
-/// *Claude's* capitalized natives, read by V33's `mutates_fs` consumer, and a
-/// second namespace under the same lookup would be the drift this comment
-/// exists to prevent.
-///
-/// Sourced from `GET /experimental/tool/ids` on the running binary
-/// (`docs/HARNESS-NATIVE-TOOLS.md` §3), not from documentation. `apply_patch` is
-/// load-bearing: it *replaces* `edit`/`write` on OpenAI-provider models, so a
-/// list naming only `edit`/`write` would leave the whole mutation surface open
-/// on exactly those tabs.
-/// **V33 Phase F added the third element, `mutates_fs`** — the same axis
-/// [`ClassRow::mutates_fs`] carries in [`TABLE`], for the same consumer (the
-/// pre-tool checkpoint). It is a THIRD element rather than a second table
-/// because the class and the mutation capability of one name must be declared
-/// in one place; `read`/`glob`/`grep` are local capability without being
-/// mutations, and `bash` is both.
-pub const OPENCODE_NATIVE_TABLE: &[(&str, ToolClass, bool)] = &[
-    // Local capability: private data + process execution + mutation.
-    ("bash", ToolClass::LocalCapability, true),
-    ("read", ToolClass::LocalCapability, false),
-    ("glob", ToolClass::LocalCapability, false),
-    ("grep", ToolClass::LocalCapability, false),
-    ("edit", ToolClass::LocalCapability, true),
-    ("write", ToolClass::LocalCapability, true),
-    // Not in the 1.18.13 registry, but the plugin's own `CIMP_EDIT_TOOLS` has
-    // carried it since V12 and the milestone's locked list names it. Gating a
-    // name the harness does not serve costs nothing and closes it in advance.
-    ("patch", ToolClass::LocalCapability, true),
-    ("apply_patch", ToolClass::LocalCapability, true),
-    // The harness's own web tools — the EXTERNAL side of the same boundary.
-    // Neither writes to the project tree, so neither checkpoints.
-    ("webfetch", ToolClass::External, false),
-    ("websearch", ToolClass::External, false),
-    // Ids deliberately left out of this table are NOT undeclared — they are
-    // listed, with their reasons, in [`OPENCODE_NATIVE_REVIEWED_UNGATED`].
-];
-
-/// Upstream tool ids that `GET /experimental/tool/ids` serves and
-/// [`OPENCODE_NATIVE_TABLE`] deliberately does **not** gate, each with the
-/// reason it was left out.
-///
-/// This is the prose that used to sit as a trailing comment inside the table,
-/// made machine-readable in V35 Phase D — because the live probe
-/// (`harness/probe.rs`, capability `opencode.tool_registry`) has to distinguish
-/// two things a bare table diff cannot:
-///
-/// * an id nobody has ever looked at — **UNCLASSIFIED**, and a failure, because
-///   the table is allowlist-only so it ships ungated; and
-/// * an id a human looked at and consciously left ungated — a **recorded
-///   decision**, which must not turn the probe permanently red. (Milestone
-///   locked decision 8: a probe that cries wolf gets ignored, which is the
-///   exact fate of the version tripwire this milestone exists to fix.)
-///
-/// All five entries were already reviewed and written down; moving them here
-/// changes no gating behavior whatsoever (the plugin builder reads
-/// [`opencode_native_names`] / [`opencode_native_mutating_names`], neither of
-/// which consults this list). Adding a row here IS a security decision and
-/// belongs in review, exactly like adding one to the table.
-pub const OPENCODE_NATIVE_REVIEWED_UNGATED: &[(&str, &str)] = &[
-    (
-        "task",
-        "sub-agent spawn: orchestration, not a capability of its own. The E2 spike confirmed a \
-         sub-agent's tool calls fire this same hook in the child session, and the plugin's tab \
-         identity is process-wide (`CIMP_TAB_ID`), so the child's `bash`/`read`/`webfetch` are \
-         gated at the same latch. Gating the spawn itself would refuse an orchestration primitive \
-         whose dangerous leaves are already closed.",
-    ),
-    (
-        "skill",
-        "no file access, no process execution, no egress. Denying it would buy nothing and would \
-         make the gate look arbitrary to the model it is talking to.",
-    ),
-    (
-        "todowrite",
-        "no file access, no process execution, no egress — see `skill`.",
-    ),
-    (
-        "question",
-        "no file access, no process execution, no egress — see `skill`.",
-    ),
-    (
-        "invalid",
-        "no file access, no process execution, no egress — see `skill`. (The harness's own \
-         placeholder for an unresolvable tool call.)",
-    ),
-];
-
-/// The class of one OpenCode native tool name, or `None` when the gate does not
-/// apply to it.
-///
-/// `None` (not `External`) for an unknown name is the whole difference from
-/// [`classify`] — see [`OPENCODE_NATIVE_TABLE`].
-///
-/// Test-only today: production reads the table through
-/// [`opencode_native_names`], because the *lookup* happens in the generated
-/// plugin's JS rather than in Rust. It stays because the unknown-⇒-`None`
-/// contract is the whole reason this table is separate, and a contract with no
-/// executable statement is a comment.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn opencode_native_class(name: &str) -> Option<ToolClass> {
-    OPENCODE_NATIVE_TABLE
-        .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, c, _)| *c)
-}
-
-/// Every OpenCode native name in one class, in table order — the input the
-/// plugin-source builder bakes into its `Set` literals, so the JS the gate runs
-/// and the table reviewed here cannot drift.
-pub fn opencode_native_names(class: ToolClass) -> Vec<&'static str> {
-    OPENCODE_NATIVE_TABLE
-        .iter()
-        .filter(|(_, c, _)| *c == class)
-        .map(|(n, _, _)| *n)
-        .collect()
-}
-
-/// V33 Phase F: every OpenCode native name that can change files on disk, in
-/// table order — the sibling of [`opencode_native_names`], baked into the
-/// generated plugin's `CIMP_MUTATING_TOOLS` set so the JS that decides whether
-/// to checkpoint reads the same reviewed table Rust does.
-///
-/// Cuts ACROSS the class axis rather than along it: `bash` is
-/// local-capability AND mutating, `read` is local-capability and not.
-pub fn opencode_native_mutating_names() -> Vec<&'static str> {
-    OPENCODE_NATIVE_TABLE
-        .iter()
-        .filter(|(_, _, m)| *m)
-        .map(|(n, _, _)| *n)
-        .collect()
-}
-
-/// V33 Phase F: whether an OpenCode native `name` can change files on disk.
-///
-/// **Unknown ⇒ `false`**, deliberately, and NOT for [`mutates_fs`]'s reason.
-/// There the default is a safety floor; here it is the same allowlist-only
-/// posture the rest of this table has — a name with no row is a name cImp makes
-/// no claim about, and minting a checkpoint for it would be inventing one.
-///
-/// The consumer is the loopback's `/workbench/tool_checkpoint` route, which
-/// must not read an OpenCode tool id (`edit`) through [`mutates_fs`]: that
-/// function answers for cImp's own vocabulary, where `edit` is an unknown name.
-/// Two vocabularies, two lookups — the drift this second table exists to
-/// prevent.
-pub fn opencode_native_mutates_fs(name: &str) -> bool {
-    OPENCODE_NATIVE_TABLE
-        .iter()
-        .find(|(n, _, _)| *n == name)
-        .is_some_and(|(_, _, m)| *m)
-}
-
 /// The class of `name`. **Unknown ⇒ [`ToolClass::External`]** — the locked
 /// cross-module invariant (see the module docs): a future/newly configured MCP
 /// server's `<server>__<tool>` ids are unknown here and must land in the most
@@ -601,7 +432,7 @@ pub fn dispatchable(name: &str) -> bool {
 /// classify as mutating.
 ///
 /// **Claude's vocabulary only.** OpenCode's native ids are a separate namespace
-/// with a separate table — see [`opencode_native_mutates_fs`].
+/// with a separate table — see [`crate::harness::opencode::tools::opencode_native_mutates_fs`].
 pub fn mutates_fs(name: &str) -> bool {
     TABLE
         .iter()
@@ -1180,6 +1011,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // V35 Phase K: the OpenCode native table moved to `harness/opencode/tools.rs`
+    // (it is a harness registry, not cImp's routed vocabulary). The tests that
+    // are purely about it moved with it; the ones left here are the CROSS-table
+    // claims, which by definition need both sides.
+    use crate::harness::opencode::tools::{
+        opencode_native_class, opencode_native_mutates_fs, OPENCODE_NATIVE_REVIEWED_UNGATED,
+        OPENCODE_NATIVE_TABLE,
+    };
+
     fn def(name: &str) -> ToolDef {
         ToolDef::function(name, "", json!({ "type": "object" }))
     }
@@ -1745,75 +1585,6 @@ mod tests {
         assert!(PROFILE_TOOL_NOTE.contains("prompt exfiltration cannot be blocked"));
     }
 
-    // ── V32 Phase H — the OpenCode native-name table ───────────────────────
-
-    /// **The whole-surface property**, which the E2 spike bought with a live
-    /// probe: with only `write` gated the model created the file through `bash`,
-    /// so the LOCAL side must be the harness's complete local-capability surface
-    /// — `apply_patch` included, because it REPLACES `edit`/`write` on
-    /// OpenAI-provider models and a list naming only those two leaves the whole
-    /// mutation surface open on exactly those tabs.
-    #[test]
-    fn the_opencode_native_table_covers_the_whole_local_surface() {
-        let local = opencode_native_names(ToolClass::LocalCapability);
-        for n in [
-            "bash",
-            "read",
-            "glob",
-            "grep",
-            "edit",
-            "write",
-            "patch",
-            "apply_patch",
-        ] {
-            assert!(local.contains(&n), "{n} missing from the local set");
-            assert_eq!(
-                opencode_native_class(n),
-                Some(ToolClass::LocalCapability),
-                "{n}"
-            );
-        }
-        assert_eq!(local.len(), 8, "got: {local:?}");
-
-        let web = opencode_native_names(ToolClass::External);
-        assert_eq!(web, vec!["webfetch", "websearch"]);
-        // The two sides are disjoint — one name must not be denied under both
-        // latches, which would be a tool nobody can ever call.
-        assert!(!web.iter().any(|n| local.contains(n)));
-    }
-
-    /// **V33 Phase F**: the mutation axis of the OpenCode table cuts ACROSS the
-    /// class axis, and the checkpoint set must be exactly the mutating half —
-    /// not "everything local", which would checkpoint before every `read`/
-    /// `grep`, and not "edit/write", which the E2 spike already showed is
-    /// incomplete (the model routes a blocked write through `bash`, and
-    /// `apply_patch` replaces edit/write on OpenAI-provider models).
-    #[test]
-    fn the_opencode_mutating_set_is_the_write_surface_not_the_local_one() {
-        let mutating = opencode_native_mutating_names();
-        assert_eq!(
-            mutating,
-            vec!["bash", "edit", "write", "patch", "apply_patch"],
-            "the pre-tool checkpoint set changed — every member is a name that \
-             can rewrite the project tree, and every non-member is one that cannot"
-        );
-        // Reads are local capability and do NOT mutate: the two axes are
-        // independent, which is the whole reason `mutates_fs` is a column of
-        // its own rather than being inferred from the class.
-        for n in ["read", "glob", "grep"] {
-            assert_eq!(
-                opencode_native_class(n),
-                Some(ToolClass::LocalCapability),
-                "{n}"
-            );
-            assert!(!opencode_native_mutates_fs(n), "{n} must not checkpoint");
-        }
-        // Neither web tool writes to the tree.
-        for n in opencode_native_names(ToolClass::External) {
-            assert!(!opencode_native_mutating_names().contains(&n), "{n}");
-        }
-    }
-
     /// The reason this is a SECOND table: `classify`'s unknown-⇒-EXTERNAL
     /// invariant is right for cImp's routed vocabulary and wrong for a harness
     /// registry, where an unlisted name must be UNGATED.
@@ -1842,37 +1613,6 @@ mod tests {
                 "{name} is in both tables — one lookup, two vocabularies"
             );
         }
-    }
-
-    /// V35 Phase D: the gated table and the reviewed-but-ungated list are two
-    /// disjoint halves of ONE claim — "every upstream tool id cImp has looked
-    /// at". The live probe subtracts their union from
-    /// `GET /experimental/tool/ids` and fails on what is left, so an id in both
-    /// (is it gated or not?) or an entry with a blank reason (reviewed by
-    /// whom, on what grounds?) would quietly weaken that subtraction instead of
-    /// breaking it.
-    #[test]
-    fn the_reviewed_ungated_list_is_disjoint_from_the_gated_table() {
-        for (name, reason) in OPENCODE_NATIVE_REVIEWED_UNGATED {
-            assert!(
-                !OPENCODE_NATIVE_TABLE.iter().any(|(n, _, _)| n == name),
-                "`{name}` is both gated and recorded as deliberately ungated — pick one"
-            );
-            // Global principle 5: `Some("")` would satisfy a bare
-            // is-it-listed check while recording nothing a reviewer can weigh.
-            assert!(
-                reason.trim().len() > 20,
-                "`{name}`: the reason must say why gating it would buy nothing, not merely exist"
-            );
-        }
-        let mut names: Vec<&str> = OPENCODE_NATIVE_REVIEWED_UNGATED
-            .iter()
-            .map(|(n, _)| *n)
-            .collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(before, names.len(), "duplicate id in the reviewed list");
     }
 
     /// The Phase H refusals share the V32 vocabulary, carry no dynamic content,

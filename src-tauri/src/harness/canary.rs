@@ -185,7 +185,7 @@ fn parse_lines(raw: &str) -> Result<Vec<Value>, String> {
 
 // ── claude.transcript.usage ─────────────────────────────────────────────────
 
-/// `oob/claude.rs::parse_usage_line` still lifts all four token counters, the
+/// `harness/claude/read.rs::parse_usage_line` still lifts all four token counters, the
 /// message id and the model out of an assistant transcript line.
 ///
 /// The failure this catches: `usage.input_tokens` is renamed upstream,
@@ -206,7 +206,7 @@ fn check_claude_transcript_usage(raw: &str) -> Result<(), String> {
     );
 
     let Some(ev) =
-        crate::oob::claude::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
+        crate::harness::claude::read::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
     else {
         return Err("claude.transcript.usage: no UsageEvent from an assistant line (`type`, \
                     `message` or `message.id` gone)"
@@ -250,7 +250,7 @@ fn check_claude_transcript_usage(raw: &str) -> Result<(), String> {
 
 // ── claude.transcript.tool_result ───────────────────────────────────────────
 
-/// `oob/claude.rs::extract_tool_results` still finds both `tool_result` content
+/// `harness/claude/read.rs::extract_tool_results` still finds both `tool_result` content
 /// shapes in a user line, and `tool_result_is_error` still reads the flag in
 /// both directions.
 ///
@@ -274,7 +274,7 @@ fn check_claude_transcript_tool_result(raw: &str) -> Result<(), String> {
     );
     let line = &lines[0];
 
-    let results = crate::oob::claude::extract_tool_results(line);
+    let results = crate::harness::claude::read::extract_tool_results(line);
     substantive!(
         results.len() == 2,
         "claude.transcript.tool_result: expected both `tool_result` blocks (string content AND \
@@ -293,14 +293,14 @@ fn check_claude_transcript_tool_result(raw: &str) -> Result<(), String> {
     // `is_error` must round-trip BOTH ways: a canary that only checks the
     // `true` case passes just as happily when the reader has been rewired to
     // return a constant.
-    let Some(parts) = crate::oob::claude::message_parts(line) else {
+    let Some(parts) = crate::harness::claude::read::message_parts(line) else {
         return Err(
             "claude.transcript.tool_result: message.content[] is no longer an array".to_string(),
         );
     };
     let flags: Vec<bool> = parts
         .iter()
-        .map(crate::oob::claude::tool_result_is_error)
+        .map(crate::harness::claude::read::tool_result_is_error)
         .collect();
     substantive!(
         flags == vec![false, true],
@@ -344,7 +344,7 @@ fn check_claude_statusline_stdin(payload: &str) -> Result<(), String> {
     );
 
     // `rate_limits` — the account quota half of the widget.
-    let (five_hour, seven_day) = crate::statusline::extract_rate_limits(&v);
+    let (five_hour, seven_day) = crate::harness::claude::statusline::extract_rate_limits(&v);
     for (name, window) in [("five_hour", five_hour), ("seven_day", seven_day)] {
         let Some(w) = window else {
             return Err(format!("claude.statusline.stdin: rate_limits.{name} gone"));
@@ -360,7 +360,7 @@ fn check_claude_statusline_stdin(payload: &str) -> Result<(), String> {
     }
 
     // `context_window` — the context-bar half.
-    let Some(ctx) = crate::statusline::extract_context(&v) else {
+    let Some(ctx) = crate::harness::claude::statusline::extract_context(&v) else {
         return Err(
             "claude.statusline.stdin: the whole context_window block stopped being read".to_string(),
         );
@@ -406,7 +406,7 @@ fn check_claude_statusline_stdin(payload: &str) -> Result<(), String> {
     // And the composed push the widget actually consumes: `extract_push`
     // returns `None` for a non-substantive snapshot, so a reshape that costs
     // every field writes nothing rather than writing zeros.
-    let Some(push) = crate::statusline::extract_push(payload) else {
+    let Some(push) = crate::harness::claude::statusline::extract_push(payload) else {
         return Err(
             "claude.statusline.stdin: the payload no longer produces a push at all".to_string(),
         );
@@ -425,7 +425,7 @@ fn check_claude_statusline_stdin(payload: &str) -> Result<(), String> {
 
 // ── opencode.sse.events ─────────────────────────────────────────────────────
 
-/// `oob/opencode.rs::Tracker::handle` still turns one turn's SSE envelopes into
+/// `harness/opencode/read.rs::Tracker::handle` still turns one turn's SSE envelopes into
 /// spoken assistant text and still binds the tab to the session.
 ///
 /// Driven as an ordered stream rather than as isolated events, because
@@ -472,7 +472,7 @@ async fn check_opencode_sse_events(raw: &str) -> Result<(), String> {
     };
 
     let (ctx, mut tts_rx, _signals) = opencode_ctx();
-    let mut tracker = crate::oob::opencode::Tracker::default();
+    let mut tracker = crate::harness::opencode::read::Tracker::default();
     for ev in &events {
         tracker.handle(ev, &ctx).await;
     }
@@ -515,7 +515,7 @@ async fn check_opencode_sse_events(raw: &str) -> Result<(), String> {
 /// `ctx_with`; kept local rather than hoisted so this module can be read (and
 /// moved, in Phase K) on its own.
 fn opencode_ctx() -> (
-    crate::oob::OobContext,
+    crate::harness::OobContext,
     tokio::sync::mpsc::Receiver<crate::tts::TtsRequest>,
     tokio::sync::mpsc::Receiver<crate::state::StateSignal>,
 ) {
@@ -530,7 +530,7 @@ fn opencode_ctx() -> (
         defaults,
         std::env::temp_dir(),
     );
-    let ctx = crate::oob::OobContext {
+    let ctx = crate::harness::OobContext {
         tab: crate::state::TabId::from_str(crate::settings::OPENCODE_TAB_ID),
         tts: tts_tx,
         state_signals: sig_tx,
@@ -652,7 +652,7 @@ mod tests {
         let lines = json_lines(&raw);
         assert_eq!(lines.len(), 1, "fixture guard: expected one assistant line");
 
-        let ev = crate::oob::claude::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
+        let ev = crate::harness::claude::read::parse_usage_line(&lines[0], crate::graph::UsageOrigin::Session)
             .expect("guard: this fixture models the drift case — a renamed token field must NOT stop the line parsing, that is precisely why it is silent");
 
         let crate::graph::UsageEvent::Turn {
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "fixture guard: expected one user line");
         let line = &lines[0];
 
-        let results = crate::oob::claude::extract_tool_results(line);
+        let results = crate::harness::claude::read::extract_tool_results(line);
         assert!(
             results.is_empty(),
             "guard: this fixture models the drift case — a renamed `tool_use_id` must yield NO \
@@ -714,12 +714,12 @@ mod tests {
         // The line itself is otherwise intact: both blocks are still there, still
         // `tool_result`, and `is_error` still round-trips. Without this the test
         // would also pass on a fixture that was merely malformed.
-        let parts = crate::oob::claude::message_parts(line)
+        let parts = crate::harness::claude::read::message_parts(line)
             .expect("guard: the drift fixture must still be a well-formed user line");
         assert_eq!(parts.len(), 2, "guard: both tool_result blocks are still present");
         let flags: Vec<bool> = parts
             .iter()
-            .map(crate::oob::claude::tool_result_is_error)
+            .map(crate::harness::claude::read::tool_result_is_error)
             .collect();
         assert_eq!(flags, vec![false, true], "guard: only `tool_use_id` was renamed");
 
@@ -749,7 +749,7 @@ mod tests {
         let v = json(&payload);
 
         assert!(
-            crate::statusline::extract_context(&v).is_none(),
+            crate::harness::claude::statusline::extract_context(&v).is_none(),
             "guard: this fixture models the drift case — with `context_window` renamed and no session \
              metadata beside it, the whole context reading must vanish. A `Some` here means the reader \
              grew an alias and the positive canary can no longer detect this reshape."
@@ -767,7 +767,7 @@ mod tests {
             "guard: only `context_window` was renamed — the model name must still render"
         );
 
-        let push = crate::statusline::extract_push(&payload)
+        let push = crate::harness::claude::statusline::extract_push(&payload)
             .expect("guard: the push must still be written — `rate_limits` is untouched");
         assert!(
             push.context.is_none(),
@@ -803,7 +803,7 @@ mod tests {
         assert!(events.len() >= 4, "fixture guard: the whole turn must be present");
 
         let (ctx, mut tts_rx, _signals) = opencode_ctx();
-        let mut tracker = crate::oob::opencode::Tracker::default();
+        let mut tracker = crate::harness::opencode::read::Tracker::default();
         for ev in &events {
             tracker.handle(ev, &ctx).await;
         }

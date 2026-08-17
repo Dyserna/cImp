@@ -1,5 +1,14 @@
 //! V20: reduce assistant markdown to speakable prose.
 //!
+//! **V35 Phase K: this lives beside the segmenter, not beside the harness
+//! adapters** (design § 4's moves table — "stays shared; it is sentence
+//! segmentation, harness-neutral"). Markdown is not a harness's wire format,
+//! and design § 5.2 makes the point load-bearing for Phase L: when assistant
+//! text starts arriving over CHP, segmentation must stay app-side so a plugin
+//! can send prose and never markup or control. Its old home (`oob/`) emptied in
+//! the same move, so `processing/` is where a harness-neutral text reduction
+//! belongs.
+//!
 //! Out-of-band sources hand us the assistant's raw message text, which is
 //! markdown: fenced code blocks, inline code, headings, list markers, links,
 //! emphasis. The old `[[TTS]]` convention let the model mark exactly what to

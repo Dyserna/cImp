@@ -1,7 +1,7 @@
 //! Unit tests for the processing layer.
 //!
 //! V20: the layer no longer extracts TTS from the terminal (AI tabs speak
-//! out-of-band via `crate::oob`). It is now a raw-stream forwarder plus the
+//! out-of-band via `crate::harness::reader`). It is now a raw-stream forwarder plus the
 //! cell model that permission detection reads. These tests cover the segmenter
 //! (still used by the out-of-band sources) and the forwarding/cell behaviour.
 
@@ -150,7 +150,7 @@ fn ansi_styling_forwarded_verbatim() {
 fn tts_markers_are_forwarded_verbatim_not_stripped() {
     // V20: the `[[TTS]]` convention is retired. Any literal markers (there
     // shouldn't be any) pass straight through to the terminal unchanged, and
-    // nothing is spoken from the stream — TTS comes from `crate::oob`.
+    // nothing is spoken from the stream — TTS comes from `crate::harness::reader`.
     let mut layer = ProcessingLayer::new();
     let events = layer.ingest(b"[[TTS]]hello[[/TTS]]");
     assert_eq!(

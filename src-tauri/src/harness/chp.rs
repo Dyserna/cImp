@@ -12,7 +12,7 @@
 //! what it says (locked decision 5 — negotiation becomes load-bearing in
 //! Phase L). (Phase J then deleted those shims: Claude's half of the wire is now
 //! `type: "http"` hooks posting Claude's own payloads to `/claude/hook/*`, with
-//! the envelope in headers — see [`crate::harness::claude_hook`].)
+//! the envelope in headers — see [`crate::harness::claude::hook`].)
 //!
 //! The written contract is [`docs/CHP.md`](../../../../docs/CHP.md). It and
 //! [`CHP_VERSION`] are kept in step by [`tests::the_doc_states_this_version`],
@@ -131,7 +131,7 @@ pub const EVENTS: &[Event] = &[
     ev(EV_HELLO, true, HELLO_ROUTE, true),
     ev(EV_PROMPT, true, "/context/retrieve", true),
     // Reserved: today assistant prose reaches TTS through the OOB readers
-    // (`oob/claude.rs` tailing JSONL, `oob/opencode.rs` consuming SSE), which is
+    // (`harness/claude/read.rs` tailing JSONL, `harness/opencode/read.rs` consuming SSE), which is
     // the Tier-C half Phase L retires from the hot path.
     ev(EV_ASSISTANT_TEXT, true, "/session/assistant_text", false),
     ev(EV_SESSION_END, true, "/session/end", false),

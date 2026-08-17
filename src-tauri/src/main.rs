@@ -17,7 +17,6 @@ mod logging;
 mod mcp_stdio;
 mod notifications;
 mod offload;
-mod oob;
 mod preview;
 mod process_guard;
 mod processing;

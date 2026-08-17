@@ -40,7 +40,7 @@
 //!
 //! At the composition sites where EXTERNAL or model-derived text enters a
 //! non-HTML sink — today the out-of-band TTS path
-//! ([`OobContext::speak`](crate::oob::OobContext::speak)). Display-only webview
+//! ([`OobContext::speak`](crate::harness::OobContext::speak)). Display-only webview
 //! paths (Tool Activity payload popups, which do carry raw external text) are
 //! **not** sanitized: Svelte escapes them, they are shown as inert text, and
 //! stripping there would falsify the forensic record the user opened the popup

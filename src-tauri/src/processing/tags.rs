@@ -2,7 +2,7 @@
 //!
 //! Before V20 this module held the `[[TTS]]` tag scanner that extracted
 //! speakable text from the raw PTY byte stream. With AI tabs running fullscreen
-//! and TTS sourced out-of-band (`crate::oob`), that scanner is gone. The only
+//! and TTS sourced out-of-band (`crate::harness::reader`), that scanner is gone. The only
 //! survivor is [`normalize_for_dedup`], still used by the input-echo bookkeeping
 //! in `ipc::commands`.
 

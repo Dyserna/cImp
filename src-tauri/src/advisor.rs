@@ -2056,12 +2056,16 @@ mod tests {
         // actionable rather than merely alarming.
         // V35 Phase J: the read advisor's shim binary is gone; its payload
         // mechanics and its route are what a reader must now open.
+        // V35 Phase K: both live under `harness/claude/` — the paths come from
+        // the registry's `wired_in`, so this assertion moved when the files did.
         assert!(
-            p.rationale.contains("src-tauri/src/harness/claude_hook.rs"),
+            p.rationale.contains("src-tauri/src/harness/claude/hook.rs"),
             "{}",
             p.rationale
         );
-        assert!(p.rationale.contains("src-tauri/src/tabs/config.rs"));
+        assert!(p
+            .rationale
+            .contains("src-tauri/src/harness/claude/overlay.rs"));
     }
 
     /// A dismissal holds per (capability, evidence) pair and NOWHERE else.

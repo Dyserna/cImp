@@ -199,14 +199,14 @@ fn app_data_root() -> Option<PathBuf> {
         if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
             return Some(PathBuf::from(local).join("cimp"));
         }
-        crate::oob::claude::home_dir().map(|h| h.join("AppData").join("Local").join("cimp"))
+        crate::harness::claude::read::home_dir().map(|h| h.join("AppData").join("Local").join("cimp"))
     }
     #[cfg(not(windows))]
     {
         if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
             return Some(PathBuf::from(xdg).join("cimp"));
         }
-        crate::oob::claude::home_dir().map(|h| h.join(".local").join("share").join("cimp"))
+        crate::harness::claude::read::home_dir().map(|h| h.join(".local").join("share").join("cimp"))
     }
 }
 

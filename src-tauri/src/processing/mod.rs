@@ -14,11 +14,11 @@
 //! - [`Segmenter`] splits assistant prose into sentence-bounded chunks for the
 //!   downstream synthesizer, with disambiguation for decimals, common
 //!   abbreviations, and ellipses. V20 calls it from the out-of-band TTS sources
-//!   (`crate::oob`) rather than from the terminal stream.
+//!   (`crate::harness::reader`) rather than from the terminal stream.
 //!
 //! - [`ProcessingLayer`] owns the parser + cell screen. V20: it no longer
 //!   extracts TTS from the terminal — AI tabs are fullscreen and speak from
-//!   structured side channels (`crate::oob`), so the layer simply forwards the
+//!   structured side channels (`crate::harness::reader`), so the layer simply forwards the
 //!   raw PTY stream to xterm verbatim and maintains the cell model used by
 //!   permission detection ([`recent_rendered`](ProcessingLayer::recent_rendered)).
 //!
@@ -29,11 +29,13 @@
 
 pub mod patterns_file;
 pub mod permission;
+mod prose;
 mod sanitize;
 mod screen;
 mod segmenter;
 mod tags;
 
+pub use prose::to_speakable;
 pub use sanitize::strip_terminal_escapes;
 // V35 Phase H: the disk-bound scrubber (strip + credential redaction), used by
 // `harness::capture`. Its `Scrubbed` result is reached through the return type

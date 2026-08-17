@@ -264,19 +264,19 @@ harness), `/describe`, `/events`, `/health`, `/status`.
 
 ### 4.3 Reserved (Phase L)
 
-Design D2 retires the Tier-C read path — `oob/claude.rs` tailing transcript
-JSONL, `oob/opencode.rs` consuming SSE, `statusline/mod.rs` parsing stdin — by
+Design D2 retires the Tier-C read path — `harness/claude/read.rs` tailing transcript
+JSONL, `harness/opencode/read.rs` consuming SSE, `harness/claude/statusline.rs` parsing stdin — by
 having the plugin push the same facts. Those routes are named now so the
 vocabulary is one table:
 
 | Event | Route | Replaces |
 |---|---|---|
-| `assistant_text` | `POST /session/assistant_text` | `oob/*` assistant prose → TTS |
+| `assistant_text` | `POST /session/assistant_text` | `harness/{claude,opencode}/read.rs` assistant prose → TTS |
 | `session_end` | `POST /session/end` | session lifecycle inferred from the tap |
-| `session.usage` | `POST /session/usage` | `oob/claude.rs::parse_usage_line` |
-| `session.tool_result` | `POST /session/tool_result` | `oob/claude.rs` tool_result extraction |
-| `session.subagent` | `POST /session/subagent` | `oob/claude.rs::SubagentFile` discovery |
-| `session.context` | `POST /session/context` | `statusline/mod.rs` context window / quota |
+| `session.usage` | `POST /session/usage` | `harness/claude/read.rs::parse_usage_line` |
+| `session.tool_result` | `POST /session/tool_result` | `harness/claude/read.rs` tool_result extraction |
+| `session.subagent` | `POST /session/subagent` | `harness/claude/read.rs::SubagentFile` discovery |
+| `session.context` | `POST /session/context` | `harness/claude/statusline.rs` context window / quota |
 
 None of these is served today. Posting to one gets a `404`.
 

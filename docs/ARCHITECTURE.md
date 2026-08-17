@@ -237,7 +237,7 @@ index rebuild calls `reset()` (drops every `RELATIONS` relation) and memory is
 runtime event data, not derived from source — it must survive a rebuild.
 
 **Memory event sources are per-agent.** Claude records in-process via the
-transcript tap (`oob/claude.rs::record_tool_events`, beside `update_agents`;
+transcript tap (`harness/claude/read.rs::record_tool_events`, beside `update_agents`;
 session id = the `<id>.jsonl` stem), wired through `OobContext.mem` from
 `pty/manager.rs`. OpenCode's OOB SSE stream has no tool events, so its memory
 comes from the injection plugin's `tool.execute.after` hook POSTing to
@@ -288,7 +288,7 @@ exposes tab → session so the Code Intelligence Overview can follow the focused
 tab rather than the most-recently-active session.
 
 **The pin is a claim, verified against the transcript's existence**
-(`oob/claude.rs::pin_step`) — passing the flag does not mean the tab runs under
+(`harness/claude/read.rs::pin_step`) — passing the flag does not mean the tab runs under
 it, which was observed in the field on tabs carrying no `--resume`/`--continue`.
 Until `<root>/<pinned>.jsonl` exists, the tab publishes no identity and behaves
 exactly as described next; the tap keeps watching and upgrades if the file
@@ -317,8 +317,8 @@ spawn dir feeding both the transcript root and the hook's cwd fallback has one
 definition (`tabs::config::ai_working_dir`).
 
 Both harnesses stamp the registry per tab: Claude from its transcript drain tick
-(`oob/claude.rs:208`), OpenCode from its `/event` SSE tap
-(`oob/opencode.rs::Tracker::track_live_session`) — every session-scoped SSE event
+(`harness/claude/read.rs:208`), OpenCode from its `/event` SSE tap
+(`harness/opencode/read.rs::Tracker::track_live_session`) — every session-scoped SSE event
 carries `properties.sessionID` (verified against the spike-0a capture in
 `docs/spikes/v20/ev.ndjson`). The loopback `/memory/event` path keeps its
 *separate* session-keyed entries (the Usage "live now" badge reads them);
@@ -335,7 +335,7 @@ outline digests — synchronous, no per-prompt embedding. Claude injects via a
 `UserPromptSubmit` hook added to the `--settings` overlay (a `type: "http"`
 entry since V35 Phase J — see the hook table below); OpenCode via a generated
 dependency-free plugin
-(`tabs/config.rs::write_opencode_plugin` → `<project>/.opencode/plugin/cimp-inject.js`,
+(`harness/opencode/plugin.rs::write_opencode_plugin` → `<project>/.opencode/plugin/cimp-inject.js`,
 baking in the loopback port+token per launch; `.opencode/` is added to
 `.git/info/exclude`). **Never launch OpenCode with `--pure`** — it disables all
 external plugins.
@@ -369,7 +369,7 @@ binaries (`cimp --context-hook` and friends) whose whole job was to carry a
 payload from stdin to the loopback and a reply back to stdout. Claude Code
 2.1.63's http hooks let the harness POST that payload itself and parse the 2xx
 JSON reply exactly as it parses a command hook's stdout, so the shims were
-deleted and their payload mechanics moved into `harness/claude_hook.rs` on the
+deleted and their payload mechanics moved into `harness/claude/hook.rs` on the
 receiving end:
 
 | Hook event | Route | Feeds |
@@ -714,6 +714,75 @@ IPC) so a bad pattern is a UI error, not a silent zero-diagnostics run.
 Parser fixtures rot when the underlying tool changes its output — see
 `MAINTENANCE.md` § Check parsers & fixtures (V12 / V22).
 
+### Adding a harness plugin
+
+Same genre as the two how-tos above, one layer down: this is what it costs to
+support a **new CLI** (or absorb a change in one), after V35 Phase K moved the
+whole harness surface into `src-tauri/src/harness/`. The in-tree twin of this
+section is `src-tauri/src/harness/README.md`; the design is
+`DESIGN-harness-plugin-architecture.md` (§ 4 for the tree, § 4.1 for the tests
+below, § 6 for this cost table).
+
+**Everything cImp knows about a harness lives in one directory**, and three
+tests in `harness/layering.rs` keep it that way:
+
+- `no_harness_literals_outside_harness` — a string a harness owns
+  (`hookSpecificOutput`, `message.part.delta`, the TUI permission footer) may not
+  appear in production code outside `harness/`. The needle list is *derived from
+  the capability registry's* `depends_on`, so declaring a new dependency
+  automatically widens what the scan refuses to see elsewhere. Exceptions are an
+  explicit, commented allowlist in that file — four files today, each with the
+  phase that retires it.
+- `harness_modules_do_not_import_capabilities` — the dependency direction is
+  L1 → L2 only. A module under `harness/` may not reach into `graph::`, `tts::`,
+  `usage::` or `workbench::`; the Tier-C fallback readers that still do are a
+  declared, **shrinking** list (`UPWARD_EXEMPT`), and the test also fails when an
+  exemption stops being needed, so the list cannot rot into padding.
+- `every_harness_dir_declares_its_capabilities` — a `harness/<id>/` with no rows
+  in the registry and no CHP hello is a harness nobody can reason about.
+
+The steps:
+
+1. **`harness/<id>/mod.rs`**, plus `pub mod <id>;` in `harness/mod.rs` and a row
+   in `layering.rs`'s `HARNESS_DIRS` (the third test fails until you add it).
+2. **Emit the harness's own extension artifact** — whatever mechanism it
+   provides. The three that exist are the template:
+   `claude/overlay.rs` (a `--settings` JSON overlay + `--mcp-config`),
+   `opencode/plugin.rs` (a dependency-free ES module) and `opencode/config.rs`
+   (one `OPENCODE_CONFIG_CONTENT` env var). All are computed in Rust at tab
+   spawn and are **spawn-baked**: the artifact outlives the binary that wrote it,
+   so every body it posts carries `chp::CHP_VERSION` (which is what turns a stale
+   artifact from a mysterious functional failure into a line in the *Harness
+   health* panel), and any Settings-derived value baked into it needs a
+   `tabs::config::spawn_inject_sig` entry so the user gets the restart hint.
+3. **Declare a hello** — `serves` / `cannot`, built from the *same* booleans that
+   decided what was emitted, so the declaration cannot claim something the
+   artifact does not do. Event ids come from `chp::EV_*`. A capability missing
+   from `serves` reads as *unavailable, with a reason*, never as *nobody wrote it
+   down*.
+4. **Add capability rows** to `harness/contract.rs` for anything not already
+   covered, with `wired_in` naming your files — `wired_in_paths_exist` and the
+   `MAINTENANCE.md` parity test both hold you to it. A row whose degradation is
+   `Silent` must carry a canary, a probe or an explicit waiver.
+5. **A fallback reader** (`<id>/read.rs`) *only* if the harness cannot push. Tier
+   C stays possible; it is now contained and declared rather than ambient. It
+   will need L4 types, so add it to `UPWARD_EXEMPT` with the reason.
+
+What you should **not** need, and which the pre-K tree did require: a new enum
+variant outside `harness/`, new match arms in `tabs/config.rs`, a bespoke gate
+constant, a frontend mirror. If a step forces one, the seam is in the wrong
+place — raise it rather than adding it.
+
+Two standing constraints. **cImp does not load harness plugins it did not
+ship** (design D7): there is no drop-in directory and no manifest format,
+because the plugin is inside the TCB — cImp only *computes* the V32 Phase H
+verdict, and the enforcement is a `throw` inside the plugin's own
+`tool.execute.before`, which no cImp-side test can verify ran. And
+`opencode/plugin.rs` / `opencode/tools.rs` are **security controls, not data
+pipes**: the native-tool gate, the taint beacon and the pre-mutation checkpoint
+all execute inside the generated file, and the registry marks those rows in its
+`controls` column.
+
 ---
 
 ## Code Audit — Aggregated Security Scanning (V23)
@@ -939,7 +1008,7 @@ six sections (Index / Activity / Memory / Context / Analyses / Usage), only
 above: `UserPromptSubmit`, `PreCompact`, `PreToolUse`, `PostToolUse`) — Index,
 Activity, Memory, Analyses, and now **Usage** all ride existing plumbing with
 no hook of their own. The usage tap extends the OOB Claude-transcript reader
-that already exists for TTS and memory (`oob/claude.rs::record_usage`, called
+that already exists for TTS and memory (`harness/claude/read.rs::record_usage`, called
 from the same `drain_new_lines` loop as `record_tool_events`): `parse_usage_line`
 pulls `message.usage.{input_tokens,output_tokens,cache_read_input_tokens,
 cache_creation_input_tokens}` keyed by `message.id` (an UPSERT-by-`msg_id`,
@@ -956,7 +1025,7 @@ lines (covered by the paragraph above). The 2.x CLIs (observed 2.1.207)
 instead write one file per agent at
 `~/.claude/projects/<slug>/<session_id>/subagents/agent-<id>.jsonl` (plus an
 `agent-<id>.meta.json` we don't read), renamed the launcher tool `Task` →
-`Agent` (`oob/claude.rs::AGENT_TOOL_NAMES` matches both), and the parent
+`Agent` (`harness/claude/read.rs::AGENT_TOOL_NAMES` matches both), and the parent
 transcript carries **zero** sidechain lines. `SubagentState` (same file)
 tails those per-agent files each poll tick, feeding ONLY `record_usage` and
 `record_commit_events` under the parent session id — a sub-agent's tokens
@@ -975,7 +1044,7 @@ look cheap again with no canary firing, diff a live session's transcript
 dir against these two known layouts first.
 
 **OpenCode usage is `est_only` — `TODO(spike C3)`, resolved as "absent."**
-`oob/opencode.rs`'s module doc records the spike outcome directly: OpenCode's
+`harness/opencode/read.rs`'s module doc records the spike outcome directly: OpenCode's
 `/event` SSE stream's `message.updated.properties.info` object was captured
 exhaustively and carries only `{id, role, time}` — no token/usage fields on
 the pinned OpenCode version — so this file adds no usage tap at all. The

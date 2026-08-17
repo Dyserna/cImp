@@ -82,7 +82,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::harness::claude_hook::{missing_fields, resolve_cwd, tab_arg};
+use crate::harness::claude::hook::{missing_fields, resolve_cwd, tab_arg};
 
 /// The agent vocabulary this shim reports under. Only Claude Code runs
 /// `PreToolUse` hooks; OpenCode beacons from its plugin
@@ -93,7 +93,7 @@ const CONSUMER: &str = "claude";
 /// write separately (the response is never read, so there is no third).
 ///
 /// Deliberately an order of magnitude below the converted hooks' budget
-/// ([`crate::harness::claude_hook::TIMEOUT_SECS`], 1 s — the deleted shims'
+/// ([`crate::harness::claude::hook::TIMEOUT_SECS`], 1 s — the deleted shims'
 /// 600 ms rounded up): those wait because their whole purpose is the reply, while
 /// this one has nothing to wait for. On loopback a live app accepts into the backlog
 /// immediately and a dead one is refused immediately, so the only case this

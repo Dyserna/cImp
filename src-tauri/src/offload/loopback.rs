@@ -17515,6 +17515,22 @@ mod tests {
 
     // ── V35 Phase J: the two transports meet at one body ────────────────────
 
+    /// An absolute project root **in the platform's own idiom**, for the hook
+    /// bodies below.
+    ///
+    /// The mapping under test is platform-NEUTRAL, but one branch it crosses is
+    /// not: `claude_hook::plan_request`'s `Bash` arm passes an absolute shell
+    /// path through untouched and joins a relative one against the payload cwd,
+    /// and `Path::is_absolute()` reads `P:\proj\big.rs` as a RELATIVE path off
+    /// Windows. A hard-coded drive-letter literal therefore flips the test onto
+    /// the join branch on Linux and fails there — CI's `tool Bash` failure.
+    /// [`crate::harness::claude::hook`]'s own fixtures are cfg'd for exactly
+    /// this reason; this is the same fact one layer up.
+    #[cfg(windows)]
+    const HOOK_ROOT: &str = "P:\\proj";
+    #[cfg(not(windows))]
+    const HOOK_ROOT: &str = "/proj";
+
     /// **The convergence assertion.** For the same logical input, the Claude
     /// `type: "http"` route builds *byte-identically* the CHP body the deleted
     /// shim used to POST — which is what makes "both paths have the same
@@ -17534,19 +17550,30 @@ mod tests {
     #[test]
     fn a_claude_http_hook_builds_the_body_its_shim_used_to_post() {
         let tab = || Some("claude-1".to_string());
-        let cwd = || Some("P:\\proj".to_string());
+        let cwd = || Some(HOOK_ROOT.to_string());
+        // Built with `join` so the separator is the platform's own, and reused
+        // as both the payload value and the expected value — the mapping must
+        // carry a path through byte-for-byte on either platform.
+        let big = Path::new(HOOK_ROOT)
+            .join("big.rs")
+            .to_string_lossy()
+            .into_owned();
+        let edited = Path::new(HOOK_ROOT)
+            .join("a.rs")
+            .to_string_lossy()
+            .into_owned();
 
         // ── UserPromptSubmit / context_hook ──────────────────────────────
         let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": "sess-a",
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "prompt": "why is the build slow?",
         }))
         .expect("hook input");
         let mapped = retrieve_body_from_hook(&input, tab(), cwd());
         let shim: ContextRetrieveBody = serde_json::from_value(serde_json::json!({
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "prompt": "why is the build slow?",
             "session_id": "sess-a",
             "agent": "claude",
@@ -17561,13 +17588,13 @@ mod tests {
         let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
             "hook_event_name": "PreCompact",
             "session_id": "sess-a",
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "trigger": "auto",
         }))
         .expect("hook input");
         let mapped = compaction_body_from_hook(&input, tab(), cwd());
         let shim: ContextCompactionBody = serde_json::from_value(serde_json::json!({
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "session_id": "sess-a",
             "trigger": "auto",
             "agent": "claude",
@@ -17582,15 +17609,15 @@ mod tests {
         // ── PreToolUse / read_hook, on BOTH its matchers ─────────────────
         for (tool_input, want_path, want_offset, want_limit, want_prefix) in [
             (
-                serde_json::json!({ "file_path": "P:\\proj\\big.rs", "offset": 40, "limit": 80 }),
-                "P:\\proj\\big.rs",
+                serde_json::json!({ "file_path": big, "offset": 40, "limit": 80 }),
+                big.as_str(),
                 Some(40u32),
                 Some(80u32),
                 "",
             ),
             (
-                serde_json::json!({ "command": "cat P:\\proj\\big.rs" }),
-                "P:\\proj\\big.rs",
+                serde_json::json!({ "command": format!("cat {big}") }),
+                big.as_str(),
                 None,
                 None,
                 claude_hook::BASH_DENY_PREFIX,
@@ -17604,17 +17631,17 @@ mod tests {
             let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
                 "hook_event_name": "PreToolUse",
                 "session_id": "sess-a",
-                "cwd": "P:\\proj",
+                "cwd": HOOK_ROOT,
                 "tool_name": tool,
                 "tool_input": tool_input,
             }))
             .expect("hook input");
-            let plan = claude_hook::plan_request(Some(tool), &input.tool_input, "P:\\proj")
+            let plan = claude_hook::plan_request(Some(tool), &input.tool_input, HOOK_ROOT)
                 .expect("a verdict request");
             assert_eq!(plan.deny_prefix, want_prefix);
             let mapped = should_read_body_from_hook(&input, &plan, tab(), cwd());
             let shim: ShouldReadBody = serde_json::from_value(serde_json::json!({
-                "cwd": "P:\\proj",
+                "cwd": HOOK_ROOT,
                 "session_id": "sess-a",
                 "file_path": want_path,
                 "offset": want_offset,
@@ -17633,16 +17660,16 @@ mod tests {
         let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
             "hook_event_name": "PostToolUse",
             "session_id": "sess-a",
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "tool_name": "Edit",
-            "tool_input": { "file_path": "P:\\proj\\a.rs" },
+            "tool_input": { "file_path": edited },
         }))
         .expect("hook input");
         let mapped = post_edit_body_from_hook(&input, tab(), cwd());
         let shim: ContextPostEditBody = serde_json::from_value(serde_json::json!({
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "session_id": "sess-a",
-            "file_path": "P:\\proj\\a.rs",
+            "file_path": edited,
             "tool_name": "Edit",
             "agent": "claude",
             "tab": "claude-1",
@@ -17660,14 +17687,14 @@ mod tests {
         let input: claude_hook::HookInput = serde_json::from_value(serde_json::json!({
             "hook_event_name": "Notification",
             "session_id": "sess-a",
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "transcript_path": "C:/t/sess-a.jsonl",
             "notification": { "type": "permission_prompt", "message": "needs your permission" },
         }))
         .expect("hook input");
         let mapped = permission_body_from_hook(&input, cwd());
         let shim: PermissionEventBody = serde_json::from_value(serde_json::json!({
-            "cwd": "P:\\proj",
+            "cwd": HOOK_ROOT,
             "session_id": "sess-a",
             "transcript_path": "C:/t/sess-a.jsonl",
             "event": "Notification",

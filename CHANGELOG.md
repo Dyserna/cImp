@@ -5,6 +5,116 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0-rc.1] — 2026-08-17
+
+**Pre-release, for testing.** The harness-resilience RC: **all thirteen V35
+phases (A–M) are implemented** — the dependency surface on Claude Code /
+OpenCode is now declared, canaried, probed, auto-verified, relocated behind
+one directory, and pushed over a named protocol — plus V33's containment
+stages 1–3 and the AppContainer sandbox (Phase A), and the V32 rc.4 retest
+closure (locked decision 43). **Settings schema 31** (was 30) — see the
+upgrade notes; several changes are spawn-baked and need fresh tabs.
+
+### Added
+
+- **The harness capability matrix** (V35 A) — every dependency cImp holds on
+  a harness is a machine-readable registry row (id, seam tier A–D, contract,
+  the exact fields/flags/routes relied on, degradation, coverage), with
+  build-time tests that keep it in lockstep with the MAINTENANCE drift table
+  and refuse a silent dependency with neither a canary nor a recorded waiver.
+- **Canaries that assert substantiveness, not parse success** (V35 B+C) —
+  fixture tests for the Tier-C readers (usage, tool results, statusline,
+  OpenCode SSE, assistant text) fail when real input stops producing real
+  output, plus negative twins that prove each canary fires on a renamed
+  field.
+- **`cimp --harness-canary [--json]`** (V35 D) — a live probe of the
+  installed CLIs: diffs OpenCode's tool registry against the reviewed
+  allowlist (unclassified ids fail loudly — the standing manual diff is now
+  automated), checks Claude's flags, and tail-verifies transcript shapes.
+  *Unavailable* and *changed-for-the-better* are distinct outcomes, never
+  failures.
+- **Auto-verify on CLI update** (V35 E+F) — a version change runs the
+  canaries + probes automatically; all-pass advances `claude_last_verified`
+  with **no Advisor card**, failures raise one notice per affected
+  capability naming the file to fix. The version tripwire survives only as
+  the cannot-verify fallback, and **Mark verified** now exists solely for
+  the three behavior spikes no probe can settle.
+- **Settings → Harness health** (V35 G) — every capability, its tier,
+  coverage, gate state and last verify result, grouped per harness with
+  seen/verified versions, out-of-step (stale-plugin) tabs, and a *Run
+  checks now* button. "What is broken right now" no longer requires reading
+  source.
+- **Capture-on-success corpus** (V35 H) — passing probes write scrubbed,
+  version-stamped payload captures to `%LOCALAPPDATA%\cimp\harness-captures`
+  (bounded, 8 good / 3 failing per harness); `cimp --harness-capture` grabs
+  a broken shape during an incident. A breakage's first diagnostic is now a
+  diff.
+- **CHP — the cImp Harness Protocol** (V35 I) — the loopback wire both
+  harnesses speak is named, versioned and documented (`docs/CHP.md`), with
+  `/session/hello` capability negotiation and stale-plugin detection (the
+  "needs a FRESH TAB" trap class is now *detected*, not mysterious).
+- **V33 containment, stages 1–3 + Phase A** — LAN auth tokens, tool
+  checkpoints with provenance, bounded detection rules, and `run_command`
+  children in a stable `cimp.worker` **AppContainer** (default OFF, its own
+  *Sandboxing* Settings category and `sandbox` Events lane).
+- **Offload server lifecycle events** — start/ready/stop/fail as their own
+  Events class with a crash watcher; quarantined memory notes get a one-line
+  row + detail dialog; Events checkpoint rows open a detail popup.
+
+### Changed
+
+- **Claude hooks are `type:"http"`** (V35 J) — the five hook shim binaries
+  are deleted (~1050 lines); hooks POST straight to loopback with a
+  bearer token carried in the environment, and `SessionStart` announces the
+  tab's capabilities. Old tabs keep working through tombstoned flags and
+  the legacy routes.
+- **The read path pushes where upstream allows** (V35 L) — assistant text
+  (TTS), tool results and subagent lifecycle arrive as pushes from the
+  harness with per-tab arbitration and quiet-capability drift detection;
+  token usage **cannot** push (no hook event carries counts — documented
+  upstream limitation) and stays on the transcript reader. OpenCode
+  declined both migrations with recorded reasons; its SSE reader stays as
+  the declared fallback.
+- **The harness surface lives in `src-tauri/src/harness/`** (V35 K) — one
+  directory, layering tests, a README for "I want to add a harness", and
+  the OpenCode plugin is a real `.js` template with a checked substitution
+  key set and byte-identity goldens (V35 M) instead of a `format!()` block.
+- **The usage bottom bar ends at the reset clock** — the context/cache
+  group and its `usage.show_context` setting are retired. An API-key-auth
+  Claude tab (which reports no quota) now shows no widget; #75 tracks the
+  universal subscription-vs-API design.
+- **`claude_last_verified` changed meaning** — it now records "canaries and
+  probes passed", advanced automatically; the Tier-D spike statuses remain
+  human-owned.
+
+### Fixed
+
+- **Payload captures are actually redacted** — `processing/sanitize.rs` was
+  a terminal-escape stripper only; it now composes credential redaction
+  from the baked secret-screen ruleset, fail-closed on every edge (V35 H
+  finding).
+- **F-40 / locked decision 43** (V32 retest) — identity-less callers get a
+  bounded row ledger (`UnscopedAudit`); the fetch budget stays deliberately
+  fail-open.
+- **`is_ancestor_or_equal` refuses unresolved `..`** (V33).
+- The documented TUI permission-prompt literal matched a retired pattern;
+  registry and MAINTENANCE now describe the shipped matchers (V35 A
+  finding).
+
+### Upgrade notes
+
+- **Settings schema 31** (30 auto-migrates; no data transform).
+- **Fresh tabs required** to pick up the http hooks and the push path —
+  tabs open across the upgrade keep the old shim/reader behavior, inert
+  but functional, and are reported as *out-of-step* in Harness health.
+- **First launch will auto-advance `claude_last_verified`** if the canaries
+  pass — that is the designed end of the reflexive Mark-verified click.
+- New machine-local store: `%LOCALAPPDATA%\cimp\harness-captures` (never
+  synced, never in the repo, bounded).
+- The remaining V35 live-verify recipes are tracked in #54; recipe 7 (a
+  prompt in a fresh Claude tab exercising context injection over http
+  hooks) is the gating one.
+
 ## [0.51.0-rc.4] — 2026-08-12
 
 **Pre-release, for testing.** The finding-closure RC: **every V32 finding is

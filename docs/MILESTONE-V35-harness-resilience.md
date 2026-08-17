@@ -1,13 +1,12 @@
 # V35 — Harness Resilience (capability matrix + drift canaries)
 
-**Status:** PHASES A–I IMPLEMENTED (A–H 2026-08-16, I 2026-08-17:
+**Status:** PHASES A–J IMPLEMENTED (A–H 2026-08-16; I, J 2026-08-17:
 `82c0da2`, `7a4262a`, `7610255`, `ee3ac18`, `d5eb95d`, `6a8c3f7`,
-`4e1c519`, `347c938`, `27b6241`). The matrix/canary/probe consolidation is
-complete and CHP is declared; Phases J–M remain. GitHub milestone 8:
-#55–#62 + #63 + #66 closed; #64 open (overlay round-trip needs the
-scripted-turn probe class); #71 open; #73 filed from Phase D's auth
-observation. Remaining live-verify recipes below: 2 (app-level leg), 3, 6
-(user leg), 7–10 (8 is now drivable).
+`4e1c519`, `347c938`, `27b6241`, `8fcce94`). The shim layer is deleted;
+Claude's L1 is http hooks straight at loopback. Phases K–M remain.
+GitHub milestone 8: #55–#62 + #63 + #66 + #67 closed; #64 open; #71 open;
+#73 filed. Remaining live-verify recipes: 2 (app leg), 3, 6 (user leg),
+7 (now the key one — proves $VAR header substitution live), 8–10.
 **Design source of truth:** this file for the *why*, the scope and the locked
 decisions; the three companion drafts for the detailed design —
 [DESIGN-harness-capability-matrix.md](DESIGN-harness-capability-matrix.md)
@@ -517,6 +516,42 @@ ignored node-driven plugin tests were also run green. Findings + rulings:
 - Hello events reuse the Graph activity lane (`source:"harness"`,
   `tool:"chp_hello"`), beside `contract_drift` — no new retention lane for
   a once-per-tab-launch row.
+
+**Phase J (`8fcce94`, 2026-08-17).** The five `*_hook.rs` shims are DELETED
+(1053 lines); Claude hooks are `type:"http"` at `/claude/hook/<event>`,
+timeout 1s pinned at generation (the shims' shared 600ms budget, ceil'd),
+bearer token via `$CIMP_HOOK_TOKEN` + `allowedEnvVars` (in the child env,
+never in the overlay — tested), identity headers X-CIMP-Tab/Agent/Chp,
+SessionStart→hello with `serves` baked at generation (recomputing at hello
+time would describe an overlay the running tab never had). Legacy shim
+routes stay for pre-upgrade tabs; the five dispatch flags are exit-0
+tombstones (removable one release later). The two beacon shims stay
+command hooks (timeout 5s — checkpoint genuinely waits 2s). cargo
+2188/0/6 (−12 shim tests, +24, all named in #67), clippy clean, ignored
+6/6. Decisions + findings:
+
+- **`Capability::drift_token` column** — four reporters now share two
+  files, so shim attribution moved off `wired_in` file names onto an
+  explicit token column (bidirectionally tested; pre-upgrade shim POSTs
+  and http handlers land in one bucket per capability).
+- Hook-native routes live beside the legacy ones and both call one
+  extracted core per capability (tested); each gated route carries its own
+  latch-gate block so the route-level gate audit still sees it.
+- **`harness_version` has no producer on either harness** (hook input
+  carries no CLI version; opportunistic read documented as speculative) —
+  the staleness arm stays implemented-but-unproduced.
+- `resolve_cwd` fallback changed on the defensive path only: an absent
+  `cwd` resolves from the tab's configured dir (the shim's `current_dir()`
+  was meaningless in-app) and is still reported as drift.
+- **New residual:** an http hook bakes its URL at generation, so hooks
+  require the loopback listener to exist at spawn (made explicit by
+  `no_endpoint_means_no_http_hooks_at_all`).
+- Pre-upgrade Claude tabs report `old_plugin` staleness on day one —
+  intended reading, the test whose meaning inverted is named in #67.
+- Deploy note: fresh tab for http hooks; old tabs keep working via
+  tombstones + legacy routes. Recipe 7 (live) is the proof that `$VAR`
+  header substitution reads the child env — the one assumption unit tests
+  cannot settle; fallback is a one-line literal-token switch.
 
 ## Two gaps to fix ahead of the milestone
 

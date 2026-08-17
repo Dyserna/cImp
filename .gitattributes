@@ -13,3 +13,12 @@
 #     no longer match what raw.githubusercontent.com serves.
 # Line-ending translation would silently break both. Keep them LF everywhere.
 detection/** text eol=lf
+
+# V35 Phase M: the generated-plugin TEMPLATE and its byte-identical goldens.
+# `harness::opencode::plugin` asserts render(template, flags) equals each golden
+# byte for byte, and the rendered text is written into a project's
+# `.opencode/plugin/`. Neither should depend on how a contributor's Git checked
+# the template out, so both stay LF everywhere — same reasoning as the detection
+# bundle above, one layer up.
+src-tauri/src/harness/opencode/templates/plugin.js text eol=lf
+src-tauri/fixtures/plugin-goldens/** text eol=lf

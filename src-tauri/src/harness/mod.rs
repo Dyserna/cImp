@@ -86,8 +86,9 @@
 //! seed rows), `docs/DESIGN-harness-drift-canaries.md` (the canary layers, § 5
 //! for Phase F's replacement of the noisy tripwire, § 3.2 and § 4.1 for the
 //! capture dir's trust boundary),
-//! `docs/DESIGN-harness-plugin-architecture.md` § 7 step 2 (Phase J) and § 4
-//! + § 4.1 (Phase K: the target tree and the layering tests).
+//! `docs/DESIGN-harness-plugin-architecture.md` § 7 step 2 (Phase J), §§ 4 and
+//! 4.1 (Phase K: the target tree and the layering tests) and § 5.1 (Phase M:
+//! the emitted artifact as a template file — [`render`]).
 
 pub mod canary;
 pub mod capture;
@@ -100,6 +101,7 @@ mod layering;
 pub mod opencode;
 pub mod probe;
 pub mod reader;
+pub mod render;
 pub mod verify;
 
 pub use reader::{spawn, OobContext, OobSpec};

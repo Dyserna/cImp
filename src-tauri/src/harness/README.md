@@ -34,6 +34,7 @@ rows in the registry and no CHP hello.
 | `health.rs` | — | Read-model for the Settings *Harness health* panel. |
 | `capture.rs` | — | The payload corpus — what a probe saw, scrubbed and stamped, so a break starts with a diff. |
 | `reader.rs` | L1 | Which fallback reader a tab attaches, and the context it runs with. Retired from the hot path by Phase L. |
+| `render.rs` | L1 | `{{cimp.*}}` substitution for the generated artifacts, and the one place values get JSON-quoted. Phase M. |
 | `layering.rs` | — | The three tests that keep all of the above true. |
 | `claude/`, `opencode/` | L1 | One directory per harness — see below. |
 
@@ -45,7 +46,20 @@ A new harness is one directory and no changes above L2.
 2. **The generated artifact** — whatever this harness's own extension mechanism
    is: `claude/overlay.rs` emits a `--settings` JSON overlay,
    `opencode/plugin.rs` emits an ES module, `opencode/config.rs` emits an env
-   var. All three are computed in Rust at tab spawn and are **spawn-baked**: the
+   var.
+
+   **Text artifact ⇒ a real file with `{{cimp.*}}` slots** under
+   `<id>/templates/`, `include_str!`ed and rendered by `render.rs` (V35 Phase M).
+   `opencode/templates/plugin.js` is the worked example: the Rust keeps the key
+   set and the values, the JavaScript keeps the JavaScript. Values are whole
+   serde literals (`render::json_lit`) so nothing a contributor adds to a table
+   can malform the artifact, and the key set is checked both ways at test time —
+   a typo'd `{{key}}` fails `cargo test` instead of shipping. **Structured
+   artifact (JSON/TOML) ⇒ build it structurally**, as `claude/overlay.rs` does
+   with `serde_json::Value`; converting one of those to a text template would be
+   a regression, not a cleanup.
+
+   All are computed in Rust at tab spawn and are **spawn-baked**: the
    artifact outlives the binary that wrote it, so it must carry `chp`
    (`chp::CHP_VERSION`) on every body it posts, and any Settings-derived value
    baked into it needs a `tabs::config::spawn_inject_sig` entry so the user gets
@@ -74,12 +88,17 @@ cImp only *computes* the V32 Phase H verdict, and the enforcement is a `throw`
 inside the plugin's own tool path. A plugin that omits it disables containment
 while looking completely functional, and no cImp-side test can catch that.
 
-## Before you edit `opencode/plugin.rs` or `opencode/tools.rs`
+## Before you edit `opencode/templates/plugin.js`, `opencode/plugin.rs` or `opencode/tools.rs`
 
 Those are **security controls**, not data pipes: the native-tool gate, the taint
 beacon and the pre-mutation checkpoint all execute inside the generated plugin.
 The registry marks them (`Capability::controls`). Treat a change there as a TCB
 change.
+
+Since Phase M the enforcement is a `throw` in a `.js` file you can open and
+read, and every edit to it shows up twice — once in the template, once in the
+byte-identical goldens under `src-tauri/fixtures/plugin-goldens/opencode/`.
+Re-blessing a golden without reading its diff defeats the entire arrangement.
 
 ## Reading list
 

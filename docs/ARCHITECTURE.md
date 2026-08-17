@@ -335,7 +335,8 @@ outline digests — synchronous, no per-prompt embedding. Claude injects via a
 `UserPromptSubmit` hook added to the `--settings` overlay (a `type: "http"`
 entry since V35 Phase J — see the hook table below); OpenCode via a generated
 dependency-free plugin
-(`harness/opencode/plugin.rs::write_opencode_plugin` → `<project>/.opencode/plugin/cimp-inject.js`,
+(`harness/opencode/plugin.rs::write_opencode_plugin`, rendering
+`harness/opencode/templates/plugin.js` → `<project>/.opencode/plugin/cimp-inject-<tab>.js`,
 baking in the loopback port+token per launch; `.opencode/` is added to
 `.git/info/exclude`). **Never launch OpenCode with `--pure`** — it disables all
 external plugins.
@@ -749,7 +750,24 @@ The steps:
    provides. The three that exist are the template:
    `claude/overlay.rs` (a `--settings` JSON overlay + `--mcp-config`),
    `opencode/plugin.rs` (a dependency-free ES module) and `opencode/config.rs`
-   (one `OPENCODE_CONFIG_CONTENT` env var). All are computed in Rust at tab
+   (one `OPENCODE_CONFIG_CONTENT` env var).
+
+   **If the artifact is text, it is a file, not a `format!()` string** (V35
+   Phase M, design § 5.1). `opencode/templates/plugin.js` is a real `.js` file
+   with `{{cimp.*}}` slots, `include_str!`ed and rendered by `harness/render.rs`;
+   `plugin.rs` keeps only the *key set* (`OPENCODE_PLUGIN_KEYS`) and the values
+   behind it. Two rules come with that: every substitution value is a whole
+   serde-produced literal (`render::json_lit`), so a tool name or refusal added
+   later can never malform the emitted file; and every `{{key}}` must be in the
+   declared set — three tests fail the build otherwise, rather than a typo
+   emitting a plugin with a missing gate constant. The emitted artifact is
+   goldened byte for byte (`src-tauri/fixtures/plugin-goldens/`), so an upstream
+   rename lands as a readable diff in JavaScript and in its goldens, in one
+   commit. **If the artifact is structured (JSON, TOML), build it structurally**
+   — `claude/overlay.rs` composes `serde_json::Value`, which is strictly safer
+   than a text template and deliberately was *not* converted.
+
+   All are computed in Rust at tab
    spawn and are **spawn-baked**: the artifact outlives the binary that wrote it,
    so every body it posts carries `chp::CHP_VERSION` (which is what turns a stale
    artifact from a mysterious functional failure into a line in the *Harness

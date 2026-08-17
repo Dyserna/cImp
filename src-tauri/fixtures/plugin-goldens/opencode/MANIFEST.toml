@@ -1,0 +1,63 @@
+# V35 Phase M — the OpenCode plugin GOLDENS.
+#
+# ── What these are ──────────────────────────────────────────────────────────
+#
+# Three renderings of `src/harness/opencode/templates/plugin.js`, one per
+# representative flag combination, asserted BYTE FOR BYTE by
+# `harness::opencode::plugin::tests::the_template_renders_the_pre_phase_m_goldens_byte_for_byte`.
+#
+#   plugin.all-on.js   port 54321, token "deadbeef00",         tab "opencode"
+#                      inject/auto_check/beacon/native_gate/checkpoint ALL ON
+#   plugin.all-off.js  port 54321, token "deadbeef00",         tab "opencode"
+#                      every optional handler INERT (OpencodePluginFlags::default)
+#   plugin.mid.js      port 41999, token "test-loopback-token", tab "ai-abc123"
+#                      inject ON, auto_check OFF, beacon ON, native_gate OFF,
+#                      checkpoint ON
+#
+# The three, not two: all-on and all-off bracket the flag space, and the mid
+# config splits every group the plugin reads together, so a renderer that only
+# works when the whole group agrees cannot pass. It also carries a duplicated
+# `ai-<uuid>` tab id and a hyphenated token.
+#
+# ── Why they exist, and what they prove ─────────────────────────────────────
+#
+# They were captured from the **pre-Phase-M `format!()` generator**, before the
+# template file existed. Asserting the template renders them byte for byte is
+# what makes Phase M a provable *pure refactor of generation* rather than an
+# unreviewed rewrite of a file that sits inside the TCB (design
+# `DESIGN-harness-plugin-architecture.md` § 5, D7): the V32 Phase H native-tool
+# gate, the V32 taint beacon and the V33 Phase F checkpoint trigger all execute
+# inside the rendered file.
+#
+# ── Why they KEEP existing ──────────────────────────────────────────────────
+#
+# **They are the standing "readable diff" artifact** the milestone exit
+# criterion asks for. An upstream OpenCode change — a renamed hook, a new
+# handler, a reclassified tool — lands as a diff in `templates/plugin.js` AND as
+# a diff in these three files, in the same commit, in JavaScript. That is the
+# thing a reviewer reads. Before Phase M the same change was a diff inside a
+# Rust string literal with every brace doubled, and nothing showed what the
+# emitted file actually became.
+#
+# Regenerate DELIBERATELY, never to make a red test green:
+#
+#     CIMP_BLESS_PLUGIN_GOLDENS=1 cargo test --bin cimp byte_for_byte
+#
+# then read `git diff` on these files before committing. An unexplained golden
+# diff in a review is a change to a security control.
+#
+# ── Not part of the harness fixture corpus ──────────────────────────────────
+#
+# Deliberately a sibling of `fixtures/harness/` rather than a directory inside
+# it. That tree is walked by `harness::canary`'s
+# `every_fixture_version_dir_has_a_manifest`, whose contract is `<harness>/<CLI
+# version>/` — recorded UPSTREAM payloads, versioned by the CLI build they were
+# modelled on. These are cImp's own OUTPUT and are versioned by nothing but this
+# repository, so filing them there would either break that walker or force a
+# fake CLI-version directory. The manifest convention is kept anyway: an
+# anonymous fixture is indistinguishable from a guess.
+
+captured_from = "cImp itself — `harness::opencode::plugin::opencode_plugin_source` at commit e2b9cee (V35 Phase L), i.e. the last `format!()`-based generator before Phase M replaced it with a template."
+date = "2026-08-17"
+method = "generated, not captured: a temporary test called the pre-Phase-M generator with the three flag combinations above and wrote its output here verbatim, before `templates/plugin.js` existed. The post-refactor renderer is then asserted equal to these bytes."
+redaction = "not applicable — nothing was captured from a live system. The port, token and tab id in each file are dummies chosen to match the existing plugin tests (54321/\"deadbeef00\", 41999/\"test-loopback-token\"); no real loopback token has ever been in this directory, and the loopback token rotates per app run in any case."

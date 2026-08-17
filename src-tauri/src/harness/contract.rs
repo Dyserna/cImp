@@ -216,7 +216,8 @@ pub struct Capability {
 
 /// V32 Phase H native-tool containment: the enforcement `throw` in the
 /// generated OpenCode plugin's `tool.execute.before`
-/// (`tabs/config.rs`, ~line 2205). cImp only *computes* the verdict.
+/// (`harness/opencode/templates/plugin.js` since V35 Phase M — grep
+/// `CIMP_REFUSAL_NATIVE_LOCAL`). cImp only *computes* the verdict.
 ///
 /// OpenCode-only, and that is a fact rather than a gap: Claude Code has no
 /// equivalent site: its `PreToolUse` shims are report-only by locked decision 14
@@ -1201,6 +1202,10 @@ pub const CAPABILITIES: &[Capability] = &[
         wired_in: &[
             "src-tauri/src/harness/opencode/tools.rs",
             "src-tauri/src/harness/opencode/plugin.rs",
+            // V35 Phase M: the emitted artifact itself. The table above decides
+            // which names are gated; THIS file is where they land, and it is
+            // the diff a reviewer reads when the classification changes.
+            "src-tauri/src/harness/opencode/templates/plugin.js",
         ],
         degradation: Degradation::Silent,
         drift_rule: &[],
@@ -1245,6 +1250,10 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
         wired_in: &[
             "src-tauri/src/harness/opencode/plugin.rs",
+            // V35 Phase M: the `throw` this row's waiver is about is a line of
+            // JavaScript, and since Phase M it is a line in a JavaScript FILE —
+            // which is the point of the move. Open this one, not the emitter.
+            "src-tauri/src/harness/opencode/templates/plugin.js",
             "src-tauri/src/offload/loopback.rs",
         ],
         degradation: Degradation::Silent,

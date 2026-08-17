@@ -5,6 +5,36 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0-rc.2] — 2026-08-17
+
+**Pre-release, for testing.** Identical to 0.52.0-rc.1 in features — that
+tag's portable-zip build was (correctly) refused by the release gate
+because the Tests workflow was red, so no rc.1 artifact exists. On top of
+rc.1:
+
+### Fixed
+
+- **The harness literal-scan test was line-ending-sensitive** — on a CRLF
+  checkout (GitHub's Windows runner default) its test-module boundary never
+  matched and it scanned test code, producing 26 artifact hits; on LF it
+  could silently skip production code after a mid-file `#[cfg(test)]`
+  item. The scan now strips `\r` before matching and removes every
+  test span via the brace-matched lexer (`rustsrc.rs`, hoisted from
+  `spawn_ledger`), so every platform scans identical bytes. The allowlist
+  gained the self-check it was assumed to have — which immediately retired
+  two entries whose stated reasons described code that does not exist.
+- **A Phase J hook-body test hardcoded a Windows drive path** and failed
+  on Linux, where `P:\proj` is not absolute (`assertion failed: tool
+  Bash`). The fixture now builds its paths per-platform; production
+  resolution was correct all along.
+
+### Added
+
+- **`docs/HARNESS-PLUGIN-LAYER.md`** — the harness plugin layer described
+  end to end, with a developer guide for adding a harness and for changing
+  a shipped plugin (verified against the tree, including the numbers the
+  milestone record had let drift).
+
 ## [0.52.0-rc.1] — 2026-08-17
 
 **Pre-release, for testing.** The harness-resilience RC: **all thirteen V35

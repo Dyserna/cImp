@@ -268,6 +268,25 @@ jobs:
     env:
       # Node 24 actions runtime (see release.yml).
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      # V33 Phase D — THIS RUNNER PROMISES A KERNEL THAT CAN SANDBOX.
+      #
+      # The Landlock live tests (`sandbox::linux`) skip when the ABI probe finds
+      # no usable Landlock, because a laptop or an old container is a legitimate
+      # place to run them. But `cargo test` CAPTURES the stdout of passing
+      # tests, so in this log a skip and a genuinely exercised pass are the same
+      # two characters: `ok`. Without this variable, the day a runner image, a
+      # container flag or a kernel `lsm=` list drops Landlock, the tests that
+      # exist to catch exactly that would go green and say nothing.
+      #
+      # Set here, it converts that skip into a PANIC: the promise is made by
+      # this file, so this file is where a broken one gets reported.
+      # ubuntu-24.04 ships kernel 6.8 with Landlock ABI 4 enabled — if that ever
+      # stops being true, the right response is to see a red run and decide, not
+      # to discover months later that the sandbox suite had been vacuous.
+      #
+      # To retire the promise (a runner that genuinely cannot sandbox), delete
+      # this line — deliberately, in a reviewed diff.
+      CIMP_EXPECT_LANDLOCK: '1'
 
     steps:
       - name: Checkout

@@ -1328,8 +1328,12 @@ mod tests {
                 );
             }
             Plan::Plain(SkipReason::Unavailable(r)) => {
-                println!("SKIPPED (no usable Landlock on this kernel): {r}");
+                // Skip or fail, decided by `CIMP_EXPECT_LANDLOCK` — the same
+                // policy the engine's own live tests use, reached through the
+                // same function so the two cannot disagree about what a
+                // kernel-less run means.
                 assert!(!r.is_empty(), "an unavailable engine must say why");
+                linux::skip_or_fail("an_enabled_switch_on_linux_reaches_the_landlock_engine", &r);
             }
             Plan::Plain(SkipReason::OffUser) => {
                 panic!("an ENABLED switch was reported as the user's choice to be off")

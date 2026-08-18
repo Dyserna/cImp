@@ -6247,38 +6247,61 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         assert_eq!(spawn_inject_sig(&s), with_graph);
     }
 
-    /// **Which tabs are agent seams** (V33 Phase B decision B1), through the
-    /// real spec builder rather than through `harness_of` alone — the property
-    /// that matters is what lands on `PtyLaunchSpec`, because that is what the
-    /// PTY manager reads.
+    /// **Which tabs are agent seams** (V33 Phase B decision B1).
+    ///
+    /// # Why the paths here are BUILT, not spelled
+    ///
+    /// The first version of this test asserted on the literal
+    /// `C:\Users\x\.local\bin\claude.exe` and passed on Windows while failing on
+    /// the Linux CI runner, because [`command_is`] resolves through
+    /// `Path::file_stem` and **`\` is not a separator on Linux** — so that whole
+    /// string is one file name whose stem is `C:\Users\x\.local\bin\claude`. The
+    /// defect was entirely in the fixture (see
+    /// [`every_default_ai_tab_carries_a_harness_on_every_platform`] for the
+    /// production-surface guard), and the standing rule it broke is: a path in a
+    /// test fixture is built with `Path::join` so the separators are the running
+    /// platform's, or it is not a path at all.
     #[test]
     fn only_ai_tool_tabs_carry_a_harness_and_shell_tabs_never_do() {
         use crate::sandbox::tabs::Harness;
-        // The direct mapping, including the local-provider variant: a
-        // `claude-local` TAB runs the `claude` COMMAND, so it is the same
-        // harness with the same state directories.
+        // The bare configured names — what settings actually hold, and identical
+        // on every platform. `claude-local` is a TAB id whose COMMAND is
+        // `claude`, so it is the same harness with the same state directories.
         assert_eq!(harness_of("claude"), Some(Harness::Claude));
-        assert_eq!(harness_of("CLAUDE.EXE"), Some(Harness::Claude));
-        assert_eq!(
-            harness_of(r"C:\Users\x\.local\bin\claude.exe"),
-            Some(Harness::Claude)
-        );
         assert_eq!(harness_of("opencode"), Some(Harness::OpenCode));
+        // Case-insensitive, and an extension is stripped. No separator in these,
+        // so they mean the same thing on both platforms.
+        assert_eq!(harness_of("CLAUDE.EXE"), Some(Harness::Claude));
+        assert_eq!(harness_of("OpenCode"), Some(Harness::OpenCode));
+
+        // A fully-qualified path, spelled the way THIS platform spells one.
+        let resolved = std::path::Path::new("home")
+            .join("x")
+            .join(".local")
+            .join("bin")
+            .join(if cfg!(windows) { "claude.exe" } else { "claude" });
+        assert_eq!(
+            harness_of(&resolved.to_string_lossy()),
+            Some(Harness::Claude),
+            "a resolved harness path must be recognised on {}",
+            std::env::consts::OS
+        );
+
         // Anything else is NOT sandboxed: a grant table nobody wrote is not a
         // boundary, it is a tool that fails to start invisibly.
         assert_eq!(harness_of("bash"), None);
         assert_eq!(harness_of("aider"), None);
         assert_eq!(harness_of(""), None);
 
-        // …and the same test the injection layer makes, so the sandbox's grant
-        // table and the injected config can never disagree about what a tab is.
-        for (command, claude) in [("claude", true), ("opencode", false)] {
+        // …and the split agrees with the one the injection layer makes, so the
+        // sandbox's grant table and the injected config can never disagree about
+        // what a tab is.
+        for command in ["claude", "opencode", "bash"] {
             assert_eq!(
                 harness_of(command) == Some(Harness::Claude),
                 command_is(command, "claude"),
                 "{command}: the sandbox and the injection layer disagree"
             );
-            let _ = claude;
         }
 
         // A Shell tab, through the real builder: no harness, therefore never
@@ -6291,14 +6314,65 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             ..Default::default()
         }));
         let dir = std::env::temp_dir();
-        if let Ok(spec) =
-            build_launch_spec(TabId::Shell("shell-1".into()), &s, &dir, &[])
-        {
+        if let Ok(spec) = build_launch_spec(TabId::Shell("shell-1".into()), &s, &dir, &[]) {
             assert!(
                 spec.harness.is_none(),
                 "a Shell tab must never be an agent seam"
             );
         }
+    }
+
+    /// **The production-surface guard the fixture above is not.**
+    ///
+    /// If `harness_of` ever returned `None` for a real AI tab on some platform,
+    /// `PtyManager::start` would skip `sandbox::tabs::plan_tab` entirely — so
+    /// that platform would get neither a boundary nor the loud skip row that is
+    /// supposed to say why, which is exactly the silent degradation V33 decision
+    /// 5 forbids. A hand-spelled fixture cannot catch that; the shipped defaults
+    /// can.
+    ///
+    /// Runs on every platform and reads the REAL default tab list, so a future
+    /// default whose command is platform-conditional (or a fourth harness added
+    /// without a grant table) fails here rather than in the field.
+    #[test]
+    fn every_default_ai_tab_carries_a_harness_on_every_platform() {
+        use crate::settings::{default_ai_tab, AiTabId};
+        // `Settings::default().tabs` is EMPTY — the reserved builtins are
+        // materialized by the integrity check from this factory, so the factory
+        // is what "the shipped defaults" means here.
+        let mut seen = 0usize;
+        for id in [AiTabId::Claude, AiTabId::ClaudeLocal, AiTabId::OpenCode] {
+            // Exhaustive on purpose: a FOURTH reserved AI builtin stops this
+            // test compiling until someone decides which harness it is and
+            // whether `sandbox::tabs` has a grant table for it.
+            match id {
+                AiTabId::Claude | AiTabId::ClaudeLocal | AiTabId::OpenCode => {}
+            }
+            let TabConfig::AiTool(cfg) = default_ai_tab(id) else {
+                panic!("{} is not an AI-tool tab", id.as_str());
+            };
+            seen += 1;
+            assert!(
+                harness_of(&cfg.command).is_some(),
+                "the default AI tab `{}` (command `{}`) carries no harness on {} — it would \
+                 spawn with NO sandbox and NO skip row explaining why",
+                cfg.id,
+                cfg.command,
+                std::env::consts::OS
+            );
+            // A default tab's command must be a bare program name. The moment a
+            // default ships a path-shaped command, this seam's answer becomes
+            // platform-specific — which is precisely how the fixture above once
+            // went green on Windows and red on Linux.
+            assert!(
+                !cfg.command.contains('/') && !cfg.command.contains('\\'),
+                "the default AI tab `{}` ships a path-shaped command (`{}`); harness detection \
+                 is `Path::file_stem`-based and a hardcoded separator does not travel",
+                cfg.id,
+                cfg.command
+            );
+        }
+        assert_eq!(seen, 3, "this test read nothing useful");
     }
 
     /// V30 Phase A: the channel registration flag is emitted for a Claude tab

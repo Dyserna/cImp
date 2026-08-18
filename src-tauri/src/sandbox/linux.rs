@@ -641,6 +641,83 @@ fn cached_probe() -> &'static Result<Probe, String> {
     PROBE.get_or_init(probe)
 }
 
+// ── how a live test behaves on a kernel that cannot sandbox ─────────────────
+
+/// The environment variable by which a runner **promises** that this machine
+/// can sandbox. Set by the `test-linux` job in `.github/workflows/tests.yml`.
+#[cfg(test)]
+pub(crate) const EXPECT_LANDLOCK_VAR: &str = "CIMP_EXPECT_LANDLOCK";
+
+/// The skip-or-fail decision and the text that goes with it, as a pure
+/// function: `Ok` is the line a skip prints, `Err` is the message a broken
+/// promise panics with.
+///
+/// Split out from [`skip_or_fail`] for the reason `spawn_ledger`'s
+/// `audit_against` is split out from its tripwire: **a tripwire whose failure
+/// path is never exercised is an assumption, not a test.** On the CI runner the
+/// promise is kept, so the panic branch never fires there — and would never
+/// fire anywhere until the day it matters, which is far too late to discover
+/// that the message was wrong or the condition inverted. Being pure, it is
+/// tested in both directions on every platform, including this Windows dev box
+/// where no Landlock exists at all.
+#[cfg(test)]
+pub(crate) fn skip_or_fail_verdict(promised: bool, test: &str, reason: &str) -> Result<String, String> {
+    if promised {
+        return Err(format!(
+            "{EXPECT_LANDLOCK_VAR} is set, so this environment promised a kernel with usable \
+             Landlock — but the ABI probe says: {reason}.\n`{test}` therefore verified NOTHING. \
+             Either the runner/container lost Landlock (fix the environment), or this machine \
+             genuinely cannot sandbox and the promise must be withdrawn by removing \
+             {EXPECT_LANDLOCK_VAR} from that job's `env:` in .github/workflows/tests.yml — in a \
+             diff someone reviews, never by letting a skip go on passing as a pass."
+        ));
+    }
+    Ok(format!(
+        "SKIPPED `{test}` (no usable Landlock on this kernel): {reason}\n  \
+         Set {EXPECT_LANDLOCK_VAR}=1 to make this a failure instead of a skip."
+    ))
+}
+
+/// What a live test does when the kernel has no usable Landlock — one policy,
+/// in one place, because two copies of it would drift and only one of them
+/// would be the one that mattered.
+///
+/// Lives at module level rather than inside `mod tests` because the sandbox
+/// layer's own `plan()` test needs it too, and a second copy over there is
+/// exactly the drift this function exists to prevent.
+///
+/// # Why a `println!` alone was not enough
+///
+/// That was the first shape of this, and it was a quality signal with no
+/// consumer. `cargo test` **captures the stdout of passing tests**, so in a CI
+/// log a skip and a genuinely exercised pass are byte-identical: `test … ok`.
+/// The Landlock tests would have gone on reporting green forever if a runner
+/// image, a container flag or a kernel `lsm=` list ever dropped Landlock —
+/// which is the precise regression they exist to catch.
+///
+/// So the skip is conditional on who is asking:
+///
+/// * [`EXPECT_LANDLOCK_VAR`] set ⇒ the environment PROMISED a Landlock kernel
+///   and did not deliver. That is a broken promise about the test environment,
+///   not a missing feature, and it **panics** — a red run, visible without
+///   anyone having to read the log.
+/// * unset ⇒ a developer's laptop, an old kernel, a container. Print and skip,
+///   which is the honest answer there.
+///
+/// The variable is checked rather than "am I on CI?", because CI is not the
+/// claim being made. A local `CIMP_EXPECT_LANDLOCK=1 cargo test` is a perfectly
+/// good way to demand the strict behaviour, and a future runner that genuinely
+/// cannot sandbox is opted out by editing one line of YAML — deliberately, in a
+/// diff someone reviews, rather than by a green run nobody questioned.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn skip_or_fail(test: &str, reason: &str) {
+    let promised = std::env::var_os(EXPECT_LANDLOCK_VAR).is_some();
+    match skip_or_fail_verdict(promised, test, reason) {
+        Ok(note) => println!("{note}"),
+        Err(broken_promise) => panic!("{broken_promise}"),
+    }
+}
+
 /// The Landlock half of [`super::posture`]: what this kernel is actually
 /// enforcing, in the row detail beside every confirmation and every denial.
 ///
@@ -1148,18 +1225,98 @@ mod tests {
         assert!(note.contains("NOT confined"), "{note}");
     }
 
+    /// **The skip policy, in both directions, on every platform.**
+    ///
+    /// The panic branch is the one that will never fire on a healthy CI runner,
+    /// which is exactly why it is tested here rather than trusted: the day it
+    /// does fire is the day someone needs its message to be right. Runs on this
+    /// Windows dev box too, where no Landlock exists at all — the policy is
+    /// text, and text is reviewable anywhere.
+    #[test]
+    fn a_broken_landlock_promise_fails_and_an_unpromised_kernel_only_skips() {
+        // Promise kept? Not this function's business — it is asked only when
+        // the kernel came up short. Unpromised ⇒ a skip, and the note has to
+        // say how to make it strict, or nobody ever will.
+        let skip = skip_or_fail_verdict(false, "some_live_test", "ENOSYS")
+            .expect("an unpromised kernel must skip, not fail");
+        assert!(skip.starts_with("SKIPPED `some_live_test`"), "{skip}");
+        assert!(skip.contains("ENOSYS"), "{skip}");
+        assert!(skip.contains(EXPECT_LANDLOCK_VAR), "{skip}");
+
+        // Promised ⇒ a failure, and the message must carry the three things
+        // whoever reads that red run needs: which test verified nothing, what
+        // the kernel actually said, and where the promise is made so it can be
+        // withdrawn deliberately.
+        let broken = skip_or_fail_verdict(true, "some_live_test", "ENOSYS")
+            .expect_err("a broken promise must fail, not skip");
+        assert!(broken.contains("some_live_test"), "{broken}");
+        assert!(broken.contains("ENOSYS"), "{broken}");
+        assert!(broken.contains(EXPECT_LANDLOCK_VAR), "{broken}");
+        assert!(broken.contains("tests.yml"), "{broken}");
+        assert!(
+            broken.contains("verified NOTHING"),
+            "the message must say what was lost, not merely that a flag was set: {broken}"
+        );
+        // The two verdicts must not read alike — a skip that looks like a
+        // failure (or vice versa) is how the wrong one gets ignored.
+        assert!(!broken.starts_with("SKIPPED"), "{broken}");
+    }
+
+    /// The variable named in code is the variable the workflow **actively**
+    /// sets, in the **Linux** job. Spelled in two files, so a rename or a
+    /// deletion in one is a silent un-promising in the other — this is the
+    /// assertion that notices.
+    ///
+    /// # Why this is line-structured rather than a `contains`
+    ///
+    /// The first version of this test was `workflow.contains("CIMP_EXPECT_
+    /// LANDLOCK: '1'")`, and it PASSED against a workflow whose line had been
+    /// commented out — `# CIMP_EXPECT_LANDLOCK: '1'` contains that substring
+    /// too. Verified by actually commenting the line and re-running, which is
+    /// the only way that class of hole is ever found. A tripwire that a
+    /// commented-out promise satisfies is the exact failure it was written to
+    /// prevent, one level up.
+    #[test]
+    fn the_promise_variable_is_actively_set_by_the_linux_job() {
+        assert_eq!(EXPECT_LANDLOCK_VAR, "CIMP_EXPECT_LANDLOCK");
+        let workflow = include_str!("../../../.github/workflows/tests.yml");
+        // Scope to the Linux job: the promise protects the LINUX live tests, so
+        // the same line sitting in the Windows job's `env:` would be worthless
+        // and must not satisfy this.
+        let linux_job = workflow
+            .split("\n  test-linux:")
+            .nth(1)
+            .expect("tests.yml must still define a `test-linux` job");
+        // `lines()` is CRLF-safe (it strips the trailing \r), and `trim` covers
+        // the rest — the Windows runner checks this file out with CRLF.
+        let actively_set = linux_job.lines().any(|line| {
+            let t = line.trim();
+            !t.starts_with('#') && t.starts_with(&format!("{EXPECT_LANDLOCK_VAR}:"))
+        });
+        assert!(
+            actively_set,
+            "the `test-linux` job must ACTIVELY set {EXPECT_LANDLOCK_VAR} (not commented out), \
+             or the Landlock live tests silently go back to passing when they skip on a runner \
+             that lost Landlock"
+        );
+    }
+
     // ── the live half (Linux only) ─────────────────────────────────────────
     //
     // These need a kernel with Landlock. On a machine (or container) without
-    // it they SKIP LOUDLY rather than passing: a sandbox test that silently
-    // reports success on a kernel that cannot sandbox anything is the
-    // vacuous-canary shape this project has been burned by before.
+    // it they skip rather than passing outright — but *how* they skip is the
+    // point, see [`skip_or_fail`]: a sandbox test that silently reports success
+    // on a kernel that cannot sandbox anything is the vacuous-canary shape this
+    // project has been burned by before.
 
+    /// Prepare a real boundary, or answer `None` after [`skip_or_fail`] has
+    /// decided whether "no Landlock here" is a skip or a failure. `test` is the
+    /// caller's own name so the message names the test that verified nothing.
     #[cfg(target_os = "linux")]
-    fn live_prepare(root: &Path, program: &Path) -> Option<Prepared> {
+    fn live_prepare(test: &str, root: &Path, program: &Path) -> Option<Prepared> {
         match cached_probe() {
             Err(e) => {
-                println!("SKIPPED (no Landlock on this kernel): {e}");
+                skip_or_fail(test, e);
                 None
             }
             Ok(_) => {
@@ -1205,7 +1362,12 @@ mod tests {
         std::fs::write(outside.join("secret.txt"), b"SECRET").unwrap();
 
         let shell = Path::new("/bin/sh");
-        let Some(prepared) = live_prepare(&root, shell) else {
+        let Some(prepared) = live_prepare(
+            "a_confined_child_reads_inside_the_root_and_is_denied_outside_it",
+            &root,
+            shell,
+        ) else {
+            let _ = std::fs::remove_dir_all(&base);
             return;
         };
         let base_env = super::super::child_env::minimal_env(&|k| std::env::var_os(k));
@@ -1286,11 +1448,16 @@ mod tests {
     fn the_posture_note_states_the_network_truth() {
         let note = posture_note(false);
         assert!(note.to_ascii_lowercase().contains("landlock"), "{note}");
-        if cached_probe().is_ok() {
-            assert!(
+        // The `Err` arm is a skip on a kernel without Landlock — but a SILENT
+        // one would leave this test green while asserting only that the word
+        // "landlock" appears in an "unavailable" string, which is not the claim
+        // it is here to make.
+        match cached_probe() {
+            Err(e) => skip_or_fail("the_posture_note_states_the_network_truth", e),
+            Ok(_) => assert!(
                 note.contains("UDP") || note.contains("below ABI 4"),
                 "the note must state which network confinement this kernel gives: {note}"
-            );
+            ),
         }
     }
 }

@@ -7286,6 +7286,15 @@
             rather than failing.
           </small>
           <small class="hint down">
+            Tools that need a runtime — Python, Node, a JRE, the .NET SDK, Go,
+            cargo — get that runtime's own directories granted automatically,
+            and their caches are redirected into
+            <code>.cimp/sandbox-cache/</code> inside the project, because the
+            project is the only place a sandboxed tool may write. When a runtime
+            is needed but cannot be located, the tool still runs and Events says
+            which piece was missing rather than leaving you a silent failure.
+          </small>
+          <small class="hint down">
             Some paths are refused here on purpose: credential directories
             (<code>.ssh</code>, <code>.aws</code>, <code>.gnupg</code>, the
             Windows credential stores), your user-profile root, a drive root and

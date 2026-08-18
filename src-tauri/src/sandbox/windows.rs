@@ -707,7 +707,7 @@ pub async fn prepare(
     let hints = hints.clone();
     let root = root.to_path_buf();
     // The child's base environment, owned so the blocking closure can hold it.
-    // It is read (never written) by the [`super::toolchain_state`] rule, which
+    // It is read (never written) by the [`super::RUNTIME_PROFILES`] rules, which
     // needs the pointers the child will actually see rather than cImp's own.
     let env: Vec<(String, OsString)> = env
         .iter()
@@ -740,62 +740,66 @@ fn prepare_blocking(
     if grant_dir(root, container.as_psid(), FULL)? {
         granted.push(format!("{} (read+write)", root.display()));
     }
-    // A program's own directory, plus the interpreter root behind it when the
-    // directory is a launcher directory (`…\Scripts\tool.exe`) — see
-    // [`super::interpreter_root`] for the convention and the live failure that
-    // named it — and, since 2026-08-18, the toolchain STATE directories behind
-    // it ([`super::toolchain_state`]): the engine redirects HOME/USERPROFILE
-    // into the sandbox root, so a tool whose state pointer is *unset* resolves
-    // it against that empty scratch, and one whose pointer IS set names a
-    // directory the container was never granted. Every grant here is RX and
-    // every one is recorded; each names why it is wider than "the program's
+    // A program's own directory, plus whatever the RUNTIME behind it needs —
+    // the interpreter root behind a `…\Scripts\tool.exe` stub, a rustup shim's
+    // two homes, the Node runtime a `node_modules\.bin` shim starts, a JDK's
+    // runtime image. See [`super::RUNTIME_PROFILES`] for the table and the
+    // measurements behind each row; the invariant it exists for is that this
+    // engine redirects HOME/USERPROFILE into the sandbox root, so a runtime
+    // whose state pointer is *unset* resolves it against that empty scratch and
+    // one whose pointer IS set names a directory the container was never
+    // granted. Every grant here is RX and every one is recorded; each names
+    // which runtime asked for it and why it is wider than "the program's
     // directory".
-    let mut state_env: Vec<(String, OsString)> = Vec::new();
+    let mut runtimes: Vec<super::RuntimeMatch> = Vec::new();
+    // The composed child environment first, cImp's own second — see
+    // [`super::Machine::env`] for why both halves are needed (the child's copy
+    // is the C2 ceiling, and most runtime pointers are deliberately not on it).
     let lookup = |name: &str| -> Option<OsString> {
         env.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var_os(name))
     };
-    let mut grant_program_dir = |install: &Path, why: &str| -> Result<(), String> {
-        if grant_dir(install, container.as_psid(), RX)? {
-            granted.push(if why.is_empty() {
-                format!("{} (read+execute)", install.display())
-            } else {
-                format!("{} (read+execute, {why})", install.display())
-            });
-        }
-        if let Some(interp) = super::interpreter_root(install) {
-            if grant_dir(interp, container.as_psid(), RX)? {
-                granted.push(format!(
-                    "{} (read+execute, the interpreter root behind {})",
-                    interp.display(),
-                    install.display()
-                ));
+    let is_dir = |p: &Path| p.is_dir();
+    let machine = super::Machine {
+        env: &lookup,
+        is_dir: &is_dir,
+    };
+    let mut grant_program = |program: &Path, why: &str| -> Result<(), String> {
+        if let Some(install) = program.parent() {
+            if grant_dir(install, container.as_psid(), RX)? {
+                granted.push(if why.is_empty() {
+                    format!("{} (read+execute)", install.display())
+                } else {
+                    format!("{} (read+execute, {why})", install.display())
+                });
             }
         }
-        for state in super::toolchain_state(install, &lookup) {
-            // A pointer to a directory that does not exist is not a grant and
-            // not an override: `RUSTUP_HOME` is derived from a convention, and
-            // stamping (or naming) a path the user never created would be cImp
-            // inventing state rather than reaching the state that is there.
-            if !state.dir.is_dir() {
-                continue;
+        for m in super::runtime_needs(program, &machine) {
+            for g in &m.needs.grants {
+                if grant_dir(&g.dir, container.as_psid(), RX)? {
+                    granted.push(format!(
+                        "{} (read+execute, {} — for the {} runtime behind {})",
+                        g.dir.display(),
+                        g.why,
+                        m.runtime,
+                        program.display()
+                    ));
+                }
             }
-            if grant_dir(&state.dir, container.as_psid(), RX)? {
-                granted.push(format!(
-                    "{} (read+execute, {} for {})",
-                    state.dir.display(),
-                    state.why,
-                    install.display()
-                ));
+            // A detected runtime whose needs cannot ALL be met is a row, never
+            // a silence — and never a failure either: the child still runs,
+            // still sandboxed, and this is what explains it if it then dies
+            // without a word.
+            for gap in &m.needs.gaps {
+                super::record_runtime_gap(seam, root, m.runtime, &gap.what, gap.why);
             }
-            state_env.push((state.env.to_string(), state.dir.as_os_str().to_os_string()));
+            runtimes.push(m);
         }
         Ok(())
     };
-    if let Some(install) = program.parent() {
-        grant_program_dir(install, "")?;
-    }
+    grant_program(program, "")?;
     // Grant inference for a seam whose spawned program is not the program that
     // does the work: `run_check` spawns `cmd.exe` (which needs no grant — it
     // lives under `System32`, where Windows already gives ALL APPLICATION
@@ -806,9 +810,7 @@ fn prepare_blocking(
     // that then cannot start surfaces as a DENIAL row rather than a silent
     // unsandboxed retry.
     for extra in &hints.programs {
-        if let Some(install) = extra.parent() {
-            grant_program_dir(install, "inferred from the check command")?;
-        }
+        grant_program(extra, "inferred from the check command")?;
     }
     // Write grants the seam asked for — cImp-owned scratch a tool is handed an
     // absolute path into (today: the audit runner's SARIF report directory).
@@ -891,22 +893,34 @@ fn prepare_blocking(
     let drive_root = drive.drive_root();
 
     // Redirect scratch + home inside the mapped root so a child that writes
-    // config/temp lands in the one writable place (and getcwd stays shallow).
-    let mut env_overrides = Vec::new();
-    for name in ["TEMP", "TMP"] {
-        env_overrides.push((name.to_string(), drive_root.as_os_str().to_os_string()));
+    // config/temp lands in the one writable place (and getcwd stays shallow),
+    // then the runtime pointers AFTER that redirect — the order is the
+    // contract, and it lives in [`super::compose_env_overrides`] as a pure
+    // function so it has a test on both platforms rather than four lines in the
+    // middle of a Win32 routine no Linux run ever compiles.
+    let env_overrides = super::compose_env_overrides(&drive_root, &runtimes);
+
+    // Create every redirected scratch directory before the child starts.
+    // Pointing a runtime at a directory that does not exist is not the same as
+    // giving it a scratch: `GOTMPDIR` is the sharp case — the go command calls
+    // `MkdirTemp` INSIDE it and does not create the parent, so an absent
+    // directory fails the build with an error that says nothing about the
+    // sandbox. The others (`GOCACHE`, the npm/pip caches, `DOTNET_CLI_HOME`)
+    // create themselves, so this is belt-and-braces for them and load-bearing
+    // for Go. Best-effort by design, exactly like `tabs::plan_tab`'s TEMP:
+    // these paths are under the project root, which is the one place the child
+    // may write, so a failure here means the root itself is unwritable — and
+    // that surfaces as a real denial the moment the child runs, with a better
+    // message than anything this line could produce.
+    for (name, value) in &env_overrides {
+        // Only the redirected ones: HOME/TEMP point at the drive root (which
+        // exists), and `Dir` pointers name real state dirs we just granted.
+        if std::path::Path::new(value).starts_with(&drive_root) && value != drive_root.as_os_str() {
+            if let Err(e) = std::fs::create_dir_all(value) {
+                tracing::debug!(%name, error = %e, "sandbox: could not pre-create a scratch dir");
+            }
+        }
     }
-    for name in ["HOME", "USERPROFILE"] {
-        env_overrides.push((name.to_string(), drive_root.as_os_str().to_os_string()));
-    }
-    // AFTER the home redirect, deliberately: these are the pointers that
-    // redirect would otherwise break (a toolchain resolving `%USERPROFILE%\
-    // .cargo` inside the sandbox root finds nothing), and every one of them
-    // names a directory that was just granted read+execute above. Same
-    // last-writer-wins composition the seams apply, so a seam that forces one
-    // of these itself still loses to the engine — which is correct: the engine
-    // is the half that knows what the container can reach.
-    env_overrides.extend(state_env);
 
     Ok(Prepared {
         container,

@@ -160,6 +160,76 @@ authoritative, versioned (manifest schema version validated at load),
 The category layer appears in this spec only to state that it carries none of
 the above.
 
+### PROPOSAL (2026-08-19, not yet approved) — the sandbox fields of the manifest
+
+Raised by the V33 live battery, which measured what actually happens when a
+real tool runs inside the OS sandbox. **Not a locked decision; approve, amend
+or drop.** Detail and evidence: `MILESTONE-V33-sandboxing.md`'s rc.9
+corrections block and #72.
+
+**The finding that motivates it.** Of the 14 built-in audit tools, 7 are
+single static binaries and work sandboxed today with only their own directory
+granted; the other 7 need a runtime (Python, Node, a JRE, the .NET SDK, cargo)
+and fail without its install tree, its state directories, or both. V33 now
+carries a `RuntimeProfile` table that INFERS this from the resolved program.
+Inference is the right default and the wrong contract for a plugin ecosystem:
+cImp cannot infer a runtime it has never heard of, and the ratio worsens as
+soon as third parties write tools (people write scanners in Python and Node).
+
+**Proposed manifest fields, per tool:**
+
+1. **`runtime: none | python | node | java | dotnet | go | rust | auto`** —
+   selects a cImp-owned profile that supplies the grants and env pointers that
+   runtime needs. `none` IS the "single static binary" statement; `auto` keeps
+   V33's inference. **Deliberately NOT a `static | runtime-dependent`
+   boolean:** that shape carries no actionable information (it never says
+   *which* runtime), it can contradict a sibling field, and it mis-classifies a
+   real third case — a project-local tool (eslint, knip resolving from
+   `node_modules/.bin`) is runtime-dependent yet needs no grant at all, because
+   its payload already lives inside the project root the sandbox grants.
+2. **`sandbox: required | optional | unsupported`** — a DIFFERENT question:
+   not what the tool needs, but what cImp does when it cannot provide it.
+   `unsupported` runs the tool outside the boundary as an informed user choice
+   with a visible row, instead of the mysterious failure V33 shipped before
+   these rows existed. The two fields are orthogonal: a Python tool may be
+   perfectly sandboxable; a static binary may need egress and declare
+   `unsupported`.
+3. **`extra_grants: [path]` (optional escape hatch)** — for a tool whose needs
+   no profile covers. Constraints, all three load-bearing: shown to the user at
+   enable time as a permission (the phone-app pattern), screened by V33's
+   existing `extra_grant_refusal` rules (credential dirs, user-profile root,
+   volume roots, `%SystemRoot%` are refused with a row, remaining grants still
+   apply), and **global scope only** — see the warning below.
+
+**Why a closed enum rather than free-form runtime paths.** A manifest is
+attacker-controlled input once plugins are installable. `runtime: python` is a
+*request* that cImp stamp an RX ACE on a runtime tree; that is safe only while
+the value selects from a table cImp owns, so the worst a lying manifest
+achieves is a grant the user can see named at enable time. Free-form paths
+would make the manifest a grant-widening primitive — which is why
+`extra_grants` is permission-prompted and screened rather than trusted.
+
+**Declaration and inference cross-check.** Keep V33's detection as the `auto`
+implementation *and* as a canary: when a manifest declares one runtime and
+detection sees another, surface the mismatch rather than silently trusting
+either side (V35's leading-indicator discipline; a stale declaration is
+exactly the drift that discipline exists to catch).
+
+**⚠ Security note on decision 10 (configuration scoping), independent of this
+proposal.** Decision 10 places tool paths and CLI parameters in the
+`.cimp/config.json` overlay. That file lives inside the project root, which
+the sandbox grants FULL — so anything running in the project, including a
+compromised model, can write it. Combined with this spec's own principle that
+"manifest + path + argv is the trust unit", an overlay-settable binary path is
+a code-execution primitive: repoint a tool's `path` and cImp runs it. V33 hit
+the identical hole (a project overlay could switch the sandbox off, or name
+`~/.ssh` as an extra grant) and closed it by making the whole `sandbox` block
+overlay-banned and machine-global, with a write-through so the settings still
+save. **Recommendation: binary paths, and any field that widens the boundary,
+must be global/machine scope only — never overlay-settable.** Variable values
+and CLI parameters can stay project-scoped. Cheaper to decide now than to
+retrofit after authors depend on per-project paths.
+
 ## Registry semantics
 
 - Registry entry = plugin-declared tool + user state: executable path

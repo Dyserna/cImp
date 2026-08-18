@@ -5,6 +5,42 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The other half of the sandbox inheritance race: cImp-visible spawns can no
+  longer overlap the sandbox's inheritable window.** The rc.5 fix below closed
+  the direction where the *sandboxed* child inherited a stranger's handles (a
+  `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly three handles). It could
+  not close the other direction from inside the sandbox: while the sandbox's
+  pipe write-ends are marked inheritable — which they must be, for the few
+  syscalls around its own `CreateProcessW` — **any** other spawn happening in
+  that instant with `bInheritHandles` captures a copy, and a copy in a
+  stranger's process is what makes the reader wait for an EOF that never
+  arrives. The standard library already solves this for itself with a private,
+  process-wide create-process lock, but the lock is not reachable from user
+  code, and cImp's two most important spawns do not go through `std` at all:
+  the sandbox's bespoke `CreateProcessW` (the only way to attach an
+  AppContainer capability list on stable Rust) and the PTY seam, where
+  portable-pty builds its own `STARTUPINFOEX`. So cImp now has a lock it *can*
+  take. A new `spawn_gate` module holds one process-wide read/write lock that
+  **every** spawn in the app passes through — shared for ordinary spawns, which
+  therefore stay fully concurrent with each other, and exclusive for the
+  sandbox, which takes the write lock around a window narrowed to three
+  handle-flips, the spawn, and closing its copies again (a few syscalls, low
+  single-digit milliseconds). All sixteen spawn seams were routed onto it: the
+  shadow-checkpoint `git` runner, `run_command`, `run_check`, the audit
+  scanners, `llama-server`, the stdio MCP servers, the harness probes, the
+  reveal-in-folder commands, the process-tree reaper, the OS opener and every
+  AI tab's PTY child. A source-scanning test refuses any future spawn that does
+  not, and is anchored to `spawn_ledger` so the two cannot drift apart.
+  **Honest residual:** spawns made by third-party code deep inside libraries
+  (the webview host, plugins) are outside the gate, because gating them would
+  mean gating code cImp does not call. For that sliver the defence is unchanged
+  — the bounded drains from the first fix, which degrade one capture instead of
+  wedging the worker.
+
 ## [0.52.0-rc.5] — 2026-08-18
 
 ### Fixed

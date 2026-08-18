@@ -40,8 +40,16 @@ pub(crate) fn run_git(root: &Path, args: &[&str]) -> AppResult<String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    let output = cmd
-        .output()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    //
+    // Split into spawn-then-wait rather than wrapped as `output()`, because
+    // `std`'s `output()` is synchronous end to end: wrapping it would hold the
+    // gate for the whole run of `git log` on a large repo, and a shared holder
+    // that never lets go is how a "gate" becomes a stall. This is exactly what
+    // `output()` does internally — every stdio slot is set explicitly above, so
+    // its pipe defaults never apply — with the guard scoped to the spawn.
+    let output = crate::spawn_gate::spawn_std(&mut cmd)
+        .and_then(|child| child.wait_with_output())
         .map_err(|e| AppError::Graph(format!("git {}: {e}", args.join(" "))))?;
     if !output.status.success() {
         return Err(AppError::Graph(format!(

@@ -108,7 +108,8 @@ pub async fn kill_tree(child: &mut tokio::process::Child) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         cmd.creation_flags(CREATE_NO_WINDOW);
-        if let Ok(mut tk) = cmd.spawn() {
+        // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+        if let Ok(mut tk) = crate::spawn_gate::spawn_tokio(&mut cmd) {
             let _ = tk.wait().await;
         }
     }
@@ -148,7 +149,8 @@ pub fn kill_tree_blocking(child: &mut std::process::Child) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .creation_flags(CREATE_NO_WINDOW);
-        if let Ok(mut tk) = cmd.spawn() {
+        // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+        if let Ok(mut tk) = crate::spawn_gate::spawn_std(&mut cmd) {
             let _ = tk.wait();
         }
     }

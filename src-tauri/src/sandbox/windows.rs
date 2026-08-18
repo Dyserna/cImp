@@ -709,13 +709,20 @@ fn spawn_blocking_inner(
     // ── pipes ──
     let (out_rd, out_wr) = make_pipe()?;
     let (err_rd, err_wr) = make_pipe()?;
-    // Read ends must NOT be inherited; write ends must be. (Still required with
-    // the handle list below: that attribute narrows what is inherited, it does
-    // not make a non-inheritable handle inheritable.)
+    // NOTHING is inheritable yet — not even the write ends. Marking a handle
+    // inheritable is a PROCESS-WIDE fact (it is a flag on the handle, and
+    // `bInheritHandles` reads every such flag), so the interval in which these
+    // are inheritable is the interval in which any other cImp spawn could
+    // capture a copy. That interval is opened, used and closed inside the
+    // `spawn_gate::exclusive()` scope further down, and it is a handful of
+    // syscalls wide.
+    //
+    // The read ends are never inheritable at all; the explicit `false` says so
+    // rather than relying on `CreatePipe`'s default with null attributes.
     set_inherit(out_rd, false);
     set_inherit(err_rd, false);
-    set_inherit(out_wr, true);
-    set_inherit(err_wr, true);
+    set_inherit(out_wr, false);
+    set_inherit(err_wr, false);
     // Stdin is the NUL device rather than `INVALID_HANDLE_VALUE`. Two reasons:
     // a pseudo-handle cannot appear in the handle list below (and every handle
     // named in `STARTUPINFO`'s std slots must), and NUL is what "no stdin" has
@@ -796,12 +803,16 @@ fn spawn_blocking_inner(
     //  * OUR child inheriting some other spawn's in-flight handles — closed
     //    here, exactly, by naming the three handles it may have;
     //  * some OTHER spawn inheriting the write ends below before we close them
-    //    — NOT closable from this side (the handles must be inheritable during
-    //    our own `CreateProcessW`, and Windows has no per-spawn scoping for
-    //    that). That leak is what wedged the first live sandboxed run: the
-    //    write end stayed open in a stranger's process, our reader never saw
-    //    EOF, and the parent's `join()` never returned. Bounding the drains
-    //    (see [`collect_drain`]) is the defence for that half.
+    //    — not closable with a handle list (the handles must be inheritable
+    //    during our own `CreateProcessW`, and Windows has no per-spawn scoping
+    //    for that), and closed instead by [`crate::spawn_gate`]: every spawn
+    //    cImp makes takes that gate SHARED, this one takes it EXCLUSIVELY, and
+    //    the inheritable window below is entirely inside the exclusive scope.
+    //    That leak is what wedged the first live sandboxed run: the write end
+    //    stayed open in a stranger's process, our reader never saw EOF, and the
+    //    parent's `join()` never returned. Spawns made by third-party code deep
+    //    inside libraries are still outside the gate, so bounding the drains
+    //    (see [`collect_drain`]) remains the defence for that residue.
     //
     // The array must outlive `CreateProcessW` — same lifetime discipline as
     // `sec_caps` — so it is a plain local declared before the call.
@@ -841,28 +852,62 @@ fn spawn_blocking_inner(
     // CREATE_UNICODE_ENVIRONMENT (0x400) | EXTENDED_STARTUPINFO_PRESENT |
     // CREATE_NO_WINDOW (0x0800_0000).
     let flags = EXTENDED_STARTUPINFO_PRESENT | 0x0000_0400 | 0x0800_0000;
-    // SAFETY: cmdline_w is a mutable, null-terminated wide buffer (CreateProcessW
-    // may write to it); env/cwd are valid; startup info and attribute list are
-    // populated; handle inheritance is on.
-    let ok = unsafe {
-        CreateProcessW(
-            null(),
-            cmdline_w.as_mut_ptr(),
-            null(),
-            null(),
-            1,
-            flags,
-            env_block.as_mut_ptr() as *mut c_void,
-            cwd_w.as_ptr(),
-            &siex.StartupInfo,
-            &mut pi,
-        )
+
+    // ── the exclusive window ──────────────────────────────────────────────
+    //
+    // Everything above (attribute list, env block, startup info) and everything
+    // below (guard_pid, drains, waits) is deliberately OUTSIDE this scope. What
+    // is inside it is only what has to be: the three handle flips, the spawn,
+    // and closing our copies again — a few syscalls, single-digit milliseconds.
+    // The write lock stalls every other spawn in the app for exactly as long as
+    // this scope lasts, so widening it buys no correctness and costs throughput
+    // everywhere else.
+    //
+    // **No other lock may be taken in here.** `RwLock` is not reentrant and the
+    // gate is process-wide: a spawn (or anything that could reach one) attempted
+    // from inside this scope deadlocks cImp against itself. The only calls
+    // present are `set_inherit`, `CreateProcessW`, `last_error` and `close_all`,
+    // all of them thin Win32 wrappers that take nothing.
+    let (ok, create_err) = {
+        let _spawn_window = crate::spawn_gate::exclusive();
+        // NOW the three handles the child may inherit become inheritable —
+        // with every other cImp spawn locked out. The handle list narrows what
+        // this child gets; the gate is what stops anyone else's child from
+        // getting it too.
+        set_inherit(nul, true);
+        set_inherit(out_wr, true);
+        set_inherit(err_wr, true);
+        // SAFETY: cmdline_w is a mutable, null-terminated wide buffer (CreateProcessW
+        // may write to it); env/cwd are valid; startup info and attribute list are
+        // populated; handle inheritance is on.
+        let ok = unsafe {
+            CreateProcessW(
+                null(),
+                cmdline_w.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                flags,
+                env_block.as_mut_ptr() as *mut c_void,
+                cwd_w.as_ptr(),
+                &siex.StartupInfo,
+                &mut pi,
+            )
+        };
+        // Read before `close_all`: `CloseHandle` is entitled to clobber the
+        // thread's last-error value, and so is the lock release at the end of
+        // this scope.
+        let create_err = last_error();
+        // The child owns the write ends now; close ours so EOF arrives when it
+        // exits — and so the window in which they are inheritable ends here,
+        // inside the guard, rather than at some later point where another
+        // spawn could see them.
+        close_all(&[nul, out_wr, err_wr]);
+        (ok, create_err)
     };
-    // The child owns the write ends now; close ours so EOF arrives when it exits.
-    close_all(&[nul, out_wr, err_wr]);
     if ok == 0 {
         close_all(&[out_rd, err_rd]);
-        return Err(format!("CreateProcessW failed ({})", last_error()));
+        return Err(format!("CreateProcessW failed ({create_err})"));
     }
 
     // Kill-on-close job membership (assign-after-spawn; hProcess pins the pid).
@@ -1051,13 +1096,18 @@ fn make_pipe() -> Result<(HANDLE, HANDLE), String> {
     Ok((rd, wr))
 }
 
-/// An inheritable read handle on the NUL device — the child's stdin.
+/// A read handle on the NUL device — the child's stdin.
 ///
 /// Replaces the `INVALID_HANDLE_VALUE` that used to sit in `hStdInput`: a
 /// pseudo-handle cannot appear in [`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`], and
 /// every handle named in `STARTUPINFO`'s std slots must. Opened by the PARENT
 /// (outside the container), so the child's own token never has to reach the
 /// device.
+///
+/// Returned NON-inheritable. It is flipped inheritable, used and closed inside
+/// the `spawn_gate::exclusive()` scope in [`spawn_blocking_inner`], together
+/// with the two pipe write ends — see the comment there for why the window has
+/// to be that narrow.
 fn open_nul() -> Result<HANDLE, String> {
     let name = wide_str("NUL");
     // SAFETY: name is a valid wide string; null security attributes and a null
@@ -1076,7 +1126,7 @@ fn open_nul() -> Result<HANDLE, String> {
     if h == INVALID_HANDLE_VALUE || h.is_null() {
         return Err(format!("opening NUL for the child's stdin failed ({})", last_error()));
     }
-    set_inherit(h, true);
+    set_inherit(h, false);
     Ok(h)
 }
 
@@ -1295,8 +1345,12 @@ mod tests {
 
     /// The child's stdin is a real device handle, not a pseudo-handle — the
     /// handle list requires it, and `Stdio::null` semantics want it.
+    ///
+    /// It comes back NON-inheritable by design: inheritability is granted for
+    /// the few syscalls inside the `spawn_gate::exclusive()` window and taken
+    /// away again there. (Renamed from `..._inheritable_handle` when that moved.)
     #[test]
-    fn nul_opens_as_a_real_inheritable_handle() {
+    fn nul_opens_as_a_real_device_handle() {
         let h = open_nul().expect("NUL must be openable");
         assert!(h != INVALID_HANDLE_VALUE && !h.is_null());
         close_all(&[h]);

@@ -342,7 +342,17 @@ fn note_opencode_version(command: &str) {
             // CREATE_NO_WINDOW, same convention as every spawned subprocess.
             cmd.creation_flags(0x0800_0000);
         }
-        let Ok(out) = cmd.output() else {
+        // The stdio `output()` would have chosen implicitly, written down: it
+        // spawns with stdin null and both output streams piped. Made explicit
+        // so this can go through the spawn gate as a *spawn* — wrapping the
+        // synchronous `output()` instead would hold the shared guard for the
+        // whole run of `opencode --version`, and a long shared hold blocks the
+        // sandbox's exclusive window (see `spawn_gate`).
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let Ok(out) = crate::spawn_gate::spawn_std(&mut cmd).and_then(|c| c.wait_with_output())
+        else {
             return;
         };
         // `opencode --version` prints a bare version (e.g. "1.4.2"); take the

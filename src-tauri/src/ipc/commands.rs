@@ -1356,12 +1356,13 @@ pub async fn detection_open_rules_folder() -> AppResult<()> {
             dir.display()
         )));
     }
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
     let result = if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(&dir).spawn()
+        crate::spawn_gate::spawn_std(std::process::Command::new("explorer").arg(&dir))
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&dir).spawn()
+        crate::spawn_gate::spawn_std(std::process::Command::new("open").arg(&dir))
     } else {
-        std::process::Command::new("xdg-open").arg(&dir).spawn()
+        crate::spawn_gate::spawn_std(std::process::Command::new("xdg-open").arg(&dir))
     };
     result
         .map(|_| ())
@@ -3349,12 +3350,13 @@ pub async fn content_open_folder() -> AppResult<()> {
             dir.display()
         )));
     }
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
     let result = if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(&dir).spawn()
+        crate::spawn_gate::spawn_std(std::process::Command::new("explorer").arg(&dir))
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&dir).spawn()
+        crate::spawn_gate::spawn_std(std::process::Command::new("open").arg(&dir))
     } else {
-        std::process::Command::new("xdg-open").arg(&dir).spawn()
+        crate::spawn_gate::spawn_std(std::process::Command::new("xdg-open").arg(&dir))
     };
     result
         .map(|_| ())

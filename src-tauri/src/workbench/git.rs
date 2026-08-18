@@ -243,8 +243,10 @@ async fn run_inner(
 
     let timeout_dur = call_timeout.unwrap_or(DEFAULT_TIMEOUT);
     let run_fut = async {
-        let mut child = cmd
-            .spawn()
+        // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+        // The guard lives entirely inside `spawn_tokio`, so nothing is held
+        // across the `.await`s below.
+        let mut child = crate::spawn_gate::spawn_tokio(&mut cmd)
             .map_err(|e| AppError::Workbench(format!("spawn git {}: {e}", args.join(" "))))?;
         // Drive the stdin write on a separate task so it runs CONCURRENTLY
         // with `wait_with_output` draining stdout/stderr. Writing all of stdin

@@ -737,8 +737,8 @@ async fn spawn_capture(
     // real work running and holding the pipe write ends.
     crate::procutil::own_process_group(&mut command);
 
-    let mut child = command
-        .spawn()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let mut child = crate::spawn_gate::spawn_tokio(&mut command)
         .map_err(|e| AppError::Checks(format!("failed to spawn check `{cmd}`: {e}")))?;
     // Backstop: reap this checker subprocess via the kill-on-job-close job if
     // cImp dies hard before `kill_on_drop` can fire.

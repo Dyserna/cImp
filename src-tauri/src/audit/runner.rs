@@ -1236,7 +1236,8 @@ async fn spawn_and_capture(
     // Windows. This is the seam the whole-tree kill was written for.
     crate::procutil::own_process_group(&mut cmd);
 
-    let mut child = match cmd.spawn() {
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let mut child = match crate::spawn_gate::spawn_tokio(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             return Capture {

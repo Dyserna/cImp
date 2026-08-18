@@ -224,7 +224,8 @@ async fn detect_tool(
     #[cfg(windows)]
     cmd.creation_flags(crate::procutil::CREATE_NO_WINDOW);
 
-    let child = match cmd.spawn() {
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let child = match crate::spawn_gate::spawn_tokio(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             return AuditDetectResult {

@@ -28,6 +28,7 @@ mod rustsrc;
 mod sandbox;
 mod settings;
 mod shell;
+mod spawn_gate;
 mod spawn_ledger;
 mod state;
 mod statusline;

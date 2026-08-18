@@ -1265,8 +1265,8 @@ async fn connect_stdio(
     // MCP server (CREATE_NO_WINDOW); output is captured over piped fds.
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let mut child = command
-        .spawn()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let mut child = crate::spawn_gate::spawn_tokio(&mut command)
         .map_err(|e| format!("spawn `{}`: {e}", cfg.command))?;
     // Backstop: reap this warm MCP-host server via the kill-on-job-close job
     // if cImp dies hard (kill_on_drop only covers a clean exit).

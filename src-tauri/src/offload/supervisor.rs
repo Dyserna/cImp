@@ -1106,8 +1106,8 @@ fn spawn_child(
     // CREATE_NO_WINDOW (0x0800_0000).
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
-    let mut child = command
-        .spawn()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let mut child = crate::spawn_gate::spawn_tokio(&mut command)
         .map_err(|e| AppError::Spawn(format!("llama-server: {e}")))?;
     // Backstop: assign to the kill-on-job-close job so the OS reaps this
     // VRAM-holding server even if cImp dies hard (crash / panic=abort /

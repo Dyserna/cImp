@@ -767,8 +767,8 @@ fn start_opencode_serve() -> Result<Serve, String> {
     }
     crate::procutil::own_process_group_std(&mut cmd);
 
-    let child = cmd
-        .spawn()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let child = crate::spawn_gate::spawn_std(&mut cmd)
         .map_err(|e| format!("`opencode serve` could not be spawned: {e}"))?;
     let serve = Serve {
         child,
@@ -1176,8 +1176,8 @@ fn claude_help() -> Result<String, String> {
     // `output()` reads both pipes to EOF, so there is no deadlock to bound —
     // but a hung child would hang the probe, so it is spawned and reaped with a
     // deadline rather than blocked on.
-    let mut child = cmd
-        .spawn()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    let mut child = crate::spawn_gate::spawn_std(&mut cmd)
         .map_err(|e| format!("`claude --help` could not be spawned: {e}"))?;
     let deadline = Instant::now() + HELP_TIMEOUT;
     loop {

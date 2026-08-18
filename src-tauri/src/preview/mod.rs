@@ -228,7 +228,13 @@ fn open_external(app: &AppHandle, url: &str) {
         );
         return;
     }
-    if let Err(e) = app.opener().open_url(url, None::<&str>) {
+    // Through the spawn gate (see `spawn_gate`): the `open` crate behind this
+    // plugin call spawns the OS handler, and a spawn cImp cannot see is still a
+    // spawn that can inherit the sandbox's pipe write-ends. `with_shared` is the
+    // shape for a spawn that happens inside a third-party call — the closure
+    // holds nothing but the call itself, and `open` detaches rather than waiting
+    // on the browser.
+    if let Err(e) = crate::spawn_gate::with_shared(|| app.opener().open_url(url, None::<&str>)) {
         warn!(url, error = %e, "preview: failed to open URL in the system browser");
     }
 }

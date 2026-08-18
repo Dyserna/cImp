@@ -576,8 +576,10 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // not outlive the timeout.
     crate::procutil::own_process_group(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    // This is the seam whose SANDBOXED twin takes the gate exclusively, so an
+    // ungated plain spawn here would be the exact race the gate exists to close.
+    let mut child = crate::spawn_gate::spawn_tokio(&mut cmd)
         .map_err(|e| format!("failed to spawn `{}`: {e}", args.command))?;
     // Backstop: reap this command subprocess via the kill-on-job-close job if
     // cImp dies hard before kill_on_drop can fire.

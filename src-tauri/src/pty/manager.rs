@@ -196,7 +196,12 @@ impl PtyManager {
         cmd.cwd(&spec.working_dir);
         apply_env(&mut cmd, &spec.env, &spec.env_remove);
 
-        let child = match pair.slave.spawn_command(cmd) {
+        // Through the spawn gate (see `spawn_gate`). portable-pty builds its own
+        // `STARTUPINFOEX` and calls `CreateProcessW` itself, so this spawn sits
+        // outside `std`'s private process-wide create-process lock entirely —
+        // which is half the reason the gate had to exist. `with_shared` wraps
+        // the third-party call and nothing else.
+        let child = match crate::spawn_gate::with_shared(|| pair.slave.spawn_command(cmd)) {
             Ok(c) => c,
             Err(e) => {
                 let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });

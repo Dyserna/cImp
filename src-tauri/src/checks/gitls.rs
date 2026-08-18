@@ -69,8 +69,18 @@ async fn run_git(root: &Path, args: &[&str]) -> AppResult<String> {
     #[cfg(windows)]
     cmd.creation_flags(crate::procutil::CREATE_NO_WINDOW);
 
-    let output = cmd
-        .output()
+    // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
+    //
+    // Spawn-then-wait rather than `output()`, so the gate is held across the
+    // spawn only and never across the `.await`. This is what `output()` does
+    // internally, minus one quirk: tokio's `output()` **unconditionally**
+    // re-points stdout AND stderr at pipes, overriding the `Stdio::null()`
+    // chosen for stderr above and then discarding what it captured. Doing it by
+    // hand makes the declared stdio the effective stdio; nothing this function
+    // returns changes, because git's stderr was thrown away either way.
+    let output = crate::spawn_gate::spawn_tokio(&mut cmd)
+        .map_err(|e| AppError::Checks(format!("git {}: {e}", args.join(" "))))?
+        .wait_with_output()
         .await
         .map_err(|e| AppError::Checks(format!("git {}: {e}", args.join(" "))))?;
     if !output.status.success() {

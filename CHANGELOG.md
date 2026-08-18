@@ -5,6 +5,40 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0-rc.9] — 2026-08-18
+
+### Added
+
+- **The OS sandbox now covers every model-reachable spawn seam, not just
+  `run_command`.** `run_check` and the audit scanners run their children inside
+  the same AppContainer, governed by the same `sandbox.enabled` switch, with
+  the same Events lane and the same wedge backstops. Checks keep their exact
+  shell semantics (the `cmd /C` tail is passed verbatim — CRT re-quoting would
+  corrupt commands containing quotes), grant inference resolves the check
+  command's first token via PATH, nested check `cwd`s map into the sandbox
+  drive correctly, and report-file audit tools (gitleaks, cppcheck,
+  dotnet-analyzers) get a scoped write grant on their `%TEMP%` scratch instead
+  of failing. Cancelling an audit terminates the sandboxed child promptly.
+- **V33 Phase B — AI-tool tabs can run inside the sandbox** (new
+  `Sandboxing → sandbox tabs` toggle, default off, effective with the master
+  switch; both are spawn-baked, so flipping them needs a fresh tab). Sandboxed
+  tabs ride a cImp-owned ConPTY spawn carrying the AppContainer identity;
+  terminal behavior is pinned identical to a plain tab. Each harness gets a
+  reviewed grant table for its own state (`~/.claude`, OpenCode's XDG dirs);
+  `~/.ssh` and the Credential Manager are deliberately not granted, network
+  egress is always on for tabs (an AI CLI without egress is a bricked tab),
+  and a sandboxed tab sees the project on a mapped drive — Claude keys its
+  per-project state under that identity. In-tab auto-update is refused by
+  design: the agent's own program image is read-only inside the boundary.
+- **V33 Phase D — Linux gets a real sandbox engine.** On Linux kernels with
+  Landlock (5.13+), `run_command`, `run_check` and audit children are confined
+  to the project root plus read-only system and toolchain paths, under the
+  same settings as Windows. With network off (ABI 4+), TCP is denied outright;
+  the UDP/DNS gap is stated in the rows rather than implied away. A kernel
+  without Landlock degrades loudly to a plain spawn — and a sandbox that fails
+  to apply refuses the run rather than running unconfined. CI now proves the
+  Landlock tests actually exercise (a silent skip turns the run red).
+
 ## [0.52.0-rc.8] — 2026-08-18
 
 ### Fixed

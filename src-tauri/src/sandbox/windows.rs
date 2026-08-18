@@ -455,16 +455,17 @@ impl Drop for DriveGuard {
 }
 
 /// The first free drive letter D..=Z not in use, as "X:".
-fn free_drive_letter() -> Option<String> {
+///
+/// `taken`: letters this process has already handed out but whose mapping the
+/// OS bitmask may not reflect yet. The caller passes the set in — `map_drive`
+/// already holds [`DRIVES`] when it calls this, so this function must never
+/// touch that lock itself. It used to, and the same-thread re-lock was a
+/// silent self-deadlock on `map_drive`'s cache-miss path: the first sandboxed
+/// spawn of an app run hung forever after the grant row, with no child, no
+/// timeout and nothing recorded (2026-08-18, rc.6 live).
+fn free_drive_letter(taken: &std::collections::HashSet<String>) -> Option<String> {
     // SAFETY: no args, returns a bitmask.
     let mask = unsafe { GetLogicalDrives() };
-    // Also avoid letters we've already handed out but whose subst the OS may
-    // not have reflected in the bitmask yet.
-    let taken: std::collections::HashSet<String> = DRIVES
-        .lock()
-        .ok()
-        .and_then(|m| m.as_ref().map(|m| m.values().map(|(l, _)| l.clone()).collect()))
-        .unwrap_or_default();
     for i in 3..26u32 {
         if mask & (1 << i) == 0 {
             let letter = format!("{}:", (b'A' + i as u8) as char);
@@ -487,7 +488,11 @@ fn map_drive(root: &Path) -> Result<DriveGuard, String> {
             letter: letter.clone(),
         });
     }
-    let letter = free_drive_letter().ok_or("no free drive letter for the sandbox root")?;
+    // The taken set comes from the guard this function already holds —
+    // `free_drive_letter` must not (re-)lock `DRIVES` itself, see its doc.
+    let taken: std::collections::HashSet<String> =
+        m.values().map(|(l, _)| l.clone()).collect();
+    let letter = free_drive_letter(&taken).ok_or("no free drive letter for the sandbox root")?;
     let letter_w = wide_str(&letter);
     let target = wide(root.as_os_str());
     // SAFETY: both valid wide strings; RAW_TARGET_PATH maps the letter to the
@@ -1252,11 +1257,41 @@ mod tests {
     #[test]
     fn free_drive_letter_is_plausible() {
         // Whatever it returns must be an unused X: form in D..=Z.
-        if let Some(l) = free_drive_letter() {
+        if let Some(l) = free_drive_letter(&Default::default()) {
             assert_eq!(l.len(), 2);
             assert!(l.ends_with(':'));
             let c = l.as_bytes()[0];
             assert!((b'D'..=b'Z').contains(&c), "got {l}");
+            // A letter this process has handed out but the OS bitmask does not
+            // reflect yet must not be handed out twice.
+            let taken: std::collections::HashSet<String> = [l.clone()].into();
+            if let Some(next) = free_drive_letter(&taken) {
+                assert_ne!(next, l);
+            }
+        }
+    }
+
+    /// The 2026-08-18 rc.6 wedge, pinned: `map_drive`'s cache-miss path called
+    /// `free_drive_letter`, which re-locked [`DRIVES`] while `map_drive` held
+    /// it — a same-thread self-deadlock that hung sandbox preparation forever
+    /// (grant row minted, then nothing: no child, no backstop, worker slot
+    /// pinned). The property under test is that `map_drive` RETURNS — mapping
+    /// success depends on the runner's privileges and is not asserted.
+    #[test]
+    fn map_drive_returns_instead_of_deadlocking() {
+        let dir = std::env::temp_dir().join("cimp-map-drive-regression");
+        let _ = std::fs::create_dir_all(&dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(map_drive(&d));
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            // A successful guard's drop removes the mapping again.
+            Ok(result) => drop(result),
+            Err(_) => panic!(
+                "map_drive did not return within 10s — the DRIVES self-deadlock is back"
+            ),
         }
     }
 

@@ -47,6 +47,19 @@ const SANDBOX_SETTLE_SLACK: Duration = Duration::from_secs(30);
 const SANDBOX_BACKSTOP: Duration =
     Duration::from_secs(TIMEOUT.as_secs() + SANDBOX_SETTLE_SLACK.as_secs());
 
+/// The caller-side backstop on sandbox *preparation* (2026-08-18, second
+/// incident of the same day). The first wedge taught us to bound
+/// `spawn_and_capture` — but preparation (profile creation, ACL grants, drive
+/// mapping) ran unbounded ahead of it on a blocking thread, and a deadlock in
+/// `map_drive` pinned the worker slot forever with the grant row as the only
+/// trace. Same rule as [`SANDBOX_BACKSTOP`]: a path whose only deadline lives
+/// inside itself has no deadline at all.
+///
+/// Generous, because a wrong elapse here refuses a healthy sandbox: first-time
+/// ACL stamps on a toolchain directory and AppContainer profile creation can
+/// take seconds each on a slow disk or with sluggish SID lookups.
+const PREPARE_BACKSTOP: Duration = Duration::from_secs(60);
+
 #[derive(Deserialize)]
 struct Args {
     /// Program to run (must match the allowlist by name).
@@ -524,7 +537,40 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
                 .collect()
         })
         .unwrap_or_default();
-    let plan = crate::sandbox::plan(&ctx.sandbox, &program, &cwd, &base_env).await;
+    let plan = match tokio::time::timeout(
+        PREPARE_BACKSTOP,
+        crate::sandbox::plan(&ctx.sandbox, &program, &cwd, &base_env),
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(_) => {
+            // Wedged BEFORE the spawn: the command was never attempted, and it
+            // must not fall back to a plain spawn — degrading the boundary
+            // silently is worse than refusing (decision 5, loudly).
+            crate::sandbox::record_event(
+                &cwd,
+                "wedged",
+                crate::sandbox::state_target("wedged", &program),
+                format!(
+                    "sandbox preparation for `{}` did not settle within {}s \
+                     (profile / ACL grants / drive mapping). The command was NOT run — \
+                     refusing rather than silently dropping the sandbox boundary. The \
+                     preparation thread may still be blocked; if this repeats, restart cImp \
+                     and check the sandbox lane for what preceded it.",
+                    args.command,
+                    PREPARE_BACKSTOP.as_secs(),
+                ),
+                false,
+            );
+            return Err(format!(
+                "sandbox preparation did not settle within {}s — treating as wedged \
+                 (see sandbox lane); `{}` was not run",
+                PREPARE_BACKSTOP.as_secs(),
+                args.command
+            ));
+        }
+    };
     #[cfg(windows)]
     if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
         return run_sandboxed(

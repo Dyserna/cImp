@@ -976,7 +976,7 @@ async fn read_sarif(transport: Transport, stdout: &str, report: Option<&Path>) -
 /// | Clean/Findings but output known-truncated | — | `failed` (incomplete) |
 /// | [`ExitClass::Clean`] (exit 0), any parsed findings | ≥ 0 | `done` (findings authoritative) |
 /// | [`ExitClass::Findings`] code, ≥ 1 parsed finding | ≥ 1 | `done` with findings |
-/// | [`ExitClass::Findings`] code, 0 parsed findings | 0 | `failed` (report lost) |
+/// | [`ExitClass::Findings`] code, 0 parsed findings | 0 | `failed` — and the message distinguishes NO output at all (the tool never ran) from a report that was written but unreadable |
 ///
 /// The Clean row is the V25 correction: cppcheck ALWAYS exits 0 (findings only
 /// in its report) and eslint exits 0 when it has warnings-only — both must be
@@ -1045,9 +1045,36 @@ fn finalize_outcome(
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
                         let tail = diag_tail(stderr, stdout);
-                        let mut msg = format!(
-                            "exit code {code_str} reports findings, but the SARIF report was empty or unreadable — findings were lost"
-                        );
+                        // **Empty is not the same as unreadable** (rc.9 live).
+                        // `semgrep` under the sandbox exited 1 with NO report,
+                        // NO stdout and NO stderr — it never started its
+                        // interpreter — and this message told the user their
+                        // findings had been lost, which sent them looking for a
+                        // parser bug. A tool that produced nothing at all did
+                        // not lose a report; it never made one, and its exit
+                        // code is therefore not evidence of findings either.
+                        let mut msg = if sarif.trim().is_empty()
+                            && stdout.trim().is_empty()
+                            && stderr.trim().is_empty()
+                        {
+                            format!(
+                                "exit code {code_str} would mean findings, but the tool produced \
+                                 NO output at all — no report, no diagnostics, nothing on either \
+                                 stream. That is how a tool dies before it starts (a missing \
+                                 runtime or interpreter, or an OS sandbox that does not grant \
+                                 one), so the exit code is not evidence of findings"
+                            )
+                        } else if sarif.trim().is_empty() {
+                            format!(
+                                "exit code {code_str} reports findings, but the tool wrote no \
+                                 report at all"
+                            )
+                        } else {
+                            format!(
+                                "exit code {code_str} reports findings, but the SARIF report was \
+                                 unreadable — findings were lost"
+                            )
+                        };
                         if !tail.is_empty() {
                             msg.push_str(": ");
                             msg.push_str(&tail);
@@ -1668,6 +1695,19 @@ async fn spawn_sandboxed(
                 class,
                 sandbox,
             );
+        } else if run.exit_code != Some(0) && stdout.trim().is_empty() && stderr.trim().is_empty() {
+            // The rc.9 `audit:semgrep` shape: exit 1, both streams empty, so
+            // `denial_signature` had nothing to read and the lane stayed silent
+            // while the scan reported "findings were lost". See
+            // `sandbox::record_silent_exit`.
+            crate::sandbox::record_silent_exit(
+                seam,
+                root,
+                &crate::sandbox::program_subject(resolved),
+                argv,
+                run.exit_code,
+                sandbox,
+            );
         }
         Outcome::Exited(run.exit_code)
     };
@@ -1884,7 +1924,8 @@ mod tests {
 
     /// A findings exit code whose SARIF turned out empty/unparseable (missing
     /// temp report, mid-JSON truncation upstream) must be a loud failure, never
-    /// a clean "0 findings" pass.
+    /// a clean "0 findings" pass — and the message must say WHICH of the three
+    /// it was, because they send the reader to three different places.
     #[test]
     fn findings_exit_with_empty_sarif_is_failed() {
         let a = adapters::adapter(AuditToolId::Gitleaks);
@@ -1903,9 +1944,58 @@ mod tests {
             assert_eq!(status, ToolStatus::Failed, "sarif = {sarif:?}");
             assert!(findings.is_empty());
             let msg = error.unwrap();
-            assert!(msg.contains("findings were lost"), "{msg}");
+            // The diagnostic tail rides along in every branch — it is the only
+            // thing in the message that came from the tool itself.
             assert!(msg.contains("permission denied"), "{msg}");
+            if sarif.is_empty() {
+                // The tool talked (stderr) but wrote no report.
+                assert!(msg.contains("wrote no report at all"), "{msg}");
+                assert!(!msg.contains("NO output at all"), "{msg}");
+            } else {
+                assert!(msg.contains("unreadable — findings were lost"), "{msg}");
+            }
         }
+    }
+
+    /// **The rc.9 `audit:semgrep` misread.** A sandboxed `semgrep.exe` that was
+    /// granted its `Scripts` directory but not the Python install root behind it
+    /// exited **1 with no report, no stdout and no stderr** — it never started
+    /// its interpreter. Exit 1 is semgrep's findings code, so the runner said
+    /// "the SARIF report was empty or unreadable — findings were lost", which
+    /// describes a parser problem the user then went looking for.
+    ///
+    /// Nothing was lost: nothing was ever produced. A tool that emitted NOTHING
+    /// on any channel did not run, and its exit code is not evidence of
+    /// findings — the message has to say that, and name the shape (a runtime or
+    /// interpreter the sandbox does not grant) that actually causes it.
+    #[test]
+    fn a_findings_exit_with_no_output_at_all_is_not_a_lost_report() {
+        let a = adapters::adapter(AuditToolId::Semgrep);
+        let (status, findings, error) = finalize_outcome(
+            AuditToolId::Semgrep,
+            a,
+            Outcome::Exited(Some(1)), // semgrep's findings code
+            "",                       // no SARIF
+            false,                    // not truncated — there was nothing to truncate
+            "",                       // no stdout
+            "",                       // no stderr either
+            &root(),
+            Duration::from_secs(600),
+        );
+        assert_eq!(status, ToolStatus::Failed);
+        assert!(findings.is_empty());
+        let msg = error.expect("a silent findings exit must explain itself");
+        assert!(msg.contains("NO output at all"), "{msg}");
+        assert!(
+            msg.contains("not evidence of findings"),
+            "the exit code must be disowned, not repeated as fact: {msg}"
+        );
+        assert!(
+            msg.contains("interpreter") && msg.contains("sandbox"),
+            "the message must name the shape that produces it: {msg}"
+        );
+        // …and it must NOT claim a report went missing.
+        assert!(!msg.contains("findings were lost"), "{msg}");
     }
 
     /// A capped (known-incomplete) stdout SARIF is discarded as a failure even

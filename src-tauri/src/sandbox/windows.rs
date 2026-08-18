@@ -730,10 +730,32 @@ fn prepare_blocking(
     if grant_dir(root, container.as_psid(), FULL)? {
         granted.push(format!("{} (read+write)", root.display()));
     }
-    if let Some(install) = program.parent() {
+    // A program's own directory, plus the interpreter root behind it when the
+    // directory is a launcher directory (`…\Scripts\tool.exe`) — see
+    // [`super::interpreter_root`] for the convention and the live failure that
+    // named it. Both grants are RX and both are recorded; the second names why
+    // it is wider than "the program's directory".
+    let mut grant_program_dir = |install: &Path, why: &str| -> Result<(), String> {
         if grant_dir(install, container.as_psid(), RX)? {
-            granted.push(format!("{} (read+execute)", install.display()));
+            granted.push(if why.is_empty() {
+                format!("{} (read+execute)", install.display())
+            } else {
+                format!("{} (read+execute, {why})", install.display())
+            });
         }
+        if let Some(interp) = super::interpreter_root(install) {
+            if grant_dir(interp, container.as_psid(), RX)? {
+                granted.push(format!(
+                    "{} (read+execute, the interpreter root behind {})",
+                    interp.display(),
+                    install.display()
+                ));
+            }
+        }
+        Ok(())
+    };
+    if let Some(install) = program.parent() {
+        grant_program_dir(install, "")?;
     }
     // Grant inference for a seam whose spawned program is not the program that
     // does the work: `run_check` spawns `cmd.exe` (which needs no grant — it
@@ -746,12 +768,7 @@ fn prepare_blocking(
     // unsandboxed retry.
     for extra in &hints.programs {
         if let Some(install) = extra.parent() {
-            if grant_dir(install, container.as_psid(), RX)? {
-                granted.push(format!(
-                    "{} (read+execute, inferred from the check command)",
-                    install.display()
-                ));
-            }
+            grant_program_dir(install, "inferred from the check command")?;
         }
     }
     // Write grants the seam asked for — cImp-owned scratch a tool is handed an

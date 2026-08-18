@@ -1260,6 +1260,30 @@ async fn spawn_capture_sandboxed(
                 class,
                 sandbox,
             );
+        } else if run.exit_code != Some(0)
+            && stdout.trim().is_empty()
+            && stderr.trim().is_empty()
+        {
+            // Failed and said nothing — unclassifiable by construction, and the
+            // shape a tool that cannot finish loading dies in. See
+            // `sandbox::record_silent_exit`.
+            crate::sandbox::record_silent_exit(
+                crate::sandbox::SEAM_RUN_CHECK,
+                root,
+                subject,
+                &[cmd.to_string()],
+                run.exit_code,
+                sandbox,
+            );
+        }
+        // The child of THIS seam is always the shell, so a failure carrying the
+        // no-child-processes fingerprint gets the explanation the raw message
+        // withholds — `'cargo' is not recognized` reads as a PATH problem and
+        // `Access is denied.` reads as a file-permission problem, and it is
+        // neither. Appended to stderr (like the leaked-drain note below) so the
+        // model and the Checks panel both see it where they already look.
+        if let Some(note) = crate::sandbox::sandboxed_shell_note(run.exit_code, &stderr) {
+            stderr.push_str(note);
         }
     }
     if run.drains_leaked {

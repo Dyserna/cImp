@@ -261,6 +261,46 @@ pub enum Plan {
     Plain(SkipReason),
 }
 
+/// The **interpreter root** behind a launcher directory, when the directory
+/// follows the one convention that hides one.
+///
+/// A Windows Python distribution puts every `pip`-installed console script in
+/// `<install-root>\Scripts\<tool>.exe`. That `.exe` is a tiny launcher stub: it
+/// loads `python3XX.dll` and the standard library **from the install root**,
+/// which is the `Scripts` directory's PARENT. Granting only the program's own
+/// directory therefore hands the container an executable it cannot initialize.
+///
+/// Live rc.9, `audit:semgrep`: the grant row named
+/// `…\pythoncore-3.14-64\Scripts` and nothing else, and the child exited **1
+/// with empty stdout AND empty stderr** — no interpreter, no message, no denial
+/// signature to classify. The adapter reads exit 1 as "findings present", so the
+/// whole thing surfaced as "the SARIF report was empty — findings were lost".
+/// Adding the install root to the grants turns that into a working
+/// `semgrep --version` (measured: exit 0, `1.170.0`).
+///
+/// **Keyed on the directory NAME, not on a tool id**, so it is a rule rather
+/// than a semgrep special-case — and keyed on that name *only*, because the
+/// general form ("grant the grandparent") would grant `C:\Windows` for anything
+/// in `System32` and `C:\Users\<user>` for a tool in `<user>\bin`. Two guards
+/// keep it narrow: the parent must literally be named `Scripts`, and the root it
+/// yields must not be a volume root (`C:\Scripts\x.exe` grants nothing).
+///
+/// Deliberately Windows-only in its callers: the POSIX equivalent directory is
+/// `bin`, and `/usr/bin/tool` would yield `/usr` — the exact over-grant this
+/// rule is shaped to avoid.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn interpreter_root(program_dir: &Path) -> Option<&Path> {
+    let name = program_dir.file_name()?.to_str()?;
+    if !name.eq_ignore_ascii_case("Scripts") {
+        return None;
+    }
+    let root = program_dir.parent()?;
+    // A volume root has no parent of its own; granting one is never the
+    // narrow answer this rule promises.
+    root.parent()?;
+    Some(root)
+}
+
 /// What a seam needs granted **beyond** what [`plan`] infers from the spawned
 /// program itself (whose own install directory is always granted read+execute,
 /// and whose project root is always granted full access).
@@ -572,6 +612,36 @@ const SOCKET_DENIAL_MARKERS: &[&str] = &[
     "socket: permission denied",
 ];
 
+/// Substrings that mean a **program could not be started** — the shape a
+/// confined *shell* dies in, as opposed to a confined tool being refused a file.
+///
+/// Measured on Windows, 2026-08-18 (rc.9 live-verify): a process running under
+/// cImp's AppContainer **cannot create a child process at all**. `cmd.exe` runs
+/// its builtins fine (`echo`, `cd`, `dir` and `type` all work, on the mapped
+/// drive and off it) and every `CreateProcess` it attempts is refused —
+/// including `C:\Windows\System32\where.exe`, which carries
+/// `ALL APPLICATION PACKAGES:(RX)`, from a cwd of `System32`, with no drive
+/// mapping involved. A plain `cmd.exe` in the same job object spawns the same
+/// grandchild successfully, so neither the job, the grants, the drive mapping
+/// nor PATH resolution is the cause.
+///
+/// The user therefore sees one of two messages, and neither says "sandbox":
+///
+/// * `'cargo' is not recognized as an internal or external command` — the PATH
+///   *search* failing, because probing `C:\Users\<u>\.cargo\bin\cargo.exe`
+///   traverses ancestors the container has no ACE on;
+/// * `Access is denied.` — the search having succeeded and `CreateProcess`
+///   being refused (already covered by [`FILESYSTEM_DENIAL_MARKERS`]).
+///
+/// The first one used to classify as nothing at all, so the lane stayed empty
+/// while the check failed. It is listed here rather than folded into the
+/// filesystem set because it is a *different fact* and deserves its own label.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PROGRAM_START_DENIAL_MARKERS: &[&str] = &[
+    "is not recognized as an internal or external command",
+    "the system cannot execute the specified program",
+];
+
 /// Substrings that mean name resolution died. These are **conditional** — see
 /// [`denial_signature`] — because with egress allowed they are ordinary
 /// network weather, and claiming them as boundary denials would be dishonest.
@@ -666,6 +736,11 @@ pub fn denial_signature(
     }
     if hit(FILESYSTEM_DENIAL_MARKERS) {
         return Some("filesystem/OS access denied");
+    }
+    // Checked AFTER the two access sets, so every string that classified before
+    // this list existed still classifies exactly as it did.
+    if hit(PROGRAM_START_DENIAL_MARKERS) {
+        return Some("a program could not be started");
     }
     if NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL && !allow_network && hit(NAME_RESOLUTION_MARKERS) {
         return Some("name resolution failed (no network capability)");
@@ -897,6 +972,99 @@ pub fn record_spawn_failure(
         refused_detail(subject, args, err, cfg),
         false,
     );
+}
+
+/// Record a sandboxed child that **ran, failed, and said nothing at all** —
+/// no stdout, no stderr, just a non-zero exit code.
+///
+/// # Why this is its own row
+///
+/// [`denial_signature`] classifies a failure by what the child *printed*. A
+/// child that prints nothing is unclassifiable by construction, so the lane
+/// stayed silent for the one failure shape that is most likely to be the
+/// boundary: a program the container cannot fully load exits without ever
+/// reaching its own error handling.
+///
+/// Live rc.9, `audit:semgrep`: `semgrep.exe` (a pip console-script launcher)
+/// was granted its own `Scripts` directory but not the Python install root it
+/// loads `python3XX.dll` and the standard library from. It exited **1 with both
+/// streams empty**. The audit adapter reads exit 1 as "findings present", so the
+/// scan reported "the SARIF report was empty — findings were lost" while the
+/// sandbox lane said nothing whatsoever. Granting the interpreter root
+/// ([`interpreter_root`]) fixes that particular tool; this row is what makes the
+/// *shape* visible the next time some other tool hits it.
+///
+/// The row asserts only the observable and names the boundary as a candidate,
+/// never as a finding — the same posture as [`record_denial`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn record_silent_exit(
+    seam: &str,
+    root: &Path,
+    subject: &str,
+    args: &[String],
+    exit_code: Option<i32>,
+    cfg: &SandboxCfg,
+) {
+    record_event(
+        seam,
+        root,
+        "silent",
+        state_target("no output", subject),
+        silent_exit_detail(subject, args, exit_code, cfg),
+        false,
+    );
+}
+
+/// [`record_silent_exit`]'s wording, pure so the row can be asserted directly.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn silent_exit_detail(
+    subject: &str,
+    args: &[String],
+    exit_code: Option<i32>,
+    cfg: &SandboxCfg,
+) -> String {
+    format!(
+        "`{}` exited {} and produced NOTHING on either stream — no output, no error text. \
+         A tool that cannot finish loading (a runtime or interpreter directory the sandbox does \
+         not grant) exits exactly like this, and it leaves no message for the classifier to read, \
+         so this row records the shape rather than a cause. Posture: {}.",
+        summarize_invocation(subject, args),
+        exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "with no code".into()),
+        posture(cfg),
+    )
+}
+
+/// Whether a sandboxed **shell's** output carries the fingerprint of the
+/// AppContainer's no-child-processes rule, and the note to hand the user if so.
+///
+/// See [`PROGRAM_START_DENIAL_MARKERS`] for the measurement. The note exists
+/// because the two messages a user actually sees — `'cargo' is not recognized`
+/// and `Access is denied.` — both point them at PATH or at file permissions,
+/// and neither is the problem: no external program can run inside this boundary
+/// at all, so a check that shells out cannot pass while it is on. Stating that
+/// is worth more than any amount of retrying.
+///
+/// Returns `None` for anything else, so a check that genuinely failed on its own
+/// terms is never handed an explanation it did not earn.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn sandboxed_shell_note(exit_code: Option<i32>, stderr: &str) -> Option<&'static str> {
+    if exit_code == Some(0) {
+        return None;
+    }
+    let hay = stderr.to_ascii_lowercase();
+    let hit = PROGRAM_START_DENIAL_MARKERS
+        .iter()
+        .chain(FILESYSTEM_DENIAL_MARKERS.iter())
+        .any(|m| hay.contains(m));
+    hit.then_some(
+        "\n[sandbox: this check ran inside the OS sandbox, where a shell cannot start ANY child \
+         process — on Windows an AppContainer is refused CreateProcess for every image, including \
+         ones it has read+execute on. If this check invokes an external tool (cargo, tsc, npm, a \
+         linter), that is the most likely reason it failed, and no grant will change it: turn the \
+         sandbox off for this run, or run the check from a tab.]",
+    )
 }
 
 /// [`record_spawn_failure`]'s `refused` wording, as a pure function so the row
@@ -1172,6 +1340,137 @@ mod tests {
             denial_signature(None, "CreateProcessW failed: Access is denied.", false),
             Some("filesystem/OS access denied")
         );
+    }
+
+    /// **The `Scripts` convention, and its two guards.** A pip console-script
+    /// launcher cannot initialize without the install root beside it (rc.9:
+    /// `semgrep.exe` exited 1 with both streams empty), so the parent of a
+    /// `Scripts` directory is granted too — and ONLY there, because the general
+    /// "grant the grandparent" rule would hand out `C:\Windows` for anything in
+    /// `System32`.
+    ///
+    /// Forward slashes throughout: `Path` treats `/` as a separator on BOTH
+    /// platforms, while a backslash is an ordinary character on Linux — a
+    /// `C:\…` fixture would make `file_name()` answer the whole string on the
+    /// Linux CI runner and this test would pass locally and fail there. (The
+    /// same trap `the_first_token_of_a_check_command_is_what_gets_a_grant`
+    /// documents.)
+    #[test]
+    fn the_interpreter_root_rule_is_the_scripts_convention_and_nothing_wider() {
+        // The live shape, and the case-insensitivity Windows paths need.
+        assert_eq!(
+            interpreter_root(Path::new(
+                "C:/Users/me/AppData/Local/Python/pythoncore-3.14-64/Scripts"
+            )),
+            Some(Path::new("C:/Users/me/AppData/Local/Python/pythoncore-3.14-64"))
+        );
+        assert_eq!(
+            interpreter_root(Path::new("C:/py/venv/scripts")),
+            Some(Path::new("C:/py/venv"))
+        );
+        // Everything else yields nothing — most importantly the directories a
+        // grandparent rule would over-grant.
+        for narrow in [
+            "C:/Windows/System32",
+            "C:/Users/me/.cargo/bin",
+            "C:/Program Files/Git/cmd",
+            "/usr/bin",
+        ] {
+            assert_eq!(
+                interpreter_root(Path::new(narrow)),
+                None,
+                "{narrow} must not widen the boundary"
+            );
+        }
+        // A `Scripts` directory sitting at a volume root would yield the volume
+        // itself; the answer there is no grant, not the whole drive. Spelled
+        // per-platform, because "the root" is the one path shape that cannot be
+        // written portably.
+        #[cfg(windows)]
+        assert_eq!(interpreter_root(Path::new(r"C:\Scripts")), None);
+        #[cfg(not(windows))]
+        assert_eq!(interpreter_root(Path::new("/Scripts")), None);
+    }
+
+    /// **The two rc.9 lane silences, both closed.**
+    ///
+    /// A sandboxed child that fails says one of three things, and until now only
+    /// the first one produced a row: output the classifier recognizes, output it
+    /// does not, or *nothing at all*. The last is the most dangerous, because it
+    /// is what a tool that cannot finish loading looks like.
+    #[test]
+    fn a_child_that_fails_silently_still_produces_a_row() {
+        let cfg = SandboxCfg::disabled();
+        // Nothing to classify — by construction, an empty stderr matches no
+        // marker, which is exactly why this needed its own row.
+        assert_eq!(denial_signature(Some(1), "", false), None);
+        let detail = silent_exit_detail("semgrep.exe", &["scan".into()], Some(1), &cfg);
+        assert!(detail.contains("produced NOTHING on either stream"), "{detail}");
+        assert!(detail.contains("interpreter"), "{detail}");
+        // It records a shape, never a verdict.
+        assert!(
+            !detail.contains("denied"),
+            "a silent exit is not evidence of a denial: {detail}"
+        );
+        // A child with no exit code at all is still describable.
+        assert!(silent_exit_detail("x", &[], None, &cfg).contains("with no code"));
+    }
+
+    /// `'cargo' is not recognized as an internal or external command` is what a
+    /// sandboxed shell prints when its PATH search cannot reach the tool, and it
+    /// classified as **nothing** — so a check that could not start its compiler
+    /// left the sandbox lane empty. It is its own class, not the filesystem one:
+    /// the fact is "no program started", which is a different thing to tell a
+    /// user than "a file was refused".
+    #[test]
+    fn a_program_that_never_started_classifies_as_its_own_denial_shape() {
+        assert_eq!(
+            denial_signature(
+                Some(1),
+                "'cargo' is not recognized as an internal or external command,\r\noperable \
+                 program or batch file.",
+                false
+            ),
+            Some("a program could not be started")
+        );
+        // The access sets keep their own labels — this list is checked after
+        // them, so nothing that classified before reclassifies now.
+        assert_eq!(
+            denial_signature(Some(1), "Access is denied.", false),
+            Some("filesystem/OS access denied")
+        );
+        // And a clean exit still classifies as nothing, whatever it printed.
+        assert_eq!(
+            denial_signature(Some(0), "'cargo' is not recognized as an internal", false),
+            None
+        );
+    }
+
+    /// **The measured AppContainer limit, stated where the user reads.** A
+    /// confined `cmd.exe` cannot start ANY child process — measured against
+    /// `System32\where.exe`, which the container has read+execute on, from a
+    /// `System32` cwd, with no drive mapping in play; a plain `cmd.exe` in the
+    /// same job object runs the same grandchild fine. Both messages the user
+    /// actually sees point at PATH or at file permissions instead, so the note
+    /// exists to say what no amount of grant-tuning will change.
+    #[test]
+    fn a_sandboxed_shell_gets_told_why_it_cannot_start_a_program() {
+        for stderr in [
+            "'cargo' is not recognized as an internal or external command,",
+            "Access is denied.",
+        ] {
+            let note = sandboxed_shell_note(Some(1), stderr)
+                .unwrap_or_else(|| panic!("no note for {stderr:?}"));
+            assert!(note.contains("cannot start ANY child process"), "{note}");
+            assert!(note.contains("no grant will change it"), "{note}");
+        }
+        // A check that failed on its own terms is not handed an excuse.
+        assert_eq!(
+            sandboxed_shell_note(Some(1), "error[E0425]: cannot find value `x` in this scope"),
+            None
+        );
+        // Nor is a successful one, whatever it printed along the way.
+        assert_eq!(sandboxed_shell_note(Some(0), "Access is denied."), None);
     }
 
     // ---- V33 Phase A follow-up: what happens INSIDE the boundary ----

@@ -1,6 +1,6 @@
 [package]
 name = "cimp"
-version = "0.52.0-rc.6"
+version = "0.52.0-rc.7"
 description = "Claude Code wrapper with TTS, avatar, and compose overlay"
 authors = ["Amir Amashe"]
 edition = "2021"

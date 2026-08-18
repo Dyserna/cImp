@@ -5,6 +5,39 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0-rc.7] — 2026-08-18
+
+### Fixed
+
+- **The live sandbox wedge was never the drain race — sandbox preparation
+  self-deadlocked before any child existed, and rc.7 removes the deadlock.**
+  The rc.6 live battery reproduced the rc.4 signature exactly (grant row, then
+  nothing, forever) with all of rc.5/rc.6's spawn hardening in place — and
+  with the new observation that **no sandboxed child process was ever
+  created**. The real cause has been in Phase A since `15ad514`:
+  `map_drive` takes the process-wide `DRIVES` mutex and, still holding it,
+  called `free_drive_letter()`, which locked `DRIVES` **again** to collect the
+  letters already handed out. `std::sync::Mutex` is not reentrant, so the
+  cache-miss path — the *first* mapping of a root in an app run, i.e. every
+  first sandboxed spawn — hung the preparation thread deterministically and
+  forever. It presented as rc.4's "22-minute wedge" and was masked by the
+  (real, worth closing) pipe-inheritance race diagnosed then; the bounded
+  drains and the spawn gate stand, but they never covered this because the
+  hang sits upstream of the spawn itself. `free_drive_letter` now receives
+  the taken-letter set from the guard its caller already holds and never
+  touches the lock; a watchdog regression test pins that `map_drive` returns
+  rather than deadlocks.
+
+- **Sandbox *preparation* is now under a caller-side backstop of its own.**
+  rc.5's `SANDBOX_BACKSTOP` bounded `spawn_and_capture`, but preparation
+  (profile creation, ACL grants, drive mapping) ran unbounded ahead of it —
+  which is why the deadlock above pinned the offload worker's slot with the
+  grant row as the only trace and the `wedged` row never minted. `run_command`
+  now wraps the whole plan/prepare phase in a 60 s `PREPARE_BACKSTOP`; on
+  elapse it mints a `wedged` sandbox row naming the phase and **refuses** the
+  command rather than falling back to an unsandboxed spawn — a wedged sandbox
+  must never silently drop the boundary it exists to hold.
+
 ## [0.52.0-rc.6] — 2026-08-18
 
 ### Fixed

@@ -307,8 +307,12 @@ const TEST_DIAG_CAP: usize = 5;
 /// flag a wrong-parser config (output produced, zero diagnostics). A
 /// validation/spawn failure is captured into `error` rather than propagated, so
 /// the editor can render it inline like any other test outcome.
-pub async fn test_check(root: &Path, def: &CheckDef) -> ChecksTestResult {
-    match run(root, def, false).await {
+pub async fn test_check(
+    root: &Path,
+    def: &CheckDef,
+    sandbox: &crate::sandbox::SandboxCfg,
+) -> ChecksTestResult {
+    match run(root, def, false, sandbox).await {
         Ok(report) => {
             let diagnostics = report
                 .groups
@@ -370,7 +374,19 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// silently returning nothing, so `run_check` still works outside git. When
 /// `def.report_file` is set the parser reads that file's content instead of
 /// stdout; either way diagnostic file paths come back project-root-relative.
-pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<CheckReport> {
+///
+/// `sandbox` is the V33 OS-sandbox config, threaded in from the caller's live
+/// settings rather than read from a global — the same plumbing discipline
+/// `run_command` follows, so the headless MCP child and unit tests get exactly
+/// the config their caller passed. Every real caller derives it with
+/// [`crate::sandbox::SandboxCfg::from_settings`]; tests pass
+/// `SandboxCfg::disabled()`.
+pub async fn run(
+    root: &Path,
+    def: &CheckDef,
+    changed_only: bool,
+    sandbox: &crate::sandbox::SandboxCfg,
+) -> AppResult<CheckReport> {
     def.validate()?;
     let started = Instant::now();
     let timeout_secs = def.timeout_secs.max(10);
@@ -384,8 +400,16 @@ pub async fn run(root: &Path, def: &CheckDef, changed_only: bool) -> AppResult<C
         None => root.to_path_buf(),
     };
 
-    let (exit_code, stdout, stderr, timed_out) =
-        spawn_capture(&effective_cwd, &def.cmd, &def.env, timeout_secs).await?;
+    let (exit_code, stdout, stderr, timed_out) = spawn_capture(
+        root,
+        &effective_cwd,
+        &def.name,
+        &def.cmd,
+        &def.env,
+        timeout_secs,
+        sandbox,
+    )
+    .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
     // Raw captured sizes, before parsing — the "did the command produce output?"
     // signal the Phase E Test button uses (see [`CheckReport::stdout_bytes`]).
@@ -706,12 +730,114 @@ fn reroot_diags(diags: &mut [Diag], cwd_rel: &str) {
 /// `run_command`). Returns `(exit_code, stdout, stderr, timed_out)`; `Err`
 /// only for a spawn failure (bad shell, permissions), never for the checked
 /// command's own exit code.
+///
+/// # The sandbox fork (V33)
+///
+/// `root` is the PROJECT root (the sandbox's writable area and the drive it
+/// maps); `cwd` is where this check actually runs, which may be a directory
+/// beneath it (`CheckDef::cwd`). When the OS sandbox is on and available the
+/// shell runs inside the AppContainer instead, with the C2 minimal environment
+/// as its base — see [`spawn_capture_sandboxed`]. The plain path below is
+/// unchanged in every respect, including its inherit-and-force environment: a
+/// sandbox-off user's checks behave exactly as they did.
+///
+/// `name` is [`CheckDef::name`] — the identity every sandbox-lane row this seam
+/// writes is scanned by. NOT the shell: `cmd.exe` is what every check spawns,
+/// so a program-derived row would render them all identically and collapse them
+/// into one confirmation. See [`row_subject`].
+#[allow(clippy::too_many_arguments)]
 async fn spawn_capture(
+    root: &Path,
     cwd: &Path,
+    name: &str,
     cmd: &str,
     env: &[(String, String)],
     timeout_secs: u64,
+    sandbox: &crate::sandbox::SandboxCfg,
 ) -> AppResult<(Option<i32>, String, String, bool)> {
+    let timeout = Duration::from_secs(timeout_secs);
+    let subject = row_subject(name, cmd);
+    // The program cImp actually spawns is the SHELL. Resolve it to an absolute
+    // path for the sandbox's benefit (`prepare` grants the program's install
+    // dir, and `CreateProcessW` gets no PATH search) — the plain path keeps
+    // using the bare name, which is what it has always done.
+    let shell = shell_program();
+    // Grant inference (V33 locked decision L3): the shell needs no grant
+    // (System32 is ALL APPLICATION PACKAGES-readable), but the tool the check
+    // invokes does. Resolve the command's FIRST token the same way
+    // `run_command` resolves its program.
+    //
+    // Computed ONLY when the sandbox is on. `check_program_hint` walks PATH,
+    // and a sandbox-off user runs checks on every `post_edit` — making them pay
+    // a `which` for a value `plan` is about to discard would be a real
+    // regression for a feature they turned off.
+    let (inferred, base_env) = if sandbox.enabled {
+        (
+            check_program_hint(cmd, &|name| crate::pty::resolve_command(name).ok())
+                .into_iter()
+                .collect::<Vec<PathBuf>>(),
+            crate::sandbox::child_env::minimal_env(&|key| std::env::var_os(key)),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let plan = match tokio::time::timeout(
+        crate::sandbox::PREPARE_BACKSTOP,
+        crate::sandbox::plan(
+            sandbox,
+            crate::sandbox::SEAM_RUN_CHECK,
+            &shell,
+            &crate::sandbox::GrantHints {
+                programs: inferred,
+                // A check writes into the project root (already granted) or into
+                // its redirected TEMP on the mapped drive; nothing outside.
+                full_dirs: Vec::new(),
+            },
+            root,
+            &base_env,
+        ),
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(_) => {
+            // Wedged BEFORE the spawn (2026-08-18's second incident shape). The
+            // check was never attempted, and it must NOT fall back to a plain
+            // spawn — silently dropping the boundary is worse than refusing.
+            crate::sandbox::record_event(
+                crate::sandbox::SEAM_RUN_CHECK,
+                root,
+                "wedged",
+                crate::sandbox::state_target("wedged", &subject),
+                format!(
+                    "sandbox preparation for check `{cmd}` did not settle within {}s \
+                     (profile / ACL grants / drive mapping). The check was NOT run — refusing \
+                     rather than silently dropping the sandbox boundary.",
+                    crate::sandbox::PREPARE_BACKSTOP.as_secs(),
+                ),
+                false,
+            );
+            return Err(AppError::Checks(format!(
+                "sandbox preparation did not settle within {}s — treating as wedged \
+                 (see the sandbox lane); check `{cmd}` was not run",
+                crate::sandbox::PREPARE_BACKSTOP.as_secs()
+            )));
+        }
+    };
+    #[cfg(windows)]
+    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
+        return spawn_capture_sandboxed(
+            prepared, root, cwd, &subject, cmd, env, &base_env, timeout, sandbox,
+        )
+        .await;
+    }
+    if let crate::sandbox::Plan::Plain(reason) = &plan {
+        // Decision 5: degradation is loud, never silent. Deduplicated by
+        // (seam, reason) per session inside `record_skip`.
+        crate::sandbox::record_skip(crate::sandbox::SEAM_RUN_CHECK, reason, &subject, root);
+    }
+
     let mut command = shell_command(cmd);
     command
         .current_dir(cwd)
@@ -757,8 +883,7 @@ async fn spawn_capture(
         MAX_OUTPUT_BYTES,
     ));
 
-    let (exit_code, timed_out) =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+    let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(status)) => (status.code(), false),
             Ok(Err(e)) => return Err(AppError::Checks(format!("check `{cmd}` failed: {e}"))),
             Err(_) => {
@@ -809,6 +934,281 @@ fn shell_command(cmd: &str) -> tokio::process::Command {
     }
 }
 
+/// The shell [`shell_command`] spawns, as an ABSOLUTE path.
+///
+/// The plain path spawns it by bare name and lets the OS resolve it; the
+/// sandboxed path cannot — `CreateProcessW` is handed a full command line with
+/// no PATH search, and `prepare` grants "the program's install directory",
+/// which needs a directory to name. On Windows that is `%ComSpec%` (falling
+/// back to `%SystemRoot%\System32\cmd.exe`), which lives under `System32` and
+/// is therefore already readable by `ALL APPLICATION PACKAGES` — so this path
+/// gets NO ACE stamped on it (`grant_dir`'s `is_app_package_readable` guard),
+/// which is exactly what we want for a system directory.
+fn shell_program() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(spec) = std::env::var_os("ComSpec") {
+            let p = PathBuf::from(spec);
+            if p.is_absolute() {
+                return p;
+            }
+        }
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        system_root.join("System32").join("cmd.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/bin/sh")
+    }
+}
+
+/// **What this seam's sandbox-lane rows are scanned by: the CHECK.**
+///
+/// The other two seams identify a row by the program they spawn, because that
+/// program *is* the work. This one always spawns `cmd.exe`, so doing the same
+/// would render every check's row identically — `sandboxed — cmd.exe`, over and
+/// over — and, worse, collapse them: the confirmation row dedups per subject,
+/// so the first sandboxed check would speak for every other one. The check's
+/// configured [`CheckDef::name`] is both the distinguishing fact and the name
+/// the user would look for. The full command line stays in the row's detail.
+///
+/// Falls back to the command's first token, then to a fixed label, so a check
+/// saved with a blank name (the struct default) still produces a scannable row
+/// instead of a dangling `"sandboxed — "`.
+fn row_subject(name: &str, cmd: &str) -> String {
+    let name = name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    first_shell_token(cmd).unwrap_or_else(|| "unnamed check".to_string())
+}
+
+/// **Grant inference for a shell-mediated check** (V33 locked decision L3).
+///
+/// The sandbox grants the *spawned program's* install directory, but this seam
+/// spawns the shell — so the tool that does the actual work (`cargo` in
+/// `cargo test --bin cimp`) would get no grant and die with an access denial
+/// the moment the container tried to read its image. This resolves the command
+/// line's FIRST token through the same resolver `run_command` uses for its
+/// program, so that tool's install directory is granted read+execute too.
+///
+/// **What is deliberately NOT inferred**, so a later reader does not "improve"
+/// it into a shell parser:
+///
+/// * later tokens of a compound command line (`cargo build && npm test`) — they
+///   rely on an already-readable install dir (Program Files / Windows) or on a
+///   `sandbox.extra_grant_dirs` row the user added deliberately;
+/// * anything that is not a plain first token: a shell builtin (`echo`), an
+///   `ENV=value cmd` prefix, a redirection or a subshell.
+///
+/// Returning `None` is a valid, non-failing answer: the shell itself still runs
+/// (its own directory needs no grant), and a tool that then cannot start
+/// surfaces as a loud DENIAL row rather than a silent unsandboxed retry.
+///
+/// `resolve` is a parameter so the rule is testable without touching PATH.
+fn check_program_hint(
+    cmd: &str,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let token = first_shell_token(cmd)?;
+    resolve(&token)
+}
+
+/// The first token of a shell command line, when it plausibly names a program.
+///
+/// Honors a quoted first token (`"C:\Program Files\...\tsc.cmd" --noEmit`, the
+/// exact shape [`shell_command`]'s `raw_arg` doc calls out). Returns `None` for
+/// anything that is not a bare leading program name: an empty command, an
+/// `ENV=value` prefix, or a token carrying shell metacharacters that mean the
+/// line starts with something other than a program.
+fn first_shell_token(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let token: String = if let Some(rest) = trimmed.strip_prefix('"') {
+        // A quoted program path; everything up to the closing quote.
+        match rest.split_once('"') {
+            Some((inside, _)) => inside.to_string(),
+            // Unterminated quote — not something to guess about.
+            None => return None,
+        }
+    } else {
+        trimmed
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    if token.is_empty() {
+        return None;
+    }
+    // `FOO=bar cmd` (sh) sets a variable; the program is the NEXT token, and
+    // guessing which is not this function's job.
+    if token.contains('=') {
+        return None;
+    }
+    // Metacharacters mean the line does not begin with a plain program name
+    // (a subshell, a redirect, a pipeline written without a leading space…).
+    if token.contains(['&', '|', '<', '>', '(', ')', ';', '^', '%', '"', '\'']) {
+        return None;
+    }
+    Some(token)
+}
+
+/// V33 — run one configured check's shell INSIDE the AppContainer.
+///
+/// Mirrors the plain path's contract (same output caps, same timeout, same
+/// `(exit_code, stdout, stderr, timed_out)` shape) and differs only in the OS
+/// boundary and — per locked decision L4 — in the environment: a sandboxed
+/// child gets the C2 minimal base rather than cImp's whole environment, then
+/// `CheckDef::env` on top, then the sandbox's TEMP/HOME redirections last.
+///
+/// The cwd is `cwd` re-expressed on the mapped drive
+/// ([`crate::sandbox::windows::Prepared::cwd_under`]), so a nested
+/// `CheckDef::cwd` still runs where it is configured to run.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+async fn spawn_capture_sandboxed(
+    prepared: &crate::sandbox::windows::Prepared,
+    root: &Path,
+    cwd: &Path,
+    subject: &str,
+    cmd: &str,
+    env: &[(String, String)],
+    base_env: &[(&str, std::ffi::OsString)],
+    timeout: Duration,
+    sandbox: &crate::sandbox::SandboxCfg,
+) -> AppResult<(Option<i32>, String, String, bool)> {
+    let shell = shell_program();
+    let mut child_env = crate::sandbox::child_env::ChildEnv::from_base(base_env);
+    // The check's own forced variables (V22 Phase B), then the sandbox's
+    // redirections LAST — those point at the mapped drive and must win.
+    child_env.overlay(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    child_env.overlay(
+        prepared
+            .env_overrides
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone())),
+    );
+    let child_env = child_env.into_pairs();
+
+    // `/C <cmd>` goes in as a RAW tail, not as a quoted argument — `cmd.exe`
+    // parses its tail with its own rules, exactly as `shell_command`'s
+    // `raw_arg` doc explains. Quoting it would double-escape a check command
+    // that contains its own quotes, and the two paths must agree.
+    let raw_tail = format!("/C {cmd}");
+    let settled = tokio::time::timeout(
+        crate::sandbox::backstop_for(timeout),
+        crate::sandbox::windows::spawn_and_capture(
+            prepared,
+            crate::sandbox::windows::SpawnRequest {
+                program: &shell,
+                args: &[],
+                raw_tail: Some(&raw_tail),
+                env: &child_env,
+                cwd: &prepared.cwd_under(cwd),
+                cap: MAX_OUTPUT_BYTES,
+                timeout,
+                // This seam has no cancel channel (a check run is bounded by
+                // its own timeout and by the caller dropping the future, which
+                // the plain path handles with `kill_on_drop`).
+                cancel: None,
+            },
+        ),
+    )
+    .await;
+    let run = match settled {
+        Err(_) => {
+            crate::sandbox::record_event(
+                crate::sandbox::SEAM_RUN_CHECK,
+                root,
+                "wedged",
+                crate::sandbox::state_target("wedged", subject),
+                format!(
+                    "check `{cmd}` did not settle within {}s (check timeout {}s + {}s settle \
+                     slack). The sandboxed spawn helper never returned; the child may have run, \
+                     may still be running, or may never have started — cImp cannot tell, so this \
+                     row asserts only the wedge.",
+                    crate::sandbox::backstop_for(timeout).as_secs(),
+                    timeout.as_secs(),
+                    crate::sandbox::SANDBOX_SETTLE_SLACK.as_secs(),
+                ),
+                false,
+            );
+            return Err(AppError::Checks(format!(
+                "sandboxed check spawn did not settle within {}s — the check may have run; \
+                 treating as wedged (see the sandbox lane)",
+                crate::sandbox::backstop_for(timeout).as_secs()
+            )));
+        }
+        Ok(Ok(run)) => run,
+        Ok(Err(e)) => {
+            // Decision 4: a `CreateProcessW` that refuses to start the child is
+            // itself a denial shape, so its error string goes through the same
+            // classifier — with no exit code, because nothing ran.
+            if let Some(class) =
+                crate::sandbox::denial_signature(None, &e, sandbox.allow_network)
+            {
+                crate::sandbox::record_denial(
+                    crate::sandbox::SEAM_RUN_CHECK,
+                    root,
+                    subject,
+                    &[cmd.to_string()],
+                    None,
+                    &e,
+                    class,
+                    sandbox,
+                );
+            }
+            return Err(AppError::Checks(format!(
+                "failed to spawn sandboxed check `{cmd}`: {e}"
+            )));
+        }
+    };
+    crate::sandbox::record_sandboxed(crate::sandbox::SEAM_RUN_CHECK, root, subject, sandbox);
+
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    if !run.timed_out {
+        // A nonzero exit is returned to the caller as data (parsers read it),
+        // so this is the last point at which the raw code and stderr exist.
+        if let Some(class) =
+            crate::sandbox::denial_signature(run.exit_code, &stderr, sandbox.allow_network)
+        {
+            crate::sandbox::record_denial(
+                crate::sandbox::SEAM_RUN_CHECK,
+                root,
+                subject,
+                &[cmd.to_string()],
+                run.exit_code,
+                &stderr,
+                class,
+                sandbox,
+            );
+        }
+    }
+    if run.drains_leaked {
+        // The capture is INCOMPLETE; a parser told nothing would read the gap
+        // as "the checker printed no diagnostics", i.e. as a clean run.
+        tracing::warn!(
+            check = %cmd,
+            "sandbox: a pipe drain never finished (leaked write end) — the check's captured \
+             output is incomplete"
+        );
+        stderr.push_str(
+            "\n[sandbox: one output stream could not be drained — a copy of its pipe leaked to \
+             another process, so part of this output is missing]",
+        );
+    }
+    // The plain path reports a timeout with NO exit code; match it exactly so
+    // the two paths produce the same `CheckReport`.
+    let exit_code = if run.timed_out { None } else { run.exit_code };
+    Ok((exit_code, stdout, stderr, run.timed_out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,6 +1222,141 @@ mod tests {
             line,
             col: None,
         }
+    }
+
+    // ── V33 — the sandboxed `run_check` seam ──────────────────────────────
+
+    /// **Grant inference, decision L3.** The sandbox grants the *spawned*
+    /// program's directory, and this seam spawns the shell — so a check's own
+    /// tool gets its grant from the command line's first token or not at all.
+    /// A resolvable token yields the program (whose PARENT `prepare` grants);
+    /// a builtin or a line that does not start with a plain program name yields
+    /// nothing, which is a valid answer: the shell still runs.
+    ///
+    /// The resolver is injected, so this pins the RULE rather than whatever
+    /// happens to be on the machine's PATH.
+    #[test]
+    fn the_first_token_of_a_check_command_is_what_gets_a_grant() {
+        // Forward slashes throughout: `Path` treats `/` as a separator on BOTH
+        // platforms, while a backslash is an ordinary character on Linux — a
+        // `C:\...` fixture would make `parent()` answer `""` on the Linux CI
+        // runner and this test would pass locally and fail there.
+        let installed = |name: &str| -> Option<PathBuf> {
+            match name {
+                "cargo" => Some(PathBuf::from("/home/me/.cargo/bin/cargo")),
+                "npm" => Some(PathBuf::from("/opt/nodejs/npm")),
+                // A quoted first token is passed through verbatim, spaces and
+                // all — the shape `shell_command`'s `raw_arg` doc calls out.
+                "/opt/my tools/tsc.cmd" => Some(PathBuf::from("/opt/my tools/tsc.cmd")),
+                // Everything else is a shell builtin or simply absent.
+                _ => None,
+            }
+        };
+        let hint = |cmd: &str| check_program_hint(cmd, &installed);
+
+        // The ordinary case: the tool that does the work gets resolved, and its
+        // parent is the directory `prepare` will grant read+execute.
+        let cargo = hint("cargo test --bin cimp").expect("cargo must be inferred");
+        assert_eq!(cargo, PathBuf::from("/home/me/.cargo/bin/cargo"));
+        assert_eq!(cargo.parent().unwrap(), Path::new("/home/me/.cargo/bin"));
+        assert!(hint("npm run lint").is_some());
+        // Leading whitespace is not a different command.
+        assert!(hint("   cargo clippy").is_some());
+        // A quoted first token — the `raw_arg` doc's own example shape (a
+        // program path containing a space, which is why it is quoted at all).
+        assert!(hint("\"/opt/my tools/tsc.cmd\" --noEmit").is_some());
+
+        // A shell builtin resolves to nothing: no grant, and the shell still
+        // runs the check.
+        assert!(hint("echo hello").is_none(), "a builtin needs no grant");
+        // Only the FIRST token is inferred — later ones rely on an
+        // already-readable dir or on `extra_grant_dirs`.
+        assert_eq!(
+            hint("cargo build && npm test"),
+            Some(PathBuf::from("/home/me/.cargo/bin/cargo")),
+            "the first token is inferred and the rest deliberately are not"
+        );
+        // Not-a-program shapes yield nothing rather than a guess.
+        assert!(hint("").is_none());
+        assert!(hint("   ").is_none());
+        assert!(hint("RUST_LOG=debug cargo test").is_none(), "env prefix");
+        assert!(hint("(cargo test)").is_none(), "subshell");
+        assert!(hint("| cargo test").is_none(), "pipeline fragment");
+        assert!(hint("\"unterminated cargo").is_none(), "unbalanced quote");
+    }
+
+    /// **A check's sandbox rows are scanned by the check, not by `cmd.exe`.**
+    ///
+    /// Every check spawns the same shell, so a program-derived subject would
+    /// render every row identically and — because the confirmation row dedups
+    /// per subject — let the first sandboxed check speak for all of them.
+    #[test]
+    fn a_checks_sandbox_rows_are_identified_by_its_configured_name() {
+        assert_eq!(row_subject("cargo", "cargo test --bin cimp"), "cargo");
+        assert_eq!(row_subject("  tsc  ", "tsc --noEmit"), "tsc");
+        // Two checks that run the same shell are still two subjects.
+        assert_ne!(
+            row_subject("cargo", "cargo test"),
+            row_subject("clippy", "cargo clippy")
+        );
+        // …and the row a user scans says so, with no shell in sight.
+        let target = crate::sandbox::state_target("sandboxed", &row_subject("cargo", "cargo test"));
+        assert_eq!(target, "sandboxed — cargo");
+        assert!(!target.contains("cmd"));
+
+        // A blank name (the `CheckDef` default) still yields something
+        // scannable rather than a dangling `"sandboxed — "`.
+        assert_eq!(row_subject("", "cargo test --bin cimp"), "cargo");
+        assert_eq!(row_subject("   ", "echo hi"), "echo");
+        // …even when the command line names no plain program at all.
+        assert_eq!(row_subject("", "(cargo test)"), "unnamed check");
+        assert!(!row_subject("", "").is_empty());
+    }
+
+    /// The shell this seam spawns must be an ABSOLUTE path — `CreateProcessW`
+    /// does no PATH search, and `prepare` grants "the program's directory",
+    /// which a bare `cmd` does not have.
+    #[test]
+    fn the_shell_program_is_an_absolute_path_with_a_parent_directory() {
+        let shell = shell_program();
+        assert!(shell.is_absolute(), "{}", shell.display());
+        assert!(
+            shell.parent().is_some_and(|p| !p.as_os_str().is_empty()),
+            "the sandbox grants the program's PARENT; {} has none",
+            shell.display()
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            shell
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase()),
+            Some("cmd.exe".to_string()),
+            "the sandboxed path must spawn the same shell the plain path does"
+        );
+    }
+
+    /// The backstop relation for THIS seam, in the shape
+    /// `run_command::sandbox_backstop_exceeds_the_child_timeout` established:
+    /// the caller-side deadline must outlast the child's own, or an ordinary
+    /// slow check would be reported as a *wedge* — the one row in that lane
+    /// that is supposed to mean "something is broken in cImp".
+    ///
+    /// A check's timeout is per-check and floored at 10 s (see [`run`]), so the
+    /// relation is asserted across the range rather than on one constant.
+    #[test]
+    fn the_check_sandbox_backstop_always_exceeds_the_check_timeout() {
+        for secs in [10u64, 30, 120, 600, 3600] {
+            let child = Duration::from_secs(secs);
+            let backstop = crate::sandbox::backstop_for(child);
+            assert!(
+                backstop > child,
+                "backstop {backstop:?} must exceed the check timeout {child:?}"
+            );
+            assert_eq!(backstop, child + crate::sandbox::SANDBOX_SETTLE_SLACK);
+        }
+        // Preparation is bounded independently of the child, because it happens
+        // before the child exists.
+        assert!(crate::sandbox::PREPARE_BACKSTOP >= Duration::from_secs(30));
     }
 
     #[test]
@@ -1002,7 +1537,12 @@ mod tests {
             timeout_secs: 30,
             ..Default::default()
         };
-        let report = run(&std::env::temp_dir(), &def, false).await.expect("run");
+        let report = run(
+            &std::env::temp_dir(),
+            &def,
+            false,
+            &crate::sandbox::SandboxCfg::disabled(),
+        ).await.expect("run");
         assert_eq!(report.exit_code, Some(0));
         assert!(!report.timed_out);
     }
@@ -1125,7 +1665,12 @@ mod tests {
             ..Default::default()
         };
         let started = Instant::now();
-        let report = run(&std::env::temp_dir(), &def, false).await.expect("run");
+        let report = run(
+            &std::env::temp_dir(),
+            &def,
+            false,
+            &crate::sandbox::SandboxCfg::disabled(),
+        ).await.expect("run");
         assert!(report.timed_out);
         assert_eq!(report.exit_code, None);
         // Floored at 10s, generous upper bound for slow CI.
@@ -1198,7 +1743,12 @@ mod tests {
             cwd: Some("../escape".into()),
             ..Default::default()
         };
-        let result = run(&std::env::temp_dir(), &def, false).await;
+        let result = run(
+            &std::env::temp_dir(),
+            &def,
+            false,
+            &crate::sandbox::SandboxCfg::disabled(),
+        ).await;
         assert!(
             result.is_err(),
             "run must reject an escaping cwd: {result:?}"
@@ -1214,10 +1764,22 @@ mod tests {
         #[cfg(not(windows))]
         let cmd = "echo cimp_env=$CIMP_CHECK_ENV".to_string();
         let env = vec![("CIMP_CHECK_ENV".to_string(), "sentinel42".to_string())];
-        let (code, stdout, _stderr, timed_out) =
-            spawn_capture(&std::env::temp_dir(), &cmd, &env, 30)
-                .await
-                .expect("spawn");
+        let tmp = std::env::temp_dir();
+        let (code, stdout, _stderr, timed_out) = spawn_capture(
+            &tmp,
+            &tmp,
+            "env-forcing",
+            &cmd,
+            &env,
+            30,
+            // Deliberately UNsandboxed: this asserts the plain path's
+            // inherit-and-force env contract, and routing it through the
+            // AppContainer would ACL-stamp real directories as a side effect of
+            // running the suite (the `run_command` precedent).
+            &crate::sandbox::SandboxCfg::disabled(),
+        )
+        .await
+        .expect("spawn");
         assert_eq!(code, Some(0));
         assert!(!timed_out);
         assert!(
@@ -1241,7 +1803,7 @@ mod tests {
             cwd: Some("nested".into()),
             ..Default::default()
         };
-        let report = run(&root, &def, false).await.expect("run");
+        let report = run(&root, &def, false, &crate::sandbox::SandboxCfg::disabled()).await.expect("run");
         let sites: Vec<_> = report
             .groups
             .iter()
@@ -1294,7 +1856,7 @@ mod tests {
             report_file: Some("report.txt".into()),
             ..Default::default()
         };
-        let report = run(&root, &def, false).await.expect("run");
+        let report = run(&root, &def, false, &crate::sandbox::SandboxCfg::disabled()).await.expect("run");
         let msgs: Vec<_> = report.groups.iter().map(|g| g.message.clone()).collect();
         assert!(
             msgs.iter().any(|m| m.contains("watch out")),
@@ -1404,7 +1966,7 @@ mod tests {
             report_file: Some("does-not-exist.xml".into()),
             ..Default::default()
         };
-        let report = run(&root, &def, false).await.expect("run");
+        let report = run(&root, &def, false, &crate::sandbox::SandboxCfg::disabled()).await.expect("run");
         assert!(
             report
                 .groups
@@ -1500,7 +2062,11 @@ mod tests {
             timeout_secs: 30,
             ..Default::default()
         };
-        let result = test_check(&std::env::temp_dir(), &def).await;
+        let result = test_check(
+            &std::env::temp_dir(),
+            &def,
+            &crate::sandbox::SandboxCfg::disabled(),
+        ).await;
         assert!(
             result.error.is_none(),
             "a valid check must not carry an error: {result:?}"
@@ -1532,7 +2098,11 @@ mod tests {
             timeout_secs: 30,
             ..Default::default()
         };
-        let result = test_check(&std::env::temp_dir(), &def).await;
+        let result = test_check(
+            &std::env::temp_dir(),
+            &def,
+            &crate::sandbox::SandboxCfg::disabled(),
+        ).await;
         assert!(result.error.is_none(), "{result:?}");
         assert_eq!(
             result.diag_count, 0,
@@ -1556,7 +2126,11 @@ mod tests {
             cwd: Some("../escape".into()),
             ..Default::default()
         };
-        let result = test_check(&std::env::temp_dir(), &def).await;
+        let result = test_check(
+            &std::env::temp_dir(),
+            &def,
+            &crate::sandbox::SandboxCfg::disabled(),
+        ).await;
         assert!(
             result.error.is_some(),
             "an escaping cwd must surface as an error: {result:?}"

@@ -190,7 +190,19 @@ impl RootRunner {
     /// `"⚠ check \`<name>\` did not run: <err>"`), so a misconfigured check
     /// reads as visibly broken rather than indistinguishable from "ran clean"
     /// (V12 review — a spawn failure must never look green).
-    pub async fn run(&self, root: &Path, defs: &[CheckDef]) -> (Vec<CheckReport>, Vec<String>) {
+    ///
+    /// `sandbox` is the V33 OS-sandbox config for this run, derived from the
+    /// caller's live settings. The auto-check path is agent-triggered (a
+    /// `post_edit` hook after a model wrote a file), so it is as much a
+    /// [`crate::spawn_ledger::SpawnClass::AgentSpawn`] as an explicit
+    /// `run_check` call and gets the same boundary — decision 17's "the switch
+    /// governs the seam, not the caller".
+    pub async fn run(
+        &self,
+        root: &Path,
+        defs: &[CheckDef],
+        sandbox: &crate::sandbox::SandboxCfg,
+    ) -> (Vec<CheckReport>, Vec<String>) {
         let lock = {
             let mut locks = self.locks.lock().unwrap();
             locks
@@ -208,7 +220,7 @@ impl RootRunner {
         let mut reports = Vec::with_capacity(defs.len());
         let mut errors = Vec::new();
         for def in defs {
-            match run(root, def, true).await {
+            match run(root, def, true, sandbox).await {
                 Ok(r) => reports.push(r),
                 Err(e) => errors.push(spawn_failure_line(&def.name, &e.to_string())),
             }
@@ -419,11 +431,17 @@ mod tests {
         let r1 = runner.clone();
         let root1 = root.clone();
         let defs1 = defs.clone();
-        let h1 = tokio::spawn(async move { r1.run(&root1, &defs1).await });
+        let h1 = tokio::spawn(async move {
+            r1.run(&root1, &defs1, &crate::sandbox::SandboxCfg::disabled())
+                .await
+        });
         let r2 = runner.clone();
         let root2 = root.clone();
         let defs2 = defs.clone();
-        let h2 = tokio::spawn(async move { r2.run(&root2, &defs2).await });
+        let h2 = tokio::spawn(async move {
+            r2.run(&root2, &defs2, &crate::sandbox::SandboxCfg::disabled())
+                .await
+        });
 
         let (res1, res2) = tokio::join!(h1, h2);
         let (reports1, errors1) = res1.unwrap();

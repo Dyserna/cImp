@@ -555,28 +555,61 @@ impl Prepared {
     pub fn cwd(&self) -> PathBuf {
         self.drive.drive_root()
     }
+
+    /// The child's cwd for a directory *under* the mapped root, expressed on
+    /// the mapped drive.
+    ///
+    /// The `run_check` seam needs this: `CheckDef::cwd` runs a check in a
+    /// subdirectory of the project (this repo's own `src-tauri/`, any monorepo
+    /// package), and handing the child the drive ROOT instead would silently
+    /// run every nested check in the wrong directory — a green run of the wrong
+    /// thing, which is worse than a failure. `dir` outside the root (or equal to
+    /// it) falls back to the drive root.
+    pub fn cwd_under(&self, dir: &Path) -> PathBuf {
+        cwd_under_root(&self.drive.drive_root(), &self.drive.root, dir)
+    }
 }
 
-/// Do all sandbox preparation for one `run_command` child, or return a
+/// [`Prepared::cwd_under`]'s rule, as a pure function so it is testable without
+/// a live drive mapping: re-express `dir` (a path under `root`) on the mapped
+/// drive, falling back to the drive root when `dir` is the root itself or is
+/// not under it at all.
+fn cwd_under_root(drive_root: &Path, root: &Path, dir: &Path) -> PathBuf {
+    match dir.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => drive_root.join(rel),
+        _ => drive_root.to_path_buf(),
+    }
+}
+
+/// Do all sandbox preparation for one agent-initiated child, or return a
 /// user-facing reason the caller records and then runs the child plain.
+///
+/// `hints` carries the grants a seam needs beyond its own program's install
+/// directory — see [`super::GrantHints`].
 pub async fn prepare(
     cfg: &super::SandboxCfg,
+    seam: &str,
     program: &Path,
+    hints: &super::GrantHints,
     root: &Path,
     _env: &[(&str, OsString)],
 ) -> Result<Prepared, String> {
     // Blocking Win32 (ACL walks, profile creation) off the async worker.
     let cfg = cfg.clone();
+    let seam = seam.to_string();
     let program = program.to_path_buf();
+    let hints = hints.clone();
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || prepare_blocking(&cfg, &program, &root))
+    tokio::task::spawn_blocking(move || prepare_blocking(&cfg, &seam, &program, &hints, &root))
         .await
         .map_err(|e| format!("sandbox prepare task failed: {e}"))?
 }
 
 fn prepare_blocking(
     cfg: &super::SandboxCfg,
+    seam: &str,
     program: &Path,
+    hints: &super::GrantHints,
     root: &Path,
 ) -> Result<Prepared, String> {
     let container = container_sid()?;
@@ -596,6 +629,38 @@ fn prepare_blocking(
             granted.push(format!("{} (read+execute)", install.display()));
         }
     }
+    // Grant inference for a seam whose spawned program is not the program that
+    // does the work: `run_check` spawns `cmd.exe` (which needs no grant — it
+    // lives under `System32`, where Windows already gives ALL APPLICATION
+    // PACKAGES read+execute) and the check's own first token — `cargo` in
+    // `cargo test --bin cimp` — lives in the user's profile, which does not.
+    // Later tokens of a compound command line are NOT inferred; they rely on an
+    // AAP-readable install dir or a settings `extra_grant_dirs` row, and a tool
+    // that then cannot start surfaces as a DENIAL row rather than a silent
+    // unsandboxed retry.
+    for extra in &hints.programs {
+        if let Some(install) = extra.parent() {
+            if grant_dir(install, container.as_psid(), RX)? {
+                granted.push(format!(
+                    "{} (read+execute, inferred from the check command)",
+                    install.display()
+                ));
+            }
+        }
+    }
+    // Write grants the seam asked for — cImp-owned scratch a tool is handed an
+    // absolute path into (today: the audit runner's SARIF report directory).
+    // FULL, not RX: the point is that the child WRITES there. Recorded like
+    // every other grant, because an inheritable write ACE on a directory is a
+    // durable change to the user's machine whatever cImp owns it for.
+    for dir in &hints.full_dirs {
+        if grant_dir(dir, container.as_psid(), FULL)? {
+            granted.push(format!(
+                "{} (read+write, tool report scratch)",
+                dir.display()
+            ));
+        }
+    }
     for extra in &cfg.extra_grant_dirs {
         if grant_dir(extra, container.as_psid(), RX)? {
             granted.push(format!("{} (read+execute, from settings)", extra.display()));
@@ -603,6 +668,7 @@ fn prepare_blocking(
     }
     if !granted.is_empty() {
         super::record_event(
+            seam,
             root,
             "grant",
             format!("{} sandbox grant(s) applied", granted.len()),
@@ -654,36 +720,101 @@ pub struct CapturedRun {
     /// the model-visible output rather than presenting a truncated capture as
     /// the whole answer.
     pub drains_leaked: bool,
+    /// The caller's [`SpawnRequest::cancel`] flag was raised while the child
+    /// was running, so the child was terminated. Distinct from `timed_out`:
+    /// a cancel is the user (or a shutting-down scan) asking to stop, and the
+    /// audit runner reports it as `Outcome::Cancelled`, not as a timeout.
+    pub cancelled: bool,
 }
 
+/// Everything one sandboxed spawn needs. A struct rather than a parameter list
+/// because the three seams need different things from it (a raw shell tail, a
+/// cancel signal) and an eight-argument function is where the wrong argument
+/// gets passed in the right position.
+pub struct SpawnRequest<'a> {
+    /// The program to run. Always an absolute path resolved by cImp.
+    pub program: &'a Path,
+    /// Arguments, each quoted per the CRT rules. Ignored when
+    /// [`SpawnRequest::raw_tail`] is set.
+    pub args: &'a [String],
+    /// **The `cmd.exe /C` escape hatch.** When set, the command line becomes
+    /// `<program> <raw_tail>` with the tail appended VERBATIM.
+    ///
+    /// `cmd.exe` parses its `/C` payload with its OWN quoting rules, not the
+    /// `CommandLineToArgvW` rules [`quote_arg`] implements, so a check command
+    /// that contains its own quotes (`"C:\Program Files\...\tsc.cmd" --noEmit`)
+    /// comes out double-escaped and unparseable if it is quoted as an argument.
+    /// This is the same reason `checks::shell_command` uses `raw_arg` rather
+    /// than `arg` on the plain path — the two paths have to agree, or a check
+    /// would run differently depending on whether the sandbox is on.
+    pub raw_tail: Option<&'a str>,
+    /// The child's complete environment (see
+    /// [`crate::sandbox::child_env::ChildEnv`]).
+    pub env: &'a [(OsString, OsString)],
+    pub cwd: &'a Path,
+    /// Per-stream capture cap in bytes — each seam's own.
+    pub cap: usize,
+    /// The CHILD's deadline (see the note on [`spawn_and_capture`]).
+    pub timeout: std::time::Duration,
+    /// Optional cooperative cancel. `None` (the `run_command` seam) keeps the
+    /// single blocking `WaitForSingleObject` the engine has always used; `Some`
+    /// makes the wait poll so a cancelled audit scan can terminate its child
+    /// promptly instead of waiting out a multi-minute tool budget.
+    pub cancel: Option<super::CancelFlag>,
+}
+
+/// How often the wait loop looks at the cancel flag. Only reached when a caller
+/// supplied one; without a flag the wait is a single call with the full
+/// deadline, exactly as before.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
 /// Spawn `program args…` inside the container with the given final environment
-/// and capture output, bounded by `cap` bytes per stream and `timeout`.
+/// and capture output, bounded by `req.cap` bytes per stream and `req.timeout`.
 ///
-/// **`timeout` bounds the child, not this call.** It is what
-/// `WaitForSingleObject` gets; the drains that follow have their own bound
-/// ([`DRAIN_GRACE`]), and the caller carries a backstop over the whole future
-/// (`run_command::SANDBOX_BACKSTOP`) because a helper cannot be its own last
+/// **`timeout` bounds the child, not this call.** It is what the wait loop
+/// gets; the drains that follow have their own bound ([`DRAIN_GRACE`]), and the
+/// caller carries a backstop over the whole future
+/// ([`crate::sandbox::backstop_for`]) because a helper cannot be its own last
 /// line of defence.
+///
+/// **Cancellation must not be implemented by dropping this future.** Dropping
+/// it drops the caller's [`Prepared`], which unmaps the subst drive out from
+/// under a live child. Callers raise [`SpawnRequest::cancel`] and keep awaiting
+/// the same future — see `audit::runner::spawn_sandboxed`.
 ///
 /// Runs the whole synchronous Win32 dance on a blocking thread: two reader
 /// threads drain stdout/stderr (so neither pipe deadlocks the other), the main
 /// path waits with a deadline, assigns the pid to the kill-on-close job, and
-/// terminates on timeout.
+/// terminates on timeout or cancel.
 pub async fn spawn_and_capture(
     prepared: &Prepared,
-    program: &Path,
-    args: &[String],
-    env: &[(OsString, OsString)],
-    cwd: &Path,
-    cap: usize,
-    timeout: std::time::Duration,
+    req: SpawnRequest<'_>,
 ) -> Result<CapturedRun, String> {
-    // Command line: quote the program and each arg. cImp resolved `program` to
-    // an absolute path already; args come from the model and may contain spaces.
+    let SpawnRequest {
+        program,
+        args,
+        raw_tail,
+        env,
+        cwd,
+        cap,
+        timeout,
+        cancel,
+    } = req;
+    // Command line: quote the program, then either the raw shell tail verbatim
+    // or each argument quoted. cImp resolved `program` to an absolute path
+    // already; args come from the model and may contain spaces.
     let mut cmdline = quote_arg(&program.to_string_lossy());
-    for a in args {
-        cmdline.push(' ');
-        cmdline.push_str(&quote_arg(a));
+    match raw_tail {
+        Some(tail) => {
+            cmdline.push(' ');
+            cmdline.push_str(tail);
+        }
+        None => {
+            for a in args {
+                cmdline.push(' ');
+                cmdline.push_str(&quote_arg(a));
+            }
+        }
     }
 
     // Environment block: NUL-separated "K=V" pairs, double-NUL terminated,
@@ -719,12 +850,14 @@ pub async fn spawn_and_capture(
             cwd_w,
             cap,
             timeout,
+            cancel,
         )
     })
     .await
     .map_err(|e| format!("sandbox spawn task failed: {e}"))?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_blocking_inner(
     container_psid: usize,
     cap_psids: &[usize],
@@ -733,6 +866,7 @@ fn spawn_blocking_inner(
     cwd_w: Vec<u16>,
     cap: usize,
     timeout: std::time::Duration,
+    cancel: Option<super::CancelFlag>,
 ) -> Result<CapturedRun, String> {
     // ── pipes ──
     let (out_rd, out_wr) = make_pipe()?;
@@ -950,27 +1084,59 @@ fn spawn_blocking_inner(
     let (t_out, out_rx) = spawn_drain(out_rd, cap);
     let (t_err, err_rx) = spawn_drain(err_rd, cap);
 
-    // ── wait with deadline ──
-    let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-    // SAFETY: pi.hProcess is a live process handle from CreateProcess.
-    let wait = unsafe { WaitForSingleObject(pi.hProcess, ms) };
+    // ── wait with deadline (and, when the caller asked for it, cancel) ──
+    //
+    // With no cancel flag the loop below runs exactly one `WaitForSingleObject`
+    // with the full deadline — byte-for-byte the behaviour the `run_command`
+    // seam has always had. With a flag, the same deadline is served in
+    // [`CANCEL_POLL`] slices so a cancelled audit scan does not have to wait out
+    // a multi-minute per-tool budget before its child is terminated.
+    let deadline = std::time::Instant::now() + timeout;
+    let slice = match &cancel {
+        Some(_) => CANCEL_POLL,
+        None => timeout,
+    };
     let mut timed_out = false;
-    let exit_code;
-    if wait == WAIT_TIMEOUT {
-        timed_out = true;
-        // SAFETY: live handle; 124 is our timeout sentinel.
+    let mut cancelled = false;
+    let mut exit_code = None;
+    let mut exited = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        let ms = remaining.min(slice).as_millis().min(u32::MAX as u128) as u32;
+        // SAFETY: pi.hProcess is a live process handle from CreateProcess.
+        let wait = unsafe { WaitForSingleObject(pi.hProcess, ms) };
+        if wait == WAIT_OBJECT_0 {
+            exited = true;
+            break;
+        }
+        if wait != WAIT_TIMEOUT {
+            // WAIT_FAILED / WAIT_ABANDONED — the pre-existing "no code" arm.
+            break;
+        }
+        if cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            cancelled = true;
+            break;
+        }
+    }
+    if exited {
+        let mut code: u32 = 0;
+        // SAFETY: live handle; code is a valid out-param.
+        unsafe { GetExitCodeProcess(pi.hProcess, &mut code) };
+        exit_code = Some(code as i32);
+    } else if timed_out || cancelled {
+        // SAFETY: live handle; 124 is our timeout/cancel sentinel.
         unsafe { TerminateProcess(pi.hProcess, 124) };
         // The job object also reaps the tree; give the child a moment then read.
         // SAFETY: live handle.
         unsafe { WaitForSingleObject(pi.hProcess, 2000) };
         exit_code = Some(124);
-    } else if wait == WAIT_OBJECT_0 {
-        let mut code: u32 = 0;
-        // SAFETY: live handle; code is a valid out-param.
-        unsafe { GetExitCodeProcess(pi.hProcess, &mut code) };
-        exit_code = Some(code as i32);
-    } else {
-        exit_code = None;
     }
 
     let out = collect_drain(&out_rx, t_out, DRAIN_GRACE, DRAIN_CANCEL_GRACE);
@@ -1017,6 +1183,7 @@ fn spawn_blocking_inner(
         exit_code,
         timed_out,
         drains_leaked,
+        cancelled,
     })
 }
 
@@ -1251,6 +1418,40 @@ fn quote_arg(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The real environment, in the block shape `spawn_and_capture` builds:
+    /// case-insensitively sorted "K=V" pairs, NUL-separated, double-NUL
+    /// terminated. (A hand-made two-variable block is not enough — Windows
+    /// itself fails the spawn with ERROR_ENVVAR_NOT_FOUND.)
+    fn inherited_env_block() -> Vec<u16> {
+        let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        pairs.sort_by(|a, b| {
+            a.0.to_string_lossy()
+                .to_ascii_uppercase()
+                .cmp(&b.0.to_string_lossy().to_ascii_uppercase())
+        });
+        let mut env_block: Vec<u16> = Vec::new();
+        for (k, v) in &pairs {
+            if k.is_empty() {
+                continue;
+            }
+            env_block.extend(k.encode_wide());
+            env_block.push('=' as u16);
+            env_block.extend(v.encode_wide());
+            env_block.push(0);
+        }
+        env_block.push(0);
+        env_block
+    }
+
+    /// `System32\cmd.exe`, or `None` when this machine cannot offer it.
+    fn system32_cmd() -> Option<(PathBuf, PathBuf)> {
+        let system32 = std::env::var_os("SystemRoot")
+            .map(|r| PathBuf::from(r).join("System32"))
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+        let cmd = system32.join("cmd.exe");
+        cmd.exists().then_some((system32, cmd))
+    }
+
     #[test]
     fn quote_arg_rules() {
         assert_eq!(quote_arg("simple"), "simple");
@@ -1275,6 +1476,33 @@ mod tests {
         assert!(!is_app_package_readable(Path::new(
             r"C:\Users\someone\.cargo\bin"
         )));
+    }
+
+    /// A nested `CheckDef::cwd` must land in the nested directory ON the mapped
+    /// drive — not at the drive root. Running `cargo` at the repo root instead
+    /// of in `src-tauri/` is a check that passes by looking at nothing, which is
+    /// the worst possible failure shape for a verification tool.
+    #[test]
+    fn a_nested_check_cwd_is_re_expressed_on_the_mapped_drive() {
+        let drive = Path::new(r"S:\");
+        let root = Path::new(r"P:\projects\cimp");
+        assert_eq!(
+            cwd_under_root(drive, root, Path::new(r"P:\projects\cimp\src-tauri")),
+            PathBuf::from(r"S:\src-tauri")
+        );
+        assert_eq!(
+            cwd_under_root(drive, root, Path::new(r"P:\projects\cimp\a\b")),
+            PathBuf::from(r"S:\a\b")
+        );
+        // The root itself is the drive root.
+        assert_eq!(cwd_under_root(drive, root, root), PathBuf::from(r"S:\"));
+        // A directory that is not under the root cannot be expressed on the
+        // drive at all; the drive root is the only safe answer (and the sandbox
+        // would deny the outside path anyway).
+        assert_eq!(
+            cwd_under_root(drive, root, Path::new(r"C:\elsewhere")),
+            PathBuf::from(r"S:\")
+        );
     }
 
     #[test]
@@ -1474,27 +1702,7 @@ mod tests {
             return;
         }
         let cmdline = format!("{} /c exit 7", quote_arg(&cmd.to_string_lossy()));
-        // The real environment, in the block shape `spawn_and_capture` builds:
-        // case-insensitively sorted "K=V" pairs, NUL-separated, double-NUL
-        // terminated. (A hand-made two-variable block is not enough — Windows
-        // itself fails the spawn with ERROR_ENVVAR_NOT_FOUND.)
-        let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-        pairs.sort_by(|a, b| {
-            a.0.to_string_lossy()
-                .to_ascii_uppercase()
-                .cmp(&b.0.to_string_lossy().to_ascii_uppercase())
-        });
-        let mut env_block: Vec<u16> = Vec::new();
-        for (k, v) in &pairs {
-            if k.is_empty() {
-                continue;
-            }
-            env_block.extend(k.encode_wide());
-            env_block.push('=' as u16);
-            env_block.extend(v.encode_wide());
-            env_block.push(0);
-        }
-        env_block.push(0);
+        let env_block = inherited_env_block();
         let run = spawn_blocking_inner(
             container.as_psid() as usize,
             &[],
@@ -1503,10 +1711,12 @@ mod tests {
             wide(system32.as_os_str()),
             4096,
             Duration::from_secs(30),
+            None,
         );
         match run {
             Ok(run) => {
                 assert!(!run.timed_out, "the child hung");
+                assert!(!run.cancelled, "nothing cancelled this child");
                 assert!(!run.drains_leaked, "a drain leaked on a well-behaved child");
                 assert_eq!(run.exit_code, Some(7), "the child's exit code must survive");
             }
@@ -1520,6 +1730,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Cancellation terminates the child instead of waiting out its budget.**
+    ///
+    /// New behaviour in a Win32 wait path that has wedged twice, so it is
+    /// asserted against a real child rather than reasoned about. The child is a
+    /// pure `cmd.exe` busy loop: no network (an AppContainer without
+    /// `internetClient` would kill a `ping` before the cancel could be
+    /// observed), no filesystem outside `System32` (which needs no grant), so
+    /// the test ACL-stamps nothing and maps no drive.
+    ///
+    /// The child's own budget is 20 s and the cancel is raised at ~300 ms; the
+    /// elapsed assertion is 10 s, generous enough that a loaded CI box cannot
+    /// flake it and tight enough that "the cancel was ignored and the timeout
+    /// fired" fails. A broken cancel bounds the test at the 20 s budget rather
+    /// than hanging it.
+    #[test]
+    fn a_cancel_terminates_the_sandboxed_child_instead_of_waiting_out_its_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let Ok(container) = container_sid() else {
+            return; // environment refuses profiles; container_sid's own test says so
+        };
+        let Some((system32, cmd)) = system32_cmd() else {
+            return;
+        };
+        // A long busy loop: `rem` is a no-op, so this burns CPU inside cmd.exe
+        // and touches nothing.
+        let cmdline = format!(
+            "{} /c for /l %x in (1,1,2000000000) do @rem",
+            quote_arg(&cmd.to_string_lossy())
+        );
+
+        let cancel: super::super::CancelFlag = Arc::new(AtomicBool::new(false));
+        let raiser = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            raiser.store(true, Ordering::SeqCst);
+        });
+
+        let started = std::time::Instant::now();
+        let run = spawn_blocking_inner(
+            container.as_psid() as usize,
+            &[],
+            wide_str(&cmdline),
+            inherited_env_block(),
+            wide(system32.as_os_str()),
+            4096,
+            Duration::from_secs(20),
+            Some(cancel),
+        );
+        let elapsed = started.elapsed();
+        match run {
+            Ok(run) => {
+                assert!(
+                    run.cancelled,
+                    "the cancel flag was raised but the run did not report a cancel \
+                     (timed_out = {}, exit = {:?})",
+                    run.timed_out, run.exit_code
+                );
+                assert!(
+                    !run.timed_out,
+                    "a cancel must not be reported as a timeout — the audit runner tells the \
+                     two apart in the user-visible tool status"
+                );
+                assert_eq!(run.exit_code, Some(124), "the terminate sentinel must survive");
+                assert!(
+                    elapsed < Duration::from_secs(10),
+                    "the cancel took {elapsed:?} — the child's 20 s budget was waited out \
+                     instead of the flag being polled"
+                );
+            }
+            Err(e) => {
+                // Same rule as the composition test: only a refused container is
+                // tolerable, never a malformed attribute list.
+                assert!(
+                    !e.contains("(87)"),
+                    "the attribute list is malformed — CreateProcessW rejected it: {e}"
+                );
+            }
+        }
+    }
+
+    /// The no-cancel path keeps the single full-deadline wait `run_command` has
+    /// always had: with `None`, the poll slice IS the timeout, so the loop makes
+    /// exactly one `WaitForSingleObject` call. Asserted on the constant rather
+    /// than by instrumenting the loop, because the constant is what encodes it.
+    #[test]
+    fn the_cancel_poll_only_applies_when_a_caller_supplies_a_flag() {
+        assert!(
+            CANCEL_POLL < Duration::from_secs(1),
+            "a cancel poll slower than a second makes a cancelled scan feel hung"
+        );
+        assert!(
+            CANCEL_POLL >= Duration::from_millis(10),
+            "polling faster than 10 ms burns a blocking thread for no benefit"
+        );
     }
 
     #[test]

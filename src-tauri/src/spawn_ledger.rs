@@ -91,7 +91,12 @@ pub const LEDGER: &[SpawnSite] = &[
                  offload worker's dispatch and from Claude/OpenCode over the MCP proxy. The \
                  model chooses the root and which tools run; the scanners themselves then \
                  read the whole tree. Unlike `checks`, no shell is interposed — argv is \
-                 built in code.",
+                 built in code. SANDBOXED since the V33 increment that followed Phase A: \
+                 when `sandbox.enabled` is on, `spawn_sandboxed` in this file runs the \
+                 scanner inside the AppContainer through `sandbox::windows` and this \
+                 `Command::new` is the PLAIN arm (sandbox off, or unavailable — recorded \
+                 loudly either way). It is also the only seam that can be CANCELLED \
+                 mid-flight, which is why the engine's wait loop grew a cancel flag.",
     },
     SpawnSite {
         file: "checks/gitls.rs",
@@ -114,7 +119,13 @@ pub const LEDGER: &[SpawnSite] = &[
                  command string is a `CheckDef::cmd` the operator authored — never \
                  model-supplied, which is why shell interpretation is intended here — but \
                  WHICH check runs, and in which configured root, is chosen by the caller. \
-                 Two constructors, one per platform arm.",
+                 Two constructors, one per platform arm. SANDBOXED since the V33 increment \
+                 that followed Phase A: with `sandbox.enabled` on, `spawn_capture_sandboxed` \
+                 in this file runs the SHELL inside the AppContainer and these two \
+                 constructors are the PLAIN arm. Because the spawned program is the shell \
+                 rather than the tool, this is the seam that needed grant INFERENCE — \
+                 `check_program_hint` resolves the command's first token so `cargo`'s \
+                 install dir is granted, and `cmd.exe`'s own System32 home needs no ACE.",
     },
     SpawnSite {
         file: "graph/gitcmd.rs",
@@ -191,7 +202,6 @@ pub const LEDGER: &[SpawnSite] = &[
     SpawnSite {
         file: "sandbox/windows.rs",
         symbol: "spawn_blocking_inner",
-        spawns: "the SAME allowlisted program as `run_command`, inside an AppContainer",
         class: AgentSpawn,
         // Two occurrences, one spawn: the `use` import and the call itself. The
         // count is defined as spawn-constructor occurrences in the file's
@@ -199,14 +209,17 @@ pub const LEDGER: &[SpawnSite] = &[
         // unlike the `Command::new` sites, whose constructor is never imported
         // by that name.
         count: 2,
-        reason: "V33 Phase A. Not a new capability — it is the `run_command` seam above \
+        spawns: "the SAME program as `run_command` / `run_check` / the audit runner, inside \
+                 an AppContainer",
+        reason: "V33 Phase A, widened by the increment that followed it. Not a new \
+                 capability — it is the `run_command`, `run_check` and audit seams above \
                  running through a different OS mechanism: a bespoke `CreateProcessW` with a \
                  `SECURITY_CAPABILITIES` attribute list, because neither `std` nor `tokio` \
-                 `Command` can attach one on stable Rust. Every constraint of that seam is \
-                 applied BEFORE this function is reached (allowlist, bare-name resolution, \
-                 `CommandPolicy`, minimal env, timeout, output cap), so this row is \
-                 AgentSpawn for the same reason and must stay classified with it: if the two \
-                 ever diverge, the sandboxed path is the one a model actually reaches. \
+                 `Command` can attach one on stable Rust. Every constraint of those seams is \
+                 applied BEFORE this function is reached (allowlist / configured-check / \
+                 resolved-scanner, minimal env, timeout, output cap), so this row is \
+                 AgentSpawn for the same reason and must stay classified with them: if the \
+                 two ever diverge, the sandboxed path is the one a model actually reaches. \
                  Sandboxing this is the POINT rather than a hazard — the inverse of the \
                  `workbench/git.rs` row.",
     },

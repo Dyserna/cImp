@@ -659,14 +659,27 @@ F-7 is closed and stays closed.
   > - **Decision 16's category:** one new top-level `Sandboxing` section in
   >   Settings, sibling to `Injection protection`.
   >
-  > **Still open in Phase A, deliberately:** the layer covers `run_command`
+  > ~~**Still open in Phase A, deliberately:** the layer covers `run_command`
   > only — the `run_check` (`checks/mod.rs`) and audit (`audit/runner.rs`)
-  > agent seams still spawn plain, and both are reachable from a model over
-  > MCP. They run through a *shell*, so they need the grant table to cover the
-  > shell plus whatever it invokes; that is the next increment, not a
-  > forgotten row (their ledger entries remain `AgentSpawn`). Also unproven
-  > live: whether a real `git`/`cargo` probe survives the sandbox on a machine
-  > other than the spike's fixture — the live-verify item below.
+  > agent seams still spawn plain~~ — **CLOSED 2026-08-18 (seam increment).**
+  > All three model-reachable seams now share the one engine, switch, Events
+  > lane and wedge backstops. Mechanics that differ per seam: `run_check`
+  > spawns the shell with the check's command appended VERBATIM
+  > (`SpawnRequest::raw_tail` — `cmd /C` tails cannot go through CRT arg
+  > quoting), grant inference resolves the check command's first token via
+  > PATH, nested `CheckDef::cwd` maps through `Prepared::cwd_under`, and rows
+  > are keyed by the configured check name. The audit seam grants the
+  > container RW on `%TEMP%\cimp-audit` when (and only when) the tool's
+  > transport is a report file, cancel terminates the sandboxed child via a
+  > polled flag (the future is never abandoned — dropping `Prepared` unmaps
+  > the subst drive under a live child), and rows read `audit:<tool>`.
+  > Accepted residuals, on record: diagnostics printed by a sandboxed tool
+  > name `S:\…` paths and skip prefix-relativization (cosmetic, same class as
+  > `run_command`'s); a failed `%TEMP%` dir creation degrades the audit seam
+  > to loud-unsandboxed via the grant-ladder contract rather than refusing.
+  > Still unproven live: a real `git`/`cargo` probe under a sandboxed
+  > `run_check` on a machine other than the spike's fixture — live-verify
+  > below.
 - **Phase B — tab spawns sandboxed** (S3-gated) + hardened Claude profile in
   the overlay (decision 6 — can ship with Phase A since it is
   platform-gated config).

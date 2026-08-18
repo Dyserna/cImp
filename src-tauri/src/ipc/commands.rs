@@ -1594,13 +1594,20 @@ pub async fn checks_dismiss_suggestion(state: State<'_, AppState>) -> AppResult<
 /// config (output produced, zero diagnostics). A validation/spawn failure is
 /// folded into the result's `error` field, not returned as an `Err`, so the
 /// editor renders every outcome inline. `root` defaults to the launch directory.
+///
+/// V33: the Test button's dry run gets the SAME OS sandbox a real `run_check`
+/// gets (locked decision L2 — the boundary belongs to the seam, not to who
+/// clicked). `state` is here only to reach the live settings; the frontend's
+/// invoke arguments are unchanged.
 #[tauri::command]
 pub async fn checks_test(
+    state: State<'_, AppState>,
     root: Option<String>,
     def: crate::checks::CheckDef,
 ) -> AppResult<crate::checks::ChecksTestResult> {
     let root = resolve_graph_root(root)?;
-    Ok(crate::checks::test_check(&root, &def).await)
+    let sandbox = crate::sandbox::SandboxCfg::from_settings(&state.settings.current());
+    Ok(crate::checks::test_check(&root, &def, &sandbox).await)
 }
 
 /// V22 Phase E: validate a `regex-custom` pattern for the ChecksEditor's live

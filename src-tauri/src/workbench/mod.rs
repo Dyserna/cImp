@@ -1221,11 +1221,16 @@ impl WorkbenchService {
         slug: &str,
     ) -> AppResult<WorktreeCheckStatus> {
         let wt_path = worktree::resolve_path(root, slug)?;
-        let checks = self.settings.current().checks.clone();
+        let settings = self.settings.current();
+        let checks = settings.checks.clone();
+        // V33: the same OS boundary every other `checks::run` caller gets. The
+        // sandbox root is the WORKTREE path, because that is the tree these
+        // checks read and write.
+        let sandbox = crate::sandbox::SandboxCfg::from_settings(&settings);
         let mut reports = Vec::with_capacity(checks.len());
         let mut pass = true;
         for def in &checks {
-            match crate::checks::run(&wt_path, def, false).await {
+            match crate::checks::run(&wt_path, def, false, &sandbox).await {
                 Ok(report) => {
                     if report
                         .groups

@@ -402,23 +402,40 @@ impl AuditState {
     /// the busy check + `scanning` state transition under the lock, followed by
     /// the first `audit-status` emit.
     ///
-    /// On success returns `(to_run, root, global_timeout, cancel)` — the
-    /// enabled+applicable subset to launch, the scan root, the resolved global
-    /// wall-clock budget, and this scan's cancel token — leaving the runner in
-    /// the `scanning` state with its chips already emitted. The caller's only
-    /// remaining job is to drive `run(to_run, root, global_timeout, cancel)`
-    /// (spawned or awaited) which clears `scanning` when it finishes.
+    /// On success returns `(to_run, root, global_timeout, cancel, sandbox)` —
+    /// the enabled+applicable subset to launch, the scan root, the resolved
+    /// global wall-clock budget, this scan's cancel token, and the V33
+    /// OS-sandbox config — leaving the runner in the `scanning` state with its
+    /// chips already emitted. The caller's only remaining job is to drive
+    /// `run(..)` (spawned or awaited) which clears `scanning` when it finishes.
+    ///
+    /// The sandbox config is resolved HERE, once, from the same settings
+    /// snapshot everything else in this scan comes from: a scan that started
+    /// under one boundary must not have half its tools run under another
+    /// because the user toggled the switch mid-scan.
     ///
     /// Rejects (leaving state untouched) exactly as before: the master switch is
     /// off (enforced here, not just by tab visibility — the IPC commands and the
     /// MCP surface are registered unconditionally, so the graph/offload gating
     /// discipline applies), no tool of this category is enabled, or a scan of
     /// *either* category is already in flight (one scan at a time, globally).
+    #[allow(clippy::type_complexity)]
     fn begin_scan(
         self: &Arc<Self>,
         category: Category,
-    ) -> Result<(Vec<AuditToolConfig>, PathBuf, Duration, CancellationToken), String> {
-        let cfg = self.settings.current().code_audit;
+    ) -> Result<
+        (
+            Vec<AuditToolConfig>,
+            PathBuf,
+            Duration,
+            CancellationToken,
+            crate::sandbox::SandboxCfg,
+        ),
+        String,
+    > {
+        let settings = self.settings.current();
+        let sandbox = crate::sandbox::SandboxCfg::from_settings(&settings);
+        let cfg = settings.code_audit;
         // The master switch is enforced here, not just by tab visibility —
         // the IPC commands are registered unconditionally (the offload/graph
         // services gate the same way).
@@ -485,7 +502,13 @@ impl AuditState {
         };
         self.emit_event();
 
-        Ok((to_run, root, Duration::from_secs(global_timeout), cancel))
+        Ok((
+            to_run,
+            root,
+            Duration::from_secs(global_timeout),
+            cancel,
+            sandbox,
+        ))
     }
 
     /// Begin a scan of `category` (V25 Phase C). Only tools of that category are
@@ -495,7 +518,7 @@ impl AuditState {
     /// enabled. Returns immediately; work runs on a background task and streams
     /// progress via `audit-status`.
     pub fn start_scan(self: &Arc<Self>, category: Category) -> Result<(), String> {
-        let (to_run, root, global_timeout, cancel) = self.begin_scan(category)?;
+        let (to_run, root, global_timeout, cancel, sandbox) = self.begin_scan(category)?;
         let this = self.clone();
         tauri::async_runtime::spawn(async move {
             // V30 Phase C: `Initiator::Gui` — nobody is awaiting this scan, so
@@ -508,6 +531,7 @@ impl AuditState {
                 global_timeout,
                 cancel,
                 Initiator::Gui,
+                sandbox,
             )
             .await;
         });
@@ -534,7 +558,7 @@ impl AuditState {
         self: &Arc<Self>,
         category: Category,
     ) -> Result<AuditSnapshot, String> {
-        let (to_run, root, global_timeout, cancel) = self.begin_scan(category)?;
+        let (to_run, root, global_timeout, cancel, sandbox) = self.begin_scan(category)?;
         // V30 Phase C: `Initiator::Agent` — the snapshot returned below IS the
         // caller's tool result, so this path never pushes (it would duplicate
         // the report into the very session that asked for it).
@@ -547,6 +571,7 @@ impl AuditState {
                 global_timeout,
                 cancel,
                 Initiator::Agent,
+                sandbox,
             )
             .await)
     }
@@ -634,6 +659,7 @@ impl AuditState {
     /// awaiting caller ([`run_scan_and_wait`](Self::run_scan_and_wait)) reads
     /// *this* scan's result — never the state of a next scan that squeezes in
     /// after the flag clears. The fire-and-forget path drops it.
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         self: Arc<Self>,
         tools: Vec<AuditToolConfig>,
@@ -642,6 +668,7 @@ impl AuditState {
         global_timeout: Duration,
         cancel: CancellationToken,
         initiator: Initiator,
+        sandbox: crate::sandbox::SandboxCfg,
     ) -> AuditSnapshot {
         // V30: wall clock for the completion push's duration floor. Started
         // here (not in `begin_scan`) so it measures the scan itself, not the
@@ -694,8 +721,9 @@ impl AuditState {
                     let this = self.clone();
                     let cancel = cancel.clone();
                     let root = root.clone();
+                    let sandbox = sandbox.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        this.run_one(tool, resolved, root, git_repo, timeout, cancel)
+                        this.run_one(tool, resolved, root, git_repo, timeout, cancel, sandbox)
                             .await;
                     }));
                 }
@@ -774,6 +802,7 @@ impl AuditState {
 
     /// Run one resolved tool end to end: spawn, capture, classify, parse SARIF,
     /// record the result, emit. Independent of the other tools.
+    #[allow(clippy::too_many_arguments)]
     async fn run_one(
         self: Arc<Self>,
         tool: AuditToolConfig,
@@ -782,6 +811,7 @@ impl AuditState {
         git_repo: bool,
         timeout: Duration,
         cancel: CancellationToken,
+        sandbox: crate::sandbox::SandboxCfg,
     ) {
         let adapter = adapters::adapter(tool.id);
         let started = Instant::now();
@@ -797,7 +827,24 @@ impl AuditState {
             &tool.ruleset,
         );
 
-        let cap = spawn_and_capture(&resolved, &argv, adapter.env, &root, timeout, &cancel).await;
+        // V33: a report-file tool writes its SARIF to the absolute path that is
+        // already inside `argv`; the sandbox has to be able to let it. Derived
+        // from the SAME `report_path` value, so the granted directory and the
+        // argument cannot drift apart.
+        let full_dirs = sandbox_full_dirs(adapter.transport, report_path.as_deref());
+
+        let cap = spawn_and_capture(
+            &resolved,
+            &argv,
+            adapter.env,
+            &root,
+            timeout,
+            &cancel,
+            &sandbox,
+            tool.id.command_name(),
+            &full_dirs,
+        )
+        .await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         // SARIF is only meaningful for a completed (non-killed) child; a
@@ -852,17 +899,51 @@ impl AuditState {
     }
 }
 
+/// cImp's own scratch directory for audit report files, created if absent.
+///
+/// Split out from [`temp_report_path`] because V33 needs to name it twice: once
+/// to build the path handed to the scanner, and once to grant the sandbox
+/// container write access to it. It must EXIST before the grant — an ACE
+/// cannot be written to a directory that is not there — and this is the one
+/// place that is guaranteed.
+fn audit_report_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("cimp-audit");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// A temp SARIF report path under the app's temp scratch dir (same
 /// `std::env::temp_dir()` root as `attach`/`fsutil`). Parent is created; the
 /// file is removed after parse.
 fn temp_report_path(id: AuditToolId) -> PathBuf {
-    let dir = std::env::temp_dir().join("cimp-audit");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!(
+    audit_report_dir().join(format!(
         "{}-{}.sarif",
         id.command_name(),
         uuid::Uuid::new_v4()
     ))
+}
+
+/// **Which directories a sandboxed scanner must be able to WRITE.**
+///
+/// Exactly one rule, and it is the whole rule: a [`Transport::ReportFile`] tool
+/// is handed an absolute SARIF path under cImp's own scratch
+/// ([`audit_report_dir`]) and writes its findings there, so the container needs
+/// full access to that directory's *parent of the report path* — the same
+/// directory the path in argv points into, which is what makes the grant and
+/// the argument impossible to drift apart. A [`Transport::Stdout`] tool writes
+/// nothing outside the (already granted) project root and gets no extra grant.
+///
+/// Pure, so the rule is testable without stamping an ACL on a real directory.
+/// The grant is only ever *applied* when the plan comes back `Sandboxed`;
+/// `sandbox::plan` discards these hints when the switch is off.
+fn sandbox_full_dirs(transport: Transport, report_path: Option<&Path>) -> Vec<PathBuf> {
+    match transport {
+        Transport::ReportFile => report_path
+            .and_then(|p| p.parent())
+            .map(|d| vec![d.to_path_buf()])
+            .unwrap_or_default(),
+        Transport::Stdout => Vec::new(),
+    }
 }
 
 /// Read the tool's SARIF from wherever its adapter delivers it.
@@ -1210,6 +1291,10 @@ struct Capture {
 /// still yields what it printed. Honors the per-tool `timeout` and the scan
 /// `cancel` token — both kill the child's whole process tree (see
 /// [`kill_tree`]).
+/// V33: `sandbox` decides whether the scanner runs inside the OS boundary;
+/// `tool_name` labels this seam's `sandbox` Events rows (`audit:semgrep`), so
+/// the lane distinguishes a scanner from a `run_command` or a `run_check`.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_capture(
     resolved: &Path,
     argv: &[String],
@@ -1217,7 +1302,85 @@ async fn spawn_and_capture(
     root: &Path,
     timeout: Duration,
     cancel: &CancellationToken,
+    sandbox: &crate::sandbox::SandboxCfg,
+    tool_name: &str,
+    full_dirs: &[PathBuf],
 ) -> Capture {
+    let seam = crate::sandbox::audit_seam(tool_name);
+    // Only composed when the sandbox is on — `plan` discards it otherwise, and
+    // the plain path below keeps its historical inherit-and-force environment.
+    let base_env = if sandbox.enabled {
+        crate::sandbox::child_env::minimal_env(&|key| std::env::var_os(key))
+    } else {
+        Vec::new()
+    };
+    let plan = match tokio::time::timeout(
+        crate::sandbox::PREPARE_BACKSTOP,
+        crate::sandbox::plan(
+            sandbox,
+            &seam,
+            resolved,
+            &crate::sandbox::GrantHints {
+                // Nothing to infer: cImp resolved the scanner binary itself and
+                // `prepare` grants its install dir. A scanner that shells out to
+                // a helper relies on an already-readable dir or on the user's
+                // `extra_grant_dirs`.
+                programs: Vec::new(),
+                // …but a report-file tool must be able to WRITE its SARIF.
+                full_dirs: full_dirs.to_vec(),
+            },
+            root,
+            &base_env,
+        ),
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(_) => {
+            // Wedged BEFORE the spawn. Refuse rather than silently dropping the
+            // boundary — a scan that quietly ran unsandboxed is worse than a
+            // failed tool chip that says why.
+            crate::sandbox::record_event(
+                &seam,
+                root,
+                "wedged",
+                crate::sandbox::state_target("wedged", &crate::sandbox::program_subject(resolved)),
+                format!(
+                    "sandbox preparation for `{tool_name}` did not settle within {}s \
+                     (profile / ACL grants / drive mapping). The scanner was NOT run.",
+                    crate::sandbox::PREPARE_BACKSTOP.as_secs(),
+                ),
+                false,
+            );
+            return Capture {
+                stdout: String::new(),
+                stdout_truncated: false,
+                stderr: String::new(),
+                outcome: Outcome::SpawnError(format!(
+                    "sandbox preparation did not settle within {}s — treating as wedged \
+                     (see the sandbox lane); `{tool_name}` was not run",
+                    crate::sandbox::PREPARE_BACKSTOP.as_secs()
+                )),
+            };
+        }
+    };
+    #[cfg(windows)]
+    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
+        return spawn_sandboxed(
+            prepared, resolved, argv, env, &base_env, root, timeout, cancel, sandbox, &seam,
+        )
+        .await;
+    }
+    if let crate::sandbox::Plan::Plain(reason) = &plan {
+        // Decision 5: degradation is loud, never silent.
+        crate::sandbox::record_skip(
+            &seam,
+            reason,
+            &crate::sandbox::program_subject(resolved),
+            root,
+        );
+    }
+
     let mut cmd = tokio::process::Command::new(resolved);
     cmd.args(argv)
         .current_dir(root)
@@ -1283,6 +1446,176 @@ async fn spawn_and_capture(
     Capture {
         stdout,
         stdout_truncated,
+        stderr,
+        outcome,
+    }
+}
+
+/// V33 — run one audit scanner INSIDE the AppContainer.
+///
+/// Mirrors the plain path's contract exactly ([`Capture`], the same
+/// [`Outcome`] classification, the same per-tool timeout and output cap) and
+/// differs only in the OS boundary and — per locked decision L4 — in the
+/// environment: the C2 minimal base, then the adapter's forced variables, then
+/// the sandbox's redirections last.
+///
+/// # Cancellation
+///
+/// The scan's [`CancellationToken`] is bridged onto a
+/// [`crate::sandbox::CancelFlag`] the blocking Win32 wait loop polls. The
+/// future is NEVER abandoned on cancel — dropping it would drop the caller's
+/// `Prepared`, which unmaps the subst drive while the child is still alive.
+/// Instead the flag is raised and the same future is awaited to completion,
+/// which returns as soon as the engine has terminated the child and drained
+/// its pipes.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+async fn spawn_sandboxed(
+    prepared: &crate::sandbox::windows::Prepared,
+    resolved: &Path,
+    argv: &[String],
+    env: &[(&str, &str)],
+    base_env: &[(&str, std::ffi::OsString)],
+    root: &Path,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    sandbox: &crate::sandbox::SandboxCfg,
+    seam: &str,
+) -> Capture {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+
+    let mut child_env = crate::sandbox::child_env::ChildEnv::from_base(base_env);
+    child_env.overlay(env.iter().map(|(k, v)| (*k, *v)));
+    child_env.overlay(
+        prepared
+            .env_overrides
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone())),
+    );
+    let child_env = child_env.into_pairs();
+
+    let flag: crate::sandbox::CancelFlag = StdArc::new(AtomicBool::new(false));
+    let cwd = prepared.cwd();
+    let fut = tokio::time::timeout(
+        crate::sandbox::backstop_for(timeout),
+        crate::sandbox::windows::spawn_and_capture(
+            prepared,
+            crate::sandbox::windows::SpawnRequest {
+                program: resolved,
+                args: argv,
+                // The adapter builds argv in code; CRT quoting is correct here.
+                raw_tail: None,
+                env: &child_env,
+                cwd: &cwd,
+                cap: MAX_OUTPUT_BYTES,
+                timeout,
+                cancel: Some(StdArc::clone(&flag)),
+            },
+        ),
+    );
+    tokio::pin!(fut);
+    let settled = tokio::select! {
+        res = &mut fut => res,
+        _ = cancel.cancelled() => {
+            flag.store(true, Ordering::SeqCst);
+            // Keep awaiting the SAME future — see this function's doc.
+            (&mut fut).await
+        }
+    };
+
+    let run = match settled {
+        Err(_) => {
+            crate::sandbox::record_event(
+                seam,
+                root,
+                "wedged",
+                crate::sandbox::state_target("wedged", &crate::sandbox::program_subject(resolved)),
+                format!(
+                    "the sandboxed scanner did not settle within {}s (tool timeout {}s + {}s \
+                     settle slack). The spawn helper never returned; the child may have run, may \
+                     still be running, or may never have started — cImp cannot tell, so this row \
+                     asserts only the wedge.",
+                    crate::sandbox::backstop_for(timeout).as_secs(),
+                    timeout.as_secs(),
+                    crate::sandbox::SANDBOX_SETTLE_SLACK.as_secs(),
+                ),
+                false,
+            );
+            return Capture {
+                stdout: String::new(),
+                stdout_truncated: false,
+                stderr: String::new(),
+                outcome: Outcome::SpawnError(format!(
+                    "the sandboxed scanner did not settle within {}s — treating as wedged \
+                     (see the sandbox lane)",
+                    crate::sandbox::backstop_for(timeout).as_secs()
+                )),
+            };
+        }
+        Ok(Ok(run)) => run,
+        Ok(Err(e)) => {
+            if let Some(class) = crate::sandbox::denial_signature(None, &e, sandbox.allow_network) {
+                crate::sandbox::record_denial(
+                    seam,
+                    root,
+                    &crate::sandbox::program_subject(resolved),
+                    argv,
+                    None,
+                    &e,
+                    class,
+                    sandbox,
+                );
+            }
+            return Capture {
+                stdout: String::new(),
+                stdout_truncated: false,
+                stderr: String::new(),
+                outcome: Outcome::SpawnError(e),
+            };
+        }
+    };
+    crate::sandbox::record_sandboxed(
+        seam,
+        root,
+        &crate::sandbox::program_subject(resolved),
+        sandbox,
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    // A cancel outranks a timeout: both terminate the child, but only one of
+    // them is the user asking. `run.cancelled` is the engine's own answer, not
+    // a re-read of the token, so a token cancelled a microsecond after the
+    // child exited on its own is still reported as an exit.
+    let outcome = if run.cancelled {
+        Outcome::Cancelled
+    } else if run.timed_out {
+        Outcome::TimedOut
+    } else {
+        if let Some(class) =
+            crate::sandbox::denial_signature(run.exit_code, &stderr, sandbox.allow_network)
+        {
+            crate::sandbox::record_denial(
+                seam,
+                root,
+                &crate::sandbox::program_subject(resolved),
+                argv,
+                run.exit_code,
+                &stderr,
+                class,
+                sandbox,
+            );
+        }
+        Outcome::Exited(run.exit_code)
+    };
+    Capture {
+        stdout,
+        // A leaked drain means the capture is INCOMPLETE, which for a
+        // stdout-transport scanner is exactly what `stdout_truncated` exists to
+        // say: `finalize_outcome` then refuses to read the SARIF as whole
+        // rather than reporting a clean bill from a half-read report.
+        stdout_truncated: run.stdout_capped || run.drains_leaked,
         stderr,
         outcome,
     }
@@ -2070,6 +2403,13 @@ mod tests {
             &std::env::temp_dir(),
             Duration::from_millis(300),
             &cancel,
+            // Deliberately UNsandboxed: this asserts the timeout/kill contract, and
+            // routing it through the AppContainer would ACL-stamp the developer's
+            // real toolchain dirs as a side effect of running the suite (the
+            // `run_command` precedent).
+            &crate::sandbox::SandboxCfg::disabled(),
+            "test-sleeper",
+            &[],
         )
         .await;
         // Returns promptly (child killed), not after the ~30s sleep.
@@ -2101,6 +2441,9 @@ mod tests {
             &std::env::temp_dir(),
             Duration::from_secs(60),
             &cancel,
+            &crate::sandbox::SandboxCfg::disabled(),
+            "test-sleeper",
+            &[],
         )
         .await;
         assert!(
@@ -2110,6 +2453,139 @@ mod tests {
         assert!(
             matches!(cap.outcome, Outcome::Cancelled),
             "expected Cancelled"
+        );
+    }
+
+    // ── V33 — the sandboxed audit seam ────────────────────────────────────
+
+    /// The backstop relation for this seam. An audit tool's budget is the
+    /// user's `code_audit.timeout_secs` (or a per-tool override), so the
+    /// relation is asserted across the range rather than on one constant: if
+    /// the caller-side deadline ever failed to outlast the child's, an
+    /// ordinary slow semgrep run would be reported as a *wedge*, which is the
+    /// one row in that lane that is supposed to mean cImp itself is broken.
+    #[test]
+    fn the_audit_sandbox_backstop_always_exceeds_the_tool_timeout() {
+        for secs in [1u64, 60, 300, 1800, 7200] {
+            let child = Duration::from_secs(secs);
+            let backstop = crate::sandbox::backstop_for(child);
+            assert!(
+                backstop > child,
+                "backstop {backstop:?} must exceed the tool timeout {child:?}"
+            );
+            assert_eq!(backstop, child + crate::sandbox::SANDBOX_SETTLE_SLACK);
+        }
+    }
+
+    /// **The report directory is granted exactly when a tool writes one.**
+    ///
+    /// A `Transport::ReportFile` scanner (gitleaks, cppcheck, dotnet-analyzers)
+    /// is handed an absolute SARIF path in its argv and writes there; without a
+    /// write grant on that directory the sandbox turns three working tools into
+    /// denial rows. A `Transport::Stdout` scanner writes nothing outside the
+    /// already-granted project root and must get NO extra grant — every entry
+    /// here widens the boundary.
+    ///
+    /// Pure-logic only: no ACL is stamped, and the grant is applied solely on
+    /// the `Sandboxed` arm (`sandbox::plan` discards the hints when the switch
+    /// is off, which `sandbox::tests::disabled_cfg_yields_off_user` pins).
+    #[test]
+    fn only_a_report_file_tool_gets_its_report_directory_granted() {
+        let report = audit_report_dir().join("gitleaks-1234.sarif");
+
+        // The write grant is the report path's OWN parent — derived from the
+        // same value that goes into argv, so the granted directory and the
+        // argument cannot drift apart.
+        let granted = sandbox_full_dirs(Transport::ReportFile, Some(&report));
+        assert_eq!(granted, vec![audit_report_dir()]);
+        assert_eq!(
+            granted[0],
+            report.parent().unwrap(),
+            "the granted dir must be the parent of the path handed to the scanner"
+        );
+        // It is cImp's own scratch, NOT the user's project tree.
+        assert!(granted[0].starts_with(std::env::temp_dir()));
+        assert!(granted[0].is_dir(), "the grant target must exist beforehand");
+
+        // A stdout-transport tool gets nothing.
+        assert!(sandbox_full_dirs(Transport::Stdout, Some(&report)).is_empty());
+        assert!(sandbox_full_dirs(Transport::Stdout, None).is_empty());
+        // …and neither does a report-file tool with no path (defensive: the
+        // runner always pairs the two, and an empty grant is the safe answer).
+        assert!(sandbox_full_dirs(Transport::ReportFile, None).is_empty());
+
+        // Cross-check against the real adapter table: every report-file adapter
+        // asks for a grant, every stdout one does not. A hand-listed pair would
+        // rot the moment a tool changed transport.
+        for id in [
+            AuditToolId::Gitleaks,
+            AuditToolId::Cppcheck,
+            AuditToolId::DotnetAnalyzers,
+            AuditToolId::Semgrep,
+            AuditToolId::OsvScanner,
+            AuditToolId::Typos,
+        ] {
+            let adapter = adapters::adapter(id);
+            let path = matches!(adapter.transport, Transport::ReportFile)
+                .then(|| temp_report_path(id));
+            let dirs = sandbox_full_dirs(adapter.transport, path.as_deref());
+            assert_eq!(
+                dirs.is_empty(),
+                adapter.transport == Transport::Stdout,
+                "{} asks for the wrong grant for its transport",
+                id.command_name()
+            );
+            // …and the granted directory really is where the ARGUMENT points.
+            // The sandboxed path passes argv through `SpawnRequest::args` with
+            // no `raw_tail`, so each element is CRT-quoted and the scanner's own
+            // runtime parses the identical string back: the absolute report path
+            // reaches the tool unmangled, spaces and all.
+            if let Some(path) = &path {
+                let argv = adapter.full_argv(Path::new("/proj"), Some(path), true, &[], "");
+                let rendered = path.to_string_lossy().into_owned();
+                assert!(
+                    argv.iter().any(|a| a.contains(&rendered)),
+                    "{}'s argv does not carry the report path it will be graded on: {argv:?}",
+                    id.command_name()
+                );
+                assert_eq!(dirs, vec![path.parent().unwrap().to_path_buf()]);
+            }
+        }
+    }
+
+    /// An audit tool's `sandbox`-lane rows name the SCANNER, not just "an
+    /// audit" — the lane is scanned by its source column, and `audit:semgrep`
+    /// hitting the boundary is a different fact from `audit:gitleaks` doing so.
+    /// Each label is also distinct from the other two seams, which is what
+    /// keeps `run_command`'s and `run_check`'s rows apart from these.
+    ///
+    /// The label is derived from `command_name`, so the Security `semgrep` and
+    /// the Quality `semgrep` share one — deliberately: it is the same binary
+    /// under the same grants, and the boundary cannot tell them apart either.
+    #[test]
+    fn audit_rows_name_the_scanner_and_not_just_the_seam() {
+        let mut seen = std::collections::BTreeSet::new();
+        for id in [
+            AuditToolId::OsvScanner,
+            AuditToolId::Gitleaks,
+            AuditToolId::Semgrep,
+            AuditToolId::Eslint,
+            AuditToolId::DotnetAnalyzers,
+        ] {
+            let seam = crate::sandbox::audit_seam(id.command_name());
+            assert!(
+                seam.starts_with("audit:") && seam.contains(id.command_name()),
+                "an audit seam label must name its scanner: {seam}"
+            );
+            assert_ne!(seam, crate::sandbox::SEAM_RUN_COMMAND);
+            assert_ne!(seam, crate::sandbox::SEAM_RUN_CHECK);
+            seen.insert(seam);
+        }
+        assert_eq!(seen.len(), 5, "distinct binaries must get distinct labels");
+        // …and the documented exception: one binary, one label.
+        assert_eq!(
+            crate::sandbox::audit_seam(AuditToolId::Semgrep.command_name()),
+            crate::sandbox::audit_seam(AuditToolId::SemgrepQuality.command_name()),
         );
     }
 
@@ -2123,6 +2599,9 @@ mod tests {
             &std::env::temp_dir(),
             Duration::from_secs(5),
             &cancel,
+            &crate::sandbox::SandboxCfg::disabled(),
+            "test-missing",
+            &[],
         )
         .await;
         assert!(matches!(cap.outcome, Outcome::SpawnError(_)));

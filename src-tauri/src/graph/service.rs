@@ -3348,9 +3348,17 @@ impl GraphService {
 
         let root_buf = root.to_path_buf();
         let defs = settings.checks.clone();
+        // V33: the auto-check runs the project's configured check commands
+        // after a model edited a file, so it gets the same OS boundary an
+        // explicit `run_check` gets. Resolved from the snapshot already read
+        // above, not re-read inside the task.
+        let sandbox = crate::sandbox::SandboxCfg::from_settings(&settings);
         let this = self.clone();
-        let mut handle =
-            tokio::spawn(async move { this.auto_check_runner.run(&root_buf, &defs).await });
+        let mut handle = tokio::spawn(async move {
+            this.auto_check_runner
+                .run(&root_buf, &defs, &sandbox)
+                .await
+        });
 
         tokio::select! {
             res = &mut handle => {

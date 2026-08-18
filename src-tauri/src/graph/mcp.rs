@@ -1662,7 +1662,12 @@ async fn run_check_inner(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let max_rows = limits(settings).0;
-    crate::checks::run(root, def, changed_only)
+    // V33: the OS sandbox for this seam, derived from the SAME settings
+    // snapshot that selected the check. Every `run_check` caller reaches here
+    // (MCP proxy, offload worker, IPC), so this is the one place the boundary
+    // has to be resolved — decision 17's one switch, applied at the seam.
+    let sandbox = crate::sandbox::SandboxCfg::from_settings(settings);
+    crate::checks::run(root, def, changed_only, &sandbox)
         .await
         .map(|report| fmt_check_report(&report, max_rows))
         // V12 review: a check that fails to spawn/run must read as visibly

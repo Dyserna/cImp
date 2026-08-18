@@ -3,10 +3,9 @@
 //! command runs only if its program name matches `command_allowlist`. Run
 //! in the first allowed root, time-bounded, output captured and truncated,
 //! and — since V33 contract C2 — with an environment built up from an explicit
-//! allowlist ([`CHILD_ENV`]) rather than inherited from cImp.
+//! allowlist ([`crate::sandbox::child_env::CHILD_ENV`]) rather than inherited
+//! from cImp.
 
-#[cfg(windows)]
-use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
@@ -16,6 +15,7 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::offload::openai::ToolDef;
+use crate::sandbox::child_env::minimal_env;
 use crate::settings::CommandPolicy;
 
 use super::ToolCtx;
@@ -23,42 +23,23 @@ use super::ToolCtx;
 const TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
-/// How much longer than [`TIMEOUT`] the sandboxed path is given to *settle*
-/// after the child's own deadline has passed: terminate the child, wait for the
-/// job to reap the tree, drain both pipes (up to `DRAIN_GRACE +
-/// DRAIN_CANCEL_GRACE` each, worst case ~14 s serial) and return.
-#[cfg_attr(not(windows), allow(dead_code))]
-const SANDBOX_SETTLE_SLACK: Duration = Duration::from_secs(30);
-/// The caller-side backstop on `spawn_and_capture` (2026-08-18 incident).
-///
-/// The sandboxed path is a hand-rolled Win32 dance on a blocking thread; if any
-/// step of it ever fails to return, the tool call never completes, the offload
-/// worker's single slot stays pinned and NOTHING is recorded — which is exactly
-/// how the first live sandboxed `run_command` spent 22 minutes invisible. The
-/// engine bounds its own internals now, but a backstop that exists only inside
-/// the thing it is backstopping is not a backstop.
-///
-/// Derived from [`TIMEOUT`] in ONE expression so the two cannot drift apart in
-/// a later edit; `sandbox_backstop_exceeds_the_child_timeout` pins the relation.
+/// The caller-side backstop on `spawn_and_capture` for THIS seam's fixed
+/// [`TIMEOUT`] (2026-08-18 incident). The rule, the slack and the reasoning are
+/// [`crate::sandbox::backstop_for`]'s — every sandboxed seam derives its own
+/// backstop from its own child timeout through that one function, so no two of
+/// them can drift apart. `sandbox_backstop_exceeds_the_child_timeout` pins the
+/// relation here.
 ///
 /// `allow(dead_code)` off Windows for the same reason `sandbox::mod`'s helpers
 /// carry it: the only non-test consumer is the Windows AppContainer path.
 #[cfg_attr(not(windows), allow(dead_code))]
-const SANDBOX_BACKSTOP: Duration =
-    Duration::from_secs(TIMEOUT.as_secs() + SANDBOX_SETTLE_SLACK.as_secs());
+const SANDBOX_BACKSTOP: Duration = crate::sandbox::backstop_for(TIMEOUT);
 
-/// The caller-side backstop on sandbox *preparation* (2026-08-18, second
-/// incident of the same day). The first wedge taught us to bound
-/// `spawn_and_capture` — but preparation (profile creation, ACL grants, drive
-/// mapping) ran unbounded ahead of it on a blocking thread, and a deadlock in
-/// `map_drive` pinned the worker slot forever with the grant row as the only
-/// trace. Same rule as [`SANDBOX_BACKSTOP`]: a path whose only deadline lives
-/// inside itself has no deadline at all.
-///
-/// Generous, because a wrong elapse here refuses a healthy sandbox: first-time
-/// ACL stamps on a toolchain directory and AppContainer profile creation can
-/// take seconds each on a slow disk or with sluggish SID lookups.
-const PREPARE_BACKSTOP: Duration = Duration::from_secs(60);
+/// The caller-side backstop on sandbox *preparation* — shared, because
+/// preparation costs the same on every seam (profile creation, ACL grants,
+/// drive mapping) and is bounded for the same reason. See
+/// [`crate::sandbox::PREPARE_BACKSTOP`].
+const PREPARE_BACKSTOP: Duration = crate::sandbox::PREPARE_BACKSTOP;
 
 #[derive(Deserialize)]
 struct Args {
@@ -233,234 +214,12 @@ fn dangerous_args(command: &str, args: &[String], policies: &[CommandPolicy]) ->
 }
 
 // ── V33 contract C2 — the child's minimal environment ──────────────────────
-
-/// One environment variable a `run_command` child is allowed to see, with the
-/// reason it is granted.
-struct EnvGrant {
-    name: &'static str,
-    /// Read by review and by `the_child_env_table_is_well_formed`, not by the
-    /// spawn path — the reason is the point of the row, so it lives with the
-    /// row rather than in a comment that can drift away from it.
-    #[allow(dead_code)]
-    why: &'static str,
-}
-
-/// The complete environment a `run_command` child gets, built up from nothing.
-///
-/// **The two-sided bar this table has to clear (V33 spec decision 10).**
-///
-/// 1. *No secret cImp holds may reach the child.* cImp inherits the shell that
-///    launched it, so its process environment routinely carries API keys
-///    (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, …), CI
-///    credentials and OAuth material, and it adds its own loopback bearer token
-///    to the environments it composes. Until this table existed the child got
-///    **all of it**: there was no `env_clear`, no `env_remove`, and the only
-///    manipulation was the additive per-`CommandPolicy` grant below. A model
-///    that got one allowlisted program to print its own environment read every
-///    one of those.
-/// 2. *`git log`, a `cargo` probe and an `npm` probe must still work* (V33
-///    live-verify item 7). That is why the toolchains' own state pointers are
-///    here — `HOME`/`USERPROFILE`, `CARGO_HOME`, `RUSTUP_HOME`, the npm cache
-///    and prefix, `PATH`, and the Windows plumbing (`SystemRoot`, `COMSPEC`,
-///    `PATHEXT`) without which a Windows child cannot even load its DLLs.
-///    Handing a tool a pointer to its OWN state directory is not a hole (spec
-///    decision 3): the child runs as the same user and can read that directory
-///    regardless. The win is everything NOT granted.
-///
-/// **Build up, never inherit-and-subtract.** A denylist of secret-shaped names
-/// is a guess about naming, and the spec rejects it: the next key with an
-/// unguessed name walks straight through. Everything absent from this table is
-/// absent from the child, including names nobody has thought of yet.
-///
-/// **Deliberate omissions, so a later reader does not "fix" them:**
-/// * `HTTP_PROXY`/`HTTPS_PROXY` — proxy URLs routinely embed credentials
-///   (`http://user:pass@host`). A probe that needs the network through an
-///   authenticating proxy is a `CommandPolicy` env grant, not a blanket one.
-/// * `SSL_CERT_FILE`/`SSL_CERT_DIR`, `NODE_OPTIONS`, `NODE_PATH`,
-///   `RUSTC_WRAPPER`, `RUSTFLAGS`, `CARGO_BUILD_*` — each names a file or flag
-///   set the child would then load or execute. None is needed by a read-only
-///   probe.
-/// * `GIT_*` — not inheriting these is a security *gain*: an ambient
-///   `GIT_EXEC_PATH`/`GIT_SSH_COMMAND` in cImp's environment used to reach the
-///   child and could re-open exactly what the `git` `CommandPolicy` closes by
-///   denying `--exec-path`. The policy's own `GIT_PAGER`/`GIT_CONFIG_NOSYSTEM`/
-///   … are applied after this table and are unaffected.
-/// * `USERNAME`/`USER`/`COMPUTERNAME` — identity, not state; no probe needs it.
-const CHILD_ENV: &[EnvGrant] = &[
-    // ── process plumbing ───────────────────────────────────────────────────
-    EnvGrant {
-        name: "PATH",
-        why: "the child's OWN program resolution — git finding its libexec helpers, \
-              cargo finding rustc, npm finding node. cImp resolves the top-level program \
-              itself, but a stripped PATH breaks everything the child then runs.",
-    },
-    EnvGrant {
-        name: "PATHEXT",
-        why: "Windows: which extensions count as executable. Without it a child that \
-              shells out cannot find `.cmd`/`.bat` shims — which is what `npm` is.",
-    },
-    EnvGrant {
-        name: "COMSPEC",
-        why: "Windows: the command processor used to run `.cmd`/`.bat` shims.",
-    },
-    EnvGrant {
-        name: "SystemRoot",
-        why: "Windows: system DLL loading (WinSock in particular). A Windows child with \
-              no SystemRoot fails to start for reasons that look nothing like an env bug.",
-    },
-    EnvGrant {
-        name: "SystemDrive",
-        why: "Windows: the companion to SystemRoot; some toolchains build paths from it.",
-    },
-    EnvGrant {
-        name: "windir",
-        why: "Windows: the older spelling of SystemRoot, still read by parts of the CRT.",
-    },
-    EnvGrant {
-        name: "TEMP",
-        why: "Windows scratch directory — cargo and npm both write temp files.",
-    },
-    EnvGrant {
-        name: "TMP",
-        why: "Windows scratch directory (the other spelling).",
-    },
-    EnvGrant {
-        name: "TMPDIR",
-        why: "Unix scratch directory.",
-    },
-    EnvGrant {
-        name: "NUMBER_OF_PROCESSORS",
-        why: "Windows: job-count default for cargo/npm. Not sensitive; omitting it makes \
-              probes serial on some tools.",
-    },
-    EnvGrant {
-        name: "PROCESSOR_ARCHITECTURE",
-        why: "Windows: how toolchains pick their native/arm64 shims.",
-    },
-    EnvGrant {
-        name: "OS",
-        why: "Windows: read by npm's shell shims to branch on platform.",
-    },
-    // ── per-user state directories ─────────────────────────────────────────
-    EnvGrant {
-        name: "HOME",
-        why: "Unix home, and Git for Windows' preferred home. The tool's own config lives \
-              here; the child can read it either way (same user), so this is a pointer, \
-              not an escalation (spec decision 3).",
-    },
-    EnvGrant {
-        name: "USERPROFILE",
-        why: "Windows home — where `.gitconfig`, `.cargo` and `.npmrc` live.",
-    },
-    EnvGrant {
-        name: "HOMEDRIVE",
-        why: "Windows: Git for Windows composes HOME from HOMEDRIVE+HOMEPATH when HOME is \
-              unset.",
-    },
-    EnvGrant {
-        name: "HOMEPATH",
-        why: "Windows: the other half of the HOMEDRIVE+HOMEPATH pair.",
-    },
-    EnvGrant {
-        name: "APPDATA",
-        why: "Windows: npm's global prefix (`%APPDATA%\\npm`) and several tools' config.",
-    },
-    EnvGrant {
-        name: "LOCALAPPDATA",
-        why: "Windows: npm's cache and cargo's fallback data dir.",
-    },
-    EnvGrant {
-        name: "ProgramData",
-        why: "Windows: machine-wide toolchain installs (a system-wide Node lives here).",
-    },
-    EnvGrant {
-        name: "ProgramFiles",
-        why: "Windows: where Git/Node are installed; tools compose absolute paths from it.",
-    },
-    EnvGrant {
-        name: "ProgramFiles(x86)",
-        why: "Windows: the 32-bit install root, for the same reason.",
-    },
-    EnvGrant {
-        name: "XDG_CACHE_HOME",
-        why: "Unix: npm/cargo cache location when the user moved it off ~/.cache.",
-    },
-    EnvGrant {
-        name: "XDG_CONFIG_HOME",
-        why: "Unix: config location when the user moved it off ~/.config.",
-    },
-    EnvGrant {
-        name: "XDG_DATA_HOME",
-        why: "Unix: data location when the user moved it off ~/.local/share.",
-    },
-    // ── toolchain state pointers (live-verify item 7) ──────────────────────
-    EnvGrant {
-        name: "CARGO_HOME",
-        why: "Where the registry index, the crate cache and the cargo binaries live. A \
-              `cargo` probe with the wrong CARGO_HOME re-downloads the world or fails \
-              offline.",
-    },
-    EnvGrant {
-        name: "RUSTUP_HOME",
-        why: "Where the toolchains live. Without it the rustup shim cannot find rustc, so \
-              every cargo probe fails.",
-    },
-    EnvGrant {
-        name: "RUSTUP_TOOLCHAIN",
-        why: "Which toolchain the shim selects; a project pinned by env rather than by \
-              rust-toolchain.toml needs it to resolve the same way cImp does.",
-    },
-    EnvGrant {
-        name: "npm_config_cache",
-        why: "npm's cache directory (lowercase is npm's documented spelling).",
-    },
-    EnvGrant {
-        name: "npm_config_prefix",
-        why: "npm's global install prefix — where its own binaries resolve from.",
-    },
-    EnvGrant {
-        name: "NPM_CONFIG_CACHE",
-        why: "The uppercase spelling of the cache var, which npm also honors.",
-    },
-    EnvGrant {
-        name: "NPM_CONFIG_PREFIX",
-        why: "The uppercase spelling of the prefix var.",
-    },
-    // ── output shape ───────────────────────────────────────────────────────
-    EnvGrant {
-        name: "LANG",
-        why: "Locale. Parsers downstream read the child's text; a missing locale silently \
-              changes encoding on Unix.",
-    },
-    EnvGrant {
-        name: "LC_ALL",
-        why: "Locale override, same reason.",
-    },
-    EnvGrant {
-        name: "LC_CTYPE",
-        why: "Character-class locale, same reason.",
-    },
-    EnvGrant {
-        name: "TZ",
-        why: "Timezone — `git log` renders author dates with it, and a probe that reports \
-              times in a different zone than the rest of the app is a support ticket.",
-    },
-];
-
-/// Compose the child's environment from [`CHILD_ENV`], reading each name
-/// through `lookup`. Names absent from cImp's own environment are simply not
-/// set (the table is a *ceiling*, not a requirement list); a present-but-empty
-/// value is passed through unchanged.
-///
-/// `lookup` is a parameter rather than a direct `std::env::var_os` call so the
-/// tests can drive a synthetic environment without mutating the test process's
-/// own (a process-wide `set_var` under a 32-thread suite is its own hazard).
-fn minimal_env(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<(&'static str, OsString)> {
-    CHILD_ENV
-        .iter()
-        .filter_map(|g| lookup(g.name).map(|v| (g.name, v)))
-        .collect()
-}
+//
+// The table itself lives in [`crate::sandbox::child_env`] since the V33
+// increment that sandboxed the `run_check` and audit seams: those children are
+// the same threat class, and a security allowlist with two copies has none.
+// What stays here is this seam's USE of it — `apply_minimal_env`, which is
+// `tokio::process::Command`-shaped and therefore plain-path-only.
 
 /// Give `cmd` the minimal environment: clear whatever it inherited, then set
 /// exactly the allowlisted names.
@@ -539,7 +298,17 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .unwrap_or_default();
     let plan = match tokio::time::timeout(
         PREPARE_BACKSTOP,
-        crate::sandbox::plan(&ctx.sandbox, &program, &cwd, &base_env),
+        crate::sandbox::plan(
+            &ctx.sandbox,
+            crate::sandbox::SEAM_RUN_COMMAND,
+            &program,
+            // Nothing extra: the model named the program, cImp resolved it, its
+            // install dir is granted by `prepare` itself, and everything it
+            // writes goes in the (already granted) root.
+            &crate::sandbox::GrantHints::default(),
+            &cwd,
+            &base_env,
+        ),
     )
     .await
     {
@@ -549,9 +318,10 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
             // must not fall back to a plain spawn — degrading the boundary
             // silently is worse than refusing (decision 5, loudly).
             crate::sandbox::record_event(
+                crate::sandbox::SEAM_RUN_COMMAND,
                 &cwd,
                 "wedged",
-                crate::sandbox::state_target("wedged", &program),
+                crate::sandbox::state_target("wedged", &crate::sandbox::program_subject(&program)),
                 format!(
                     "sandbox preparation for `{}` did not settle within {}s \
                      (profile / ACL grants / drive mapping). The command was NOT run — \
@@ -587,7 +357,12 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     if let crate::sandbox::Plan::Plain(reason) = &plan {
         // Decision 5: degradation is loud, never silent. Deduplicated by reason
         // per session inside `record_skip`, so this cannot flood its lane.
-        crate::sandbox::record_skip(reason, &program, &cwd);
+        crate::sandbox::record_skip(
+            crate::sandbox::SEAM_RUN_COMMAND,
+            reason,
+            &crate::sandbox::program_subject(&program),
+            &cwd,
+        );
     }
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args.args)
@@ -760,21 +535,19 @@ async fn run_sandboxed(
     ctx: &ToolCtx,
     root: &std::path::Path,
 ) -> Result<String, String> {
-    // Same composition order as the plain path: minimal env first, then the
-    // program's policy env, then the sandbox's own redirections last — those
-    // point at the mapped drive and must win over an inherited TEMP/HOME.
-    let mut env: Vec<(OsString, OsString)> = base_env
-        .iter()
-        .map(|(k, v)| (OsString::from(*k), v.clone()))
-        .collect();
-    for (k, v) in policy_env {
-        env.retain(|(ek, _)| ek != OsStr::new(k.as_str()));
-        env.push((OsString::from(k), v.clone()));
-    }
-    for (k, v) in &prepared.env_overrides {
-        env.retain(|(ek, _)| ek != OsStr::new(k.as_str()));
-        env.push((OsString::from(k), v.clone()));
-    }
+    // Same composition order as the plain path, through the one shared
+    // composer: minimal env first, then the program's policy env, then the
+    // sandbox's own redirections last — those point at the mapped drive and
+    // must win over an inherited TEMP/HOME.
+    let mut env = crate::sandbox::child_env::ChildEnv::from_base(base_env);
+    env.overlay(policy_env.iter().map(|(k, v)| (k.as_str(), v.clone())));
+    env.overlay(
+        prepared
+            .env_overrides
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone())),
+    );
+    let env = env.into_pairs();
 
     // The backstop (2026-08-18): the engine bounds its own waits now, but a
     // path whose only deadline lives inside itself has no deadline at all. If
@@ -784,12 +557,18 @@ async fn run_sandboxed(
         SANDBOX_BACKSTOP,
         crate::sandbox::windows::spawn_and_capture(
             prepared,
-            program,
-            &args.args,
-            &env,
-            &prepared.cwd(),
-            MAX_OUTPUT_BYTES,
-            TIMEOUT,
+            crate::sandbox::windows::SpawnRequest {
+                program,
+                args: &args.args,
+                // This seam builds argv itself, so the CRT quoting rules apply.
+                raw_tail: None,
+                env: &env,
+                cwd: &prepared.cwd(),
+                cap: MAX_OUTPUT_BYTES,
+                timeout: TIMEOUT,
+                // No cancel: this seam has no cancel channel and never had one.
+                cancel: None,
+            },
         ),
     )
     .await;
@@ -799,9 +578,10 @@ async fn run_sandboxed(
             // night this was diagnosed it showed nothing at all, because every
             // row was minted downstream of a call that never returned.
             crate::sandbox::record_event(
+                crate::sandbox::SEAM_RUN_COMMAND,
                 root,
                 "wedged",
-                crate::sandbox::state_target("wedged", program),
+                crate::sandbox::state_target("wedged", &crate::sandbox::program_subject(program)),
                 format!(
                     "`{}` did not settle within {}s (child timeout {}s + {}s settle slack). \
                      The sandboxed spawn helper never returned; the child may have run, may \
@@ -811,7 +591,7 @@ async fn run_sandboxed(
                     args.command,
                     SANDBOX_BACKSTOP.as_secs(),
                     TIMEOUT.as_secs(),
-                    SANDBOX_SETTLE_SLACK.as_secs(),
+                    crate::sandbox::SANDBOX_SETTLE_SLACK.as_secs(),
                 ),
                 false,
             );
@@ -831,8 +611,9 @@ async fn run_sandboxed(
             if let Some(class) = crate::sandbox::denial_signature(None, &e, ctx.sandbox.allow_network)
             {
                 crate::sandbox::record_denial(
+                    crate::sandbox::SEAM_RUN_COMMAND,
                     root,
-                    program,
+                    &crate::sandbox::program_subject(program),
                     &args.args,
                     None,
                     &e,
@@ -845,7 +626,12 @@ async fn run_sandboxed(
     };
     // The spawn succeeded, so the boundary is real for this program: say so
     // once, positively. Deduped per program inside `record_sandboxed`.
-    crate::sandbox::record_sandboxed(root, program, &ctx.sandbox);
+    crate::sandbox::record_sandboxed(
+        crate::sandbox::SEAM_RUN_COMMAND,
+        root,
+        &crate::sandbox::program_subject(program),
+        &ctx.sandbox,
+    );
 
     if run.timed_out {
         // No denial row: a hang matches no access-denial signature, and
@@ -863,8 +649,9 @@ async fn run_sandboxed(
         crate::sandbox::denial_signature(run.exit_code, &stderr_text, ctx.sandbox.allow_network)
     {
         crate::sandbox::record_denial(
+            crate::sandbox::SEAM_RUN_COMMAND,
             root,
-            program,
+            &crate::sandbox::program_subject(program),
             &args.args,
             run.exit_code,
             &stderr_text,
@@ -962,11 +749,11 @@ mod tests {
         // reap wait + two serial drain collections (5 s grace + 2 s cancel
         // grace each).
         assert!(
-            SANDBOX_SETTLE_SLACK >= Duration::from_secs(16),
+            crate::sandbox::SANDBOX_SETTLE_SLACK >= Duration::from_secs(16),
             "settle slack {:?} is under the engine's worst-case settle time",
-            SANDBOX_SETTLE_SLACK
+            crate::sandbox::SANDBOX_SETTLE_SLACK
         );
-        assert_eq!(SANDBOX_BACKSTOP, TIMEOUT + SANDBOX_SETTLE_SLACK);
+        assert_eq!(SANDBOX_BACKSTOP, TIMEOUT + crate::sandbox::SANDBOX_SETTLE_SLACK);
     }
 
     #[test]
@@ -1163,7 +950,9 @@ mod tests {
     /// that way everywhere; on Unix the child sees exactly the bytes we wrote,
     /// so the looser comparison costs nothing.
     fn is_allowlisted(name: &str) -> bool {
-        CHILD_ENV.iter().any(|g| g.name.eq_ignore_ascii_case(name))
+        crate::sandbox::child_env::CHILD_ENV
+            .iter()
+            .any(|g| g.name.eq_ignore_ascii_case(name))
     }
 
     /// Marker for the child dump below. Built with `concat!` so a grep for the
@@ -1344,7 +1133,7 @@ mod tests {
         // Every name this process actually has, and that the table grants, must
         // be present in the child — the table is a ceiling, and nothing between
         // the table and the spawn may drop a granted name.
-        for grant in CHILD_ENV {
+        for grant in crate::sandbox::child_env::CHILD_ENV {
             if std::env::var_os(grant.name).is_some() {
                 assert!(
                     get(grant.name).is_some(),
@@ -1425,62 +1214,5 @@ mod tests {
         } else {
             println!("SKIPPED the `cargo` leg: no cargo on PATH");
         }
-    }
-
-    /// The table itself: no duplicates, every row carries a reason, and the
-    /// composition drops nothing and invents nothing.
-    #[test]
-    fn the_child_env_table_is_well_formed() {
-        // Exact-name duplicates only. The `npm_config_*` / `NPM_CONFIG_*` pairs
-        // differ ONLY in case and are deliberate: Unix lookups are
-        // case-sensitive, so a user who exported the uppercase spelling would
-        // be missed by a lowercase-only row (and vice versa). On Windows both
-        // rows resolve to the same variable and the second `cmd.env` write is a
-        // no-op with the same value.
-        let mut seen: Vec<&str> = Vec::new();
-        for grant in CHILD_ENV {
-            assert!(
-                !seen.contains(&grant.name),
-                "`{}` is listed twice in CHILD_ENV",
-                grant.name
-            );
-            seen.push(grant.name);
-            assert!(
-                grant.why.len() > 20,
-                "`{}` is granted without a reason — the table is reviewed like the V32 \
-                 class table, and an unreasoned row cannot be reviewed",
-                grant.name
-            );
-            assert!(
-                !grant.name.is_empty() && !grant.name.contains('='),
-                "`{}` is not a usable variable name",
-                grant.name
-            );
-        }
-        assert!(
-            CHILD_ENV.iter().any(|g| g.name == "PATH"),
-            "dropping PATH from the table breaks every child; it must stay granted"
-        );
-
-        // Composition: only allowlisted names come out, absent names are
-        // skipped rather than set empty, and a name outside the table can never
-        // be produced no matter what the lookup answers.
-        let composed = minimal_env(&|k| match k {
-            "PATH" => Some(OsString::from("/usr/bin")),
-            "LANG" => Some(OsString::from("")),
-            _ => None,
-        });
-        assert_eq!(composed.len(), 2, "only what the lookup answered: {composed:?}");
-        assert!(composed.iter().all(|(k, _)| is_allowlisted(k)));
-        assert!(composed
-            .iter()
-            .any(|(k, v)| *k == "LANG" && v.is_empty()));
-        // A lookup that answers EVERYTHING still yields exactly the table.
-        let greedy = minimal_env(&|_| Some(OsString::from("x")));
-        assert_eq!(
-            greedy.len(),
-            CHILD_ENV.len(),
-            "the table is the ceiling; nothing outside it can be produced"
-        );
     }
 }

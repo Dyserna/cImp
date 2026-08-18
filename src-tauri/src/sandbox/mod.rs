@@ -6,12 +6,20 @@
 //! until then non-Windows reports `Unavailable` and children run exactly as
 //! before — loudly, per decision 5, never silently.
 //!
-//! **Scope.** This layer wraps the [`SpawnClass::AgentSpawn`] seam that a model
-//! drives most directly: `run_command` children (`offload/tools/run_command.rs`).
-//! Tab spawns (ConPTY) are Phase B behind spike S3; `run_check`/audit children
-//! run through a shell today and follow once the engine has soaked. Host spawns
-//! (`spawn_ledger::SpawnClass::HostSpawn`) are **never** sandboxed — see the
-//! ledger's reasons column.
+//! **Scope.** This layer wraps three of the four [`SpawnClass::AgentSpawn`]
+//! seams: `run_command` children (`offload/tools/run_command.rs`, Phase A), the
+//! `run_check` shell (`checks/mod.rs`) and the audit scanners
+//! (`audit/runner.rs`). Tab spawns (ConPTY) are Phase B behind spike S3. Host
+//! spawns (`spawn_ledger::SpawnClass::HostSpawn`) are **never** sandboxed — see
+//! the ledger's reasons column.
+//!
+//! **One switch, every seam** (milestone decision 17's membership test): there
+//! is no per-seam sandbox toggle. `sandbox.enabled` governs the OS boundary
+//! wherever a model's request reaches a spawn, because the question the setting
+//! answers ("does the OS confine what agents run?") does not have three
+//! different answers. What differs per seam is only what has to: which program
+//! is spawned, which directories grant-on-first-use infers, and which `seam`
+//! label its rows carry.
 //!
 //! **What the boundary is (and honestly is not).** A sandboxed child can
 //! read+write the project root, read the OS dirs and each granted tool's own
@@ -35,10 +43,86 @@
 //! child then runs unsandboxed — this is a hardening layer over a working
 //! product, not a gate that bricks tool calls on a missing prerequisite.
 
+pub mod child_env;
 #[cfg(windows)]
 pub mod windows;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+// ── the seam labels ─────────────────────────────────────────────────────────
+//
+// Every row this module writes names the seam it came from in the activity
+// record's `source` column, so the Events lane distinguishes "a model ran a
+// command", "a model ran a configured check" and "a model ran an audit
+// scanner" without opening a row. They are `&'static str` rather than an enum
+// because the audit seam's label carries the tool name (`audit:semgrep`) and an
+// enum with a `String` payload would buy nothing over this.
+
+/// `offload/tools/run_command.rs` — the model names program and arguments.
+pub const SEAM_RUN_COMMAND: &str = "run_command";
+/// `checks/mod.rs` — the model selects one of the operator's configured checks,
+/// which cImp runs through the platform shell.
+pub const SEAM_RUN_CHECK: &str = "run_check";
+/// `audit/runner.rs` — the label is `audit:<tool>` (see [`audit_seam`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn audit_seam(tool: &str) -> String {
+    format!("audit:{tool}")
+}
+
+// ── the caller-side backstops (the 2026-08-18 wedges) ───────────────────────
+
+/// How much longer than its own child timeout a sandboxed spawn is given to
+/// *settle*: terminate the child, wait for the job to reap the tree, drain both
+/// pipes (up to `DRAIN_GRACE + DRAIN_CANCEL_GRACE` each, worst case ~14 s
+/// serial) and return.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const SANDBOX_SETTLE_SLACK: Duration = Duration::from_secs(30);
+
+/// The caller-side backstop for a sandboxed child whose own deadline is
+/// `child_timeout` (2026-08-18 incident).
+///
+/// The sandboxed path is a hand-rolled Win32 dance on a blocking thread; if any
+/// step of it ever fails to return, the tool call never completes, the calling
+/// worker/scan stays pinned and NOTHING is recorded — which is exactly how the
+/// first live sandboxed `run_command` spent 22 minutes invisible. The engine
+/// bounds its own internals now, but a backstop that exists only inside the
+/// thing it is backstopping is not a backstop.
+///
+/// A `const fn` so each seam's constant timeout still yields a constant, and so
+/// the three seams cannot each invent their own slack: `run_command` has a
+/// fixed 120 s cap, a check has its per-check floored timeout and an audit tool
+/// has its per-tool budget, but all three derive from this one expression.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const fn backstop_for(child_timeout: Duration) -> Duration {
+    Duration::from_secs(child_timeout.as_secs() + SANDBOX_SETTLE_SLACK.as_secs())
+}
+
+/// The caller-side backstop on sandbox *preparation* (2026-08-18, second
+/// incident of the same day). The first wedge taught us to bound
+/// `spawn_and_capture` — but preparation (profile creation, ACL grants, drive
+/// mapping) ran unbounded ahead of it on a blocking thread, and a deadlock in
+/// `map_drive` pinned the worker slot forever with the grant row as the only
+/// trace. Same rule as [`backstop_for`]: a path whose only deadline lives
+/// inside itself has no deadline at all.
+///
+/// Shared by every seam and independent of the child's timeout, because
+/// preparation happens BEFORE the child exists and costs the same everywhere.
+///
+/// Generous, because a wrong elapse here refuses a healthy sandbox: first-time
+/// ACL stamps on a toolchain directory and AppContainer profile creation can
+/// take seconds each on a slow disk or with sluggish SID lookups.
+pub const PREPARE_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// A cooperative cancel signal a sandboxed spawn polls while it waits.
+///
+/// Platform-neutral so a seam can build one without a `cfg(windows)` arm, and a
+/// plain `AtomicBool` rather than a `CancellationToken` because the consumer is
+/// a **blocking** Win32 wait loop with no runtime to await on. The audit
+/// runner's scan token is bridged onto one of these at the call site; see
+/// `audit::runner::spawn_sandboxed`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
 /// The runtime slice of `Settings::sandbox` a spawn seam needs. Carried on
 /// `ToolCtx` beside the command allowlist rather than read from a global, so
@@ -66,6 +150,32 @@ impl SandboxCfg {
     /// honest shape; real paths opt in with the settings value.
     pub fn disabled() -> Self {
         Self::default()
+    }
+
+    /// Translate the persisted `SandboxSettings` into the runtime config the
+    /// spawn seams consume.
+    ///
+    /// A function rather than a `From` impl because the two types are
+    /// deliberately not 1:1 — settings hold user-facing strings
+    /// (`extra_grant_dirs`), the runtime wants `PathBuf`s, and a future
+    /// engine-selection field will resolve here rather than widening the
+    /// settings struct.
+    ///
+    /// It lives here (rather than beside one seam) because all three seams
+    /// build their config from the same settings snapshot: one master switch,
+    /// one translation.
+    pub fn from_settings(s: &crate::settings::Settings) -> Self {
+        Self {
+            enabled: s.sandbox.enabled,
+            allow_network: s.sandbox.allow_network,
+            extra_grant_dirs: s
+                .sandbox
+                .extra_grant_dirs
+                .iter()
+                .filter(|d| !d.trim().is_empty())
+                .map(PathBuf::from)
+                .collect(),
+        }
     }
 }
 
@@ -99,15 +209,56 @@ pub enum Plan {
     Plain(SkipReason),
 }
 
-/// Decide how to run one `run_command` child, doing all sandbox preparation
+/// What a seam needs granted **beyond** what [`plan`] infers from the spawned
+/// program itself (whose own install directory is always granted read+execute,
+/// and whose project root is always granted full access).
+///
+/// Every field widens the boundary, so every field is a reviewed decision — the
+/// decision-3 grant ladder applied to the seams that cannot express their needs
+/// as "the program I spawn". Seams with nothing extra pass
+/// [`GrantHints::default`], which grants nothing.
+///
+/// Owned rather than borrowed because both lists are tiny (0–2 entries) and
+/// `prepare` has to move them onto a blocking thread anyway.
+#[derive(Debug, Clone, Default)]
+pub struct GrantHints {
+    /// Resolved program paths whose **parent directory** gets read+execute,
+    /// exactly as the spawned program's does.
+    ///
+    /// The grant-inference hook for a seam where the spawned program is not the
+    /// program that does the work: `run_check` spawns `cmd.exe`, and the tool
+    /// the check invokes (`cargo` in `cargo test --bin cimp`) lives somewhere
+    /// else entirely.
+    pub programs: Vec<PathBuf>,
+    /// Directories the child must be able to **write**, granted full access.
+    ///
+    /// Today's only user is the audit runner's report directory: a
+    /// `Transport::ReportFile` scanner (gitleaks, cppcheck, dotnet-analyzers)
+    /// is handed an absolute SARIF path under cImp's own temp scratch and
+    /// writes its findings there. Without this grant those three tools fail
+    /// with an access denial the moment the sandbox is switched on — correctly
+    /// reported, but a working feature turned into a denial row.
+    ///
+    /// **Only cImp-owned scratch belongs here.** The project root is already
+    /// granted; the user's tree is not a place cImp adds write ACEs to on a
+    /// tool's behalf.
+    pub full_dirs: Vec<PathBuf>,
+}
+
+/// Decide how to run one agent-initiated child, doing all sandbox preparation
 /// (profile, grants, drive mapping) that the decision needs.
+///
+/// `program` is what cImp actually spawns; its install directory is granted
+/// read+execute. `hints` widens that — see [`GrantHints`].
 ///
 /// `env` is the exact minimal-environment pair list the plain spawn would
 /// use — the sandbox path adds its redirections on top (TEMP and tool caches
 /// into the root) rather than composing a second environment.
 pub async fn plan(
     cfg: &SandboxCfg,
+    seam: &str,
     program: &Path,
+    hints: &GrantHints,
     root: &Path,
     env: &[(&str, std::ffi::OsString)],
 ) -> Plan {
@@ -116,30 +267,34 @@ pub async fn plan(
     }
     #[cfg(windows)]
     {
-        match windows::prepare(cfg, program, root, env).await {
+        match windows::prepare(cfg, seam, program, hints, root, env).await {
             Ok(prepared) => Plan::Sandboxed(prepared),
             Err(reason) => Plan::Plain(SkipReason::Unavailable(reason)),
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = (program, root, env);
+        let _ = (seam, program, hints, root, env);
         Plan::Plain(SkipReason::Unavailable(
             "no OS sandbox engine on this platform yet (Linux Landlock is V33 Phase D)".into(),
         ))
     }
 }
 
-/// Record one skip loudly, once per distinct reason per session — repeat
-/// occurrences are the same fact, and a row per spawn would just let this
-/// lane crowd itself out of its retention window.
-pub fn record_skip(reason: &SkipReason, program: &Path, root: &Path) {
+/// Record one skip loudly, once per distinct reason **per seam** per session —
+/// repeat occurrences are the same fact, and a row per spawn would just let
+/// this lane crowd itself out of its retention window.
+///
+/// The seam is part of the dedup key, not only of the row: "run_command runs
+/// unsandboxed" and "run_check runs unsandboxed" are two facts, and keying on
+/// the reason alone would let whichever seam spawned first silence the others.
+pub fn record_skip(seam: &str, reason: &SkipReason, subject: &str, root: &Path) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let key = match reason {
-        SkipReason::OffUser => "off".to_string(),
-        SkipReason::Unavailable(r) => r.clone(),
+        SkipReason::OffUser => format!("{seam}|off"),
+        SkipReason::Unavailable(r) => format!("{seam}|{r}"),
     };
     if let Ok(mut guard) = EMITTED.lock() {
         let set = guard.get_or_insert_with(HashSet::new);
@@ -159,13 +314,9 @@ pub fn record_skip(reason: &SkipReason, program: &Path, root: &Path) {
             crate::activity::ActivityKind::Sandbox,
             crate::activity::now_ms(),
             root.to_string_lossy().into_owned(),
-            "run_command".into(),
+            seam.to_string(),
             "unsandboxed".into(),
-            format!(
-                "{} — {}",
-                reason.label(),
-                program.file_name().unwrap_or_default().to_string_lossy()
-            ),
+            state_target(reason.label(), subject),
             0,
             0,
             // `ok` mirrors whether this state is a chosen one: a user choice is
@@ -179,19 +330,20 @@ pub fn record_skip(reason: &SkipReason, program: &Path, root: &Path) {
     });
 }
 
-/// Record a sandbox-side lifecycle fact — today, the one-time ACL grants that
-/// prepare a machine (`tool = "grant"`) — into the same lane.
+/// Record a sandbox-side lifecycle fact — the one-time ACL grants that prepare
+/// a machine (`tool = "grant"`), a confirmation, a denial, a wedge — into the
+/// same lane, tagged with the `seam` it came from.
 ///
 /// `#[allow(dead_code)]` off Windows: the only caller is the AppContainer
 /// engine, and Landlock (Phase D) will be the second.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn record_event(root: &Path, tool: &str, target: String, detail: String, ok: bool) {
+pub fn record_event(seam: &str, root: &Path, tool: &str, target: String, detail: String, ok: bool) {
     crate::activity::record_bg(crate::activity::ActivityRecord {
         entry: crate::activity::ActivityEntry::new(
             crate::activity::ActivityKind::Sandbox,
             crate::activity::now_ms(),
             root.to_string_lossy().into_owned(),
-            "run_command".into(),
+            seam.to_string(),
             tool.to_string(),
             target,
             0,
@@ -319,15 +471,30 @@ fn posture(cfg: &SandboxCfg) -> String {
     )
 }
 
-/// The dedup key for a confirmation row: the program's file stem, lowercased.
-/// `git.exe` and `GIT.EXE` are one program; `git` and `cargo` are two.
+/// **What a sandbox-lane row is about**, rendered from a program path: the file
+/// name. This is what lands in the scannable `target` column and what the
+/// confirmation row dedups on.
+///
+/// Two of the three seams use this. The `run_check` seam deliberately does NOT:
+/// it always spawns `cmd.exe`, so a program-derived subject would render every
+/// check identically and collapse them all into one confirmation row. It passes
+/// the CHECK NAME instead — the thing the user configured and the thing they
+/// would look for in the lane. That is why these helpers take a `&str` subject
+/// rather than a `&Path`.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn program_key(program: &Path) -> String {
+pub(crate) fn program_subject(program: &Path) -> String {
     program
-        .file_stem()
+        .file_name()
         .unwrap_or_default()
         .to_string_lossy()
-        .to_ascii_lowercase()
+        .into_owned()
+}
+
+/// The dedup key for a confirmation row: the subject, lowercased.
+/// `git.exe` and `GIT.EXE` are one subject; `git.exe` and `cargo.exe` are two.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn subject_key(subject: &str) -> String {
+    subject.to_ascii_lowercase()
 }
 
 /// Insert `key`, returning whether it was new. Split out from the statics so
@@ -361,22 +528,30 @@ fn first_time(set: &mut std::collections::HashSet<String>, key: String) -> bool 
 /// a glance answers "which program?" without opening the row; the posture and
 /// the rest of the facts ride the detail payload.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn record_sandboxed(root: &Path, program: &Path, cfg: &SandboxCfg) {
+pub fn record_sandboxed(seam: &str, root: &Path, subject: &str, cfg: &SandboxCfg) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     if let Ok(mut guard) = EMITTED.lock() {
         let set = guard.get_or_insert_with(HashSet::new);
-        if !first_time(set, program_key(program)) {
+        // Per subject per SEAM. Both halves earn their place:
+        //
+        // * the SEAM, because `run_check` and `run_command` can both spawn the
+        //   same program (`cmd.exe`) and "checks are sandboxed" is not the same
+        //   fact as "commands are sandboxed";
+        // * the SUBJECT, which is a program name for `run_command`/audit but the
+        //   CHECK NAME for `run_check` — so each configured check confirms once
+        //   per session instead of the first one speaking for all of them.
+        if !first_time(set, format!("{seam}|{}", subject_key(subject))) {
             return;
         }
     }
-    let name = program.file_name().unwrap_or_default().to_string_lossy();
     record_event(
+        seam,
         root,
         "sandboxed",
-        state_target("sandboxed", program),
-        format!("{name} is running inside the sandbox — {}", posture(cfg)),
+        state_target("sandboxed", subject),
+        format!("{subject} is running inside the sandbox — {}", posture(cfg)),
         true,
     );
 }
@@ -405,9 +580,11 @@ pub fn record_sandboxed(root: &Path, program: &Path, cfg: &SandboxCfg) {
 /// have to open a row to find. Everything else — the bounded invocation, the
 /// exit code, the posture, the screened stderr tail — rides the detail payload.
 #[cfg_attr(not(windows), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub fn record_denial(
+    seam: &str,
     root: &Path,
-    program: &Path,
+    subject: &str,
     args: &[String],
     exit_code: Option<i32>,
     stderr: &str,
@@ -421,13 +598,20 @@ pub fn record_denial(
         "`{}` exit {} — matches an access-denial signature ({}) — likely the sandbox boundary, \
          but cImp cannot observe the OS's decision directly, so this is a labeled heuristic, not \
          proof. Posture: {}.\nstderr tail: {}",
-        summarize_invocation(program, args),
+        summarize_invocation(subject, args),
         exit,
         class,
         posture(cfg),
         stderr_tail(stderr)
     );
-    record_event(root, "denied", state_target(class, program), detail, false);
+    record_event(
+        seam,
+        root,
+        "denied",
+        state_target(class, subject),
+        detail,
+        false,
+    );
 }
 
 /// The `target` column for a sandbox-lane row: `"<label> — <program>"`, the
@@ -441,25 +625,18 @@ pub fn record_denial(
 /// fact it records is "the engine never returned", which is only observable
 /// from outside the engine.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn state_target(label: &str, program: &Path) -> String {
-    format!(
-        "{label} — {}",
-        program.file_name().unwrap_or_default().to_string_lossy()
-    )
+pub(crate) fn state_target(label: &str, subject: &str) -> String {
+    format!("{label} — {subject}")
 }
 
 /// `git rev-parse --show-toplevel …(+2 more)` — the invocation, bounded.
 /// Three args is enough to tell one probe from another; the rest would just
 /// be an unbounded model-controlled string in a security row.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn summarize_invocation(program: &Path, args: &[String]) -> String {
+fn summarize_invocation(subject: &str, args: &[String]) -> String {
     const SHOWN: usize = 3;
     const ARG_CHARS: usize = 60;
-    let mut out = program
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let mut out = truncate_chars(subject, ARG_CHARS);
     for arg in args.iter().take(SHOWN) {
         out.push(' ');
         out.push_str(&truncate_chars(arg, ARG_CHARS));
@@ -532,7 +709,9 @@ mod tests {
             .unwrap();
         let plan = rt.block_on(plan(
             &cfg,
+            SEAM_RUN_COMMAND,
             Path::new("C:/x/y.exe"),
+            &GrantHints::default(),
             Path::new("C:/proj"),
             &[],
         ));
@@ -560,8 +739,9 @@ mod tests {
     fn the_off_switch_reaches_the_os_layer_only() {
         let cfg = SandboxCfg::disabled();
         // The struct carries only OS-boundary knobs. Job objects
-        // (`process_guard`), the C2 minimal environment (`run_command::
-        // CHILD_ENV`) and the injection-layer fixes are deliberately not
+        // (`process_guard`), the C2 minimal environment
+        // (`sandbox::child_env::CHILD_ENV`) and the injection-layer fixes are
+        // deliberately not
         // representable here — they stay on regardless of `enabled`.
         assert!(!cfg.enabled);
         assert!(!cfg.allow_network);
@@ -587,7 +767,9 @@ mod tests {
             .unwrap();
         let plan = rt.block_on(plan(
             &SandboxCfg::disabled(),
+            SEAM_RUN_COMMAND,
             Path::new("C:/x/git.exe"),
+            &GrantHints::default(),
             Path::new("C:/proj"),
             &[],
         ));
@@ -698,25 +880,38 @@ mod tests {
         );
     }
 
-    /// The confirmation row's dedup policy: one key per program stem, matched
+    /// The confirmation row's dedup policy: one key per subject, matched
     /// case-insensitively and independent of where the binary lives, so a
     /// second `git` spawn is silent and a first `cargo` spawn is not.
     #[test]
     fn confirmation_rows_dedup_per_program_not_per_spawn() {
+        let key = |p: &str| subject_key(&program_subject(Path::new(p)));
         let mut set = std::collections::HashSet::new();
-        assert!(first_time(&mut set, program_key(Path::new("C:/bin/git.exe"))));
-        assert!(!first_time(&mut set, program_key(Path::new("C:/bin/git.exe"))));
+        assert!(first_time(&mut set, key("C:/bin/git.exe")));
+        assert!(!first_time(&mut set, key("C:/bin/git.exe")));
         // Same program, different path and case — still the same fact.
-        assert!(!first_time(
-            &mut set,
-            program_key(Path::new("D:/other/GIT.EXE"))
-        ));
+        assert!(!first_time(&mut set, key("D:/other/GIT.EXE")));
         // A different program is a different fact and must be recorded.
-        assert!(first_time(
-            &mut set,
-            program_key(Path::new("C:/bin/cargo.exe"))
-        ));
+        assert!(first_time(&mut set, key("C:/bin/cargo.exe")));
         assert_eq!(set.len(), 2);
+    }
+
+    /// …and the `run_check` seam's subject is the CHECK NAME, not the shell it
+    /// runs through. Every check spawns the same `cmd.exe`, so a program-derived
+    /// subject would render every row identically AND let the first sandboxed
+    /// check speak for all of them. Each configured check confirms once.
+    #[test]
+    fn a_check_is_identified_by_its_configured_name_not_by_the_shell() {
+        let mut set = std::collections::HashSet::new();
+        // Two different checks, one shell: two facts, two rows.
+        assert!(first_time(&mut set, subject_key("cargo")));
+        assert!(first_time(&mut set, subject_key("tsc")));
+        // …and re-running a check is the same fact, whatever its case.
+        assert!(!first_time(&mut set, subject_key("Cargo")));
+        assert_eq!(set.len(), 2);
+        // The row a user scans names the check, not `cmd.exe`.
+        assert_eq!(state_target("sandboxed", "cargo"), "sandboxed — cargo");
+        assert!(!state_target("sandboxed", "cargo").contains("cmd"));
     }
 
     /// Denials are NOT deduped — the repeated boundary hit is the signal the
@@ -758,32 +953,42 @@ mod tests {
     #[test]
     fn invocation_summary_is_bounded() {
         let args: Vec<String> = (0..10).map(|i| format!("--flag-{i}")).collect();
-        let got = summarize_invocation(Path::new("C:/bin/git.exe"), &args);
+        let got = summarize_invocation(&program_subject(Path::new("C:/bin/git.exe")), &args);
         assert!(got.starts_with("git.exe --flag-0 --flag-1 --flag-2"), "{got}");
         assert!(got.contains("(+7 more)"), "{got}");
         assert!(!got.contains("--flag-3"), "{got}");
         let huge = vec!["x".repeat(500)];
-        let got = summarize_invocation(Path::new("git"), &huge);
+        let got = summarize_invocation("git", &huge);
         assert!(got.chars().count() < 100, "{got}");
+        // The subject is model-adjacent too (a check name comes from settings,
+        // but the shell tail beside it does not), so it is bounded as well.
+        let got = summarize_invocation(&"n".repeat(500), &huge);
+        assert!(got.chars().count() < 200, "{got}");
     }
 
-    /// The lane is scanned by its `target` column, so all three row types must
-    /// lay it out the same way: `"<state label> — <program file name>"`. The
-    /// skip row set that shape ("off (user choice) — git.exe") and the two new
-    /// rows follow it — a program name that lives only in an unopened detail
-    /// payload is a program name nobody sees.
+    /// The lane is scanned by its `target` column, so all four row types must
+    /// lay it out the same way: `"<state label> — <subject>"`. The skip row set
+    /// that shape ("off (user choice) — git.exe") and the rest follow it — a
+    /// subject that lives only in an unopened detail payload is a subject
+    /// nobody sees.
     #[test]
     fn every_row_type_puts_the_program_in_the_target_column() {
         assert_eq!(
-            state_target("sandboxed", Path::new("C:/bin/git.exe")),
+            state_target("sandboxed", &program_subject(Path::new("C:/bin/git.exe"))),
             "sandboxed — git.exe"
         );
         assert_eq!(
-            state_target("filesystem/OS access denied", Path::new("/usr/bin/curl")),
+            state_target(
+                "filesystem/OS access denied",
+                &program_subject(Path::new("/usr/bin/curl"))
+            ),
             "filesystem/OS access denied — curl"
         );
         // Same separator the skip row uses, so the column reads as one list.
-        assert!(state_target("x", Path::new("git")).contains(" — "));
+        assert!(state_target("x", "git").contains(" — "));
+        // A program path with no file name still yields something scannable
+        // rather than a panic or an empty half-row.
+        assert_eq!(state_target("x", &program_subject(Path::new(""))), "x — ");
     }
 
     /// Both new rows must state the capability posture — a denial is only
@@ -811,7 +1016,14 @@ mod tests {
             .unwrap();
         let mut cfg = SandboxCfg::disabled();
         cfg.enabled = true;
-        let plan = rt.block_on(plan(&cfg, Path::new("/usr/bin/git"), Path::new("/proj"), &[]));
+        let plan = rt.block_on(plan(
+            &cfg,
+            SEAM_RUN_COMMAND,
+            Path::new("/usr/bin/git"),
+            &GrantHints::default(),
+            Path::new("/proj"),
+            &[],
+        ));
         match plan {
             Plan::Plain(SkipReason::Unavailable(r)) => {
                 assert!(r.contains("Landlock"), "reason must name the gap: {r}");

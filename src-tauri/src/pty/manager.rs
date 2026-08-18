@@ -47,11 +47,28 @@ pub struct PtyLaunchSpec {
     /// AI tab whose source can't be resolved. The source rides the tab's PTY
     /// cancel token, so it starts with the tab and dies with it.
     pub oob: Option<crate::harness::OobSpec>,
+    /// V33 Phase B: which AI harness this tab runs, or `None` for a Shell tab.
+    ///
+    /// The ONLY thing that makes a tab eligible for the sandbox (decision B1),
+    /// and it is decided in `tabs::config::build_ai_tool_spec` — the one place
+    /// that already knows which harness a command is — rather than re-derived
+    /// here from `binary`, so "which tabs are agent seams" has exactly one
+    /// answer in the codebase. `None` means plain spawn, no sandbox, no row.
+    pub harness: Option<crate::sandbox::tabs::Harness>,
 }
 
 pub struct PtyManager {
     inner: Arc<TokioMutex<Option<PtyHandle>>>,
 }
+
+/// The two trait objects a spawned PTY session hands back, whichever backend
+/// produced them — portable-pty's native ConPTY or V33 Phase B's sandboxed twin.
+/// Named so both arms of the spawn have one shape and the manager's downstream
+/// code cannot tell them apart, which is the property the whole design rests on.
+type PtySession = (
+    Box<dyn MasterPty + Send>,
+    Box<dyn portable_pty::Child + Send + Sync>,
+);
 
 /// Shape the child's environment: strip first, then add.
 ///
@@ -136,12 +153,123 @@ struct PtyHandle {
     /// expand-vs-shrink semantics aren't worth the complexity for a
     /// rarely-changed knob — the new cap takes effect on next start).
     scrollback_cap: usize,
+    /// V33 Phase B, decision B10: the tab's sandbox preparation, held for the
+    /// LIFETIME OF THE PTY SESSION.
+    ///
+    /// Never read — held. `Prepared` owns the refcounted `subst` drive mapping
+    /// the child's cwd points at (`S:\`), so dropping it unmaps that drive; a
+    /// `Prepared` scoped to the spawn function would pull the child's own
+    /// working directory out from under it milliseconds after launch. The
+    /// mapping is refcounted per project root, so several sandboxed tabs on one
+    /// project share one letter and the last one to close releases it.
+    ///
+    /// `None` for every plain tab, which is every tab on a non-Windows build.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    sandbox: Option<Box<crate::sandbox::windows::Prepared>>,
 }
 
 impl PtyManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(TokioMutex::new(None)),
+        }
+    }
+
+    /// V33 Phase B — spawn one AI tab INSIDE the AppContainer.
+    ///
+    /// Everything policy-shaped (which switches, which grants, which scratch)
+    /// was decided by `sandbox::tabs::plan_tab` before this is reached; what
+    /// happens here is the three things only this layer can do:
+    ///
+    /// 1. **redirect the scratch** — `TEMP`/`TMP` into the per-tab directory
+    ///    under the project root, expressed on the MAPPED DRIVE so the child
+    ///    never hands a deep real path to a tool that walks its ancestors
+    ///    (the S1 canonicalization gotcha, which reproduces through ConPTY);
+    /// 2. **read the resolved environment back out of the same
+    ///    `CommandBuilder` the plain path would have spawned with** (decision
+    ///    B4). On Windows `CommandBuilder::new` is NOT a plain
+    ///    `std::env::vars_os()` snapshot — it re-reads the machine and user
+    ///    `Environment` registry keys and concatenates system+user `PATH` — so
+    ///    a hand-rolled equivalent would give the sandboxed child a different
+    ///    `PATH` than the plain one, and nobody would connect that to the
+    ///    sandbox switch. The one fidelity gap is inherent to the public API:
+    ///    `iter_full_env_as_str` drops entries that are not valid UTF-8, so a
+    ///    non-UTF-8 variable does not reach a sandboxed child;
+    /// 3. **mint the lane's rows** — a confirmation on success, and on a Win32
+    ///    refusal a denial row plus a hard failure. Decision B9: a spawn error
+    ///    AFTER the grants landed is not a prerequisite gap, so it is never
+    ///    retried plain.
+    #[cfg(windows)]
+    fn start_sandboxed(
+        spec: &PtyLaunchSpec,
+        prepared: &crate::sandbox::windows::Prepared,
+        cfg: &crate::sandbox::SandboxCfg,
+        cmd: &mut CommandBuilder,
+        size: PtySize,
+    ) -> Result<PtySession, String> {
+        let tab_id = spec.tab.as_str();
+        let seam = crate::sandbox::tab_seam(tab_id);
+        let root = &spec.working_dir;
+
+        // (1) the scratch, on the mapped drive.
+        let scratch = crate::sandbox::tabs::scratch_dir(root, tab_id);
+        for (key, value) in crate::sandbox::tabs::env_overrides(&prepared.cwd_under(&scratch)) {
+            cmd.env(key, value);
+        }
+
+        // (2) the resolved environment, from the builder itself.
+        let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = cmd
+            .iter_full_env_as_str()
+            .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)))
+            .collect();
+
+        let mut args: Vec<String> = Vec::with_capacity(spec.pre_args.len() + spec.extra_args.len());
+        args.extend(spec.pre_args.iter().cloned());
+        args.extend(spec.extra_args.iter().cloned());
+
+        let spawned = crate::pty::sandboxed_conpty::open_and_spawn(
+            prepared,
+            crate::pty::sandboxed_conpty::TabSpawn {
+                program: &spec.binary,
+                args: &args,
+                env: &env,
+                // Decision B6: the drive root, not the real project path.
+                cwd: &prepared.cwd(),
+                size,
+            },
+        );
+
+        // (3) the rows.
+        match spawned {
+            Ok(pty) => {
+                // Deduped per (seam, subject) inside `record_sandboxed`, and the
+                // seam already carries the tab id — so this is once per tab per
+                // session, which is once per launch in practice.
+                crate::sandbox::record_sandboxed(&seam, root, tab_id, cfg);
+                info!(tab = %tab_id, "AI tab spawned inside the sandbox");
+                Ok((pty.master, pty.child))
+            }
+            Err(e) => {
+                // A container that cannot read the program image fails right
+                // here, with no exit code because nothing ran — the same
+                // classification `run_command` applies to its own
+                // `CreateProcessW` refusals. `allow_network` is passed as
+                // `true` because a sandboxed tab always has egress (B3), which
+                // is what keeps a name-resolution failure from being libelled
+                // as a boundary denial.
+                if let Some(class) = crate::sandbox::denial_signature(None, &e, true) {
+                    crate::sandbox::record_denial(
+                        &seam, root, tab_id, &args, None, &e, class, cfg,
+                    );
+                }
+                Err(format!(
+                    "the sandboxed tab could not be started: {e}. The sandbox grants were \
+                     already applied, so this is not a missing prerequisite and cImp will NOT \
+                     silently retry it unsandboxed — switch AI-tab sandboxing off in \
+                     Settings ▸ Sandboxing if you need this tab now."
+                ))
+            }
         }
     }
 
@@ -168,24 +296,63 @@ impl PtyManager {
         let tab = spec.tab.clone();
         info!(?tab, path = %spec.binary.display(), "spawning subprocess");
 
-        let pty_system = native_pty_system();
-        let pair = match pty_system.openpty(PtySize {
+        let size = PtySize {
             rows: initial_rows.max(1),
             cols: initial_cols.max(1),
             pixel_width: 0,
             pixel_height: 0,
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                // The waiter task (which normally emits SubprocessExited) is
-                // never spawned on the spawn-error path; emit it here so the
-                // state machine pins the tab to Error and the avatar reflects
-                // the failure.
-                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
-                return Err(AppError::Pty(format!("openpty: {e}")));
-            }
         };
 
+        // ── V33 Phase B: decide the boundary BEFORE opening a pty ──────────
+        //
+        // Sandboxed and plain are two different OS mechanisms (a bespoke
+        // `CreatePseudoConsole` + `CreateProcessW` with an AppContainer
+        // attribute list, versus portable-pty's one-attribute ConPTY), not a
+        // flag on one, so the decision has to come first. Everything downstream
+        // of the spawn is trait-level and does not know which it got.
+        //
+        // A Shell tab (`harness == None`) never reaches this at all: decision B1
+        // — a shell tab is the user's own hands, not an agent seam.
+        //
+        // ONE settings snapshot serves the decision and the rows it mints: a
+        // second read could straddle a save and describe the boundary with a
+        // posture the child never ran under.
+        let sandbox_settings = app.state::<crate::ipc::AppState>().settings.current();
+        // Read on every platform (the value is what the ROWS are described
+        // with), consumed only by the Windows engine — the same shape the rest
+        // of the sandbox layer carries off Windows.
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        let sandbox_cfg = crate::sandbox::tabs::tab_sandbox_cfg(&sandbox_settings);
+        let sandbox_plan = match spec.harness {
+            Some(harness) => {
+                crate::sandbox::tabs::plan_tab(
+                    &sandbox_settings,
+                    harness,
+                    tab.as_str(),
+                    &spec.binary,
+                    &spec.working_dir,
+                )
+                .await
+            }
+            None => crate::sandbox::tabs::TabPlan::Plain,
+        };
+        // Decision B9: a WEDGED preparation refuses the launch. Never a silent
+        // unsandboxed fallback — dropping the boundary because a step hung is
+        // exactly the degradation V33 decision 5 forbids, and the user sees the
+        // reason as the tab's launch error.
+        if let crate::sandbox::tabs::TabPlan::Refused(reason) = &sandbox_plan {
+            let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
+            return Err(AppError::Spawn(reason.clone()));
+        }
+
+        // The command is built the SAME way for both paths (decision B4): same
+        // `CommandBuilder`, same `apply_env`, same `env_remove` list. The
+        // sandboxed backend then reads the RESOLVED environment back out of this
+        // builder rather than composing a second one — because on Windows
+        // `CommandBuilder::new` is not a plain `std::env::vars_os()` snapshot
+        // (it re-reads the machine and user `Environment` registry keys and
+        // merges PATH), and a hand-rolled equivalent would disagree about the
+        // child's PATH in ways nobody would connect to the sandbox switch.
         let mut cmd = CommandBuilder::new(&spec.binary);
         for arg in &spec.pre_args {
             cmd.arg(arg);
@@ -196,16 +363,61 @@ impl PtyManager {
         cmd.cwd(&spec.working_dir);
         apply_env(&mut cmd, &spec.env, &spec.env_remove);
 
-        // Through the spawn gate (see `spawn_gate`). portable-pty builds its own
-        // `STARTUPINFOEX` and calls `CreateProcessW` itself, so this spawn sits
-        // outside `std`'s private process-wide create-process lock entirely —
-        // which is half the reason the gate had to exist. `with_shared` wraps
-        // the third-party call and nothing else.
-        let child = match crate::spawn_gate::with_shared(|| pair.slave.spawn_command(cmd)) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = state_signals.try_send(StateSignal::SubprocessExited { tab, code: None });
-                return Err(AppError::Spawn(format!("{e}")));
+        #[cfg(windows)]
+        let sandboxed = match &sandbox_plan {
+            crate::sandbox::tabs::TabPlan::Sandboxed(prepared) => Some(prepared),
+            _ => None,
+        };
+        #[cfg(not(windows))]
+        let sandboxed: Option<()> = None;
+
+        let (master, child): PtySession = match sandboxed {
+            #[cfg(windows)]
+            Some(prepared) => {
+                match Self::start_sandboxed(&spec, prepared, &sandbox_cfg, &mut cmd, size) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = state_signals
+                            .try_send(StateSignal::SubprocessExited { tab, code: None });
+                        return Err(AppError::Spawn(e));
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            Some(()) => unreachable!("the sandboxed backend is Windows-only"),
+            None => {
+                let pty_system = native_pty_system();
+                let pair = match pty_system.openpty(size) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // The waiter task (which normally emits
+                        // SubprocessExited) is never spawned on the spawn-error
+                        // path; emit it here so the state machine pins the tab
+                        // to Error and the avatar reflects the failure.
+                        let _ = state_signals
+                            .try_send(StateSignal::SubprocessExited { tab, code: None });
+                        return Err(AppError::Pty(format!("openpty: {e}")));
+                    }
+                };
+                // Through the spawn gate (see `spawn_gate`). portable-pty builds
+                // its own `STARTUPINFOEX` and calls `CreateProcessW` itself, so
+                // this spawn sits outside `std`'s private process-wide
+                // create-process lock entirely — which is half the reason the
+                // gate had to exist. `with_shared` wraps the third-party call
+                // and nothing else.
+                let child = match crate::spawn_gate::with_shared(|| pair.slave.spawn_command(cmd)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = state_signals
+                            .try_send(StateSignal::SubprocessExited { tab, code: None });
+                        return Err(AppError::Spawn(format!("{e}")));
+                    }
+                };
+                // Drop the slave end in the parent; the child inherits its own
+                // reference. (The sandboxed backend has no slave half — the
+                // pseudoconsole IS the child's console.)
+                drop(pair.slave);
+                (pair.master, child)
             }
         };
         let killer = child.clone_killer();
@@ -228,14 +440,11 @@ impl PtyManager {
             None => tracing::debug!(?tab, "pty child reported no pid; cannot job-guard it"),
         }
 
-        // Drop the slave end in the parent; the child inherits its own reference.
-        drop(pair.slave);
-
         // The child is already running. If we bail past this point without
         // killing it AND signaling exit, we leak the process and leave the
         // state machine in its prior state (no Error overlay) — the same
         // hazard the openpty/spawn error paths above guard. Mirror that here.
-        let reader = match pair.master.try_clone_reader() {
+        let reader = match master.try_clone_reader() {
             Ok(r) => r,
             Err(e) => {
                 let _ = child.clone_killer().kill();
@@ -243,7 +452,7 @@ impl PtyManager {
                 return Err(AppError::Pty(format!("try_clone_reader: {e}")));
             }
         };
-        let writer = match pair.master.take_writer() {
+        let writer = match master.take_writer() {
             Ok(w) => w,
             Err(e) => {
                 let _ = child.clone_killer().kill();
@@ -252,7 +461,7 @@ impl PtyManager {
             }
         };
 
-        let master: Arc<StdMutex<Box<dyn MasterPty + Send>>> = Arc::new(StdMutex::new(pair.master));
+        let master: Arc<StdMutex<Box<dyn MasterPty + Send>>> = Arc::new(StdMutex::new(master));
         let writer: Arc<StdMutex<Box<dyn Write + Send>>> = Arc::new(StdMutex::new(writer));
         let killer: Arc<StdMutex<Box<dyn ChildKiller + Send + Sync>>> =
             Arc::new(StdMutex::new(killer));
@@ -353,6 +562,12 @@ impl PtyManager {
             control_tx,
             scrollback,
             scrollback_cap,
+            // Decision B10: the drive mapping lives as long as the session.
+            #[cfg(windows)]
+            sandbox: match sandbox_plan {
+                crate::sandbox::tabs::TabPlan::Sandboxed(prepared) => Some(prepared),
+                _ => None,
+            },
         });
         info!(
             ?tab,
@@ -647,6 +862,84 @@ mod tests {
         );
         std::env::remove_var("CIMP_TEST_INHERITED");
         std::env::remove_var("CIMP_TEST_OVERRIDDEN");
+    }
+
+    /// **V33 Phase B decision B4, as a test: the sandboxed child's environment
+    /// is the plain child's environment plus the scratch redirection.**
+    ///
+    /// This is the likeliest regression in the whole phase. The sandboxed
+    /// backend cannot spawn through `CommandBuilder` (its `cmdline()` and
+    /// `environment_block()` are `pub(crate)`), so a naive implementation
+    /// composes a second environment from `std::env::vars_os()` — and on
+    /// Windows that is NOT what `CommandBuilder::new` produces: it additionally
+    /// re-reads the machine and user `Environment` registry keys and
+    /// concatenates system+user `PATH`. A sandboxed tab would then run with a
+    /// different `PATH` than the same tab unsandboxed, and nobody would connect
+    /// that to the sandbox switch.
+    ///
+    /// The fix under test is structural — `start_sandboxed` reads the RESOLVED
+    /// environment back out of the same builder — so what this asserts is the
+    /// composition that reading depends on: removals still bite, an explicit
+    /// per-tab value still wins, the scratch override lands last, and
+    /// `HOME`/`USERPROFILE` are left alone (unlike `run_command`'s children,
+    /// whose home is redirected into the sandbox root).
+    #[test]
+    fn the_sandboxed_env_is_the_plain_env_plus_the_scratch_redirection() {
+        use std::path::Path;
+        std::env::set_var("CIMP_TEST_B4_INHERITED", "yes");
+        std::env::set_var("CIMP_TEST_B4_STRIPPED", "leak");
+
+        // Exactly the composition `start` performs for BOTH paths…
+        let mut cmd = CommandBuilder::new("claude");
+        let mut env = std::collections::HashMap::new();
+        env.insert("CIMP_TEST_B4_EXPLICIT".to_string(), "tab".to_string());
+        apply_env(&mut cmd, &env, &["CIMP_TEST_B4_STRIPPED".to_string()]);
+        // …then the sandbox's own overrides, last, as `start_sandboxed` adds
+        // them (the scratch expressed on the mapped drive).
+        let scratch = Path::new(r"S:\.cimp\sandbox-tmp\claude");
+        for (key, value) in crate::sandbox::tabs::env_overrides(scratch) {
+            cmd.env(key, value);
+        }
+
+        let pairs: std::collections::HashMap<String, String> = cmd
+            .iter_full_env_as_str()
+            .map(|(k, v)| (k.to_ascii_uppercase(), v.to_string()))
+            .collect();
+
+        assert_eq!(
+            pairs.get("CIMP_TEST_B4_INHERITED").map(String::as_str),
+            Some("yes"),
+            "the sandboxed child must still inherit the environment the plain one would"
+        );
+        assert!(
+            !pairs.contains_key("CIMP_TEST_B4_STRIPPED"),
+            "the harness-marker strip list must apply on the sandboxed path too — a Claude \
+             spawned with CLAUDE_CODE_CHILD_SESSION set writes no transcript at all"
+        );
+        assert_eq!(
+            pairs.get("CIMP_TEST_B4_EXPLICIT").map(String::as_str),
+            Some("tab"),
+            "an explicit per-tab value still outranks everything"
+        );
+        let expected = scratch.to_string_lossy().to_string();
+        assert_eq!(pairs.get("TEMP"), Some(&expected), "TEMP must be redirected");
+        assert_eq!(pairs.get("TMP"), Some(&expected), "…and TMP with it");
+
+        // The load-bearing negative: the harness's real home is where its
+        // credentials and session history live, and the grant table — not an
+        // env redirection — is what keeps the rest of that directory dark.
+        for key in ["HOME", "USERPROFILE"] {
+            if let Some(real) = std::env::var_os(key).and_then(|v| v.into_string().ok()) {
+                assert_eq!(
+                    pairs.get(key),
+                    Some(&real),
+                    "{key} must stay REAL for a tab (unlike run_command's children)"
+                );
+            }
+        }
+
+        std::env::remove_var("CIMP_TEST_B4_INHERITED");
+        std::env::remove_var("CIMP_TEST_B4_STRIPPED");
     }
 
     /// V1.4-03: rebind on an empty manager errors with NotStarted. The

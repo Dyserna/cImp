@@ -6,20 +6,31 @@
 //! until then non-Windows reports `Unavailable` and children run exactly as
 //! before — loudly, per decision 5, never silently.
 //!
-//! **Scope.** This layer wraps three of the four [`SpawnClass::AgentSpawn`]
-//! seams: `run_command` children (`offload/tools/run_command.rs`, Phase A), the
-//! `run_check` shell (`checks/mod.rs`) and the audit scanners
-//! (`audit/runner.rs`). Tab spawns (ConPTY) are Phase B behind spike S3. Host
-//! spawns (`spawn_ledger::SpawnClass::HostSpawn`) are **never** sandboxed — see
-//! the ledger's reasons column.
+//! **Scope.** This layer wraps all four [`SpawnClass::AgentSpawn`] seams:
+//! `run_command` children (`offload/tools/run_command.rs`, Phase A), the
+//! `run_check` shell (`checks/mod.rs`), the audit scanners (`audit/runner.rs`)
+//! and — since Phase B, on the engine spike S3 proved — the **AI-tool tab**
+//! itself (`pty/manager.rs` + `pty::sandboxed_conpty`, see
+//! [`tabs`](crate::sandbox::tabs)). Host spawns
+//! (`spawn_ledger::SpawnClass::HostSpawn`) are **never** sandboxed — see the
+//! ledger's reasons column.
 //!
-//! **One switch, every seam** (milestone decision 17's membership test): there
-//! is no per-seam sandbox toggle. `sandbox.enabled` governs the OS boundary
-//! wherever a model's request reaches a spawn, because the question the setting
-//! answers ("does the OS confine what agents run?") does not have three
+//! **One switch, every TOOL seam** (milestone decision 17's membership test):
+//! there is no per-seam sandbox toggle. `sandbox.enabled` governs the OS
+//! boundary wherever a model's request reaches a spawn, because the question the
+//! setting answers ("does the OS confine what agents run?") does not have three
 //! different answers. What differs per seam is only what has to: which program
 //! is spawned, which directories grant-on-first-use infers, and which `seam`
 //! label its rows carry.
+//!
+//! **Tabs are the one documented exception, and it is a SCOPE switch, not a
+//! second master** (Phase B decision B2). `sandbox.tabs` widens the same
+//! boundary to the tab process; it is inert unless `sandbox.enabled` is also on.
+//! It earns its own checkbox because confining the tab confines *everything the
+//! agent afterwards runs* — including tools whose credentials the boundary
+//! deliberately withholds — which is a materially larger step than confining one
+//! allowlisted probe, and a user who says yes to the second has not thereby said
+//! yes to the first.
 //!
 //! **What the boundary is (and honestly is not).** A sandboxed child can
 //! read+write the project root, read the OS dirs and each granted tool's own
@@ -44,6 +55,7 @@
 //! product, not a gate that bricks tool calls on a missing prerequisite.
 
 pub mod child_env;
+pub mod tabs;
 #[cfg(windows)]
 pub mod windows;
 
@@ -68,6 +80,19 @@ pub const SEAM_RUN_CHECK: &str = "run_check";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn audit_seam(tool: &str) -> String {
     format!("audit:{tool}")
+}
+/// `pty/manager.rs` — V33 Phase B. The label is `tab:<tab id>` and the row's
+/// SUBJECT is the tab id too.
+///
+/// Per-tab rather than one flat `tab` label, because unlike the other three
+/// seams a tab is long-lived and identity-bearing: two Claude tabs on one
+/// project are two boundaries with two lifetimes, and a lane that called both
+/// `tab` would let the first tab's confirmation speak for the second's. The
+/// subject repeats the id (rather than naming `claude.exe`) for the same reason
+/// `run_check` names the check instead of `cmd.exe` — every AI tab of one
+/// harness spawns the same binary.
+pub fn tab_seam(tab_id: &str) -> String {
+    format!("tab:{tab_id}")
 }
 
 // ── the caller-side backstops (the 2026-08-18 wedges) ───────────────────────
@@ -243,6 +268,56 @@ pub struct GrantHints {
     /// granted; the user's tree is not a place cImp adds write ACEs to on a
     /// tool's behalf.
     pub full_dirs: Vec<PathBuf>,
+    /// V33 Phase B: the reviewed grant TABLE — one row per widening, each
+    /// carrying its own access width, whether it names a file or a directory,
+    /// and the reason it exists.
+    ///
+    /// The two lists above are shorthands that predate this and stay as they
+    /// are (`programs` = "and this program's install dir too", `full_dirs` =
+    /// "and cImp's own scratch"). Rows are what a seam uses when the grant is a
+    /// *decision* rather than an inference — the tab seam's per-harness state
+    /// paths, where the reviewer's question is "why is `~/.claude` readable?"
+    /// and the answer has to live beside the path.
+    pub rows: Vec<GrantRow>,
+}
+
+/// How wide one [`GrantRow`] opens the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantAccess {
+    /// Read + execute. Enough to run code and read config.
+    ReadExecute,
+    /// Read + write + execute. Only for state the tool genuinely owns and
+    /// rewrites (a session store, a credentials file it refreshes).
+    Full,
+}
+
+/// One reviewed widening of the sandbox boundary.
+///
+/// Data in code with a reason per row, deliberately in the shape of
+/// `sandbox::child_env::CHILD_ENV` and `spawn_ledger::LEDGER`: the reviewer of
+/// a diff that adds a row sees the path, the width and the justification in one
+/// place, and a row with no reason does not compile.
+#[derive(Debug, Clone)]
+pub struct GrantRow {
+    /// The absolute path. Resolved by the seam (usually from `%USERPROFILE%`),
+    /// never a pattern.
+    pub path: PathBuf,
+    pub access: GrantAccess,
+    /// `true` when `path` names a FILE rather than a directory. Both go through
+    /// `SE_FILE_OBJECT`, but only a directory grant is made inheritable — an
+    /// inheritable ACE on a file is meaningless, and asking for one on a
+    /// per-file grant is how a reader concludes the directory around it was
+    /// granted too.
+    pub is_file: bool,
+    /// Why the boundary is wider because of this row. User-visible: it is what
+    /// the grant Events row prints beside the path.
+    pub reason: &'static str,
+    /// `false` ⇒ a path that does not exist is skipped rather than failing the
+    /// whole preparation. Most harness state is created on first use, so
+    /// "absent" is the normal state of half this table on a fresh machine, and
+    /// refusing to sandbox a tab because the user has no `~/.config/git` would
+    /// be the prerequisite check punishing a perfectly fine machine.
+    pub required: bool,
 }
 
 /// Decide how to run one agent-initiated child, doing all sandbox preparation
@@ -289,6 +364,23 @@ pub async fn plan(
 /// unsandboxed" and "run_check runs unsandboxed" are two facts, and keying on
 /// the reason alone would let whichever seam spawned first silence the others.
 pub fn record_skip(seam: &str, reason: &SkipReason, subject: &str, root: &Path) {
+    record_skip_noting(seam, reason, subject, root, "");
+}
+
+/// [`record_skip`] plus a seam-supplied `note` appended to the row's detail.
+///
+/// Exists for the V33 Phase B tab seam, where "off" has TWO causes — the master
+/// switch, or `sandbox.tabs` alone — and a row that says only "off (user
+/// choice)" would leave the user hunting for which of two checkboxes they left
+/// unticked. The note is a constant per seam, so it is deliberately NOT part of
+/// the dedup key: the fact recorded is still "this seam runs unsandboxed", once.
+pub fn record_skip_noting(
+    seam: &str,
+    reason: &SkipReason,
+    subject: &str,
+    root: &Path,
+    note: &str,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -306,8 +398,9 @@ pub fn record_skip(seam: &str, reason: &SkipReason, subject: &str, root: &Path) 
     // answers "was this run sandboxed?" without the user having to remember
     // what the switch was set to at the time (C10's two-states rule).
     let detail = match reason {
-        SkipReason::OffUser => String::new(),
-        SkipReason::Unavailable(r) => r.clone(),
+        SkipReason::OffUser => note.to_string(),
+        SkipReason::Unavailable(r) if note.is_empty() => r.clone(),
+        SkipReason::Unavailable(r) => format!("{r}\n{note}"),
     };
     crate::activity::record_bg(crate::activity::ActivityRecord {
         entry: crate::activity::ActivityEntry::new(

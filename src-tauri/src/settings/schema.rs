@@ -2819,6 +2819,24 @@ pub struct SandboxSettings {
     /// items in `docs/reviews/SPIKE-S1-appcontainer-2026-08-15.md` have soaked
     /// — the same posture `workbench.checkpoints` shipped with.
     pub enabled: bool,
+    /// V33 Phase B — also sandbox the **AI-tool tabs** (Claude, claude-local,
+    /// OpenCode), not just the tool seams.
+    ///
+    /// Effective only when [`enabled`](Self::enabled) is also true: this is a
+    /// scope widener inside the OS layer, never a second master switch. The two
+    /// off states stay distinguishable in the Events lane (the skip row's detail
+    /// names which switch was off), because "I turned sandboxing off" and "I
+    /// left tabs out of it" are different user intents.
+    ///
+    /// Default **false**, and a bigger step than [`enabled`](Self::enabled) is:
+    /// a tab IS the agent, so confining it confines everything the agent
+    /// afterwards runs — including a `git push` whose credential helper now
+    /// cannot read the user's store. Opt in deliberately.
+    ///
+    /// **Plain Shell tabs are never sandboxed by this.** A shell tab is the
+    /// user's own hands, not an agent seam; confining it would be cImp deciding
+    /// what its user may do on their own machine.
+    pub tabs: bool,
     /// Give sandboxed children the `internetClient` capability.
     ///
     /// Default **false** — a read-only probe needs no egress. Spike S1
@@ -2826,6 +2844,12 @@ pub struct SandboxSettings {
     /// LAN as well as the internet (capabilities are class-granular), so the
     /// honest choice today is all-or-nothing; per-host scoping per locked
     /// decision 4 is WFP work (spike S4).
+    ///
+    /// **This knob governs `run_command` / `run_check` / the audit scanners
+    /// only — NOT tabs.** A sandboxed AI tab always gets `internetClient`
+    /// (locked decision B3): an AI CLI that cannot reach its own model endpoint
+    /// is a bricked tab, not a hardened one. See
+    /// [`crate::sandbox::tabs::tab_sandbox_cfg`].
     pub allow_network: bool,
     /// Extra directories granted read+execute inside the sandbox — the
     /// user-curated rows of decision 3's grant table.

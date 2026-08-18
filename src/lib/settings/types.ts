@@ -1443,8 +1443,14 @@ export interface SandboxSettings {
   /// Master switch for the OS sandbox layer. Off by default until the grant
   /// ladder has soaked on real machines.
   enabled: boolean;
+  /// V33 Phase B: also sandbox the AI-tool tabs (Claude / OpenCode). Effective
+  /// only when `enabled` is also true; plain Shell tabs are never included.
+  tabs: boolean;
   /// Give sandboxed children network access. Off by default; on, it reaches
   /// the internet AND the LAN — Windows capabilities cannot separate them.
+  ///
+  /// Governs the tool seams only. A sandboxed TAB always gets network access
+  /// (an AI CLI with no egress is a bricked tab) — see Rust `tab_sandbox_cfg`.
   allow_network: boolean;
   /// Extra directories granted read+execute inside the sandbox (decision 3's
   /// user-curated grant rows). The program's own directory is automatic.
@@ -2310,6 +2316,7 @@ export function defaultSettings(): Settings {
     },
     sandbox: {
       enabled: false,
+      tabs: false,
       allow_network: false,
       extra_grant_dirs: [],
     },

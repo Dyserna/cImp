@@ -84,6 +84,11 @@ pub fn build_launch_spec(
                 env_remove: Vec::new(),
                 // Shell tabs have no AI assistant output to speak.
                 oob: None,
+                // V33 Phase B decision B1: a Shell tab is NOT an agent seam. It
+                // is the user's own hands at their own machine, so it is never
+                // sandboxed and mints no sandbox row — the same reason
+                // `env_remove` is empty above.
+                harness: None,
             })
         }
     }
@@ -138,7 +143,36 @@ fn build_ai_tool_spec(
         env,
         env_remove,
         oob,
+        // V33 Phase B (decision B1): which harness this tab is, resolved HERE
+        // because this is the function that already knows — `build_pre_args`
+        // (Claude) and `build_opencode_config` (OpenCode) branch on the very
+        // same `command_is` test a few lines up. Resolving it again in the PTY
+        // manager would give "which tabs are agent seams" two answers.
+        //
+        // An AI-tool tab whose command is NEITHER (a user pointed the entry at
+        // something else) gets `None` and is not sandboxed: a grant table nobody
+        // wrote is not a boundary, it is a tool that fails to start for reasons
+        // the user cannot see.
+        harness: harness_of(&cfg.command),
     })
+}
+
+/// [`crate::sandbox::tabs::Harness`] for an AI tab's configured command.
+///
+/// Uses [`command_is`] — the ONE spelling of "which harness is this" in the
+/// codebase — so the sandbox's grant table and the injection layer can never
+/// disagree about what a tab is.
+fn harness_of(command: &str) -> Option<crate::sandbox::tabs::Harness> {
+    use crate::sandbox::tabs::Harness;
+    if command_is(command, "claude") {
+        // `claude-local` is the same binary with a synthesized provider env, so
+        // it is the same harness with the same state directories.
+        Some(Harness::Claude)
+    } else if command_is(command, "opencode") {
+        Some(Harness::OpenCode)
+    } else {
+        None
+    }
 }
 
 /// V30 (review M9): environment markers of the Claude Code session cImp was
@@ -555,9 +589,27 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
                 s.claude_local.model_alias,
             ])
         });
+    // V33 Phase B: the tab sandbox is baked at spawn in the most literal sense —
+    // an OS boundary is put around the process at `CreateProcessW` time and
+    // cannot be added to or removed from a running one. Without a slot here,
+    // ticking "Also sandbox AI tabs" would leave every open tab unconfined with
+    // no restart hint, and the user would reasonably believe the switch took.
+    //
+    // The EFFECTIVE value, per the rule at the top of this object: `tabs` alone
+    // changes no spawn while the master switch is off. `extra_grant_dirs` rides
+    // along because the grants are applied during preparation, so editing the
+    // list cannot widen a boundary that already exists. `allow_network` is
+    // deliberately ABSENT: it does not govern tabs (a sandboxed tab always has
+    // egress, decision B3), and nagging every tab to restart for a knob that
+    // cannot reach them is how a restart hint stops being read.
+    let sandbox = serde_json::json!([
+        s.sandbox.enabled && s.sandbox.tabs,
+        s.sandbox.extra_grant_dirs,
+    ]);
     let claude = serde_json::json!({
         "mcp": [advertises_offload_to_claude(s), advertises_audit_to_claude(s)],
         "guidance": guidance.clone(),
+        "sandbox": sandbox.clone(),
         "statusline": s.statusline.enabled,
         // The `--settings` hooks overlay gates, in `build_pre_args` order:
         // UserPromptSubmit, PreCompact, PreToolUse Read, PreToolUse Bash,
@@ -648,6 +700,7 @@ pub(crate) fn spawn_inject_sig(s: &Settings) -> [serde_json::Value; 2] {
     let opencode = serde_json::json!({
         "mcp": [advertises_offload_to_opencode(s), advertises_audit_to_opencode(s)],
         "guidance": guidance,
+        "sandbox": sandbox,
         // `write_opencode_plugin` inputs: plugin presence + its baked
         // CIMP_INJECT_ENABLED / CIMP_AUTO_CHECK_ENABLED flags.
         //
@@ -6146,6 +6199,45 @@ console.log("OK: the swap reached neither the gate nor the beacon");
             "no cimp-offload server ⇒ session_push changes no argv ⇒ no restart hint"
         );
 
+        // V33 Phase B: the tab sandbox. The most literally spawn-baked setting
+        // there is — an OS boundary exists around a process from
+        // `CreateProcessW` onward and cannot be added to a running one — so
+        // both consumers owe a restart hint. Asserted with the EFFECTIVE
+        // semantics, which is where this could silently go wrong.
+        let mut s = Settings::default();
+        s.sandbox.tabs = true;
+        assert_eq!(
+            spawn_inject_sig(&s),
+            base,
+            "`sandbox.tabs` with the master switch off changes no spawn, so it must not nag"
+        );
+        s.sandbox.enabled = true;
+        let sandboxed = spawn_inject_sig(&s);
+        assert_ne!(
+            sandboxed[0], base[0],
+            "turning tab sandboxing on must move the Claude sig — a running tab cannot be \
+             confined retroactively"
+        );
+        assert_ne!(
+            sandboxed[1], base[1],
+            "…and the OpenCode sig: the switch is not per-consumer"
+        );
+        // The grant table is applied during preparation, so editing it cannot
+        // widen a boundary that already exists ⇒ a running tab is owed a hint.
+        let mut widened = s.clone();
+        widened.sandbox.extra_grant_dirs = vec!["D:/tools".into()];
+        assert_ne!(spawn_inject_sig(&widened), sandboxed);
+        // …but `allow_network` does NOT govern tabs (decision B3: a sandboxed
+        // tab always has egress), so flipping it must not nag a tab that it
+        // cannot reach.
+        let mut net = s.clone();
+        net.sandbox.allow_network = true;
+        assert_eq!(
+            spawn_inject_sig(&net),
+            sandboxed,
+            "`allow_network` is the run_command knob; nagging tabs for it is a hint nobody reads"
+        );
+
         // Live-applied tuning must NOT nag: the read-advisor thresholds are
         // read per-invocation by the loopback handler, not baked at spawn.
         let mut s = Settings::default();
@@ -6153,6 +6245,60 @@ console.log("OK: the swap reached neither the gate nor the beacon");
         s.graph.read_advisor_min_lines += 25;
         s.graph.context_per_file_chars += 100;
         assert_eq!(spawn_inject_sig(&s), with_graph);
+    }
+
+    /// **Which tabs are agent seams** (V33 Phase B decision B1), through the
+    /// real spec builder rather than through `harness_of` alone — the property
+    /// that matters is what lands on `PtyLaunchSpec`, because that is what the
+    /// PTY manager reads.
+    #[test]
+    fn only_ai_tool_tabs_carry_a_harness_and_shell_tabs_never_do() {
+        use crate::sandbox::tabs::Harness;
+        // The direct mapping, including the local-provider variant: a
+        // `claude-local` TAB runs the `claude` COMMAND, so it is the same
+        // harness with the same state directories.
+        assert_eq!(harness_of("claude"), Some(Harness::Claude));
+        assert_eq!(harness_of("CLAUDE.EXE"), Some(Harness::Claude));
+        assert_eq!(
+            harness_of(r"C:\Users\x\.local\bin\claude.exe"),
+            Some(Harness::Claude)
+        );
+        assert_eq!(harness_of("opencode"), Some(Harness::OpenCode));
+        // Anything else is NOT sandboxed: a grant table nobody wrote is not a
+        // boundary, it is a tool that fails to start invisibly.
+        assert_eq!(harness_of("bash"), None);
+        assert_eq!(harness_of("aider"), None);
+        assert_eq!(harness_of(""), None);
+
+        // …and the same test the injection layer makes, so the sandbox's grant
+        // table and the injected config can never disagree about what a tab is.
+        for (command, claude) in [("claude", true), ("opencode", false)] {
+            assert_eq!(
+                harness_of(command) == Some(Harness::Claude),
+                command_is(command, "claude"),
+                "{command}: the sandbox and the injection layer disagree"
+            );
+            let _ = claude;
+        }
+
+        // A Shell tab, through the real builder: no harness, therefore never
+        // sandboxed and never a row. It is the user's own hands.
+        let mut s = Settings::default();
+        s.tabs.push(TabConfig::Shell(crate::settings::ShellTabConfig {
+            id: "shell-1".into(),
+            name: "Shell".into(),
+            command: if cfg!(windows) { "cmd" } else { "sh" }.into(),
+            ..Default::default()
+        }));
+        let dir = std::env::temp_dir();
+        if let Ok(spec) =
+            build_launch_spec(TabId::Shell("shell-1".into()), &s, &dir, &[])
+        {
+            assert!(
+                spec.harness.is_none(),
+                "a Shell tab must never be an agent seam"
+            );
+        }
     }
 
     /// V30 Phase A: the channel registration flag is emitted for a Claude tab

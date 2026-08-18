@@ -1,9 +1,10 @@
 //! V33 contract C1 — the external-process **spawn seam ledger**.
 //!
 //! The V33 spec opened by asserting cImp owns "two spawn seams". It owns
-//! fourteen source sites across four different spawn mechanisms, and the
-//! distinction that matters for sandboxing is not *how many* but *whose work
-//! the child is doing*:
+//! seventeen source sites across five different spawn mechanisms (the count is
+//! [`LEDGER`]'s length and moves with it — the tripwire below is what keeps the
+//! table honest, not this sentence), and the distinction that matters for
+//! sandboxing is not *how many* but *whose work the child is doing*:
 //!
 //! * [`SpawnClass::AgentSpawn`] — the child's program/arguments are chosen (or
 //!   selected from) something a model asked for. These are the seams a sandbox
@@ -270,7 +271,36 @@ pub const LEDGER: &[SpawnSite] = &[
                  is typed to a `tokio::process::Child`. Before that it was the only cImp \
                  child OUTSIDE the kill-on-job-close job. Its env discipline is \
                  `env_remove`-based and is deliberately NOT the C2 allowlist: a harness \
-                 needs the user's full interactive environment.",
+                 needs the user's full interactive environment. SANDBOXED since V33 Phase B, \
+                 but through a SIBLING file rather than a branch here: with \
+                 `sandbox.enabled && sandbox.tabs` an AI-tool tab spawns through \
+                 `pty/sandboxed_conpty.rs` below, and this `spawn_command` is the PLAIN arm \
+                 — the arm every Shell tab always takes, because a shell tab is the user's \
+                 own hands and is deliberately out of scope (decision B1).",
+    },
+    SpawnSite {
+        file: "pty/sandboxed_conpty.rs",
+        symbol: "open_and_spawn / spawn_into",
+        spawns: "the SAME AI-tab harness binary as `pty/manager.rs`, inside an AppContainer \
+                 and attached to a pseudoconsole",
+        class: AgentSpawn,
+        // Two occurrences, one spawn — the `use` import and the call — exactly
+        // like `sandbox/windows.rs`'s row, and for the same reason: the
+        // constructor here is a Win32 symbol that has to be imported by name.
+        count: 2,
+        reason: "V33 Phase B, on spike S3's result. Not a new capability — it is the tab seam \
+                 above running through a different OS mechanism: one `STARTUPINFOEXW` \
+                 attribute list carrying BOTH `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and \
+                 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, because `portable_pty` \
+                 hardcodes a one-attribute list and hides the `HPCON` in a private module, \
+                 and because no `std`/`tokio` `Command` can attach an AppContainer on stable \
+                 Rust. Every constraint of the tab seam is applied BEFORE this is reached \
+                 (the resolved binary, the tab's configured args, the `env_remove` \
+                 discipline, the grant table), so this row is AgentSpawn for the same reason \
+                 and must stay classified with it. Unlike `sandbox/windows.rs` this spawn \
+                 passes `bInheritHandles = FALSE` and therefore takes the spawn gate SHARED, \
+                 not exclusively: it has no inheritable window to protect, and the exclusive \
+                 leg has exactly one legitimate holder.",
     },
     SpawnSite {
         file: "tabs/config.rs",
@@ -477,6 +507,10 @@ mod tests {
             ("sandbox/windows.rs", include_str!("sandbox/windows.rs")),
             ("procutil.rs", include_str!("procutil.rs")),
             ("pty/manager.rs", include_str!("pty/manager.rs")),
+            (
+                "pty/sandboxed_conpty.rs",
+                include_str!("pty/sandboxed_conpty.rs"),
+            ),
             ("tabs/config.rs", include_str!("tabs/config.rs")),
             ("workbench/git.rs", include_str!("workbench/git.rs")),
         ]
@@ -566,13 +600,22 @@ mod tests {
     /// Every agent-reachable seam is still named, with its reason. The counts
     /// above catch a spawn that MOVES; this catches a row being quietly
     /// downgraded to `HostSpawn` to make a future sandbox check pass.
+    ///
+    /// Six rows, not four: each of the four seams has a plain arm, and two of
+    /// them additionally have a SANDBOXED twin (`sandbox/windows.rs` for the
+    /// three tool seams, `pty/sandboxed_conpty.rs` for the tab seam). The twins
+    /// are the arm a model actually reaches once the switch is on, so a twin
+    /// quietly reclassified as HostSpawn would be the more dangerous of the two
+    /// mistakes.
     #[test]
-    fn the_four_agent_seams_are_still_classified_as_agent_seams() {
+    fn every_agent_seam_is_still_classified_as_an_agent_seam() {
         for file in [
             "audit/runner.rs",
             "checks/mod.rs",
             "offload/tools/run_command.rs",
             "pty/manager.rs",
+            "pty/sandboxed_conpty.rs",
+            "sandbox/windows.rs",
         ] {
             let site = LEDGER
                 .iter()

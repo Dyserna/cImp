@@ -853,6 +853,7 @@ dependencies = [
 name = "cimp"
 version = "0.52.0-rc.8"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64 0.23.1",
  "bytemuck",

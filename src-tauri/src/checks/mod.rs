@@ -793,6 +793,10 @@ async fn spawn_capture(
                 // A check writes into the project root (already granted) or into
                 // its redirected TEMP on the mapped drive; nothing outside.
                 full_dirs: Vec::new(),
+                // No reviewed grant rows: this seam widens the boundary only by
+                // inferring the check command's own tool directory, above. The
+                // row table is V33 Phase B's per-harness state paths.
+                rows: Vec::new(),
             },
             root,
             &base_env,

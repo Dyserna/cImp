@@ -120,10 +120,10 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// wait another five seconds to learn nothing.
 const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
-fn wide(s: &OsStr) -> Vec<u16> {
+pub(crate) fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
-fn wide_str(s: &str) -> Vec<u16> {
+pub(crate) fn wide_str(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
@@ -282,30 +282,43 @@ const FULL: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
 /// caller records the former, so the Events feed shows a machine being
 /// prepared exactly once rather than on every spawn.
 fn grant_dir(dir: &Path, sid: *mut c_void, mask: u32) -> Result<bool, String> {
-    if is_app_package_readable(dir) && mask == RX {
+    grant_path(dir, sid, mask, false)
+}
+
+/// The generalized form: `SE_FILE_OBJECT` names files and directories alike, so
+/// the ONLY difference is inheritance — a directory's ACE is made inheritable so
+/// the tree under it is covered, a file's is not (there is nothing to inherit
+/// it, and asking for it would read as "the folder was granted too").
+///
+/// V33 Phase B needs the file form for `~/.claude.json` and `~/.gitconfig`:
+/// granting their parent (`%USERPROFILE%`) instead would hand the container the
+/// user's entire home directory, which is the precise opposite of the point.
+fn grant_path(path: &Path, sid: *mut c_void, mask: u32, is_file: bool) -> Result<bool, String> {
+    if !is_file && is_app_package_readable(path) && mask == RX {
         return Ok(false);
     }
+    // Key on (path, mask, kind) so a later FULL grant on a path RX-granted
+    // earlier still applies. Cheap: only run_command roots, toolchain dirs and
+    // the tab seam's small harness table land here.
+    let key = |p: &Path| p.join(format!("\u{1}{mask}\u{1}{}", u8::from(is_file)));
     {
         let mut g = GRANTED.lock().map_err(|_| "grant lock poisoned".to_string())?;
         let set = g.get_or_insert_with(std::collections::HashSet::new);
-        // Key on (dir, mask) so a later FULL grant on a dir RX-granted earlier
-        // still applies. Cheap: only run_command roots and toolchain dirs land
-        // here.
-        let key = dir.join(format!("\u{1}{mask}"));
-        if set.contains(&key) {
+        let k = key(path);
+        if set.contains(&k) {
             return Ok(false);
         }
         // Record optimistically; a failure below removes it so a retry re-runs.
-        set.insert(key.clone());
+        set.insert(k);
     }
-    match grant_dir_uncached(dir, sid, mask) {
+    match grant_path_uncached(path, sid, mask, is_file) {
         Ok(()) => Ok(true),
         Err(e) => {
             // Un-record so a later attempt retries rather than trusting a
             // grant that never landed.
             if let Ok(mut g) = GRANTED.lock() {
                 if let Some(set) = g.as_mut() {
-                    set.remove(&dir.join(format!("\u{1}{mask}")));
+                    set.remove(&key(path));
                 }
             }
             Err(e)
@@ -313,7 +326,12 @@ fn grant_dir(dir: &Path, sid: *mut c_void, mask: u32) -> Result<bool, String> {
     }
 }
 
-fn grant_dir_uncached(dir: &Path, sid: *mut c_void, mask: u32) -> Result<(), String> {
+fn grant_path_uncached(
+    dir: &Path,
+    sid: *mut c_void,
+    mask: u32,
+    is_file: bool,
+) -> Result<(), String> {
     let mut path_w = wide(dir.as_os_str());
 
     // Read the current DACL.
@@ -350,7 +368,12 @@ fn grant_dir_uncached(dir: &Path, sid: *mut c_void, mask: u32) -> Result<(), Str
     let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
     ea.grfAccessPermissions = mask;
     ea.grfAccessMode = GRANT_ACCESS;
-    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    // A file has nothing beneath it to inherit the ACE (`NO_INHERITANCE` = 0).
+    ea.grfInheritance = if is_file {
+        0
+    } else {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    };
     ea.Trustee = TRUSTEE_W {
         pMultipleTrustee: null_mut(),
         MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -547,10 +570,44 @@ pub struct Prepared {
     drive: DriveGuard,
     /// Env names→values to add/override for the child (TEMP/TMP/HOME/USERPROFILE
     /// pointed inside the mapped root).
+    ///
+    /// **The tab seam deliberately does not consume this** (V33 Phase B,
+    /// decision B4): a tab CLI lives off its real state directories, so
+    /// `HOME`/`USERPROFILE` must stay real there and only the scratch dirs move.
+    /// `sandbox::tabs::compose_env` builds its own overrides for that reason —
+    /// which is a fact worth knowing before "make the tab path reuse
+    /// `env_overrides`" looks like a tidy-up.
     pub env_overrides: Vec<(String, OsString)>,
 }
 
+/// The AppContainer identity of a [`Prepared`], as raw `PSID`s carried as
+/// `usize` — the shuttle `spawn_and_capture` already uses to move them onto a
+/// blocking thread, because a `*mut c_void` is neither `Send` nor `Sync`.
+///
+/// # Safety contract
+///
+/// The pointers borrow buffers owned by the `Prepared` this came from. They are
+/// valid only while that value is alive, and the caller must not outlive it —
+/// which is why this is `pub(crate)` and produced by a method rather than being
+/// a free-standing value anyone can construct.
+pub(crate) struct SecurityIdentity {
+    pub container: usize,
+    pub caps: Vec<usize>,
+}
+
 impl Prepared {
+    /// The container + capability SIDs for a bespoke `CreateProcessW`.
+    ///
+    /// V33 Phase B: the sandboxed ConPTY backend lives in `pty/` (it is a PTY
+    /// mechanism, not a sandbox one) and needs exactly these two things from the
+    /// sandbox engine. See [`SecurityIdentity`]'s safety contract.
+    pub(crate) fn security(&self) -> SecurityIdentity {
+        SecurityIdentity {
+            container: self.container.as_psid() as usize,
+            caps: self.caps.iter().map(|c| c.as_psid() as usize).collect(),
+        }
+    }
+
     /// The cwd the child runs in (the drive-root, so getcwd never walks `C:\`).
     pub fn cwd(&self) -> PathBuf {
         self.drive.drive_root()
@@ -661,6 +718,36 @@ fn prepare_blocking(
             ));
         }
     }
+    // V33 Phase B: the reviewed grant TABLE — a seam's own rows, each with its
+    // width, its kind and its reason (see [`super::GrantRow`]). The tab seam's
+    // per-harness state paths arrive here.
+    //
+    // An OPTIONAL row whose path does not exist is skipped rather than failing:
+    // most harness state is created on first use, so "absent" is the normal
+    // state of half the table on a fresh machine, and refusing to sandbox a tab
+    // because the user has no `~/.config/git` would be the prerequisite check
+    // punishing a healthy machine. A REQUIRED row that is missing still fails
+    // the whole prepare, loudly, exactly like an ungrantable directory.
+    for row in &hints.rows {
+        if !row.required && !row.path.exists() {
+            continue;
+        }
+        let mask = match row.access {
+            super::GrantAccess::ReadExecute => RX,
+            super::GrantAccess::Full => FULL,
+        };
+        if grant_path(&row.path, container.as_psid(), mask, row.is_file)? {
+            granted.push(format!(
+                "{} ({}, {})",
+                row.path.display(),
+                match row.access {
+                    super::GrantAccess::ReadExecute => "read+execute",
+                    super::GrantAccess::Full => "read+write",
+                },
+                row.reason
+            ));
+        }
+    }
     for extra in &cfg.extra_grant_dirs {
         if grant_dir(extra, container.as_psid(), RX)? {
             granted.push(format!("{} (read+execute, from settings)", extra.display()));
@@ -768,6 +855,38 @@ pub struct SpawnRequest<'a> {
 /// deadline, exactly as before.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
+/// A `CreateProcessW` environment block: NUL-separated `K=V` pairs, double-NUL
+/// terminated, **sorted case-insensitively** — Windows requires the sort, and an
+/// unsorted block is the kind of defect that works until the one variable that
+/// happens to be looked up by the loader is in the wrong place.
+///
+/// One function since V33 Phase B, shared by the capture spawn above and the
+/// sandboxed ConPTY spawn (`pty::sandboxed_conpty`), because two copies of this
+/// are two chances for a sandboxed tab and a sandboxed command to disagree about
+/// what an environment block is.
+pub(crate) fn env_block_of(env: &[(OsString, OsString)]) -> Vec<u16> {
+    let mut pairs: Vec<(OsString, OsString)> = env.to_vec();
+    pairs.sort_by(|a, b| {
+        a.0.to_string_lossy()
+            .to_ascii_uppercase()
+            .cmp(&b.0.to_string_lossy().to_ascii_uppercase())
+    });
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in &pairs {
+        // An empty name cannot be spelled in a block (`=VALUE` is the reserved
+        // per-drive-cwd form), and Windows fails the spawn outright on one.
+        if k.is_empty() {
+            continue;
+        }
+        block.extend(k.encode_wide());
+        block.push('=' as u16);
+        block.extend(v.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 /// Spawn `program args…` inside the container with the given final environment
 /// and capture output, bounded by `req.cap` bytes per stream and `req.timeout`.
 ///
@@ -817,22 +936,7 @@ pub async fn spawn_and_capture(
         }
     }
 
-    // Environment block: NUL-separated "K=V" pairs, double-NUL terminated,
-    // sorted case-insensitively as Windows requires.
-    let mut pairs: Vec<(OsString, OsString)> = env.to_vec();
-    pairs.sort_by(|a, b| {
-        a.0.to_string_lossy()
-            .to_ascii_uppercase()
-            .cmp(&b.0.to_string_lossy().to_ascii_uppercase())
-    });
-    let mut env_block: Vec<u16> = Vec::new();
-    for (k, v) in &pairs {
-        env_block.extend(k.encode_wide());
-        env_block.push('=' as u16);
-        env_block.extend(v.encode_wide());
-        env_block.push(0);
-    }
-    env_block.push(0);
+    let env_block = env_block_of(env);
 
     // Snapshot the security capabilities into a heap-stable form the blocking
     // closure owns.
@@ -1386,7 +1490,14 @@ fn drain_pipe(h: HANDLE, cap: usize) -> (Vec<u8>, bool) {
 /// Quote one command-line argument per the Windows CRT rules (backslashes
 /// before a quote double; the whole thing wrapped in quotes if it has spaces
 /// or quotes). Absolute program paths and model args both pass through here.
-fn quote_arg(s: &str) -> String {
+///
+/// `pub(crate)` since V33 Phase B: the sandboxed ConPTY backend
+/// (`pty::sandboxed_conpty`) builds its own command line and MUST use this one
+/// rather than reimplementing the rules — `portable_pty`'s equivalent
+/// (`CommandBuilder::cmdline`) is `pub(crate)` to that crate, and two quoting
+/// routines that are supposed to agree is exactly the silent-divergence hazard
+/// spike S3 called out.
+pub(crate) fn quote_arg(s: &str) -> String {
     if !s.is_empty() && !s.contains([' ', '\t', '"']) {
         return s.to_string();
     }

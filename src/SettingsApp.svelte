@@ -7197,6 +7197,37 @@
               prerequisite can never hide behind this setting.
             </small>
           {/if}
+          <!--
+            V33 Phase B (locked decision B2). A scope widener INSIDE the OS
+            layer, not a second master switch — hence disabled until the master
+            is on, and hence its own paragraph about what confining the agent
+            itself costs.
+          -->
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              disabled={!snapshot.sandbox.enabled}
+              checked={snapshot.sandbox.tabs}
+              onchange={(e) =>
+                patch(
+                  (s) => (s.sandbox.tabs = (e.currentTarget as HTMLInputElement).checked),
+                )}
+            />
+            <span>Also sandbox AI tabs (Claude, OpenCode)</span>
+          </label>
+          <small class="hint down">
+            The tab <em>is</em> the agent, so this confines everything it later
+            runs. A sandboxed tab reads and writes the project and its own
+            harness state (<code>~/.claude</code>, OpenCode's config and data),
+            reads <code>~/.gitconfig</code> for your commit identity, and always
+            has network access — an AI CLI without egress is a bricked tab.
+            Deliberately <strong>not</strong> granted: <code>~/.ssh</code> and the
+            Windows Credential Manager, so a <code>git push</code> from inside a
+            sandboxed tab will be refused. Add what you want reachable under
+            “Extra readable tool directories” below. Plain Shell tabs are never
+            sandboxed — they are your own hands, not an agent seam. Changing this
+            affects tabs started afterwards; running tabs need a restart.
+          </small>
           <label class="checkbox">
             <input
               type="checkbox"
@@ -7217,7 +7248,9 @@
             for build and test probes. On, it reaches the internet <em>and</em>
             your LAN: Windows capabilities cannot separate the two on this
             network, so per-host allowlisting is not yet offered rather than
-            offered and untrue.
+            offered and untrue. This applies to the commands, checks and audit
+            scanners an agent runs; sandboxed <em>tabs</em> always have network
+            access regardless of this setting.
           </small>
           <label class="field">
             <span>Extra readable tool directories</span>

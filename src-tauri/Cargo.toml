@@ -97,6 +97,15 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # shutdown. We deliberately do NOT invert it on our side: that compensation
 # would silently break the day upstream fixes theirs.
 portable-pty = "0.9"
+# V33 Phase B: `portable_pty`'s public traits (`MasterPty`, `Child`,
+# `ChildKiller`) return `anyhow::Result`, and cImp now IMPLEMENTS them — the
+# sandboxed ConPTY backend in `pty::sandboxed_conpty`. An impl has to spell its
+# trait's return type, and portable-pty imports `anyhow::Error` privately
+# (`use`, not `pub use`), so there is no path to it through that crate. Promoted
+# from a transitive dependency to a direct one, which adds ZERO entries to
+# `Cargo.lock` (portable-pty already pins 1.0.x) — the same promotion rationale
+# as `libc`, `url` and `sha2` elsewhere in this manifest.
+anyhow = "1"
 thiserror = "2"
 # V12 Phase A: `run_check` diagnostic parsers (tsc / generic gcc-style
 # `file:line:col: level: message`). Pure Rust, no C deps.

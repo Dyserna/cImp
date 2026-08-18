@@ -1328,6 +1328,10 @@ async fn spawn_and_capture(
                 programs: Vec::new(),
                 // …but a report-file tool must be able to WRITE its SARIF.
                 full_dirs: full_dirs.to_vec(),
+                // No reviewed grant rows: this seam's only widening is the
+                // report directory above. The row table is V33 Phase B's
+                // per-harness tab state.
+                rows: Vec::new(),
             },
             root,
             &base_env,

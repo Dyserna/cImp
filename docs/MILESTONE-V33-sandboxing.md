@@ -1,6 +1,8 @@
 # V33 — OS Sandboxing & Max Paranoia Mode
 
-**Status:** SPEC — not yet coded (2026-08-06). GitHub: milestone 6, umbrella #30.
+**Status:** IMPLEMENTED except Phase D's Landlock half (2026-08-18) — Phase A
+live-verified on rc.8; seam increment + Phase B (S3 POSITIVE) coded, gates
+green, live-verify tracked in #72. GitHub: milestone 6, umbrella #30.
 **Amendments:** 2026-08-09 — Phase F's throttling note, made false by V32's
 `946d7d1` (checkpoint throttle re-keyed per `(root, tab)`). **2026-08-13 — a
 six-agent investigation verified this spec against the live tree and found
@@ -680,9 +682,47 @@ F-7 is closed and stays closed.
   > Still unproven live: a real `git`/`cargo` probe under a sandboxed
   > `run_check` on a machine other than the spike's fixture — live-verify
   > below.
-- **Phase B — tab spawns sandboxed** (S3-gated) + hardened Claude profile in
+- **Phase B — tab spawns sandboxed** (S3-gated) ~~+ hardened Claude profile in
   the overlay (decision 6 — can ship with Phase A since it is
-  platform-gated config).
+  platform-gated config)~~ (decision 6 moved to #76).
+
+  > **IMPLEMENTED 2026-08-18.** S3 ran POSITIVE the same day
+  > (`docs/reviews/SPIKE-S3-conpty-appcontainer-2026-08-18.md`: dual
+  > `PSEUDOCONSOLE`+`SECURITY_CAPABILITIES` attributes work in either order;
+  > confinement token-proven in child and grandchild through the pty;
+  > `claude.exe` ran sandboxed in a ConPTY). As built:
+  > - **Backend:** `pty/sandboxed_conpty.rs`, a cImp-owned ConPTY spawn
+  >   implementing portable_pty's public traits (its own ConPTY internals are
+  >   private); portable_pty stays byte-identical for plain tabs.
+  >   `CONPTY_FLAGS = 0x6` — parity with the plain path minus only the
+  >   `INHERIT_CURSOR` DSR-deadlock bit, const-asserted both ways.
+  > - **Policy:** `sandbox/tabs.rs` (platform-neutral). New `sandbox.tabs`
+  >   switch, default OFF, effective only with the master switch, spawn-baked
+  >   (`spawn_inject_sig` slot). AI-tool tabs only; shell tabs are the user's
+  >   own hands. `internetClient` is unconditional for sandboxed tabs — an AI
+  >   CLI without egress is a bricked tab; per-host scoping is V36/WFP.
+  > - **Grants:** per-harness table with a reason per row (Claude: `~/.claude`
+  >   RW, `~/.claude.json`(+backup) as FILE ACEs, `~/.local/share/claude`
+  >   READ-ONLY on purpose — an agent that can rewrite its own image persists
+  >   across the boundary, so in-tab auto-update is refused; OpenCode: its
+  >   three XDG dirs RW). Never `~/.ssh`, never Credential Manager, never
+  >   `%USERPROFILE%` itself (test-enforced). HOME stays REAL; TEMP/TMP go to
+  >   per-tab scratch under the mapped drive.
+  > - **Env:** the sandboxed child reads the RESOLVED env back out of the same
+  >   `CommandBuilder` as the plain path (which re-reads the Environment
+  >   registry keys and concatenates system+user `PATH` — a hand-rolled
+  >   snapshot would silently diverge). Residual: non-UTF-8 env vars don't
+  >   reach a sandboxed child.
+  > - **Degradation = Phase A semantics** (off/unavailable → plain + loud skip
+  >   row; wedged prepare → refusal; Win32 failure after grants → denial row +
+  >   visible tab error, never a silent plain retry). `Prepared`/drive guard
+  >   live for the tab session; the subst mapping is refcounted per root.
+  > - **Documented consequences, accepted:** a sandboxed tab sees `S:\…`, so
+  >   Claude keys per-project state under a different slug than the same tab
+  >   unsandboxed (toggling the switch looks to Claude like a new project);
+  >   conhost runs OUTSIDE the container (the boundary is around the child,
+  >   not the pty); a `~/.claude.json` atomic-rewrite (temp+rename) would shed
+  >   its file ACE mid-session — live-verify item, no static answer.
 - **Phase C — Max Paranoia Mode, Windows** (S4+S5-gated): `.wsb` generation,
   bootstrap, SSH tab wiring, WFP scoping, teardown, UI toggle named
   "Max Paranoia".

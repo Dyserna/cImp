@@ -395,6 +395,24 @@ windows = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux-only (V33 Phase D): the OS sandbox engine, `sandbox::linux`.
+#
+# `landlock` is the Landlock LSM maintainer's own Rust binding, which is the
+# reason to prefer it over hand-rolling three syscalls: the access-right sets
+# are versioned by kernel ABI (V1 5.13 … V9 7.1) and its best-effort
+# compatibility layer is where the knowledge of which right exists in which
+# version actually lives. Reimplementing that is reimplementing the part that
+# is hard to keep correct.
+#
+# Adds exactly ONE entry to `Cargo.lock`: its three dependencies —
+# `enumflags2` 0.7, `thiserror` 2.0 and `libc` 0.2.186 — are already resolved
+# here (enumflags2 transitively, the other two as direct deps of this crate).
+#
+# Scoped to Linux rather than `cfg(unix)` because Landlock is a Linux LSM; a
+# macOS build has no engine and says so (see `sandbox::plan`).
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 # V14 Phase B: backdating a directory's mtime in `attach::tests` (to exercise
 # `attach::prune`'s age cutoff). Already resolved in Cargo.lock as a

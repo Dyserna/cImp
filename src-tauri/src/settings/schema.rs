@@ -2790,8 +2790,11 @@ pub struct WorkbenchSettings {
 /// *does this control the boundary the OS enforces?* — not *did V33 add it?*
 ///
 /// **Locked decision 17: [`enabled`](Self::enabled) reaches the OS layer
-/// ONLY.** Off ⇒ no per-spawn AppContainer wrapper (and, when they land, no
-/// Landlock and no Max Paranoia). Unconditional regardless of this switch, and
+/// ONLY.** Off ⇒ no per-spawn AppContainer wrapper on Windows, no Landlock
+/// ruleset on Linux (V33 Phase D), and — when it lands — no Max Paranoia. The
+/// same three fields govern both engines: there is no Linux-only setting, and
+/// `extra_grant_dirs` means the same thing on both (a reviewed read+execute
+/// widening). Unconditional regardless of this switch, and
 /// therefore absent from this struct: job-object kill-on-close (lifecycle
 /// correctness — switching it off reintroduces orphans, a bug not a freedom),
 /// `run_command`'s minimal environment (it withholds credentials, not

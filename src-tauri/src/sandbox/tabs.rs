@@ -298,8 +298,10 @@ pub fn grant_hints(harness: Harness) -> GrantHints {
 /// the same way it already would for the two files above.
 ///
 /// `allow(dead_code)` off Windows for the same reason the rest of this layer
-/// carries it: the AppContainer engine is the only consumer today, and Landlock
-/// (Phase D) will be the second.
+/// carries it. Unlike the rest, this one is still literally true after V33
+/// Phase D: the Landlock engine confines the three TOOL seams and deliberately
+/// not tabs (see [`plan_tab`]), so the AppContainer engine remains this
+/// function's only consumer.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn scratch_dir(root: &Path, tab_id: &str) -> PathBuf {
     root.join(".cimp").join("sandbox-tmp").join(sanitize(tab_id))
@@ -447,6 +449,35 @@ pub async fn plan_tab(
                 return TabPlan::Plain;
             }
             TabPlan::Sandboxed(Box::new(prepared))
+        }
+        // V33 Phase D: the Linux engine exists and confines the three TOOL
+        // seams, but a tab is spawned by `portable_pty` and there is nowhere to
+        // apply `restrict_self` in its child. Investigated, precisely:
+        // `CommandBuilder` exposes no exec hook (its public surface is args,
+        // env, cwd, umask, controlling_tty), its `as_command()` — the one place
+        // a `std::process::Command` exists — is `pub(crate)`, and
+        // `UnixPtyPair::spawn_command` registers its OWN `pre_exec` (signal
+        // dispositions, `setsid`, `TIOCSCTTY`, umask) before handing back a
+        // child. `pre_exec` closures compose in registration order, so a
+        // `CommandBuilder::pre_exec` hook upstream — or a public
+        // `as_command()` — would be enough; today neither exists, and the
+        // alternative is reimplementing the unix PTY spawn the way
+        // `pty::sandboxed_conpty` reimplements the Windows one. That is a phase
+        // of its own, not a line here.
+        //
+        // So the ruleset this arm was handed is dropped and the tab launches
+        // plain — LOUDLY, as its own skip row, never as an empty lane that
+        // reads like confinement.
+        #[cfg(target_os = "linux")]
+        super::Plan::Sandboxed(_) => {
+            let reason = super::SkipReason::Unavailable(
+                "AI tabs are not sandboxed on Linux: the PTY backend (portable_pty) exposes no \
+                 spawn hook to apply a Landlock ruleset in the child. The run_command, run_check \
+                 and audit seams ARE confined on this machine."
+                    .to_string(),
+            );
+            super::record_skip_noting(&seam, &reason, tab_id, root, off_note(settings));
+            TabPlan::Plain
         }
         super::Plan::Plain(reason) => {
             super::record_skip_noting(&seam, &reason, tab_id, root, off_note(settings));

@@ -397,14 +397,44 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // not outlive the timeout.
     crate::procutil::own_process_group(&mut cmd);
 
+    // V33 Phase D — on Linux this IS the sandboxed path. Where Windows needs a
+    // whole second spawn mechanism, Landlock is applied to the command built
+    // above: the composed environment (C2 base → the program's policy env →
+    // the sandbox's TMPDIR/HOME redirections) and a `pre_exec` that restricts
+    // the child between fork and exec. An error here REFUSES the run — it never
+    // falls through to an unconfined spawn (Phase D decision D3).
+    #[cfg(target_os = "linux")]
+    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
+        prepared.apply(
+            &mut cmd,
+            &base_env,
+            policy_env.iter().map(|(k, v)| (k.as_str(), v.clone())),
+        )?;
+    }
+
     // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
     // This is the seam whose SANDBOXED twin takes the gate exclusively, so an
     // ungated plain spawn here would be the exact race the gate exists to close.
+    // (The Linux sandbox needs no exclusive window: it opens no inheritable
+    // handles, so it takes the gate SHARED right here, like any other spawn.)
     let mut child = crate::spawn_gate::spawn_tokio(&mut cmd)
         .map_err(|e| format!("failed to spawn `{}`: {e}", args.command))?;
     // Backstop: reap this command subprocess via the kill-on-job-close job if
     // cImp dies hard before kill_on_drop can fire.
     crate::process_guard::guard_child(&child);
+    // The spawn succeeded, so on Linux the boundary is real for this program:
+    // say so once, positively — the same confirmation row `run_sandboxed` mints
+    // on Windows, and for the same reason (an empty lane must not mean two
+    // different things). Deduped per program inside `record_sandboxed`.
+    #[cfg(target_os = "linux")]
+    if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
+        crate::sandbox::record_sandboxed(
+            crate::sandbox::SEAM_RUN_COMMAND,
+            &cwd,
+            &crate::sandbox::program_subject(&program),
+            &ctx.sandbox,
+        );
+    }
 
     // Read stdout/stderr concurrently with waiting, each capped so a command
     // that floods output (e.g. `git log -p` on a huge repo) can't balloon RSS
@@ -445,6 +475,29 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         }
     };
     let status = status.map_err(|e| format!("`{}` failed: {e}", args.command))?;
+
+    // V33 Phase D — the Linux denial row. This is the last point at which the
+    // raw exit code and stderr exist (a nonzero exit is returned to the model as
+    // text), which is exactly why `run_sandboxed` mints its equivalent here too.
+    // A timeout mints nothing: a hang matches no access-denial signature.
+    #[cfg(target_os = "linux")]
+    if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
+        let stderr_text = String::from_utf8_lossy(&err.bytes);
+        if let Some(class) =
+            crate::sandbox::denial_signature(status.code(), &stderr_text, ctx.sandbox.allow_network)
+        {
+            crate::sandbox::record_denial(
+                crate::sandbox::SEAM_RUN_COMMAND,
+                &cwd,
+                &crate::sandbox::program_subject(&program),
+                &args.args,
+                status.code(),
+                &stderr_text,
+                class,
+                &ctx.sandbox,
+            );
+        }
+    }
 
     Ok(format_run_output(
         &out.bytes,

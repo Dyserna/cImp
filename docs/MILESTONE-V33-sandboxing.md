@@ -727,8 +727,45 @@ F-7 is closed and stays closed.
   bootstrap, SSH tab wiring, WFP scoping, teardown, UI toggle named
   "Max Paranoia".
 - **Phase D — Linux tier 2 + Max Paranoia** (rides the Linux milestone):
-  Landlock `pre_exec` + grant table; podman mode; nesting spike (Claude's
-  bwrap starting under our Landlock wrapper — expected fine, unverified).
+  Landlock `pre_exec` + grant table; ~~podman mode; nesting spike (Claude's
+  bwrap starting under our Landlock wrapper — expected fine, unverified)~~
+  (moved to #76).
+
+  > **Landlock half IMPLEMENTED 2026-08-18** (`sandbox/linux.rs`, `landlock
+  > 0.4.7`, the same three settings fields govern both engines — no new keys).
+  > As built:
+  > - **Probe in the parent, before any fork:** the raw
+  >   `landlock_create_ruleset(NULL, 0, VERSION)` syscall (the crate's own probe
+  >   is private) — unsupported kernel ⇒ `Plain(Unavailable)`, loud. The ruleset
+  >   is built PRE-fork for exactly the probed ABI (requested == enforced by
+  >   construction); `pre_exec` only calls `restrict_self` (allocation-free,
+  >   verified) and FAILS THE SPAWN on any error or a `NotEnforced` status —
+  >   between "sandboxed" and "error" the code chooses error; loud-plain exists
+  >   only via the pre-fork Unavailable.
+  > - **Grant tiers:** RW = root + hint full-dirs; `/dev` = read + WriteFile/
+  >   Truncate/Ioctl (so `2>/dev/null` works) but never create/unlink; RX =
+  >   the system-dirs list + program parents + extra_grant_dirs, existence-
+  >   filtered, widest-tier dedup. NOT granted: `$HOME` (so `~/.ssh`, other
+  >   projects), `~/.cargo`/`~/.rustup` (opt-in, denial rows otherwise), `/tmp`
+  >   (TMPDIR/HOME redirect into the root).
+  > - **Network:** `allow_network=false` + ABI≥4 ⇒ deny-all TCP bind+connect.
+  >   **UDP — and thus direct-socket DNS — is never restricted**; stated in the
+  >   rows and `posture()`, never implied away. `NAME_RESOLUTION_IS_A_BOUNDARY_
+  >   SIGNAL = cfg!(windows)` keeps the DNS-failure classifier truthful per
+  >   platform. Landlock refuses scoped TCP with **EACCES** (not EPERM), so the
+  >   socket markers are operation-naming phrases and the classifier checks
+  >   socket before filesystem.
+  > - **Tabs on Linux: out of scope** (portable_pty exposes no pre_exec hook and
+  >   its unix spawn registers its own; a small upstream ask — `pre_exec` on
+  >   CommandBuilder or a public `as_command()` — would unlock it; recorded in
+  >   `sandbox/tabs.rs`). The tab plan on Linux degrades to plain with a loud
+  >   skip row.
+  > - **Verification:** Linux-half type-checked locally via a scratchpad
+  >   cross-check harness (clippy-clean for the linux target); live enforcement
+  >   tests are Linux-CI-only and SKIP LOUDLY on a Landlock-less kernel — a
+  >   green run must show them exercised, not skipped. The ABI-4 TCP-denial leg
+  >   has NO test route (dash has no /dev/tcp; curl not guaranteed) — it needs
+  >   the in-app battery, tracked in #72.
 
   > **Amendment 2026-08-13 (investigation) — "rides the Linux milestone" is
   > stale: the Linux port SHIPPED.** Full GPU parity on Ubuntu 24.04, a

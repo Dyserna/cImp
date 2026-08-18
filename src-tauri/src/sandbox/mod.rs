@@ -1,10 +1,23 @@
 //! V33 Phase A — the OS sandbox layer for **agent-initiated child processes**.
 //!
-//! Engine: Windows AppContainer, chosen by spike S1
-//! (`docs/reviews/SPIKE-S1-appcontainer-2026-08-15.md`, user decision
-//! 2026-08-15 closing milestone decision 2). Linux gets Landlock in Phase D;
-//! until then non-Windows reports `Unavailable` and children run exactly as
-//! before — loudly, per decision 5, never silently.
+//! Engines, one per platform:
+//!
+//! * **Windows — AppContainer** ([`windows`]), chosen by spike S1
+//!   (`docs/reviews/SPIKE-S1-appcontainer-2026-08-15.md`, user decision
+//!   2026-08-15 closing milestone decision 2). Covers all four seams.
+//! * **Linux — Landlock** ([`linux`], V33 Phase D). Covers the three non-PTY
+//!   tool seams; AI *tabs* stay unsandboxed there and say so, because a
+//!   confined PTY child needs a spawn hook `portable_pty` does not expose.
+//! * **Everything else (macOS)** reports `Unavailable` and children run exactly
+//!   as before — loudly, per decision 5, never silently.
+//!
+//! The two engines meet the seams differently and deliberately: Windows must
+//! hand-roll a `CreateProcessW` (no `std`/`tokio` `Command` can attach an
+//! AppContainer attribute list), so it owns the whole spawn; Linux applies its
+//! boundary *to the seam's own spawn* through `pre_exec`, so the plain path and
+//! the sandboxed path are the same code with two extra lines. That is why only
+//! the Windows path carries settle-slack backstops, cancel flags and bounded
+//! drains — those bound a bespoke blocking dance that does not exist on Linux.
 //!
 //! **Scope.** This layer wraps all four [`SpawnClass::AgentSpawn`] seams:
 //! `run_command` children (`offload/tools/run_command.rs`, Phase A), the
@@ -55,6 +68,12 @@
 //! product, not a gate that bricks tool calls on a missing prerequisite.
 
 pub mod child_env;
+/// The Linux engine. Declared on **every** platform, unlike [`windows`]: its
+/// grant ladder, environment redirection and posture wording are pure functions
+/// with their own tests, and the machine this project is developed on cannot
+/// compile the Linux target at all — so the half that can be reviewed and run
+/// everywhere is. Only the parts that need the kernel are `cfg`'d inside.
+pub mod linux;
 pub mod tabs;
 #[cfg(windows)]
 pub mod windows;
@@ -231,6 +250,14 @@ impl SkipReason {
 pub enum Plan {
     #[cfg(windows)]
     Sandboxed(windows::Prepared),
+    /// The two `Sandboxed` variants are mutually exclusive by `cfg` — exactly
+    /// one exists in any build, and neither does on a platform with no engine.
+    /// Same name on purpose: a seam's `if let Plan::Sandboxed(prepared)` arm
+    /// reads identically on both platforms, and what differs (a bespoke spawn
+    /// vs. a hook on the plain one) differs where it has to, in the seam's own
+    /// `cfg` block.
+    #[cfg(target_os = "linux")]
+    Sandboxed(linux::Prepared),
     Plain(SkipReason),
 }
 
@@ -347,11 +374,20 @@ pub async fn plan(
             Err(reason) => Plan::Plain(SkipReason::Unavailable(reason)),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        match linux::prepare(cfg, seam, program, hints, root, env).await {
+            Ok(prepared) => Plan::Sandboxed(prepared),
+            Err(reason) => Plan::Plain(SkipReason::Unavailable(reason)),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (seam, program, hints, root, env);
         Plan::Plain(SkipReason::Unavailable(
-            "no OS sandbox engine on this platform yet (Linux Landlock is V33 Phase D)".into(),
+            "no OS sandbox engine on this platform yet — Windows uses AppContainer and Linux uses \
+             Landlock; macOS has neither"
+                .into(),
         ))
     }
 }
@@ -427,8 +463,10 @@ pub fn record_skip_noting(
 /// a machine (`tool = "grant"`), a confirmation, a denial, a wedge — into the
 /// same lane, tagged with the `seam` it came from.
 ///
-/// `#[allow(dead_code)]` off Windows: the only caller is the AppContainer
-/// engine, and Landlock (Phase D) will be the second.
+/// `#[allow(dead_code)]` off Windows: the callers are the AppContainer engine
+/// and, since V33 Phase D, the Landlock one — so the attribute is now only
+/// there for the platform with neither (macOS), where an `allow` on a used item
+/// costs nothing and a missing one would warn.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn record_event(seam: &str, root: &Path, tool: &str, target: String, detail: String, ok: bool) {
     crate::activity::record_bg(crate::activity::ActivityRecord {
@@ -455,9 +493,9 @@ pub fn record_event(seam: &str, root: &Path, tool: &str, target: String, detail:
 /// tool cannot push its own row past the activity store's payload cap.
 ///
 /// The `allow(dead_code)` on this and the helpers below is the same one
-/// [`record_event`] carries and for the same reason: the only non-test caller
-/// today is the Windows AppContainer engine, and Landlock (Phase D) will be
-/// the second.
+/// [`record_event`] carries and for the same reason: the non-test callers are
+/// the two engines (AppContainer, and Landlock since V33 Phase D), so the
+/// attribute now only covers the platform with neither.
 #[cfg_attr(not(windows), allow(dead_code))]
 const DENIAL_STDERR_TAIL_CHARS: usize = 500;
 
@@ -468,18 +506,44 @@ const DENIAL_STDERR_TAIL_CHARS: usize = 500;
 /// denied` is what the Win32 tools print for the same thing; `Permission
 /// denied` is the POSIX spelling, kept here because a cross-compiled or
 /// MSYS-linked tool prints it on Windows too.
+///
+/// V33 Phase D adds the Linux spellings. **A Landlock denial is `EACCES`** —
+/// for the filesystem and, since ABI 4, for a refused TCP `bind`/`connect` as
+/// well — so `os error 13` and the bare `EACCES` token join `permission
+/// denied`, which already covered the rendered form.
 #[cfg_attr(not(windows), allow(dead_code))]
-const FILESYSTEM_DENIAL_MARKERS: &[&str] = &["os error 5", "access is denied", "permission denied"];
+const FILESYSTEM_DENIAL_MARKERS: &[&str] = &[
+    "os error 5",
+    "access is denied",
+    "permission denied",
+    "os error 13",
+    "eacces",
+];
 
 /// Substrings whose presence means the OS refused a **socket** operation.
 /// `10013` is `WSAEACCES`; the "forbidden by its access permissions" phrasing
 /// is the message Windows renders for it, which is exactly what an
 /// AppContainer without `internetClient` produces on `connect()`.
+///
+/// **The Linux entries name the OPERATION, not the errno, and that is the whole
+/// point.** Landlock refuses a scoped TCP `bind`/`connect` with `EACCES` — the
+/// same errno a denied `open()` returns — so on Linux the number cannot tell a
+/// socket denial from a file one. What can is the syscall the tool printed
+/// beside it, which is why these are compound phrases and why
+/// [`denial_signature`] checks this list FIRST.
+///
+/// `EPERM` (`os error 1`) is deliberately absent. It is Linux's most generic
+/// refusal, it is what this crate's own `pre_exec` returns when it refuses to
+/// exec an unconfined child, and claiming it as a socket denial would put a
+/// confident wrong label on the one row a user needs to trust.
 #[cfg_attr(not(windows), allow(dead_code))]
 const SOCKET_DENIAL_MARKERS: &[&str] = &[
     "os error 10013",
     "wsaeacces",
     "forbidden by its access permissions",
+    "connect: permission denied",
+    "bind: permission denied",
+    "socket: permission denied",
 ];
 
 /// Substrings that mean name resolution died. These are **conditional** — see
@@ -493,13 +557,34 @@ const NAME_RESOLUTION_MARKERS: &[&str] = &[
     "curle_couldnt_resolve_host",
 ];
 
+/// Whether a name-resolution failure can be the boundary's fingerprint **on
+/// this platform at all** — the second condition on [`NAME_RESOLUTION_MARKERS`],
+/// and the one that is not a runtime flag.
+///
+/// * **Windows: yes.** An AppContainer without `internetClient` refuses the
+///   resolver's socket, so DNS is where a network-touching tool dies first.
+/// * **Linux: no.** Landlock scopes **TCP only**; UDP is untouched, so a
+///   confined child with egress denied still resolves names perfectly well. A
+///   resolver failure there is ordinary network weather, and labelling it a
+///   boundary denial would be a claim the user cannot check and we cannot
+///   support (V33 Phase D, decision D6's honesty rule).
+///
+/// A `const` rather than a `cfg` inside [`denial_signature`] so the *test* can
+/// branch on the same fact the function does, and stays truthful on both
+/// platforms instead of being disabled on one.
+#[cfg_attr(not(windows), allow(dead_code))]
+const NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL: bool = cfg!(windows);
+
 /// Classify one failed child's output: does it *look like* the sandbox
 /// boundary refused something?
 ///
-/// Pure and cross-platform on purpose — the AppContainer engine is
-/// Windows-only, but the judgement it feeds is plain string work, so it is
-/// testable (and reviewable) on any machine, and Landlock's Phase D failures
-/// will be classified by this same function rather than a second copy.
+/// Pure and (almost) cross-platform on purpose — the engines are
+/// platform-specific, but the judgement they feed is plain string work, so it
+/// is testable and reviewable on any machine, and Landlock's denials are
+/// classified by this same function rather than by a second copy. The one
+/// platform-dependent term is
+/// [`NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL`], which is a fact about the
+/// mechanism rather than a preference — see it for why.
 ///
 /// # This is a heuristic, and the caller must say so
 ///
@@ -522,6 +607,10 @@ const NAME_RESOLUTION_MARKERS: &[&str] = &[
 /// broken or the host is wrong, and the sandbox had nothing to do with it.
 /// One flag, two meanings — so the flag is an argument, not an assumption.
 ///
+/// The *platform* is the second condition and it is not a flag:
+/// [`NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL`] is false on Linux, where Landlock
+/// scopes TCP only and DNS therefore keeps working inside the boundary.
+///
 /// Returns `None` for a clean exit (whatever the stderr says — a passing run
 /// that mentions "permission denied" in a test name is not a boundary event)
 /// and for an ordinary nonzero exit with no matching marker (a failing test
@@ -540,13 +629,19 @@ pub fn denial_signature(
     }
     let hay = stderr.to_ascii_lowercase();
     let hit = |markers: &[&str]| markers.iter().any(|m| hay.contains(m));
-    if hit(FILESYSTEM_DENIAL_MARKERS) {
-        return Some("filesystem/OS access denied");
-    }
+    // SOCKET first, FILESYSTEM second — the socket list is the more SPECIFIC
+    // one (its Linux entries name a syscall, e.g. `connect: Permission
+    // denied`), and on Linux both denials share the `EACCES` errno, so a
+    // filesystem-first order would swallow every network denial into the wrong
+    // class. The two Windows sets are disjoint, so the order costs nothing
+    // there — `filesystem_and_socket_markers_are_unconditional` pins that.
     if hit(SOCKET_DENIAL_MARKERS) {
         return Some("socket access denied");
     }
-    if !allow_network && hit(NAME_RESOLUTION_MARKERS) {
+    if hit(FILESYSTEM_DENIAL_MARKERS) {
+        return Some("filesystem/OS access denied");
+    }
+    if NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL && !allow_network && hit(NAME_RESOLUTION_MARKERS) {
         return Some("name resolution failed (no network capability)");
     }
     None
@@ -555,13 +650,40 @@ pub fn denial_signature(
 /// The capability posture a sandboxed child ran under, rendered for a row's
 /// detail. Both new row types carry it: a denial is only interpretable next to
 /// what the boundary was actually configured to allow.
+///
+/// The first clause is what the USER asked for and reads the same everywhere.
+/// On Linux a second clause states what the KERNEL is actually enforcing
+/// ([`linux::posture_note`]) — the ABI, and which of the two network holes
+/// applies — because `network=off` on a Landlock box means "TCP is scoped, UDP
+/// is not" or, below ABI 4, "nothing is scoped", and a posture line that stops
+/// at `off` would be promising confinement the kernel is not providing.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn posture(cfg: &SandboxCfg) -> String {
     format!(
-        "network={}, extra grants={}",
+        "network={}, extra grants={}{}",
         if cfg.allow_network { "on" } else { "off" },
-        cfg.extra_grant_dirs.len()
+        cfg.extra_grant_dirs.len(),
+        engine_posture(cfg)
     )
+}
+
+/// The engine-specific half of [`posture`], or the empty string where the
+/// engine has nothing to add beyond what the user configured.
+///
+/// Empty on Windows on purpose: an AppContainer's `internetClient` capability
+/// is all-or-nothing and `network=on/off` says the whole truth about it. Linux
+/// is the platform where it does not — see [`linux::posture_note`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn engine_posture(cfg: &SandboxCfg) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        linux::posture_note(cfg.allow_network)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        String::new()
+    }
 }
 
 /// **What a sandbox-lane row is about**, rendered from a program path: the file
@@ -871,7 +993,7 @@ mod tests {
             Plan::Plain(SkipReason::Unavailable(r)) => {
                 panic!("a disabled switch was reported as unavailable: {r}")
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             Plan::Sandboxed(_) => panic!("a disabled switch still sandboxed the spawn"),
         }
     }
@@ -895,6 +1017,16 @@ mod tests {
                 "An attempt was made to access a socket in a way forbidden by its access permissions.",
                 "socket access denied",
             ),
+            // V33 Phase D — the Linux spellings. A Landlock filesystem denial
+            // is EACCES, which tools render either way round.
+            ("open /home/me/.ssh/id_ed25519: os error 13", "filesystem/OS access denied"),
+            ("cat: /etc/shadow: EACCES", "filesystem/OS access denied"),
+            // …and a denied TCP operation is EACCES *too*, so what makes it a
+            // socket row is the syscall the tool named beside it. This is the
+            // pair the marker ORDER exists for: `connect: Permission denied`
+            // matches BOTH lists, and the socket class is the true one.
+            ("curl: (7) Failed to connect: connect: Permission denied", "socket access denied"),
+            ("bind: Permission denied", "socket access denied"),
         ];
         for (stderr, class) in cases {
             for allow_network in [false, true] {
@@ -907,13 +1039,20 @@ mod tests {
         }
     }
 
-    /// The honesty rule, as a test: name-resolution failures are the
-    /// AppContainer's usual death shape ONLY when egress was withheld. With
-    /// `allow_network = true` the very same strings are ordinary network
-    /// errors, and claiming them as boundary denials would be a lie the user
-    /// cannot check.
+    /// The honesty rule, as a test, in its two dimensions.
+    ///
+    /// 1. **The flag.** Name-resolution failures are the AppContainer's usual
+    ///    death shape ONLY when egress was withheld; with `allow_network =
+    ///    true` the same strings are ordinary network errors.
+    /// 2. **The platform.** On Linux they are never the boundary's fingerprint,
+    ///    because Landlock scopes TCP and DNS is UDP — so the expectation below
+    ///    is read from the same constant the classifier reads, and this test
+    ///    asserts the truth on both platforms rather than being switched off on
+    ///    one.
     #[test]
-    fn name_resolution_is_a_denial_only_when_network_is_off() {
+    fn name_resolution_is_a_denial_only_when_the_platform_and_the_flag_both_allow_it() {
+        let expected = NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL
+            .then_some("name resolution failed (no network capability)");
         for stderr in [
             "fatal: Could not resolve host: github.com",
             "getaddrinfo ENOTFOUND registry.npmjs.org",
@@ -922,8 +1061,8 @@ mod tests {
         ] {
             assert_eq!(
                 denial_signature(Some(128), stderr, false),
-                Some("name resolution failed (no network capability)"),
-                "{stderr:?} must classify with the network capability off"
+                expected,
+                "{stderr:?} with the network capability off"
             );
             assert_eq!(
                 denial_signature(Some(128), stderr, true),
@@ -931,6 +1070,9 @@ mod tests {
                 "{stderr:?} must NOT be called a boundary denial when egress was granted"
             );
         }
+        // The constant is not a free parameter: it must match the platform's
+        // actual mechanism, or the rule above is enforcing nothing.
+        assert_eq!(NAME_RESOLUTION_IS_A_BOUNDARY_SIGNAL, cfg!(windows));
     }
 
     /// A failing test suite is not a boundary event. An ordinary nonzero exit
@@ -1089,21 +1231,43 @@ mod tests {
     #[test]
     fn posture_names_the_capabilities() {
         let cfg = SandboxCfg::disabled();
-        assert_eq!(posture(&cfg), "network=off, extra grants=0");
+        // `starts_with`, not equality: on Linux the engine appends what the
+        // KERNEL is enforcing (see `posture`), and pinning the exact string
+        // would either forbid that clause or make this test platform-specific.
+        assert!(
+            posture(&cfg).starts_with("network=off, extra grants=0"),
+            "{}",
+            posture(&cfg)
+        );
         let cfg = SandboxCfg {
             enabled: true,
             allow_network: true,
             extra_grant_dirs: vec![PathBuf::from("C:/tools")],
         };
-        assert_eq!(posture(&cfg), "network=on, extra grants=1");
+        assert!(
+            posture(&cfg).starts_with("network=on, extra grants=1"),
+            "{}",
+            posture(&cfg)
+        );
+        // …and where there IS an engine-specific clause, it must name the
+        // engine — a posture nobody can attribute is a posture nobody trusts.
+        #[cfg(target_os = "linux")]
+        assert!(
+            posture(&cfg).to_ascii_lowercase().contains("landlock"),
+            "{}",
+            posture(&cfg)
+        );
     }
 
     /// On a platform with no engine, the reason must NAME the missing thing —
     /// decision 5's "loud, never silent" applied to the string a user reads in
     /// the Events row.
-    #[cfg(not(windows))]
+    ///
+    /// Since V33 Phase D that platform is macOS only; Linux has an engine and
+    /// its own coverage in [`linux`].
+    #[cfg(not(any(windows, target_os = "linux")))]
     #[test]
-    fn non_windows_says_what_is_missing() {
+    fn a_platform_with_no_engine_says_what_is_missing() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1122,6 +1286,54 @@ mod tests {
                 assert!(r.contains("Landlock"), "reason must name the gap: {r}");
             }
             _ => panic!("an enabled sandbox on a platform with no engine must be Unavailable"),
+        }
+    }
+
+    /// V33 Phase D — on Linux an enabled switch must reach the Landlock engine:
+    /// either it prepares a boundary, or it says why it could not, naming
+    /// Landlock. What it may never be is `OffUser` (the switch is on) or a
+    /// silent success.
+    ///
+    /// The kernel is not a given — a container without Landlock is a normal
+    /// place for this to run — so the unavailable arm is a PASS with a loud
+    /// note rather than a failure. What is asserted either way is that the two
+    /// states stay distinguishable (C10).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_enabled_switch_on_linux_reaches_the_landlock_engine() {
+        let root = std::env::temp_dir();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let cfg = SandboxCfg {
+            enabled: true,
+            allow_network: false,
+            extra_grant_dirs: Vec::new(),
+        };
+        let plan = rt.block_on(plan(
+            &cfg,
+            SEAM_RUN_COMMAND,
+            Path::new("/bin/sh"),
+            &GrantHints::default(),
+            &root,
+            &[],
+        ));
+        match plan {
+            Plan::Sandboxed(prepared) => {
+                // A boundary with no grants would confine the child out of its
+                // own project; the root is always the first rule.
+                assert!(
+                    !prepared.grants.is_empty(),
+                    "a prepared Landlock boundary must grant at least the root"
+                );
+            }
+            Plan::Plain(SkipReason::Unavailable(r)) => {
+                println!("SKIPPED (no usable Landlock on this kernel): {r}");
+                assert!(!r.is_empty(), "an unavailable engine must say why");
+            }
+            Plan::Plain(SkipReason::OffUser) => {
+                panic!("an ENABLED switch was reported as the user's choice to be off")
+            }
         }
     }
 }

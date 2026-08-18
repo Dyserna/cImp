@@ -1403,6 +1403,24 @@ async fn spawn_and_capture(
     // Windows. This is the seam the whole-tree kill was written for.
     crate::procutil::own_process_group(&mut cmd);
 
+    // V33 Phase D — on Linux this IS the sandboxed path: Landlock is applied to
+    // the scanner command built above. Locked decision L4 is enforced by
+    // `apply`: the C2 minimal base, then the adapter's forced variables, then
+    // the sandbox's redirections last. A failure REFUSES the scanner (reported
+    // as a `SpawnError`, i.e. a failed tool chip that says why) rather than
+    // running it with the boundary quietly missing (decision D3).
+    #[cfg(target_os = "linux")]
+    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
+        if let Err(e) = prepared.apply(&mut cmd, &base_env, env.iter().map(|(k, v)| (*k, *v))) {
+            return Capture {
+                stdout: String::new(),
+                stdout_truncated: false,
+                stderr: String::new(),
+                outcome: Outcome::SpawnError(e),
+            };
+        }
+    }
+
     // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
     let mut child = match crate::spawn_gate::spawn_tokio(&mut cmd) {
         Ok(c) => c,
@@ -1417,6 +1435,16 @@ async fn spawn_and_capture(
     };
     // Backstop reaper if cImp dies hard before kill_on_drop fires.
     crate::process_guard::guard_child(&child);
+    // The confirmation row, once per scanner per session.
+    #[cfg(target_os = "linux")]
+    if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
+        crate::sandbox::record_sandboxed(
+            &seam,
+            root,
+            &crate::sandbox::program_subject(resolved),
+            sandbox,
+        );
+    }
 
     let out_task = tokio::spawn(crate::procutil::read_capped(
         child.stdout.take(),
@@ -1447,6 +1475,36 @@ async fn spawn_and_capture(
 
     let (stdout, stdout_truncated) = crate::procutil::drain_capture(out_task).await;
     let (stderr, _) = crate::procutil::drain_capture(err_task).await;
+
+    // V33 Phase D — the Linux denial row. Only for a scanner that actually ran
+    // to completion: a cancel and a timeout are not access-denial signatures,
+    // and `Outcome` is where that distinction already lives.
+    #[cfg(target_os = "linux")]
+    {
+        // Only a scanner that actually RAN, inside the boundary, can have hit
+        // it: a cancel, a timeout and a spawn failure are not access-denial
+        // signatures, and `Outcome` is where that distinction already lives.
+        let confined_exit = match &outcome {
+            Outcome::Exited(code) => {
+                matches!(&plan, crate::sandbox::Plan::Sandboxed(_)).then_some(*code)
+            }
+            _ => None,
+        };
+        let class = confined_exit
+            .and_then(|code| crate::sandbox::denial_signature(code, &stderr, sandbox.allow_network));
+        if let Some(class) = class {
+            crate::sandbox::record_denial(
+                &seam,
+                root,
+                &crate::sandbox::program_subject(resolved),
+                argv,
+                confined_exit.flatten(),
+                &stderr,
+                class,
+                sandbox,
+            );
+        }
+    }
     Capture {
         stdout,
         stdout_truncated,

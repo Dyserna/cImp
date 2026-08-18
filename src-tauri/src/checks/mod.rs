@@ -867,12 +867,36 @@ async fn spawn_capture(
     // real work running and holding the pipe write ends.
     crate::procutil::own_process_group(&mut command);
 
+    // V33 Phase D — on Linux this IS the sandboxed path: Landlock is applied to
+    // the shell command built above rather than through a second spawn
+    // mechanism. Locked decision L4 still holds, and it is `apply` that
+    // enforces it — the confined shell gets the C2 minimal base, then
+    // `CheckDef::env`, then the sandbox's TMPDIR/HOME redirections last,
+    // replacing the inherit-and-force environment the plain path keeps. An
+    // error REFUSES the check rather than running it unconfined (decision D3).
+    #[cfg(target_os = "linux")]
+    if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
+        prepared
+            .apply(
+                &mut command,
+                &base_env,
+                env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            )
+            .map_err(AppError::Checks)?;
+    }
+
     // Through the spawn gate like every other cImp spawn — see `spawn_gate`.
     let mut child = crate::spawn_gate::spawn_tokio(&mut command)
         .map_err(|e| AppError::Checks(format!("failed to spawn check `{cmd}`: {e}")))?;
     // Backstop: reap this checker subprocess via the kill-on-job-close job if
     // cImp dies hard before `kill_on_drop` can fire.
     crate::process_guard::guard_child(&child);
+    // The confirmation row, once per CHECK per session — the subject is the
+    // configured name, never `sh`, for the reason `row_subject` documents.
+    #[cfg(target_os = "linux")]
+    if matches!(&plan, crate::sandbox::Plan::Sandboxed(_)) {
+        crate::sandbox::record_sandboxed(crate::sandbox::SEAM_RUN_CHECK, root, &subject, sandbox);
+    }
 
     // Drain stdout/stderr on their own tasks so the buffers survive a timeout
     // on `child.wait()` below — killing the child for a timeout only closes
@@ -904,6 +928,32 @@ async fn spawn_capture(
     // treat output as best-effort text).
     let (stdout, _) = crate::procutil::drain_capture(out_task).await;
     let (stderr, _) = crate::procutil::drain_capture(err_task).await;
+
+    // V33 Phase D — the Linux denial row, minted where the raw exit code and
+    // stderr still exist (a nonzero exit is data to this function's callers).
+    // Not for a timeout: a hang matches no access-denial signature, and
+    // guessing would put noise in the one lane that is supposed to mean
+    // something.
+    #[cfg(target_os = "linux")]
+    {
+        let confined_and_finished =
+            !timed_out && matches!(&plan, crate::sandbox::Plan::Sandboxed(_));
+        let class = confined_and_finished
+            .then(|| crate::sandbox::denial_signature(exit_code, &stderr, sandbox.allow_network))
+            .flatten();
+        if let Some(class) = class {
+            crate::sandbox::record_denial(
+                crate::sandbox::SEAM_RUN_CHECK,
+                root,
+                &subject,
+                &[cmd.to_string()],
+                exit_code,
+                &stderr,
+                class,
+                sandbox,
+            );
+        }
+    }
     Ok((exit_code, stdout, stderr, timed_out))
 }
 

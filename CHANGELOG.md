@@ -5,6 +5,27 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0-rc.8] — 2026-08-18
+
+### Fixed
+
+- **The sandbox's mapped drive now actually resolves — rc.7's deadlock fix
+  uncovered the next defect in the same never-executed path.** With the
+  `map_drive` deadlock gone, the first live sandboxed spawn on rc.7 got as far
+  as `CreateProcessW` and died with error 267 ("the directory name is
+  invalid"): the child's cwd was the mapped drive root, and the mapping was
+  defined but unresolvable. `DefineDosDeviceW(DDD_RAW_TARGET_PATH, ..)` takes
+  its target in the **NT object namespace**, where a Win32 drive path is
+  spelled `\??\P:\dir` — the code passed the root through verbatim, and the
+  root arrives canonicalized with the *Win32* long-path prefix (`\\?\P:\dir`),
+  which means nothing to the object manager. A new `nt_target` helper spells
+  the target correctly for every input shape (`\\?\`-prefixed, plain, UNC) and
+  both the define and the exact-match remove go through it. The `map_drive`
+  regression test now feeds a canonicalized root and asserts the mapped drive
+  is *usable* (not merely defined) whenever mapping succeeds — the assertion
+  that would have caught this — and `nt_target`'s spelling is pinned by a unit
+  test.
+
 ## [0.52.0-rc.7] — 2026-08-18
 
 ### Fixed

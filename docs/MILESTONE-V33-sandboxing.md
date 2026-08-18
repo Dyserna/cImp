@@ -14,6 +14,23 @@ implementation contracts derived from that pass live in
 source of truth for the build, this one for the design. **Locked decisions now
 run 1–15.** Amendments are
 dated in place rather than edited silently, matching the V32 spec's convention.
+
+**Amendment 2026-08-18 (user decision) — RE-SCOPE: the full-environment tier
+moves to V36.** Phase C (Max Paranoia Mode), spikes S4 and S5, the podman/bwrap
+half of Phase D, and decision 6's WSL2-gated hardened Claude `sandbox.*`
+profile are re-homed in
+[MILESTONE-V36-sandbox-containerization.md](MILESTONE-V36-sandbox-containerization.md)
+(GitHub milestone 10, umbrella #76). Rationale: tier 3 of the ladder below is a
+step beyond per-process sandboxing, and its platform story diverges — WSL2 and
+Windows Sandbox do not exist on Linux, where the same tier is a rootless
+container; V36 carries the Windows (`.wsb`) and Linux (podman/bwrap) legs as
+first-class peers. **V33 closes on per-process OS sandboxing alone:** Phase A
+(implemented `15ad514`, live-verified 2026-08-18 on v0.52.0-rc.8 in both
+network modes), the `run_check`/`audit` seam increment, Phase B (S3-gated tab
+spawns), Phase D's Landlock half, and live-verify #72. The moved sections below
+(§ Max Paranoia Mode — platform designs, S4/S5, Phase C, decisions 4/9's
+Max-Paranoia legs) are left standing per this doc's convention; V36's doc is
+authoritative for them from this date.
 **Builds on:** the two spawn seams cImp owns — `pty/manager.rs::PtyLaunchSpec:20`
 (every AI tab: Claude, OpenCode, future harnesses) and the offload worker's
 `run_command` children (`offload/tools/run_command.rs`, plain non-PTY `Stdio`

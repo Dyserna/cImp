@@ -287,6 +287,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      is_rc: ${{ steps.tag.outputs.is_rc }}
     env:
       # Opt into the Node 24 actions runtime ahead of the June 2026 cutoff
       # so we don't see the "Node 20 actions deprecated" warning each run.
@@ -328,6 +329,13 @@ jobs:
           version="${ref#v}"
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # RC tags take a FAST path: only the Windows no-models zip is built
+          # and uploaded — no model fetch, no full zip, no Linux job. RCs exist
+          # to be installed over a working install for live-verification, and
+          # that is exactly what the no-models update zip is. Finals (and any
+          # non-rc pre-release) keep the full four-artifact path untouched.
+          if [[ "$ref" == *-rc.* ]]; then is_rc=true; else is_rc=false; fi
+          echo "is_rc=$is_rc" >> "$GITHUB_OUTPUT"
           echo "stage_dir_full=cimp-portable-win-x64-$ref" >> "$GITHUB_OUTPUT"
           echo "stage_dir_slim=cimp-portable-win-x64-$ref-no-models" >> "$GITHUB_OUTPUT"
 
@@ -349,6 +357,9 @@ jobs:
       # verify-only pass, a corrupt cache self-heals, and the old
       # "Verify committed Kokoro assets" step is subsumed.
       - name: Restore models cache
+        # RC fast path: the no-models zip is the only artifact, so the model
+        # blobs are never read — skip the cache and the fetch entirely.
+        if: steps.tag.outputs.is_rc != 'true'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
@@ -364,6 +375,7 @@ jobs:
             models-
 
       - name: Fetch + verify models
+        if: steps.tag.outputs.is_rc != 'true'
         shell: pwsh
         run: ./scripts/fetch-models.ps1
 
@@ -478,11 +490,12 @@ jobs:
         run: |
           npm run tauri build -- --no-bundle --features stt-vulkan,tts-webgpu
 
-      - name: Stage portable layouts (full + no-models)
+      - name: Stage portable layout (full, with models)
+        # Skipped on the RC fast path — RCs ship only the no-models zip below.
+        if: steps.tag.outputs.is_rc != 'true'
         shell: pwsh
         run: |
           $stageFull = "${{ steps.tag.outputs.stage_dir_full }}"
-          $stageSlim = "${{ steps.tag.outputs.stage_dir_slim }}"
 
           # --- Full variant (with model + default voicepack) ---------------
           New-Item -ItemType Directory -Force -Path "$stageFull/bin" | Out-Null
@@ -578,6 +591,15 @@ jobs:
           Copy-Item NOTICE "$stageFull/"
           Copy-Item scripts/portable-readme.txt "$stageFull/README.txt"
 
+          Write-Host "Staged FULL contents:"
+          Get-ChildItem -Recurse $stageFull | Select-Object FullName, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Stage portable layout (no-models)
+        shell: pwsh
+        run: |
+          $stageSlim = "${{ steps.tag.outputs.stage_dir_slim }}"
+
           # --- Slim variant (no Kokoro model, no voicepack) ----------------
           # Same exe + DLLs as the full build. Skip `models/` entirely so a
           # user extracting this zip over an existing install keeps their
@@ -618,9 +640,6 @@ jobs:
           Copy-Item NOTICE "$stageSlim/"
           Copy-Item scripts/portable-readme-no-models.txt "$stageSlim/README.txt"
 
-          Write-Host "Staged FULL contents:"
-          Get-ChildItem -Recurse $stageFull | Select-Object FullName, Length |
-            Format-Table -AutoSize | Out-String | Write-Host
           Write-Host "Staged SLIM contents:"
           Get-ChildItem -Recurse $stageSlim | Select-Object FullName, Length |
             Format-Table -AutoSize | Out-String | Write-Host
@@ -637,7 +656,12 @@ jobs:
           # src-tauri/src/pty/resolve.rs. No tools are bundled; users drop the
           # executables in themselves (see README.txt). A placeholder file is
           # staged because Compress-Archive drops empty directories.
-          foreach ($stage in @($stageFull, $stageSlim)) {
+          #
+          # The RC fast path stages only the slim layout, so enumerate what
+          # was staged rather than assuming both.
+          $stages = @($stageSlim)
+          if ("${{ steps.tag.outputs.is_rc }}" -ne 'true') { $stages += $stageFull }
+          foreach ($stage in $stages) {
             $ebin = "$stage/ebin"
             New-Item -ItemType Directory -Force -Path $ebin | Out-Null
             @(
@@ -647,7 +671,7 @@ jobs:
             ) | Set-Content "$ebin/README.txt"
           }
 
-      - name: Zip both variants
+      - name: Zip the staged variants
         id: zip
         shell: pwsh
         run: |
@@ -656,23 +680,25 @@ jobs:
           $zipFull = "$stageFull.zip"
           $zipSlim = "$stageSlim.zip"
 
-          Compress-Archive -Path $stageFull -DestinationPath $zipFull -CompressionLevel Optimal
           Compress-Archive -Path $stageSlim -DestinationPath $zipSlim -CompressionLevel Optimal
-
-          $shaFull = (Get-FileHash -Algorithm SHA256 $zipFull).Hash.ToLower()
           $shaSlim = (Get-FileHash -Algorithm SHA256 $zipSlim).Hash.ToLower()
-          $sizeFull = (Get-Item $zipFull).Length
           $sizeSlim = (Get-Item $zipSlim).Length
-
-          Write-Host "full zip: $zipFull ($sizeFull bytes)"
-          Write-Host "  sha256: $shaFull"
           Write-Host "slim zip: $zipSlim ($sizeSlim bytes)"
           Write-Host "  sha256: $shaSlim"
-
-          "zip_full=$zipFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "zip_slim=$zipSlim" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "sha_full=$shaFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha_slim=$shaSlim" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          # RC fast path: no full layout was staged, so the zip_full/sha_full
+          # outputs stay unset — downstream steps key off their emptiness.
+          if ("${{ steps.tag.outputs.is_rc }}" -ne 'true') {
+            Compress-Archive -Path $stageFull -DestinationPath $zipFull -CompressionLevel Optimal
+            $shaFull = (Get-FileHash -Algorithm SHA256 $zipFull).Hash.ToLower()
+            $sizeFull = (Get-Item $zipFull).Length
+            Write-Host "full zip: $zipFull ($sizeFull bytes)"
+            Write-Host "  sha256: $shaFull"
+            "zip_full=$zipFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "sha_full=$shaFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
 
       - name: Build release notes (CHANGELOG section if present, else autogen)
         id: notes
@@ -717,8 +743,15 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "**Portable zip SHA-256 (full, with models):** \`${{ steps.zip.outputs.sha_full }}\`"
-            echo ""
+            # sha_full is unset on the RC fast path (no full zip was built);
+            # don't print a checksum line for an asset that does not exist.
+            if [ -n "${{ steps.zip.outputs.sha_full }}" ]; then
+              echo "**Portable zip SHA-256 (full, with models):** \`${{ steps.zip.outputs.sha_full }}\`"
+              echo ""
+            else
+              echo "_RC build: Windows no-models update zip only (see the release workflow's RC fast path)._"
+              echo ""
+            fi
             echo "**Portable zip SHA-256 (no-models, update zip):** \`${{ steps.zip.outputs.sha_slim }}\`"
           } >> "$out"
 
@@ -745,12 +778,18 @@ jobs:
             echo "tag $tag is a pre-release"
           fi
 
+          # zip_full is empty on the RC fast path — upload only what was built.
+          assets=("$zip_slim")
+          if [ -n "$zip_full" ]; then
+            assets=("$zip_full" "$zip_slim")
+          fi
+
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag exists — refreshing notes and uploading both assets"
+            echo "release $tag exists — refreshing notes and uploading ${#assets[@]} asset(s)"
             gh release edit "$tag" --notes-file release-notes.md "${prerelease[@]}"
-            gh release upload "$tag" "$zip_full" "$zip_slim" --clobber
+            gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" "$zip_full" "$zip_slim" \
+            gh release create "$tag" "${assets[@]}" \
               --title "$tag" \
               --notes-file release-notes.md \
               "${prerelease[@]}"
@@ -766,6 +805,10 @@ jobs:
   # docs/MILESTONE-linux-support.md.
   build-linux:
     needs: build-windows
+    # Skipped entirely on the RC fast path (Windows no-models zip only).
+    # `needs` + a skipped job would normally poison downstream jobs, but
+    # nothing needs this one, so a plain `if:` is the whole story.
+    if: needs.build-windows.outputs.is_rc != 'true'
     runs-on: ubuntu-24.04
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'

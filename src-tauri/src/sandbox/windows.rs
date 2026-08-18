@@ -439,7 +439,9 @@ impl Drop for DriveGuard {
         };
         if remove {
             m.remove(&self.root);
-            let target = wide(self.root.as_os_str());
+            // Must be the SAME spelling `map_drive` defined the mapping with —
+            // exact-target removal string-matches against the stored target.
+            let target = wide_str(&nt_target(&self.root));
             let letter = wide_str(&self.letter);
             // SAFETY: both valid wide strings; DDD_REMOVE_DEFINITION with an
             // exact target removes just this mapping.
@@ -452,6 +454,27 @@ impl Drop for DriveGuard {
             }
         }
     }
+}
+
+/// The NT-object-namespace spelling of `root`, for
+/// `DefineDosDeviceW(DDD_RAW_TARGET_PATH, ..)`.
+///
+/// A RAW target is resolved in the NT object namespace, where a Win32 drive
+/// path is spelled `\??\P:\dir` — NOT `\\?\P:\dir`, which is the *Win32*
+/// long-path prefix and means nothing to the object manager. The root arrives
+/// here canonicalized (so usually `\\?\`-prefixed), and passing it through raw
+/// defined a mapping whose target no NT lookup could resolve: the letter
+/// existed, every use of it failed, and the first sandboxed spawn died with
+/// `CreateProcessW failed (267)` ("the directory name is invalid" — the
+/// child's cwd was the broken drive root). 2026-08-18, rc.7 live — the defect
+/// the `map_drive` deadlock had been hiding.
+///
+/// `\\?\UNC\server\share` becomes `\??\UNC\server\share`, and an unprefixed
+/// `P:\dir` becomes `\??\P:\dir`, so every input shape lands on the NT form.
+fn nt_target(root: &Path) -> String {
+    let s = root.as_os_str().to_string_lossy();
+    let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    format!(r"\??\{stripped}")
 }
 
 /// The first free drive letter D..=Z not in use, as "X:".
@@ -494,9 +517,9 @@ fn map_drive(root: &Path) -> Result<DriveGuard, String> {
         m.values().map(|(l, _)| l.clone()).collect();
     let letter = free_drive_letter(&taken).ok_or("no free drive letter for the sandbox root")?;
     let letter_w = wide_str(&letter);
-    let target = wide(root.as_os_str());
+    let target = wide_str(&nt_target(root));
     // SAFETY: both valid wide strings; RAW_TARGET_PATH maps the letter to the
-    // exact NT path of `root`.
+    // NT-namespace spelling of `root` (see `nt_target`).
     let ok = unsafe {
         DefineDosDeviceW(DDD_RAW_TARGET_PATH, letter_w.as_ptr(), target.as_ptr())
     };
@@ -1281,18 +1304,51 @@ mod tests {
     fn map_drive_returns_instead_of_deadlocking() {
         let dir = std::env::temp_dir().join("cimp-map-drive-regression");
         let _ = std::fs::create_dir_all(&dir);
+        // Canonicalized, so the root is `\\?\`-prefixed — the exact shape the
+        // live path feeds in, and the shape whose raw-target spelling rc.7
+        // got wrong (see `nt_target`).
+        let dir = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
         let (tx, rx) = std::sync::mpsc::channel();
         let d = dir.clone();
         std::thread::spawn(move || {
             let _ = tx.send(map_drive(&d));
         });
         match rx.recv_timeout(Duration::from_secs(10)) {
-            // A successful guard's drop removes the mapping again.
-            Ok(result) => drop(result),
+            Ok(Ok(guard)) => {
+                // The mapping must be USABLE, not merely defined: rc.7's
+                // follow-up defect was a letter that existed while resolving
+                // to an NT path no lookup could serve, so the first sandboxed
+                // spawn died with CreateProcessW error 267 (invalid cwd).
+                std::fs::metadata(guard.drive_root()).unwrap_or_else(|e| {
+                    panic!(
+                        "the mapped drive root is not usable ({e}) — the DefineDosDeviceW \
+                         raw target is mis-spelled for the NT namespace again"
+                    )
+                });
+                // The guard's drop removes the mapping again.
+                drop(guard);
+            }
+            // Mapping can legitimately fail on a locked-down runner (no free
+            // letter, no privilege) — the deadlock regression under test is
+            // that map_drive RETURNS.
+            Ok(Err(e)) => eprintln!("map_drive returned an error (acceptable here): {e}"),
             Err(_) => panic!(
                 "map_drive did not return within 10s — the DRIVES self-deadlock is back"
             ),
         }
+    }
+
+    /// `nt_target` is a pure spelling function; pin every input shape it
+    /// claims to handle (doc comment) so a refactor cannot quietly reintroduce
+    /// the Win32-prefix-as-NT-path confusion.
+    #[test]
+    fn nt_target_spells_the_object_namespace_form() {
+        assert_eq!(nt_target(Path::new(r"\\?\P:\proj")), r"\??\P:\proj");
+        assert_eq!(nt_target(Path::new(r"C:\plain\dir")), r"\??\C:\plain\dir");
+        assert_eq!(
+            nt_target(Path::new(r"\\?\UNC\srv\share\dir")),
+            r"\??\UNC\srv\share\dir"
+        );
     }
 
     // ── bounded drains (the 2026-08-18 wedge) ──

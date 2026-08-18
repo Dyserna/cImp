@@ -65,6 +65,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
           HEAD_SHA: ${{ github.sha }}
+          # The pushed ref's short name (the tag, for tag pushes) — the gate
+          # scopes itself to the Windows job for `-rc.` tags; see §4a.
+          REF_NAME: ${{ github.ref_name }}
           ALLOW_UNTESTED: ${{ inputs.allow_untested }}
           POLL_SECONDS: '30'
           # 160 x 30 s = 80 min: tests.yml's own ceiling is 75, plus runner
@@ -133,7 +136,30 @@ jobs:
           if (!/^[0-9a-f]{40}$/.test(sha)) {
             die(`could not resolve the commit being released (got '${sha}') — refusing to gate on nothing`);
           }
-          console.log(`gating the release on ${sha}`);
+
+          // ── 1a. RC or final? ─────────────────────────────────────────────
+          // User decision 2026-08-18: an `-rc.` tag builds ONLY the Windows
+          // no-models zip (the fast path at `Resolve tag` below), so its gate
+          // consults only the Windows `tests` JOB — it passes as soon as that
+          // job is green, without waiting for `test-linux`, and tolerates a run
+          // whose only failure is the Linux leg. The trade, stated rather than
+          // hidden: an RC can ship from a commit whose Linux suite never
+          // passed; the job-scoped pass says so on the run as a ::notice::.
+          // FINAL tags are untouched — they gate on the whole run, always.
+          // Same `-rc.` spelling as the fast path's is_rc check; keep in sync.
+          const TAG_NAME = EVENT === "workflow_dispatch" ? INPUT_TAG : (process.env.REF_NAME ?? "");
+          const IS_RC = TAG_NAME.includes("-rc.");
+          // The Windows job's name in tests.yml (the job key, no display name).
+          const RC_GATE_JOB = "tests";
+          console.log(`gating the release on ${sha}${IS_RC ? ` (rc tag ${TAG_NAME}: Windows '${RC_GATE_JOB}' job only)` : ""}`);
+
+          // The jobs endpoint reads the LATEST attempt, which is the attempt a
+          // re-run is trying to make green — earlier attempts are history.
+          function rcWindowsJobGreen(run) {
+            const jobs = apiOrNull(`repos/${REPO}/actions/runs/${run.id}/jobs?per_page=100`);
+            if (!Array.isArray(jobs?.jobs)) return false;
+            return jobs.jobs.some((j) => j.name === RC_GATE_JOB && j.conclusion === "success");
+          }
 
           // ── 2. the bypass ────────────────────────────────────────────────
           // Deliberately awkward: an exact sentence, dispatch-only (a tag push
@@ -253,12 +279,25 @@ jobs:
                 console.log(`Tests passed for ${sha}`);
                 process.exit(0);
               }
+              // §4a: the RC job-scoped pass. Checked before the in-progress
+              // wait ON PURPOSE — the whole point is passing while test-linux
+              // is still running — and before the all-finished die, so a run
+              // whose only failure is the Linux leg still releases an RC.
+              // pull_request runs are excluded for the same merge-preview
+              // reason the full gate only warns about them.
+              if (IS_RC) {
+                const scoped = runs.find((r) => r.event !== "pull_request" && rcWindowsJobGreen(r));
+                if (scoped) {
+                  console.log(`::notice::RC gate: the Windows '${RC_GATE_JOB}' job passed for ${sha} (${scoped.html_url}); test-linux was NOT consulted — this rc is evidence for the Windows suite only`);
+                  process.exit(0);
+                }
+              }
               if (runs.some((r) => r.status !== "completed")) {
                 console.log(`Tests has not finished for ${sha}; waiting ${POLL_SECONDS}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
                 await sleep(POLL_SECONDS);
                 continue;
               }
-              die(`every Tests run for ${sha} is finished and none passed (${runs.map((r) => r.conclusion ?? "?").join(", ")}). A tag is not evidence the suite passed — fix the suite, or re-run tests.yml on that commit, then re-run this workflow.`);
+              die(`every Tests run for ${sha} is finished and none passed (${runs.map((r) => r.conclusion ?? "?").join(", ")})${IS_RC ? ", and no run's Windows '" + RC_GATE_JOB + "' job passed either" : ""}. A tag is not evidence the suite passed — fix the suite, or re-run tests.yml on that commit, then re-run this workflow.`);
             }
 
             // No run at all for this commit — see §3. The analysis is

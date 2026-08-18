@@ -388,6 +388,26 @@ pub async fn run(
     sandbox: &crate::sandbox::SandboxCfg,
 ) -> AppResult<CheckReport> {
     def.validate()?;
+    // **A relative root is never this project.** Every path below resolves
+    // against it — the effective cwd the checker runs in, the confinement
+    // boundary, the sandbox's grants and drive mapping — and a relative one
+    // resolves against the *cImp process's* working directory, i.e. cImp's own
+    // install directory. Running a build or a linter there and reporting the
+    // result as this project's is the same failure shape `Prepared::cwd_under`
+    // is written to prevent: a green run of the wrong thing, which is worse
+    // than a failure. It arrives here whenever the caller could not resolve a
+    // project root at all — live rc.9: `POST /graph_run` with no `cwd` in the
+    // body defaults to `"."`, and `run_graph_tool`'s `run_check` arm falls back
+    // to that cwd as the root. Refuse it, and say which half is missing.
+    if !root.is_absolute() {
+        return Err(AppError::Checks(format!(
+            "check `{}` was not run: `{}` is not an absolute project root — the calling session \
+             supplied no working directory, so cImp cannot tell which project (or which \
+             directory) this check belongs to",
+            def.name,
+            root.display()
+        )));
+    }
     let started = Instant::now();
     let timeout_secs = def.timeout_secs.max(10);
 
@@ -1202,21 +1222,19 @@ async fn spawn_capture_sandboxed(
         Ok(Err(e)) => {
             // Decision 4: a `CreateProcessW` that refuses to start the child is
             // itself a denial shape, so its error string goes through the same
-            // classifier — with no exit code, because nothing ran.
-            if let Some(class) =
-                crate::sandbox::denial_signature(None, &e, sandbox.allow_network)
-            {
-                crate::sandbox::record_denial(
-                    crate::sandbox::SEAM_RUN_CHECK,
-                    root,
-                    subject,
-                    &[cmd.to_string()],
-                    None,
-                    &e,
-                    class,
-                    sandbox,
-                );
-            }
+            // classifier — with no exit code, because nothing ran. An error the
+            // classifier does NOT recognize still mints a row (`refused`): this
+            // seam's failure is otherwise visible only in the check result, and
+            // that is exactly how rc.9's `CreateProcessW failed (267)` left the
+            // sandbox lane silent about a spawn that never happened.
+            crate::sandbox::record_spawn_failure(
+                crate::sandbox::SEAM_RUN_CHECK,
+                root,
+                subject,
+                &[cmd.to_string()],
+                &e,
+                sandbox,
+            );
             return Err(AppError::Checks(format!(
                 "failed to spawn sandboxed check `{cmd}`: {e}"
             )));
@@ -1275,6 +1293,46 @@ mod tests {
             file: file.to_string(),
             line,
             col: None,
+        }
+    }
+
+    /// **The rc.9 live defect, at the seam that must not run.** A check whose
+    /// project root is relative would resolve every path — the effective cwd,
+    /// the confinement boundary, the sandbox's grants and drive mapping —
+    /// against cImp's OWN working directory, i.e. its install directory. The
+    /// sandboxed spawn died there with an unattributable `CreateProcessW failed
+    /// (267)`; the PLAIN spawn would have quietly run the build command in the
+    /// wrong directory and reported the result as this project's.
+    ///
+    /// So `run` refuses before it spawns anything, on both paths — asserted
+    /// with the sandbox OFF, because the plain path is the one where the wrong
+    /// answer would have looked like a real one.
+    #[tokio::test]
+    async fn a_relative_project_root_is_refused_before_anything_spawns() {
+        let def = CheckDef {
+            name: "cargo-check".into(),
+            cmd: "cargo check".into(),
+            parser: ParserKind::CargoJson,
+            timeout_secs: 30,
+            // The nested-cwd shape the live check used; the root is what is
+            // broken here, not the cwd.
+            cwd: Some("src-tauri".into()),
+            ..Default::default()
+        };
+        for root in [".", "", "some/relative/dir"] {
+            let err = run(
+                Path::new(root),
+                &def,
+                false,
+                &crate::sandbox::SandboxCfg::disabled(),
+            )
+            .await
+            .expect_err("a relative project root must not run a check");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("absolute project root") && msg.contains("cargo-check"),
+                "the error must name the check and the missing half: {msg}"
+            );
         }
     }
 

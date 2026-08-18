@@ -574,7 +574,10 @@ fn format_run_output(
 ///   or "nothing ever spawned", which is not an answer.
 /// * A **denial-suspicion** row, every time a failed child's output matches
 ///   [`crate::sandbox::denial_signature`] — including the spawn-error path
-///   below, whose `Err` string is classified before it propagates.
+///   below, whose `Err` string is classified before it propagates. A spawn
+///   error the classifier does not recognize mints a `refused` row instead
+///   ([`crate::sandbox::record_spawn_failure`]), so "no child ever started" is
+///   never a silent outcome.
 ///
 /// A timeout mints neither: a hang is not a denial signature, and guessing
 /// would put noise in the one lane that is supposed to mean something.
@@ -661,19 +664,17 @@ async fn run_sandboxed(
             // program image fails right here), so its error string goes through
             // the same classifier as a child's stderr — with no exit code,
             // because nothing ran.
-            if let Some(class) = crate::sandbox::denial_signature(None, &e, ctx.sandbox.allow_network)
-            {
-                crate::sandbox::record_denial(
-                    crate::sandbox::SEAM_RUN_COMMAND,
-                    root,
-                    &crate::sandbox::program_subject(program),
-                    &args.args,
-                    None,
-                    &e,
-                    class,
-                    &ctx.sandbox,
-                );
-            }
+            // An error the classifier does not recognize mints a `refused` row
+            // instead of nothing — same funnel as the other two seams, see
+            // `sandbox::record_spawn_failure`.
+            crate::sandbox::record_spawn_failure(
+                crate::sandbox::SEAM_RUN_COMMAND,
+                root,
+                &crate::sandbox::program_subject(program),
+                &args.args,
+                &e,
+                &ctx.sandbox,
+            );
             return Err(e);
         }
     };

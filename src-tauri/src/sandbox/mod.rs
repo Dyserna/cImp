@@ -367,6 +367,32 @@ pub async fn plan(
     if !cfg.enabled {
         return Plan::Plain(SkipReason::OffUser);
     }
+    // **A relative root is not a boundary.** Every engine resolves `root`
+    // against the *cImp process's* working directory — which is cImp's own
+    // install directory, never the caller's project. A relative root therefore
+    // asks the sandbox to grant, map and confine the wrong tree entirely:
+    // AppContainer stamps an inheritable read+WRITE ACE on cImp's install
+    // directory and maps a drive letter to a name no NT lookup can serve
+    // (`\??\.`), and Landlock's `root.exists()` check passes for the same wrong
+    // directory and writes its rules against it.
+    //
+    // Live, rc.9: `POST /graph_run` with no `cwd` in the body defaults the
+    // caller's working directory to `"."`, `run_graph_tool` falls back to that
+    // cwd as the project root when no graph root is found, and `run_check` then
+    // died with a bare `CreateProcessW failed (267)` — a Win32 error code for
+    // what is really "cImp was told to sandbox a directory it cannot name".
+    //
+    // Checked HERE rather than in each engine because it is a property of the
+    // request, not of the OS: one guard, before any ACL is stamped or any
+    // kernel rule is written, and it degrades through the loud path every other
+    // prerequisite failure already uses.
+    if !root.is_absolute() {
+        return Plan::Plain(SkipReason::Unavailable(format!(
+            "the project root `{}` is not an absolute path, so there is nothing the sandbox can \
+             grant or map (the calling session supplied no working directory)",
+            root.display()
+        )));
+    }
     #[cfg(windows)]
     {
         match windows::prepare(cfg, seam, program, hints, root, env).await {
@@ -829,6 +855,69 @@ pub fn record_denial(
     );
 }
 
+/// Record a sandboxed spawn that produced **no child at all** — the one
+/// funnel all three seams route their `Err` from the spawn engine through.
+///
+/// # Why this exists
+///
+/// Each seam used to classify the engine's error itself and mint a `denied`
+/// row only when [`denial_signature`] matched. An error it could not classify
+/// — rc.9's `CreateProcessW failed (267)` is exactly that shape, and so is
+/// every future unattributable Win32/`libc` code — minted **nothing**, so the
+/// sandbox lane's silence meant two different things again: "no sandboxed
+/// spawn failed" or "one failed in a way nobody taught the classifier". The
+/// failure was visible only inside the calling tool's own result text, which
+/// is precisely where a user auditing the boundary is not looking.
+///
+/// So an unclassified refusal now mints a `refused` row. It deliberately does
+/// NOT claim the boundary denied anything — it asserts only the fact cImp can
+/// actually observe: the child never started, and this is the error the OS
+/// gave. A classified one still goes to [`record_denial`], unchanged.
+///
+/// Every occurrence is recorded, for [`record_denial`]'s reason: a spawn
+/// refused again and again IS the signal, and dedup would delete it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn record_spawn_failure(
+    seam: &str,
+    root: &Path,
+    subject: &str,
+    args: &[String],
+    err: &str,
+    cfg: &SandboxCfg,
+) {
+    if let Some(class) = denial_signature(None, err, cfg.allow_network) {
+        record_denial(seam, root, subject, args, None, err, class, cfg);
+        return;
+    }
+    record_event(
+        seam,
+        root,
+        "refused",
+        state_target("refused", subject),
+        refused_detail(subject, args, err, cfg),
+        false,
+    );
+}
+
+/// [`record_spawn_failure`]'s `refused` wording, as a pure function so the row
+/// it writes can be asserted without an activity store.
+///
+/// `err` is **cImp's own** error string (the engine's, e.g. `CreateProcessW
+/// failed (267)`), not a child's output — nothing ran, so there is no child
+/// output to screen. It is still bounded, because an engine error can carry a
+/// path and this lane is not the place to grow unbounded rows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn refused_detail(subject: &str, args: &[String], err: &str, cfg: &SandboxCfg) -> String {
+    format!(
+        "`{}` never started: {} — the sandboxed spawn was refused with an error that matches no \
+         access-denial signature, so this row asserts only that NO child ran; whether the \
+         boundary is the cause is not something cImp can tell from this. Posture: {}.",
+        summarize_invocation(subject, args),
+        truncate_chars(err.trim(), DENIAL_STDERR_TAIL_CHARS),
+        posture(cfg),
+    )
+}
+
 /// The `target` column for a sandbox-lane row: `"<label> — <program>"`, the
 /// shape [`record_skip`] established ("off (user choice) — git.exe"). Kept as
 /// one function so the new row types cannot drift from the skip row's
@@ -996,6 +1085,93 @@ mod tests {
             #[cfg(any(windows, target_os = "linux"))]
             Plan::Sandboxed(_) => panic!("a disabled switch still sandboxed the spawn"),
         }
+    }
+
+    /// **The rc.9 defect at its widest point.** A root that is not absolute
+    /// resolves against cImp's OWN working directory, so every engine would
+    /// build its boundary around cImp's install directory: an inheritable
+    /// read+write ACE for the container on Windows, Landlock rules on the wrong
+    /// tree on Linux, and a drive letter mapped to `\??\.` whose only symptom
+    /// was `CreateProcessW failed (267)`.
+    ///
+    /// It must therefore be refused HERE — before any engine runs, so nothing
+    /// is stamped or mapped — and refused as `Unavailable` (a broken
+    /// prerequisite), never as `OffUser` (a deliberate setting). The test runs
+    /// with the switch ON, on every platform, and touches nothing: no engine is
+    /// reached.
+    #[test]
+    fn a_relative_project_root_is_never_sandboxed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let cfg = SandboxCfg {
+            enabled: true,
+            allow_network: false,
+            extra_grant_dirs: Vec::new(),
+        };
+        // `"."` is the live shape (a `/graph_run` body with no `cwd`); `""` is
+        // the same mistake spelled as an absent value.
+        for root in [".", "", "src-tauri"] {
+            let plan = rt.block_on(plan(
+                &cfg,
+                SEAM_RUN_CHECK,
+                Path::new("C:/x/cmd.exe"),
+                &GrantHints::default(),
+                Path::new(root),
+                &[],
+            ));
+            match plan {
+                Plan::Plain(SkipReason::Unavailable(r)) => assert!(
+                    r.contains("not an absolute path"),
+                    "the reason must name the real problem: {r}"
+                ),
+                Plan::Plain(SkipReason::OffUser) => {
+                    panic!("a broken root was reported as the user's choice (root {root:?})")
+                }
+                #[cfg(any(windows, target_os = "linux"))]
+                Plan::Sandboxed(_) => {
+                    panic!("a relative root {root:?} was accepted as a sandbox boundary")
+                }
+            }
+        }
+    }
+
+    /// A spawn error the classifier does not recognize must still leave a row.
+    ///
+    /// `CreateProcessW failed (267)` — the live rc.9 error — matches no denial
+    /// marker, so before [`record_spawn_failure`] it minted nothing at all and
+    /// the failure existed only inside the calling tool's own result text. The
+    /// two branches are asserted through the pure wording function plus the
+    /// classifier, so no activity store is needed.
+    #[test]
+    fn an_unclassifiable_spawn_error_still_says_no_child_ran() {
+        let cfg = SandboxCfg::disabled();
+        // The routing premise: 267 is genuinely unclassifiable, so it takes the
+        // `refused` branch rather than being mislabeled a denial.
+        assert_eq!(
+            denial_signature(None, "CreateProcessW failed (267)", false),
+            None,
+            "if this ever classifies, the `refused` branch is no longer the one 267 takes"
+        );
+        let detail = refused_detail(
+            "cmd.exe",
+            &["cargo check".to_string()],
+            "CreateProcessW failed (267)",
+            &cfg,
+        );
+        assert!(detail.contains("never started"), "{detail}");
+        assert!(detail.contains("267"), "{detail}");
+        assert!(detail.contains("NO child ran"), "{detail}");
+        // …and it must NOT claim the boundary denied anything.
+        assert!(
+            !detail.contains("access-denial signature ("),
+            "a refusal must not borrow the denial row's claim: {detail}"
+        );
+        // A classifiable spawn error still goes the denial route.
+        assert_eq!(
+            denial_signature(None, "CreateProcessW failed: Access is denied.", false),
+            Some("filesystem/OS access denied")
+        );
     }
 
     // ---- V33 Phase A follow-up: what happens INSIDE the boundary ----

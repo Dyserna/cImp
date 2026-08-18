@@ -1617,18 +1617,18 @@ async fn spawn_sandboxed(
         }
         Ok(Ok(run)) => run,
         Ok(Err(e)) => {
-            if let Some(class) = crate::sandbox::denial_signature(None, &e, sandbox.allow_network) {
-                crate::sandbox::record_denial(
-                    seam,
-                    root,
-                    &crate::sandbox::program_subject(resolved),
-                    argv,
-                    None,
-                    &e,
-                    class,
-                    sandbox,
-                );
-            }
+            // Classified ⇒ a `denied` row; unclassified ⇒ a `refused` one. Both
+            // are minted, because a scanner that never started is a fact about
+            // the boundary whichever error code carried it — see
+            // `sandbox::record_spawn_failure`.
+            crate::sandbox::record_spawn_failure(
+                seam,
+                root,
+                &crate::sandbox::program_subject(resolved),
+                argv,
+                &e,
+                sandbox,
+            );
             return Capture {
                 stdout: String::new(),
                 stdout_truncated: false,

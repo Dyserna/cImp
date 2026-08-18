@@ -1529,6 +1529,17 @@ async fn handle_run(
 struct GraphRunBody {
     /// The calling session's working directory; the project root is resolved
     /// from it (same ancestor-walk the MCP child uses).
+    ///
+    /// **Absent ⇒ `"."`, which resolves to nothing.** The field is optional for
+    /// back-compat with children that predate it, and the `"."` default is a
+    /// placeholder, NOT a working directory: it would resolve against *cImp's*
+    /// process cwd (its install directory), which is never the caller's
+    /// project. Every consumer therefore refuses it rather than guessing —
+    /// graph tools with "no code graph found from .", `run_check` with an
+    /// explicit "not an absolute project root", and `sandbox::plan` with an
+    /// `Unavailable` skip. rc.9 live: a `/graph_run` post that omitted this
+    /// field reached the AppContainer engine, which mapped a drive letter to
+    /// `\??\.` and failed the spawn with a bare `CreateProcessW failed (267)`.
     #[serde(default)]
     cwd: Option<String>,
     /// The `graph_*` / `context_*` tool name.

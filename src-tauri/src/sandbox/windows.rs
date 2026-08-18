@@ -553,6 +553,38 @@ fn map_drive(root: &Path) -> Result<DriveGuard, String> {
             last_error()
         ));
     }
+    // **Defined is not usable.** `DefineDosDeviceW` only writes a symbolic-link
+    // object; it never resolves the target, so ANY target string it accepts
+    // yields a letter that exists. Twice now that has produced a live incident
+    // whose only symptom was `CreateProcessW failed (267)` at the first spawn —
+    // rc.7's Win32-prefixed raw target, and rc.9's *relative* project root
+    // (`.`, from a `/graph_run` body with no `cwd`), which maps the letter to
+    // `\??\.` — a name no NT lookup can serve. Both are indistinguishable from
+    // "the sandbox is broken" at the seam, because the letter looked fine.
+    //
+    // So the mapping is USED here, once, before anyone builds a boundary on it:
+    // a `stat` of the drive root. A letter that cannot be statted is torn down
+    // and reported as an unavailable sandbox — the loud degradation `plan`
+    // already knows how to surface — instead of being handed to a spawn that
+    // can only fail with an unattributable Win32 error code.
+    let probe = PathBuf::from(format!("{letter}\\"));
+    if let Err(e) = std::fs::metadata(&probe) {
+        // SAFETY: both valid wide strings; exact-target removal takes back the
+        // definition made three lines up, so a failed mapping leaks no letter.
+        unsafe {
+            DefineDosDeviceW(
+                DDD_REMOVE_DEFINITION | DDD_RAW_TARGET_PATH,
+                letter_w.as_ptr(),
+                target.as_ptr(),
+            );
+        }
+        return Err(format!(
+            "the sandbox drive mapping of {} ({letter} → {}) is not usable ({e}) — the project \
+             root must be an existing ABSOLUTE path",
+            root.display(),
+            nt_target(root)
+        ));
+    }
     m.insert(root.to_path_buf(), (letter.clone(), 1));
     Ok(DriveGuard {
         root: root.to_path_buf(),
@@ -634,7 +666,24 @@ impl Prepared {
 fn cwd_under_root(drive_root: &Path, root: &Path, dir: &Path) -> PathBuf {
     match dir.strip_prefix(root) {
         Ok(rel) if !rel.as_os_str().is_empty() => drive_root.join(rel),
-        _ => drive_root.to_path_buf(),
+        Ok(_) => drive_root.to_path_buf(),
+        Err(_) => {
+            // `dir` is not under `root` at all. The drive root is the only path
+            // that can be expressed here, but it is NOT the directory the
+            // caller asked for — so the fallback is stated rather than taken
+            // silently. Today the checks seam derives `dir` as `root.join(rel)`
+            // and cannot land here; a future caller that mixes path SPELLINGS
+            // (a canonicalized `\\?\P:\…` root against a plain `P:\…` dir)
+            // would, and would otherwise get a check that ran one directory up
+            // with nothing anywhere saying so.
+            tracing::warn!(
+                root = %root.display(),
+                dir = %dir.display(),
+                "sandbox: the requested cwd is not under the sandbox root — falling back to the \
+                 drive root, so this child does NOT run where it was asked to"
+            );
+            drive_root.to_path_buf()
+        }
     }
 }
 
@@ -1675,6 +1724,106 @@ mod tests {
                 "map_drive did not return within 10s — the DRIVES self-deadlock is back"
             ),
         }
+    }
+
+    /// **The rc.9 defect, pinned: a mapping that DEFINES but does not RESOLVE.**
+    ///
+    /// `DefineDosDeviceW` writes a symbolic-link object without ever resolving
+    /// its target, so a bogus target still yields a letter that exists — and
+    /// the only symptom is `CreateProcessW failed (267)` at the first spawn,
+    /// an error code that names neither the root nor the mapping. A RELATIVE
+    /// project root (`"."`, which reached the checks seam live from a
+    /// `/graph_run` body with no `cwd`) produces exactly that: the NT target is
+    /// `\??\.`, which no lookup can serve.
+    ///
+    /// `map_drive` must therefore refuse it, and leave nothing behind: no cache
+    /// entry, and no surviving DOS-device definition (taken back on the failure
+    /// path, so a rejected root cannot burn a letter per attempt). Nothing here
+    /// touches ACLs or a real toolchain directory; the root is a name, not a
+    /// place.
+    #[test]
+    fn map_drive_refuses_a_root_that_maps_to_an_unresolvable_target() {
+        let err = match map_drive(Path::new(".")) {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a relative root maps to `\\??\\.`, which resolves to nothing — it must not \
+                 come back as a usable mapping"
+            ),
+        };
+        assert!(
+            err.contains("not usable") && err.contains("ABSOLUTE"),
+            "the reason must name what is wrong with the root: {err}"
+        );
+        // No cache entry either: a rejected root must not be reusable as a hit
+        // on the next call, which would hand out the poisoned letter anyway.
+        // (The OS-level definition is removed on the same path; asserting *that*
+        // by letter would race the other tests mapping drives in parallel.)
+        assert!(
+            DRIVES
+                .lock()
+                .expect("DRIVES")
+                .as_ref()
+                .map(|m| !m.contains_key(Path::new(".")))
+                .unwrap_or(true),
+            "a refused mapping must not be cached"
+        );
+    }
+
+    /// **A NESTED directory on the mapped drive is usable as a spawn cwd.**
+    ///
+    /// `map_drive_returns_instead_of_deadlocking` asserts the drive ROOT is
+    /// usable, which is what `run_command` and the audit seam ask of it. The
+    /// `run_check` seam asks for more — [`Prepared::cwd_under`] hands the child
+    /// a directory *beneath* the root — and "the root statted fine" says
+    /// nothing about that, so the property is asserted here against a real
+    /// mapping and a real `CreateProcessW`, which is the only place a broken
+    /// nested path shows up (as error 267).
+    ///
+    /// Temp directories only: no ACL is stamped, and the AppContainer needs no
+    /// grant to run `System32\cmd.exe`. A machine that refuses profiles or has
+    /// no free letter skips, exactly like its sibling tests.
+    #[test]
+    fn a_nested_directory_on_the_mapped_drive_is_a_usable_spawn_cwd() {
+        let base = std::env::temp_dir().join("cimp-nested-cwd-regression");
+        let nested = base.join("pkg");
+        std::fs::create_dir_all(&nested).expect("create the nested fixture");
+        let base = std::fs::canonicalize(&base).expect("canonicalize the fixture");
+        let Ok(guard) = map_drive(&base) else {
+            return; // no free letter / no privilege — the sibling test owns that
+        };
+        let on_drive = cwd_under_root(&guard.drive_root(), &base, &base.join("pkg"));
+        assert_eq!(on_drive, guard.drive_root().join("pkg"));
+        std::fs::metadata(&on_drive)
+            .unwrap_or_else(|e| panic!("the nested directory {on_drive:?} is not reachable: {e}"));
+
+        let Ok(container) = container_sid() else {
+            return; // environment refuses profiles
+        };
+        let Some((_system32, cmd)) = system32_cmd() else {
+            return;
+        };
+        let cmdline = format!("{} /c exit 7", quote_arg(&cmd.to_string_lossy()));
+        match spawn_blocking_inner(
+            container.as_psid() as usize,
+            &[],
+            wide_str(&cmdline),
+            inherited_env_block(),
+            wide(on_drive.as_os_str()),
+            4096,
+            Duration::from_secs(30),
+            None,
+        ) {
+            Ok(run) => assert_eq!(
+                run.exit_code,
+                Some(7),
+                "the child ran but did not survive its own exit code"
+            ),
+            Err(e) => panic!(
+                "a nested cwd on the mapped drive was rejected by CreateProcessW: {e} \
+                 (267 = ERROR_DIRECTORY — the mapping does not serve nested paths)"
+            ),
+        }
+        drop(guard);
     }
 
     /// `nt_target` is a pure spelling function; pin every input shape it

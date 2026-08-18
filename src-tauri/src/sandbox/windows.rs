@@ -698,7 +698,7 @@ pub async fn prepare(
     program: &Path,
     hints: &super::GrantHints,
     root: &Path,
-    _env: &[(&str, OsString)],
+    env: &[(&str, OsString)],
 ) -> Result<Prepared, String> {
     // Blocking Win32 (ACL walks, profile creation) off the async worker.
     let cfg = cfg.clone();
@@ -706,9 +706,18 @@ pub async fn prepare(
     let program = program.to_path_buf();
     let hints = hints.clone();
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || prepare_blocking(&cfg, &seam, &program, &hints, &root))
-        .await
-        .map_err(|e| format!("sandbox prepare task failed: {e}"))?
+    // The child's base environment, owned so the blocking closure can hold it.
+    // It is read (never written) by the [`super::toolchain_state`] rule, which
+    // needs the pointers the child will actually see rather than cImp's own.
+    let env: Vec<(String, OsString)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        prepare_blocking(&cfg, &seam, &program, &hints, &root, &env)
+    })
+    .await
+    .map_err(|e| format!("sandbox prepare task failed: {e}"))?
 }
 
 fn prepare_blocking(
@@ -717,6 +726,7 @@ fn prepare_blocking(
     program: &Path,
     hints: &super::GrantHints,
     root: &Path,
+    env: &[(String, OsString)],
 ) -> Result<Prepared, String> {
     let container = container_sid()?;
 
@@ -733,8 +743,19 @@ fn prepare_blocking(
     // A program's own directory, plus the interpreter root behind it when the
     // directory is a launcher directory (`…\Scripts\tool.exe`) — see
     // [`super::interpreter_root`] for the convention and the live failure that
-    // named it. Both grants are RX and both are recorded; the second names why
-    // it is wider than "the program's directory".
+    // named it — and, since 2026-08-18, the toolchain STATE directories behind
+    // it ([`super::toolchain_state`]): the engine redirects HOME/USERPROFILE
+    // into the sandbox root, so a tool whose state pointer is *unset* resolves
+    // it against that empty scratch, and one whose pointer IS set names a
+    // directory the container was never granted. Every grant here is RX and
+    // every one is recorded; each names why it is wider than "the program's
+    // directory".
+    let mut state_env: Vec<(String, OsString)> = Vec::new();
+    let lookup = |name: &str| -> Option<OsString> {
+        env.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
     let mut grant_program_dir = |install: &Path, why: &str| -> Result<(), String> {
         if grant_dir(install, container.as_psid(), RX)? {
             granted.push(if why.is_empty() {
@@ -751,6 +772,24 @@ fn prepare_blocking(
                     install.display()
                 ));
             }
+        }
+        for state in super::toolchain_state(install, &lookup) {
+            // A pointer to a directory that does not exist is not a grant and
+            // not an override: `RUSTUP_HOME` is derived from a convention, and
+            // stamping (or naming) a path the user never created would be cImp
+            // inventing state rather than reaching the state that is there.
+            if !state.dir.is_dir() {
+                continue;
+            }
+            if grant_dir(&state.dir, container.as_psid(), RX)? {
+                granted.push(format!(
+                    "{} (read+execute, {} for {})",
+                    state.dir.display(),
+                    state.why,
+                    install.display()
+                ));
+            }
+            state_env.push((state.env.to_string(), state.dir.as_os_str().to_os_string()));
         }
         Ok(())
     };
@@ -814,7 +853,19 @@ fn prepare_blocking(
             ));
         }
     }
+    // The user's own grant rows — the ONE input to this function that a
+    // settings file supplies verbatim, and therefore the one that gets
+    // screened. `grant_dir` stamps a DURABLE inheritable ACE, so a row naming
+    // `~/.ssh` would leave the container able to read the user's keys after
+    // cImp exits; `super::extra_grant_refusal` refuses that shape (and volume
+    // roots, profile roots and the Windows directory) whatever named it. A
+    // refused row is recorded and SKIPPED — the remaining grants still apply,
+    // because one unusable settings row must not brick the sandbox.
     for extra in &cfg.extra_grant_dirs {
+        if let Some(why) = super::extra_grant_refusal_live(extra) {
+            super::record_grant_refused(seam, root, extra, why);
+            continue;
+        }
         if grant_dir(extra, container.as_psid(), RX)? {
             granted.push(format!("{} (read+execute, from settings)", extra.display()));
         }
@@ -848,6 +899,14 @@ fn prepare_blocking(
     for name in ["HOME", "USERPROFILE"] {
         env_overrides.push((name.to_string(), drive_root.as_os_str().to_os_string()));
     }
+    // AFTER the home redirect, deliberately: these are the pointers that
+    // redirect would otherwise break (a toolchain resolving `%USERPROFILE%\
+    // .cargo` inside the sandbox root finds nothing), and every one of them
+    // names a directory that was just granted read+execute above. Same
+    // last-writer-wins composition the seams apply, so a seam that forces one
+    // of these itself still loses to the engine — which is correct: the engine
+    // is the half that knows what the container can reach.
+    env_overrides.extend(state_env);
 
     Ok(Prepared {
         container,

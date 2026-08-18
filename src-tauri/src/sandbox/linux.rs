@@ -220,7 +220,18 @@ pub fn grant_list(
             row.reason,
         );
     }
+    // The user's own grant rows, screened exactly as the Windows engine screens
+    // them (`super::extra_grant_refusal`): a credential directory, a profile
+    // root, a filesystem root or a relative path is dropped rather than
+    // granted. Nothing here is durable the way an ACE is, but a Landlock rule
+    // that opens `~/.ssh` to a confined child is the same disclosure while the
+    // child runs, and the two engines must not disagree about which rows are
+    // honorable. The refusal ROW is minted by `prepare` (see `refused_extras`),
+    // because this function is pure.
     for extra in &cfg.extra_grant_dirs {
+        if super::extra_grant_refusal_live(extra).is_some() {
+            continue;
+        }
         push(
             extra,
             Tier::ReadExecute,
@@ -798,6 +809,13 @@ pub async fn prepare(
             root.display()
         ));
     }
+    // Screened out of the grant list above; recorded here, where there is a
+    // seam and a root to record against.
+    for extra in &cfg.extra_grant_dirs {
+        if let Some(why) = super::extra_grant_refusal_live(extra) {
+            super::record_grant_refused(seam, root, extra, why);
+        }
+    }
     let grants = grant_list(cfg, program, hints, root, &|p| p.exists());
     let prepared = Prepared {
         abi_raw: probe.raw,
@@ -923,6 +941,40 @@ mod tests {
             "the check seam's inferred tool directory must be granted"
         );
         assert_eq!(tier_of(&grants, "/opt/tools"), Some(Tier::ReadExecute));
+    }
+
+    /// **The settings rows are screened here too** (V33, 2026-08-18). The
+    /// Windows engine refuses a credential/system/root grant row before it
+    /// stamps an ACE; a Landlock rule is not durable the way an ACE is, but it
+    /// is the same disclosure while the child runs, and the two engines must
+    /// not disagree about which rows are honorable. The refused row is dropped
+    /// from the list — the others still apply, because one bad settings row
+    /// must not brick the sandbox.
+    #[test]
+    fn a_refused_settings_row_is_dropped_and_the_rest_still_granted() {
+        let cfg = super::super::SandboxCfg {
+            enabled: true,
+            allow_network: false,
+            extra_grant_dirs: vec![
+                PathBuf::from("/opt/tools"),
+                // A credential store named by a settings file — refused
+                // whatever named it (`super::extra_grant_refusal`). Not under
+                // `$HOME`, so this fires on the table rule alone and does not
+                // depend on the runner's own profile path.
+                PathBuf::from("/srv/state/.ssh"),
+                // A rootless row would resolve against cImp's own cwd.
+                PathBuf::from("relative/tools"),
+            ],
+        };
+        let grants = ladder(&cfg, &super::super::GrantHints::default());
+        assert_eq!(
+            tier_of(&grants, "/opt/tools"),
+            Some(Tier::ReadExecute),
+            "a healthy row is still granted"
+        );
+        for refused in ["/srv/state/.ssh", "relative/tools"] {
+            assert_eq!(tier_of(&grants, refused), None, "{refused} must be dropped");
+        }
     }
 
     /// **The read-denial bar, as an assertion.** `$HOME` is not a grant, and

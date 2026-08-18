@@ -317,8 +317,15 @@ impl ChildEnv {
         self.pairs
     }
 
-    /// One variable's current value — test/diagnostic accessor.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// One variable's current value, matched case-insensitively like
+    /// [`ChildEnv::set`].
+    ///
+    /// A production reader since V33's sandboxed `run_check` fix: the seam
+    /// composes the whole environment, then reads `PATH` back to put the
+    /// resolved program's directory in front of it (`checks::path_led_by`).
+    /// Reading the COMPOSED value is the point — a seam's own `CheckDef::env`
+    /// may have replaced `PATH` entirely, and the grant must still lead.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn get(&self, name: &str) -> Option<&OsString> {
         let lower = name.to_ascii_lowercase();
         self.pairs

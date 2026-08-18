@@ -301,6 +301,321 @@ pub fn interpreter_root(program_dir: &Path) -> Option<&Path> {
     Some(root)
 }
 
+/// One toolchain **state directory** a granted program cannot work without —
+/// the directory an environment pointer names, paired with the pointer itself.
+///
+/// # The invariant this exists to keep
+///
+/// The C2 table ([`child_env::CHILD_ENV`]) hands the child pointers to its own
+/// state (`CARGO_HOME`, `RUSTUP_HOME`, the npm cache/prefix) *and* the engine
+/// redirects `HOME`/`USERPROFILE` into the sandbox root. Those two facts fight:
+/// a pointer that is unset in cImp's environment resolves, inside the boundary,
+/// against the REDIRECTED home — so `cargo` looks for its registry in an empty
+/// scratch directory — and a pointer that IS set names a directory the
+/// container was never granted. Either way the tool starts and then fails for a
+/// reason that looks nothing like a sandbox.
+///
+/// Measured (2026-08-18, this machine): with only the program's own directory
+/// granted, `cargo --version` inside the container dies with
+/// `could not create home directory: 'C:\Users\<u>\.rustup'`; with `.rustup`
+/// granted read+execute it prints its version, and with `CARGO_HOME` granted
+/// too a real `cargo check --offline` resolves, compiles and reaches the
+/// linker. Nothing about process creation was ever involved.
+///
+/// # Why it is keyed on a layout, not on a tool list
+///
+/// Same shape as [`interpreter_root`]: the rule encodes ONE published
+/// convention — rustup's `CARGO_HOME/bin/<shim>.exe`, whose sibling
+/// `RUSTUP_HOME` defaults to `<profile>/.rustup` — so it fires for exactly the
+/// installs that follow it and for nothing else. An explicitly-set pointer wins
+/// over the default, so a user who moved either home is served by the same
+/// rule. A tool cImp has no layout knowledge of gets what it always got: its
+/// own install directory, plus whatever the user adds under
+/// `Settings ▸ Sandboxing ▸ extra grants`.
+///
+/// Consumed by the Windows engine (`windows::prepare_blocking`), which both
+/// grants `dir` read+execute and re-asserts `env` in the child's environment so
+/// the redirected home cannot mislead the tool. The Linux engine does not use
+/// it yet — its Landlock path grants are a separate list, and adding an
+/// unverified rule there would be a claim rather than a measurement.
+///
+/// **Two costs, both deliberate.** The grant is *read+execute only*: a warm
+/// `cargo check --offline` needs nothing more (measured), and a tool that
+/// genuinely needs to WRITE its cache — a fetching build, `cargo install` —
+/// fails with a denial that now classifies, rather than being handed a
+/// registry it could rewrite for every later run. And the first stamp walks the
+/// tree: `.rustup` + `.cargo` measured ~10s each here, inside
+/// [`PREPARE_BACKSTOP`]'s budget and once per session
+/// (`windows::GRANTED` skips the repeat).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateDir {
+    /// The directory to grant read+execute.
+    pub dir: PathBuf,
+    /// The environment variable that must name `dir` inside the boundary.
+    pub env: &'static str,
+    /// Why this directory is needed, for the grant row the user reads.
+    pub why: &'static str,
+}
+
+/// The state directories a granted program needs, from its install directory
+/// and the environment cImp is about to hand the child.
+///
+/// `lookup` reads the *composed child* environment (so an explicit
+/// `CARGO_HOME` the user set, or a seam forced, is what wins) and is a
+/// parameter for the same reason [`child_env::minimal_env`]'s is: the tests
+/// drive a synthetic environment instead of mutating the process's own.
+///
+/// Pure and IO-free — the caller filters to directories that actually exist,
+/// because "does this path exist" is not a property of the convention.
+pub fn toolchain_state(
+    program_dir: &Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<StateDir> {
+    let named = |var: &'static str| lookup(var).map(PathBuf::from);
+    // rustup's convention: the shims live in `<CARGO_HOME>\bin`.
+    let is_cargo_bin = program_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
+        && program_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(".cargo"));
+    if !is_cargo_bin {
+        return Vec::new();
+    }
+    let Some(cargo_home) = program_dir.parent() else {
+        return Vec::new();
+    };
+    // `<profile>` — the directory `.cargo` sits in, which is where rustup puts
+    // `.rustup` too, because both default to the same `$HOME`.
+    let profile = cargo_home.parent();
+    let mut out = vec![StateDir {
+        dir: named("CARGO_HOME").unwrap_or_else(|| cargo_home.to_path_buf()),
+        env: "CARGO_HOME",
+        why: "the crate cache and registry index this toolchain reads",
+    }];
+    if let Some(rustup) = named("RUSTUP_HOME").or_else(|| profile.map(|p| p.join(".rustup"))) {
+        out.push(StateDir {
+            dir: rustup,
+            env: "RUSTUP_HOME",
+            why: "the toolchains the rustup shim resolves rustc through",
+        });
+    }
+    // A volume root is never the narrow answer — the derived forms cannot BE
+    // one, but an environment pointer can say anything, and `CARGO_HOME=C:\`
+    // must not hand the container the drive.
+    out.retain(|s| s.dir.parent().is_some());
+    out
+}
+
+/// One shape of directory that `sandbox.extra_grant_dirs` is **not** allowed to
+/// open, identified by the components it ends in, with the reason the user's
+/// refusal row carries.
+///
+/// Data in code with a reason per row, the shape [`GrantRow`] and
+/// [`child_env::CHILD_ENV`] use: the reviewer of a diff that adds a row sees
+/// the pattern and the justification together, and a row with no reason does
+/// not compile.
+struct GrantRefusalRule {
+    /// The TRAILING path components that identify the directory. Compared
+    /// lowercased on both platforms — a broader match than Linux's
+    /// case-sensitive filesystem strictly needs, which is the safe direction
+    /// for a deny rule.
+    suffix: &'static [&'static str],
+    why: &'static str,
+}
+
+/// The credential stores no reviewed grant row may name.
+///
+/// Deliberately short and literal. This is not an attempt to enumerate every
+/// secret on a machine — the structural rules in [`extra_grant_refusal`] (a
+/// volume root, a user-profile root, the Windows install directory) are what
+/// stop the wholesale cases, and these rows cover the specific directories a
+/// plausible-looking "just grant my toolchain" entry would otherwise reach.
+const GRANT_REFUSAL_RULES: &[GrantRefusalRule] = &[
+    GrantRefusalRule {
+        suffix: &[".ssh"],
+        why: "an SSH key store — private keys, agent config and known-hosts",
+    },
+    GrantRefusalRule {
+        suffix: &[".aws"],
+        why: "AWS long-lived credentials and cached session tokens",
+    },
+    GrantRefusalRule {
+        suffix: &[".gnupg"],
+        why: "a GnuPG private keyring",
+    },
+    GrantRefusalRule {
+        suffix: &[".config", "gh"],
+        why: "the GitHub CLI's OAuth token store",
+    },
+    GrantRefusalRule {
+        suffix: &["microsoft", "credentials"],
+        why: "the Windows credential store (AppData\\Roaming\\Microsoft\\Credentials)",
+    },
+    GrantRefusalRule {
+        suffix: &["microsoft", "protect"],
+        why: "the DPAPI master keys that decrypt the Windows credential store",
+    },
+    GrantRefusalRule {
+        suffix: &["microsoft", "vault"],
+        why: "the Windows Vault credential store",
+    },
+];
+
+/// Why a `sandbox.extra_grant_dirs` row must NOT be granted — `None` means it
+/// is fine to grant.
+///
+/// # Why a settings row needs screening at all
+///
+/// This is the second of the two independent V33 mitigations for
+/// *"the settings file that configures the boundary lives inside the
+/// boundary"* (2026-08-18). The first is
+/// `settings::persistence::OVERLAY_BANNED_KEYS`, which stops a project overlay
+/// carrying a `sandbox` block at all. This one is what still holds if the
+/// **global** settings file is the thing that goes wrong: whatever names the
+/// row, cImp runs as the user and `grant_dir` stamps a **durable, inheritable**
+/// ACE — so `extra_grant_dirs: ["C:\\Users\\<u>\\.ssh"]` would not merely let
+/// one child read the keys, it would leave the container able to read them
+/// after cImp exits. Neither mitigation covers the other's case, which is why
+/// both exist.
+///
+/// # The rules
+///
+/// Structural first, then the [`GRANT_REFUSAL_RULES`] table:
+///
+/// 1. a **rootless (relative)** path — it would resolve against cImp's own
+///    working directory, which is not a boundary anyone reviewed. `has_root`
+///    rather than `is_absolute` on purpose: a POSIX-rooted row is a legitimate
+///    Linux grant, and `is_absolute` calls it relative on Windows, which would
+///    make this rule platform-dependent for no security gain;
+/// 2. a **volume / filesystem root** — everything on the machine is beneath it;
+/// 3. a **user-profile root or an ancestor of one** (`C:\Users\<u>`,
+///    `C:\Users`, `/home`) — it contains every credential store there is, so
+///    the table below would be decoration;
+/// 4. the **Windows install directory** or anything under it — already readable
+///    inside the container (`ALL APPLICATION PACKAGES` covers `System32`), so a
+///    grant buys nothing and an ACE on the OS is a durable machine change;
+/// 5. a directory whose trailing components match [`GRANT_REFUSAL_RULES`].
+///
+/// `home` and `system_root` are parameters rather than direct `env` reads for
+/// the same reason [`child_env::minimal_env`]'s lookup is: the tests drive a
+/// synthetic machine, on either platform, without touching the process's own
+/// environment. [`extra_grant_refusal_live`] is the production wrapper.
+///
+/// **A refusal is not a failure.** The engines skip the row, record it, and
+/// carry on with the rest — a bad settings row must not brick the sandbox, and
+/// refusing to run *unsandboxed* over one is the wrong direction too.
+pub fn extra_grant_refusal(
+    path: &Path,
+    home: Option<&Path>,
+    system_root: Option<&Path>,
+) -> Option<&'static str> {
+    if path.as_os_str().is_empty() || !path.has_root() {
+        return Some(
+            "not a rooted path — a relative grant row resolves against cImp's own working \
+             directory, which is not a reviewed boundary",
+        );
+    }
+    let comps = lower_components(path);
+    if comps.is_empty() || path.parent().is_none() {
+        return Some(
+            "a volume/filesystem root — everything on the machine is beneath it, so this is not \
+             a grant, it is switching the sandbox off",
+        );
+    }
+    if let Some(home) = home {
+        // `path` is the profile root itself, or an ancestor of it.
+        if starts_with(&lower_components(home), &comps) {
+            return Some(
+                "a user-profile root (or an ancestor of one) — it contains every credential \
+                 store on the machine",
+            );
+        }
+    }
+    if let Some(system_root) = system_root {
+        // `path` is the Windows directory itself, or something under it.
+        if starts_with(&comps, &lower_components(system_root)) {
+            return Some(
+                "the Windows install directory — already readable inside the container, and an \
+                 ACE stamped there is a durable change to the OS",
+            );
+        }
+    }
+    GRANT_REFUSAL_RULES
+        .iter()
+        .find(|rule| ends_with(&comps, rule.suffix))
+        .map(|rule| rule.why)
+}
+
+/// [`extra_grant_refusal`] against the machine cImp is running on.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn extra_grant_refusal_live(path: &Path) -> Option<&'static str> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+    extra_grant_refusal(path, home.as_deref(), system_root.as_deref())
+}
+
+/// A path's components, lowercased — the comparison unit for the rules above.
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect()
+}
+
+/// Is `prefix` the leading run of `comps` (component-wise, so `C:\Users\amirx`
+/// does not "start with" `C:\Users\amir`)?
+fn starts_with(comps: &[String], prefix: &[String]) -> bool {
+    !prefix.is_empty() && comps.len() >= prefix.len() && comps[..prefix.len()] == *prefix
+}
+
+/// Does `comps` END in `suffix` (already lowercase, component-wise)?
+fn ends_with(comps: &[String], suffix: &[&str]) -> bool {
+    comps.len() >= suffix.len()
+        && comps[comps.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(a, b)| a == b)
+}
+
+/// Record one refused `extra_grant_dirs` row — once per (seam, path) per
+/// session, because the row is re-read on every spawn and a line per spawn
+/// would push the rest of this lane out of its retention window.
+///
+/// `ok = false`: a settings row that cannot be honored is a state the user has
+/// to fix, not a choice they made.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn record_grant_refused(seam: &str, root: &Path, path: &Path, why: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let key = format!("{seam}|{}", path.display());
+    if let Ok(mut guard) = EMITTED.lock() {
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !set.insert(key) {
+            return;
+        }
+    }
+    record_event(
+        seam,
+        root,
+        "grant-refused",
+        state_target("grant refused", &path.display().to_string()),
+        format!(
+            "`{}` is listed in sandbox.extra_grant_dirs and was NOT granted: {why}. Nothing was \
+             written to that directory's ACL. Every other grant was applied and the run \
+             continued — one unusable settings row does not switch the boundary off. If a tool \
+             genuinely needs something in there, name the narrower directory it actually reads.",
+            path.display()
+        ),
+        false,
+    );
+}
+
 /// What a seam needs granted **beyond** what [`plan`] infers from the spawned
 /// program itself (whose own install directory is always granted read+execute,
 /// and whose project root is always granted full access).
@@ -615,27 +930,61 @@ const SOCKET_DENIAL_MARKERS: &[&str] = &[
 /// Substrings that mean a **program could not be started** — the shape a
 /// confined *shell* dies in, as opposed to a confined tool being refused a file.
 ///
-/// Measured on Windows, 2026-08-18 (rc.9 live-verify): a process running under
-/// cImp's AppContainer **cannot create a child process at all**. `cmd.exe` runs
-/// its builtins fine (`echo`, `cd`, `dir` and `type` all work, on the mapped
-/// drive and off it) and every `CreateProcess` it attempts is refused —
-/// including `C:\Windows\System32\where.exe`, which carries
-/// `ALL APPLICATION PACKAGES:(RX)`, from a cwd of `System32`, with no drive
-/// mapping involved. A plain `cmd.exe` in the same job object spawns the same
-/// grandchild successfully, so neither the job, the grants, the drive mapping
-/// nor PATH resolution is the cause.
+/// # The 2026-08-18 retraction (read this before trusting the old story)
 ///
-/// The user therefore sees one of two messages, and neither says "sandbox":
+/// An earlier rc.9 note recorded here claimed that a process under cImp's
+/// AppContainer "cannot create a child process at all". **That is false, and
+/// it was measured false on the same machine and build** (Windows 11 Pro
+/// 26200.9168) with a harness that reproduces this engine's spawn dance
+/// exactly — `CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT |
+/// EXTENDED_STARTUPINFO_PRESENT`, the two-attribute list (security
+/// capabilities + handle list), piped stdio, a hand-built environment block,
+/// the kill-on-close job, the `cimp.worker` profile itself, and a cwd on the
+/// mapped drive. Under all of it:
 ///
-/// * `'cargo' is not recognized as an internal or external command` — the PATH
-///   *search* failing, because probing `C:\Users\<u>\.cargo\bin\cargo.exe`
-///   traverses ancestors the container has no ACE on;
-/// * `Access is denied.` — the search having succeeded and `CreateProcess`
-///   being refused (already covered by [`FILESYSTEM_DENIAL_MARKERS`]).
+/// * a container child spawns grandchildren and great-grandchildren freely
+///   (`where.exe`, `cmd.exe`, `cargo.exe` → `rustc.exe` → a build script →
+///   `link.exe`);
+/// * `cargo --version` / `rustc --version` run **inside** the container once
+///   the toolchain's state directory is granted (see [`toolchain_state`]);
+/// * the spike S1/S3 results (npm's node grandchild, a token-proven ConPTY
+///   grandchild) reproduce unchanged.
 ///
-/// The first one used to classify as nothing at all, so the lane stayed empty
-/// while the check failed. It is listed here rather than folded into the
-/// filesystem set because it is a *different fact* and deserves its own label.
+/// What actually produces the two user-visible messages:
+///
+/// * `'cargo' is not recognized …` — a genuine PATH-search miss, or the
+///   toolchain shim dying before it prints anything of its own;
+/// * `Access is denied.` from a sandboxed `cmd.exe` — **not** a refused
+///   `CreateProcess`. `cmd` resolves a *drive-qualified* path (`C:\…`, and
+///   even `C:x`) through the VOLUME ROOT, and `C:\` carries no
+///   `ALL APPLICATION PACKAGES` ACE on a stock install, so
+///   `GetVolumeInformation("C:\")` returns error 5 and `cmd` reports that
+///   before it creates anything. The same command spelled without a drive
+///   (`\Windows\System32\where.exe`, `.\tool.exe`), or by bare name through
+///   PATH, or on the sandbox's own mapped drive (whose root IS granted), runs
+///   normally. Granting the volume root would need elevation, so the practical
+///   rule is: inside the sandbox, spell programs by bare name or on the mapped
+///   drive.
+///
+/// The marker list itself is unchanged — the classification was always right;
+/// only the *explanation* was wrong.
+///
+/// # What the two halves of the fix each removed
+///
+/// Both causes above are now handled at their own seam, and the markers stay
+/// for what is left:
+///
+/// * the drive-qualified spelling — `checks::sandboxed_raw_tail` never hands a
+///   sandboxed `cmd.exe` a program token that designates a drive, and leads the
+///   child's `PATH` with the directory the sandbox granted;
+/// * the state directory — [`toolchain_state`] grants it and re-asserts its
+///   pointer, so a shim cannot resolve its home into the redirected scratch.
+///
+/// The residual, and why these markers still earn their place: a compound
+/// command line's LATER tokens are not rewritten (only the first is resolved
+/// and granted at all), and a tool whose own tree cImp has no layout knowledge
+/// of still dies exactly this way until the user adds it under
+/// `Settings ▸ Sandboxing ▸ extra grants`.
 #[cfg_attr(not(windows), allow(dead_code))]
 const PROGRAM_START_DENIAL_MARKERS: &[&str] = &[
     "is not recognized as an internal or external command",
@@ -1036,15 +1385,14 @@ fn silent_exit_detail(
     )
 }
 
-/// Whether a sandboxed **shell's** output carries the fingerprint of the
-/// AppContainer's no-child-processes rule, and the note to hand the user if so.
+/// Whether a sandboxed **shell's** output carries the fingerprint of a program
+/// that never started, and the note to hand the user if so.
 ///
-/// See [`PROGRAM_START_DENIAL_MARKERS`] for the measurement. The note exists
-/// because the two messages a user actually sees — `'cargo' is not recognized`
-/// and `Access is denied.` — both point them at PATH or at file permissions,
-/// and neither is the problem: no external program can run inside this boundary
-/// at all, so a check that shells out cannot pass while it is on. Stating that
-/// is worth more than any amount of retrying.
+/// See [`PROGRAM_START_DENIAL_MARKERS`] for the measurement — including the
+/// retraction of the "no child processes" claim this note used to carry.
+/// Programs DO run inside the boundary; what stops them is narrower, and the
+/// note now names the two things a user can actually act on: an ungranted
+/// toolchain state directory, and a drive-qualified path in a sandboxed shell.
 ///
 /// Returns `None` for anything else, so a check that genuinely failed on its own
 /// terms is never handed an explanation it did not earn.
@@ -1059,11 +1407,15 @@ pub fn sandboxed_shell_note(exit_code: Option<i32>, stderr: &str) -> Option<&'st
         .chain(FILESYSTEM_DENIAL_MARKERS.iter())
         .any(|m| hay.contains(m));
     hit.then_some(
-        "\n[sandbox: this check ran inside the OS sandbox, where a shell cannot start ANY child \
-         process — on Windows an AppContainer is refused CreateProcess for every image, including \
-         ones it has read+execute on. If this check invokes an external tool (cargo, tsc, npm, a \
-         linter), that is the most likely reason it failed, and no grant will change it: turn the \
-         sandbox off for this run, or run the check from a tab.]",
+        "\n[sandbox: this check ran inside the OS sandbox and a program it invoked did not \
+         start. Programs DO run inside the boundary, so this is a reachability problem with a \
+         cause: either the tool's own files are not granted (its install dir is granted \
+         automatically, its STATE directory only for toolchains cImp knows the layout of), or \
+         the command spells a drive-qualified path — a sandboxed `cmd.exe` resolves `C:\\…` \
+         through the volume root, which no AppContainer can read on a stock Windows install, \
+         and reports `Access is denied.` before starting anything. Spell the program by bare \
+         name (PATH works) or by a path on the sandbox's mapped drive, add its directory under \
+         Settings ▸ Sandboxing ▸ extra grants, or turn the sandbox off for this run.]",
     )
 }
 
@@ -1392,6 +1744,195 @@ mod tests {
         assert_eq!(interpreter_root(Path::new("/Scripts")), None);
     }
 
+    /// **The grant-site screen (V33, 2026-08-18).** `extra_grant_dirs` is the
+    /// one input to the engines a settings file supplies verbatim, and
+    /// `grant_dir` stamps a DURABLE inheritable ACE — so a row naming `~/.ssh`
+    /// would outlive the run. Both directions, and the near-misses that a
+    /// sloppy string comparison would get wrong.
+    #[test]
+    fn a_grant_row_that_opens_credentials_or_the_world_is_refused() {
+        let home = Path::new("/home/me");
+        for (path, needle) in [
+            ("/home/me/.ssh", "SSH"),
+            ("/home/me/.aws", "AWS"),
+            ("/home/me/.gnupg", "GnuPG"),
+            ("/home/me/.config/gh", "GitHub"),
+            ("/home/me", "user-profile root"),
+            ("/home", "user-profile root"),
+            ("/", "volume/filesystem root"),
+            ("tools", "not a rooted path"),
+            ("", "not a rooted path"),
+        ] {
+            let why = extra_grant_refusal(Path::new(path), Some(home), None)
+                .unwrap_or_else(|| panic!("{path} must be refused"));
+            assert!(why.contains(needle), "{path}: {why}");
+        }
+        // Case and a trailing separator do not launder a refusal.
+        assert!(extra_grant_refusal(Path::new("/home/me/.SSH"), Some(home), None).is_some());
+        assert!(extra_grant_refusal(Path::new("/home/me/.ssh/"), Some(home), None).is_some());
+        // …and the legitimate rows this setting exists for still pass.
+        for ok in [
+            "/opt/toolchains/gcc/bin",
+            "/home/me/.cargo/bin",
+            "/home/me/.local/share/pnpm",
+            "/usr/lib/llvm-18",
+        ] {
+            assert_eq!(
+                extra_grant_refusal(Path::new(ok), Some(home), None),
+                None,
+                "{ok} is exactly what extra_grant_dirs is for"
+            );
+        }
+        // Component-wise, not string-prefix: another user's tree is not this
+        // user's profile root, and `.sshkeys` is not `.ssh`.
+        assert_eq!(
+            extra_grant_refusal(Path::new("/home/melissa/tools"), Some(home), None),
+            None
+        );
+        assert_eq!(
+            extra_grant_refusal(Path::new("/home/me/.sshkeys"), Some(home), None),
+            None
+        );
+        // With no home known, the structural profile rule simply does not fire
+        // — the table still does.
+        assert_eq!(extra_grant_refusal(Path::new("/opt/x"), None, None), None);
+        assert!(extra_grant_refusal(Path::new("/opt/x/.ssh"), None, None).is_some());
+    }
+
+    /// The Windows shapes of the same rule — the drive prefix, the profile
+    /// ancestry and the three credential stores under `AppData\Roaming`.
+    /// Split off because `C:\…` is one opaque component on the Linux runner.
+    #[cfg(windows)]
+    #[test]
+    fn a_grant_row_is_screened_with_windows_shapes_too() {
+        let home = Path::new(r"C:\Users\me");
+        let sys = Path::new(r"C:\Windows");
+        for p in [
+            r"C:\",
+            r"C:\Users",
+            r"C:\Users\me",
+            r"C:\Users\me\.ssh",
+            r"C:\Users\me\AppData\Roaming\Microsoft\Credentials",
+            r"C:\Users\me\AppData\Roaming\Microsoft\Protect",
+            r"C:\Users\me\AppData\Roaming\Microsoft\Vault",
+            r"C:\Windows",
+            r"C:\Windows\System32",
+            r"tools\bin",
+        ] {
+            assert!(
+                extra_grant_refusal(Path::new(p), Some(home), Some(sys)).is_some(),
+                "{p} must be refused"
+            );
+        }
+        for p in [
+            r"C:\Users\me\.cargo\bin",
+            r"D:\toolchains\llvm\bin",
+            r"C:\Program Files\nodejs",
+            r"C:\Users\meredith\shared",
+        ] {
+            assert_eq!(
+                extra_grant_refusal(Path::new(p), Some(home), Some(sys)),
+                None,
+                "{p}"
+            );
+        }
+        // Windows paths are case-insensitive, and so is this screen.
+        assert!(extra_grant_refusal(Path::new(r"c:\users\ME\.SSH"), Some(home), Some(sys)).is_some());
+        assert!(extra_grant_refusal(Path::new(r"c:\WINDOWS\system32"), Some(home), Some(sys)).is_some());
+    }
+
+    /// Every refusal row carries a reason a user can act on — the same bar
+    /// [`GrantRow`] and `child_env::CHILD_ENV` are held to.
+    #[test]
+    fn every_grant_refusal_rule_carries_a_reason_and_a_pattern() {
+        for rule in GRANT_REFUSAL_RULES {
+            assert!(
+                !rule.suffix.is_empty(),
+                "a rule with no pattern matches nothing"
+            );
+            assert!(
+                rule.why.len() > 20,
+                "`{:?}` is refused without a reason a user can act on",
+                rule.suffix
+            );
+            for seg in rule.suffix {
+                assert_eq!(
+                    *seg,
+                    seg.to_ascii_lowercase(),
+                    "patterns are compared lowercased; `{seg}` would never match"
+                );
+            }
+        }
+    }
+
+    /// **The rustup convention, and the pointer/redirect invariant behind it.**
+    ///
+    /// Measured 2026-08-18: a sandboxed `cargo` with only `…\.cargo\bin`
+    /// granted dies on `C:\Users\<u>\.rustup`; with both state directories
+    /// granted it runs, resolves offline and compiles. The rule must therefore
+    /// yield BOTH homes for a rustup shim — and nothing at all for a directory
+    /// that merely happens to be called `bin`, because every such grant is a
+    /// durable ACE on the user's machine.
+    #[test]
+    fn the_toolchain_state_rule_is_the_rustup_convention_and_nothing_wider() {
+        let none = |_: &str| None;
+        let got = toolchain_state(Path::new("C:/Users/me/.cargo/bin"), &none);
+        assert_eq!(
+            got,
+            vec![
+                StateDir {
+                    dir: PathBuf::from("C:/Users/me/.cargo"),
+                    env: "CARGO_HOME",
+                    why: "the crate cache and registry index this toolchain reads",
+                },
+                StateDir {
+                    dir: PathBuf::from("C:/Users/me/.rustup"),
+                    env: "RUSTUP_HOME",
+                    why: "the toolchains the rustup shim resolves rustc through",
+                },
+            ]
+        );
+        // An explicitly-set pointer wins over the convention, both halves
+        // independently — a user who moved either home is still served.
+        let moved = |name: &str| match name {
+            "RUSTUP_HOME" => Some(std::ffi::OsString::from("D:/rust/toolchains")),
+            _ => None,
+        };
+        let got = toolchain_state(Path::new("C:/Users/me/.cargo/bin"), &moved);
+        assert_eq!(got[0].dir, PathBuf::from("C:/Users/me/.cargo"));
+        assert_eq!(got[1].dir, PathBuf::from("D:/rust/toolchains"));
+        // Nothing else fires. `bin` alone is not the convention: the parent must
+        // be `.cargo`, or this rule would grant `C:\Program Files\Git\usr` and
+        // `/usr` on the strength of a directory name.
+        for narrow in [
+            "C:/Program Files/Git/usr/bin",
+            "/usr/bin",
+            "C:/Windows/System32",
+            "C:/Users/me/.cargo",
+            "C:/Users/me/AppData/Local/Python/pythoncore-3.14-64/Scripts",
+        ] {
+            assert!(
+                toolchain_state(Path::new(narrow), &none).is_empty(),
+                "{narrow} must not widen the boundary"
+            );
+        }
+        // `.rustup` is derived as `.cargo`'s sibling because both default to the
+        // same home — including when that home is a volume root.
+        let root_cargo = toolchain_state(Path::new("C:/.cargo/bin"), &none);
+        assert_eq!(root_cargo[1].dir, PathBuf::from("C:/.rustup"));
+        // But a pointer that names a volume root outright is dropped: no rule
+        // here may ever hand the container a whole drive.
+        let drive = |name: &str| match name {
+            "CARGO_HOME" => Some(std::ffi::OsString::from("C:/")),
+            _ => None,
+        };
+        let got = toolchain_state(Path::new("C:/Users/me/.cargo/bin"), &drive);
+        assert!(
+            got.iter().all(|s| s.env != "CARGO_HOME"),
+            "a volume-root pointer must be dropped, got {got:?}"
+        );
+    }
+
     /// **The two rc.9 lane silences, both closed.**
     ///
     /// A sandboxed child that fails says one of three things, and until now only
@@ -1446,13 +1987,13 @@ mod tests {
         );
     }
 
-    /// **The measured AppContainer limit, stated where the user reads.** A
-    /// confined `cmd.exe` cannot start ANY child process — measured against
-    /// `System32\where.exe`, which the container has read+execute on, from a
-    /// `System32` cwd, with no drive mapping in play; a plain `cmd.exe` in the
-    /// same job object runs the same grandchild fine. Both messages the user
-    /// actually sees point at PATH or at file permissions instead, so the note
-    /// exists to say what no amount of grant-tuning will change.
+    /// **The retraction, pinned.** The note used to assert that no child
+    /// process can run inside the boundary; that was measured false on
+    /// 2026-08-18 (see [`PROGRAM_START_DENIAL_MARKERS`]), and a note that tells
+    /// a user their situation is hopeless is worse than no note at all. What it
+    /// must say instead is what they can act on — reachability, and the
+    /// drive-qualified-path rule — and what it must never say again is that a
+    /// grant cannot help.
     #[test]
     fn a_sandboxed_shell_gets_told_why_it_cannot_start_a_program() {
         for stderr in [
@@ -1461,8 +2002,14 @@ mod tests {
         ] {
             let note = sandboxed_shell_note(Some(1), stderr)
                 .unwrap_or_else(|| panic!("no note for {stderr:?}"));
-            assert!(note.contains("cannot start ANY child process"), "{note}");
-            assert!(note.contains("no grant will change it"), "{note}");
+            // The measured truth, and the two actionable causes.
+            assert!(note.contains("Programs DO run inside the boundary"), "{note}");
+            assert!(note.contains("volume root"), "{note}");
+            assert!(note.contains("extra grants"), "{note}");
+            // The retracted claims must not come back.
+            let lower = note.to_ascii_lowercase();
+            assert!(!lower.contains("cannot start any child process"), "{note}");
+            assert!(!lower.contains("no grant will change"), "{note}");
         }
         // A check that failed on its own terms is not handed an excuse.
         assert_eq!(

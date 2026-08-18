@@ -696,7 +696,41 @@ fn read_overlay(path: &Path, quarantine: bool) -> Option<Value> {
 /// `prompt_templates`/`templates_seeded` are out-of-band there too, but a
 /// project overlay legitimately carries its own project-scoped template
 /// library ([`read_project_prompt_templates`]), so they are NOT banned here.
-const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions"];
+///
+/// # `sandbox` is banned for a different reason: it is a SECURITY boundary
+///
+/// V33 (2026-08-18). The other two rows are here to stop stale state shadowing
+/// a global write. `sandbox` is here because **the overlay file lives inside
+/// the boundary the block configures**: `.cimp/config.json` sits under the
+/// project root, the project root is granted FULL access to every sandboxed
+/// child, and [`load_readonly`] deep-merges that overlay on every MCP-child
+/// call (`graph::mcp::current_settings`). Without this ban a confined child
+/// could write its own `.cimp/config.json` and:
+///
+/// * set `sandbox.enabled = false` — the boundary is simply gone on the next
+///   spawn; or
+/// * add `sandbox.extra_grant_dirs: ["C:\\Users\\<u>\\.ssh"]` — and cImp,
+///   running as the user, would stamp a DURABLE inheritable ACE granting the
+///   container read access to the user's credentials.
+///
+/// A boundary a confined process can widen is not a boundary. `sandbox` is
+/// therefore **machine/global scope**: it describes what this machine's OS will
+/// enforce, not what one checkout prefers, and it is edited in the global
+/// settings file only. [`save`] writes the live block THROUGH to the physical
+/// global file (`sync_sandbox_into`) so the Settings window still works from
+/// inside a customized project, and [`load`] deliberately does **not** promote
+/// an existing overlay's `sandbox` block into the global baseline the way the
+/// audit scanner paths are promoted — promotion would honor exactly the
+/// contaminated file this ban exists to ignore. A user who had configured
+/// sandboxing per-project before this landed re-sets it once, globally.
+///
+/// This is one of TWO independent mitigations; the other is
+/// [`crate::sandbox::extra_grant_refusal`], which refuses a credential or
+/// system directory at the grant site whatever settings file named it. Neither
+/// is sufficient alone: banning the key still leaves a compromised *global*
+/// file able to name `~/.ssh`, and screening paths still leaves
+/// `sandbox.enabled` flippable.
+const OVERLAY_BANNED_KEYS: &[&str] = &["llm_pricing", "harness_versions", "sandbox"];
 
 fn strip_overlay_banned(v: &mut Value) {
     if let Value::Object(map) = v {
@@ -704,6 +738,26 @@ fn strip_overlay_banned(v: &mut Value) {
             map.remove(*k);
         }
     }
+}
+
+/// SAVE write-through for the machine-scope `sandbox` block: copy the live
+/// value onto the on-disk global settings, returning true when it changed.
+///
+/// `sandbox` is in [`OVERLAY_BANNED_KEYS`], so [`save`]'s diff can never carry
+/// it into a project overlay — which would leave a Settings-window edit with
+/// nowhere to land if this did not exist. Same pattern as
+/// [`sync_audit_paths_into`]: the pure half, so the caller decides whether the
+/// physical file is worth rewriting.
+///
+/// Whole-block, not per-field: every field of `SandboxSettings` is the same
+/// scope (what the OS enforces on this machine), and a per-field copy would be
+/// a place for a newly added field to be silently forgotten.
+fn sync_sandbox_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    if disk_global.sandbox == current.sandbox {
+        return false;
+    }
+    disk_global.sandbox = current.sandbox.clone();
+    true
 }
 
 // ── Audit scanner paths: machine-scope splitting ─────────────────────────────
@@ -1007,7 +1061,11 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             let mut disk = read_settings_or_default(&gpath);
             let paths_changed = sync_audit_paths_into(&mut disk, settings);
             let templates_changed = sync_offload_templates_into(&mut disk, settings);
-            if paths_changed || templates_changed {
+            // V33: `sandbox` is banned from overlays (it configures a boundary
+            // whose own writable area holds the overlay file), so the global
+            // file is the ONLY place a sandbox edit can land.
+            let sandbox_changed = sync_sandbox_into(&mut disk, settings);
+            if paths_changed || templates_changed || sandbox_changed {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -3142,6 +3200,75 @@ mod tests {
         assert!(
             !bare.checks_allow_remote_worker,
             "a project with no override must fall back to DENIED"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **V33 (HIGH, 2026-08-18): a project overlay must not be able to widen or
+    /// switch off the OS sandbox.**
+    ///
+    /// `.cimp/config.json` lives INSIDE the boundary the `sandbox` block
+    /// configures — the project root is granted FULL access to every sandboxed
+    /// child, and [`load_readonly`] deep-merges the overlay on every MCP-child
+    /// call. Three claims, one per half of the fix:
+    ///
+    /// 1. a sandbox edit never lands in an overlay (so nothing pins one there
+    ///    for a later child to inherit);
+    /// 2. an overlay that carries a `sandbox` block anyway — the shape a
+    ///    confined child could write, `enabled: false` plus a `~/.ssh` grant
+    ///    row — is stripped before ANY merge;
+    /// 3. the write-through is what keeps the setting savable at all, which is
+    ///    the thing a plain ban would have broken.
+    #[test]
+    fn a_project_overlay_cannot_configure_the_sandbox() {
+        let _shell = fake_default_shell();
+        let mut global = Settings::default();
+        integrity_check(&mut global);
+
+        let dir = std::env::temp_dir().join(format!("cimp_v33_sbx_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let overlay = custom_path(&dir);
+
+        let mut customized = global.clone();
+        customized.sandbox.enabled = true;
+        customized.sandbox.extra_grant_dirs = vec!["/opt/toolchains".to_string()];
+        // Something that DOES belong in an overlay, so the diff is non-empty
+        // and the file exists to be inspected.
+        customized.checks_allow_remote_worker = true;
+        save(&customized, &dir, &global).unwrap();
+
+        // (1) The overlay carries the project-scoped key and NOTHING sandboxy.
+        let text = fs::read_to_string(&overlay).unwrap();
+        let val: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({ "checks_allow_remote_worker": true }),
+            "overlay: {text}"
+        );
+        assert!(!text.contains("sandbox"), "overlay: {text}");
+
+        // (2) A contaminated overlay is stripped before the merge. This is the
+        //     exact function `load` and `load_readonly` both call.
+        let hostile = r#"{"sandbox":{"enabled":false,"extra_grant_dirs":["/home/me/.ssh"]},
+                          "checks_allow_remote_worker":true}"#;
+        fs::write(&overlay, hostile).unwrap();
+        let mut v = read_overlay(&overlay, false).expect("the overlay parses");
+        strip_overlay_banned(&mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({ "checks_allow_remote_worker": true }),
+            "a project overlay may not carry `sandbox`"
+        );
+
+        // (3) …and the global write-through is where a real edit lands.
+        let mut disk = Settings::default();
+        assert!(sync_sandbox_into(&mut disk, &customized));
+        assert!(disk.sandbox.enabled);
+        assert_eq!(disk.sandbox.extra_grant_dirs, customized.sandbox.extra_grant_dirs);
+        assert!(
+            !sync_sandbox_into(&mut disk, &customized),
+            "a no-op edit must not rewrite the global file"
         );
 
         let _ = fs::remove_dir_all(&dir);

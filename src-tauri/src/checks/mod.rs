@@ -801,6 +801,12 @@ async fn spawn_capture(
     } else {
         (Vec::new(), Vec::new())
     };
+    // The SAME resolution the grant is inferred from, kept for the sandboxed
+    // tail: `sandboxed_raw_tail` prepends this program's directory to the
+    // child's PATH, and it must be the directory `prepare` granted — one
+    // resolution, one directory, no way for the two to drift.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    let program_hint: Option<PathBuf> = inferred.first().cloned();
 
     let plan = match tokio::time::timeout(
         crate::sandbox::PREPARE_BACKSTOP,
@@ -852,7 +858,16 @@ async fn spawn_capture(
     #[cfg(windows)]
     if let crate::sandbox::Plan::Sandboxed(prepared) = &plan {
         return spawn_capture_sandboxed(
-            prepared, root, cwd, &subject, cmd, env, &base_env, timeout, sandbox,
+            prepared,
+            root,
+            cwd,
+            &subject,
+            cmd,
+            program_hint.as_deref(),
+            env,
+            &base_env,
+            timeout,
+            sandbox,
         )
         .await;
     }
@@ -1098,23 +1113,35 @@ fn check_program_hint(
 /// `ENV=value` prefix, or a token carrying shell metacharacters that mean the
 /// line starts with something other than a program.
 fn first_shell_token(cmd: &str) -> Option<String> {
-    let trimmed = cmd.trim_start();
+    split_first_shell_token(cmd).map(|(token, _)| token)
+}
+
+/// [`first_shell_token`] plus the byte offset in `cmd` where the REST of the
+/// command line begins — everything after the token and its closing quote.
+///
+/// The offset is what lets [`sandboxed_raw_tail`] rewrite the program token
+/// without re-parsing (or re-quoting) the arguments behind it: the tail is
+/// `<new token>` + `&cmd[rest..]`, byte for byte.
+fn split_first_shell_token(cmd: &str) -> Option<(String, usize)> {
+    let lead = cmd.len() - cmd.trim_start().len();
+    let trimmed = &cmd[lead..];
     if trimmed.is_empty() {
         return None;
     }
-    let token: String = if let Some(rest) = trimmed.strip_prefix('"') {
+    let (token, rest): (String, usize) = if let Some(after_quote) = trimmed.strip_prefix('"') {
         // A quoted program path; everything up to the closing quote.
-        match rest.split_once('"') {
-            Some((inside, _)) => inside.to_string(),
+        match after_quote.split_once('"') {
+            // 1 opening quote + the token + 1 closing quote.
+            Some((inside, _)) => (inside.to_string(), lead + 1 + inside.len() + 1),
             // Unterminated quote — not something to guess about.
             None => return None,
         }
     } else {
-        trimmed
+        let t = trimmed
             .split(|c: char| c.is_whitespace())
             .next()
-            .unwrap_or_default()
-            .to_string()
+            .unwrap_or_default();
+        (t.to_string(), lead + t.len())
     };
     if token.is_empty() {
         return None;
@@ -1129,7 +1156,137 @@ fn first_shell_token(cmd: &str) -> Option<String> {
     if token.contains(['&', '|', '<', '>', '(', ')', ';', '^', '%', '"', '\'']) {
         return None;
     }
-    Some(token)
+    Some((token, rest))
+}
+
+/// The `/C` tail a **sandboxed** check runs, and the directory that has to lead
+/// the child's `PATH` for it to resolve.
+///
+/// # Why the sandboxed tail is not the plain one
+///
+/// Measured on Windows, 2026-08-18 (the rc.9 bisect, full production spawn
+/// shape): a process inside cImp's AppContainer **can** create children — what
+/// it cannot do is let `cmd.exe` resolve a **drive-qualified program path**.
+/// `cmd /d /c C:\Windows\System32\HOSTNAME.EXE` dies with `Access is denied.`;
+/// the same image reached as `HOSTNAME.EXE` (through `PATH`) or as
+/// `.\prog.exe` runs. The cause is not the image and not the job: the volume
+/// root `C:\` carries no `ALL APPLICATION PACKAGES` ACE, `read_dir("C:\")` from
+/// inside the container is `os error 5`, and `cmd`'s program resolution opens
+/// the drive root for a path that names a drive. (`dir` and `cd /d C:\…` fail
+/// for the same reason; a plain `type C:\…\hosts` — a file open, no drive
+/// designator resolution — succeeds.)
+///
+/// So the sandboxed tail names the program the two ways that work:
+///
+/// So the program token gets exactly what its shape needs, and nothing more:
+///
+/// | token as the operator wrote it | tail | child `PATH` |
+/// |---|---|---|
+/// | bare (`cargo test`) | unchanged | led by the resolved directory |
+/// | drive-qualified (`"C:\…\npm.cmd" run x`) | the resolved **file name** | led by the resolved directory |
+/// | drive-less path (`.\gradlew`, `\Windows\…\where.exe`) | unchanged | unchanged |
+///
+/// The directory that leads `PATH` is the SAME one [`check_program_hint`] made
+/// the sandbox grant read+execute — one resolution, so the granted directory
+/// and the searched directory cannot drift apart. That is the determinism the
+/// absolute spelling used to buy, kept without the drive designator.
+///
+/// **A bare token keeps its spelling**, and that is deliberate rather than
+/// lazy: `cmd.exe` builtins (`echo`, `mkdir`, `type`, `start`) beat `PATH` only
+/// while the line names them the way the user wrote them, and a dev box with
+/// MSYS on `PATH` has an `echo.exe` that [`crate::pty::resolve_command`] will
+/// happily find. Rewriting `echo done` to `echo.exe done` would silently change
+/// which one runs.
+///
+/// **A drive-less path is left completely alone** — the bisect measured both
+/// `.\prog.exe` and `\Windows\System32\HOSTNAME.EXE` as working, so there is
+/// nothing to fix, and `resolve_command` resolves a *relative* token against
+/// cImp's own working directory rather than the check's, which is not a fact
+/// worth acting on.
+///
+/// # What this does NOT promise
+///
+/// `cmd.exe` searches the **current directory before `PATH`**. Prepending the
+/// resolved directory therefore wins against every other `PATH` entry — the
+/// hijack the resolution exists to rule out — but not against a same-named
+/// executable sitting in the check's own working directory. That exposure is
+/// identical on the plain path (which hands `cmd` the operator's command line
+/// verbatim, bare token and all), and the two paths must behave the same, so it
+/// is stated rather than "fixed" here. `NoDefaultCurrentDirectoryInExePath`
+/// would close it and is deliberately NOT set: it would also break a check that
+/// legitimately runs a `build.cmd` out of the project root, and only on the
+/// sandboxed path.
+///
+/// When the program could not be resolved at all, this returns today's tail
+/// unchanged (`/C <cmd>` verbatim, no `PATH` prefix) — there is nothing to
+/// prepend and nothing to rename, and a check that then fails to start surfaces
+/// as a loud row exactly as before.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sandboxed_raw_tail(cmd: &str, resolved: Option<&Path>) -> (String, Option<PathBuf>) {
+    let unchanged = || (format!("/C {cmd}"), None);
+    let Some(resolved) = resolved else {
+        return unchanged();
+    };
+    let (Some(dir), Some(name)) = (resolved.parent(), resolved.file_name()) else {
+        return unchanged();
+    };
+    if dir.as_os_str().is_empty() {
+        return unchanged();
+    }
+    let dir = dir.to_path_buf();
+    let Some((token, rest)) = split_first_shell_token(cmd) else {
+        // No program token to rewrite (a builtin-only line, a pipeline, an
+        // `ENV=value` prefix). The PATH prefix is still worth nothing here,
+        // because nothing resolved it — `resolved` came from the same token.
+        return unchanged();
+    };
+    // Exactly three shapes, and each gets what the bisect measured it needs.
+    let has_drive = token.chars().nth(1) == Some(':');
+    let is_path = has_drive || token.contains('\\') || token.contains('/');
+    if !is_path {
+        // BARE — already resolved through PATH, which works inside the
+        // container. Lead PATH with the granted directory and leave the
+        // spelling alone (rewriting it would shadow a `cmd.exe` builtin).
+        return (format!("/C {cmd}"), Some(dir));
+    }
+    if !has_drive {
+        // A DRIVE-LESS path (`.\gradlew`, `\Windows\System32\where.exe`) — the
+        // bisect measured both as working, so this is today's behaviour
+        // untouched, and no PATH prefix either: the line names its program
+        // explicitly, so prepending a directory would only add a shadowing
+        // surface for whatever the line runs NEXT. (`resolve_command` resolves
+        // a relative token against cImp's OWN cwd, which is not necessarily the
+        // check's — one more reason not to act on it.)
+        return unchanged();
+    }
+    let name = name.to_string_lossy();
+    // A program file name with a space in it still has to survive `cmd`'s own
+    // tokenization; the arguments behind it are copied through untouched.
+    let head = if name.contains(' ') {
+        format!("\"{name}\"")
+    } else {
+        name.into_owned()
+    };
+    (format!("/C {head}{}", &cmd[rest..]), Some(dir))
+}
+
+/// The child's `PATH` with `dir` in FRONT of whatever it already held.
+///
+/// Windows list separator (`;`): the only caller composes the environment of a
+/// `CreateProcessW` child on the sandboxed `run_check` path. An absent or empty
+/// existing value yields just `dir` with **no trailing separator** — an empty
+/// `PATH` element means "the current directory" to `cmd.exe`, and adding one is
+/// the opposite of what leading the search with a resolved directory is for.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn path_led_by(dir: &Path, existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let mut out = dir.as_os_str().to_os_string();
+    if let Some(existing) = existing {
+        if !existing.is_empty() {
+            out.push(";");
+            out.push(existing);
+        }
+    }
+    out
 }
 
 /// V33 — run one configured check's shell INSIDE the AppContainer.
@@ -1151,12 +1308,23 @@ async fn spawn_capture_sandboxed(
     cwd: &Path,
     subject: &str,
     cmd: &str,
+    program_hint: Option<&Path>,
     env: &[(String, String)],
     base_env: &[(&str, std::ffi::OsString)],
     timeout: Duration,
     sandbox: &crate::sandbox::SandboxCfg,
 ) -> AppResult<(Option<i32>, String, String, bool)> {
     let shell = shell_program();
+    // `/C <cmd>` goes in as a RAW tail, not as a quoted argument — `cmd.exe`
+    // parses its tail with its own rules, exactly as `shell_command`'s
+    // `raw_arg` doc explains. Quoting it would double-escape a check command
+    // that contains its own quotes, and the two paths must agree.
+    //
+    // The tail and the `PATH` prefix come from the SAME resolved program the
+    // grant was inferred from — see [`sandboxed_raw_tail`] for the measured
+    // reason a sandboxed `cmd.exe` cannot be handed a drive-qualified one.
+    let (raw_tail, path_prefix) = sandboxed_raw_tail(cmd, program_hint);
+
     let mut child_env = crate::sandbox::child_env::ChildEnv::from_base(base_env);
     // The check's own forced variables (V22 Phase B), then the sandbox's
     // redirections LAST — those point at the mapped drive and must win.
@@ -1167,13 +1335,15 @@ async fn spawn_capture_sandboxed(
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone())),
     );
+    // After every overlay, so the resolved directory leads the search whatever
+    // `CheckDef::env` did to `PATH` — the whole point is that the binary the
+    // sandbox GRANTED is the binary the shell finds.
+    if let Some(dir) = &path_prefix {
+        let led = path_led_by(dir, child_env.get("PATH").map(|v| v.as_os_str()));
+        child_env.set("PATH", led);
+    }
     let child_env = child_env.into_pairs();
 
-    // `/C <cmd>` goes in as a RAW tail, not as a quoted argument — `cmd.exe`
-    // parses its tail with its own rules, exactly as `shell_command`'s
-    // `raw_arg` doc explains. Quoting it would double-escape a check command
-    // that contains its own quotes, and the two paths must agree.
-    let raw_tail = format!("/C {cmd}");
     let settled = tokio::time::timeout(
         crate::sandbox::backstop_for(timeout),
         crate::sandbox::windows::spawn_and_capture(
@@ -1419,6 +1589,159 @@ mod tests {
         assert!(hint("(cargo test)").is_none(), "subshell");
         assert!(hint("| cargo test").is_none(), "pipeline fragment");
         assert!(hint("\"unterminated cargo").is_none(), "unbalanced quote");
+    }
+
+    /// The offset half of [`split_first_shell_token`] — what makes rewriting the
+    /// program token possible without re-quoting the arguments behind it.
+    /// `&cmd[rest..]` must be the REST of the line, byte for byte, including
+    /// the separator that followed the token.
+    #[test]
+    fn splitting_the_program_token_leaves_the_arguments_byte_identical() {
+        for cmd in [
+            "cargo test --bin cimp",
+            "   cargo   test",
+            "\"/opt/my tools/tsc.cmd\" --noEmit",
+            "\"/opt/x/t.cmd\"",
+            "cargo",
+        ] {
+            let (token, rest) = split_first_shell_token(cmd).expect(cmd);
+            assert!(
+                cmd.contains(&token),
+                "the token must be a slice of the line: {cmd}"
+            );
+            // The remainder is whatever the caller would have had to re-quote.
+            let tail = &cmd[rest..];
+            assert!(
+                tail.is_empty() || tail.starts_with(char::is_whitespace),
+                "rest must begin at the separator: {cmd:?} -> {tail:?}"
+            );
+        }
+        // The quoted form consumes BOTH quotes.
+        let (token, rest) = split_first_shell_token("\"/o/my t/tsc.cmd\" --noEmit").unwrap();
+        assert_eq!(token, "/o/my t/tsc.cmd");
+        assert_eq!(&"\"/o/my t/tsc.cmd\" --noEmit"[rest..], " --noEmit");
+    }
+
+    /// **FIX 1 — what a SANDBOXED `cmd.exe` may be handed** (2026-08-18 bisect;
+    /// see [`sandboxed_raw_tail`] for the measurement). Two claims:
+    ///
+    /// 1. the resolved program's directory leads the child's `PATH`, and it is
+    ///    the SAME directory `check_program_hint` had the sandbox grant — the
+    ///    determinism the absolute-path spelling used to provide, kept without
+    ///    the drive designator that the volume root refuses;
+    /// 2. a **bare** token keeps its spelling. Rewriting it to the resolved file
+    ///    name would shadow a `cmd.exe` builtin on a machine that happens to
+    ///    have an `echo.exe`/`mkdir.exe` on PATH (MSYS, GnuWin32), and a bare
+    ///    token was never the failing shape.
+    #[test]
+    fn a_sandboxed_check_resolves_its_program_through_a_led_path() {
+        let resolved = PathBuf::from("/home/me/.cargo/bin/cargo");
+        let (tail, dir) = sandboxed_raw_tail("cargo test --bin cimp", Some(&resolved));
+        assert_eq!(tail, "/C cargo test --bin cimp", "a bare token is untouched");
+        assert_eq!(dir.as_deref(), Some(Path::new("/home/me/.cargo/bin")));
+
+        // A DRIVE-LESS path is left completely alone — measured working inside
+        // the container, and nothing to lead PATH with.
+        let resolved = PathBuf::from("/opt/my tools/tsc.cmd");
+        assert_eq!(
+            sandboxed_raw_tail("\"/opt/my tools/tsc.cmd\" --noEmit", Some(&resolved)),
+            ("/C \"/opt/my tools/tsc.cmd\" --noEmit".to_string(), None)
+        );
+        assert_eq!(
+            sandboxed_raw_tail(".\\gradlew build", Some(Path::new("/proj/gradlew.bat"))),
+            ("/C .\\gradlew build".to_string(), None)
+        );
+
+        // No resolution ⇒ today's behaviour, byte for byte, and nothing to lead
+        // PATH with.
+        assert_eq!(
+            sandboxed_raw_tail("cargo test", None),
+            ("/C cargo test".to_string(), None)
+        );
+        // A program with no directory of its own is not something to prepend.
+        assert_eq!(
+            sandboxed_raw_tail("cargo test", Some(Path::new("cargo"))),
+            ("/C cargo test".to_string(), None)
+        );
+        // A line that names no plain program (a pipeline, an env prefix) is
+        // left exactly as the operator wrote it.
+        let (tail, _) = sandboxed_raw_tail("(cargo test)", Some(&PathBuf::from("/a/b/cargo")));
+        assert_eq!(tail, "/C (cargo test)");
+    }
+
+    /// The Windows half of the same rule, with the drive designator that is the
+    /// whole point. Split off because `C:\…` is a single opaque component on
+    /// the Linux CI runner, where `parent()` would answer `""`.
+    #[cfg(windows)]
+    #[test]
+    fn a_sandboxed_check_never_gets_a_drive_qualified_program() {
+        let resolved = PathBuf::from(r"C:\Program Files\nodejs\npm.cmd");
+        let (tail, dir) =
+            sandboxed_raw_tail(r#""C:\Program Files\nodejs\npm.cmd" run test"#, Some(&resolved));
+        assert_eq!(tail, "/C npm.cmd run test");
+        assert_eq!(dir.as_deref(), Some(Path::new(r"C:\Program Files\nodejs")));
+        // The measured failure: a drive designator anywhere in the PROGRAM
+        // position makes `cmd` open the volume root, which no AppContainer can
+        // read. Nothing of the sort may survive.
+        let program = tail
+            .trim_start_matches("/C ")
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert!(!program.contains(':'), "{tail}");
+        assert!(!program.contains('\\'), "{tail}");
+
+        // The drive-RELATIVE spelling (`C:tool.exe`) designates a drive too,
+        // and resolves through the same volume root.
+        let (tail, _) = sandboxed_raw_tail(
+            r"C:tool.exe --x",
+            Some(Path::new(r"C:\Users\me\bin\tool.exe")),
+        );
+        assert_eq!(tail, "/C tool.exe --x");
+
+        // A program file name with a space in it still survives `cmd`'s own
+        // tokenization.
+        let (tail, _) = sandboxed_raw_tail(
+            r#""C:\t\my tool.exe" -x"#,
+            Some(Path::new(r"C:\t\my tool.exe")),
+        );
+        assert_eq!(tail, "/C \"my tool.exe\" -x");
+
+        // ARGUMENTS are untouched — only program resolution walks the volume
+        // root, so a check that passes an absolute output path keeps it.
+        let (tail, _) = sandboxed_raw_tail(
+            r"cargo test -- --out C:\tmp\r.json",
+            Some(Path::new(r"C:\Users\me\.cargo\bin\cargo.exe")),
+        );
+        assert_eq!(tail, r"/C cargo test -- --out C:\tmp\r.json");
+
+        // …and a drive-less rooted path stays exactly as written on Windows too.
+        assert_eq!(
+            sandboxed_raw_tail(
+                r"\Windows\System32\where.exe cargo",
+                Some(Path::new(r"C:\Windows\System32\where.exe"))
+            ),
+            (r"/C \Windows\System32\where.exe cargo".to_string(), None)
+        );
+    }
+
+    /// The resolved directory must be FIRST — that is what makes the binary the
+    /// sandbox granted the binary the shell finds, and it is the hijack
+    /// resistance the old absolute-path spelling provided.
+    #[test]
+    fn the_resolved_directory_leads_the_childs_path() {
+        use std::ffi::{OsStr, OsString};
+        let dir = Path::new("/opt/tools");
+        let led = path_led_by(dir, Some(OsStr::new("/usr/bin;/bin")));
+        assert_eq!(led, OsString::from("/opt/tools;/usr/bin;/bin"));
+        assert!(led.to_string_lossy().starts_with("/opt/tools;"));
+        // An absent or empty PATH must not leave a trailing separator: an empty
+        // element means "the current directory" to `cmd.exe`.
+        assert_eq!(path_led_by(dir, None), OsString::from("/opt/tools"));
+        assert_eq!(
+            path_led_by(dir, Some(OsStr::new(""))),
+            OsString::from("/opt/tools")
+        );
     }
 
     /// **A check's sandbox rows are scanned by the check, not by `cmd.exe`.**

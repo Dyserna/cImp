@@ -1,8 +1,58 @@
 # V33 — OS Sandboxing & Max Paranoia Mode
 
-**Status:** IMPLEMENTED except Phase D's Landlock half (2026-08-18) — Phase A
-live-verified on rc.8; seam increment + Phase B (S3 POSITIVE) coded, gates
-green, live-verify tracked in #72. GitHub: milestone 6, umbrella #30.
+**Status:** IMPLEMENTED (2026-08-19) — all four seams on Windows, three on Linux
+(Landlock; tabs need an upstream portable_pty hook). Phase A live-verified on
+rc.8; the rc.9 live battery found and closed four real defects (below).
+Live-verify tracked in #72. GitHub: milestone 6, umbrella #30.
+
+> **⚡ Corrections from the rc.9 live battery (2026-08-18/19) — read these before
+> trusting any earlier sentence in this document about what the sandbox can do.**
+>
+> 1. **A contained process CAN spawn children.** A round-2 claim that it cannot
+>    (shipped briefly in `e632847`) was FALSE and is retracted in code. A full
+>    bisect reproducing cImp's exact production spawn shape — profile, handle
+>    list, `bInheritHandles`, kill-on-close job, minimal env, piped stdio — found
+>    grandchildren work under every combination, including a real
+>    `cargo → rustc → build script → link.exe` chain.
+> 2. **The real rule: `cmd.exe` cannot resolve a DRIVE-QUALIFIED program path
+>    inside the container.** `C:\` (the volume root) carries no
+>    `ALL APPLICATION PACKAGES` ACE, and cmd opens the drive root when resolving
+>    a drive-designated path — so `cmd /c C:\…\tool.exe` is denied before any
+>    spawn, while a bare name via `PATH`, a drive-less path, or the sandbox's own
+>    mapped drive all run. `dir` and `cd /d C:\…` fail for the same reason;
+>    plain file opens do not (bypass-traverse is present and works).
+>    **Fix:** the sandboxed check path resolves the program once, rewrites a
+>    drive-qualified token to its file name, and leads the child's `PATH` with
+>    the resolved directory. Bare tokens keep their spelling (rewriting them
+>    would change which `echo` runs); drive-less paths are left untouched.
+> 3. **Toolchain state dirs are part of the boundary.** The engine redirects
+>    `HOME`/`USERPROFILE` into the sandbox root, so an unset `CARGO_HOME`/
+>    `RUSTUP_HOME` resolved against empty scratch and rustup could not choose a
+>    toolchain; `~/.rustup` was never granted at all. Granted program dirs now
+>    also grant their state dirs RX, and the pointers are appended AFTER the
+>    HOME redirect. With that, `cargo check --offline` compiles inside the
+>    container.
+> 4. **A project overlay must never configure the boundary (SECURITY).**
+>    `.cimp/config.json` lives inside a FULL-granted root, so anything running
+>    in the project can write it — and `load_readonly` merged it on every
+>    MCP-child call. An overlay could set `sandbox.enabled = false`, or name
+>    `~/.ssh` in `extra_grant_dirs` and make cImp stamp a durable ACE granting
+>    the container read access to credentials. **`sandbox` is now an
+>    overlay-banned key (machine/global scope, with a write-through so the
+>    setting still saves), and `extra_grant_dirs` is screened at the grant site**
+>    on both engines: credential dirs, the user-profile root, volume roots and
+>    the Windows directory are refused with an Events row, and the remaining
+>    grants still apply. `injection` is reachable by the identical path and is
+>    NOT yet banned — open decision, see #72.
+>
+> **Known residuals, measured:** `link.exe` exits `0xC0000142` in the container
+> (a further grant question, not a spawn one); grants are RX, so a *fetching*
+> cargo is denied on `CARGO_HOME` (deliberate); interpreter tools whose
+> resolution walks to the volume root (semgrep's `scan`) still fail — closing
+> that needs machine-wide ACL weakening, which is refused. 7 of the 14 audit
+> tools are single static binaries and work sandboxed today; the rest depend on
+> a runtime and are candidates for a per-tool `sandbox: required|optional|
+> unsupported` declaration when V38 makes tools manifest-driven.
 **Amendments:** 2026-08-09 — Phase F's throttling note, made false by V32's
 `946d7d1` (checkpoint throttle re-keyed per `(root, tab)`). **2026-08-13 — a
 six-agent investigation verified this spec against the live tree and found

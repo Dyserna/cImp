@@ -5,6 +5,52 @@ All notable changes to cImp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Sandboxed checks and audits actually run now.** Testing rc.9 live turned up
+  a chain of defects that made the sandbox look far more limited than it is.
+  A check's command was handed to the shell as a full drive-qualified path,
+  which the container refuses — not because it cannot start programs (an
+  earlier claim to that effect was wrong and has been retracted in full), but
+  because `C:\` itself is unreadable to a sandboxed process and the shell opens
+  the drive root to resolve such a path. The sandboxed path now leads the
+  child's `PATH` with the resolved program's directory and passes the program
+  by name, which the container handles fine. Separately, the sandbox redirects
+  `HOME` into the project root, so Rust's toolchain launcher looked for its
+  state in an empty directory and gave up; toolchain state directories are now
+  granted and their pointers restored after the redirect. With both, a real
+  `cargo check` compiles inside the sandbox.
+- **A relative project root can no longer reach the sandbox.** A tool call that
+  supplied no working directory let `"."` flow into the drive mapping, which
+  Windows accepted while resolving to nothing — and the same path would have
+  granted the sandbox write access to whatever directory cImp was started in.
+  Four guards now stand, including one that catches it with the sandbox off,
+  where the failure would have silently run a build in the wrong directory and
+  reported the result as your project's.
+- **Every sandbox failure now leaves a row.** A spawn that never started, a
+  child that exited without a word, and a program the shell could not start are
+  each recorded distinctly instead of vanishing. An audit tool that dies before
+  it speaks no longer reports "findings were lost", because an exit code from a
+  tool that never ran is not evidence about findings.
+- **Interpreter-based scanners get the grant they need** — a tool launched from
+  a Python `Scripts` directory now also gets its install root, so semgrep runs
+  instead of dying silently.
+
+### Security
+
+- **A project file can no longer switch off the sandbox.** `.cimp/config.json`
+  sits inside the project root, which a sandboxed process can write, and its
+  contents were merged into the settings every tool call read. A project file
+  could therefore disable the boundary outright, or list a credential directory
+  as an extra grant and have cImp stamp a lasting permission that let the
+  sandbox read your SSH keys. Sandboxing settings are now machine-global and
+  ignored in project files, and extra grants are screened at the point they are
+  applied: credential directories, your user-profile root, drive roots and the
+  Windows directory are refused with an Events row, while the remaining grants
+  still apply.
+
 ## [0.52.0-rc.9] — 2026-08-18
 
 ### Added

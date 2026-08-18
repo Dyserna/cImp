@@ -7161,11 +7161,20 @@
           <h2>Sandboxing</h2>
           <small class="hint top">
             An OS-enforced boundary around the child processes an agent starts —
-            today the commands the offload worker runs through
-            <code>run_command</code>. Injection protection (above) constrains a
-            compromised model at the tool layer; this makes the operating system
-            enforce a boundary the model cannot negotiate with. They are separate
-            categories because neither delivers the other.
+            the commands the offload worker runs through <code>run_command</code>,
+            the configured checks <code>run_check</code> runs, the code-audit
+            scanners, and (separately switched below) AI tool tabs. Injection
+            protection (above) constrains a compromised model at the tool layer;
+            this makes the operating system enforce a boundary the model cannot
+            negotiate with. They are separate categories because neither delivers
+            the other.
+          </small>
+          <small class="hint top">
+            <strong>These settings are machine-global.</strong> They are saved to
+            the global settings file and are deliberately ignored if they appear
+            in a project's <code>.cimp/config.json</code> — a boundary a project
+            file could switch off would be no boundary at all, since anything
+            running inside the project root can write that file.
           </small>
           <label class="checkbox">
             <input
@@ -7275,6 +7284,14 @@
             entry. If a directory cannot be granted — typically one owned by
             Administrators — the command runs unsandboxed and says so in Events
             rather than failing.
+          </small>
+          <small class="hint down">
+            Some paths are refused here on purpose: credential directories
+            (<code>.ssh</code>, <code>.aws</code>, <code>.gnupg</code>, the
+            Windows credential stores), your user-profile root, a drive root and
+            the Windows directory. A refused line is reported in Events and the
+            remaining grants still apply — so a single bad entry never widens the
+            boundary and never breaks the run.
           </small>
         </section>
       {:else if activeSection === 'harness'}

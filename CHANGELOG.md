@@ -51,6 +51,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows directory are refused with an Events row, while the remaining grants
   still apply.
 
+## [0.53.0-rc.1] — 2026-08-19
+
+### Added
+
+- **V38 — unified tool registry + drop-in plugin framework.** Every tool cImp
+  can run now lives in one registry fed by definition-only plugin manifests
+  discovered from the exe-adjacent `plugins/` folder — no rebuild, ever.
+  Capability kinds (`audit`/`security` → SARIF findings, `check` → `run_check`
+  diagnostics, `command` → `run_command`) are orthogonal to user-facing
+  categories; identity is `name@version` with loud duplicate/conflict
+  rejection into a new `plugin` Events lane. Manifests declare their sandbox
+  needs (`runtime` profile, `required|optional|unsupported` posture, screened
+  `extra_grants` shown as permissions at enable time). The authoring contract
+  is `docs/TOOL-PLUGINS.md`, drift-tested against the code.
+- **The 14 built-in audit scanners are now plugins themselves** (embedded
+  `cimp-audit` manifests through the same loader), byte-match-proven against
+  pre-migration goldens; the hardcoded adapter/parser tier is deleted and one
+  parser layer serves both umbrellas. Settings migrate automatically
+  (schema v34); per-project binary paths live in a machine-global map — the
+  project overlay carries only declared variable values and CLI parameters,
+  screened as untrusted before they touch a command line.
+- **A starter pack of seven toolchain plugins ships next to the exe**: Java
+  (maven/gradle), Rust (cargo), .NET, Go, JS/TS (tsc/vitest/npm/node), Python
+  (pytest), and source control (git/svn) — 25 tools, inert until you set
+  their binary paths. Build/test checks gate on project markers
+  (`pom.xml` → maven, `build.gradle` → gradle).
+- **Tier-2 audit providers**: an audit plugin tool may be answered by a
+  configured MCP server (SARIF over `tools/call`) instead of a spawned
+  binary, riding V37's dispatch enforcement, SSRF screen and per-call
+  logging; a disabled server surfaces as a failed tool, never a clean scan.
+- **V37 follow-through**: a detection rules change now re-screens live MCP
+  surfaces (drop-only, no reconnect), and native tool-surface changes
+  (checks, plugin rescans) propagate to sessions via the same debounced
+  `tools/list_changed` pulse as MCP toggles.
+- New Settings → Tool Plugins pane: master-detail plugin management, per-tool
+  enables/paths/variables with explicit global-vs-project scope and revert,
+  category group toggles, permission summaries, and a Rescan action.
+
+### Fixed
+
+- A project-local `.cimp/config.json` can no longer influence machine-scope
+  tool state (enables/timeouts/paths) or feed MCP registry entries to the
+  offload worker — banned fields are stripped loudly on every settings read.
+- Windows checks with quote-heavy command lines no longer break under
+  `cmd.exe /C` quote-stripping (both the plain and sandboxed spawn paths).
+- `run_command` names an enabled-but-pathless registered tool honestly
+  instead of silently falling back to PATH resolution.
+
 ## [0.52.0-rc.9] — 2026-08-18
 
 ### Added

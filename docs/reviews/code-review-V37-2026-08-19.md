@@ -68,6 +68,37 @@ the running tab. Pinned by
 `spawn_inject_sig_tracks_spawn_time_settings`, which allows exactly `notify_hooks`
 to move there and nothing else.
 
+**F-V37-4 (MED) — CLOSED by the sandbox-grant fix.** Making the proxy child
+unconditional widened a pre-existing V33 Phase B gap. A sandboxed AI tab
+(`sandbox.tabs`, AppContainer) is granted the project root, its harness's own
+state and nothing else — so the `cimp --offload-mcp` child that every AI tab
+must now spawn could neither be launched (no grant on `cimp.exe`) nor find the
+app (no grant on the discovery data beside it, which is how it resolves the
+loopback port + token). Every sandboxed tab's MCP child would have failed:
+loudly, as a denial row, and still broken. **Decision: three file-scoped grants,
+never the exe directory.** `<exe-dir>` is cImp's portable root —
+`settings.json` with the app's auth tokens and API keys, `tool-activity.jsonl`,
+the detection stores — and V33's posture is that no secret cImp holds may reach
+a child, so the read+execute directory grant that would have been the one-line
+fix is refused. The tab gets `cimp.exe` (read+execute, FILE),
+`<exe-dir>/.cimp-offload.json` (read-only, FILE) and `<exe-dir>/.cimp-discovery/`
+(read-only, directory — discovery entries only). The discovery TOKEN is readable
+by design: it is the credential the child authenticates to its own app with, and
+every tab carrying this child has always read it. The rows are shared by both
+harness tables because the child is unconditional in both, and
+`the_proxy_child_gets_the_binary_and_its_discovery_and_nothing_wider` pins the
+three paths and widths *and* that the exe DIRECTORY, `settings.json` and
+`tool-activity.jsonl` are never rows. Two residuals are written into
+`sandbox::tabs::cimp_child_rows`: the legacy `.cimp-offload.json` row is
+optional, so a tab prepared before the app first wrote that file loses only the
+legacy fallback (the granted `.cimp-discovery/` entry is authoritative and its
+ACE is inheritable); and a sibling DLL imported at LOAD time would be unreadable
+for the same reason — the shipped layout has none (`DirectML.dll`, the one
+non-system load-time import, resolves from `System32`). Linux untouched: V33
+Phase D deliberately does not sandbox tabs there. No live-behavior change on this
+install — `sandbox.tabs` defaults OFF and protection is globally off — so this is
+correctness before anyone enables it, and item 13 below is its gate.
+
 ## Whole-run review (post-E)
 
 All seven seams PASS: pulse chain (no producer bypasses `run_pulse_gate`;
@@ -143,3 +174,9 @@ covers tool names + descriptions; input schemas out of scope (documented in
     server/category, `withheld` chip (not "Call failed").
 12. **Cadence edit live:** `mcp_health_interval_secs` 0 → checker silent;
     back to 5 → resumes next tick, no restart.
+13. **Sandboxed tab keeps its MCP child (F-V37-4):** with `sandbox.enabled` +
+    `sandbox.tabs` ON, a Claude tab and an OpenCode tab each still list the
+    `cimp-offload` tools and can call one; the Sandboxing lane shows the three
+    file-scoped grants (`cimp.exe`, `.cimp-offload.json`, `.cimp-discovery`) and
+    **no** grant row for the exe directory itself. Shares the V33 #72
+    live-verify session.

@@ -52,7 +52,12 @@ use super::toolclass::{self, Latch, Profile, ProxyGate, ToolClass, WriteTaint};
 /// Discovery-file name under the portable root (next to `settings.json`).
 /// Legacy single-instance location, still written for anything that only
 /// knows this path; the per-instance directory below is authoritative.
-const DISCOVERY_FILE: &str = ".cimp-offload.json";
+///
+/// `pub(crate)` so the sandbox grant table (`sandbox::tabs`) names the file the
+/// proxy child actually reads rather than a second spelling of it — a rename
+/// here would otherwise leave a sandboxed tab's child unable to find the app,
+/// with nothing but a denial row to say why.
+pub(crate) const DISCOVERY_FILE: &str = ".cimp-offload.json";
 
 /// Per-instance discovery DIRECTORY under the portable root: one
 /// `<pid>.json` per running instance, each carrying that instance's launch
@@ -60,7 +65,9 @@ const DISCOVERY_FILE: &str = ".cimp-offload.json";
 /// instances open a child spawned by project A's agent could connect to
 /// project B's app — and audits/graph queries would run against the WRONG
 /// project. Readers resolve root-aware via [`read_discovery_for`].
-const DISCOVERY_DIR: &str = ".cimp-discovery";
+///
+/// `pub(crate)` for the same reason as [`DISCOVERY_FILE`].
+pub(crate) const DISCOVERY_DIR: &str = ".cimp-discovery";
 
 /// Total wall-clock budget for ONE candidate's liveness probe ([`responds`]) —
 /// connect, write and read together, not per syscall.

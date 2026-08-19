@@ -1004,6 +1004,25 @@ fn validate_tool(t: &ToolManifest, provenance: Provenance) -> Result<(), Validat
                     t.id
                 )));
             }
+            // The command line must BEGIN with a plain program token, because
+            // that token is the placeholder cImp replaces with the binary the
+            // user configured (decision 7: a manifest never names an
+            // executable). A line starting with an `ENV=value` prefix, a
+            // pipeline, a redirection or a quoting oddity has nowhere to put
+            // the path — and refusing it HERE rather than at the first
+            // `run_check` call is the one-artifact-one-verdict rule this arm
+            // already applies to `cwd`/`report_file`: a plugin is authored once
+            // and read on every machine, so it must not load on one and fail
+            // mid-session on the next.
+            if crate::checks::split_first_shell_token(cmd).is_none() {
+                return Err(ValidationError::KindField(format!(
+                    "tool `{}`: `cmd` (`{cmd}`) must begin with a plain program name — cImp \
+                     replaces that first token with the binary path the user configures for this \
+                     tool, and a command line that starts with anything else (an `NAME=value` \
+                     prefix, a pipeline, a redirection) gives it nowhere to go",
+                    t.id
+                )));
+            }
             // `{var:NAME}` substitution applies to a check's command line too —
             // same token vocabulary, same undeclared-variable rule. `{report}`
             // has no meaning here (a check names its report file directly).
@@ -1564,6 +1583,54 @@ mod tests {
                 probe.validate().is_err(),
                 "`{abs}` is absolute to the manifest but not to CheckDef — the two \
                  verdicts have drifted apart"
+            );
+        }
+    }
+
+    /// V38 Phase D: a check's `cmd` must BEGIN with a plain program token,
+    /// because that token is the placeholder cImp replaces with the binary the
+    /// user configured (decision 7 — a manifest never names an executable).
+    /// Refused at LOAD, not at the first `run_check`: a plugin is authored once
+    /// and read on every machine, so one artifact gets one verdict.
+    #[test]
+    fn a_check_cmd_must_begin_with_a_program_token() {
+        // Swap the `cmd` VALUE, quotes and all, through serde's own escaper —
+        // a Windows path in a JSON string is backslashes, and hand-escaping it
+        // in a test fixture is how a test ends up asserting on a parse error.
+        let with_cmd = |cmd: &str| {
+            check_json().replace(
+                "\"acme build --json\"",
+                &serde_json::to_string(cmd).expect("escape"),
+            )
+        };
+        for bad in [
+            "FOO=bar acme build",   // an sh variable prefix — the program is the NEXT token
+            "| acme build",         // a pipeline
+            "> out.txt acme build", // a redirection
+            "(acme build)",         // a subshell
+            "\"unterminated acme",  // a quote with no partner
+        ] {
+            match err(&with_cmd(bad)) {
+                ValidationError::KindField(m) => {
+                    assert!(m.contains("plain program name"), "{bad}: {m}")
+                }
+                other => panic!("`{bad}` must be refused as a KindField, got {other:?}"),
+            }
+        }
+        // The shapes that DO name a program keep loading: a bare name, a quoted
+        // absolute path (spaces included), and a drive-less relative one.
+        for ok in [
+            "acme build --json",
+            "\"C:\\Program Files\\acme\\acme.exe\" build",
+            "./acme build",
+        ] {
+            assert!(
+                validate(
+                    &serde_json::from_str(&with_cmd(ok)).expect("json"),
+                    Provenance::User
+                )
+                .is_ok(),
+                "`{ok}` names a program and must load"
             );
         }
     }

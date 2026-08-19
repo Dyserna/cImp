@@ -394,6 +394,14 @@ export function formatCoverageLine(paths: readonly string[]): string {
 /// render that category's configured tool list from settings as idle chips (in
 /// canonical order, including disabled tools — spec). Once a scan of the
 /// category starts the backend's `tools` is authoritative and this is unused.
+///
+/// **V38: this is the LAST RESORT, not the pre-scan answer.** It knows only the
+/// built-in roster (`code_audit.tools`), so a plugin tool the user enabled and
+/// pointed at a binary is absent from it — exactly the residual Phase C left
+/// open. `audit_effective_roster` answers the same question with the registry
+/// joined in and `chipToolStates` prefers it; this stays for the moment before
+/// that IPC has answered (and if it ever fails), where showing the built-ins
+/// beats showing nothing.
 export function configuredToolStates(
   settings: CodeAuditSettings,
   category: AuditCategory,
@@ -417,17 +425,29 @@ export function configuredToolStates(
   return out;
 }
 
-/// The `category` tool states to render as chips: the snapshot's OWN
-/// (category-filtered) list once a scan of this category has produced one, else
-/// the configured fallback. A merged snapshot may carry both categories' tools
-/// (see `mergeAuditSnapshot`), so this always filters by category first.
+/// The `category` tool states to render as chips, in preference order:
+///
+/// 1. the snapshot's OWN (category-filtered) list, once a scan of this category
+///    has produced one — authoritative, it is what actually ran;
+/// 2. `roster`, the backend's `audit_effective_roster` answer — what a scan
+///    *would* run right now, built-ins **and** plugin tools;
+/// 3. `configuredToolStates`, the built-ins-only derivation, for the moment
+///    before the IPC answers.
+///
+/// A merged snapshot may carry both categories' tools (see
+/// `mergeAuditSnapshot`), so this always filters by category first. `roster` is
+/// likewise filtered rather than trusted: the panel holds one category and a
+/// stale answer for the other one must not leak into it.
 export function chipToolStates(
   snapshot: AuditSnapshot,
   settings: CodeAuditSettings,
   category: AuditCategory,
+  roster: readonly AuditToolState[] | null = null,
 ): AuditToolState[] {
   const own = snapshot.tools.filter((t) => t.category === category);
-  return own.length > 0 ? own : configuredToolStates(settings, category);
+  if (own.length > 0) return own;
+  const fromRoster = (roster ?? []).filter((t) => t.category === category);
+  return fromRoster.length > 0 ? fromRoster : configuredToolStates(settings, category);
 }
 
 /// The chip-visibility split for one tab. A tool is HIDDEN when it's

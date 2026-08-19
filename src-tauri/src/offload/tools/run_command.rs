@@ -5,8 +5,33 @@
 //! and — since V33 contract C2 — with an environment built up from an explicit
 //! allowlist ([`crate::sandbox::child_env::CHILD_ENV`]) rather than inherited
 //! from cImp.
+//!
+//! # V38 Phase D — a registered `command`-kind plugin tool is its own entry
+//!
+//! Design authority, "Registry semantics": *a `command`-kind registry entry
+//! (explicit path + enabled) BECOMES the allowlist entry and the path
+//! resolution, superseding a separate allowlist for registered tools.* So there
+//! are two ways a program may run here, and they answer different questions:
+//!
+//! | | who says it may run | which binary |
+//! |---|---|---|
+//! | allowlist | `command_allowlist` names the stem | PATH (`resolve_command`) |
+//! | registry | the tool is enabled AND has a path | that exact path |
+//!
+//! The registry arm is **narrower on both axes**, which is why it is allowed to
+//! supersede: enabling a plugin tool and pointing it at a binary is a stronger,
+//! more specific act than typing a name into a list, and it names the file
+//! rather than trusting whatever PATH resolves that name to today. Everything
+//! else is unchanged and applies to both: the bare-name guard, the
+//! [`CommandPolicy`] argv rules (policies are about ARGUMENTS, not about which
+//! file), the timeout, the caps, and the V33 sandbox.
+//!
+//! The registry is read at INVOCATION time (invariant 9) — not baked into
+//! [`ToolCtx`] — so enabling a tool or changing its path takes effect on the
+//! next call rather than on the next worker spawn.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -15,6 +40,9 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::offload::openai::ToolDef;
+use crate::plugins::manifest::ToolKind;
+use crate::plugins::posture::ToolPosture;
+use crate::plugins::registry::EffectiveTool;
 use crate::sandbox::child_env::minimal_env;
 use crate::settings::CommandPolicy;
 
@@ -64,6 +92,98 @@ pub fn def() -> ToolDef {
             "required": ["command"]
         }),
     )
+}
+
+/// The `command`-kind plugin tools this project may run, read LIVE.
+///
+/// Invariant 9: nothing about the registry is spawn-baked. `ToolCtx` carries a
+/// settings snapshot taken when the agent run started, which is the right shape
+/// for the allowlist (it is part of the run's policy) and the wrong one for a
+/// registry the user is editing in another window — enabling a tool would then
+/// take effect on the next worker spawn instead of the next call. So this reads
+/// the plugin set and the settings container here, at the invocation.
+///
+/// `cwd` keys the per-project binary-path map, exactly as the audit fan-out and
+/// the check seam do.
+fn registered_commands(cwd: &Path) -> Vec<EffectiveTool> {
+    let settings = crate::settings::load_readonly(cwd);
+    crate::plugins::registry::runnable_tools(
+        &crate::plugins::snapshot_or_scan(),
+        &settings.tool_plugins,
+        Some(cwd),
+    )
+    .into_iter()
+    .filter(|t| t.kind() == ToolKind::Command)
+    .collect()
+}
+
+/// How a requested program earned the right to run, and which file it is.
+#[derive(Debug)]
+enum Resolution {
+    /// A `command_allowlist` entry: resolved through PATH.
+    Allowlist,
+    /// A registered `command`-kind plugin tool: the configured path IS the
+    /// resolution (decision 7 — cImp never picks a plugin's binary).
+    Registered(Box<EffectiveTool>),
+}
+
+/// Match a requested program against the registered command tools, by the
+/// manifest's tool **id**, case-insensitively.
+///
+/// **Case-insensitively, and that is a Windows decision** made deliberately for
+/// both platforms: `is_allowed` has always matched the allowlist that way, the
+/// model is not the author of either name, and a `run_command{command:"Git"}`
+/// that ran under the allowlist but not under the registry would be a
+/// difference nobody could explain. Matching on the id rather than on the
+/// namespaced key keeps the model-facing vocabulary a bare program name, which
+/// is what the bare-name guard requires anyway.
+fn registered_match<'a>(command: &str, registered: &'a [EffectiveTool]) -> Option<&'a EffectiveTool> {
+    let stem = command_stem(command);
+    registered
+        .iter()
+        .find(|t| t.tool_id.eq_ignore_ascii_case(&stem) || t.tool_id.eq_ignore_ascii_case(command))
+}
+
+/// The admission decision, pure so every branch of it is assertable.
+///
+/// Order matters: the registry is consulted FIRST, because a registered entry
+/// is both the permission and the path, and falling through to the allowlist
+/// would resolve the same name through PATH — losing the one guarantee
+/// registration buys. A registry miss falls through to the pre-V38 behaviour
+/// unchanged.
+fn admit(
+    command: &str,
+    allowlist: &[String],
+    registered: &[EffectiveTool],
+) -> Result<Resolution, String> {
+    // "Disabled" now means BOTH surfaces are empty. An allowlist-less project
+    // with a registered command tool is configured, not disabled — the registry
+    // entry IS the allowlist entry.
+    if allowlist.is_empty() && registered.is_empty() {
+        return Err("run_command is disabled — no commands are allowlisted and no plugin \
+                    command tools are registered"
+            .into());
+    }
+    if !is_bare_command(command) {
+        return Err(format!(
+            "`{command}` must be a bare program name with no path — only allowlisted \
+             programs resolved through PATH may run"
+        ));
+    }
+    if let Some(tool) = registered_match(command, registered) {
+        return Ok(Resolution::Registered(Box::new(tool.clone())));
+    }
+    if !is_allowed(command, allowlist) {
+        // Name both surfaces, because "not allowlisted" alone reads as a wrong
+        // answer to a caller looking at a plugin tool it can see in Settings.
+        let mut allowed: Vec<String> = allowlist.to_vec();
+        allowed.extend(registered.iter().map(|t| t.tool_id.clone()));
+        return Err(format!(
+            "`{command}` is not allowlisted (allowed: {})",
+            allowed.join(", ")
+        ));
+    }
+    Ok(Resolution::Allowlist)
 }
 
 /// Match the requested program against the allowlist by its file-stem
@@ -240,23 +360,16 @@ fn apply_minimal_env(
 pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, String> {
     let args: Args =
         serde_json::from_value(args).map_err(|e| format!("invalid run_command args: {e}"))?;
-    if ctx.command_allowlist.is_empty() {
-        return Err("run_command is disabled — no commands are allowlisted".into());
-    }
-    if !is_bare_command(&args.command) {
-        return Err(format!(
-            "`{}` must be a bare program name with no path — only allowlisted \
-             programs resolved through PATH may run",
-            args.command
-        ));
-    }
-    if !is_allowed(&args.command, &ctx.command_allowlist) {
-        return Err(format!(
-            "`{}` is not allowlisted (allowed: {})",
-            args.command,
-            ctx.command_allowlist.join(", ")
-        ));
-    }
+    // The root is resolved FIRST now: it is both where the command runs and the
+    // key the registry's per-project binary paths are stored under, so the
+    // admission decision below needs it.
+    let cwd = ctx
+        .allowed_roots
+        .first()
+        .cloned()
+        .ok_or_else(|| "run_command has no allowed root to execute in".to_string())?;
+    let registered = registered_commands(&cwd);
+    let resolution = admit(&args.command, &ctx.command_allowlist, &registered)?;
     // Per-program security policy. The allowlist is the real boundary
     // (operators must only allowlist genuinely read-only programs), but some
     // allowlisted tools expose global flags/subcommands that turn them into
@@ -264,20 +377,73 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     // applicable `CommandPolicy` (visible/editable in Settings) names the
     // denied flags/subcommands; a program with no policy gets only the
     // allowlist + bare-name guard.
+    //
+    // V38: applied to a REGISTERED tool too, and matched by the same stem. A
+    // policy is a statement about a program's ARGUMENTS (`git --exec-path`,
+    // `cargo --config`), which does not stop being true because the user
+    // configured the binary's path through a plugin instead of typing its name
+    // into the allowlist.
     if let Some(reason) = dangerous_args(&args.command, &args.args, &ctx.command_policies) {
         return Err(reason);
     }
-    // Resolve through PATH so we spawn the operator's `git`, never a binary
-    // the model pointed us at (path components are already rejected above,
-    // but this also pins the result against a PATH/CWD-resolution surprise).
-    let program = crate::pty::resolve_command(&args.command)
-        .map_err(|_| format!("`{}` was not found on PATH", args.command))?;
-
-    let cwd = ctx
-        .allowed_roots
-        .first()
-        .cloned()
-        .ok_or_else(|| "run_command has no allowed root to execute in".to_string())?;
+    let program = match &resolution {
+        // Resolve through PATH so we spawn the operator's `git`, never a binary
+        // the model pointed us at (path components are already rejected above,
+        // but this also pins the result against a PATH/CWD-resolution surprise).
+        Resolution::Allowlist => crate::pty::resolve_command(&args.command)
+            .map_err(|_| format!("`{}` was not found on PATH", args.command))?,
+        // Decision 7: the user supplied this path, and cImp runs THAT file. No
+        // PATH search — the whole point of registering a tool is that the
+        // binary is named rather than looked up. Checked for existence here so
+        // a stale path reads as a configuration problem rather than as an
+        // opaque spawn error (the audit runner's `PathInvalid` chip, in the one
+        // shape this seam has for saying it).
+        Resolution::Registered(tool) => {
+            let path = PathBuf::from(tool.path.as_deref().unwrap_or_default());
+            if !path.is_file() {
+                return Err(format!(
+                    "`{}` is registered by the plugin tool `{}`, but its configured path does \
+                     not exist: {} — fix it in Settings → Tool Plugins",
+                    args.command,
+                    tool.tool_key,
+                    path.display()
+                ));
+            }
+            path
+        }
+    };
+    // V38: the manifest's sandbox posture for a registered tool; the historical
+    // one (infer, degrade loudly, widen nothing) for an allowlisted program,
+    // which declares nothing.
+    let posture = match &resolution {
+        Resolution::Allowlist => ToolPosture::default(),
+        Resolution::Registered(tool) => ToolPosture::resolve(
+            crate::sandbox::SEAM_RUN_COMMAND,
+            &cwd,
+            &ctx.sandbox,
+            tool.manifest.runtime,
+            tool.manifest.sandbox,
+            &tool.manifest.extra_grants,
+        ),
+    };
+    let subject = crate::sandbox::program_subject(&program);
+    crate::plugins::posture::runtime_canary(
+        crate::sandbox::SEAM_RUN_COMMAND,
+        &cwd,
+        &subject,
+        &posture.runtime,
+        &program,
+    );
+    // `unsupported` means the boundary is not ATTEMPTED — a disabled config is
+    // how that reaches `plan`, so nothing is stamped or mapped for a tool that
+    // declared it can use neither.
+    let unsupported = crate::plugins::posture::unsupported_cfg(
+        crate::sandbox::SEAM_RUN_COMMAND,
+        &cwd,
+        &subject,
+        posture.sandbox,
+    );
+    let sandbox_cfg = unsupported.as_ref().unwrap_or(&ctx.sandbox);
     // V33 Phase A: decide whether this child runs inside the OS sandbox before
     // building the plain command, because the sandboxed path is a different
     // spawn mechanism (a bespoke `CreateProcessW` — std/tokio cannot attach the
@@ -299,13 +465,19 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
     let plan = match tokio::time::timeout(
         PREPARE_BACKSTOP,
         crate::sandbox::plan(
-            &ctx.sandbox,
+            sandbox_cfg,
             crate::sandbox::SEAM_RUN_COMMAND,
             &program,
-            // Nothing extra: the model named the program, cImp resolved it, its
-            // install dir is granted by `prepare` itself, and everything it
-            // writes goes in the (already granted) root.
-            &crate::sandbox::GrantHints::default(),
+            // Nothing to infer: the model named the program, cImp resolved it,
+            // its install dir is granted by `prepare` itself, and everything it
+            // writes goes in the (already granted) root. V38 adds a registered
+            // tool's declared runtime profile and its screened `extra_grants`;
+            // both are empty for an allowlisted program.
+            &crate::sandbox::GrantHints {
+                runtime: posture.runtime.clone(),
+                rows: posture.rows.clone(),
+                ..Default::default()
+            },
             &cwd,
             &base_env,
         ),
@@ -355,14 +527,29 @@ pub async fn execute(args: serde_json::Value, ctx: &ToolCtx) -> Result<String, S
         .await;
     }
     if let crate::sandbox::Plan::Plain(reason) = &plan {
-        // Decision 5: degradation is loud, never silent. Deduplicated by reason
-        // per session inside `record_skip`, so this cannot flood its lane.
-        crate::sandbox::record_skip(
+        // V38: `required` means never run unprotected — including when the
+        // master switch is off. The command is simply not run, loudly, in both
+        // the lane and the result the model sees.
+        if let Some(refusal) = crate::plugins::posture::required_refusal(
             crate::sandbox::SEAM_RUN_COMMAND,
-            reason,
-            &crate::sandbox::program_subject(&program),
             &cwd,
-        );
+            &subject,
+            posture.sandbox,
+            reason,
+        ) {
+            return Err(refusal);
+        }
+        // Decision 5: degradation is loud, never silent. Deduplicated by reason
+        // per session inside `record_skip`, so this cannot flood its lane —
+        // except where `unsupported` already minted a more specific row.
+        if unsupported.is_none() {
+            crate::sandbox::record_skip(
+                crate::sandbox::SEAM_RUN_COMMAND,
+                reason,
+                &subject,
+                &cwd,
+            );
+        }
     }
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args.args)
@@ -823,6 +1010,119 @@ mod tests {
     #[test]
     fn empty_allowlist_denies() {
         assert!(!is_allowed("git", &[]));
+    }
+
+    // ── V38 Phase D: registered `command`-kind plugin tools ─────────────────
+
+    /// One plugin with a `command` tool, resolved through the real loader and
+    /// registry so these assertions run against the same join the live seam
+    /// uses — not against a hand-built struct that could drift from it.
+    fn registered_fixture(path: &str) -> (Vec<EffectiveTool>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cimp-runcmd-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "1.0.0",
+              "categories": [{ "id": "vcs", "label": "VCS", "tools": ["svn"] }],
+              "tools": [{ "id": "svn", "label": "Subversion", "kind": "command" }]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = crate::plugins::loader::scan_dir(&dir, crate::plugins::manifest::Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        cfg.global_paths
+            .insert("acme@1.0.0/svn".to_string(), path.to_string());
+        let tools = crate::plugins::registry::runnable_tools(&set, &cfg, None)
+            .into_iter()
+            .filter(|t| t.kind() == ToolKind::Command)
+            .collect();
+        (tools, dir)
+    }
+
+    /// The design authority's rule: **a registered entry IS the allowlist entry
+    /// and the path resolution.** With an EMPTY allowlist the tool still runs,
+    /// and it resolves to the configured file rather than to PATH.
+    #[test]
+    fn a_registered_command_runs_with_no_allowlist_at_all() {
+        let (registered, dir) = registered_fixture("C:\\tools\\svn.exe");
+        match admit("svn", &[], &registered).expect("a registered tool is admitted") {
+            Resolution::Registered(t) => {
+                assert_eq!(t.tool_key, "acme@1.0.0/svn");
+                assert_eq!(t.path.as_deref(), Some("C:\\tools\\svn.exe"));
+            }
+            Resolution::Allowlist => panic!("must resolve through the registry, not PATH"),
+        }
+        // …and the case-insensitive spelling matches too, like the allowlist's.
+        assert!(matches!(
+            admit("SVN.exe", &[], &registered),
+            Ok(Resolution::Registered(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A registry MISS falls through to the pre-V38 path unchanged: the
+    /// allowlist decides, and PATH resolves.
+    #[test]
+    fn a_registry_miss_falls_through_to_the_allowlist() {
+        let (registered, dir) = registered_fixture("C:\\tools\\svn.exe");
+        let allow = vec!["git".to_string()];
+        assert!(matches!(
+            admit("git", &allow, &registered),
+            Ok(Resolution::Allowlist)
+        ));
+        let err = admit("rm", &allow, &registered).expect_err("still denied");
+        assert!(err.contains("not allowlisted"), "{err}");
+        // The refusal names BOTH surfaces, so a caller looking at a plugin tool
+        // in Settings is not told a half-truth about what may run.
+        assert!(err.contains("git") && err.contains("svn"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Disabled" means both surfaces are empty. The wording has to stay honest
+    /// about that — an operator with a registered tool and no allowlist is
+    /// configured, not disabled.
+    #[test]
+    fn disabled_means_no_allowlist_and_no_registered_commands() {
+        let err = admit("git", &[], &[]).expect_err("nothing configured ⇒ disabled");
+        assert!(err.contains("disabled"), "{err}");
+        assert!(err.contains("plugin command tools"), "{err}");
+
+        let (registered, dir) = registered_fixture("C:\\tools\\svn.exe");
+        let err = admit("git", &[], &registered).expect_err("git is still not allowed");
+        assert!(!err.contains("disabled"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bare-name guard is NOT relaxed for a registered tool: the model
+    /// still cannot hand over a path. Registration decides which file runs;
+    /// the caller only names the tool.
+    #[test]
+    fn a_registered_tool_does_not_relax_the_bare_name_guard() {
+        let (registered, dir) = registered_fixture("C:\\tools\\svn.exe");
+        for spelling in ["C:\\evil\\svn.exe", "./svn", "..\\svn"] {
+            let err = admit(spelling, &[], &registered).expect_err("paths stay refused");
+            assert!(err.contains("bare program name"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `command_policy` is a statement about ARGUMENTS, so it survives the
+    /// registry arm untouched — `dangerous_args` matches by stem and never
+    /// looks at how the program was admitted.
+    #[test]
+    fn command_policies_still_apply_to_a_registered_tool() {
+        let policies = vec![CommandPolicy {
+            program: "svn".to_string(),
+            denied_flags: vec!["--config-dir".to_string()],
+            ..CommandPolicy::default()
+        }];
+        assert!(dangerous_args("svn", &["--config-dir".into(), "x".into()], &policies).is_some());
+        assert!(dangerous_args("svn", &["status".into()], &policies).is_none());
     }
 
     #[test]

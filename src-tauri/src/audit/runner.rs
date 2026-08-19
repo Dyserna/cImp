@@ -694,6 +694,50 @@ impl AuditState {
         self.snapshot()
     }
 
+    /// V38 Phase D: the tools a scan of `category` **would** run right now —
+    /// the built-in roster as configured, plus this project's runnable plugin
+    /// tools — as `idle` chips, so the Code Audit panel can render the real
+    /// roster BEFORE any scan has produced one.
+    ///
+    /// # Why this is an IPC and not more frontend logic
+    ///
+    /// The pre-scan chip list used to be derived in TypeScript from
+    /// `code_audit.tools`, which is the built-in roster and nothing else. After
+    /// Phase C a plugin tool therefore appeared only once a scan had started —
+    /// enabled, path-configured, and invisible until it ran. The join that
+    /// answers "what would run" (plugin set ⋈ user state ⋈ project ⋈ census)
+    /// exists exactly once, here on the Rust side; re-deriving half of it in the
+    /// browser is how the two lists start disagreeing.
+    ///
+    /// Read-only and cheap by construction: the CACHED census (never a walk —
+    /// `audit_refresh_census` owns that), the live settings snapshot, and the
+    /// in-memory registry join. Nothing is spawned, resolved or written.
+    ///
+    /// Built-ins are reported for every configured entry INCLUDING disabled ones
+    /// (the pre-V38 contract this replaces — the panel greys them). Plugin tools
+    /// are the runnable set: a plugin tool that is disabled or has no path is
+    /// configuration the Tool Plugins pane shows, not a chip promising a scan.
+    pub fn effective_roster(&self, category: Category) -> Vec<ToolState> {
+        let settings = self.settings.current();
+        let (root, block) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.root.clone(), inner.census.clone())
+        };
+        // An empty census means "not walked yet", not "this project has no
+        // languages" — `partitionChips` makes the same distinction, and gating
+        // on an unknown census would hide every language-specific tool on a cold
+        // tab.
+        let census_known = !(block.extensions.is_empty() && block.markers.is_empty());
+        let census = census::Census::from_block(&block.extensions, &block.markers);
+        plan_roster(
+            &settings.code_audit.tools,
+            &plugin_tools(&settings.tool_plugins, &root),
+            category,
+            &census,
+            census_known,
+        )
+    }
+
     /// Cancel the in-flight scan (kills running children). Errors if none.
     pub fn cancel_scan(&self) -> Result<(), String> {
         let cancel = self.inner.lock().unwrap().cancel.clone();
@@ -1600,6 +1644,63 @@ fn plan_plugin_scan(
         }
     }
     (chips, to_run)
+}
+
+/// V38 Phase D: the PRE-SCAN roster for one category — what a scan would run,
+/// as `idle` chips, before any scan has run.
+///
+/// Pure, and split out of [`AuditState::effective_roster`] for the reason
+/// [`plan_scan`] and [`plan_plugin_scan`] are free functions: the rule is
+/// assertable without a runner, an `AppHandle` or a settings file.
+///
+/// The two populations are treated differently, on purpose:
+///
+/// * **built-ins** are listed exactly as configured, disabled ones included —
+///   the pre-V38 contract this replaces (`configuredToolStates`), which the
+///   panel renders greyed. Applicability is left to the frontend, which has the
+///   built-in table and already applies it.
+/// * **plugin tools** are the RUNNABLE set (enabled ∩ path-configured): a plugin
+///   tool that is off or unconfigured is configuration the Tool Plugins pane
+///   shows, not a chip promising a scan. Their applicability lives in a manifest
+///   the frontend cannot read, so it is decided here — but only against a census
+///   that has actually been taken (`census_known`), because an unwalked project
+///   is unknown, not empty.
+fn plan_roster(
+    builtin: &[AuditToolConfig],
+    plugin_tools: &[crate::plugins::registry::EffectiveTool],
+    category: Category,
+    census: &census::Census,
+    census_known: bool,
+) -> Vec<ToolState> {
+    let mut out: Vec<ToolState> = builtin
+        .iter()
+        .filter(|t| adapters::adapter(t.id).category == category)
+        .map(|t| ToolState::idle(t.id, category))
+        .collect();
+
+    for tool in plugin_tools {
+        match RunnableAudit::from_effective(tool) {
+            // A `check`/`command`-kind tool: not an umbrella population.
+            Ok(None) => continue,
+            Ok(Some(runnable)) if runnable.category == category => {
+                out.push(if census_known && !runnable.applicable(census) {
+                    ToolState::skipped_not_applicable(runnable.key, category)
+                } else {
+                    ToolState::idle(runnable.key, category)
+                });
+            }
+            Ok(Some(_)) => continue,
+            // A tool that belongs to an umbrella and cannot run. Shown for the
+            // same reason `plan_plugin_scan` shows it during a scan: a
+            // configured capability must not be invisible.
+            Err(why) => out.push(ToolState::failed_to_plan(
+                ToolKey::Plugin(tool.tool_key.clone()),
+                category,
+                format!("this plugin tool cannot run: {why}"),
+            )),
+        }
+    }
+    out
 }
 
 /// A concise `failed` message for a tool-error exit, appending a short tail of
@@ -3035,6 +3136,88 @@ mod tests {
             );
         }
         crate::plugins::registry::runnable_tools(set, &cfg, None)
+    }
+
+    /// **The chip residual Phase C left open, closed.** The PRE-SCAN roster
+    /// carries the built-ins AND this project's runnable plugin tools, so a
+    /// plugin tool the user enabled and pointed at a binary is visible before
+    /// anything has run — not only once a scan starts.
+    #[test]
+    fn the_pre_scan_roster_shows_plugin_tools_beside_the_builtins() {
+        let (set, dir) = plugin_fixture();
+        let tools = effective(&set);
+        let builtin = crate::settings::default_audit_tools();
+
+        let roster = plan_roster(
+            &builtin,
+            &tools,
+            Category::Security,
+            &census::Census::default(),
+            false,
+        );
+        let ids: Vec<String> = roster.iter().map(|t| t.id.wire()).collect();
+        // The built-in security trio, then the plugin tools of that category.
+        assert!(ids.contains(&"gitleaks".to_string()));
+        assert!(ids.contains(&"acme@1.0.0/scan".to_string()));
+        assert!(ids.contains(&"acme@1.0.0/gitleaks".to_string()));
+        assert!(
+            roster.iter().all(|t| t.status == ToolStatus::Idle),
+            "a pre-scan roster promises nothing about outcomes"
+        );
+        assert!(
+            roster.iter().all(|t| t.category == Category::Security),
+            "one panel, one category"
+        );
+        // A `command`-kind tool is never an umbrella chip (Phase D's other half).
+        assert!(!ids.iter().any(|id| id.ends_with("/fmt")));
+
+        // A plugin tool's applicability lives in a manifest the frontend cannot
+        // read, so the BACKEND decides it — but only against a census that was
+        // actually taken. Unknown census ⇒ shown; known-and-not-matching ⇒
+        // already marked, so `partitionChips` hides it with no new rule.
+        let quality = |census: &census::Census, known| {
+            plan_roster(&builtin, &tools, Category::Quality, census, known)
+                .into_iter()
+                .find(|t| t.id.wire() == "acme@1.0.0/lint")
+                .expect("the java-gated tool is in the quality roster")
+                .status
+        };
+        assert_eq!(
+            quality(&census::Census::default(), false),
+            ToolStatus::Idle,
+            "an unwalked project is unknown, not empty"
+        );
+        assert_eq!(
+            quality(&census::Census::from_parts(&["rs"], &[]), true),
+            ToolStatus::SkippedNotApplicable
+        );
+        assert_eq!(
+            quality(&census::Census::from_parts(&["java"], &[]), true),
+            ToolStatus::Idle
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The built-in half of the roster is the pre-V38 contract, unchanged: every
+    /// configured entry of the category, DISABLED ones included (the panel greys
+    /// them), and untouched by whatever the plugin population does.
+    #[test]
+    fn the_roster_still_lists_disabled_builtins() {
+        let mut builtin = crate::settings::default_audit_tools();
+        for t in builtin.iter_mut() {
+            t.enabled = false;
+        }
+        let roster = plan_roster(
+            &builtin,
+            &[],
+            Category::Security,
+            &census::Census::default(),
+            true,
+        );
+        let ids: Vec<String> = roster.iter().map(|t| t.id.wire()).collect();
+        for id in ["osv-scanner", "gitleaks", "semgrep"] {
+            assert!(ids.contains(&id.to_string()), "{id} must still be listed");
+        }
     }
 
     /// The fan-out rule: this category's kind, gated by the SAME census test a

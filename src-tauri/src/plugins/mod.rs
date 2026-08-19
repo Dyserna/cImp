@@ -69,9 +69,49 @@ pub fn set_global(store: Arc<PluginStore>) {
 /// rather than with its first caller so the seam and its publish site are one
 /// reviewable pair — the `audit::GLOBAL` arrangement, whose consumers are the
 /// same ones Phase C/D brings here.
-#[allow(dead_code)]
 pub fn global() -> Option<Arc<PluginStore>> {
     GLOBAL.get().cloned()
+}
+
+/// The plugin set for a consumer that may not be running inside the app.
+///
+/// # Why this is not just [`global`]
+///
+/// `run_check` is dispatched from more than one PROCESS: the app (the Settings
+/// test button, the in-process offload worker) and — for every model-issued
+/// call — the `cimp --offload-mcp` child, a separate short-lived process that
+/// never runs `main.rs`'s setup and therefore never has a [`PluginStore`]
+/// published. Phase C never met this, because an audit scan always runs in the
+/// app. Left as `global()`, a plugin `check` would be invisible on the one leg
+/// the model actually uses: the tool would not be advertised, and naming it
+/// would answer "no configured check named …". A capability that exists in
+/// settings but not in the session is worse than one that does not exist.
+///
+/// So a store-less process scans once, lazily, and keeps the result for its own
+/// lifetime. Two deliberate differences from [`PluginStore::rescan`]:
+///
+/// * **no Events rows.** A stdio child has no lane to speak into, and the app's
+///   own startup scan already reported every rejection this scan would repeat.
+///   (The same reasoning `load_readonly` applies to its overlay-strip warning.)
+/// * **no rescan.** These processes are per-session and short-lived; `Rescan` is
+///   an app action, and a child that re-walked the directory mid-session could
+///   answer two different tool lists to two calls in one conversation.
+///
+/// In the app this IS `global()` — the managed store, read live, so a Rescan is
+/// picked up by the next invocation (invariant 9: nothing spawn-baked).
+pub fn snapshot_or_scan() -> Arc<PluginSet> {
+    if let Some(store) = global() {
+        return store.snapshot();
+    }
+    static LOCAL: OnceLock<Arc<PluginSet>> = OnceLock::new();
+    LOCAL
+        .get_or_init(|| {
+            Arc::new(match loader::plugins_dir() {
+                Some(dir) => loader::scan_dir(&dir, manifest::Provenance::User),
+                None => PluginSet::default(),
+            })
+        })
+        .clone()
 }
 
 // ---- IPC commands --------------------------------------------------------

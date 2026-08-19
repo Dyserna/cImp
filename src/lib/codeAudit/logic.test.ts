@@ -305,6 +305,59 @@ describe('configuredToolStates / chipToolStates', () => {
       'semgrep',
     ]);
   });
+
+  // ── V38: the effective roster is the pre-scan answer ──────────────────────
+
+  const roster: AuditToolState[] = [
+    tool({ id: 'osv-scanner', status: 'idle' }),
+    tool({ id: 'gitleaks', status: 'idle' }),
+    tool({ id: 'acme@1.0.0/scan', status: 'idle' }),
+    tool({ id: 'other@2.0.0/lint', status: 'idle', category: 'quality' }),
+  ];
+
+  test('a plugin tool shows in the PRE-SCAN chip list, from the backend roster', () => {
+    // The residual Phase C left open: derived from settings alone, a plugin
+    // tool the user had enabled and pointed at a binary was invisible until a
+    // scan started running it.
+    expect(configuredToolStates(settings, 'security').map((s) => s.id)).not.toContain(
+      'acme@1.0.0/scan',
+    );
+    expect(
+      chipToolStates(snapshot({ tools: [] }), settings, 'security', roster).map((s) => s.id),
+    ).toEqual(['osv-scanner', 'gitleaks', 'acme@1.0.0/scan']);
+  });
+
+  test('the roster is filtered by category and never outranks a real scan', () => {
+    // The other category's entry must not leak into this panel…
+    expect(
+      chipToolStates(snapshot({ tools: [] }), settings, 'security', roster).map((s) => s.id),
+    ).not.toContain('other@2.0.0/lint');
+    // …and once a scan has produced tools of this category, THEY are the truth.
+    expect(chipToolStates(FULL, settings, 'security', roster).map((s) => s.id)).toEqual([
+      'osv-scanner',
+      'gitleaks',
+      'semgrep',
+    ]);
+  });
+
+  test('an unanswered or empty roster falls back to the configured built-ins', () => {
+    for (const r of [null, [] as AuditToolState[]]) {
+      expect(
+        chipToolStates(snapshot({ tools: [] }), settings, 'security', r).map((s) => s.id),
+      ).toEqual(['osv-scanner', 'gitleaks', 'semgrep']);
+    }
+  });
+
+  test('a plugin tool the backend gated out is hidden by partitionChips', () => {
+    // Only the backend can evaluate a manifest's applicability gate, so a
+    // gated-out plugin tool arrives pre-decided as `skipped-not-applicable` —
+    // the same status the built-in population uses, so the existing partition
+    // needs no new rule for it.
+    const gated = [tool({ id: 'acme@1.0.0/scan', status: 'skipped-not-applicable' })];
+    const { visible, hiddenCount } = partitionChips(gated, { extensions: ['rs'], markers: [] });
+    expect(visible).toHaveLength(0);
+    expect(hiddenCount).toBe(1);
+  });
 });
 
 // ── event-merge reducer ──────────────────────────────────────────────────────

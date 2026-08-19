@@ -22,12 +22,19 @@
   import { revealTab } from './tabs/visibility';
   import { revealFileInGraph } from './graphReveal';
   import { loadViewString, saveViewString, loadViewSet, saveViewSet } from './viewSection';
-  import { auditStartScan, auditCancelScan, auditSnapshot, auditRefreshCensus } from './codeAudit/ipc';
+  import {
+    auditStartScan,
+    auditCancelScan,
+    auditSnapshot,
+    auditRefreshCensus,
+    auditEffectiveRoster,
+  } from './codeAudit/ipc';
   import type {
     AuditCategory,
     AuditSeverity,
     AuditSnapshot,
     AuditToolRef,
+    AuditToolState,
   } from './codeAudit/types';
   import {
     SEVERITIES,
@@ -78,6 +85,10 @@
 
   // ── Runtime state ───────────────────────────────────────────────────────
   let snapshot = $state<AuditSnapshot>(emptySnapshot());
+  // V38: the backend's answer to "what would a scan of this category run?" —
+  // built-ins AND plugin tools. `null` until the first `audit_effective_roster`
+  // returns; see `chipToolStates` for the fallback order.
+  let roster = $state<AuditToolState[] | null>(null);
   let scanError = $state<string | null>(null);
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -119,7 +130,7 @@
   });
   // Chips: this category's states (snapshot-own or configured fallback), then
   // split into visible / hidden-because-not-applicable.
-  const chipStates = $derived(chipToolStates(snapshot, $settings.code_audit, category));
+  const chipStates = $derived(chipToolStates(snapshot, $settings.code_audit, category, roster));
   const chipPartition = $derived(partitionChips(chipStates, snapshot.census));
   const toolToggleIds = $derived(chipPartition.visible.map((t) => t.id));
   // Scan-coverage is osv-scanner-only, and osv-scanner is Security-only (V23).
@@ -158,6 +169,26 @@
       }
     } catch {
       /* backend unavailable mid-teardown — keep what we have */
+    }
+    // V38: the PRE-SCAN roster (built-ins ∪ this project's runnable plugin
+    // tools). Pulled alongside every snapshot refresh, and deliberately AFTER
+    // the census one: the backend gates a plugin tool's chip on the census it
+    // has stored, so asking before `auditRefreshCensus` returns would answer
+    // against the previous walk. Cheap to re-ask (no walk, no resolution, no
+    // spawn) and it MUST be re-asked — enabling a plugin tool or setting its
+    // path happens in the Settings window, not here.
+    void pullRoster();
+  }
+
+  /// The effective roster for THIS panel's category, or `null` until the first
+  /// answer arrives — `chipToolStates` then falls back to the built-ins-only
+  /// derivation rather than rendering an empty chip row.
+  async function pullRoster(): Promise<void> {
+    try {
+      const next = await auditEffectiveRoster(category);
+      if (alive) roster = next;
+    } catch {
+      /* leave the previous answer (or the settings fallback) in place */
     }
   }
 

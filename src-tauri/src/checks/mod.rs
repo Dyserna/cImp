@@ -17,6 +17,10 @@ pub mod auto;
 pub mod detect;
 pub mod gitls;
 pub mod parsers;
+/// V38 Phase D: the `check`-kind tools an enabled plugin contributes, rendered
+/// into [`CheckDef`]s and joined with `settings.checks` into the one set
+/// `run_check` advertises, selects from and runs.
+pub mod plugin;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -396,6 +400,32 @@ pub async fn run(
     changed_only: bool,
     sandbox: &crate::sandbox::SandboxCfg,
 ) -> AppResult<CheckReport> {
+    run_with_posture(
+        root,
+        def,
+        changed_only,
+        sandbox,
+        &crate::plugins::posture::ToolPosture::default(),
+    )
+    .await
+}
+
+/// [`run`], plus the sandbox posture a **plugin** check declared.
+///
+/// V38 Phase D. A `check`-kind plugin tool carries `runtime` / `sandbox` /
+/// `extra_grants` exactly as an audit-kind one does, and those have to reach the
+/// spawn — but a *configured* check declares none of them and must keep its
+/// historical behaviour to the letter (infer the runtime, degrade loudly, widen
+/// nothing). So the posture is a parameter with a `Default` that IS that
+/// historical behaviour, and [`run`] passes it: every pre-V38 call site is
+/// unchanged, and the only way to get plugin semantics is to ask for them.
+pub async fn run_with_posture(
+    root: &Path,
+    def: &CheckDef,
+    changed_only: bool,
+    sandbox: &crate::sandbox::SandboxCfg,
+    posture: &crate::plugins::posture::ToolPosture,
+) -> AppResult<CheckReport> {
     def.validate()?;
     // **A relative root is never this project.** Every path below resolves
     // against it — the effective cwd the checker runs in, the confinement
@@ -437,6 +467,7 @@ pub async fn run(
         &def.env,
         timeout_secs,
         sandbox,
+        posture,
     )
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -791,9 +822,21 @@ async fn spawn_capture(
     env: &[(String, String)],
     timeout_secs: u64,
     sandbox: &crate::sandbox::SandboxCfg,
+    posture: &crate::plugins::posture::ToolPosture,
 ) -> AppResult<(Option<i32>, String, String, bool)> {
     let timeout = Duration::from_secs(timeout_secs);
     let subject = row_subject(name, cmd);
+    // V38: `sandbox: unsupported` means the boundary is not ATTEMPTED — a
+    // disabled config is how that reaches `plan`, so no ACE is stamped and no
+    // drive is mapped for a tool that declared it can use neither. `Default`
+    // posture (every configured check) never takes this branch.
+    let unsupported = crate::plugins::posture::unsupported_cfg(
+        crate::sandbox::SEAM_RUN_CHECK,
+        root,
+        &subject,
+        posture.sandbox,
+    );
+    let sandbox = unsupported.as_ref().unwrap_or(sandbox);
     // The program cImp actually spawns is the SHELL. Resolve it to an absolute
     // path for the sandbox's benefit (`prepare` grants the program's install
     // dir, and `CreateProcessW` gets no PATH search) — the plain path keeps
@@ -825,6 +868,22 @@ async fn spawn_capture(
     #[cfg_attr(not(windows), allow(unused_variables))]
     let program_hint: Option<PathBuf> = inferred.first().cloned();
 
+    // V38: the declaration ⇄ inference cross-check, on the program the command
+    // NAMES rather than on the shell — the shell is `cmd.exe` for every check,
+    // and a canary run against it would compare a manifest's `python` to
+    // System32 on every single check. `program_hint` is `None` when the sandbox
+    // is off (nothing was resolved) or when the line does not start with a plain
+    // program, and there is nothing to cross-check in either case.
+    if let Some(resolved) = program_hint.as_deref() {
+        crate::plugins::posture::runtime_canary(
+            crate::sandbox::SEAM_RUN_CHECK,
+            root,
+            &subject,
+            &posture.runtime,
+            resolved,
+        );
+    }
+
     let plan = match tokio::time::timeout(
         crate::sandbox::PREPARE_BACKSTOP,
         crate::sandbox::plan(
@@ -832,17 +891,20 @@ async fn spawn_capture(
             crate::sandbox::SEAM_RUN_CHECK,
             &shell,
             &crate::sandbox::GrantHints {
-                // A check's runtime is inferred from the program the command
-                // names — a `CheckDef` declares nothing about it.
-                runtime: crate::sandbox::RuntimeSelect::Infer,
+                // A configured check declares nothing about its runtime, so it
+                // is inferred from the program the command names
+                // (`ToolPosture::default()`). A PLUGIN check declares one, and a
+                // declaration cImp cannot infer is the whole reason the field
+                // exists.
+                runtime: posture.runtime.clone(),
                 programs: inferred,
                 // A check writes into the project root (already granted) or into
                 // its redirected TEMP on the mapped drive; nothing outside.
                 full_dirs: Vec::new(),
-                // No reviewed grant rows: this seam widens the boundary only by
-                // inferring the check command's own tool directory, above. The
-                // row table is V33 Phase B's per-harness state paths.
-                rows: Vec::new(),
+                // V38: a plugin manifest's screened `extra_grants`. Empty for a
+                // configured check, whose only widening is the tool directory
+                // inferred above.
+                rows: posture.rows.clone(),
             },
             root,
             &base_env,
@@ -892,9 +954,26 @@ async fn spawn_capture(
         .await;
     }
     if let crate::sandbox::Plan::Plain(reason) = &plan {
+        // V38: `required` means never run unprotected — including when the
+        // master switch is off, which is the case a plugin author cannot see and
+        // a user can. The check is simply missing from this run, loudly, in both
+        // the lane and the caller's error.
+        if let Some(refusal) = crate::plugins::posture::required_refusal(
+            crate::sandbox::SEAM_RUN_CHECK,
+            root,
+            &subject,
+            posture.sandbox,
+            reason,
+        ) {
+            return Err(AppError::Checks(refusal));
+        }
         // Decision 5: degradation is loud, never silent. Deduplicated by
-        // (seam, reason) per session inside `record_skip`.
-        crate::sandbox::record_skip(crate::sandbox::SEAM_RUN_CHECK, reason, &subject, root);
+        // (seam, reason) per session inside `record_skip` — except where
+        // `unsupported` already minted a more specific row, for which "off (user
+        // choice)" would be an outright wrong reason.
+        if unsupported.is_none() {
+            crate::sandbox::record_skip(crate::sandbox::SEAM_RUN_CHECK, reason, &subject, root);
+        }
     }
 
     let mut command = shell_command(cmd);
@@ -1142,7 +1221,13 @@ fn first_shell_token(cmd: &str) -> Option<String> {
 /// The offset is what lets [`sandboxed_raw_tail`] rewrite the program token
 /// without re-parsing (or re-quoting) the arguments behind it: the tail is
 /// `<new token>` + `&cmd[rest..]`, byte for byte.
-fn split_first_shell_token(cmd: &str) -> Option<(String, usize)> {
+///
+/// V38 gave it a second reader: [`plugin::inject_program`] performs exactly that
+/// rewrite on the plain path too (substituting the user-configured binary for a
+/// manifest's placeholder token), and `plugins::manifest` calls it at LOAD time
+/// so a `cmd` with nowhere to put a path is refused as an invalid manifest
+/// rather than as a mysterious run. One parser, three readers.
+pub(crate) fn split_first_shell_token(cmd: &str) -> Option<(String, usize)> {
     let lead = cmd.len() - cmd.trim_start().len();
     let trimmed = &cmd[lead..];
     if trimmed.is_empty() {
@@ -2295,6 +2380,7 @@ mod tests {
             // AppContainer would ACL-stamp real directories as a side effect of
             // running the suite (the `run_command` precedent).
             &crate::sandbox::SandboxCfg::disabled(),
+            &crate::plugins::posture::ToolPosture::default(),
         )
         .await
         .expect("spawn");

@@ -59,6 +59,27 @@ pub struct Census {
 }
 
 impl Census {
+    /// Rehydrate a census from the serialized census block a snapshot carries.
+    ///
+    /// V38 Phase D: `effective_roster` answers "would this tool run?" from the
+    /// census the LAST walk stored, without walking again. That is the same
+    /// applicability question `plan_scan` asks, so it must be asked OF A
+    /// `Census` rather than re-implemented against two string vectors.
+    ///
+    /// A marker string that is not one of [`MARKERS`] is dropped rather than
+    /// interned: the invariant `markers ⊆ MARKERS` is what makes the private
+    /// representation safe, and a block that has been through a snapshot is not
+    /// a reason to weaken it.
+    pub fn from_block(extensions: &[String], markers: &[String]) -> Census {
+        Census {
+            extensions: extensions.iter().cloned().collect(),
+            markers: markers
+                .iter()
+                .filter_map(|m| MARKERS.iter().find(|known| *known == m).copied())
+                .collect(),
+        }
+    }
+
     /// Whether a file with this (lowercase, dot-less) extension was seen.
     pub fn has_extension(&self, ext: &str) -> bool {
         self.extensions.contains(ext)

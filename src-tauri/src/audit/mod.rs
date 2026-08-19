@@ -324,6 +324,24 @@ pub fn audit_snapshot(state: State<'_, Arc<AuditState>>) -> AuditSnapshot {
     state.snapshot()
 }
 
+/// V38 Phase D: the tools a scan of `category` **would** run right now — the
+/// configured built-in roster plus this project's runnable plugin tools — as
+/// `idle` chips.
+///
+/// This is the Code Audit panel's PRE-SCAN chip list. Before V38 that list was
+/// derived in TypeScript from `code_audit.tools`, i.e. from the built-in roster
+/// alone, so a plugin tool the user had enabled and pointed at a binary stayed
+/// invisible until a scan started running it. Read-only and cheap: the CACHED
+/// census (never a walk — [`audit_refresh_census`] owns that), the live settings
+/// snapshot, and the in-memory registry join.
+#[tauri::command]
+pub fn audit_effective_roster(
+    state: State<'_, Arc<AuditState>>,
+    category: adapters::Category,
+) -> Vec<runner::ToolState> {
+    state.effective_roster(category)
+}
+
 /// Take (or reuse, ≤60s cache) the project's language census outside a scan,
 /// apply quality auto-selection when it's on, and return the full snapshot —
 /// so tab mount and the Settings section know applicability (chip gating,

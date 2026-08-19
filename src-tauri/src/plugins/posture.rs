@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use super::manifest::SandboxReq;
+use super::manifest::{RuntimeReq, SandboxReq};
 use crate::sandbox::{
     self, GrantAccess, GrantRow, GrantSource, RuntimeSelect, SandboxCfg, SkipReason,
 };
@@ -173,8 +173,110 @@ pub fn runtime_canary(
     }
 }
 
+/// A manifest's declared `runtime` as the sandbox's profile selection.
+///
+/// The one translation between the two vocabularies, so the audit runner, the
+/// check seam and the command seam cannot disagree about what `auto` means. The
+/// profile ids are the same strings on both sides, pinned by Phase A's
+/// `every_declared_runtime_names_a_real_sandbox_profile`.
+pub fn runtime_select(req: RuntimeReq) -> RuntimeSelect {
+    match req {
+        RuntimeReq::Auto => RuntimeSelect::Infer,
+        RuntimeReq::None => RuntimeSelect::None,
+        other => RuntimeSelect::Profile(other.as_str()),
+    }
+}
+
+/// Everything one plugin spawn asks of the OS boundary, resolved.
+///
+/// The `check`/`command` seams' counterpart to the audit runner's
+/// `SpawnPosture` (which additionally carries the report-file scratch
+/// directory — a fact only the audit transport has). Those two do not share a
+/// type because they do not share a field list; they share the four functions
+/// above, which is where the rules actually live.
+#[derive(Debug, Clone)]
+pub struct ToolPosture {
+    /// Which runtime profile's grants apply.
+    pub runtime: RuntimeSelect,
+    /// What to do when the boundary cannot be provided.
+    pub sandbox: SandboxReq,
+    /// Screened `extra_grants`.
+    pub rows: Vec<GrantRow>,
+}
+
+impl ToolPosture {
+    /// Resolve a manifest's three sandbox fields against a live seam.
+    ///
+    /// `boundary_expected` is `cfg.enabled && sandbox != unsupported` — computed
+    /// here from the [`SandboxCfg`] the caller is about to plan with, so the two
+    /// halves of B-C1's rule cannot drift apart.
+    pub fn resolve(
+        seam: &str,
+        root: &Path,
+        cfg: &SandboxCfg,
+        runtime: RuntimeReq,
+        sandbox: SandboxReq,
+        extra_grants: &[String],
+    ) -> Self {
+        let boundary_expected = cfg.enabled && sandbox != SandboxReq::Unsupported;
+        Self {
+            runtime: runtime_select(runtime),
+            sandbox,
+            rows: screen_extra_grants(seam, root, extra_grants, boundary_expected),
+        }
+    }
+}
+
+impl Default for ToolPosture {
+    /// The **non-plugin** answer: infer the runtime, degrade loudly, widen
+    /// nothing. Hand-written because [`SandboxReq`]'s own default is `Required`
+    /// — right for a manifest, where an author who has not thought about
+    /// confinement gets the safe answer, and wrong here, where "no manifest at
+    /// all" has always meant `optional`. A derived `Default` would retro-fit
+    /// "refuse to run unsandboxed" onto every configured check and every
+    /// allowlisted command, stopping both on a machine with the switch off.
+    fn default() -> Self {
+        Self {
+            runtime: RuntimeSelect::Infer,
+            sandbox: SandboxReq::Optional,
+            rows: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// `Default` must not inherit `SandboxReq::Required`.
+    #[test]
+    fn the_default_posture_is_the_pre_plugin_behaviour() {
+        let p = ToolPosture::default();
+        assert_eq!(p.sandbox, SandboxReq::Optional);
+        assert_eq!(p.runtime, RuntimeSelect::Infer);
+        assert!(p.rows.is_empty());
+        assert_eq!(
+            SandboxReq::default(),
+            SandboxReq::Required,
+            "a MANIFEST still defaults to required — the two defaults are deliberately different"
+        );
+    }
+
+    /// `auto` is inference, `none` is "static binary", anything else names a
+    /// profile — the same mapping the audit runner has always used.
+    #[test]
+    fn runtime_select_maps_the_manifest_vocabulary() {
+        assert_eq!(runtime_select(RuntimeReq::Auto), RuntimeSelect::Infer);
+        assert_eq!(runtime_select(RuntimeReq::None), RuntimeSelect::None);
+        assert_eq!(
+            runtime_select(RuntimeReq::Python),
+            RuntimeSelect::Profile("python")
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
     use super::*;
 
     /// A refused grant never becomes a row, whether or not a boundary is being

@@ -219,14 +219,12 @@ impl RunnableAudit {
     }
 
     /// Which sandbox runtime profile this tool's grants come from.
+    ///
+    /// Delegated to `plugins::posture` since Phase D: three seams translate this
+    /// vocabulary now, and one of them disagreeing about what `auto` means would
+    /// be a boundary difference nobody could see.
     pub fn runtime_select(&self) -> crate::sandbox::RuntimeSelect {
-        match self.runtime {
-            RuntimeReq::Auto => crate::sandbox::RuntimeSelect::Infer,
-            RuntimeReq::None => crate::sandbox::RuntimeSelect::None,
-            // The ids are the same strings on both sides, pinned by Phase A's
-            // `every_declared_runtime_names_a_real_sandbox_profile`.
-            other => crate::sandbox::RuntimeSelect::Profile(other.as_str()),
-        }
+        crate::plugins::posture::runtime_select(self.runtime)
     }
 }
 

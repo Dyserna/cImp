@@ -603,6 +603,74 @@ mod tests {
         assert_eq!(plugin.builtin(), None);
     }
 
+    /// The join, end to end: kind decides the umbrella, the registry's layered
+    /// variables reach argv, and the user's parameters are APPENDED after the
+    /// template — the `extra_args` contract, unchanged.
+    #[test]
+    fn from_effective_maps_the_registry_entry_onto_a_runnable_tool() {
+        let dir = std::env::temp_dir().join(format!("cimp-runnable-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("acme.json"),
+            r#"{
+              "manifest_version": 1,
+              "name": "acme",
+              "version": "2.0.0",
+              "categories": [{ "id": "q", "label": "Quality", "tools": ["lint"] }],
+              "tools": [{
+                "id": "lint", "label": "Acme Lint", "kind": "audit",
+                "argv": ["--rules", "{var:ruleset}", "{root}"],
+                "variables": [{ "name": "ruleset", "label": "Ruleset", "default": "p/default" }],
+                "parameters_allowed": true,
+                "findings_exit_codes": [1, 2],
+                "timeout_secs": 300
+              }]
+            }"#,
+        )
+        .expect("write manifest");
+        let set = crate::plugins::loader::scan_dir(&dir, Provenance::User);
+        assert!(set.errors.is_empty(), "{:?}", set.errors);
+
+        let mut cfg = crate::settings::ToolPluginsSettings::default();
+        cfg.global_paths
+            .insert("acme@2.0.0/lint".to_string(), r"C:\bin\acme.exe".to_string());
+        cfg.plugins.insert(
+            "acme@2.0.0".to_string(),
+            crate::settings::PluginState {
+                enabled: true,
+                tools: std::collections::BTreeMap::from([(
+                    "lint".to_string(),
+                    crate::settings::ToolState {
+                        variables: std::collections::BTreeMap::from([(
+                            "ruleset".to_string(),
+                            "p/ci".to_string(),
+                        )]),
+                        parameters: vec!["--exclude".into(), "vendor".into()],
+                        ..Default::default()
+                    },
+                )]),
+            },
+        );
+        let tools = crate::plugins::registry::runnable_tools(&set, &cfg, None);
+        let runnable = RunnableAudit::from_effective(&tools[0])
+            .expect("a valid audit tool")
+            .expect("an umbrella tool");
+
+        assert_eq!(runnable.category, Category::Quality, "audit kind ⇒ Quality");
+        assert_eq!(runnable.key.wire(), "acme@2.0.0/lint");
+        assert_eq!(runnable.program, r"C:\bin\acme.exe");
+        assert_eq!(runnable.timeout_secs, Some(300));
+        assert_eq!(runnable.findings_exit_codes, vec![1, 2]);
+        assert_eq!(runnable.parser, AuditParser::Sarif);
+        assert_eq!(runnable.transport, Transport::Stdout);
+        assert_eq!(
+            runnable.full_argv(Path::new(r"C:\proj"), None),
+            vec!["--rules", "p/ci", r"C:\proj", "--exclude", "vendor"],
+            "the user's value substitutes, and parameters land AFTER the template"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A manifest naming a diagnostics parser on a findings tool is refused,
     /// not defaulted: the wrong decoder returns zero findings, which is
     /// indistinguishable from a clean scan.

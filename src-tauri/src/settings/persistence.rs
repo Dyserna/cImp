@@ -3586,6 +3586,38 @@ mod tests {
         assert_eq!(clean, serde_json::json!({ "ui": { "theme": "tui" } }));
     }
 
+    /// **The two settings readers must strip the overlay the same way**
+    /// (V38 Phase D).
+    ///
+    /// `run_check` is answered from more than one PROCESS: the app (through
+    /// [`load`]) and the `cimp --offload-mcp` child (through [`load_readonly`]).
+    /// Both resolve the same effective check set through `checks::plugin`, and
+    /// a plugin check's command line is rendered from its declared variable
+    /// values — which ride the project overlay. If one reader applied a
+    /// different rule to `tool_plugins`, the same check would run with this
+    /// project's values on one leg and the machine's on the other, with nothing
+    /// anywhere to notice. They stay identical by calling ONE function; this
+    /// pins that they still do, at the only level a test can see it without a
+    /// real global settings file on disk.
+    ///
+    /// Newline-agnostic: CI checks this tree out with CRLF.
+    #[test]
+    fn both_settings_readers_strip_the_overlay_through_the_same_function() {
+        let src = include_str!("persistence.rs");
+        for sig in ["pub fn load(", "pub fn load_readonly("] {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
+            let body = &src[start..];
+            let end = body.find("\n}").unwrap_or(body.len());
+            assert!(
+                body[..end].contains("strip_overlay_tool_plugins"),
+                "`{sig}` must strip the overlay's machine-scope `tool_plugins` fields through \
+                 the shared allow-list — a second rule here is two answers to one question"
+            );
+        }
+    }
+
     /// Phase B review, **B-1**: the strip's allow-list covers SHAPE, and the
     /// claim is not about the strip function — it is about what a hostile
     /// `.cimp/config.json` can do to the answers a pipeline reads.

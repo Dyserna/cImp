@@ -5579,7 +5579,7 @@ mod tests {
     /// file (`src-tauri/src/settings/`), up to the repo root.
     const AUDIT_TS_TYPES: &str = include_str!("../../../src/lib/settings/types.ts");
 
-    /// The eleven audit-tool wire ids the FRONTEND still keys off, and the
+    /// The fourteen audit-tool wire ids the FRONTEND still keys off, and the
     /// mirror that keeps them true.
     ///
     /// V38 Phase E deleted `AuditToolId`: the fourteen built-in tools are

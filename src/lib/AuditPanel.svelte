@@ -87,7 +87,7 @@
   let snapshot = $state<AuditSnapshot>(emptySnapshot());
   // V38: the backend's answer to "what would a scan of this category run?" —
   // built-ins AND plugin tools. `null` until the first `audit_effective_roster`
-  // returns; see `chipToolStates` for the fallback order.
+  // returns; `chipToolStates` prefers a scan's own tools and falls back to this.
   let roster = $state<AuditToolState[] | null>(null);
   let scanError = $state<string | null>(null);
   let copied = $state(false);
@@ -181,14 +181,16 @@
   }
 
   /// The effective roster for THIS panel's category, or `null` until the first
-  /// answer arrives — `chipToolStates` then falls back to the built-ins-only
-  /// derivation rather than rendering an empty chip row.
+  /// answer arrives. `chipToolStates` prefers a scan's own tool list and uses
+  /// this only when there is none; there is no third source since V38 Phase E
+  /// deleted the settings-derived built-ins list, so until this answers the
+  /// idle chip row is empty rather than a roster the backend never confirmed.
   async function pullRoster(): Promise<void> {
     try {
       const next = await auditEffectiveRoster(category);
       if (alive) roster = next;
     } catch {
-      /* leave the previous answer (or the settings fallback) in place */
+      /* leave the previous answer in place — an empty row beats a wrong one */
     }
   }
 

@@ -105,10 +105,12 @@ export const AUDIT_TOOL_APPLICABILITY: Record<
   'semgrep-quality': { extensions: [], markers: [] },
 };
 
-/// The quality tools whose FACTORY default is disabled (mirror of
-/// `default_audit_tools()` in Rust `settings/schema.rs` — `dotnet-analyzers`
-/// runs a real build, `semgrep-quality` downloads network rulesets). Quality
-/// auto-selection keeps these opt-in even when applicable.
+/// The quality tools whose FACTORY default is disabled (mirror of the
+/// `enabled_by_default: false` tools in the embedded manifest,
+/// `src-tauri/src/plugins/builtin/cimp-audit.json` — `dotnet-analyzers` runs a
+/// real build, `semgrep-quality` downloads network rulesets; pinned Rust-side
+/// by `the_heavyweight_tools_stay_opt_in`). Quality auto-selection keeps these
+/// opt-in even when applicable.
 export const AUDIT_TOOL_DEFAULT_OFF: ReadonlySet<AuditToolId> = new Set([
   'dotnet-analyzers',
   'semgrep-quality',

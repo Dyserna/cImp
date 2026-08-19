@@ -764,8 +764,10 @@ fn strip_overlay_banned(v: &mut Value) {
 /// `sandbox` is in [`OVERLAY_BANNED_KEYS`], so [`save`]'s diff can never carry
 /// it into a project overlay — which would leave a Settings-window edit with
 /// nowhere to land if this did not exist. Same pattern as
-/// [`sync_audit_paths_into`]: the pure half, so the caller decides whether the
-/// physical file is worth rewriting.
+/// [`sync_tool_plugin_state_into`]: the pure half, so the caller decides
+/// whether the physical file is worth rewriting. (It used to name
+/// `sync_audit_paths_into`, which V38 Phase E deleted along with the per-tool
+/// array it split.)
 ///
 /// Whole-block, not per-field: every field of `SandboxSettings` is the same
 /// scope (what the OS enforces on this machine), and a per-field copy would be

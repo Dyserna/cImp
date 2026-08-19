@@ -192,8 +192,14 @@ soon as third parties write tools (people write scanners in Python and Node).
    boolean:** that shape carries no actionable information (it never says
    *which* runtime), it can contradict a sibling field, and it mis-classifies a
    real third case — a project-local tool (eslint, knip resolving from
-   `node_modules/.bin`) is runtime-dependent yet needs no grant at all, because
+   `node_modules/.bin`) is runtime-dependent yet needs almost no grant, because
    its payload already lives inside the project root the sandbox grants.
+   *(Corrected 2026-08-19 against what Phase E shipped, per the E-gate's
+   code-over-doc ruling 3: eslint and knip declare `runtime: node`, not
+   `runtime: none`. The payload is inside the root, but the `.bin` entry is a
+   shim that re-enters the Node install tree — declaring `none` breaks them
+   under the sandbox. The third case is real and the field still expresses it;
+   what it buys is a SMALLER grant set, not the absence of one.)*
 2. **`sandbox: required | optional | unsupported`** — a DIFFERENT question:
    not what the tool needs, but what cImp does when it cannot provide it.
    `unsupported` runs the tool outside the boundary as an informed user choice

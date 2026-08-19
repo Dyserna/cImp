@@ -12,7 +12,8 @@ propagation, and screening).
 ## Motivation
 
 Every tool cImp can run is hardcoded twice over: the audit/security roster is
-15 `static Adapter` consts (`src-tauri/src/audit/adapters.rs`) with a
+14 `static Adapter` consts (`src-tauri/src/audit/adapters.rs` — the design said
+15; the implementation survey counted them) with a
 hand-written parser each (`audit/parsers.rs`), per-tool settings baked into
 the versioned schema (`settings/schema.rs`, `src/lib/settings/codeAudit.ts`),
 and the MCP surface fanned out over that fixed roster (`audit/mcp.rs`). Adding

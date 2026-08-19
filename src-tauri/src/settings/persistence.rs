@@ -325,6 +325,14 @@ pub fn load_readonly(launch_cwd: &Path) -> Settings {
         // this very file. No Events row — a lightweight subprocess has no lane
         // to speak into, and the app's own `load` already reported it.
         let _ = strip_overlay_tool_plugins(&mut overlay);
+        // V37 registry, same reason and the SAME asymmetry made explicit: `load`
+        // promotes an overlay's servers/categories into the global baseline and
+        // then enforces the global arrays over the merged view, so an overlay
+        // holds no registry authority there. This reader does neither, so it
+        // removes the keys outright — see the block comment above
+        // `promote_overlay_mcp_registry` for why removal and not
+        // `strip_mcp_registry`.
+        let _ = strip_overlay_mcp_registry(&mut overlay);
         deep_merge(&mut merged, overlay);
     }
     serde_json::from_value(merged).unwrap_or_default()
@@ -1296,9 +1304,31 @@ fn strip_offload_templates(v: &mut Value) {
 // `OffloadSettings::any_claude_mcp`), and per-project variation is
 // `mcp_activation`'s job.
 //
-// `load_readonly` stays exempt, like its two precedents: the MCP child reads
-// `mcp_servers` only to render a tool-count phrase in the `offload_task`
-// description, and the app's own `load` heals the overlay on first launch.
+// `load_readonly` is NOT exempt, and that is the one place this differs from
+// its two precedents (V38 merge review; the gap is pre-existing on develop and
+// was surfaced by the V37 -> V38 merge). `load` promotes and then ENFORCES, so
+// an overlay's registry never reaches the app's merged view. `load_readonly`
+// does neither, so until this fix a project `.cimp/config.json` carrying
+// `offload.mcp_servers` / `mcp_categories` / `mcp_activation` deep-merged
+// straight into every read-only consumer — the `cimp --offload-mcp` child and
+// `run_command`'s settings read. That is an ENABLE/ACTIVATION WIDENING toward
+// the offload child (an overlay-declared server joins the pool the child
+// describes, and its URL joins `outbound::EndpointAllowlist`, which is built
+// from `offload.mcp_servers`), reachable by anything that can write inside the
+// project root. It is not code execution and is not claimed as such.
+//
+// The fix is a KEY REMOVAL on the overlay value before the merge, deliberately
+// NOT `strip_mcp_registry`: that one is the SAVE-side diff normalizer and
+// INSERTS empty arrays, which under `deep_merge`'s replace-arrays-wholesale
+// rule would erase the global registry rather than ignore the overlay's.
+//
+// `mcp_activation` goes too, even though `load` legitimately keeps it
+// per-project: nothing behind `load_readonly` reads it. The child's registry
+// consumers are `tool_scope_summary` (a tool-count phrase built from
+// `mcp_servers`) and the SSRF endpoint allowlist; activation is resolved
+// in-app, by `offload::mcp_host::effective_enable` over the live `load`
+// snapshot. A per-project surface with no reader on this leg is a widening
+// vector with no upside.
 
 /// LOAD step 1: promote a legacy overlay's servers and categories into the
 /// global baseline, keyed by name (a name already present globally wins).
@@ -1381,6 +1411,30 @@ fn sync_mcp_registry_into(disk_global: &mut Settings, current: &Settings) -> boo
         changed = true;
     }
     changed
+}
+
+/// LOAD step, read-only readers only: **remove** the registry keys from an
+/// overlay value before it is merged.
+///
+/// Removal, not replacement. [`strip_mcp_registry`] is the save-side normalizer
+/// and writes `[]` into both keys; running it on an overlay would hand
+/// `deep_merge` an explicit empty array, and `deep_merge` replaces arrays
+/// wholesale — so the global registry would be ERASED for the child rather than
+/// merely un-widened. Two functions with one name-shape, two jobs; this is the
+/// load-side one.
+///
+/// Returns the keys that were actually present, for tests and for a caller that
+/// wants to say so. [`load_readonly`] discards it: a lightweight subprocess has
+/// no Events lane, and the app's own [`load`] already promotes and reports.
+fn strip_overlay_mcp_registry(v: &mut Value) -> Vec<String> {
+    const KEYS: [&str; 3] = ["mcp_servers", "mcp_categories", "mcp_activation"];
+    let Some(off) = v.get_mut("offload").and_then(Value::as_object_mut) else {
+        return Vec::new();
+    };
+    KEYS.iter()
+        .filter(|k| off.remove(**k).is_some())
+        .map(|k| format!("offload.{k}"))
+        .collect()
 }
 
 /// SAVE step 2: empty both registry arrays on a diff side so the overlay never
@@ -3600,22 +3654,161 @@ mod tests {
     /// pins that they still do, at the only level a test can see it without a
     /// real global settings file on disk.
     ///
+    /// The same claim covers the V37 **MCP registry** (V38 merge review). The
+    /// two readers do not handle it identically and must not: `load` promotes
+    /// an overlay's servers/categories into the global baseline and then
+    /// enforces the global arrays over the merged view, healing the file on the
+    /// way; `load_readonly` has no side effects to heal with, so it removes the
+    /// keys. What is pinned here is that NEITHER reader simply merges them —
+    /// the state this test was written against, in which a project overlay's
+    /// `offload.mcp_servers` reached the `cimp --offload-mcp` child untouched.
+    ///
     /// Newline-agnostic: CI checks this tree out with CRLF.
     #[test]
     fn both_settings_readers_strip_the_overlay_through_the_same_function() {
         let src = include_str!("persistence.rs");
-        for sig in ["pub fn load(", "pub fn load_readonly("] {
+        // (signature, what its body must name)
+        let required: [(&str, &[&str]); 2] = [
+            (
+                "pub fn load(",
+                &[
+                    "strip_overlay_tool_plugins",
+                    "promote_overlay_mcp_registry",
+                    "enforce_global_mcp_registry",
+                ],
+            ),
+            (
+                "pub fn load_readonly(",
+                &["strip_overlay_tool_plugins", "strip_overlay_mcp_registry"],
+            ),
+        ];
+        for (sig, needles) in required {
             let start = src
                 .find(sig)
                 .unwrap_or_else(|| panic!("`{sig}` is gone — re-point this test"));
             let body = &src[start..];
             let end = body.find("\n}").unwrap_or(body.len());
-            assert!(
-                body[..end].contains("strip_overlay_tool_plugins"),
-                "`{sig}` must strip the overlay's machine-scope `tool_plugins` fields through \
-                 the shared allow-list — a second rule here is two answers to one question"
-            );
+            let body = &body[..end];
+            for needle in needles {
+                assert!(
+                    body.contains(needle),
+                    "`{sig}` must name `{needle}`: the machine-scope blocks (`tool_plugins`, the \
+                     MCP registry) are never authority an overlay can carry, and a reader that \
+                     merged one of them straight through would answer differently from the other"
+                );
+            }
         }
+        // The load-side removal must never be the SAVE-side normalizer: that
+        // one INSERTS `[]`, and `deep_merge` replaces arrays wholesale.
+        let start = src.find("pub fn load_readonly(").unwrap();
+        let body = &src[start..];
+        let end = body.find("\n}").unwrap_or(body.len());
+        assert!(
+            !body[..end].contains("strip_mcp_registry(&mut overlay)"),
+            "`load_readonly` must REMOVE the registry keys, not normalize them to `[]` — an \
+             empty array in the overlay would erase the global registry through the merge"
+        );
+    }
+
+    /// **A project overlay's MCP registry cannot reach a read-only snapshot**
+    /// (V38 merge review; the gap is pre-existing on develop).
+    ///
+    /// Driven through the real steps [`load_readonly`] performs on the values
+    /// it has — global to `Value`, strip the overlay, `deep_merge`,
+    /// deserialize — rather than through the function itself, which reads the
+    /// machine's real global settings path. Same shape as
+    /// `a_hostile_overlay_shape_cannot_re_enable_a_disabled_plugin_tool`, and
+    /// for the same reason: what is asserted is what a pipeline READS, not what
+    /// a helper returns.
+    #[test]
+    fn an_overlay_mcp_registry_cannot_reach_a_read_only_snapshot() {
+        let mut global = Settings::default();
+        global.offload.mcp_servers = vec![McpServerConfig {
+            name: "ddg".to_string(),
+            ..McpServerConfig::default()
+        }];
+        global.offload.mcp_categories = vec![McpCategory {
+            name: "research".to_string(),
+            ..McpCategory::default()
+        }];
+        let mut merged = serde_json::to_value(&global).unwrap();
+
+        // What anything running inside the project root can write.
+        let mut overlay: Value = serde_json::json!({
+            "offload": {
+                "mcp_servers": [{ "name": "attacker", "url": "http://127.0.0.1:9/" }],
+                "mcp_categories": [{ "name": "smuggled" }],
+                "mcp_activation": { "servers": { "ddg": false } },
+                // A legitimately per-project neighbour, to prove the removal is
+                // keyed and not a wholesale drop of the `offload` block.
+                "enabled": true
+            }
+        });
+        let removed = strip_overlay_mcp_registry(&mut overlay);
+        assert_eq!(
+            removed,
+            vec![
+                "offload.mcp_servers".to_string(),
+                "offload.mcp_categories".to_string(),
+                "offload.mcp_activation".to_string(),
+            ]
+        );
+        deep_merge(&mut merged, overlay);
+        let out: Settings = serde_json::from_value(merged).unwrap();
+
+        let names: Vec<&str> = out
+            .offload
+            .mcp_servers
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["ddg"],
+            "an overlay-declared server must not join the pool the offload child describes, \
+             nor the SSRF endpoint allowlist built from this array"
+        );
+        let cats: Vec<&str> = out
+            .offload
+            .mcp_categories
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(cats, vec!["research"]);
+        assert!(
+            out.offload.mcp_activation.servers.is_empty(),
+            "activation is resolved in-app; nothing behind this reader reads it, so an overlay \
+             may not set it here either"
+        );
+        assert!(
+            out.offload.enabled,
+            "a non-registry `offload` key still merges"
+        );
+    }
+
+    /// The trap the fix was ordered around: reusing the SAVE-side normalizer on
+    /// an overlay would not un-widen the registry, it would ERASE it — because
+    /// `deep_merge` replaces arrays wholesale, and `strip_mcp_registry` inserts
+    /// `[]` rather than removing the key.
+    #[test]
+    fn the_save_side_normalizer_would_erase_the_global_registry_on_the_load_side() {
+        let mut global = Settings::default();
+        global.offload.mcp_servers = vec![McpServerConfig {
+            name: "ddg".to_string(),
+            ..McpServerConfig::default()
+        }];
+        let mut merged = serde_json::to_value(&global).unwrap();
+        let mut overlay: Value = serde_json::json!({
+            "offload": { "mcp_servers": [{ "name": "attacker" }] }
+        });
+        strip_mcp_registry(&mut overlay); // the WRONG function on this side
+        deep_merge(&mut merged, overlay);
+        let out: Settings = serde_json::from_value(merged).unwrap();
+        assert!(
+            out.offload.mcp_servers.is_empty(),
+            "this is why `load_readonly` removes the keys instead: normalizing them to `[]` \
+             hands the merge an explicit empty array and the machine's registry is gone"
+        );
     }
 
     /// Phase B review, **B-1**: the strip's allow-list covers SHAPE, and the

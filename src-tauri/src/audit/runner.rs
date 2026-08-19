@@ -1263,7 +1263,7 @@ async fn read_sarif(transport: Transport, stdout: &str, report: Option<&Path>) -
 /// "report lost" guard fires only for a *findings exit code* whose output didn't
 /// parse — never for a clean exit, whose empty output is a legitimate clean bill.
 #[allow(clippy::too_many_arguments)]
-fn finalize_outcome(
+pub(super) fn finalize_outcome(
     id: AuditToolId,
     adapter: &Adapter,
     outcome: Outcome,
@@ -1759,7 +1759,7 @@ fn record_audit_run(name: &str, root: &Path, findings: usize, ms: u64, ok: bool)
 // ── child spawn + capture ──────────────────────────────────────────────────
 
 /// How a captured child ended.
-enum Outcome {
+pub(super) enum Outcome {
     /// Exited on its own; `Option<i32>` is the exit code.
     Exited(Option<i32>),
     /// Exceeded the per-tool wall clock (child killed).

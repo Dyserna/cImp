@@ -12,6 +12,11 @@
 
 pub mod adapters;
 pub mod census;
+/// V38 Phase E — the pre-migration byte-match golden for the fourteen built-in
+/// tools. Test-only: it exists to prove that turning the adapter table into
+/// embedded manifests changed nothing observable.
+#[cfg(test)]
+mod golden;
 pub mod mcp;
 pub mod parsers;
 pub mod runnable;

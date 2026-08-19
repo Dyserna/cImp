@@ -3,12 +3,13 @@
 //!
 //! Design authority: `docs/MILESTONE-V38-tool-plugin-framework.md`.
 //!
-//! **Phase C is where a plugin first RUNS.** Manifests are found, parsed,
-//! validated, identified, made visible (A), joined with the user's configuration
-//! (B), and — for the `audit`/`security` kinds — fanned out under the two
-//! umbrellas beside the built-in scanners (C). `check` and `command` kinds are
-//! still inert until Phase D. The surface a model sees stays byte-for-byte
-//! unchanged throughout (decision 5): what plugins change is what the fan-out
+//! **Phase C is where a plugin first RUNS; Phase D is where all four kinds do.**
+//! Manifests are found, parsed, validated, identified, made visible (A), joined
+//! with the user's configuration (B), fanned out under the two audit umbrellas
+//! beside the built-in scanners (C), and — for the `check` and `command` kinds —
+//! offered to `run_check` and `run_command` (D). The surface a model sees stays
+//! byte-for-byte unchanged throughout (decision 5) except for `run_check`'s
+//! already-project-scoped `name` enum: what plugins change is what a pipeline
 //! runs, never the tool schema.
 //!
 //! Layout:
@@ -18,10 +19,13 @@
 //! * [`events`] — the `plugin` Events lane's row builders.
 //! * [`registry`] — Phase B's join of manifests, user state and the open
 //!   project into the one answer a pipeline needs.
+//! * [`posture`] — the manifest's sandbox fields, applied identically at every
+//!   seam that spawns a plugin tool.
 
 pub mod events;
 pub mod loader;
 pub mod manifest;
+pub mod posture;
 /// The manifest ⋈ user-state ⋈ project join.
 ///
 /// Phase C is the first consumer: the audit fan-out reads `runnable_tools` for

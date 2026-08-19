@@ -813,7 +813,7 @@ pub async fn prepare(
     // seam and a root to record against.
     for extra in &cfg.extra_grant_dirs {
         if let Some(why) = super::extra_grant_refusal_live(extra) {
-            super::record_grant_refused(seam, root, extra, why);
+            super::record_grant_refused(seam, root, extra, why, super::GrantSource::Settings);
         }
     }
     let grants = grant_list(cfg, program, hints, root, &|p| p.exists());

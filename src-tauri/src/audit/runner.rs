@@ -1043,57 +1043,27 @@ impl AuditState {
         let argv = tool.full_argv(&root, report_path.as_deref());
         let full_dirs = sandbox_full_dirs(tool.transport, report_path.as_deref());
 
-        // The manifest's `extra_grants`, screened by the SAME rules a settings
-        // grant row gets. A refused path is dropped with its own row and the
-        // run continues — a bad grant must not brick a tool, and it must not
-        // silently widen the boundary either.
+        // The manifest's sandbox posture, resolved by the rules every plugin
+        // seam shares (`plugins::posture`) rather than by a copy that lives
+        // here: Phase D gave `run_check` and `run_command` the same three
+        // fields, and three spellings of "what `required` means" is three
+        // chances for one of them to mean something else.
+        //
+        // `boundary_expected` is B-C1: a refusal row promises "this path was not
+        // granted, every other grant was", which is false when nothing is being
+        // granted at all. Screening still happens — a refused path never reaches
+        // a `GrantRow` — only the row is withheld.
         let seam = crate::sandbox::audit_seam(&subject);
-        let mut rows = Vec::new();
-        for grant in &tool.extra_grants {
-            let path = PathBuf::from(grant);
-            match crate::sandbox::extra_grant_refusal_live(&path) {
-                Some(why) => crate::sandbox::record_grant_refused(&seam, &root, &path, why),
-                None => rows.push(crate::sandbox::GrantRow {
-                    path,
-                    // READ+EXECUTE, never full: `extra_grants` exists for a tool
-                    // that must READ something no profile covers (a rules tree,
-                    // a runtime image). The two places a tool legitimately
-                    // WRITES are already granted — the project root and, for a
-                    // report-file tool, cImp's own report directory — so a write
-                    // ACE here would only ever widen the boundary past what the
-                    // field is for.
-                    access: crate::sandbox::GrantAccess::ReadExecute,
-                    is_file: false,
-                    reason: "requested by a tool plugin's manifest (`extra_grants`) and granted \
-                             by enabling that tool — shown as a permission where it is enabled",
-                    // Absent is not fatal: a manifest is written once for many
-                    // machines, and refusing to sandbox a tool because an
-                    // optional rules directory is missing punishes a fine
-                    // machine.
-                    required: false,
-                }),
-            }
-        }
-
-        // The declaration/inference cross-check. cImp runs with what the
-        // manifest DECLARED — inference cannot know a runtime it has never met —
-        // and records the disagreement rather than silently trusting either
-        // side.
         let select = tool.runtime_select();
-        if let crate::sandbox::RuntimeSelect::Profile(declared) = select {
-            let lookup = |k: &str| std::env::var_os(k);
-            let is_dir = |d: &Path| d.is_dir();
-            let machine = crate::sandbox::Machine {
-                env: &lookup,
-                is_dir: &is_dir,
-            };
-            let inferred = crate::sandbox::inferred_runtime_ids(&resolved, &machine);
-            if !inferred.is_empty() && !inferred.contains(&declared) {
-                crate::sandbox::record_runtime_mismatch(
-                    &seam, &root, &subject, declared, &inferred,
-                );
-            }
-        }
+        let boundary_expected =
+            sandbox.enabled && tool.sandbox != crate::plugins::manifest::SandboxReq::Unsupported;
+        let rows = crate::plugins::posture::screen_extra_grants(
+            &seam,
+            &root,
+            &tool.extra_grants,
+            boundary_expected,
+        );
+        crate::plugins::posture::runtime_canary(&seam, &root, &subject, &select, &resolved);
 
         let cap = spawn_and_capture(
             &resolved,
@@ -1780,22 +1750,16 @@ async fn spawn_and_capture(
     // (the process group, the caps, the drains, the kill-tree, the Linux denial
     // classifier) is what running a scanner means, and a tool that declared
     // itself unsandboxable must still get all of it.
-    let declared_unsupported = posture.sandbox_req == SandboxReq::Unsupported;
-    if declared_unsupported {
-        crate::sandbox::record_declared_unsandboxed(&seam, root, &subject);
-    }
+    //
     // …and a disabled config is how that is expressed to the layer below:
     // `plan` prepares NOTHING for it, so no ACE is stamped and no drive is
     // mapped for a tool that declared it cannot use either. Passing the real
     // config and discarding the plan would make the same run, plus durable
     // changes to the user's machine on a tool's behalf.
-    let unsupported_cfg;
-    let sandbox = if declared_unsupported {
-        unsupported_cfg = crate::sandbox::SandboxCfg::disabled();
-        &unsupported_cfg
-    } else {
-        sandbox
-    };
+    let declared_unsupported = posture.sandbox_req == SandboxReq::Unsupported;
+    let unsupported_cfg =
+        crate::plugins::posture::unsupported_cfg(&seam, root, &subject, posture.sandbox_req);
+    let sandbox = unsupported_cfg.as_ref().unwrap_or(sandbox);
 
     // Only composed when the sandbox is on — `plan` discards it otherwise, and
     // the plain path below keeps its historical inherit-and-force environment.
@@ -1875,22 +1839,18 @@ async fn spawn_and_capture(
         // user can. A manifest that says "this tool must be confined" is not
         // overridden by a global preference; the tool is simply missing from
         // this scan, loudly, in both the lane and its own chip.
-        if posture.sandbox_req == SandboxReq::Required {
-            let why = match reason {
-                crate::sandbox::SkipReason::OffUser => {
-                    "OS sandboxing is switched off in cImp settings".to_string()
-                }
-                crate::sandbox::SkipReason::Unavailable(r) => r.clone(),
-            };
-            crate::sandbox::record_sandbox_required_refusal(&seam, root, &subject, &why);
+        if let Some(refusal) = crate::plugins::posture::required_refusal(
+            &seam,
+            root,
+            &subject,
+            posture.sandbox_req,
+            reason,
+        ) {
             return Capture {
                 stdout: String::new(),
                 stdout_truncated: false,
                 stderr: String::new(),
-                outcome: Outcome::SpawnError(format!(
-                    "not run: this tool's manifest declares `sandbox: required` and the OS \
-                     sandbox could not be provided — {why} (see the sandbox lane)"
-                )),
+                outcome: Outcome::SpawnError(refusal),
             };
         }
         // Decision 5: degradation is loud, never silent — except where a more

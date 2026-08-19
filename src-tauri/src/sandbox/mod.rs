@@ -1302,11 +1302,26 @@ pub fn record_runtime_mismatch(
         root,
         "runtime-mismatch",
         state_target("runtime mismatch", subject),
-        format!(
-            "the manifest declares the `{declared}` runtime; detection recognizes `{seen}` behind              this program. cImp ran with the DECLARED profile — a declaration is the author's              statement and inference cannot know a runtime it has never met — but the two              disagreeing is drift: either the manifest names the wrong runtime, or the tool's              layout changed under it. If the tool then fails to start, this is the first row to              read."
-        ),
+        runtime_mismatch_body(declared, &seen),
         false,
     );
+}
+
+/// The row text [`record_runtime_mismatch`] writes.
+///
+/// A function rather than an inline `format!` for the reason
+/// [`grant_refused_body`] states: these bodies are user-visible prose, and
+/// prose nothing can read back is prose nothing can check
+/// (`row_texts_read_as_sentences`).
+fn runtime_mismatch_body(declared: &str, seen: &str) -> String {
+    format!(
+        "the manifest declares the `{declared}` runtime; detection recognizes `{seen}` behind \
+         this program. cImp ran with the DECLARED profile — a declaration is the author's \
+         statement and inference cannot know a runtime it has never met — but the two \
+         disagreeing is drift: either the manifest names the wrong runtime, or the tool's \
+         layout changed under it. If the tool then fails to start, this is the first row to \
+         read."
+    )
 }
 
 /// Record that a tool ran OUTSIDE the boundary because its manifest declares
@@ -1337,11 +1352,19 @@ pub fn record_declared_unsandboxed(seam: &str, root: &Path, subject: &str) {
         root,
         "unsandboxed",
         state_target("declared unsupported", subject),
-        format!(
-            "{subject} ran OUTSIDE the OS sandbox because its plugin manifest declares              `sandbox: unsupported` — the boundary was not attempted, whether or not it was              available. That declaration is shown as a permission where the tool is enabled;              disabling the tool is the way to withdraw it."
-        ),
+        declared_unsandboxed_body(subject),
         false,
     );
+}
+
+/// The row text [`record_declared_unsandboxed`] writes.
+fn declared_unsandboxed_body(subject: &str) -> String {
+    format!(
+        "{subject} ran OUTSIDE the OS sandbox because its plugin manifest declares \
+         `sandbox: unsupported` — the boundary was not attempted, whether or not it was \
+         available. That declaration is shown as a permission where the tool is enabled; \
+         disabling the tool is the way to withdraw it."
+    )
 }
 
 /// Record that a tool was NOT RUN because its manifest declares
@@ -1369,11 +1392,19 @@ pub fn record_sandbox_required_refusal(seam: &str, root: &Path, subject: &str, w
         root,
         "refused",
         state_target("refused (sandbox required)", subject),
-        format!(
-            "{subject} was NOT run: its plugin manifest declares `sandbox: required`, and the OS              boundary could not be provided here — {why}. Running it anyway would have delivered              findings from a tool the manifest says must never run unprotected, which is a worse              outcome than this tool being missing from the report."
-        ),
+        sandbox_required_refusal_body(subject, why),
         false,
     );
+}
+
+/// The row text [`record_sandbox_required_refusal`] writes.
+fn sandbox_required_refusal_body(subject: &str, why: &str) -> String {
+    format!(
+        "{subject} was NOT run: its plugin manifest declares `sandbox: required`, and the OS \
+         boundary could not be provided here — {why}. Running it anyway would have delivered \
+         findings from a tool the manifest says must never run unprotected, which is a worse \
+         outcome than this tool being missing from the report."
+    )
 }
 
 /// One shape of directory that `sandbox.extra_grant_dirs` is **not** allowed to
@@ -1548,18 +1579,56 @@ fn ends_with(comps: &[String], suffix: &[&str]) -> bool {
             .all(|(a, b)| a == b)
 }
 
-/// Record one refused `extra_grant_dirs` row — once per (seam, path) per
-/// session, because the row is re-read on every spawn and a line per spawn
-/// would push the rest of this lane out of its retention window.
+/// Where a refused grant was ASKED FOR — the fact the refusal row has to carry
+/// if the reader is to have anywhere to go and fix it.
 ///
-/// `ok = false`: a settings row that cannot be honored is a state the user has
-/// to fix, not a choice they made.
+/// V38 Phase C gave [`GrantRow`] a second population (a tool plugin manifest's
+/// `extra_grants`) and kept one row text, which then told every reader of a
+/// manifest-sourced refusal that the path "is listed in
+/// `sandbox.extra_grant_dirs`" — sending them to hunt for a settings entry that
+/// does not exist. The two sources are fixed at the call site and cannot be
+/// re-derived from a path, so they travel with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-pub fn record_grant_refused(seam: &str, root: &Path, path: &Path, why: &str) {
+pub enum GrantSource {
+    /// A `sandbox.extra_grant_dirs` row in cImp's own settings — the user typed
+    /// it, and the user is the one who can remove it.
+    Settings,
+    /// A tool plugin manifest's `extra_grants` entry (V38). The user consented
+    /// to it by enabling the tool; the *author* is who would narrow it.
+    Manifest,
+}
+
+/// Record one refused grant row — once per (seam, source, path) per session,
+/// because the row is re-read on every spawn and a line per spawn would push
+/// the rest of this lane out of its retention window.
+///
+/// `ok = false`: a grant that cannot be honored is a state someone has to fix,
+/// not a choice they made.
+///
+/// **Only call this when a boundary is actually being prepared.** A refusal row
+/// promises "this path was not granted, everything else was" — which is true
+/// inside `prepare` and false when the sandbox is off or the tool declared
+/// `sandbox: unsupported`, where NOTHING is granted because there is no
+/// container, and the child can read the refused directory freely. Screening
+/// the list there is still right (a refused path must never reach a
+/// [`GrantRow`]); saying so in the lane is not, and the honest row for that run
+/// is the unsandboxed/skip one its seam already mints.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn record_grant_refused(
+    seam: &str,
+    root: &Path,
+    path: &Path,
+    why: &str,
+    source: GrantSource,
+) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static EMITTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    let key = format!("{seam}|{}", path.display());
+    // The source is part of the key: the same directory refused from both a
+    // settings row and a manifest is two different things to fix, and deduping
+    // them together would silence whichever arrived second.
+    let key = format!("{seam}|{source:?}|{}", path.display());
     if let Ok(mut guard) = EMITTED.lock() {
         let set = guard.get_or_insert_with(HashSet::new);
         if !set.insert(key) {
@@ -1571,15 +1640,36 @@ pub fn record_grant_refused(seam: &str, root: &Path, path: &Path, why: &str) {
         root,
         "grant-refused",
         state_target("grant refused", &path.display().to_string()),
-        format!(
+        grant_refused_body(source, path, why),
+        false,
+    );
+}
+
+/// The row text [`record_grant_refused`] writes, per source.
+///
+/// Pure and named so the prose is testable. A user-visible sentence assembled
+/// inline inside a `format!` argument list is a sentence no test ever reads,
+/// which is how three of these shipped with fourteen-space gaps mid-clause
+/// (Phase C review, B-C3) — `row_texts_read_as_sentences` now reads all four.
+fn grant_refused_body(source: GrantSource, path: &Path, why: &str) -> String {
+    match source {
+        GrantSource::Settings => format!(
             "`{}` is listed in sandbox.extra_grant_dirs and was NOT granted: {why}. Nothing was \
              written to that directory's ACL. Every other grant was applied and the run \
              continued — one unusable settings row does not switch the boundary off. If a tool \
              genuinely needs something in there, name the narrower directory it actually reads.",
             path.display()
         ),
-        false,
-    );
+        GrantSource::Manifest => format!(
+            "`{}` is requested by a tool plugin manifest's `extra_grants` and was NOT granted: \
+             {why}. Nothing was written to that directory's ACL. Every other grant was applied \
+             and the tool still ran — one refused grant does not switch the boundary off. This \
+             is NOT a cImp settings row: it comes from the plugin's definition file, so the fix \
+             is either the plugin naming the narrower directory it actually reads, or disabling \
+             the tool in Settings → Tool Plugins.",
+            path.display()
+        ),
+    }
 }
 
 /// What a seam needs granted **beyond** what [`plan`] infers from the spawned
@@ -2546,6 +2636,59 @@ mod tests {
             SkipReason::OffUser.label(),
             SkipReason::Unavailable("x".into()).label()
         );
+    }
+
+    /// **The Events lane is prose, and prose is a contract too** (Phase C
+    /// review, B-C3). Three V38 row texts shipped with fourteen-space runs
+    /// mid-clause, because a single-line `format!` string literal indented to
+    /// match its call site keeps every one of those spaces. Nothing read them
+    /// back, so nothing noticed.
+    ///
+    /// This reads all four bodies and asserts they are sentences: no run of
+    /// three or more spaces, no embedded newline, and a real ending. It is the
+    /// consumer that makes the wording a checked signal rather than a hope.
+    #[test]
+    fn row_texts_read_as_sentences() {
+        let p = Path::new("C:\\Users\\x\\.ssh");
+        let bodies = [
+            runtime_mismatch_body("python", "node, rust"),
+            declared_unsandboxed_body("acme@1.0.0/scan"),
+            sandbox_required_refusal_body("acme@1.0.0/scan", "the sandbox is off"),
+            grant_refused_body(GrantSource::Settings, p, "an SSH key store"),
+            grant_refused_body(GrantSource::Manifest, p, "an SSH key store"),
+        ];
+        for body in &bodies {
+            assert!(
+                !body.contains("   "),
+                "a user-visible row must not carry a run of spaces: {body}"
+            );
+            assert!(!body.contains('\n'), "one row, one line: {body}");
+            assert!(body.ends_with('.'), "a row text is a sentence: {body}");
+        }
+    }
+
+    /// The two grant sources say DIFFERENT things about where to go and fix it.
+    /// A manifest-sourced refusal that named `sandbox.extra_grant_dirs` sent the
+    /// reader hunting for a settings entry that does not exist (B-C1).
+    #[test]
+    fn a_manifest_grant_refusal_does_not_blame_settings() {
+        let p = Path::new("C:\\Users\\x\\.aws");
+        let from_manifest = grant_refused_body(GrantSource::Manifest, p, "AWS credentials");
+        assert!(
+            !from_manifest.contains("is listed in sandbox.extra_grant_dirs"),
+            "{from_manifest}"
+        );
+        assert!(from_manifest.contains("extra_grants"), "{from_manifest}");
+        assert!(from_manifest.contains("Tool Plugins"), "{from_manifest}");
+
+        // …and the settings wording is unchanged, which is what keeps the
+        // pre-V38 row identical for the population that always had it.
+        let from_settings = grant_refused_body(GrantSource::Settings, p, "AWS credentials");
+        assert!(
+            from_settings.contains("is listed in sandbox.extra_grant_dirs"),
+            "{from_settings}"
+        );
+        assert!(!from_settings.contains("Tool Plugins"), "{from_settings}");
     }
 
     /// Decision 17, as a test rather than a comment: the master switch governs

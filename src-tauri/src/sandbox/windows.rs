@@ -876,7 +876,7 @@ fn prepare_blocking(
     // because one unusable settings row must not brick the sandbox.
     for extra in &cfg.extra_grant_dirs {
         if let Some(why) = super::extra_grant_refusal_live(extra) {
-            super::record_grant_refused(seam, root, extra, why);
+            super::record_grant_refused(seam, root, extra, why, super::GrantSource::Settings);
             continue;
         }
         if grant_dir(extra, container.as_psid(), RX)? {

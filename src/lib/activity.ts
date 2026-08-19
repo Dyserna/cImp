@@ -96,6 +96,21 @@ export interface ActivityEntry {
   /// questions — V32's screens say a model was refused something, this says
   /// the OS boundary was or was not in place — and because it carries its own
   /// retention lane (`SANDBOX_CAP` backend-side).
+  ///
+  /// `plugin` = one V38 tool-plugin DISCOVERY fact: a manifest that failed to
+  /// load (with its reason), an identity conflict naming both offending files,
+  /// or a scan summary. Its own kind, and its own retention lane (`PLUGIN_CAP`
+  /// backend-side), because these rows are about definitions rather than about
+  /// anything that ran — and because they are minted in a burst at startup or
+  /// on a manual Rescan, which is precisely the rare-and-explanatory shape the
+  /// chatty feeds would evict. Each of them is paired with an error state in
+  /// the Tool Plugins settings section (Phase B): visible where it happened AND
+  /// where it gets fixed.
+  ///
+  /// It adds no `RowStatus` word on purpose. A plugin row has exactly two
+  /// outcomes — the definition loaded, or it did not — so `ok`/`failed` say it
+  /// exactly, and inventing a synonym would dilute a vocabulary whose whole
+  /// value is that each word means one thing (see `RowStatus`).
   kind:
     | 'graph'
     | 'offload'
@@ -103,7 +118,8 @@ export interface ActivityEntry {
     | 'audit'
     | 'mcp'
     | 'injection_flag'
-    | 'sandbox';
+    | 'sandbox'
+    | 'plugin';
   /// The project this row belongs to, canonicalized backend-side
   /// (`activity::root_key`). Lets a per-project consumer filter out other
   /// projects' activity.

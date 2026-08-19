@@ -556,6 +556,10 @@
       }
       return e.ms > 0 ? dur : '';
     }
+    // Plugin discovery rows carry no payload either (`chars` is structurally 0
+    // — see the column conventions in src-tauri/src/plugins/events.rs), and only
+    // the per-scan summary has a duration worth printing.
+    if (e.kind === 'plugin') return e.ms > 0 ? dur : '';
     return `${dur} · ${fmtTok(e.chars)} chars`;
   }
 
@@ -1218,6 +1222,13 @@
      rows report the state of a boundary, not a blocked call. */
   .ekind.sandbox {
     color: var(--warning, #f0a020);
+  }
+  /* V38 tool-plugin discovery rows: teal-leaning info, unfilled. These report
+     on DEFINITIONS rather than on anything that ran, so they must not borrow
+     either the graph blue (a tool call) or the warning tone the sandbox rows
+     use for a boundary fact. */
+  .ekind.plugin {
+    color: color-mix(in srgb, var(--text-info, #58a6ff) 60%, var(--accent-purple, #d2a8ff));
   }
   /* Synthetic checkpoint rows (#51): teal, so they read as neither the graph
      blue nor the offload green next to them. */

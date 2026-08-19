@@ -504,3 +504,41 @@ describe('rowStatus — sandbox', () => {
     expect(new Set(words).size).toBe(words.length);
   });
 });
+
+// ── plugin discovery rows (V38 Phase A) ───────────────────────────────────
+//
+// This lane deliberately adds NO new status word: a plugin definition either
+// loaded or it did not, and `ok`/`failed` say that exactly. What it must not do
+// is fall into any of the words that carry a security claim — a rejected
+// manifest is a malformed FILE, not a blocked call.
+
+/// One `plugin` row. `tool` is the verb (`rejected` / `conflict` / `rescan`).
+function plug(tool: string, ok: boolean, over: Partial<ActivityEntry> = {}): ActivityEntry {
+  return entry(1, { kind: 'plugin', source: 'acme@1.0.0', tool, ok, ...over });
+}
+
+describe('rowStatus — plugin discovery', () => {
+  it('reads a rejected manifest as a plain failure, never as a blocked call', () => {
+    const rejected = plug('rejected', false, { target: 'identity: `name` must be…' });
+    expect(rowStatus(rejected)).toBe('failed');
+    // The security vocabulary belongs to rows where something was STOPPED.
+    expect(rowStatus(rejected)).not.toBe('denied');
+    expect(rowStatus(rejected)).not.toBe('flagged');
+    expect(rowStatus(rejected)).not.toBe('boundary');
+  });
+
+  it('reads an identity conflict as a failure too', () => {
+    expect(rowStatus(plug('conflict', false, { source: 'acme@1.0.0' }))).toBe('failed');
+  });
+
+  it('lets the scan summary report the folder at a glance', () => {
+    // The backend sets `ok` on the summary to the FOLDER’s health, so a clean
+    // folder is one green row and a folder with a rejected plugin is not.
+    expect(rowStatus(plug('rescan', true, { source: 'plugins', target: 'loaded 2 · rejected 0' }))).toBe(
+      'ok',
+    );
+    expect(rowStatus(plug('rescan', false, { source: 'plugins', target: 'loaded 1 · rejected 1' }))).toBe(
+      'failed',
+    );
+  });
+});

@@ -186,6 +186,92 @@ pub struct DisabledServer {
     pub name: String,
     /// Which level turned it off, for the refusal wording.
     pub verdict: EnableVerdict,
+    /// Expose to Claude Code — copied from the config row.
+    ///
+    /// V37 Phase B (seam finding F2): the C4 refusal is a statement that the
+    /// server EXISTS, and it must only be made to a consumer that could have
+    /// reached the server had it been enabled. A consumer without the grant
+    /// never saw these tools and never would have, so it keeps the pre-V37
+    /// unknown-tool wording — otherwise the refusal becomes an existence
+    /// oracle for servers the caller was never granted.
+    pub claude_access: bool,
+    /// Expose to the offload worker — see [`Self::claude_access`].
+    pub offload_access: bool,
+    /// Expose to OpenCode — see [`Self::claude_access`].
+    pub opencode_access: bool,
+}
+
+/// V37 contract C5 — a hash of the tool surface **each consumer can currently
+/// see**, one field per consumer.
+///
+/// # Not the same question as [`host_config_sig`]
+///
+/// The two hashes are deliberately separate and must not be merged:
+///
+/// * [`host_config_sig`] answers *"should I reconcile?"* — it is computed from
+///   the DESIRED config (every server row, the categories, the activation maps,
+///   the allowed roots) before anything is connected, and `warm_host` compares
+///   it to decide whether to do the work at all.
+/// * this answers *"did the advertised surface actually move?"* — it is
+///   computed from the RESULT (what [`McpHost::advertised`] returns after the
+///   disabled filter, the access filter and the health filter) and the service
+///   compares it to decide whether a change pulse is worth emitting.
+///
+/// They disagree constantly, and that is the point. Editing a server's
+/// `auth_token` moves the config signature and reconnects, but if the server
+/// comes back offering the same tools no consumer's surface moved and no agent
+/// needs a `tools/list_changed`. Conversely a server dying mid-call moves no
+/// config at all, while its whole namespace vanishes from every surface.
+///
+/// # Computed from the output, not a parallel predicate
+///
+/// Each field hashes the sorted `(server, tool)` pairs that
+/// [`McpHost::advertised`] produced for that consumer — the same values the
+/// consumer's `tools/list` is built from. There is no second copy of the
+/// "is this advertised" rule to drift: if the filter changes, this changes with
+/// it. Sorted because the warm pool's order is an artefact of connect timing
+/// (reconcile appends), and a reordered pool is not a moved surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpSurfaceFingerprint {
+    claude: u64,
+    opencode: u64,
+    offload: u64,
+}
+
+impl McpSurfaceFingerprint {
+    /// The fingerprint of a host advertising nothing to anyone — the honest
+    /// seed for the pulse gate, which starts life alongside an empty
+    /// [`McpHost`]. Computed rather than a hand-written constant, so it stays
+    /// equal to `McpHost::new().surface_fingerprint()` whatever
+    /// [`surface_digest`] does (a test pins exactly that).
+    pub fn empty() -> Self {
+        let none: Vec<(String, ToolDef)> = Vec::new();
+        McpSurfaceFingerprint {
+            claude: surface_digest(&none),
+            opencode: surface_digest(&none),
+            offload: surface_digest(&none),
+        }
+    }
+}
+
+/// Hash one consumer's advertised surface: the sorted `server` + namespaced
+/// tool-name pairs. Names only — a description or schema edit on the same tool
+/// is not a surface *membership* change, and V37's propagation is about which
+/// tools exist. (Phase E drops screened tools outright, which changes the name
+/// set, so it is covered.)
+///
+/// Non-cryptographic: this only ever answers "did it move", exactly like
+/// [`token_fp`].
+fn surface_digest(rows: &[(String, ToolDef)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|(server, def)| (server.as_str(), def.function.name.as_str()))
+        .collect();
+    keys.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    keys.hash(&mut h);
+    h.finish()
 }
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -745,10 +831,33 @@ impl Consumer {
 
     /// Whether `server` is exposed to this consumer.
     fn wants(self, server: &McpServer) -> bool {
+        self.granted(
+            server.claude_access,
+            server.offload_access,
+            server.opencode_access,
+        )
+    }
+
+    /// V37 F2: whether a *disabled* server would have been exposed to this
+    /// consumer. Same three flags, read off the retained
+    /// [`DisabledServer`] instead of a live connection — a disabled server has
+    /// none. Kept as a second method rather than a generic over both types so
+    /// no call site can accidentally ask the question about the wrong one.
+    fn wants_disabled(self, server: &DisabledServer) -> bool {
+        self.granted(
+            server.claude_access,
+            server.offload_access,
+            server.opencode_access,
+        )
+    }
+
+    /// The grant test itself, over the three flags in their canonical order.
+    /// One body, so `wants` and `wants_disabled` cannot drift apart.
+    fn granted(self, claude: bool, offload: bool, opencode: bool) -> bool {
         match self {
-            Consumer::Claude => server.claude_access,
-            Consumer::Offload => server.offload_access,
-            Consumer::Opencode => server.opencode_access,
+            Consumer::Claude => claude,
+            Consumer::Offload => offload,
+            Consumer::Opencode => opencode,
         }
     }
 }
@@ -983,6 +1092,11 @@ impl McpHost {
                 (!verdict.is_enabled()).then(|| DisabledServer {
                     name: c.name.clone(),
                     verdict,
+                    // F2: carried so the refusal can be scoped to the consumers
+                    // that would actually have had this server.
+                    claude_access: c.claude_access,
+                    offload_access: c.offload_access,
+                    opencode_access: c.opencode_access,
                 })
             })
             .collect();
@@ -1072,33 +1186,104 @@ impl McpHost {
     /// completing — advertisement is a courtesy (contract C4), but a courtesy
     /// that lies for a few milliseconds costs a model one refused call.
     async fn tool_defs_filtered(&self, consumer: Consumer) -> Vec<ToolDef> {
+        self.advertised(consumer)
+            .await
+            .into_iter()
+            .map(|(_, def)| def)
+            .collect()
+    }
+
+    /// The advertised surface for one consumer, each tool paired with the
+    /// server that owns it. **The** traversal: [`Self::tool_defs_filtered`]
+    /// drops the owner column and [`Self::surface_fingerprint`] hashes it, so
+    /// the pulse's notion of "what is advertised" is the output of the same
+    /// filter the advertisement itself is, not a second predicate that could
+    /// drift from it.
+    ///
+    /// Ownership comes from the pool, never from splitting the namespaced name
+    /// (this file has documented that hazard since V8-03).
+    ///
+    /// Lock order: `disabled` before `servers` (see [`McpHost::disabled`]).
+    async fn advertised(&self, consumer: Consumer) -> Vec<(String, ToolDef)> {
         let disabled = self.disabled.read().await;
         let servers = self.servers.read().await;
         let mut out = Vec::new();
         for s in servers.iter() {
             if consumer.wants(s) && !disabled.iter().any(|d| d.name == s.name) {
-                out.extend(s.tool_defs());
+                out.extend(s.tool_defs().into_iter().map(|d| (s.name.clone(), d)));
             }
         }
         out
     }
 
-    /// V37 C4: the disabled server that would own `namespaced`, if any.
+    /// V37 contract C5 — the fingerprint of the surface each consumer can
+    /// currently see. See [`McpSurfaceFingerprint`] for why it is a different
+    /// hash from [`host_config_sig`].
+    pub async fn surface_fingerprint(&self) -> McpSurfaceFingerprint {
+        McpSurfaceFingerprint {
+            claude: surface_digest(&self.advertised(Consumer::Claude).await),
+            opencode: surface_digest(&self.advertised(Consumer::Opencode).await),
+            offload: surface_digest(&self.advertised(Consumer::Offload).await),
+        }
+    }
+
+    /// V37 C4: the disabled server that owns `namespaced` **for `consumer`**,
+    /// if any — `None` means "let dispatch continue".
     ///
-    /// Matched by NAMESPACE PREFIX, which is the one place this file deviates
-    /// from its own route-by-ownership rule (`call`) — and it has to: a
-    /// disabled server has no connection, therefore no advertised tool list to
-    /// match exactly against. The longest matching name wins, so a
-    /// `git`/`git__extra` pair resolves deterministically to the more specific
-    /// one. The blast radius of a wrong pick is bounded to the *wording* of a
-    /// refusal that is happening either way: only disabled names are candidates,
-    /// and an unknown tool matches none of them and falls through to the
-    /// existing "not available to X" error — which is what keeps *disabled*
-    /// distinguishable from *never existed*.
-    async fn disabled_owner(&self, namespaced: &str) -> Option<(String, EnableVerdict)> {
+    /// # A live owner settles it (Phase B seam finding F1)
+    ///
+    /// The prefix match below is the one place this file deviates from its own
+    /// route-by-ownership rule (`call`), and it has to: a disabled server has no
+    /// connection, therefore no advertised tool list to match exactly against.
+    /// But a prefix is only evidence when nothing better exists, and a LIVE
+    /// server that exactly owns the tool is better evidence — `git` disabled and
+    /// `git__extra` enabled both prefix-match `git__extra__log`, and the pre-F1
+    /// code refused a call that a healthy, enabled server was serving.
+    ///
+    /// So the dispatch order is:
+    ///
+    /// 1. a live server exactly owns the tool and is NOT in `disabled` => `None`,
+    ///    and the call proceeds to its real owner;
+    /// 2. the live owner IS in `disabled` => refuse with ITS verdict. This is
+    ///    the toggle-to-teardown window: `reconcile` writes `disabled` before it
+    ///    tears connections down, precisely so this window refuses instead of
+    ///    dispatching into a server the user just turned off;
+    /// 3. no live owner at all => the prefix match, longest name first so a
+    ///    `git`/`git__extra` pair resolves deterministically.
+    ///
+    /// # Scoped to the consumer (Phase B seam finding F2)
+    ///
+    /// Only servers `consumer` would have been granted are candidates. For any
+    /// other consumer the tool falls through to the pre-V37 "not available to X"
+    /// wording, which is the truth for it and does not disclose that a server it
+    /// was never granted exists.
+    ///
+    /// Lock order: `disabled` before `servers` (see [`McpHost::disabled`]).
+    async fn disabled_owner(
+        &self,
+        consumer: Consumer,
+        namespaced: &str,
+    ) -> Option<(String, EnableVerdict)> {
         let disabled = self.disabled.read().await;
+        let live_owner = {
+            let servers = self.servers.read().await;
+            servers
+                .iter()
+                .find(|s| s.raw_name(namespaced).is_some())
+                .map(|s| s.name.clone())
+        };
+        // Ownership is a routing fact, so the live lookup is NOT grant-filtered:
+        // whoever actually serves the tool is who this call is about. The grant
+        // filter applies to the refusal below, which is the disclosure.
+        if let Some(name) = live_owner {
+            return disabled
+                .iter()
+                .find(|d| d.name == name && consumer.wants_disabled(d))
+                .map(|d| (d.name.clone(), d.verdict.clone()));
+        }
         disabled
             .iter()
+            .filter(|d| consumer.wants_disabled(d))
             .filter(|d| {
                 namespaced.len() > d.name.len() + 2
                     && namespaced.starts_with(&d.name)
@@ -1141,16 +1326,27 @@ impl McpHost {
     /// runs BEFORE the `owns` check: `owns` is computed from live connections,
     /// which a disabled server by definition has none of.
     ///
-    /// In-flight calls are never killed by a toggle — a call already inside
-    /// [`Self::call`] runs to completion. The new state applies from the next
-    /// call, which is the only point at which it is observable anyway.
+    /// # What a toggle does to a call already in flight (corrected, F3)
+    ///
+    /// The DISPATCH DECISION is never re-checked mid-call: this function reads
+    /// `disabled` once, before it routes, and a call already inside
+    /// [`Self::call`] is never re-evaluated against a newer verdict. That is not
+    /// the same as "the call survives". `reconcile` tears the connection down as
+    /// part of applying the toggle, and for a stdio server teardown kills the
+    /// child process — so an in-flight request on that transport can still come
+    /// back as a transport failure (`connection lost: ...`) rather than a
+    /// result. HTTP calls, having no warm channel to kill, do run to completion.
+    ///
+    /// The distinction matters because the wording differs: a call the toggle
+    /// aborted mid-transport reports a lost connection, not [`REFUSAL_DISABLED`]
+    /// — only the NEXT call gets the honest disabled refusal.
     async fn call_for_consumer(
         &self,
         consumer: Consumer,
         namespaced: &str,
         args: Value,
     ) -> Result<String, HostError> {
-        if let Some((name, verdict)) = self.disabled_owner(namespaced).await {
+        if let Some((name, verdict)) = self.disabled_owner(consumer, namespaced).await {
             // `refusal` yields `None` only for `Enabled`, which
             // `disabled_owner` never returns.
             if let Some(msg) = verdict.refusal(&name) {
@@ -1370,10 +1566,38 @@ impl McpHost {
     }
 
     /// Tear down every connection (app exit / offload disabled).
+    ///
+    /// V37 F4: this also clears [`Self::disabled`]. That list is the *last
+    /// reconcile's* verdict, and after a shutdown there is no reconcile behind
+    /// it — leaving it populated would let a host that is holding nothing keep
+    /// answering "server `X` is disabled" for a registry it no longer reflects,
+    /// and would shadow a server a later reconcile connects before it rewrites
+    /// the list. Lock order: `disabled` before `servers`.
+    /// V37 C5: a teardown that actually dropped something is a surface change
+    /// like any other, so it pulses. Before this, `warm_host` tearing the host
+    /// down (the user cleared the last access flag) emptied every consumer's
+    /// surface in silence, and a live child kept advertising tools that now
+    /// answer "no MCP server owns tool X". The service's gate suppresses the
+    /// pulse if the surface was already empty, so the app-exit call is free.
     pub async fn shutdown(&self) {
-        let mut servers = self.servers.write().await;
-        for s in servers.drain(..) {
-            s.shutdown().await;
+        // Lock order: `disabled` before `servers`, and both released before the
+        // pulse so the gate's fingerprint read cannot contend with this call.
+        let had_disabled = {
+            let mut disabled = self.disabled.write().await;
+            let had = !disabled.is_empty();
+            disabled.clear();
+            had
+        };
+        let had_servers = {
+            let mut servers = self.servers.write().await;
+            let had = !servers.is_empty();
+            for s in servers.drain(..) {
+                s.shutdown().await;
+            }
+            had
+        };
+        if had_servers || had_disabled {
+            self.signal_change();
         }
     }
 }
@@ -1483,6 +1707,60 @@ pub fn host_config_sig(
     let mut roots: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
     roots.sort();
     format!("{servers:?}|cats:{cats:?}|act:{act}|roots:{roots:?}")
+}
+
+/// A fake healthy server (no real connection) carrying one namespaced tool,
+/// for exercising the per-consumer filtering without spawning an MCP server.
+/// At module scope rather than inside `mod tests` because `service`'s pulse-gate
+/// tests drive a real [`McpHost`] through it — the gate asks the host for a
+/// fingerprint, and every other way of populating the pool opens a socket.
+#[cfg(test)]
+fn fake_server(
+    name: &str,
+    claude: bool,
+    offload: bool,
+    opencode: bool,
+    namespaced: &str,
+) -> McpServer {
+    let raw = namespaced
+        .split("__")
+        .nth(1)
+        .unwrap_or(namespaced)
+        .to_string();
+    McpServer {
+        name: name.into(),
+        sig: String::new(),
+        transport_label: "http",
+        conn: None,
+        tools: vec![HostTool {
+            def: ToolDef::function(namespaced, "", json!({ "type": "object" })),
+            raw_name: raw,
+        }],
+        healthy: AtomicBool::new(true),
+        error: StdMutex::new(None),
+        claude_access: claude,
+        offload_access: offload,
+        opencode_access: opencode,
+    }
+}
+
+#[cfg(test)]
+impl McpHost {
+    /// Push a [`fake_server`] into the warm pool — the only way a test outside
+    /// this module can move the advertised surface.
+    pub(super) async fn insert_fake_server(
+        &self,
+        name: &str,
+        claude: bool,
+        offload: bool,
+        opencode: bool,
+        namespaced: &str,
+    ) {
+        self.servers
+            .write()
+            .await
+            .push(Arc::new(fake_server(name, claude, offload, opencode, namespaced)));
+    }
 }
 
 /// Connect (or fail-soft) one server from its config. A failure yields an
@@ -2228,37 +2506,6 @@ fn confine_filesystem(cfg: &McpServerConfig, args: &mut Vec<String>, allowed_roo
 mod tests {
     use super::*;
 
-    /// A fake healthy server (no real connection) carrying one namespaced tool,
-    /// for exercising the per-consumer filtering without spawning an MCP server.
-    fn fake_server(
-        name: &str,
-        claude: bool,
-        offload: bool,
-        opencode: bool,
-        namespaced: &str,
-    ) -> McpServer {
-        let raw = namespaced
-            .split("__")
-            .nth(1)
-            .unwrap_or(namespaced)
-            .to_string();
-        McpServer {
-            name: name.into(),
-            sig: String::new(),
-            transport_label: "http",
-            conn: None,
-            tools: vec![HostTool {
-                def: ToolDef::function(namespaced, "", json!({ "type": "object" })),
-                raw_name: raw,
-            }],
-            healthy: AtomicBool::new(true),
-            error: StdMutex::new(None),
-            claude_access: claude,
-            offload_access: offload,
-            opencode_access: opencode,
-        }
-    }
-
     #[tokio::test]
     async fn tool_defs_and_calls_partition_by_access_flag() {
         let host = McpHost::new();
@@ -2926,6 +3173,18 @@ mod tests {
         }
     }
 
+    /// A disabled-server record granted to EVERY consumer — the default for
+    /// tests that are not about the F2 grant scoping.
+    fn disabled(name: &str, verdict: EnableVerdict) -> DisabledServer {
+        DisabledServer {
+            name: name.into(),
+            verdict,
+            claude_access: true,
+            offload_access: true,
+            opencode_access: true,
+        }
+    }
+
     fn category(name: &str, enabled: bool, servers: &[&str]) -> McpCategory {
         McpCategory {
             name: name.into(),
@@ -3077,10 +3336,8 @@ mod tests {
             Arc::new(fake_server("beta", true, true, true, "beta__y")),
         ]);
         // `beta` is off at the category level.
-        *host.disabled.write().await = vec![DisabledServer {
-            name: "beta".into(),
-            verdict: EnableVerdict::CategoriesOff("research".into()),
-        }];
+        *host.disabled.write().await =
+            vec![disabled("beta", EnableVerdict::CategoriesOff("research".into()))];
 
         for defs in [
             host.tool_defs_for_claude().await,
@@ -3106,14 +3363,8 @@ mod tests {
             .await
             .push(Arc::new(fake_server("alpha", true, true, true, "alpha__x")));
         *host.disabled.write().await = vec![
-            DisabledServer {
-                name: "beta".into(),
-                verdict: EnableVerdict::ServerOff,
-            },
-            DisabledServer {
-                name: "gamma".into(),
-                verdict: EnableVerdict::CategoriesOff("research".into()),
-            },
+            disabled("beta", EnableVerdict::ServerOff),
+            disabled("gamma", EnableVerdict::CategoriesOff("research".into())),
         ];
 
         let err = host
@@ -3166,25 +3417,17 @@ mod tests {
     async fn disabled_owner_prefers_the_longest_namespace_match() {
         let host = McpHost::new();
         *host.disabled.write().await = vec![
-            DisabledServer {
-                name: "git".into(),
-                verdict: EnableVerdict::ServerOff,
-            },
-            DisabledServer {
-                name: "git__extra".into(),
-                verdict: EnableVerdict::CategoriesOff("vcs".into()),
-            },
+            disabled("git", EnableVerdict::ServerOff),
+            disabled("git__extra", EnableVerdict::CategoriesOff("vcs".into())),
         ];
-        assert_eq!(
-            host.disabled_owner("git__extra__log").await.unwrap().0,
-            "git__extra"
-        );
-        assert_eq!(host.disabled_owner("git__log").await.unwrap().0, "git");
+        let owner = |t: &'static str| host.disabled_owner(Consumer::Claude, t);
+        assert_eq!(owner("git__extra__log").await.unwrap().0, "git__extra");
+        assert_eq!(owner("git__log").await.unwrap().0, "git");
         // The separator is required: `github__x` is not `git`'s.
-        assert!(host.disabled_owner("github__x").await.is_none());
+        assert!(owner("github__x").await.is_none());
         // A bare server name with no tool half owns nothing.
-        assert!(host.disabled_owner("git").await.is_none());
-        assert!(host.disabled_owner("git__").await.is_none());
+        assert!(owner("git").await.is_none());
+        assert!(owner("git__").await.is_none());
     }
 
     /// V37 C3: reconcile must treat a disabled server as ABSENT — never
@@ -3217,10 +3460,169 @@ mod tests {
             disabled[1].verdict,
             EnableVerdict::CategoriesOff("research".into())
         );
+        // F2: the grants ride along, so the refusal can be scoped to the
+        // consumers that would have had the server (`cfg` sets offload only).
+        assert!(disabled[0].offload_access);
+        assert!(!disabled[0].claude_access);
+        assert!(!disabled[0].opencode_access);
         drop(disabled);
 
         // Nothing disabled ended up in the pool.
         let pool = host.servers.read().await;
         assert!(pool.iter().all(|s| s.name != "beta" && s.name != "gamma"));
+    }
+    // ── V37 Phase B ──────────────────────────────────────────────────────────
+
+    /// F1: a LIVE server that exactly owns the tool outranks a disabled server
+    /// that merely prefixes it. Before this, `git` being off refused every
+    /// `git__extra__*` call that the enabled `git__extra` server was serving —
+    /// a namespace collision turning one toggle into an outage for another
+    /// server.
+    #[tokio::test]
+    async fn live_owner_outranks_a_disabled_prefix() {
+        let host = McpHost::new();
+        host.servers
+            .write()
+            .await
+            .push(Arc::new(fake_server(
+                "git__extra",
+                true,
+                true,
+                true,
+                "git__extra__log",
+            )));
+        *host.disabled.write().await = vec![disabled("git", EnableVerdict::ServerOff)];
+
+        // The live owner settles it: no refusal, dispatch continues.
+        assert!(host
+            .disabled_owner(Consumer::Claude, "git__extra__log")
+            .await
+            .is_none());
+        let err = host
+            .call_for_consumer(Consumer::Claude, "git__extra__log", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.diagnostic().contains(REFUSAL_DISABLED),
+            "an enabled server's tool must not be refused as disabled: {err}"
+        );
+
+        // A tool with NO live owner still falls back to the prefix match.
+        assert_eq!(
+            host.disabled_owner(Consumer::Claude, "git__log")
+                .await
+                .unwrap()
+                .0,
+            "git"
+        );
+
+        // The toggle-to-teardown window stays closed: `reconcile` writes
+        // `disabled` before it tears connections down, so a live connection
+        // whose OWN name is disabled must still refuse.
+        *host.disabled.write().await = vec![disabled("git__extra", EnableVerdict::ServerOff)];
+        let err = host
+            .call_for_consumer(Consumer::Claude, "git__extra__log", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.diagnostic().contains(REFUSAL_DISABLED), "got: {err}");
+        assert!(err.diagnostic().contains("git__extra"), "got: {err}");
+    }
+
+    /// F2: the C4 refusal states that a server EXISTS, so it is only served to
+    /// consumers that would have been granted that server. Everyone else keeps
+    /// the pre-V37 unknown-tool wording.
+    #[tokio::test]
+    async fn disabled_refusal_only_reaches_granted_consumers() {
+        let host = McpHost::new();
+        // Disabled, and only ever exposed to OpenCode.
+        *host.disabled.write().await = vec![DisabledServer {
+            name: "beta".into(),
+            verdict: EnableVerdict::ServerOff,
+            claude_access: false,
+            offload_access: false,
+            opencode_access: true,
+        }];
+
+        let err = host
+            .call_for_consumer(Consumer::Opencode, "beta__y", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.diagnostic().contains(REFUSAL_DISABLED), "got: {err}");
+
+        for consumer in [Consumer::Claude, Consumer::Offload] {
+            let err = host
+                .call_for_consumer(consumer, "beta__y", json!({}))
+                .await
+                .unwrap_err();
+            let d = err.diagnostic();
+            assert!(
+                !d.contains(REFUSAL_DISABLED),
+                "an ungranted consumer must not learn `beta` exists: {d}"
+            );
+            assert!(d.contains("is not available to"), "got: {d}");
+        }
+    }
+
+    /// F4: `shutdown` holds nothing, so it must claim nothing. A stale
+    /// `disabled` list would keep refusing on behalf of a registry the host no
+    /// longer reflects.
+    #[tokio::test]
+    async fn shutdown_clears_the_disabled_set() {
+        let host = McpHost::new();
+        *host.disabled.write().await = vec![disabled("beta", EnableVerdict::ServerOff)];
+        host.shutdown().await;
+        assert!(host.disabled.read().await.is_empty());
+        let err = host
+            .call_for_consumer(Consumer::Claude, "beta__y", json!({}))
+            .await
+            .unwrap_err();
+        assert!(!err.diagnostic().contains(REFUSAL_DISABLED), "got: {err}");
+    }
+
+    /// C5: the fingerprint is per consumer and tracks the OUTPUT of the same
+    /// filter advertisement uses — access flags, the disabled set and health all
+    /// move it, and only for the consumers actually affected.
+    #[tokio::test]
+    async fn surface_fingerprint_tracks_each_consumer_separately() {
+        let host = McpHost::new();
+        assert_eq!(
+            host.surface_fingerprint().await,
+            McpSurfaceFingerprint::empty(),
+            "an empty host must equal the seed the pulse gate starts from"
+        );
+
+        // Claude-only server: Claude's surface moves, the other two do not.
+        host.insert_fake_server("alpha", true, false, false, "alpha__x")
+            .await;
+        let one = host.surface_fingerprint().await;
+        let seed = McpSurfaceFingerprint::empty();
+        assert_ne!(one.claude, seed.claude);
+        assert_eq!(one.offload, seed.offload);
+        assert_eq!(one.opencode, seed.opencode);
+
+        // Recomputing an unchanged host is stable (a pulse would be suppressed).
+        assert_eq!(host.surface_fingerprint().await, one);
+
+        // Disabling it takes Claude's surface back to empty.
+        *host.disabled.write().await = vec![disabled("alpha", EnableVerdict::ServerOff)];
+        assert_eq!(host.surface_fingerprint().await, seed);
+    }
+
+    /// Pool ORDER is an artefact of connect timing (reconcile appends as
+    /// connections complete). Two hosts advertising the same tools must
+    /// fingerprint identically, or every reconnect would emit a spurious pulse.
+    #[tokio::test]
+    async fn surface_fingerprint_ignores_pool_order() {
+        let a = McpHost::new();
+        a.insert_fake_server("alpha", true, true, true, "alpha__x")
+            .await;
+        a.insert_fake_server("beta", true, true, true, "beta__y")
+            .await;
+        let b = McpHost::new();
+        b.insert_fake_server("beta", true, true, true, "beta__y")
+            .await;
+        b.insert_fake_server("alpha", true, true, true, "alpha__x")
+            .await;
+        assert_eq!(a.surface_fingerprint().await, b.surface_fingerprint().await);
     }
 }

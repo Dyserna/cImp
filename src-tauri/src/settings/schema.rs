@@ -3229,7 +3229,13 @@ pub struct McpActivation {
 /// The hand-rolled `Debug` redacts `env` values, which may carry API
 /// keys, and (V33 Phase E) the HTTP transport's `auth_token`, so a stray
 /// `?settings` log line cannot leak either.
-#[derive(Clone, Serialize, Deserialize)]
+// V37 F5: `PartialEq`/`Eq` because the registry is written THROUGH to the
+// physical global settings file on save (`persistence::sync_mcp_registry_into`),
+// and that write-through only rewrites the file when the array actually moved.
+// Derived rather than hand-rolled: every field is connection- or
+// identity-relevant, so "equal" must mean all of them, and a field added later
+// must join the comparison without anyone remembering to.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct McpServerConfig {
     /// Display + namespacing prefix (e.g. `ddg`, `git`). Tools are
@@ -3754,11 +3760,34 @@ impl OffloadSettings {
     }
 
     /// Whether at least one MCP server is exposed to Claude Code.
+    ///
+    /// # V37 D-1: this reads `claude_access` and deliberately NOT `enabled`
+    ///
+    /// The two flags answer different questions. `*_access` is a STRUCTURAL
+    /// grant — it decides whether this harness's child is spawned with the
+    /// proxy wired in at all, which is baked at spawn time and cannot be
+    /// changed for a live tab. `enabled` (with `mcp_categories` /
+    /// `mcp_activation`, via `offload::mcp_host::effective_enable`) is LIVE
+    /// activation state, re-evaluated on every reconcile and every dispatch.
+    ///
+    /// Gating this on `enabled` would break contract C5 in the exact case C5
+    /// exists for: with every server disabled at spawn time, the tab would come
+    /// up with no proxy, and re-enabling a server later could not reach it — the
+    /// user would have to restart the tab, which is the restart-tab semantics
+    /// V37 is removing. It would also cost contract C4 its last-server case: with
+    /// no proxy, a stale call gets "unknown tool" from the child instead of the
+    /// disabled refusal that names which toggle did it.
+    ///
+    /// So: spawn broadly, enforce at dispatch. Do not "optimize" this by adding
+    /// an `enabled` term.
     pub fn any_claude_mcp(&self) -> bool {
         self.mcp_servers.iter().any(|m| m.claude_access)
     }
 
     /// V19: whether at least one MCP server is exposed to OpenCode.
+    ///
+    /// V37 D-1: reads `opencode_access` and NOT `enabled`, for the reasons
+    /// spelled out on [`Self::any_claude_mcp`].
     pub fn any_opencode_mcp(&self) -> bool {
         self.mcp_servers.iter().any(|m| m.opencode_access)
     }
@@ -3770,6 +3799,14 @@ impl OffloadSettings {
     /// warm-host lifecycle. NOTE: runtime/loopback startup gates on the
     /// broader [`Settings::loopback_needed`] — graph and Code Audit children
     /// need the loopback without needing the host.
+    ///
+    /// V37 D-1: composed from the two `*_access` predicates, so it inherits
+    /// their deliberate blindness to `enabled` (see [`Self::any_claude_mcp`]).
+    /// The warm host must run whenever a server COULD become reachable: it is
+    /// the host that owns `effective_enable`, holds the disabled set behind
+    /// contract C4's refusal, and is the thing a re-enable has to reconcile
+    /// into. A host that shut itself down because everything was toggled off
+    /// would have nothing left to turn back on.
     pub fn mcp_host_needed(&self) -> bool {
         self.enabled || self.any_claude_mcp() || self.any_opencode_mcp()
     }

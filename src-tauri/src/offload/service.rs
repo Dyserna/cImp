@@ -38,7 +38,9 @@ use crate::settings::{
 };
 
 use super::agent::{self, AgentConfig, HostRouter, OffloadTask, RunTrace, ThinkingMode};
-use super::mcp_host::{host_config_sig, Consumer, McpHost, McpServerHealth};
+use super::mcp_host::{
+    host_config_sig, Consumer, McpHost, McpServerHealth, McpSurfaceFingerprint,
+};
 use super::metrics::{BackendDashboard, CallRecord, MetricsPoller, RunRecord, ServerMetrics};
 use super::outbound;
 use super::remote::RemoteBackend;
@@ -141,7 +143,16 @@ pub struct OffloadService {
     /// (health/`/props` probes use each handle's own short-timeout client).
     client: reqwest::Client,
     /// Capability-change pulses relayed to the loopback `/events` stream.
+    ///
+    /// V37 C5: nothing sends on this directly any more. Every producer goes
+    /// through `pulse_tx` and the ONE gate task ([`run_pulse_gate`]) owns this
+    /// half, so debouncing and surface suppression cannot be bypassed by a new
+    /// call site.
     change_tx: broadcast::Sender<()>,
+    /// V37 C5: the intake side of the pulse gate. Unbounded because a dropped
+    /// pulse is a surface that never propagates, and the gate collapses bursts
+    /// anyway — the queue only ever holds one debounce window's worth.
+    pulse_tx: mpsc::UnboundedSender<PulseSource>,
     /// V30 Phase B: the live per-tab `--offload-mcp` children, for addressed
     /// session pushes. Separate from `change_tx` on purpose — that broadcast
     /// stays the un-addressed capability pulse every subscriber gets.
@@ -662,6 +673,7 @@ impl OffloadService {
             .unwrap_or_default();
         let host = McpHost::new();
         let (change_tx, _) = broadcast::channel(16);
+        let (pulse_tx, pulse_rx) = mpsc::unbounded_channel();
 
         let service = Arc::new(Self {
             settings,
@@ -674,6 +686,7 @@ impl OffloadService {
             local_pool: TokioMutex::new(HashMap::new()),
             client,
             change_tx,
+            pulse_tx,
             pushes: PushRegistry::new(),
             app,
             latest_metrics: StdMutex::new(Vec::new()),
@@ -685,14 +698,31 @@ impl OffloadService {
             run_id_seq: AtomicU64::new(1),
         });
 
-        // Relay MCP-host change pulses into the service change channel so a
-        // tool server connecting/dropping reaches `/events`.
+        // V37 C5: the ONE pulse gate. Every producer feeds `pulse_tx`; this task
+        // is the only thing that ever sends on `change_tx`. It starts seeded
+        // with the empty-host fingerprint, which is exactly what `host` is
+        // right now — so the first reconcile that connects anything reads as a
+        // move, and one that connects nothing does not.
+        {
+            let host = service.host.clone();
+            let out = service.change_tx.clone();
+            tauri::async_runtime::spawn(run_pulse_gate(
+                host,
+                out,
+                pulse_rx,
+                PULSE_DEBOUNCE,
+                McpSurfaceFingerprint::empty(),
+            ));
+        }
+
+        // Relay MCP-host change pulses (reconcile added/dropped a connection, a
+        // server died mid-call) into the gate.
         {
             let mut host_rx = service.host.subscribe();
-            let out = service.change_tx.clone();
+            let pulses = service.pulse_tx.clone();
             tauri::async_runtime::spawn(async move {
                 while host_rx.recv().await.is_ok() {
-                    let _ = out.send(());
+                    let _ = pulses.send(PulseSource::Host);
                 }
             });
         }
@@ -706,9 +736,18 @@ impl OffloadService {
         self.change_tx.subscribe()
     }
 
-    /// Emit a capability-change pulse.
-    fn signal_change(&self) {
-        let _ = self.change_tx.send(());
+    /// Ask for a capability-change pulse on behalf of something that is NOT
+    /// the MCP host — today only [`Self::spawn_health_watch`]'s backend
+    /// ready-set comparison.
+    ///
+    /// Named for its source rather than its effect because the source is what
+    /// the gate needs: [`PulseSource::Backend`] is never surface-suppressed (a
+    /// backend going up/down moves the child's `offload_task` description, not
+    /// the MCP surface), while a host pulse is. A future producer must pick a
+    /// source deliberately instead of inheriting whichever one a generic
+    /// `signal_change` happened to use.
+    fn signal_backend_change(&self) {
+        let _ = self.pulse_tx.send(PulseSource::Backend);
     }
 
     // ── V30 Phase B: session push (see the `PushRegistry` section above) ──
@@ -2201,10 +2240,92 @@ impl OffloadService {
                 ready.sort();
                 if ready != last {
                     last = ready;
-                    this.signal_change();
+                    this.signal_backend_change();
                 }
             }
         });
+    }
+}
+
+/// V37 contract C5 — where a capability-change pulse came from, and therefore
+/// what the gate is allowed to do with it.
+///
+/// The distinction exists because the `change` frame is broader than the MCP
+/// surface. The per-session child's `tools/list` is `offload_task`/
+/// `offload_batch` (whose live description names the reachable backends) +
+/// the graph tools + the proxied MCP surface, so "did the MCP surface move" is
+/// the right suppression question for exactly one of the three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PulseSource {
+    /// The MCP host: `reconcile` added/dropped a connection, or a server died
+    /// mid-call. Suppressed when no consumer's advertised surface moved.
+    Host,
+    /// A producer whose change is invisible in the MCP surface — today the
+    /// backend ready-set watcher, which already does its own did-it-move
+    /// comparison before it asks. Never suppressed here; suppressing it would
+    /// silently undo `spawn_health_watch`'s documented purpose.
+    Backend,
+}
+
+/// How long the gate collects pulses before deciding. The UI batches a category
+/// toggle into ONE settings write (Phase D), but a reconcile still signals per
+/// connection edge, and `warm_host` can be driven from three places at once —
+/// so a single user action legitimately produces a burst. Tests supply their
+/// own window and assert ONE pulse per action; nothing depends on this value.
+const PULSE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// The ONE place a `change` pulse is decided: debounce, then suppress.
+///
+/// Every producer (`reconcile`'s connection edges, a server dying mid-call, the
+/// backend ready-set watcher) funnels into `rx`; `out` is the broadcast the
+/// loopback `/events` stream — the sole consumer of the `change` frame — reads.
+/// Concentrating it here rather than at each producer is what makes
+/// "one user action, one `tools/list_changed`" a property of the system instead
+/// of a property every call site has to remember.
+///
+/// Order matters: the fingerprint is read AFTER the window closes, so a burst
+/// is judged by where the host ended up, not by any intermediate state it
+/// passed through (a reconnect that tears a server down and brings it back with
+/// the same tools is correctly silent).
+async fn run_pulse_gate(
+    host: Arc<McpHost>,
+    out: broadcast::Sender<()>,
+    mut rx: mpsc::UnboundedReceiver<PulseSource>,
+    window: Duration,
+    seed: McpSurfaceFingerprint,
+) {
+    let mut last = seed;
+    while let Some(first) = rx.recv().await {
+        let mut from_host = first == PulseSource::Host;
+        let mut unconditional = first == PulseSource::Backend;
+        // Collect everything that arrives inside the window. The deadline runs
+        // from the FIRST pulse, so a steady stream cannot postpone the emit
+        // indefinitely.
+        let deadline = tokio::time::sleep(window);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                more = rx.recv() => match more {
+                    Some(PulseSource::Host) => from_host = true,
+                    Some(PulseSource::Backend) => unconditional = true,
+                    // Every producer is gone: decide on what we have, then the
+                    // outer loop sees the same `None` and the task ends.
+                    None => break,
+                },
+            }
+        }
+        let mut emit = unconditional;
+        if from_host {
+            let fingerprint = host.surface_fingerprint().await;
+            if fingerprint != last {
+                last = fingerprint;
+                emit = true;
+            }
+        }
+        if emit {
+            let _ = out.send(());
+        }
     }
 }
 
@@ -2577,5 +2698,106 @@ mod tests {
         // Remote backend → only with the explicit opt-in.
         assert!(!worker_graph_allowed(true, true, false));
         assert!(worker_graph_allowed(true, true, true));
+    }
+    // ── V37 C5: the pulse gate ───────────────────────────────────────────────
+
+    /// A short window keeps the tests quick. Nothing below asserts the window's
+    /// value — the contract is ONE pulse per action, whatever the constant is.
+    const TEST_WINDOW: Duration = Duration::from_millis(30);
+
+    /// Long enough for the gate to have closed its window and decided. Several
+    /// windows wide so a scheduling hiccup cannot turn a real pulse into a
+    /// missing one (which would make the test pass for the wrong reason).
+    async fn settle() {
+        tokio::time::sleep(TEST_WINDOW * 8).await;
+    }
+
+    fn spawn_gate(
+        host: Arc<McpHost>,
+    ) -> (
+        mpsc::UnboundedSender<PulseSource>,
+        broadcast::Receiver<()>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (out, out_rx) = broadcast::channel(64);
+        tokio::spawn(run_pulse_gate(
+            host,
+            out,
+            rx,
+            TEST_WINDOW,
+            McpSurfaceFingerprint::empty(),
+        ));
+        (tx, out_rx)
+    }
+
+    /// Drain what the gate emitted since the last check.
+    fn pulses(rx: &mut broadcast::Receiver<()>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// C5, the whole contract in one run: a burst coalesces, an unmoved surface
+    /// is silent, and a surface that moves emits exactly once.
+    #[tokio::test]
+    async fn pulse_gate_coalesces_a_burst_and_suppresses_an_unmoved_surface() {
+        let host = McpHost::new();
+        let (tx, mut out) = spawn_gate(host.clone());
+
+        // (b) A reconcile that changes connections without moving any
+        //     consumer's advertised surface — here, the degenerate case: the
+        //     host still advertises nothing, which is what the gate was seeded
+        //     with. Zero pulses.
+        for _ in 0..5 {
+            tx.send(PulseSource::Host).unwrap();
+        }
+        settle().await;
+        assert_eq!(pulses(&mut out), 0, "an unmoved surface must not pulse");
+
+        // (a)+(c) A toggle that DOES move the surface, signalled as a burst the
+        //     way `reconcile` signals per connection edge: exactly ONE pulse.
+        host.insert_fake_server("alpha", true, true, true, "alpha__x")
+            .await;
+        for _ in 0..8 {
+            tx.send(PulseSource::Host).unwrap();
+        }
+        settle().await;
+        assert_eq!(
+            pulses(&mut out),
+            1,
+            "a burst from one action must coalesce into ONE pulse"
+        );
+
+        // And the new surface becomes the baseline: repeating the burst with
+        // nothing changed is silent again.
+        for _ in 0..4 {
+            tx.send(PulseSource::Host).unwrap();
+        }
+        settle().await;
+        assert_eq!(pulses(&mut out), 0);
+    }
+
+    /// A pulse that is NOT about the MCP surface must never be suppressed by
+    /// it. `spawn_health_watch` exists to tell `/events` about a backend going
+    /// up/down — that moves the child's `offload_task` description, not the
+    /// proxied tool list, so a surface fingerprint has nothing to say about it.
+    #[tokio::test]
+    async fn pulse_gate_never_suppresses_a_backend_pulse() {
+        let host = McpHost::new();
+        let (tx, mut out) = spawn_gate(host);
+
+        tx.send(PulseSource::Backend).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 1, "a backend pulse must always emit");
+
+        // Mixed burst: the backend half carries it even though the host half
+        // would have been suppressed, and it is still ONE pulse.
+        tx.send(PulseSource::Host).unwrap();
+        tx.send(PulseSource::Backend).unwrap();
+        tx.send(PulseSource::Host).unwrap();
+        settle().await;
+        assert_eq!(pulses(&mut out), 1);
     }
 }

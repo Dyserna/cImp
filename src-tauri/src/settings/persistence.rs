@@ -45,7 +45,8 @@ use crate::settings::schema::{
     default_ai_tab, default_audit_tools, default_events_tab, default_graph_monitor_tab,
     default_shell_1_tab, default_tool_activity_tab, default_workbench_tab, pricing_rows_since,
     starter_prompt_templates, AiTabId, HarnessVersions, LayoutNodePersisted, LlmPricingModel,
-    PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate, Settings, TabConfig,
+    McpCategory, McpServerConfig, PromptTemplate, RemoteBackendTemplate, ServerCommandTemplate,
+    Settings, TabConfig,
     CLAUDE_LOCAL_TAB_ID, CLAUDE_TAB_ID, CODE_AUDIT_TAB_ID, CODE_QUALITY_TAB_ID, EVENTS_TAB_ID,
     GRAPH_MONITOR_TAB_ID, GRAPH_VIEW_TAB_ID, OFFLOAD_SERVER_TAB_ID, OPENCODE_TAB_ID,
     PRICING_GENERATION, SHELL_DEFAULT_TAB_ID, TOOL_ACTIVITY_TAB_ID, WORKBENCH_TAB_ID,
@@ -200,7 +201,8 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
     let promoted = overlay_value.as_ref().is_some_and(|ov| {
         let paths = promote_overlay_audit_paths(&mut global, ov);
         let templates = promote_overlay_offload_templates(&mut global, ov);
-        paths || templates
+        let registry = promote_overlay_mcp_registry(&mut global, ov);
+        paths || templates || registry
     });
 
     // 3. Merge the (now both-current-shape) global + overlay.
@@ -222,6 +224,7 @@ pub fn load(default_shell: &ShellSpec, launch_cwd: &Path) -> LoadOutcome {
         //     legacy data, not authority.
         enforce_global_audit_paths(&mut merged, &global);
         enforce_global_offload_templates(&mut merged, &global);
+        enforce_global_mcp_registry(&mut merged, &global);
     }
 
     let mut settings: Settings = match serde_json::from_value(merged) {
@@ -1042,6 +1045,138 @@ fn strip_offload_templates(v: &mut Value) {
     }
 }
 
+// ── V37 F5: the MCP registry is GLOBAL, activation is per-project ───────────
+//
+// `offload.mcp_servers` and `offload.mcp_categories` are the REGISTRY: which
+// servers exist, what they are called, how to reach them, which category they
+// sit in. `offload.mcp_activation` is the only per-project surface (contract
+// C2) — two `BTreeMap`s of name -> bool that `deep_merge` folds key by key.
+//
+// Left on the normal diff path the registry would repeat the V26 audit-paths
+// field report exactly. The generic `diff` replaces arrays WHOLESALE, so the
+// first project in which the user touches anything MCP-shaped pins a snapshot
+// of the entire server list in ITS overlay; from then on every global edit —
+// a new server, a fixed URL, a rotated token — is invisible in that project,
+// with no error and nothing in the UI to suggest why. Worse than the audit
+// case, because `mcp_servers` predates V37 and overlays carrying it already
+// exist in the wild.
+//
+// So the same three-step treatment the templates got:
+//
+//   * LOAD — a legacy overlay's servers/categories are promoted into the
+//     global baseline once (by name; an existing global name is never
+//     overwritten), then the merged view's arrays are ALWAYS overwritten from
+//     the global baseline: overlays carry no registry authority.
+//   * SAVE — the live arrays are written through to the PHYSICAL global file
+//     and replaced with `[]` on both diff sides, so no new overlay carries a
+//     copy.
+//
+// `mcp_activation` is deliberately NOT in any of this: it is the per-project
+// half, and stripping it would leave per-project enablement nowhere to live.
+//
+// One consequence, stated because it is a real behaviour change: a project
+// overlay that carried per-project ACCESS flags (`claude_access` and friends)
+// loses them to the global value. That is the intended scope split — the
+// access flags are spawn-baked structural grants (see
+// `OffloadSettings::any_claude_mcp`), and per-project variation is
+// `mcp_activation`'s job.
+//
+// `load_readonly` stays exempt, like its two precedents: the MCP child reads
+// `mcp_servers` only to render a tool-count phrase in the `offload_task`
+// description, and the app's own `load` heals the overlay on first launch.
+
+/// LOAD step 1: promote a legacy overlay's servers and categories into the
+/// global baseline, keyed by name (a name already present globally wins).
+///
+/// Returns true when the caller should persist — which here also covers
+/// "promoted nothing, but the overlay still carries a registry key". Unlike the
+/// template libraries, `mcp_servers` is an OLD field: an overlay whose copy is
+/// merely stale (same names, different flags) promotes nothing yet must still
+/// be rewritten in the stripped shape, or it keeps shadowing global edits
+/// forever. The rewrite is one-time — `save` strips both keys, so the next load
+/// finds nothing to heal.
+fn promote_overlay_mcp_registry(global: &mut Settings, overlay: &Value) -> bool {
+    let mut changed = false;
+    let carries = overlay
+        .get("offload")
+        .and_then(Value::as_object)
+        .is_some_and(|o| o.contains_key("mcp_servers") || o.contains_key("mcp_categories"));
+    if let Some(entries) = overlay
+        .get("offload")
+        .and_then(|o| o.get("mcp_servers"))
+        .and_then(Value::as_array)
+    {
+        for e in entries {
+            let Ok(m) = serde_json::from_value::<McpServerConfig>(e.clone()) else {
+                continue;
+            };
+            if !m.name.trim().is_empty()
+                && !global.offload.mcp_servers.iter().any(|g| g.name == m.name)
+            {
+                global.offload.mcp_servers.push(m);
+                changed = true;
+            }
+        }
+    }
+    if let Some(entries) = overlay
+        .get("offload")
+        .and_then(|o| o.get("mcp_categories"))
+        .and_then(Value::as_array)
+    {
+        for e in entries {
+            let Ok(c) = serde_json::from_value::<McpCategory>(e.clone()) else {
+                continue;
+            };
+            if !c.name.trim().is_empty()
+                && !global.offload.mcp_categories.iter().any(|g| g.name == c.name)
+            {
+                global.offload.mcp_categories.push(c);
+                changed = true;
+            }
+        }
+    }
+    changed || carries
+}
+
+/// LOAD step 2: overwrite the merged view's registry arrays from the
+/// (post-promotion) global baseline. `mcp_activation` is untouched.
+fn enforce_global_mcp_registry(merged: &mut Value, global: &Settings) {
+    let Some(off) = merged.get_mut("offload").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Ok(v) = serde_json::to_value(&global.offload.mcp_servers) {
+        off.insert("mcp_servers".to_string(), v);
+    }
+    if let Ok(v) = serde_json::to_value(&global.offload.mcp_categories) {
+        off.insert("mcp_categories".to_string(), v);
+    }
+}
+
+/// SAVE step 1 (pure half of the write-through): copy the live registry arrays
+/// onto the on-disk global settings. Returns true when anything changed — the
+/// caller only rewrites the physical file then.
+fn sync_mcp_registry_into(disk_global: &mut Settings, current: &Settings) -> bool {
+    let mut changed = false;
+    if disk_global.offload.mcp_servers != current.offload.mcp_servers {
+        disk_global.offload.mcp_servers = current.offload.mcp_servers.clone();
+        changed = true;
+    }
+    if disk_global.offload.mcp_categories != current.offload.mcp_categories {
+        disk_global.offload.mcp_categories = current.offload.mcp_categories.clone();
+        changed = true;
+    }
+    changed
+}
+
+/// SAVE step 2: empty both registry arrays on a diff side so the overlay never
+/// carries them. `mcp_activation` is left alone — it is the per-project half.
+fn strip_mcp_registry(v: &mut Value) {
+    if let Some(off) = v.get_mut("offload").and_then(Value::as_object_mut) {
+        off.insert("mcp_servers".to_string(), Value::Array(Vec::new()));
+        off.insert("mcp_categories".to_string(), Value::Array(Vec::new()));
+    }
+}
+
 /// Write the diff between `settings` and `global` to the custom overlay
 /// file in `launch_cwd`. If the diff is empty, deletes any existing
 /// overlay (so a user who reverts every change ends up with a clean
@@ -1061,11 +1196,14 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
             let mut disk = read_settings_or_default(&gpath);
             let paths_changed = sync_audit_paths_into(&mut disk, settings);
             let templates_changed = sync_offload_templates_into(&mut disk, settings);
+            // V37 F5: the MCP registry is global; only `mcp_activation` varies
+            // per project.
+            let registry_changed = sync_mcp_registry_into(&mut disk, settings);
             // V33: `sandbox` is banned from overlays (it configures a boundary
             // whose own writable area holds the overlay file), so the global
             // file is the ONLY place a sandbox edit can land.
             let sandbox_changed = sync_sandbox_into(&mut disk, settings);
-            if paths_changed || templates_changed || sandbox_changed {
+            if paths_changed || templates_changed || registry_changed || sandbox_changed {
                 if let Err(e) = save_to(&gpath, &disk) {
                     tracing::warn!(error = %e, "settings: machine-scope global write-through failed");
                 }
@@ -1083,6 +1221,8 @@ pub fn save(settings: &Settings, launch_cwd: &Path, global: &Settings) -> AppRes
     strip_audit_tool_paths(&mut baseline);
     strip_offload_templates(&mut current);
     strip_offload_templates(&mut baseline);
+    strip_mcp_registry(&mut current);
+    strip_mcp_registry(&mut baseline);
 
     match diff(&current, &baseline) {
         Some(delta) => {
@@ -3972,5 +4112,164 @@ mod tests {
         live.offload.server_command_templates.clear();
         assert!(sync_offload_templates_into(&mut disk, &live));
         assert!(disk.offload.server_command_templates.is_empty());
+    }
+    // ── V37 F5: the MCP registry is global, activation is per-project ────────
+
+    fn mcp_server(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mcp_registry_promotion_adds_new_names_only() {
+        let mut global = base_test_settings();
+        global
+            .offload
+            .mcp_servers
+            .push(mcp_server("ddg", "http://global/mcp"));
+        let overlay = serde_json::json!({
+            "offload": {
+                "mcp_servers": [
+                    { "name": "ddg", "url": "http://stale/mcp" },
+                    { "name": "context7", "url": "http://c7/mcp" },
+                    { "name": "   ", "url": "http://anon/mcp" },
+                ],
+                "mcp_categories": [
+                    { "name": "research", "servers": ["ddg"], "enabled": true },
+                ],
+            }
+        });
+
+        assert!(promote_overlay_mcp_registry(&mut global, &overlay));
+        // Existing global name: never overwritten by the overlay copy.
+        assert_eq!(global.offload.mcp_servers[0].url, "http://global/mcp");
+        // New name promoted; whitespace-only name skipped.
+        assert_eq!(global.offload.mcp_servers.len(), 2);
+        assert_eq!(global.offload.mcp_servers[1].name, "context7");
+        assert_eq!(global.offload.mcp_categories.len(), 1);
+        assert_eq!(global.offload.mcp_categories[0].name, "research");
+
+        // Still "persist me" on a second pass, because the overlay still
+        // CARRIES the keys — that heal is what stops a stale copy shadowing
+        // global edits forever. An overlay with no registry keys asks for
+        // nothing.
+        assert!(promote_overlay_mcp_registry(&mut global, &overlay));
+        let clean = serde_json::json!({ "offload": { "mcp_activation": { "servers": {} } } });
+        assert!(!promote_overlay_mcp_registry(&mut global, &clean));
+    }
+
+    #[test]
+    fn merged_mcp_registry_comes_from_global_not_overlay() {
+        let mut global = base_test_settings();
+        global
+            .offload
+            .mcp_servers
+            .push(mcp_server("ddg", "http://global/mcp"));
+
+        // Simulate the deep-merge outcome: the overlay's stale array replaced
+        // the global's wholesale, and its activation map survived per key.
+        let mut merged = serde_json::to_value(&global).unwrap();
+        merged["offload"]["mcp_servers"] =
+            serde_json::json!([{ "name": "ddg", "url": "http://stale/mcp" }]);
+        merged["offload"]["mcp_activation"]["servers"] = serde_json::json!({ "ddg": false });
+
+        enforce_global_mcp_registry(&mut merged, &global);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        assert_eq!(
+            settings.offload.mcp_servers, global.offload.mcp_servers,
+            "the merged view must take the registry from the global baseline"
+        );
+        // The per-project half is untouched — it is the ONLY per-project half.
+        assert_eq!(
+            settings.offload.mcp_activation.servers.get("ddg"),
+            Some(&false),
+            "activation is per-project and must survive"
+        );
+    }
+
+    #[test]
+    fn overlay_diff_never_carries_mcp_registry() {
+        // A settings state that differs from global ONLY in the registry must
+        // produce NO overlay once both sides are stripped — the registry lands
+        // in the global file via the save() write-through instead.
+        let global = base_test_settings();
+        let mut current = global.clone();
+        current
+            .offload
+            .mcp_servers
+            .push(mcp_server("ddg", "http://x/mcp"));
+        current.offload.mcp_categories.push(McpCategory {
+            name: "research".into(),
+            servers: vec!["ddg".into()],
+            enabled: true,
+        });
+
+        let mut cur_v = serde_json::to_value(&current).unwrap();
+        let mut base_v = serde_json::to_value(&global).unwrap();
+        strip_mcp_registry(&mut cur_v);
+        strip_mcp_registry(&mut base_v);
+        assert!(
+            diff(&cur_v, &base_v).is_none(),
+            "a registry-only change must not create an overlay"
+        );
+
+        // The per-project half still diffs — and does so WITHOUT dragging a
+        // copy of the registry along.
+        let mut current2 = current.clone();
+        current2
+            .offload
+            .mcp_activation
+            .servers
+            .insert("ddg".into(), false);
+        let mut cur2_v = serde_json::to_value(&current2).unwrap();
+        strip_mcp_registry(&mut cur2_v);
+        let delta = diff(&cur2_v, &base_v).expect("an activation override must diff");
+        assert_eq!(
+            delta["offload"]["mcp_activation"]["servers"],
+            serde_json::json!({ "ddg": false })
+        );
+        for key in ["mcp_servers", "mcp_categories"] {
+            assert!(
+                delta["offload"].get(key).is_none(),
+                "overlay must not carry {key}: {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_mcp_registry_into_disk_global_reports_changes() {
+        // The other half of the write-through: an edit made while a project
+        // overlay is in play lands in the PHYSICAL global file, which is what
+        // makes it visible from every other project.
+        let mut disk = base_test_settings();
+        let mut live = base_test_settings();
+        live.offload
+            .mcp_servers
+            .push(mcp_server("ddg", "http://x/mcp"));
+
+        assert!(sync_mcp_registry_into(&mut disk, &live));
+        assert_eq!(disk.offload.mcp_servers, live.offload.mcp_servers);
+        // Unchanged on a second sync — the physical file isn't rewritten.
+        assert!(!sync_mcp_registry_into(&mut disk, &live));
+
+        // A field edit inside an existing row counts as a change (this is what
+        // `PartialEq` on `McpServerConfig` is for).
+        live.offload.mcp_servers[0].url = "http://y/mcp".into();
+        assert!(sync_mcp_registry_into(&mut disk, &live));
+        assert_eq!(disk.offload.mcp_servers[0].url, "http://y/mcp");
+
+        // Categories ride the same write-through, and a deletion propagates.
+        live.offload.mcp_categories.push(McpCategory {
+            name: "research".into(),
+            servers: vec!["ddg".into()],
+            enabled: true,
+        });
+        assert!(sync_mcp_registry_into(&mut disk, &live));
+        live.offload.mcp_servers.clear();
+        assert!(sync_mcp_registry_into(&mut disk, &live));
+        assert!(disk.offload.mcp_servers.is_empty());
     }
 }

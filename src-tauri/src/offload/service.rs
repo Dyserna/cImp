@@ -715,6 +715,69 @@ impl OffloadService {
             ));
         }
 
+        // V38 Phase F (V37's E-1): the detection-change watcher. The connect-time
+        // tool screen runs once per connection, so without this a rules-bundle
+        // update or a detection toggle leaves a live surface screened against
+        // the rules of whenever each server happened to connect.
+        //
+        // TWO edges, because the fact arrives two ways: a settings save (the
+        // toggles) and a rules reload (the bundle, which changes no setting at
+        // all). Only a settings save is compared — the config either moved or it
+        // did not — while a reload is taken at face value, since "the rules are
+        // different now" is exactly what it means and cImp does not hash them.
+        {
+            let this = service.clone();
+            let mut settings_rx = service.settings.subscribe();
+            let mut rules_rx = super::detection::subscribe_rules_reload();
+            let mut last = super::detection::Config::from_settings(
+                &service.settings.current(),
+                crate::settings::injection::Scope::AppWide,
+            );
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let changed = tokio::select! {
+                        s = settings_rx.recv() => match s {
+                            Ok(s) => {
+                                let now = super::detection::Config::from_settings(
+                                    &s,
+                                    crate::settings::injection::Scope::AppWide,
+                                );
+                                let moved = now != last;
+                                last = now;
+                                moved
+                            }
+                            // A LAGGED receiver dropped frames, and one of them
+                            // can be the very edge this task exists for — the
+                            // standard broadcast pattern in this file: treat it
+                            // as "changed, re-check" against the authoritative
+                            // current settings rather than skipping past it.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                let now = super::detection::Config::from_settings(
+                                    &this.settings.current(),
+                                    crate::settings::injection::Scope::AppWide,
+                                );
+                                let moved = now != last;
+                                last = now;
+                                moved
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        r = rules_rx.recv() => match r {
+                            // Lagged is the same answer as Ok here: N coalesced
+                            // reloads and one reload ask for the same work,
+                            // because the screen reads the CURRENT rules either
+                            // way.
+                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                    };
+                    if changed {
+                        this.rescreen_mcp_surface().await;
+                    }
+                }
+            });
+        }
+
         // Relay MCP-host change pulses (reconcile added/dropped a connection, a
         // server died mid-call) into the gate.
         {
@@ -920,6 +983,23 @@ impl OffloadService {
             )
             .await;
         *self.last_host_sig.lock().unwrap() = Some(sig);
+    }
+
+    /// V38 Phase F (V37's E-1) — re-screen the live MCP surface against the
+    /// CURRENT detection config, drop-only, and pulse if anything went.
+    ///
+    /// The pulse source is [`PulseSource::Host`] and that is exact: a withheld
+    /// tool is a change to what every consumer is advertised, so the host's own
+    /// surface fingerprint is the right thing to judge it by — and it will
+    /// judge a real drop as a move, because the drop is one.
+    pub async fn rescreen_mcp_surface(&self) {
+        let cfg = super::detection::Config::from_settings(
+            &self.settings.current(),
+            crate::settings::injection::Scope::AppWide,
+        );
+        if self.host.rescreen(cfg).await {
+            let _ = self.pulse_tx.send(PulseSource::Host);
+        }
     }
 
     /// Aggregate service status for the Settings readout: the honest global

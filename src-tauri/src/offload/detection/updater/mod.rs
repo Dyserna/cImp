@@ -402,6 +402,10 @@ pub fn live_reload(c: Component, dir: &Path) -> Result<String, String> {
     match c {
         Component::Rules => {
             let s = super::signature::reload();
+            // E-1: same edge as the Settings "Reload rules" action — a bundle
+            // the updater just activated is a rules change a live MCP surface
+            // has never been screened against.
+            super::note_rules_reloaded();
             health_from_rules(&s, dir)
         }
     }

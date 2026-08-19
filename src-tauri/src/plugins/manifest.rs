@@ -415,7 +415,12 @@ pub struct ToolManifest {
     /// [`ValidationError::BuiltinField`] instead of serde's generic
     /// "unknown field", which would read as a typo rather than as the
     /// provenance forgery it is.
-    #[serde(default)]
+    ///
+    /// Never serialized: a validated manifest always has `None` here, and a
+    /// permanently-null field in the snapshot DTO would invite a Phase B reader
+    /// to treat it as the provenance flag. The real one is
+    /// `LoadedPlugin::provenance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<serde_json::Value>,
 }
 
@@ -440,8 +445,9 @@ pub struct PluginManifest {
     pub categories: Vec<CategoryDecl>,
     #[serde(default)]
     pub tools: Vec<ToolManifest>,
-    /// See [`ToolManifest::builtin`] — same reason, plugin level.
-    #[serde(default)]
+    /// See [`ToolManifest::builtin`] — same reason, plugin level, and likewise
+    /// never serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<serde_json::Value>,
 }
 

@@ -868,7 +868,8 @@ impl OffloadService {
         // Serialize against other reconcile callers (pre-run, health watch,
         // live reload IPC) so a freshly-added server isn't connected twice.
         let _guard = self.host_reconcile_lock.lock().await;
-        let snap = self.settings.current().offload;
+        let cur = self.settings.current();
+        let snap = cur.offload.clone();
         // Keep the host up when offload is enabled OR a server is exposed to
         // Claude Code (Claude reaches it over the loopback independent of
         // offload). Only tear it down when neither consumer needs it.
@@ -896,6 +897,15 @@ impl OffloadService {
                 &snap.mcp_categories,
                 &snap.mcp_activation,
                 &roots,
+                // V37 contract C9. `AppWide` because the warm host is one pool
+                // shared by every Claude tab, every OpenCode tab and the worker:
+                // there is no single scope whose per-tab override could speak for
+                // it, and `AppWide` is the scope whose documented meaning is
+                // exactly "what the application is configured to do".
+                super::detection::Config::from_settings(
+                    &cur,
+                    crate::settings::injection::Scope::AppWide,
+                ),
             )
             .await;
         *self.last_host_sig.lock().unwrap() = Some(sig);
@@ -2244,11 +2254,33 @@ impl OffloadService {
                 // probe against a half-warm host would report a connect that
                 // has not finished as a failure.
                 tokio::time::sleep(interval).await;
-                let snap = this.settings.current().offload;
+                // ONE settings read per sweep: the probe below takes real time,
+                // and the registry the retry filters against must be the same
+                // snapshot as the detection config it screens with.
+                let cur = this.settings.current();
+                let snap = cur.offload.clone();
                 if snap.mcp_health_interval_secs == 0 || !snap.mcp_host_needed() {
                     continue;
                 }
                 this.host.probe_health(mcp_probe_timeout(interval)).await;
+                // V37 Phase E: one reconnect attempt per server this lane has
+                // already reported down, AFTER the probe — so a server that came
+                // back on its own is seen by the probe (which mints the ordinary
+                // recovery row) and is no longer a candidate here. The checker
+                // itself still never reconciles; this is a per-server replace
+                // guarded at the swap, not a pool rebuild. See
+                // `McpHost::retry_unhealthy` for why it takes no reconcile lock.
+                this.host
+                    .retry_unhealthy(
+                        &snap.mcp_servers,
+                        &snap.mcp_categories,
+                        &snap.mcp_activation,
+                        super::detection::Config::from_settings(
+                            &cur,
+                            crate::settings::injection::Scope::AppWide,
+                        ),
+                    )
+                    .await;
             }
         });
     }

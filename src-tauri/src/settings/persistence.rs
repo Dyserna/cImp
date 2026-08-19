@@ -810,6 +810,30 @@ fn legacy_tool_key(id: &str) -> String {
     format!("{}/{id}", crate::plugins::builtin::AUDIT_PLUGIN_KEY)
 }
 
+/// Is `id` a tool this build actually ships under the built-in audit plugin?
+///
+/// **Phase E gate, B-E2.** The legacy overlay is a JSON file a user (or an
+/// older build, or a hand edit) wrote, and nothing has ever validated the ids
+/// in it — the pre-v34 reader dropped an unknown one at deserialize time, and
+/// the v33 → v34 migration drops it explicitly. This is the third reader of
+/// the same array and it has to make the same call, because the two things it
+/// writes are worse than a dropped setting: a container slot for a tool that
+/// does not exist is husk state the settings pane cannot show or clear, and a
+/// `global_paths` entry is a MACHINE-WIDE path keyed on a name nothing will
+/// ever resolve — a fabricated id in one project's overlay minting machine
+/// state is a wider blast radius than the promotion is worth.
+///
+/// Reads the embedded set rather than a frozen list: unlike a migration step
+/// (which describes a file shape on a fixed date — ruling R4), this describes
+/// what THIS build can run, so it should move when the roster moves.
+fn legacy_id_is_shipped(id: &str) -> bool {
+    crate::plugins::builtin::plugin_set()
+        .plugins
+        .iter()
+        .filter(|p| p.key == crate::plugins::builtin::AUDIT_PLUGIN_KEY)
+        .any(|p| p.manifest.tools.iter().any(|t| t.id == id))
+}
+
 /// Promote a legacy overlay's `code_audit.tools` into the global baseline's
 /// `tool_plugins` container, filling only slots the container does not have.
 /// Returns true when `global` changed — the caller persists via the post-load
@@ -827,6 +851,11 @@ fn promote_overlay_audit_config(global: &mut Settings, overlay: &Value) -> bool 
         let Some(id) = e.get("id").and_then(Value::as_str) else {
             continue;
         };
+        // B-E2: an id this build does not ship buys nothing and costs husk
+        // state plus a machine-wide path — see `legacy_id_is_shipped`.
+        if !legacy_id_is_shipped(id) {
+            continue;
+        }
         let tool_key = legacy_tool_key(id);
 
         // The path is machine scope and always was: promote it into the
@@ -4259,6 +4288,37 @@ mod tests {
         // Idempotent: a second pass over the same overlay changes nothing, so a
         // project that is never saved does not re-promote on every launch.
         assert!(!promote_overlay_audit_config(&mut global, &overlay));
+    }
+
+    /// **Phase E gate, B-E2.** A legacy overlay is an unvalidated file: a hand
+    /// edit, a tool a later build removed, or a hostile `.cimp/config.json` can
+    /// name an id this build does not ship. The promotion must drop it, because
+    /// the two things it would otherwise write are worse than a lost setting —
+    /// a container slot no pane can show or clear, and a MACHINE-WIDE path
+    /// keyed on a name nothing resolves, minted from one project's file.
+    #[test]
+    fn a_legacy_overlay_cannot_promote_an_id_this_build_does_not_ship() {
+        let mut global = base_test_settings();
+        let overlay = serde_json::json!({
+            "code_audit": { "tools": [
+                { "id": "not-a-tool", "enabled": true, "path": "P:/evil/x.exe" },
+                { "id": "cargo-audit", "enabled": false, "timeout_secs": 900 },
+                { "id": "gitleaks", "enabled": false }
+            ] }
+        });
+
+        // The one real id still promotes — the filter is a filter, not a veto.
+        assert!(promote_overlay_audit_config(&mut global, &overlay));
+        let tools = &global.tool_plugins.plugins["cimp-audit@1"].tools;
+        assert!(!tools["gitleaks"].enabled);
+
+        assert!(!tools.contains_key("not-a-tool"));
+        assert!(!tools.contains_key("cargo-audit"), "a tool V23 removed");
+        assert!(
+            global.tool_plugins.global_paths.is_empty(),
+            "a fabricated id must not mint a machine-wide path: {:?}",
+            global.tool_plugins.global_paths
+        );
     }
 
     /// An overlay with no legacy block at all is not a promotion.

@@ -2730,10 +2730,35 @@ fn migrate_v33_to_v34(value: &mut Value) {
                     .entry("plugins".to_string())
                     .or_insert_with(|| Value::Object(serde_json::Map::new()));
                 if let Some(plugins) = plugins.as_object_mut() {
-                    let mut plugin = serde_json::Map::new();
-                    plugin.insert("enabled".to_string(), Value::Bool(true));
-                    plugin.insert("tools".to_string(), Value::Object(states));
-                    plugins.insert(V34_AUDIT_PLUGIN_KEY.to_string(), Value::Object(plugin));
+                    // Phase E gate, B-E1: merge into the audit plugin's slot
+                    // rather than writing over it, for the same reason the
+                    // container itself is merged one level up. A slot that is
+                    // already there was written by a build that reads the
+                    // container, so it is NEWER than the array being moved —
+                    // clobbering it would replace live configuration with a
+                    // copy of the legacy shape. `or_insert` throughout: the
+                    // stored value wins, per tool, exactly as `global_paths`
+                    // below already does.
+                    let slot = plugins
+                        .entry(V34_AUDIT_PLUGIN_KEY.to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if !slot.is_object() {
+                        *slot = Value::Object(serde_json::Map::new());
+                    }
+                    let slot = slot.as_object_mut().expect("just made an object");
+                    slot.entry("enabled".to_string())
+                        .or_insert(Value::Bool(true));
+                    let tools = slot
+                        .entry("tools".to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if !tools.is_object() {
+                        *tools = Value::Object(serde_json::Map::new());
+                    }
+                    if let Some(tools) = tools.as_object_mut() {
+                        for (k, v) in states {
+                            tools.entry(k).or_insert(v);
+                        }
+                    }
                 }
             }
             if !paths.is_empty() {
@@ -4017,6 +4042,42 @@ mod tests {
             crate::plugins::builtin::AUDIT_PLUGIN_KEY,
             "the step writes container keys under a plugin key nothing reads"
         );
+    }
+
+    /// **Phase E gate, B-E1: the move MERGES into the audit plugin's slot.**
+    ///
+    /// The container is merged one level up already (a file that has been
+    /// through a newer build may carry user plugins). One level down was still
+    /// a clobber: a `cimp-audit@1` slot that is present was written by a build
+    /// that READS the container, so it is newer than the array being moved —
+    /// replacing it with a copy of the legacy shape would undo live
+    /// configuration during an upgrade, which is the exact failure this step
+    /// exists to prevent. Stored value wins per tool, `global_paths`-style.
+    #[test]
+    fn the_move_never_clobbers_container_state_a_newer_build_wrote() {
+        let mut v = json!({
+            "schema_version": 33,
+            "tool_plugins": { "plugins": { "cimp-audit@1": {
+                "enabled": false,
+                "tools": { "semgrep": { "enabled": true, "parameters": ["--new"] } }
+            } } },
+            "code_audit": { "tools": [
+                { "id": "semgrep", "enabled": false, "extra_args": ["--legacy"] },
+                { "id": "gitleaks", "enabled": false }
+            ] },
+        });
+        migrate_v33_to_v34(&mut v);
+
+        let slot = &v["tool_plugins"]["plugins"]["cimp-audit@1"];
+        assert_eq!(slot["enabled"], json!(false), "the stored plugin flag wins");
+        assert_eq!(
+            slot["tools"]["semgrep"]["parameters"],
+            json!(["--new"]),
+            "the stored tool state wins over the legacy array"
+        );
+        assert_eq!(slot["tools"]["semgrep"]["enabled"], json!(true));
+        // A tool the container had NO state for still arrives.
+        assert_eq!(slot["tools"]["gitleaks"]["enabled"], json!(false));
     }
 
     /// **The V37/V38 linearization caveat, pinned** (develop merge, 2026-08-19).
